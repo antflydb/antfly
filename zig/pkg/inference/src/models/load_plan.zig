@@ -1,0 +1,739 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Artifact-derived load/admission geometry. This layer describes tokenizer,
+//! representation, persistent-weight and temporary preparation requirements;
+//! serving owns eviction, admission leases, publication and cancellation lanes.
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ModelSource = @import("model_source.zig").ModelSource;
+const tokenizer_loader = @import("tokenizer_loader.zig");
+const std = @import("std");
+const backends = @import("../backends/backends.zig");
+const manifest_mod = @import("manifest.zig");
+const gliner_specialty = @import("gliner_specialty_qualification.zig");
+const c_file = @import("../util/c_file.zig");
+const gguf_format = @import("../gguf/format.zig");
+const session_factory = @import("../architectures/session_factory.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
+const runtime = @import("../runtime/root.zig");
+fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
+    return man.nativeWeightArtifactKind() != null;
+}
+
+pub const ModelLoadAdmissionPlan = struct {
+    /// Maximum simultaneous bytes while parsing/importing/repacking.
+    peak: runtime.tier.memory.AdmissionAmounts,
+    /// Bytes retained by the completed backend session.
+    resident: runtime.tier.memory.AdmissionAmounts,
+    /// Minimum serving envelope justified by the same resolved load plan.
+    /// Operator overrides are applied after this floor.
+    limit_floor: runtime.tier.memory.Limits = .{},
+    /// CUDA A4B serving excludes temporary GGUF staging and reuses the
+    /// resident KV/scratch reservation through a bounded session sub-ledger.
+    serving_floor: ?runtime.tier.memory.Limits = null,
+};
+
+pub fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
+    const min_workspace = 16 * 1024 * 1024;
+    const max_workspace = 1024 * 1024 * 1024;
+    return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
+}
+
+pub const TokenizerArtifactKind = enum {
+    huggingface,
+    sentencepiece,
+    wordpiece,
+};
+
+pub const tokenizer_fixed_resident_bytes = 16 * 1024 * 1024;
+
+pub const tokenizer_fixed_peak_bytes = 24 * 1024 * 1024;
+
+pub fn checkedScaledBytes(base: usize, multiplier: usize, fixed: usize) !usize {
+    return std.math.add(
+        usize,
+        std.math.mul(usize, base, multiplier) catch
+            return error.ResourceLimitExceeded,
+        fixed,
+    ) catch return error.ResourceLimitExceeded;
+}
+
+pub fn tokenizerAdmissionPlan(encoded_bytes: usize, kind: TokenizerArtifactKind) !ModelLoadAdmissionPlan {
+    const factors: struct { resident: usize, peak: usize } = switch (kind) {
+        .huggingface => .{ .resident = 10, .peak = 13 },
+        .wordpiece => .{ .resident = 7, .peak = 9 },
+        // Keep the published matcher while constructing the replacement and
+        // its batched token journal; both belong to the construction peak.
+        .sentencepiece => .{ .resident = 5, .peak = 10 },
+    };
+    return .{
+        .peak = .{
+            .host_weight_bytes = try checkedScaledBytes(
+                encoded_bytes,
+                factors.peak,
+                tokenizer_fixed_peak_bytes,
+            ),
+        },
+        .resident = .{
+            .host_weight_bytes = try checkedScaledBytes(
+                encoded_bytes,
+                factors.resident,
+                tokenizer_fixed_resident_bytes,
+            ),
+        },
+    };
+}
+
+pub fn tokenizerFileAdmissionPlan(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    kind: TokenizerArtifactKind,
+) !ModelLoadAdmissionPlan {
+    const encoded_u64 = try c_file.fileSize(allocator, path);
+    const encoded = std.math.cast(usize, encoded_u64) orelse
+        return error.ResourceLimitExceeded;
+    return tokenizerAdmissionPlan(encoded, kind);
+}
+
+pub fn tokenizerLoadAdmissionPlan(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    tokenizer_type: manifest_mod.TokenizerType,
+) !ModelLoadAdmissionPlan {
+    return tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, man, tokenizer_type, null);
+}
+
+pub fn tokenizerLoadAdmissionPlanWithArtifacts(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    tokenizer_type: manifest_mod.TokenizerType,
+    artifacts: ?*PublishedArtifacts,
+) !ModelLoadAdmissionPlan {
+    var sentencepiece_sidecar_bytes: usize = 0;
+    // Admission and loading must inspect the same catalog-selected artifacts,
+    // including export-local vocabularies and root metadata fallbacks.
+    if (tokenizer_type == .huggingface) {
+        if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
+        if (man.vocab_txt_path) |path| {
+            var encoded: usize = 0;
+            for ([_]?[]const u8{ path, man.tokenizer_config_path, man.special_tokens_map_path }) |candidate| {
+                if (candidate) |selected| {
+                    const size = std.math.cast(usize, try c_file.fileSize(allocator, selected)) orelse return error.ResourceLimitExceeded;
+                    encoded = std.math.add(usize, encoded, size) catch return error.ResourceLimitExceeded;
+                }
+            }
+            return tokenizerAdmissionPlan(encoded, .wordpiece);
+        }
+    } else {
+        var encoded: usize = 0;
+        var found_sentencepiece = false;
+        const sidecars = [_][]const u8{
+            "tokenizer.model",
+            "tokenizer.json",
+            "added_tokens.json",
+        };
+        for (sidecars) |name| {
+            const path = if (artifacts) |source|
+                (try source.resolve(name)) orelse continue
+            else
+                try std.fs.path.join(allocator, &.{ model_dir, name });
+            defer allocator.free(path);
+            if (artifacts == null and !c_file.fileExists(allocator, path)) continue;
+            const size = std.math.cast(
+                usize,
+                try c_file.fileSize(allocator, path),
+            ) orelse return error.ResourceLimitExceeded;
+            encoded = std.math.add(usize, encoded, size) catch
+                return error.ResourceLimitExceeded;
+            if (std.mem.eql(u8, name, "tokenizer.model")) {
+                found_sentencepiece = true;
+            }
+        }
+        if (found_sentencepiece) {
+            return tokenizerAdmissionPlan(encoded, .sentencepiece);
+        }
+        sentencepiece_sidecar_bytes = encoded;
+    }
+    if (man.gguf_path) |path| {
+        if (artifacts) |source| try source.verifyPath(path);
+        var region = try c_file.MmapRegion.init(allocator, path);
+        defer region.deinit();
+        const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
+            region.data,
+            "tokenizer.",
+        );
+        if (encoded == 0) return error.NoTokenizerFound;
+        var plan = try tokenizerAdmissionPlan(
+            std.math.add(usize, encoded, sentencepiece_sidecar_bytes) catch return error.ResourceLimitExceeded,
+            if (tokenizer_type == .huggingface)
+                .huggingface
+            else
+                .sentencepiece,
+        );
+        // The tokenizer loader currently parses the complete GGUF metadata and
+        // tensor-info header before extracting tokenizer arrays. Account for
+        // those temporary copied keys/names/dimensions in the construction peak.
+        const header_bytes = try gguf_format.encodedHeaderBytes(region.data);
+        if (header_bytes < encoded) return error.InvalidTokenizerMetadata;
+        const non_tokenizer_header = header_bytes - encoded;
+        plan.peak.host_weight_bytes = std.math.add(
+            usize,
+            plan.peak.host_weight_bytes,
+            std.math.mul(usize, non_tokenizer_header, 3) catch
+                return error.ResourceLimitExceeded,
+        ) catch return error.ResourceLimitExceeded;
+        return plan;
+    }
+    return error.NoTokenizerFound;
+}
+
+pub const ComponentArtifactEstimate = union(enum) {
+    disabled,
+    onnx: usize,
+    native: *const manifest_mod.ModelManifest,
+
+    pub fn init(allocator: std.mem.Allocator, source: ModelSource) !ComponentArtifactEstimate {
+        if (source.kind == .onnx) {
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithReader(
+                allocator,
+                source.path,
+                source.external_base_dir,
+                source.external_reader,
+            );
+            defer artifacts.deinit();
+            return .{ .onnx = artifacts.encoded_bytes };
+        }
+
+        // Native sessions accept directories as well as direct GGUF paths.
+        // Loading the manifest is essential here: a directory's stat size only
+        // describes its entries and bears no relation to resident model bytes.
+        return .{ .native = source.manifest orelse return error.NoModelFileFound };
+    }
+
+    pub fn deinit(self: *ComponentArtifactEstimate) void {
+        self.* = .disabled;
+    }
+
+    pub fn encodedBytes(self: *const ComponentArtifactEstimate) !usize {
+        return switch (self.*) {
+            .disabled => 0,
+            .onnx => |bytes| bytes,
+            .native => |man| estimateModelArtifactBytes(man.*),
+        };
+    }
+
+    pub fn extraBackendResidentAmounts(
+        self: *const ComponentArtifactEstimate,
+        backend: backends.BackendType,
+    ) runtime.tier.memory.AdmissionAmounts {
+        if (backend != .metal) return .{};
+        return switch (self.*) {
+            .native => |man| session_factory.metalDebertaFastPathAdmissionAmounts(man.*),
+            .disabled, .onnx => .{},
+        };
+    }
+};
+
+pub fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
+    const path = maybe_path orelse return;
+    const size = if (std.mem.endsWith(u8, path, ".onnx")) blk: {
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(allocator, path);
+        defer artifacts.deinit();
+        break :blk artifacts.encoded_bytes;
+    } else std.math.cast(usize, try c_file.fileSize(allocator, path)) orelse
+        return error.ResourceLimitExceeded;
+    total.* = std.math.add(usize, total.*, size) catch return error.ResourceLimitExceeded;
+}
+
+pub fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
+    var total: usize = 0;
+    const uses_native_weights = manifestHasNativeAssets(man);
+    if (uses_native_weights) {
+        const native_weight_bytes = std.math.cast(
+            usize,
+            try session_factory.estimateNativeWeightBytes(man.allocator, man),
+        ) orelse return error.ResourceLimitExceeded;
+        total = std.math.add(usize, total, native_weight_bytes) catch
+            return error.ResourceLimitExceeded;
+    } else {
+        if (man.onnx_path) |path| {
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(man.allocator, path, if (man.onnx_logical_path) |logical| std.fs.path.dirname(logical) else null);
+            defer artifacts.deinit();
+            total = artifacts.encoded_bytes;
+        }
+    }
+
+    if (total == 0) return error.NoModelFileFound;
+    return total;
+}
+
+pub fn estimateModelLoadAdmission(
+    model_path: []const u8,
+    man: manifest_mod.ModelManifest,
+    backend_runtime: backends.BackendRuntime,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    laya_packed: bool,
+) !ModelLoadAdmissionPlan {
+    const base = try estimateBaseModelLoadAdmission(model_path, man, backend_runtime, a4b_request, laya_packed);
+    return withJinaAdapterAdmission(man, backend_runtime.backend, base);
+}
+
+pub fn a4bGpuModelLoadAdmission(
+    config: backend_contracts.A4bInferenceConfig,
+    encoded_artifact_bytes: usize,
+    backend: backends.BackendType,
+) ModelLoadAdmissionPlan {
+    const budget: usize = @intCast(config.memory_budget_bytes);
+    const kv: usize = @intCast(config.kv_budget_bytes);
+    const scratch: usize = @intCast(config.safety_reserve_bytes);
+    const weights = budget -| kv -| scratch;
+    const resident = runtime.tier.memory.AdmissionAmounts{
+        .backend_weight_bytes = weights,
+        .backend_kv_bytes = kv,
+        .backend_scratch_bytes = scratch,
+    };
+    var peak = resident;
+    // CUDA constructs a temporary native GGUF session while uploading its
+    // resident representation. Metal maps the encoded artifact directly and
+    // does not retain a second host copy.
+    if (backend == .cuda) peak.host_weight_bytes = encoded_artifact_bytes;
+    const host_staging = if (backend == .cuda) encoded_artifact_bytes else 0;
+    return .{
+        .peak = peak,
+        .resident = resident,
+        .limit_floor = .{
+            .host_limit_bytes = host_staging,
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget +| host_staging,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        },
+        .serving_floor = if (backend == .cuda) .{
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        } else null,
+    };
+}
+
+pub fn onnxModelLoadAdmission(
+    weights: usize,
+    backend_runtime: backends.BackendRuntime,
+) !ModelLoadAdmissionPlan {
+    return switch (backend_runtime.backend) {
+        .metal, .cuda => .{
+            .peak = .{
+                // The importer retains encoded host bytes while constructing device
+                // parameters and graph metadata.
+                .backend_weight_bytes = weights,
+                .host_weight_bytes = weights,
+            },
+            .resident = .{ .backend_weight_bytes = weights },
+        },
+        .native, .wasm => .{
+            .peak = .{
+                // The current ONNX path reads the encoded protobuf and then owns the
+                // converted parameter storage, so reserve both copies.
+                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
+                    return error.ResourceLimitExceeded,
+            },
+            .resident = .{ .host_weight_bytes = weights },
+        },
+        .pjrt => return error.UnsupportedBackend,
+    };
+}
+
+pub fn nativeModelLoadAdmission(
+    weights: usize,
+    backend: backends.BackendType,
+    extra_backend_resident: runtime.tier.memory.AdmissionAmounts,
+) !ModelLoadAdmissionPlan {
+    return switch (backend) {
+        .metal => blk: {
+            const encoded_resident = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights);
+            var resident = extra_backend_resident;
+            resident.backend_weight_bytes = std.math.add(
+                usize,
+                encoded_resident,
+                resident.backend_weight_bytes,
+            ) catch return error.ResourceLimitExceeded;
+            var peak = resident;
+            peak.host_weight_bytes = weights / 4;
+            break :blk .{
+                // Device weights plus persistent architecture caches, bounded
+                // graph-plan scratch, and conservative host import staging.
+                .peak = peak,
+                .resident = resident,
+            };
+        },
+        .cuda => .{
+            .peak = .{
+                // CUDA construction currently builds a complete native session first,
+                // then uploads every resident weight before releasing the native copy.
+                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+                .host_weight_bytes = weights,
+            },
+            .resident = .{
+                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+            },
+        },
+        .native, .wasm => .{
+            .peak = .{
+                // Native import may retain a source mapping while materializing or
+                // repacking resident weights.
+                .host_weight_bytes = std.math.add(usize, weights, weights / 4) catch
+                    return error.ResourceLimitExceeded,
+            },
+            .resident = .{ .host_weight_bytes = weights },
+        },
+        .pjrt => return error.UnsupportedBackend,
+    };
+}
+
+pub fn qwenEmbeddingAdmissionConfig(
+    backend: backends.BackendType,
+    man: ?*const manifest_mod.ModelManifest,
+    config: ?@import("../architectures/gpt.zig").Config,
+) ?@import("../architectures/gpt.zig").Config {
+    if (backend != .metal) return null;
+    const manifest = man orelse return null;
+    if (manifest.model_type != .embedder or !manifest.isLastTokenDecoderEmbedder()) return null;
+    const cfg = config orelse return null;
+    if (!@import("../architectures/gpt.zig").denseQwen3PrefillEligible(cfg)) return null;
+    return cfg;
+}
+
+pub fn sessionRunAdmissionModelProfile(
+    backend_runtime: backends.BackendRuntime,
+    man: ?*const manifest_mod.ModelManifest,
+    config: ?@import("../architectures/gpt.zig").Config,
+) @import("../backends/session.zig").RunAdmission.ModelProfile {
+    const manifest = man orelse return .{};
+    const qwen_cfg = qwenEmbeddingAdmissionConfig(backend_runtime.backend, man, config);
+    return .{
+        .hidden_size = manifest.hidden_size,
+        .intermediate_size = manifest.intermediate_size,
+        .attention_heads = manifest.num_attention_heads,
+        .embedding_gemma2_cuda = manifest.embedding_style == .embedding_gemma2 and backend_runtime.backend == .cuda,
+        .qwen_dense_workspace = qwen_cfg != null,
+        .query_width = if (qwen_cfg) |cfg| @as(usize, cfg.num_attention_heads) * cfg.headDim() else 0,
+        .kv_width = if (qwen_cfg) |cfg| @as(usize, cfg.effectiveKVHeads()) * cfg.headDim() else 0,
+    };
+}
+
+pub fn admissionBackendClassForRuntime(
+    backend_runtime: backends.BackendRuntime,
+) runtime.tier.memory.BackendClass {
+    return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
+}
+
+pub fn attachSessionRunAdmission(
+    allocator: std.mem.Allocator,
+    session: *backends.Session,
+    controller: *runtime.tier.memory.AdmissionController,
+    backend_runtime: backends.BackendRuntime,
+    limits: runtime.tier.memory.Limits,
+    resident: runtime.tier.memory.AdmissionAmounts,
+    man: ?*const manifest_mod.ModelManifest,
+) !void {
+    const backend_class = admissionBackendClassForRuntime(backend_runtime);
+    try session_factory.configureSharedCacheAdmissionForSession(
+        session.*,
+        allocator,
+        controller,
+        backend_class,
+        limits,
+        resident,
+    );
+    const weight_bytes = std.math.add(
+        usize,
+        resident.host_weight_bytes,
+        resident.backend_weight_bytes,
+    ) catch std.math.maxInt(usize);
+    const qwen_cfg = if (backend_runtime.backend == .metal and
+        metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        session_factory.getGptConfig(session.*)
+    else
+        null;
+    session.run_admission = .{
+        .controller = controller,
+        .backend_class = backend_class,
+        .limits = limits,
+        .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
+        .static_workspace_kind = .estimate,
+        .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
+    };
+}
+
+test "SentencePiece sidecar admission includes overlays when the base vocabulary is in GGUF" {
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var layout = try @import("../gguf/writer.zig").buildLayout(a, &.{.{ .key = "tokenizer.ggml.model", .value = .{ .string = "llama" } }}, &.{});
+    defer layout.deinit(a);
+    const data = try a.alloc(u8, std.mem.alignForward(usize, layout.header_bytes.len, 32));
+    defer a.free(data);
+    @memset(data, 0);
+    @memcpy(data[0..layout.header_bytes.len], layout.header_bytes);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.gguf", .data = data });
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "tokenizer.gguf" });
+    defer a.free(path);
+    const man = manifest_mod.ModelManifest{ .allocator = a, .gguf_path = path };
+    const without = try tokenizerLoadAdmissionPlan(a, root, &man, .sentencepiece);
+    const overlay = "{\"added_tokens\":[{\"content\":\"<control>\",\"id\":11}]}";
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = overlay });
+    const with = try tokenizerLoadAdmissionPlan(a, root, &man, .sentencepiece);
+    try std.testing.expect(with.peak.host_weight_bytes >= without.peak.host_weight_bytes + overlay.len);
+    try std.testing.expect(with.resident.host_weight_bytes >= without.resident.host_weight_bytes + overlay.len);
+}
+
+/// Exact F32 specialty mappings remain resident while Metal mirrors borrow them.
+/// Size is a prefilter; construction still authenticates the complete digest.
+pub fn metalQualifiedSpecialtyF32HostSourceBytes(
+    man: manifest_mod.ModelManifest,
+    artifact_bytes: usize,
+) usize {
+    const declared = man.gliner_specialty_profile orelse return 0;
+    const artifact_kind = man.nativeWeightArtifactKind() orelse return 0;
+    if (man.gliner_architecture != .span or
+        man.gliner_span_encoder_family != .deberta or
+        artifact_kind != .safetensors or
+        man.safetensors_index_path != null)
+    {
+        return 0;
+    }
+    const size_profile = gliner_specialty.profileForWeightSize(
+        std.math.cast(u64, artifact_bytes) orelse return 0,
+    ) orelse return 0;
+    return if (size_profile == declared) artifact_bytes else 0;
+}
+
+pub fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !void {
+    if (bytes == 0) return;
+    const resident_host = std.math.add(
+        usize,
+        plan.resident.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    // Preserve the existing import staging above the newly resident source.
+    const peak_host = std.math.add(
+        usize,
+        plan.peak.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    plan.resident.host_weight_bytes = resident_host;
+    plan.peak.host_weight_bytes = peak_host;
+}
+
+pub fn withJinaAdapterAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return base;
+    const adapter = (try man.jinaRetrievalAdapter()) orelse return base;
+    const weights = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.weights)) orelse return error.ResourceLimitExceeded;
+    const config = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.config)) orelse return error.ResourceLimitExceeded;
+    // Mapping/header parsing and F32 staging are temporary on CPU/CUDA. Metal
+    // retains the adapter reader for lazy merges; its encoded mapping stays live.
+    const peak = try checkedScaledBytes(weights, 5, try checkedScaledBytes(config, 13, 0));
+    var result = base;
+    result.peak.host_weight_bytes = std.math.add(usize, result.peak.host_weight_bytes, peak) catch return error.ResourceLimitExceeded;
+    if (backend == .metal) result.resident.host_weight_bytes = std.math.add(usize, result.resident.host_weight_bytes, weights) catch return error.ResourceLimitExceeded;
+    return result;
+}
+
+const safetensors_format = @import("safetensors.zig");
+
+/// Every represented tensor must be dense F32 and have a complete checked
+/// extent. Unknown/mixed formats keep the existing conservative load plan.
+/// This does not read or materialize a numerical tensor payload.
+fn strictF32DeviceBytes(header: *const safetensors_format.Header, data_offset: u64, file_bytes: usize) !?usize {
+    if (header.tensors.count() == 0 or data_offset % @alignOf(f32) != 0) return null;
+    var bytes: usize = 0;
+    var it = header.tensors.iterator();
+    while (it.next()) |entry| {
+        const tensor = entry.value_ptr;
+        if (tensor.dtype != .f32 or tensor.data_start % @alignOf(f32) != 0) return null;
+        var elements: usize = 1;
+        for (tensor.shape) |dimension| {
+            if (dimension < 0) return error.InvalidSafetensorsWeightExtent;
+            const size = std.math.cast(usize, dimension) orelse return error.ResourceLimitExceeded;
+            if (size == 0) return null;
+            elements = std.math.mul(usize, elements, size) catch return error.ResourceLimitExceeded;
+        }
+        const extent = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+        if (tensor.data_end < tensor.data_start or tensor.data_end - tensor.data_start != extent) return error.InvalidSafetensorsWeightExtent;
+        const end = std.math.add(u64, data_offset, tensor.data_end) catch return error.ResourceLimitExceeded;
+        if (end > file_bytes) return error.InvalidSafetensorsWeightExtent;
+        bytes = std.math.add(usize, bytes, extent) catch return error.ResourceLimitExceeded;
+    }
+    // Same finite metadata/alignment margin as the retained eager inventory.
+    const padded = std.math.add(usize, bytes, @max(bytes / 16, 64 * 1024 * 1024)) catch return error.ResourceLimitExceeded;
+    return padded;
+}
+
+/// Strict dense upload policy is established from the parsed architecture,
+/// not a repository/model name or artifact-size fingerprint. Optional packed,
+/// quantized, LoRA, sharded and companion layouts retain their old bound.
+fn strictDenseF32CudaLoadPlan(man: manifest_mod.ModelManifest, encoded: usize, packed_weights: bool) !?ModelLoadAdmissionPlan {
+    if (packed_weights or man.nativeWeightArtifactKind() != .safetensors or man.nativeCompanion() != .none) return null;
+    const span = man.gliner_span_declared and man.gliner_architecture == .span and man.gliner_span_encoder_family == .modern_bert;
+    if (!man.laya_declared and !span) return null;
+    const nested = if (span) try std.fs.path.join(man.allocator, &.{ std.fs.path.dirname(man.safetensors_path.?) orelse return null, "encoder_config/config.json" }) else null;
+    defer if (nested) |path| man.allocator.free(path);
+    const config_path = nested orelse man.config_path orelse return null;
+    var config_source = try c_file.MmapRegion.initLimited(man.allocator, config_path, 16 * 1024 * 1024);
+    defer config_source.deinit();
+    if (span) {
+        const expected = man.gliner_span_encoder_digest orelse return null;
+        if (!std.meta.eql(expected, @import("gliner_boundary_bundle.zig").Digest.of(config_source.data))) return error.ModelArtifactsChanging;
+    }
+    const cfg = @import("../architectures/modern_bert_config.zig").parseConfig(man.allocator, config_source.data) catch return null;
+    if (cfg.lora_rank != 0) return null;
+    if (cfg.laya) |decision| {
+        if ((try decision.effectiveWeightQuantization()) != .none or decision.packing.enabled()) return null;
+    } else if (!span) return null;
+    const cuda_weights = @import("cuda_weights.zig");
+    const architecture: @import("../architectures/model_definition.zig").ArchConfig = if (span) .{ .gliner_modern_bert = cfg } else .{ .modern_bert = cfg };
+    const profile = cuda_weights.cudaProfileForArch(architecture, if (span) .extractor else .classifier, &man) orelse return null;
+    // These actual uploader profiles prohibit packed expansion of dense source
+    // tensors. Explicit F16/BF16 encoder uploads only reduce this F32 bound.
+    if (!cuda_weights.strictF32UploadForProfile(profile, &man)) return null;
+    var source = safetensors_format.MMapReader.openFileAbsoluteLimited(man.allocator, man.safetensors_path.?, encoded, 8 * 1024 * 1024) catch |err| switch (err) {
+        error.HeaderTooLarge => return null,
+        else => return err,
+    };
+    defer source.deinit();
+    const device = (try strictF32DeviceBytes(&source.header, source.data_offset, source.file_bytes.len)) orelse return null;
+    // Import/repacking staging remains charged; this removes only speculative
+    // F16/quantized expansion from a proved unchanged-F32 device representation.
+    const host = std.math.add(usize, encoded, encoded / 4) catch return error.ResourceLimitExceeded;
+    return .{ .peak = .{ .host_weight_bytes = host, .backend_weight_bytes = device }, .resident = .{ .backend_weight_bytes = device } };
+}
+
+pub fn estimateBaseModelLoadAdmission(
+    model_path: []const u8,
+    man: manifest_mod.ModelManifest,
+    backend_runtime: backends.BackendRuntime,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    laya_packed: bool,
+) !ModelLoadAdmissionPlan {
+    const weights = try estimateModelArtifactBytes(man);
+    if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
+    if (backend_runtime.backend == .metal) {
+        if (!laya_packed) {
+            if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
+                return .{ .peak = resident.peak, .resident = resident.resident };
+            }
+        }
+        if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
+            return .{ .peak = resident.peak, .resident = resident.resident };
+        }
+    }
+    if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
+        const config = if (backend_runtime.backend == .cuda)
+            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                man.allocator,
+                model_path,
+                man,
+                a4b_request,
+            )
+        else
+            try session_factory.resolveA4bInferenceConfigForModelListing(
+                man.allocator,
+                model_path,
+                man,
+                a4b_request,
+            );
+        if (config) |resolved| {
+            return a4bGpuModelLoadAdmission(resolved, weights, backend_runtime.backend);
+        }
+    }
+    const extra_backend_resident = if (backend_runtime.backend == .metal)
+        session_factory.metalDebertaFastPathAdmissionAmounts(man)
+    else
+        runtime.tier.memory.AdmissionAmounts{};
+    if (backend_runtime.backend == .cuda) if (try strictDenseF32CudaLoadPlan(man, weights, laya_packed)) |precise| return precise;
+    var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    if (backend_runtime.backend == .metal) {
+        const host_source_bytes = metalQualifiedSpecialtyF32HostSourceBytes(man, weights);
+        try addMetalResidentHostSource(&plan, host_source_bytes);
+    }
+    return plan;
+}
+
+test "strict F32 CUDA footprint authenticates every dtype extent and checked dimension" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}",
+        "{\"w\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}",
+        "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,12]}}",
+        "{\"w\":{\"dtype\":\"F32\",\"shape\":[9223372036854775807,9223372036854775807],\"data_offsets\":[0,16]}}",
+    };
+    for (cases, 0..) |json, index| {
+        const padded_header = std.mem.alignForward(usize, json.len, 8);
+        const raw = try a.alloc(u8, 8 + padded_header);
+        defer a.free(raw);
+        std.mem.writeInt(u64, raw[0..8], padded_header, .little);
+        @memset(raw[8..], ' ');
+        @memcpy(raw[8..][0..json.len], json);
+        var parsed = try safetensors_format.parseHeader(a, raw);
+        defer parsed.header.deinit();
+        switch (index) {
+            0 => {
+                try std.testing.expectEqual(@as(?usize, 64 * 1024 * 1024 + 16), try strictF32DeviceBytes(&parsed.header, parsed.data_offset, raw.len + 16));
+                try std.testing.expectError(error.InvalidSafetensorsWeightExtent, strictF32DeviceBytes(&parsed.header, parsed.data_offset, raw.len + 15));
+            },
+            1 => try std.testing.expectEqual(@as(?usize, null), try strictF32DeviceBytes(&parsed.header, parsed.data_offset, raw.len + 8)),
+            2 => try std.testing.expectError(error.InvalidSafetensorsWeightExtent, strictF32DeviceBytes(&parsed.header, parsed.data_offset, raw.len + 16)),
+            3 => try std.testing.expectError(error.ResourceLimitExceeded, strictF32DeviceBytes(&parsed.header, parsed.data_offset, std.math.maxInt(usize))),
+            else => unreachable,
+        }
+    }
+}
+
+test "strict F32 load plan uses parsed dense span upload policy and preserves unknown representation fallback" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "encoder_config");
+    const config = "{\"model_type\":\"modernbert\",\"hidden_size\":64,\"intermediate_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"max_position_embeddings\":64}";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder_config/config.json", .data = config });
+    const json = "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}";
+    const header_bytes = std.mem.alignForward(usize, json.len, 8);
+    const raw = try a.alloc(u8, 8 + header_bytes + 16);
+    defer a.free(raw);
+    @memset(raw, 0);
+    std.mem.writeInt(u64, raw[0..8], header_bytes, .little);
+    @memset(raw[8..][0..header_bytes], ' ');
+    @memcpy(raw[8..][0..json.len], json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = raw });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model.safetensors" });
+    defer a.free(path);
+    var man = manifest_mod.ModelManifest{ .allocator = a, .safetensors_path = path, .gliner_span_declared = true, .gliner_architecture = .span, .gliner_span_encoder_family = .modern_bert, .gliner_span_encoder_digest = @import("gliner_boundary_bundle.zig").Digest.of(config) };
+    const plan = (try strictDenseF32CudaLoadPlan(man, raw.len, false)).?;
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024 + 16), plan.peak.backend_weight_bytes);
+    try std.testing.expectEqual(raw.len + raw.len / 4, plan.peak.host_weight_bytes);
+    try std.testing.expectEqual(plan.peak.backend_weight_bytes, plan.resident.backend_weight_bytes);
+    try std.testing.expectEqual(@as(?ModelLoadAdmissionPlan, null), try strictDenseF32CudaLoadPlan(man, raw.len, true));
+    man.gliner_span_encoder_family = .unknown;
+    try std.testing.expectEqual(@as(?ModelLoadAdmissionPlan, null), try strictDenseF32CudaLoadPlan(man, raw.len, false));
+    man.gliner_span_encoder_family = .modern_bert;
+    man.gliner_span_encoder_digest.?.size_bytes += 1;
+    try std.testing.expectError(error.ModelArtifactsChanging, strictDenseF32CudaLoadPlan(man, raw.len, false));
+}

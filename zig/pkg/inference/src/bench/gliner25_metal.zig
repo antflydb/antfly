@@ -189,7 +189,7 @@ fn verifyIdentity(identity: bundle.Identity, fixture: Fixture) !void {
 }
 
 fn checkBackend(cb: *const inference.ops.ComputeBackend) !void {
-    if (cb.kind() != .metal or !cb.decoderRuntimeReady() or cb.vtable.glinerBoundaryDevice == null or cb.vtable.glinerBoundaryDownload == null)
+    if (cb.kind() != .metal or !cb.decoderRuntimeReady() or cb.vtable.regions.relative_boundary.device == null or cb.vtable.regions.relative_boundary.download == null)
         return error.BenchmarkMetalBackendUnavailable;
     if (cb.decoderRuntimeHasActiveFrame()) return error.BenchmarkExternalMetalFrame;
     try cb.checkExecutionControl();

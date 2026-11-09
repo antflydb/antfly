@@ -1,0 +1,120 @@
+{
+  "source": "Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca tokenizer_config.json chat_template",
+  "template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "oracle": "Jinja2 3.1.6; trim_blocks=true lstrip_blocks=true",
+  "cases": [
+    {
+      "id": "disabled",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2 + 2? Reply with only the number."
+        }
+      ],
+      "add_generation_prompt": true,
+      "enable_thinking": false,
+      "expected": "<|im_start|>user\nWhat is 2 + 2? Reply with only the number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "id": "default",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "add_generation_prompt": true,
+      "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "history",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nold\n</think>\n\nB"
+        },
+        {
+          "role": "user",
+          "content": "C"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nnew\n</think>\n\nD"
+        }
+      ],
+      "add_generation_prompt": false,
+      "expected": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n<think>\nnew\n</think>\n\nD<|im_end|>\n"
+    },
+    {
+      "id": "tool-response",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<tool_response>wrapped</tool_response>"
+        },
+        {
+          "role": "assistant",
+          "content": "Ready",
+          "tool_calls": [
+            {
+              "function": {
+                "name": "lookup",
+                "arguments": {
+                  "city": "Paris"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "result"
+        },
+        {
+          "role": "user",
+          "content": "continue"
+        }
+      ],
+      "add_generation_prompt": true,
+      "enable_thinking": false,
+      "expected": "<|im_start|>user\n<tool_response>wrapped</tool_response><|im_end|>\n<|im_start|>assistant\nReady\n<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nresult\n</tool_response><|im_end|>\n<|im_start|>user\ncontinue<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
+  ],
+  "operations": [
+    {
+      "source": "{{ values|tojson }}",
+      "values": {
+        "z": [
+          "<>&'東京🙂",
+          true,
+          null,
+          2.5
+        ],
+        "a": [
+          1.0,
+          -0.0,
+          0.5,
+          0.0001,
+          1e-05,
+          1000000000000000.0,
+          1e+16,
+          1.2345678901234567e+30,
+          5e-324
+        ]
+      },
+      "expected": "{\"a\": [1.0, -0.0, 0.5, 0.0001, 1e-05, 1000000000000000.0, 1e+16, 1.2345678901234567e+30, 5e-324], \"z\": [\"\\u003c\\u003e\\u0026\\u0027\\u6771\\u4eac\\ud83d\\ude42\", true, null, 2.5]}"
+    },
+    {
+      "source": "{{ '©'.rstrip('é') }}|{{ 'éabcé'.strip('é') }}|{{ '　abc '.strip() }}",
+      "expected": "©|abc|abc"
+    },
+    {
+      "source": "{{ true is true }}|{{ false is false }}|{{ 1 is true }}|{{ 0 is false }}|{{ none is not false }}",
+      "expected": "True|True|False|False|True"
+    }
+  ]
+}

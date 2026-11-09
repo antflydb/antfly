@@ -42,8 +42,8 @@ const Fake = struct {
         result.vtable.tensorDType = dtype;
         result.vtable.residentTrainingPrimitive = primitive;
         result.vtable.residentTrainingInstruction = instruction;
-        result.vtable.glinerBoundaryDownload = download;
-        result.vtable.glinerBoundaryScope = null;
+        result.vtable.regions.relative_boundary.download = download;
+        result.vtable.regions.relative_boundary.scope = null;
         return result;
     }
     fn cb(self: *Fake) ops.ComputeBackend {

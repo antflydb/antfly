@@ -644,22 +644,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .gpu
         else
             .cpu;
-    var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
-    budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    if (draft_model) |loaded| {
-        budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, budget_limits);
-    }
-    budget_limits = try applyBudgetOverrides(budget_limits, opts);
+    var automatic_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
+    var budget_sessions: [2]backends.Session = undefined;
+    budget_sessions[0] = model.session;
+    var budget_session_count: usize = 1;
     if (draft_model) |loaded| {
         const draft_budget_backend_class: runtime.tier.memory.BackendClass = switch (draft_backend_kind.?) {
             .native => .cpu,
             else => .gpu,
         };
-        var draft_budget_limits = runtime.tier.memory.defaultLimitsForBackend(draft_budget_backend_class);
-        draft_budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, draft_budget_limits);
-        draft_budget_limits = try applyBudgetOverrides(draft_budget_limits, opts);
-        budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
+        automatic_limits = runtime.tier.memory.maxCompositeLimits(automatic_limits, runtime.tier.memory.defaultLimitsForBackend(draft_budget_backend_class));
+        budget_sessions[1] = loaded.session;
+        budget_session_count = 2;
     }
+    const budget_limits = try session_factory.resolveBudgetLimitsForSessions(budget_sessions[0..budget_session_count], automatic_limits, try budgetOverrideLimits(opts));
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     print("budget: host={d}MiB backend={d}MiB combined={d}MiB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
@@ -845,11 +843,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
+    const VisionPublication = if (build_options.enable_cuda) @import("execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else struct {};
+    var vision_publication: ?VisionPublication = null;
+    defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
+    if (comptime build_options.enable_cuda) if (generation_resources.resources) |*primary| {
+        const publication_bytes = if (backend_kind == .cuda and draft_model == null and config.qwen3vl_parity_json_path == null) generation.nativeCudaVisionPublicationBytes(allocator, opts.model_dir, gpt_config, &messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
+        vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, .{});
+    };
+    var publication_cleanup: ?@import("execution/cleanup_owner.zig").Owner = if (vision_publication != null) try @import("execution/cleanup_owner.zig").Owner.beginAdmitted(model.session) else null;
+    defer if (publication_cleanup) |*owner| owner.finishAfterUnlock();
+
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
 
     debugGenerateSetup("compute backend begin", .{});
-    var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
+    var cb = (if (publication_cleanup) |*owner|
+        @import("execution/architecture_session.zig").getComputeBackendWithBudgetAndCleanup(model.session, allocator, &run_budget, .{ .boundary = owner.epoch() })
+    else
+        session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget)) catch |err| {
         debugGenerateSetup("compute backend failed err={s}", .{@errorName(err)});
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
@@ -858,7 +869,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     debugGenerateSetup("compute backend done", .{});
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
-    defer cb.deinit();
+    defer if (publication_cleanup) |*owner| cb.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = cb.operationToken() }) else cb.deinit();
     if (opts.debug_gemma4_target) {
         try printGemma4TargetDebug(&cb, tokenizer, model.manifest, gpt_config, prompt_encoded.ids[0..prompt_tokens]);
     }
@@ -935,7 +946,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (compiled_attachment_target != .whole_model or draft_model != null or opts.video_path != null or opts.image_count != 0 or opts.audio_count != 0) return error.UnsupportedPjrtFeature;
     }
 
+    defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.finish(.{ .boundary = if (publication_cleanup) |*owner| owner.epoch() else null, .operation = cb.operationToken() });
     var pipeline = generation.NativeGenerationPipeline{
+        .vision_publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null,
+        .execution_cleanup_owner = if (publication_cleanup) |*owner| owner else null,
         .allocator = allocator,
         .io = io,
         .cb = cb,
@@ -961,6 +975,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
         .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
         .draft_cb = if (draft_cb) |draft_backend| draft_backend else null,
+        .draft_diagnostics_binding = if (draft_model) |loaded| loaded.session.invocation_diagnostics else null,
         .draft_gpt_config = draft_gpt_config,
         .draft_decode_state = if (draft_decode_state) |*state| state else null,
         .graph_cache = if (graph_mode) &graph_cache else null,
@@ -8044,7 +8059,7 @@ fn acquireCliGenerationResources(
                 .resources = .{
                     .backend_class = if (component.backend == .native) .cpu else .gpu,
                     .limits = limits,
-                    .amounts = memory.AdmissionAmounts.fromEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*)),
+                    .amounts = try memory.AdmissionAmounts.fromEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*)),
                 },
             };
         }
@@ -8350,6 +8365,10 @@ fn printUsage() void {
         \\  Profile capture auto-selects shadow unless a conflicting mode is explicit. Target and draft profiles are model-bound and separate.
         \\
     , .{});
+}
+
+fn budgetOverrideLimits(opts: Options) !runtime.tier.memory.Limits {
+    return budgetOverrides(opts).toByteLimits();
 }
 
 fn budgetOverrides(opts: Options) runtime.tier.memory.BudgetOverridesMib {
@@ -9491,6 +9510,24 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
     try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
 }
 
+test "native generation raw budget overrides preserve omitted composite and scratch provenance" {
+    const mib = runtime.tier.memory.bytes_per_mib;
+    var opts: Options = .{ .model_dir = "unused", .prompt = "unused", .host_budget_mb = 3 };
+    const raw = try budgetOverrideLimits(opts);
+    try std.testing.expectEqual(@as(usize, 3 * mib), raw.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), raw.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), raw.scratch_limit_bytes);
+    const applied = try applyBudgetOverrides(.{ .backend_limit_bytes = 7 * mib }, opts);
+    try std.testing.expectEqual(@as(usize, 10 * mib), applied.combined_limit_bytes);
+    opts.combined_budget_mb = 4;
+    opts.scratch_budget_mb = 2;
+    const explicit = try budgetOverrideLimits(opts);
+    try std.testing.expectEqual(@as(usize, 4 * mib), explicit.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 2 * mib), explicit.scratch_limit_bytes);
+    opts.host_budget_mb = std.math.maxInt(usize);
+    try std.testing.expectError(error.Overflow, budgetOverrideLimits(opts));
+}
+
 test "native generate artifact tokenizer admission rejects oversized parse before lookup" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9536,8 +9573,8 @@ test "native generate admits target draft transients beside residency and shrink
         .intermediate_size = 256,
         .vocab_size = 1024,
     };
-    const small = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
-    const large = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
+    const small = try memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
+    const large = try memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
     const resident_bytes = 4 * large.hostTotalBytes();
     const limits = memory.Limits{ .host_limit_bytes = resident_bytes + 2 * small.hostTotalBytes(), .combined_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() };
     var resources = try model_manager_mod.ModelManager.SharedResources.init(a, limits);

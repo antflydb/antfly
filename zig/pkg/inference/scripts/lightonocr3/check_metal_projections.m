@@ -4312,8 +4312,76 @@ static int frame_staging_lifetime_check(void) {
     return 0;
 }
 
+// A failed constructor owns only a prefix of the runtime's resources.
+// calloc storage needs explicit ARC retirement even when no frame was begun.
+static int partial_runtime_ownership_check(void) {
+    __weak id witness = nil;
+    @autoreleasepool {
+        termite_metal_decode_runtime *runtime = calloc(1, sizeof(*runtime));
+        if (runtime == NULL) return 1;
+        termite_metal_jit_exact_dispatch_stats_init(runtime);
+        termite_metal_paged_kv_slot_leases_init(runtime);
+        id pipeline = [NSObject new];
+        witness = pipeline;
+        runtime->q3_k_pipeline = pipeline;
+        runtime->optional_dummy_buffer = [NSObject new];
+        termite_metal_decode_runtime_destroy(runtime);
+    }
+    if (witness != nil) {
+        fprintf(stderr, "partial runtime retained an ARC-owned pipeline\n");
+        return 1;
+    }
+    return 0;
+}
+
+// Exercise the real constructor and every catalog admission bit. Required
+// pipelines retain their failure policy even when no quant family is requested.
+static int pipeline_preparation_check(void) {
+    if (termite_metal_pipeline_preparation_has_override()) {
+        fprintf(stderr, "pipeline preparation check requires a clean kernel environment\n");
+        return 1;
+    }
+    const uint16_t q8 = ANTFLY_METAL_FAMILY_Q8_0;
+    size_t expected = 0;
+    for (size_t i = 0; i < ANTFLY_METAL_PIPELINE_COUNT; ++i) {
+        const uint16_t family = termite_metal_pipeline_bindings[i].format_mask;
+        for (unsigned bit = 0; bit < 12; ++bit) {
+            const uint16_t formats = 1u << bit;
+            const BOOL want = termite_metal_pipeline_required[i] || family == 0 || (family & formats) != 0;
+            if (termite_metal_prepare_catalog_entry(i, formats) != want ||
+                !termite_metal_prepare_catalog_entry(i, UINT16_MAX)) return 2;
+        }
+        expected += termite_metal_prepare_catalog_entry(i, q8);
+    }
+    termite_metal_decode_runtime *selected = termite_metal_decode_runtime_create_for_quant_formats(q8);
+    if (selected == NULL || selected->pipeline_quant_formats != q8) return 3;
+    for (size_t i = 0; i < ANTFLY_METAL_PIPELINE_COUNT; ++i) {
+        id<MTLComputePipelineState> pipeline = *termite_metal_catalog_slot(selected, i);
+        if ((!termite_metal_prepare_catalog_entry(i, q8) && pipeline != nil) ||
+            (termite_metal_pipeline_required[i] && pipeline == nil)) return 4;
+    }
+    termite_metal_decode_runtime *legacy = termite_metal_decode_runtime_create();
+    if (legacy == NULL || legacy->pipeline_quant_formats != UINT16_MAX) return 5;
+    for (size_t i = 0; i < ANTFLY_METAL_PIPELINE_COUNT; ++i) {
+        if (termite_metal_prepare_catalog_entry(i, q8) &&
+            *termite_metal_catalog_slot(selected, i) != *termite_metal_catalog_slot(legacy, i)) return 6;
+    }
+    setenv("TERMITE_METAL_PREPARATION_TEST_OVERRIDE", "1", 1);
+    termite_metal_decode_runtime *override = termite_metal_decode_runtime_create_for_quant_formats(q8);
+    unsetenv("TERMITE_METAL_PREPARATION_TEST_OVERRIDE");
+    if (override == NULL || override->pipeline_quant_formats != UINT16_MAX) return 7;
+    termite_metal_decode_runtime_destroy(override);
+    termite_metal_decode_runtime_destroy(legacy);
+    termite_metal_decode_runtime_destroy(selected);
+    fprintf(stderr, "pipeline preparation: Q8_0 selects %zu/%u catalog slots; required policy, cached identity, live override passed\n", expected, ANTFLY_METAL_PIPELINE_COUNT);
+    return 0;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (partial_runtime_ownership_check() != 0) return 1;
+        if (argc == 2 && strcmp(argv[1], "--check-pipeline-preparation") == 0) return pipeline_preparation_check();
+        if (argc == 2 && strcmp(argv[1], "--check-partial-runtime-ownership") == 0) return 0;
         if (argc == 2 && strcmp(argv[1], "--check-device-policy") == 0) return device_policy_check();
         if (argc == 2 && strcmp(argv[1], "--check-frame-staging-lifetime") == 0) return frame_staging_lifetime_check();
         termite_metal_decode_runtime *r = termite_metal_decode_runtime_create();

@@ -609,6 +609,42 @@ pub const BicubicAxis = struct {
     }
 };
 
+/// Exact metadata for the SAME coefficient builder, before payload allocation.
+/// Temporary f64 coefficients are accounted separately from retained planes.
+pub const PillowBicubicAxisPlan = struct {
+    source_size: usize,
+    target_size: usize,
+    taps: usize,
+    retained_bytes: usize,
+    temporary_bytes: usize,
+};
+const PillowTapRange = struct { first: usize, last: usize, center: f64, filter_scale: f64 };
+fn pillowTapRange(source_size: usize, target_size: usize, target: usize) !PillowTapRange {
+    if (source_size == 0 or target_size == 0 or source_size > std.math.maxInt(isize) or target >= target_size) return error.InvalidImageDimensions;
+    const scale = @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(target_size));
+    const filter_scale = @max(scale, 1.0);
+    const support = 2.0 * filter_scale;
+    const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
+    const first_value = center - support + 0.5;
+    const last_value = center + support + 0.5;
+    const source_float = @as(f64, @floatFromInt(source_size));
+    const first = if (first_value <= 0) @as(usize, 0) else if (first_value >= source_float) source_size else @as(usize, @intFromFloat(first_value));
+    const last = if (last_value <= 0) @as(usize, 0) else if (last_value >= source_float) source_size else @as(usize, @intFromFloat(last_value));
+    if (last <= first) return error.InvalidImageDimensions;
+    return .{ .first = first, .last = last, .center = center, .filter_scale = filter_scale };
+}
+pub fn planPillowBicubicAxis(source_size: usize, target_size: usize) !PillowBicubicAxisPlan {
+    if (source_size == 0 or target_size == 0) return error.InvalidImageDimensions;
+    const indices = try std.math.add(usize, target_size, try std.math.add(usize, target_size, 1));
+    _ = try std.math.mul(usize, indices, @sizeOf(usize));
+    var taps: usize = 0;
+    for (0..target_size) |target| {
+        const range = try pillowTapRange(source_size, target_size, target);
+        taps = try std.math.add(usize, taps, range.last - range.first);
+    }
+    return .{ .source_size = source_size, .target_size = target_size, .taps = taps, .retained_bytes = try std.math.add(usize, try std.math.mul(usize, indices, @sizeOf(usize)), try std.math.mul(usize, taps, @sizeOf(i32))), .temporary_bytes = try std.math.mul(usize, taps, @sizeOf(f64)) };
+}
+
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
@@ -618,64 +654,58 @@ pub fn buildPillowBicubicAxis(
     target_size: usize,
     torchvision: bool,
 ) !BicubicAxis {
-    if (source_size == 0 or target_size == 0) return error.InvalidImageDimensions;
+    const plan = try planPillowBicubicAxis(source_size, target_size);
     const starts = try allocator.alloc(usize, target_size);
     errdefer allocator.free(starts);
     const offsets = try allocator.alloc(usize, target_size + 1);
     errdefer allocator.free(offsets);
-    var float_weights = std.ArrayListUnmanaged(f64).empty;
-    defer float_weights.deinit(allocator);
-    var weights = std.ArrayListUnmanaged(i32).empty;
-    errdefer weights.deinit(allocator);
-
-    const scale = @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(target_size));
-    const filter_scale = @max(scale, 1.0);
-    const support = 2.0 * filter_scale;
+    const float_weights = try allocator.alloc(f64, plan.taps);
+    defer allocator.free(float_weights);
+    const weights = try allocator.alloc(i32, plan.taps);
+    errdefer allocator.free(weights);
+    var used: usize = 0;
     for (0..target_size) |target| {
         if (target & 63 == 0) try @import("image_work_control").check();
-        const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
-        var first: isize = @intFromFloat(center - support + 0.5);
-        var last: isize = @intFromFloat(center + support + 0.5);
-        first = @max(first, 0);
-        last = @min(last, @as(isize, @intCast(source_size)));
-        if (last <= first) return error.InvalidImageDimensions;
-        starts[target] = @intCast(first);
-        offsets[target] = float_weights.items.len;
-        const float_start = float_weights.items.len;
+        const range = try pillowTapRange(source_size, target_size, target);
+        starts[target] = range.first;
+        offsets[target] = used;
+        const float_start = used;
         var total: f64 = 0.0;
-        var source = first;
-        while (source < last) : (source += 1) {
-            const distance = (@as(f64, @floatFromInt(source)) - center + 0.5) / filter_scale;
+        var source = range.first;
+        while (source < range.last) : (source += 1) {
+            const distance = (@as(f64, @floatFromInt(source)) - range.center + 0.5) / range.filter_scale;
             const weight = cubicWeightF64(distance);
-            try float_weights.append(allocator, weight);
+            float_weights[used] = weight;
+            used += 1;
             total += weight;
         }
         if (total == 0.0 or !std.math.isFinite(total)) return error.InvalidImageDimensions;
-        for (float_weights.items[float_start..]) |*weight| weight.* /= total;
+        for (float_weights[float_start..used]) |*weight| weight.* /= total;
     }
-    offsets[target_size] = float_weights.items.len;
+    std.debug.assert(used == plan.taps);
+    offsets[target_size] = used;
     var precision: u6 = pillow_precision_bits;
     if (torchvision) {
         // PyTorch 2.10 UpSampleKernel.cpp compute_index_ranges_int16_weights:
         // select the largest fixed-point scale whose coefficients fit int16.
         var maximum: f64 = 0;
-        for (float_weights.items) |weight| maximum = @max(maximum, weight);
+        for (float_weights) |weight| maximum = @max(maximum, weight);
         precision = 0;
         while (precision < 22) : (precision += 1) {
             const next: i64 = @intFromFloat(0.5 + maximum * @as(f64, @floatFromInt(@as(u64, 1) << (precision + 1))));
             if (next >= 1 << 15) break;
         }
     }
-    for (float_weights.items) |weight| {
+    for (float_weights, weights) |weight, *out| {
         const scaled = weight * @as(f64, @floatFromInt(@as(u64, 1) << precision));
         const rounded = if (scaled < 0.0) scaled - 0.5 else scaled + 0.5;
-        try weights.append(allocator, @intFromFloat(rounded));
+        out.* = @intFromFloat(rounded);
     }
     return .{
         .allocator = allocator,
         .starts = starts,
         .offsets = offsets,
-        .weights = try weights.toOwnedSlice(allocator),
+        .weights = weights,
         .precision_bits = precision,
     };
 }
@@ -1194,4 +1224,19 @@ test "Pillow horizontal unsafe coefficients retain wide scalar accumulation" {
     try pillowHorizontal(image, axis, &vector, 1, true);
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, &scalar);
     try std.testing.expectEqualSlices(u8, &scalar, &vector);
+}
+
+test "Pillow bicubic cold geometry accounts exact retained and temporary coefficient payloads" {
+    inline for (.{ .{ 7, 13 }, .{ 100, 48 }, .{ 4096, 96 }, .{ 48, 48 } }) |shape| {
+        const plan = try planPillowBicubicAxis(shape[0], shape[1]);
+        inline for (.{ false, true }) |torchvision| {
+            var axis = try buildPillowBicubicAxis(std.testing.allocator, shape[0], shape[1], torchvision);
+            defer axis.deinit();
+            try std.testing.expectEqual(plan.taps, axis.weights.len);
+            try std.testing.expectEqual(plan.retained_bytes, axis.starts.len * @sizeOf(usize) + axis.offsets.len * @sizeOf(usize) + axis.weights.len * @sizeOf(i32));
+            try std.testing.expectEqual(plan.taps * @sizeOf(f64), plan.temporary_bytes);
+        }
+    }
+    try std.testing.expectError(error.InvalidImageDimensions, planPillowBicubicAxis(0, 1));
+    try std.testing.expectError(error.InvalidImageDimensions, planPillowBicubicAxis(1, 0));
 }

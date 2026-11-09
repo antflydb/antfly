@@ -164,23 +164,40 @@ function blankComments(src: string): string {
     .replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
 }
 
+/** Source owners may nest within one generator, never across generators. */
+export function generatedRegionSpans(source: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const stack: Array<{ owner: string; start: number }> = [];
+  for (const marker of source.matchAll(/^[ \t]*\/\/ (quant-kernel-codegen|tile-codegen):(begin|end)\b[^\n]*/gm)) {
+    const owner = marker[1];
+    if (marker[2] === "begin") {
+      if (stack.length && stack.at(-1)!.owner !== owner) throw new Error("overlapping generator owners");
+      stack.push({ owner, start: marker.index });
+    } else {
+      const open = stack.pop();
+      if (!open || open.owner !== owner) throw new Error("unpaired generator markers");
+      if (!stack.length) spans.push([open.start, marker.index]);
+    }
+  }
+  if (stack.length) throw new Error("unclosed generator region");
+  return spans;
+}
+
 /** Scan metal_kernels.m + generated/*.metal for `kernel void <name>`. */
 export function extractKernelInventory(): KernelInventoryEntry[] {
   const seen = new Map<string, KernelInventoryEntry>();
 
   const mContent = readRepoFile(KERNELS_M);
-  // Markers live inside comments, so locate them on the raw text; match
-  // kernel declarations on the comment-blanked text (same offsets).
-  const beginMarker = mContent.indexOf("quant-kernel-codegen:begin generated quant kernels");
-  const endMarker = mContent.indexOf("quant-kernel-codegen:end generated quant kernels");
-  if (beginMarker >= 0 !== endMarker >= 0 || (beginMarker >= 0 && endMarker < beginMarker)) {
-    throw new Error(`unpaired quant-kernel-codegen markers in ${KERNELS_M}`);
-  }
-  const kernelRe = /kernel void ([a-zA-Z0-9_]+)/g;
+  const regions = generatedRegionSpans(mContent);
+  // Plain kernels, plus template instances (`template [[host_name("x")]]
+  // kernel ...`); a templated definition is not itself a host function.
+  const kernelRe =
+    /(template\s*<[^>]*>\\n"\s*")?kernel void ([a-zA-Z0-9_]+)|host_name\(\\"([a-zA-Z0-9_]+)\\"\)|(?:TERMITE_MSL_ABI_[A-Z0-9_]+\(|ANTFLY_PAGED_KV_SEED\([^,]+,\s*)(termite_[a-zA-Z0-9_]+|antfly_[a-zA-Z0-9_]+)\)/g;
   for (const m of blankComments(mContent).matchAll(kernelRe)) {
-    const name = m[1];
+    if (m[1]) continue;
+    const name = m[2] ?? m[3] ?? m[4];
     if (seen.has(name)) continue;
-    const inGenerated = beginMarker >= 0 && m.index > beginMarker && m.index < endMarker;
+    const inGenerated = regions.some(([start, end]) => m.index > start && m.index < end);
     seen.set(name, {
       name,
       family: classifyKernel(name),

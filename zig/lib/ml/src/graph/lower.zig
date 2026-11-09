@@ -51,7 +51,17 @@ pub const LowerResult = struct {
 /// fused ops are replaced by their primitive equivalents.
 ///
 /// The returned id_map translates old node IDs to new node IDs.
+pub const Options = struct {
+    /// Native execution and autodiff preserve their qualified activation
+    /// kernels. Portable frontends may request the canonical decomposition.
+    preserve_activation_kernels: bool = true,
+};
+
 pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
+    return lowerWithOptions(allocator, graph, .{});
+}
+
+pub fn lowerWithOptions(allocator: std.mem.Allocator, graph: *const Graph, options: Options) !LowerResult {
     const count = graph.nodeCount();
 
     // Step 1: Build a "redirect" map. For each fused node with vjp_alternate,
@@ -66,7 +76,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         if (n.num_inputs > n.inputs.len) return error.InvalidGraphDependency;
         for (n.getInputs()) |input| if (input != null_node and input >= count) return error.InvalidGraphDependency;
         if (n.vjp_alternate != null_node and n.vjp_alternate >= count) return error.InvalidGraphDependency;
-        if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax) continue;
+        if (n.op == .fused_softmax or (options.preserve_activation_kernels and (n.op == .fused_gelu or n.op == .fused_gelu_exact))) continue;
         // Fused disentangled attention keeps its fused forward kernel and is
         // differentiated by a custom VJP rule (not vjp_alternate lowering).
         if (n.op == .fused_disentangled_attention or n.op == .fused_disentangled_attention_backward) continue;

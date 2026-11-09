@@ -26,10 +26,114 @@ const micro = @import("executor_microbatch.zig");
 pub const Dispatch = struct {
     ptr: *anyopaque,
     task: micro.Task,
+    run_resident_fn: ?*const fn (*anyopaque, micro.Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror!?session_mod.ResidentOutputs = null,
     run_fn: *const fn (*anyopaque, micro.Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror![]Tensor,
 
     pub fn run(self: Dispatch, allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control) ![]Tensor {
         return self.run_fn(self.ptr, self.task, allocator, session, permit, gate, inputs, control);
+    }
+    pub fn supportsResident(self: Dispatch) bool {
+        return self.run_resident_fn != null;
+    }
+
+    pub fn runResident(self: Dispatch, allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control) !?session_mod.ResidentOutputs {
+        const execute_resident = self.run_resident_fn orelse return null;
+        return execute_resident(self.ptr, self.task, allocator, session, permit, gate, inputs, control);
+    }
+};
+
+/// Invocation-local metadata. Physical outputs/provider/model/quota are shared
+/// by ResidentOutputs; row children own only their independently retained CTs.
+const ResidentBatch = struct {
+    operation_scope: @import("../execution/backend_operation.zig").Scope,
+    allocator: std.mem.Allocator,
+    outputs: *session_mod.ResidentOutputs,
+    columns: []Column,
+    total: usize,
+    const Column = struct { shape: []i64, flat: @import("../ops/ops.zig").CT, width: usize };
+
+    fn reshape(backend: *const @import("../ops/ops.zig").ComputeBackend, value: @import("../ops/ops.zig").CT, shape: []const i64) !@import("../ops/ops.zig").CT {
+        switch (backend.kind()) {
+            // Native's canonical reshape materializes logical strided views;
+            // CUDA preserves owning/physical storage with retained metadata.
+            .native, .cuda => return backend.primReshape(value, shape),
+            .metal => {
+                var dimensions: [8]i32 = undefined;
+                if (shape.len > dimensions.len) return error.UnsupportedResidentRowViews;
+                for (shape, 0..) |dim, i| dimensions[i] = std.math.cast(i32, dim) orelse return error.UnsupportedResidentRowViews;
+                // Never permit the general primitive's hidden host fallback.
+                return (try backend.cloneTensorShape(value, dimensions[0..shape.len])) orelse error.UnsupportedResidentRowViews;
+            },
+            else => return error.UnsupportedResidentRowViews,
+        }
+    }
+
+    fn init(allocator: std.mem.Allocator, outputs: *session_mod.ResidentOutputs, session: session_mod.Session, total: usize) !ResidentBatch {
+        if (total == 0 or outputs.outputs.len == 0 or outputs.outputs.len != session.outputInfo().len or outputs.backend.vtable.sliceRows2D == null) return error.InvalidFusedOutputShape;
+        var operation_scope: @import("../execution/backend_operation.zig").Scope = undefined;
+        try @import("../execution/backend_operation.zig").enterInto(outputs.backend, null, outputs.backend.operationToken(), .legacy_unknown_frame, &operation_scope);
+        errdefer operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        const columns = try allocator.alloc(Column, outputs.outputs.len);
+        var built: usize = 0;
+        errdefer {
+            for (columns[0..built]) |column| {
+                outputs.backend.free(column.flat);
+                allocator.free(column.shape);
+            }
+            allocator.free(columns);
+        }
+        for (outputs.outputs, session.outputInfo(), columns) |value, info, *column| {
+            if (info.dtype != .f32 or try outputs.backend.tensorDType(value) != .f32) return error.InvalidFusedOutputShape;
+            const shape = try outputs.backend.tensorShape(value, allocator);
+            errdefer allocator.free(shape);
+            if (shape.len == 0 or shape.len > 8 or shape[0] != total) return error.InvalidFusedOutputShape;
+            var width: usize = 1;
+            for (shape[1..]) |dim| {
+                if (dim <= 0) return error.InvalidFusedOutputShape;
+                width = std.math.mul(usize, width, std.math.cast(usize, dim) orelse return error.InvalidFusedOutputShape) catch return error.ResourceLimitExceeded;
+            }
+            if (session.vtable.independentBatchRows == null) {
+                if (info.shape.len != shape.len) return error.InvalidFusedOutputShape;
+                for (shape[1..], info.shape[1..]) |actual, declared| if (declared > 0 and actual != declared) return error.InvalidFusedOutputShape;
+            }
+            const flat = try reshape(outputs.backend, value, &.{ @intCast(total), std.math.cast(i64, width) orelse return error.ResourceLimitExceeded });
+            column.* = .{ .shape = shape, .flat = flat, .width = width };
+            built += 1;
+        }
+        return .{ .allocator = allocator, .outputs = outputs, .columns = columns, .total = total, .operation_scope = operation_scope };
+    }
+
+    fn deinit(self: *ResidentBatch) void {
+        // Flat/view CT metadata is retired under the SAME explicit provider
+        // scope as construction; no nested gate acquisition or network wait.
+        defer self.operation_scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        for (self.columns) |column| {
+            self.outputs.backend.free(column.flat);
+            self.allocator.free(column.shape);
+        }
+        self.allocator.free(self.columns);
+    }
+
+    fn rows(self: *ResidentBatch, start: usize, count: usize) !session_mod.ResidentOutputs {
+        if (start > self.total or count > self.total - start) return error.InvalidFusedOutputShape;
+        const cb = self.outputs.backend;
+        const views = try self.allocator.alloc(@import("../ops/ops.zig").CT, self.columns.len);
+        var built: usize = 0;
+        errdefer {
+            for (views[0..built]) |view| cb.free(view);
+            self.allocator.free(views);
+        }
+        for (self.columns, views) |column, *view| {
+            const slice = try cb.vtable.sliceRows2D.?(cb.ptr, column.flat, start, count, column.width);
+            defer cb.free(slice);
+            var shape: [8]i64 = undefined;
+            @memcpy(shape[0..column.shape.len], column.shape);
+            shape[0] = std.math.cast(i64, count) orelse return error.ResourceLimitExceeded;
+            view.* = try reshape(cb, slice, shape[0..column.shape.len]);
+            built += 1;
+        }
+        // Failure leaves the newly created CTs/vector owned by this function.
+        return self.outputs.ownViewsOf(self.allocator, views);
     }
 };
 
@@ -233,15 +337,41 @@ test "tensor microbatch explicit collection override preserves zero and bounded 
 }
 
 pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) ![]Tensor {
+    return runMode(.host, broker, allocator, io, task, session, permit, gate, inputs, control, deadline, wait_us);
+}
+
+pub fn runResident(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) !session_mod.ResidentOutputs {
+    return runMode(.resident, broker, allocator, io, task, session, permit, gate, inputs, control, deadline, wait_us);
+}
+
+const OutputPlacement = enum { host, resident };
+fn OutputType(comptime placement: OutputPlacement) type {
+    return if (placement == .host) []Tensor else session_mod.ResidentOutputs;
+}
+fn destroyMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator, value: OutputType(placement)) void {
+    if (comptime placement == .host) destroy(allocator, value) else {
+        var owned = value;
+        owned.deinit();
+    }
+}
+
+fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) !OutputType(placement) {
     if (control) |active| try active.check();
-    if (!eligible(session, inputs)) return direct(allocator, .{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = 1 });
+    // A resident result owns its execution lease. Keep a reusable supplied
+    // permit in yielded input-residency mode even on the direct path.
+    if (comptime placement == .resident) if (permit) |borrowed| {
+        if (!try borrowed.yieldExecution() and borrowed.lease != null) return error.MissingRunRequest;
+    };
+    if (!eligible(session, inputs)) return directMode(placement, allocator, .{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = 1 });
     const alloc = std.heap.smp_allocator;
     var signature = std.Io.Writer.Allocating.init(allocator);
     defer signature.deinit();
+    try signature.writer.print("{s};", .{@tagName(placement)});
     try signature.writer.print("{d}:{d};", .{ @intFromPtr(session.vtable), @intFromPtr(gate) });
     try std.json.Stringify.value(session.output_geometry, .{}, &signature.writer);
     try std.json.Stringify.value(session.cached_decoder_geometry, .{}, &signature.writer);
     try std.json.Stringify.value(session.broadcast_inputs, .{}, &signature.writer);
+    try std.json.Stringify.value(if (control) |active| active.native_call_policy else @import("../execution_control.zig").NativeCallPolicy.require_supervision, .{}, &signature.writer);
     // A fused native call must stay inside the same supervising boundary.
     // Never inherit just one caller's deadline/cancellation for its peers.
     if (control) |active| if (active.hard_cancellation) |boundary| {
@@ -269,9 +399,9 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
     if (max_items == 0 or max_rows == 0) return error.InvalidMicrobatchLimits;
     // Requests already larger than the coalescing window keep their existing
     // native batch. Do not turn a valid caller batch into a broker size error.
-    if (ticket.rows > max_rows or bytes > 64 * 1024 * 1024) return direct(allocator, ticket);
+    if (ticket.rows > max_rows or bytes > 64 * 1024 * 1024) return directMode(placement, allocator, ticket);
     if (permit) |borrowed| {
-        if (!try borrowed.yieldExecution()) return direct(allocator, ticket);
+        if (!try borrowed.yieldExecution()) return directMode(placement, allocator, ticket);
     }
     const Probe = struct {
         fn canceled(raw: *const anyopaque) bool {
@@ -280,16 +410,22 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
             return false;
         }
     };
-    const results = try broker.submitBatchControlled(Ticket, []Tensor, io, alloc, .{
+    const Executor = struct {
+        fn call(raw: *anyopaque, items: []const micro.ExecuteItem) void {
+            executeMode(placement, raw, items);
+        }
+    };
+    const results = try broker.submitBatchControlled(Ticket, OutputType(placement), io, alloc, .{
         .model = "tensor-forward",
         .generation = @intFromPtr(session.ptr),
         .task = task,
         .schema = signature.written(),
         .resource_class = if (session.backend().usesGpuHostedSession()) .gpu else .cpu,
-    }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = max_rows, .max_bytes = 64 * 1024 * 1024, .max_wait_us = collectionWaitUs(wait_us, policy.collection_wait_us) }, &.{.{ .bytes = bytes, .tokens = ticket.rows }}, &.{.{}}, deadline, if (control) |*active| .{ .ptr = active, .is_cancelled_fn = Probe.canceled } else .{}, &.{ticket}, broker, execute);
+    }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = max_rows, .max_bytes = 64 * 1024 * 1024, .max_wait_us = collectionWaitUs(wait_us, policy.collection_wait_us) }, &.{.{ .bytes = bytes, .tokens = ticket.rows }}, &.{.{}}, deadline, if (control) |*active| .{ .ptr = active, .is_cancelled_fn = Probe.canceled } else .{}, &.{ticket}, broker, Executor.call);
+    var owns_result = true;
     defer {
-        for (results) |result| switch (result.result) {
-            .value => |value| destroy(alloc, value),
+        if (owns_result) for (results) |result| switch (result.result) {
+            .value => |value| destroyMode(placement, alloc, value),
             .item_error => {},
         };
         alloc.free(results);
@@ -300,22 +436,77 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
             if (control) |active| try active.check();
             // Move tensor ownership after joining; only the small container
             // uses the caller allocator. No copies of encoder hidden states.
-            const output = try allocator.dupe(Tensor, value);
-            alloc.free(value);
-            results[0].result = .{ .value = &.{} };
-            return output;
+            if (comptime placement == .host) {
+                const output = try allocator.dupe(Tensor, value);
+                alloc.free(value);
+                owns_result = false;
+                return output;
+            } else {
+                owns_result = false;
+                return value;
+            }
         },
     }
 }
 
-fn direct(allocator: std.mem.Allocator, ticket: Ticket) ![]Tensor {
-    if (ticket.control) |control| try control.lock(ticket.gate) else platform.sync.lockYielding(ticket.gate);
-    defer ticket.gate.unlock();
-    if (ticket.permit) |permit| return permit.runWithControl(ticket.inputs, allocator, ticket.control);
-    return ticket.session.runWithControl(ticket.inputs, allocator, ticket.control);
+fn execute(raw: *anyopaque, items: []const micro.ExecuteItem) void {
+    executeMode(.host, raw, items);
+}
+fn executeGroup(items: []const micro.ExecuteItem) !void {
+    return executeGroupMode(.host, items);
 }
 
-fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {
+fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator, ticket: Ticket) !OutputType(placement) {
+    const control = ticket.control orelse Control{};
+    // A caller's preprocessing/input owner remains alive independently of the
+    // new exact execution. Release idle workspace before queueing ready work.
+    if (ticket.permit) |permit| _ = try permit.yieldExecution();
+    var cohort_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    try ticket.session.selectReadyCohort(ticket.gate, control, &cohort_waiter);
+    defer ticket.session.leaveSelectedCohort(&cohort_waiter);
+    var cleanup_owner: @import("../execution/cleanup_owner.zig").Owner = .{};
+    defer cleanup_owner.finishAfterUnlock();
+    if (comptime placement == .resident)
+        cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(ticket.session);
+    // A request-less explicit permit retains its original custom callback and
+    // quota policy. Only request-owning permits split off fresh execution.
+    var owned_execution: ?session_mod.RunPermit = if (ticket.permit) |permit|
+        if (permit.request != null) try permit.acquireExecutionInputsBeforeExecution(.{ .host = ticket.inputs }, allocator, ticket.control) else null
+    else
+        try ticket.session.admitInputsBeforeExecution(ticket.inputs, allocator, ticket.control);
+    defer if (owned_execution) |*execution| execution.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+    const execution = if (owned_execution) |*owned| owned else ticket.permit.?;
+    if (comptime placement == .resident) try execution.prepareResidentOutputRetirement();
+    try execution.preparePhysicalStorage(allocator);
+    if (comptime placement == .host)
+        cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(ticket.session);
+    if (cleanup_owner.epoch()) |epoch| try execution.bindPhysicalCleanupEpoch(epoch);
+    // Exact prepared resources and admission exist before the actual gate.
+    try ticket.session.acquireSelectedCohort(control, &cohort_waiter);
+    defer ticket.session.releaseSelectedCohortGate(&cohort_waiter);
+    if (comptime placement == .resident) {
+        var outputs = (try execution.runResidentWithControl(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
+        errdefer outputs.deinitWithBoundary(cleanup_owner.epoch());
+        _ = try cleanup_owner.retainThroughBackend(outputs.backend);
+        if (owned_execution != null and outputs.resource_lease == null) {
+            outputs.resource_lease = execution.lease;
+            execution.lease = null;
+        }
+        ticket.session.releaseSelectedCohortGate(&cohort_waiter);
+        execution.retireExecutionWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        return outputs;
+    } else {
+        const outputs = try execution.runWithControl(ticket.inputs, allocator, ticket.control);
+        errdefer destroy(allocator, outputs);
+        ticket.session.releaseSelectedCohortGate(&cohort_waiter);
+        execution.retireExecutionWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        // Output-quota reduction and ownership publication are producer
+        // boundaries too; perform them after numerical/model unlock.
+        return if (owned_execution != null) execution.attachHostOutputs(outputs, allocator) else outputs;
+    }
+}
+
+fn executeMode(comptime placement: OutputPlacement, _: *anyopaque, items: []const micro.ExecuteItem) void {
     // Regroup rows from the same immutable encoder allocation in source order.
     // Result slots travel with tickets, so request arrival order is irrelevant.
     var ordered: [8]micro.ExecuteItem = undefined;
@@ -335,7 +526,7 @@ fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {
             return key(a) < key(b);
         }
     }.less);
-    executeGroup(ordered[0..items.len]) catch |err| {
+    executeGroupMode(placement, ordered[0..items.len]) catch |err| {
         for (items) |item| if (!item.slot.completed) item.slot.fail(err);
     };
 }
@@ -359,38 +550,24 @@ fn sharedColumn(items: []const micro.ExecuteItem, column: usize) ?[]u8 {
     return storage[start - base .. offset];
 }
 
-fn serial(items: []const micro.ExecuteItem) void {
-    for (items) |item| {
-        item.control.check() catch |err| {
-            item.slot.fail(err);
-            continue;
-        };
-        const output = direct(std.heap.smp_allocator, item.payloadAs(Ticket).*) catch |err| {
-            item.slot.fail(err);
-            continue;
-        };
-        item.slot.setValue([]Tensor, output, .fallback);
-    }
-}
-
 /// Capacity subdivision only happens before a forward. Already completed
 /// subgroups are never replayed if a later subgroup fails.
-fn subdivide(items: []const micro.ExecuteItem) void {
+fn subdivideMode(comptime placement: OutputPlacement, items: []const micro.ExecuteItem) void {
     std.debug.assert(items.len > 1);
     const split = items.len / 2;
     for ([_][]const micro.ExecuteItem{ items[0..split], items[split..] }) |part| {
-        executeGroup(part) catch |err| {
+        executeGroupMode(placement, part) catch |err| {
             for (part) |item| if (!item.slot.completed) item.slot.fail(err);
         };
     }
 }
 
-fn executeGroup(items: []const micro.ExecuteItem) !void {
+fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.ExecuteItem) !void {
     if (items.len == 0) return;
     if (items.len == 1) {
-        const output = try direct(std.heap.smp_allocator, items[0].payloadAs(Ticket).*);
+        const output = try directMode(placement, std.heap.smp_allocator, items[0].payloadAs(Ticket).*);
         items[0].slot.physical_group_key = @intFromPtr(items[0].slot);
-        items[0].slot.setValue([]Tensor, output, if (items[0].payloadAs(Ticket).rows > 1) .native_batch else .serial);
+        items[0].slot.setValue(OutputType(placement), output, if (items[0].payloadAs(Ticket).rows > 1) .native_batch else .serial);
         return;
     }
     const alloc = std.heap.smp_allocator;
@@ -398,6 +575,7 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     var rows: usize = 0;
     var bytes: usize = 0;
     var unadmitted_input_bytes: usize = 0;
+    var packed_input_bytes: usize = 0;
     for (items) |item| {
         rows += item.payloadAs(Ticket).rows;
         for (item.payloadAs(Ticket).inputs) |tensor| {
@@ -409,6 +587,9 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     request.pre_admitted_host_bytes = 0;
     for (first.inputs, 0..) |_, column| {
         const borrowing = sharedColumn(items, column) != null;
+        if (!borrowing and !first.session.isBroadcastInput(first.inputs[column].name)) {
+            packed_input_bytes = try std.math.add(usize, packed_input_bytes, try std.math.mul(usize, first.inputs[column].data.len / first.rows, rows));
+        }
         for (items) |item| {
             const ticket = item.payloadAs(Ticket);
             const input = ticket.inputs[column];
@@ -425,17 +606,17 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     // input_bytes covers the new packed allocation. Originals with a live
     // caller permit are already charged; retain only the uncovered originals.
     request.host_preprocess_bytes = unadmitted_input_bytes;
-    if (first.session.run_admission) |admission| {
-        if (!try (try admission.estimateRequest(request, first.session.outputInfo())).fitsLimits(admission.limits)) return subdivide(items);
-    }
     var group = micro.ExecutionControl{ .items = items };
     var all_grace = true;
+    var all_in_process = true;
     var group_grace_ns: ?u64 = null;
     for (items) |item| {
         const item_control = item.payloadAs(Ticket).control orelse {
             all_grace = false;
+            all_in_process = false;
             continue;
         };
+        if (item_control.native_call_policy != .in_process) all_in_process = false;
         if (item_control.cancellation_grace_ns) |grace_ns| {
             group_grace_ns = if (group_grace_ns) |current| @min(current, grace_ns) else grace_ns;
         } else {
@@ -449,23 +630,33 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
         // The aggregate check keeps the forward alive while any caller is
         // live. A scalar deadline from one caller would override that check.
         .deadline_ns = null,
+        .native_call_policy = if (all_in_process) .in_process else .require_supervision,
         .hard_cancellation = if (first.control) |active| active.hard_cancellation else null,
         .cancellation_grace_ns = if (all_grace) group_grace_ns else null,
     };
-    try control.lock(first.gate);
-    var locked = true;
-    defer if (locked) first.gate.unlock();
-    // Caller permits now retain only input residency. Reserve one physical
-    // forward, without charging each queued caller's idle compute workspace.
-    var permit = first.session.admit(request) catch |err| switch (err) {
+    // One FIFO ready turn bounds resource admission, while suppliers can
+    // reenter the original model gate. No numerical/provider scope is active.
+    var cohort_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    try first.session.selectReadyCohort(first.gate, control, &cohort_waiter);
+    var cohort_owned = true;
+    defer if (cohort_owned) first.session.leaveSelectedCohort(&cohort_waiter);
+    var cleanup_owner: @import("../execution/cleanup_owner.zig").Owner = .{};
+    defer cleanup_owner.finishAfterUnlock();
+    if (comptime placement == .resident)
+        cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(first.session);
+    const preparation_bytes = try std.math.add(usize, packed_input_bytes, unadmitted_input_bytes);
+    var preparation = first.session.admitHostPreprocess(preparation_bytes) catch |err| switch (err) {
         error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
-            first.gate.unlock();
-            locked = false;
-            return subdivide(items);
+            first.session.leaveSelectedCohort(&cohort_waiter);
+            cohort_owned = false;
+            return subdivideMode(placement, items);
         },
     };
-    var owns_permit = true;
-    defer if (owns_permit) permit.deinit();
+    var preparation_open = true;
+    defer if (preparation_open) preparation.deinit();
+    // The exact owned tensors below replace this separately admitted host
+    // phase without double-charging their payload or uncovered source rows.
+    request.pre_admitted_host_bytes = try std.math.add(usize, request.pre_admitted_host_bytes, preparation_bytes);
     const batch_inputs = try alloc.alloc(Tensor, first.inputs.len);
     var owns_inputs = true;
     var initialized: usize = 0;
@@ -493,6 +684,94 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
         batch_inputs[column] = .{ .data = data, .shape = shape, .dtype = input.dtype, .name = input.name, .allocator = alloc, .owns_data = shared == null, .owns_shape = true };
         initialized += 1;
     }
+    var permit = first.session.admitShapeRequestBeforeExecution(.{ .tensors = batch_inputs }, request, alloc, control) catch |err| switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
+            destroy(alloc, batch_inputs);
+            owns_inputs = false;
+            preparation.deinit();
+            preparation_open = false;
+            first.session.leaveSelectedCohort(&cohort_waiter);
+            cohort_owned = false;
+            return subdivideMode(placement, items);
+        },
+        else => return err,
+    };
+    var owns_permit = true;
+    defer if (owns_permit) permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+    if (comptime placement == .resident) try permit.prepareResidentOutputRetirement();
+    try permit.preparePhysicalStorage(alloc);
+    if (comptime placement == .host)
+        cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(first.session);
+    if (cleanup_owner.epoch()) |epoch| try permit.bindPhysicalCleanupEpoch(epoch);
+    // The lexical cleanup owner binds prepared resources before this gate
+    // and seals only after its eventual numerical unlock.
+    try first.session.acquireSelectedCohort(control, &cohort_waiter);
+    var locked = true;
+    defer if (locked) first.session.releaseSelectedCohortGate(&cohort_waiter);
+    if (comptime placement == .resident) {
+        var outputs = (try permit.runResidentWithControl(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
+        defer outputs.deinitWithBoundary(cleanup_owner.epoch());
+        _ = try cleanup_owner.retainThroughBackend(outputs.backend);
+        var batch = try ResidentBatch.init(alloc, &outputs, first.session, rows);
+        var batch_open = true;
+        defer if (batch_open) batch.deinit();
+        const PreparedRow = union(enum) { empty, value: session_mod.ResidentOutputs, item_error: anyerror };
+        var prepared: [8]PreparedRow = @splat(.empty);
+        std.debug.assert(items.len <= prepared.len);
+        defer for (prepared[0..items.len]) |*row| switch (row.*) {
+            .value => |*value| value.deinitWithBoundary(cleanup_owner.epoch()),
+            else => {},
+        };
+        for (batch_inputs) |*tensor| tensor.deinit();
+        alloc.free(batch_inputs);
+        owns_inputs = false;
+        // Provider caches and escaped physical spans may survive the forward.
+        // Share the complete reservation, rather than trim by logical bytes.
+        if (outputs.resource_lease == null) {
+            outputs.resource_lease = permit.lease;
+            permit.lease = null;
+        }
+        var offset: usize = 0;
+        for (items, prepared[0..items.len]) |item, *row| {
+            const count = item.payloadAs(Ticket).rows;
+            const start = offset;
+            offset += count;
+            item.control.check() catch |err| {
+                row.* = .{ .item_error = err };
+                continue;
+            };
+            const views = batch.rows(start, count) catch |err| {
+                row.* = .{ .item_error = err };
+                continue;
+            };
+            row.* = .{ .value = views };
+        }
+        batch.deinit();
+        batch_open = false;
+        first.session.releaseSelectedCohortGate(&cohort_waiter);
+        locked = false;
+        permit.retireExecutionWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        // Publication/cancellation probes can enter the actual provider now.
+        // A receiver never wakes while this actor owns its numerical lane.
+        for (items, prepared[0..items.len]) |item, *row| {
+            item.control.check() catch |err| {
+                if (row.* == .value) row.value.deinitWithBoundary(cleanup_owner.epoch());
+                row.* = .empty;
+                item.slot.fail(err);
+                continue;
+            };
+            switch (row.*) {
+                .value => |value| {
+                    item.slot.physical_group_key = @intFromPtr(items[0].slot);
+                    item.slot.setValue(OutputType(placement), value, .native_batch);
+                },
+                .item_error => |err| item.slot.fail(err),
+                .empty => unreachable,
+            }
+            row.* = .empty;
+        }
+        return;
+    }
     const outputs = try permit.runWithControl(batch_inputs, alloc, control);
     var owns_outputs = true;
     defer if (owns_outputs) destroy(alloc, outputs);
@@ -514,9 +793,10 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     for (batch_inputs) |*tensor| tensor.deinit();
     alloc.free(batch_inputs);
     owns_inputs = false;
-    try permit.retainOutputs(outputs);
-    first.gate.unlock();
+    first.session.releaseSelectedCohortGate(&cohort_waiter);
     locked = false;
+    permit.retireExecutionWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+    try permit.retainOutputs(outputs);
     const owner = try alloc.create(SharedOutputs);
     errdefer alloc.destroy(owner);
     const columns = try alloc.alloc(SharedOutputs.Column, outputs.len);
@@ -541,7 +821,7 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
             continue;
         };
         item.slot.physical_group_key = @intFromPtr(items[0].slot);
-        item.slot.setValue([]Tensor, views, .native_batch);
+        item.slot.setValue(OutputType(placement), views, .native_batch);
     }
 }
 
@@ -1066,4 +1346,509 @@ test "tensor microbatch canceled consumer does not discard healthy fused rows" {
         if (caller.err) |err| return err;
         try std.testing.expectEqualSlices(f32, &.{ 2, 4 }, caller.output.?[0].asFloat32());
     }
+}
+
+const ResidentProbe = struct {
+    backend: @import("../ops/ops.zig").ComputeBackend,
+    gate: *std.atomic.Mutex,
+    calls: usize = 0,
+    host_calls: usize = 0,
+    closed: bool = false,
+    cleanup_charged: bool = false,
+    controller: ?*@import("../runtime/tier/memory.zig").AdmissionController = null,
+    malformed: bool = false,
+    transpose: bool = false,
+    fail_host: bool = false,
+    cancel_after_forward: ?*std.atomic.Value(bool) = null,
+    const vtable = session_mod.Session.VTable{
+        .run = host,
+        .runWithControl = hostControlled,
+        .runResident = resident,
+        .runResidentWithControl = residentControlled,
+        .inputInfo = info,
+        .outputInfo = info,
+        .backend = kind,
+        .close = close,
+    };
+    fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+        return &.{.{ .name = "values", .dtype = .f32, .shape = &.{ -1, 2 } }};
+    }
+    fn kind(raw: *anyopaque) @import("../backends/backends.zig").BackendType {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return switch (self.backend.kind()) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            else => unreachable,
+        };
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.closed = true;
+    }
+    fn cleanup(raw: *anyopaque, _: std.mem.Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.controller) |controller| self.cleanup_charged = controller.snapshot().hostTotalBytes() + controller.snapshot().backendTotalBytes() > 0;
+    }
+    fn resident(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?session_mod.ResidentOutputs {
+        return residentImpl(raw, inputs, allocator, null);
+    }
+    fn residentControlled(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: Control) !?session_mod.ResidentOutputs {
+        return residentImpl(raw, inputs, allocator, control);
+    }
+    fn residentImpl(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?Control) !?session_mod.ResidentOutputs {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (control) |active| try active.check();
+        if (self.gate.tryLock()) {
+            self.gate.unlock();
+            return error.ResidentDispatchMissingGate;
+        }
+        self.calls += 1;
+        const batch = inputs[0].shape[0];
+        const source = blk: {
+            const host_input = try self.backend.fromFloat32Shape(inputs[0].asFloat32(), &.{ @intCast(batch), 2 });
+            errdefer self.backend.free(host_input);
+            if (try self.backend.ensureDeviceResident(host_input)) |device| {
+                self.backend.free(host_input);
+                break :blk device;
+            }
+            break :blk host_input;
+        };
+        defer self.backend.free(source);
+        const doubled = try self.backend.add(source, source);
+        var doubled_open = true;
+        defer if (doubled_open) self.backend.free(doubled);
+        const value = if (self.transpose) blk: {
+            const reshaped = try self.backend.primReshape(doubled, &.{ 2, batch });
+            defer self.backend.free(reshaped);
+            break :blk try self.backend.primTranspose(reshaped, &.{ 1, 0 }, &.{ 2, batch });
+        } else if (self.malformed) try self.backend.primReshape(doubled, &.{ 1, batch * 2 }) else blk: {
+            doubled_open = false;
+            break :blk doubled;
+        };
+        errdefer self.backend.free(value);
+        const outputs = try allocator.alloc(@import("../ops/ops.zig").CT, 1);
+        outputs[0] = value;
+        if (self.cancel_after_forward) |flag| flag.store(true, .release);
+        return .{ .outputs = outputs, .backend = &self.backend, .allocator = allocator, .backend_owner = self, .deinit_backend_owner = cleanup };
+    }
+    fn host(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+        return hostImpl(raw, inputs, allocator, null);
+    }
+    fn hostControlled(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: Control) ![]Tensor {
+        return hostImpl(raw, inputs, allocator, control);
+    }
+    fn hostImpl(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.host_calls += 1;
+        if (self.fail_host) return error.ResidentDispatchUsedHost;
+        var result = (try residentImpl(raw, inputs, allocator, control)).?;
+        defer result.deinit();
+        const values = try self.backend.toFloat32(result.outputs[0], allocator);
+        defer allocator.free(values);
+        const outputs = try allocator.alloc(Tensor, 1);
+        errdefer allocator.free(outputs);
+        outputs[0] = try Tensor.initFloat32(allocator, "values", inputs[0].shape, values);
+        return outputs;
+    }
+};
+
+fn checkResidentCohort(cb: @import("../ops/ops.zig").ComputeBackend, _: @import("../ops/ops.zig").ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    var probe = ResidentProbe{ .backend = cb, .gate = &gate, .controller = &controller, .fail_host = true };
+    var lifetime = session_mod.Session.ModelLifetime{ .owner = &probe, .destroy_fn = ResidentProbe.close };
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &ResidentProbe.vtable, .model_lifetime = &lifetime, .run_admission = .{ .controller = &controller, .backend_class = if (cb.kind() == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var session_open = true;
+    defer if (session_open) session.close();
+    var first = try Tensor.initFloat32(a, "values", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    defer first.deinit();
+    var second = try Tensor.initFloat32(a, "values", &.{ 2, 2 }, &.{ 5, 6, 7, 8 });
+    defer second.deinit();
+    var tickets = [_]Ticket{ .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{first}, .control = .{ .native_call_policy = .in_process }, .rows = 2 }, .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{second}, .control = .{ .native_call_policy = .in_process }, .rows = 2 } };
+    var outputs: [2]session_mod.ResidentOutputs = undefined;
+    var slots = [_]micro.ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    var items = [_]micro.ExecuteItem{ .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[0], .slot = &slots[0], .control = .{ .io = std.testing.io } }, .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[1], .slot = &slots[1], .control = .{ .io = std.testing.io } } };
+    var open = [_]bool{ false, false };
+    defer for (&outputs, open) |*output, live| {
+        if (live) output.deinit();
+    };
+    const before_forward = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    try executeGroupMode(.resident, &items);
+    try before_forward.expectUnchanged(cb);
+    for (&slots, &open) |*slot, *live| {
+        try std.testing.expect(slot.completed);
+        if (slot.err) |err| return err;
+        live.* = true;
+        try std.testing.expectEqual(micro.Execution.native_batch, slot.execution);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.host_calls);
+    try std.testing.expect(outputs[0].backend_owner == outputs[1].backend_owner);
+    try std.testing.expect(outputs[0].backend == outputs[1].backend);
+    const bytes_before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const shape = try outputs[0].backend.tensorShape(outputs[0].outputs[0], a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, shape);
+    try bytes_before.expectUnchanged(cb);
+    session.close();
+    session_open = false;
+    try std.testing.expect(!probe.closed);
+    outputs[0].deinit();
+    open[0] = false;
+    try std.testing.expect(!probe.closed);
+    try std.testing.expect(controller.snapshot().hostTotalBytes() + controller.snapshot().backendTotalBytes() > 0);
+    const remaining = try outputs[1].backend.toFloat32(outputs[1].outputs[0], a);
+    defer a.free(remaining);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 12, 14, 16 }, remaining);
+    outputs[1].deinit();
+    open[1] = false;
+    try std.testing.expect(probe.closed and probe.cleanup_charged);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "resident tensor microbatch actual Native cohort shares full quota and model through sibling retirement" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkResidentCohort);
+}
+
+test "resident tensor microbatch actual Metal cohort shares full quota and model through sibling retirement" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(helper.noWeights, checkResidentCohort);
+}
+
+fn checkResidentFaults(cb: @import("../ops/ops.zig").ComputeBackend, _: @import("../ops/ops.zig").ComputeBackend) !void {
+    const a = std.testing.allocator;
+    for (0..3) |scenario| {
+        var canceled = std.atomic.Value(bool).init(false);
+        var gate: std.atomic.Mutex = .unlocked;
+        var probe = ResidentProbe{ .backend = cb, .gate = &gate, .malformed = scenario == 0, .transpose = scenario == 2, .cancel_after_forward = if (scenario == 1) &canceled else null, .fail_host = true };
+        const session = session_mod.Session{ .ptr = &probe, .vtable = &ResidentProbe.vtable };
+        var first = try Tensor.initFloat32(a, "values", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+        defer first.deinit();
+        var second = try Tensor.initFloat32(a, "values", &.{ 2, 2 }, &.{ 5, 6, 7, 8 });
+        defer second.deinit();
+        var tickets = [_]Ticket{ .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{first}, .control = .{}, .rows = 2 }, .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{second}, .control = .{}, .rows = 2 } };
+        var outputs: [2]session_mod.ResidentOutputs = undefined;
+        var slots = [_]micro.ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+        var items = [_]micro.ExecuteItem{ .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[0], .slot = &slots[0], .control = .{ .io = std.testing.io, .cancel_requested = if (scenario == 1) &canceled else null } }, .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[1], .slot = &slots[1], .control = .{ .io = std.testing.io } } };
+        var broker = micro.Broker.init(a);
+        defer broker.deinit();
+        executeMode(.resident, &broker, &items);
+        defer for (&outputs, slots) |*output, slot| {
+            if (slot.completed and slot.err == null) output.deinit();
+        };
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.host_calls);
+        if (scenario == 0) {
+            // A malformed physical result is an error after one submitted
+            // forward, never permission to retry a serial/host route.
+            for (slots) |slot| try std.testing.expectEqual(error.InvalidFusedOutputShape, slot.err.?);
+        } else {
+            if (scenario == 1) try std.testing.expectEqual(error.Canceled, slots[0].err.?) else try std.testing.expect(slots[0].err == null);
+            try std.testing.expect(slots[1].completed and slots[1].err == null);
+            const values = try outputs[1].backend.toFloat32(outputs[1].outputs[0], a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, if (scenario == 2) &.{ 6, 14, 8, 16 } else &.{ 10, 12, 14, 16 }, values);
+            if (scenario == 2) {
+                const first_values = try outputs[0].backend.toFloat32(outputs[0].outputs[0], a);
+                defer a.free(first_values);
+                try std.testing.expectEqualSlices(f32, &.{ 2, 10, 4, 12 }, first_values);
+            }
+        }
+    }
+}
+
+test "resident tensor microbatch fail closed after malformed forward preserve canceled sibling and noncontiguous Native rows" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkResidentFaults);
+}
+
+test "resident tensor microbatch row view and complete quota promotion unwind every allocation failure" {
+    const Probe = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const native = @import("../ops/native_compute.zig");
+            var weights = native.WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+            defer weights.deinitOwned();
+            var compute = native.NativeCompute.init(allocator, &weights, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const value = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 4, 2 });
+            var value_open = true;
+            defer if (value_open) cb.free(value);
+            const vector = try allocator.alloc(@import("../ops/ops.zig").CT, 1);
+            vector[0] = value;
+            value_open = false;
+            var outputs = session_mod.ResidentOutputs{ .outputs = vector, .backend = &cb, .allocator = allocator };
+            defer outputs.deinit();
+            var gate: std.atomic.Mutex = .unlocked;
+            var model = ResidentProbe{ .backend = cb, .gate = &gate };
+            const session = session_mod.Session{ .ptr = &model, .vtable = &ResidentProbe.vtable };
+            var batch = try ResidentBatch.init(allocator, &outputs, session, 4);
+            defer batch.deinit();
+            var first = try batch.rows(0, 2);
+            defer first.deinit();
+            var second = try batch.rows(2, 2);
+            defer second.deinit();
+            const values = try second.backend.toFloat32(second.outputs[0], allocator);
+            defer allocator.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8 }, values);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+fn checkResidentBrokerPlacement(cb: @import("../ops/ops.zig").ComputeBackend, _: @import("../ops/ops.zig").ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    var lane: std.Io.Mutex = .init;
+    broker.execution_mutex = &lane;
+    var gate: std.atomic.Mutex = .unlocked;
+    var probe = ResidentProbe{ .backend = cb, .gate = &gate };
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &ResidentProbe.vtable };
+    var input = try Tensor.initFloat32(a, "values", &.{ 1, 2 }, &.{ 1, 2 });
+    defer input.deinit();
+    var canceled = std.atomic.Value(bool).init(false);
+    const Submit = struct {
+        broker: *micro.Broker,
+        session: session_mod.Session,
+        gate: *std.atomic.Mutex,
+        inputs: []const Tensor,
+        placement: OutputPlacement,
+        canceled: *std.atomic.Value(bool),
+        err: ?anyerror = null,
+        fn isCanceled(raw: ?*anyopaque) bool {
+            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return flag.load(.acquire);
+        }
+        fn call(self: *@This()) void {
+            const control = Control{ .io = std.testing.io, .native_call_policy = .in_process, .cancellation = .{ .ptr = self.canceled, .is_cancelled_fn = isCanceled } };
+            switch (self.placement) {
+                .host => {
+                    const value = run(self.broker, std.testing.allocator, std.testing.io, .transcribe, self.session, null, self.gate, self.inputs, control, null, 0) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    destroy(std.testing.allocator, value);
+                },
+                .resident => {
+                    var value = runResident(self.broker, std.testing.allocator, std.testing.io, .transcribe, self.session, null, self.gate, self.inputs, control, null, 0) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    value.deinit();
+                },
+            }
+        }
+    };
+    var calls = [_]Submit{ .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input}, .placement = .host, .canceled = &canceled }, .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input}, .placement = .resident, .canceled = &canceled } };
+    lane.lockUncancelable(io);
+    var locked = true;
+    var group = std.Io.Group.init;
+    defer {
+        canceled.store(true, .release);
+        if (locked) lane.unlock(io);
+        group.cancel(io);
+    }
+    for (&calls) |*call| try group.concurrent(io, Submit.call, .{call});
+    const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    var groups: usize = 0;
+    var has_host = false;
+    var has_resident = false;
+    while (true) {
+        var queued: usize = 0;
+        groups = 0;
+        has_host = false;
+        has_resident = false;
+        for (&broker.shards) |*shard| {
+            shard.mutex.lockUncancelable(io);
+            for (shard.groups.items) |cohort| {
+                queued += cohort.tickets.items.len;
+                groups += 1;
+                has_host = has_host or std.mem.startsWith(u8, cohort.key.schema, "host;");
+                has_resident = has_resident or std.mem.startsWith(u8, cohort.key.schema, "resident;");
+            }
+            shard.mutex.unlock(io);
+        }
+        if (queued == 2) break;
+        if (platform.time.monotonicNs() >= deadline) return error.ResidentPlacementQueueTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // Cancel before opening the lane, so a regressed mixed typed key can fail
+    // this assertion without writing one output representation into the other.
+    canceled.store(true, .release);
+    lane.unlock(io);
+    locked = false;
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 2), groups);
+    try std.testing.expect(has_host and has_resident);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    for (calls) |call| {
+        const err = call.err orelse return error.ExpectedPlacementCancellation;
+        try std.testing.expect(err == error.Canceled or err == error.Cancelled);
+    }
+}
+
+test "resident tensor microbatch actual Broker separates host and resident typed cohorts before submission" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkResidentBrokerPlacement);
+}
+
+fn checkResidentReusablePermit(cb: @import("../ops/ops.zig").ComputeBackend, _: @import("../ops/ops.zig").ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Geometry = struct {
+        fn plan(_: *anyopaque, _: session_mod.ShapeInputs, batch: usize) !?session_mod.RunGeometry {
+            return .{ .sequence = 2, .output_bytes = batch * 2 * @sizeOf(f32) };
+        }
+    };
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    var probe = ResidentProbe{ .backend = cb, .gate = &gate, .controller = &controller, .fail_host = true };
+    var table = ResidentProbe.vtable;
+    table.runGeometry = Geometry.plan;
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var small = try Tensor.initFloat32(a, "values", &.{ 1, 2 }, &.{ 1, 2 });
+    defer small.deinit();
+    var large = try Tensor.initFloat32(a, "values", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    defer large.deinit();
+    var permit = try session.admit(try session.planRun(&.{large}, null));
+    var permit_open = true;
+    defer if (permit_open) permit.deinit();
+    for ([_]Tensor{ small, large, small }) |input| {
+        var output = try runResident(&broker, a, std.testing.io, .transcribe, session, &permit, &gate, &.{input}, null, null, 0);
+        defer output.deinit();
+        try std.testing.expect(permit.execution_yielded);
+        try std.testing.expect(output.resource_lease != null);
+        const values = try output.backend.toFloat32(output.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqual(input.asFloat32().len, values.len);
+        for (input.asFloat32(), values) |before, after| try std.testing.expectEqual(before * 2, after);
+    }
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.host_calls);
+    permit.deinit();
+    permit_open = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "resident tensor microbatch reusable supplied permit reacquires execution through changing windows" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkResidentReusablePermit);
+}
+
+test "resident cohort view metadata keeps one actual shared Native provider scope" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const operation = @import("../execution/backend_operation.zig");
+    const a = std.testing.allocator;
+    const shared = try @import("../backends/compute_context.zig").SharedBackendContext.init(a, .native, null);
+    defer shared.release();
+    var cb = shared.computeBackend();
+    const values = try a.alloc(@import("../ops/ops.zig").CT, 1);
+    values[0] = cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 }) catch |err| {
+        a.free(values);
+        return err;
+    };
+    var outputs = session_mod.ResidentOutputs{ .outputs = values, .backend = &cb, .allocator = a };
+    defer outputs.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    var probe = ResidentProbe{ .backend = cb, .gate = &gate };
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &ResidentProbe.vtable };
+    var blocked = try operation.enter(cb, null, null, .managed);
+    defer blocked.deinitChecked() catch @panic("shared provider blocker cleanup");
+    try std.testing.expectError(error.QueueFull, ResidentBatch.init(a, &outputs, session, 2));
+    try blocked.finish();
+    var batch = try ResidentBatch.init(a, &outputs, session, 2);
+    var batch_open = true;
+    defer if (batch_open) batch.deinit();
+    try std.testing.expectError(error.QueueFull, operation.enter(cb, null, null, .managed));
+    var first = try batch.rows(0, 1);
+    defer first.deinit();
+    var second = try batch.rows(1, 1);
+    defer second.deinit();
+    const first_values = try cb.toFloat32(first.outputs[0], a);
+    defer a.free(first_values);
+    const second_values = try cb.toFloat32(second.outputs[0], a);
+    defer a.free(second_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, first_values);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, second_values);
+    batch.deinit();
+    batch_open = false;
+    var available = try operation.enter(cb, null, null, .managed);
+    try available.finish();
+}
+
+test "resident serving cohort releases actual provider before publishing receiver slots" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const operation = @import("../execution/backend_operation.zig");
+    const a = std.testing.allocator;
+    const shared = try @import("../backends/compute_context.zig").SharedBackendContext.init(a, .native, null);
+    defer shared.release();
+    const cb = shared.computeBackend();
+    var gate: std.atomic.Mutex = .unlocked;
+    var probe = ResidentProbe{ .backend = cb, .gate = &gate, .fail_host = true };
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &ResidentProbe.vtable };
+    const Publication = struct {
+        probe: *ResidentProbe,
+        checked: usize = 0,
+        unavailable: bool = false,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.probe.calls == 0) return false;
+            // The existing model-lane publication boundary distinguishes the
+            // receiver check from pre-forward/per-item construction checks.
+            if (!self.probe.gate.tryLock()) return false;
+            self.probe.gate.unlock();
+            self.checked += 1;
+            var receiver = operation.enter(self.probe.backend, null, null, .managed) catch {
+                self.unavailable = true;
+                return false;
+            };
+            receiver.finish() catch {
+                self.unavailable = true;
+            };
+            return false;
+        }
+    };
+    var publication = Publication{ .probe = &probe };
+    var first = try Tensor.initFloat32(a, "values", &.{ 1, 2 }, &.{ 1, 2 });
+    defer first.deinit();
+    var second = try Tensor.initFloat32(a, "values", &.{ 1, 2 }, &.{ 3, 4 });
+    defer second.deinit();
+    var tickets = [_]Ticket{
+        .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{first}, .control = .{ .native_call_policy = .in_process }, .rows = 1 },
+        .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{second}, .control = .{ .native_call_policy = .in_process }, .rows = 1 },
+    };
+    var outputs: [2]session_mod.ResidentOutputs = undefined;
+    var slots = [_]micro.ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    defer for (&slots, &outputs) |*slot, *output| {
+        if (slot.completed and slot.err == null) output.deinit();
+    };
+    var items = [_]micro.ExecuteItem{
+        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[0], .slot = &slots[0], .control = .{ .cancellation = .{ .ptr = &publication, .is_cancelled_fn = Publication.canceled } } },
+        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[1], .slot = &slots[1], .control = .{ .cancellation = .{ .ptr = &publication, .is_cancelled_fn = Publication.canceled } } },
+    };
+    try executeGroupMode(.resident, &items);
+    try std.testing.expect(publication.checked >= 2);
+    try std.testing.expect(!publication.unavailable);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    var receiver = try operation.enter(cb, null, null, .managed);
+    defer receiver.deinitChecked() catch @panic("receiver cleanup failed");
+    for (&slots, &outputs, 0..) |*slot, *output, index| {
+        try std.testing.expect(slot.completed);
+        if (slot.err) |err| return err;
+        try std.testing.expectEqual(micro.Execution.native_batch, slot.execution);
+        const actual = try cb.toFloat32(output.outputs[0], a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, if (index == 0) &.{ 2, 4 } else &.{ 6, 8 }, actual);
+    }
+    try receiver.finish();
 }

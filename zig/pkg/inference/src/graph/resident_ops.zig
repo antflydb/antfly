@@ -29,25 +29,36 @@ pub fn l2NormalizeLastDim(
     input: CT,
     input_shape: []const i64,
 ) !CT {
+    return l2NormalizeLastDimWithCleanup(allocator, backend, input, input_shape, null);
+}
+inline fn freeForCall(backend: *const ComputeBackend, tensor: CT, cleanup: ?*const @import("../execution/cleanup_context.zig").Context) void {
+    if (cleanup) |current| backend.freeWithCleanup(tensor, current.*) else backend.free(tensor);
+}
+
+pub fn l2NormalizeLastDimWithCleanup(
+    allocator: std.mem.Allocator,
+    backend: *const ComputeBackend,
+    input: CT,
+    input_shape: []const i64,
+    cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
+) !CT {
     if (input_shape.len == 0 or input_shape.len > 8) return error.UnsupportedShape;
     const last_axis = input_shape.len - 1;
     const dim = input_shape[last_axis];
     if (dim <= 0) return error.UnsupportedShape;
 
-    // CUDA has a fused bare-RMS kernel but intentionally does not expose the
-    // generic reduction primitives used below. RMS(x) / sqrt(dim) is L2(x),
-    // so use that two-kernel resident path when it is available. Keep epsilon
-    // normal-sized: dividing floatMin by a typical embedding dimension makes
-    // it subnormal and risks a zero-row 0 * rsqrt(0) NaN on GPU hardware.
+    // Reuse an admitted bare-RMS row program plus a scalar epilogue. Keep
+    // epsilon normal-sized: subnormal eps can produce zero-row NaNs on GPUs.
+    // Unsupported layouts use the primitive reference below without readback.
     const dim_usize: usize = @intCast(dim);
-    if (backend.kind() == .cuda) {
+    if (backend.kind() == .cuda or backend.kind() == .metal) {
         if (try backend.rmsNormBare(input, dim_usize, std.math.floatMin(f32))) |rms| {
-            errdefer backend.free(rms);
+            errdefer freeForCall(backend, rms, cleanup);
             if (try backend.multiplyScalar(rms, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))))) |normalized| {
-                backend.free(rms);
+                freeForCall(backend, rms, cleanup);
                 return normalized;
             }
-            backend.free(rms);
+            freeForCall(backend, rms, cleanup);
         }
     }
 
@@ -73,22 +84,22 @@ pub fn l2NormalizeLastDim(
     @memset(one_values, 1.0);
 
     const eps = try backend.fromFloat32Shape(eps_values, const_shape);
-    defer backend.free(eps);
+    defer freeForCall(backend, eps, cleanup);
     const one = try backend.fromFloat32Shape(one_values, const_shape);
-    defer backend.free(one);
+    defer freeForCall(backend, one, cleanup);
 
     const squared = try backend.multiply(input, input);
-    defer backend.free(squared);
+    defer freeForCall(backend, squared, cleanup);
     const sum_sq = try backend.primReduceSum(squared, &.{@intCast(last_axis)}, input_shape);
-    defer backend.free(sum_sq);
+    defer freeForCall(backend, sum_sq, cleanup);
     const zeroish = try backend.primLessThan(sum_sq, eps);
-    defer backend.free(zeroish);
+    defer freeForCall(backend, zeroish, cleanup);
     const inv_norm_raw = try backend.primRsqrt(sum_sq);
-    defer backend.free(inv_norm_raw);
+    defer freeForCall(backend, inv_norm_raw, cleanup);
     const inv_norm = try backend.primWhereSelect(zeroish, one, inv_norm_raw);
-    defer backend.free(inv_norm);
+    defer freeForCall(backend, inv_norm, cleanup);
     const scale = try backend.primBroadcastInDim(inv_norm, input_shape, broadcast_axes, reduced_shape);
-    defer backend.free(scale);
+    defer freeForCall(backend, scale, cleanup);
     return backend.multiply(input, scale);
 }
 

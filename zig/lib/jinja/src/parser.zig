@@ -496,6 +496,10 @@ pub const Parser = struct {
                     if (negated) .is_not_none else .is_none
                 else if (std.mem.eql(u8, test_tok.value, "boolean"))
                     .is_boolean
+                else if (std.mem.eql(u8, test_tok.value, "true"))
+                    .is_true
+                else if (std.mem.eql(u8, test_tok.value, "false"))
+                    .is_false
                 else
                     return error.UnexpectedToken;
 
@@ -668,39 +672,31 @@ pub const Parser = struct {
                 .lbracket => {
                     _ = self.nextToken(); // consume [
 
-                    // Check for slice: [start:stop]
-                    const next = self.peekToken();
-                    if (next.kind == .colon) {
-                        // [:stop]
-                        _ = self.nextToken(); // consume :
-                        var stop: ?*Expr = null;
-                        if (self.peekToken().kind != .rbracket) {
-                            stop = try self.parseExpr();
-                        }
+                    const start: ?*Expr = if (self.peekToken().kind == .colon)
+                        null
+                    else
+                        try self.parseExpr();
+                    if (self.peekToken().kind != .colon) {
                         _ = try self.expect(.rbracket);
                         const node = try self.allocExpr();
-                        node.* = .{ .slice = .{ .obj = expr, .start = null, .stop = stop } };
+                        node.* = .{ .get_item = .{ .obj = expr, .key = start.? } };
                         expr = node;
-                    } else {
-                        const key = try self.parseExpr();
-                        if (self.peekToken().kind == .colon) {
-                            // [start:stop]
-                            _ = self.nextToken(); // consume :
-                            var stop: ?*Expr = null;
-                            if (self.peekToken().kind != .rbracket) {
-                                stop = try self.parseExpr();
-                            }
-                            _ = try self.expect(.rbracket);
-                            const node = try self.allocExpr();
-                            node.* = .{ .slice = .{ .obj = expr, .start = key, .stop = stop } };
-                            expr = node;
-                        } else {
-                            _ = try self.expect(.rbracket);
-                            const node = try self.allocExpr();
-                            node.* = .{ .get_item = .{ .obj = expr, .key = key } };
-                            expr = node;
-                        }
+                        continue;
                     }
+                    _ = self.nextToken(); // first :
+                    const stop: ?*Expr = if (self.peekToken().kind == .colon or self.peekToken().kind == .rbracket)
+                        null
+                    else
+                        try self.parseExpr();
+                    var step: ?*Expr = null;
+                    if (self.peekToken().kind == .colon) {
+                        _ = self.nextToken();
+                        if (self.peekToken().kind != .rbracket) step = try self.parseExpr();
+                    }
+                    _ = try self.expect(.rbracket);
+                    const node = try self.allocExpr();
+                    node.* = .{ .slice = .{ .obj = expr, .start = start, .stop = stop, .step = step } };
+                    expr = node;
                 },
                 .lparen => {
                     _ = self.nextToken(); // consume (

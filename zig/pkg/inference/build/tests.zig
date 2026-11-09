@@ -37,20 +37,40 @@ pub fn create(ctx: Context) Suite {
     // Native CPU Debug peaked at 12,070,764,544 bytes with cold compiler
     // caches. 12,672 MiB retains 10% headroom rounded up to 128 MiB.
     // Accelerator and other-host reservations retain their existing profiles.
-    const native_cpu = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+    const native_cpu_macos = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    // The optimized native CPU closeout scope peaked at 11,435,048,960
+    // bytes. 12,032 MiB retains 10% headroom rounded up to 128 MiB.
+    // The broad ARM Linux CUDA suite peaked at 26,424,184,832 bytes.
+    // 28 GiB covers that measurement with at least 10% headroom. Other CUDA
+    // hosts retain 24 GiB; Metal retains its measured 20 GiB reservation.
+    // These bounds schedule compiler memory, not model/runtime admission.
+    // Incoming native aarch64 Linux document orchestration peaked at14.26 GB;
+    // retain its16 GiB reservation alongside the larger measured GPU bounds.
+    // Main's native ARM Linux ReleaseSafe boundary test measured 20,025,544,704
+    // bytes; preserve its 24 GiB compiler reservation for that mode.
+    const cuda_arm_linux = ctx.backend.enable_cuda and b.graph.host.result.os.tag == .linux and
+        b.graph.host.result.cpu.arch == .aarch64;
+    // Exact unfiltered native ARM Linux CUDA+PJRT ReleaseFast, unstripped
+    // A suite peaked at 58,795,728,896 bytes. The outer build returned zero
+    // despite a declaration failure at 28 GiB; keep that diagnostic as a
+    // failure. Reserve 25% headroom rounded up to 64 MiB (70,144 MiB).
+    // Do not extrapolate to filtered/runtime-filtered, stripped, CPU-only,
+    // cross-target, other backend combinations or other optimization modes.
+    const measured_cuda_pjrt_arm_linux = runtime_build.measuredCudaPjrtCompileMemory(b.graph.host, ctx.target, ctx.optimize, .{
+        .strip = ctx.strip,
+        .enable_cuda = ctx.backend.enable_cuda,
+        .enable_pjrt = ctx.backend.enable_pjrt,
+        .enable_metal = ctx.backend.enable_metal,
+    });
+    const existing_test_compile_max_rss: usize = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024;
+    const default_test_compile_memory_mb: usize = if (measured_cuda_pjrt_arm_linux) |profile| profile.testMiB(selected_test_filters.len, ctx.runtime_test_filter) orelse (existing_test_compile_max_rss / (1024 * 1024)) else existing_test_compile_max_rss / (1024 * 1024);
+    const test_compile_memory_mb = b.option(usize, "inference-test-compile-memory-mb", "Declared inference test compiler memory bound in MiB") orelse default_test_compile_memory_mb;
+    if (test_compile_memory_mb == 0) @panic("inference test compiler memory bound must be positive");
     const tests = b.addTest(.{
-        // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
-        // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
-        // footprint and leaves room for the socket/reference coverage.
-        // Native aarch64 Linux CPU document orchestration (Zig 0.17,
-        // ReleaseFast) peaked at 14.26 GB. Reserve 16 GiB for this closure.
-        // The ReleaseSafe boundary admission regression peaked at
-        // 20,025,544,704 bytes with cold caches; reserve 24 GiB in that mode.
-        // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
-        // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, test_compile_memory_mb, 1024 * 1024) catch @panic("inference test compiler memory bound overflows"),
+
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -59,6 +79,10 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
+    // Large AArch64 ELF Debug suites exceed the call range within one text
+    // section. Separate functions let the linker insert range-extension thunks.
+    tests.link_function_sections = ctx.optimize == .debug and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.target.result.ofmt == .elf;
     if (ctx.backend.enable_pjrt) {
         const fixture = b.addLibrary(.{
             .name = "pjrt-admission-fixture",
@@ -95,21 +119,7 @@ pub fn create(ctx: Context) Suite {
     // Direct reader API tests share the runtime's request and result types.
     // Reuse the root owner so native reader options, imports, and framework
     // linkage stay consistent with the runtime under test.
-    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers") orelse blk: {
-        const standalone_readers_mod = b.createModule(.{
-            .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        });
-        standalone_readers_mod.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
-        standalone_readers_mod.addImport("httpx", ctx.graph.httpx_mod);
-        standalone_readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
-        standalone_readers_mod.addImport("antfly_google", ctx.graph.google_mod);
-        standalone_readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
-        standalone_readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
-        standalone_readers_mod.addImport("antfly_image", ctx.graph.image_mod);
-        break :blk standalone_readers_mod;
-    };
+    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers").?;
     tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
@@ -125,6 +135,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     tests.root_module.addImport("inference_fixed_tokenizer_data", ctx.graph.inference_fixed_tokenizer_data_mod);
     tests.root_module.addImport("antfly_jsonschema", ctx.graph.jsonschema_mod);
     tests.root_module.addImport("antfly_scraping", ctx.graph.scraping_mod);
@@ -152,6 +163,17 @@ pub fn create(ctx: Context) Suite {
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
     runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
+
+    // Reuse the exact configured test module and runner without requesting an
+    // emitted binary. This performs semantic checking without LLVM or linking.
+    const test_check = b.addTest(.{
+        .name = "inference-test-check",
+        .root_module = tests.root_module,
+        .filters = main_test_filters,
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = tests.step.max_rss,
+    });
+    ctx.step("check-inference-tests", "Type-check the inference tests without emitting a binary").dependOn(&test_check.step);
 
     // Keep the standalone server's CLI and configuration parsing covered too.
     // `src/inference.zig` does not import `src/main.zig`, so tests declared by
@@ -297,7 +319,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var lifecycle_imports = suite.tests.root_module.import_table.iterator();
     while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     lifecycle_root.link_libc = true;
-    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple }, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
     const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
     ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
@@ -305,8 +327,17 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var microbatch_imports = suite.tests.root_module.import_table.iterator();
     while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     microbatch_root.link_libc = true;
-    const microbatch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &.{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch", "test_0" } });
+    // Native ARM macOS ReleaseSafe peaks: CPU 5,713,297,408 bytes and
+    // Metal 7,442,055,168 bytes. Reserve 10% headroom rounded to 128 MiB.
+    // Other hosts, backend combinations and optimization modes retain 4 GiB.
+    const measured_microbatch_macos = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
+        ctx.backend.enable_native and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt and ctx.optimize == .safe;
+    const microbatch_tests = b.addTest(.{ .max_rss = if (measured_microbatch_macos) @as(usize, if (ctx.backend.enable_metal) 7808 else 6016) * 1024 * 1024 else 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &.{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch", "test_0" } });
     const run_microbatch_tests = ctx.addRunArtifact(microbatch_tests);
+    // This cohort includes actual provider/device discovery and retirement.
+    // A cached skip must not stand in for the current execution environment.
+    run_microbatch_tests.has_side_effects = true;
     test_step.dependOn(&run_microbatch_tests.step);
     ctx.step("test-executor-microbatch", "Verify executor batching, GLiNER adapters, row ownership, capacity and cancellation").dependOn(&run_microbatch_tests.step);
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
@@ -466,6 +497,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     tests.root_module.addImport("ml", ml);
     const run = ctx.addRunArtifact(tests);
     ctx.step("test-gliner25-fuzz", "Run bounded GLiNER2.5 parser, schema and document property tests").dependOn(&run.step);

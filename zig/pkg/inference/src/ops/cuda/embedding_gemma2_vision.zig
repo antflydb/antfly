@@ -34,6 +34,11 @@ pub const Plan = struct {
     sequence: usize,
     grid_x: usize,
     grid_y: usize,
+    source_sequence: ?usize = null,
+
+    pub fn physicalSequence(self: Plan) !usize {
+        return (try @import("../kernel_geometry.zig").SourceGemmRows.resolve(self.sequence, self.source_sequence)).physical;
+    }
 
     pub fn validate(self: Plan) !void {
         if (self.sequence == 0 or self.sequence > max_patches) return error.InvalidEmbeddingGemma2VisionShape;
@@ -41,7 +46,9 @@ pub const Plan = struct {
         const patches = std.math.mul(usize, self.grid_x, self.grid_y) catch return error.InvalidEmbeddingGemma2VisionShape;
         if (patches != self.sequence) return error.InvalidEmbeddingGemma2VisionShape;
         if (self.sequence > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2VisionShape;
-        _ = std.math.mul(usize, self.sequence, intermediate_size) catch return error.InvalidEmbeddingGemma2VisionShape;
+        const physical = try self.physicalSequence();
+        if (physical > max_patches) return error.InvalidEmbeddingGemma2VisionShape;
+        _ = std.math.mul(usize, physical, intermediate_size) catch return error.InvalidEmbeddingGemma2VisionShape;
     }
 };
 
@@ -121,4 +128,19 @@ test "official vision weights use exact immutable Hugging Face names" {
     try std.testing.expectEqualStrings("vision_tower.encoder.layers.15.self_attn.q_proj.linear.weight", weights.q);
     try std.testing.expectEqualStrings("vision_tower.encoder.layers.15.mlp.down_proj.linear.weight", weights.down);
     try std.testing.expectError(error.InvalidEmbeddingGemma2VisionLayer, layerWeights(&storage, layer_count));
+}
+
+test "vision source phase keeps physical rows distinct from valid key geometry" {
+    const phase = Plan{ .sequence = 2340, .source_sequence = 2520, .grid_x = 60, .grid_y = 39 };
+    try phase.validate();
+    try std.testing.expectEqual(@as(usize, 2520), try phase.physicalSequence());
+    const sizes = try scratchSizes(try phase.physicalSequence(), false, false);
+    try std.testing.expectEqual(@as(usize, 2520 * hidden_size * 2), sizes[0]);
+    try std.testing.expectEqual(@as(usize, 2520 * intermediate_size * 2), sizes[2]);
+    const legacy = Plan{ .sequence = 2340, .grid_x = 60, .grid_y = 39 };
+    try legacy.validate();
+    try std.testing.expectEqual(@as(usize, 2340), try legacy.physicalSequence());
+    try std.testing.expectError(error.InvalidShape, (Plan{ .sequence = 2340, .source_sequence = 2339, .grid_x = 60, .grid_y = 39 }).validate());
+    try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, (Plan{ .sequence = 2340, .source_sequence = max_patches + 1, .grid_x = 60, .grid_y = 39 }).validate());
+    try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, (Plan{ .sequence = 2339, .source_sequence = 2520, .grid_x = 60, .grid_y = 39 }).validate());
 }

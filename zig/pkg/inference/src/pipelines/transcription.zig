@@ -25,6 +25,9 @@
 //   - config.json (model_type: whisper)
 //   - preprocessor_config.json (mel spectrogram params)
 
+const stage_runtime = @import("../execution/encoder_decoder_runtime.zig");
+const decoder_stage = @import("../execution/decoder_stage.zig");
+const pending_step = @import("../execution/decoder_pending_step.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -115,7 +118,119 @@ pub const Timing = struct {
     }
 };
 
+/// Actual selected decode termination. Unknown is the default for other
+/// result constructors; output-budget exhaustion remains a propagated error.
+pub const Termination = enum { unknown, eos, context_limit, output_budget, silence };
+const PipelinedTermination = enum { declined, eos, context_limit, output_budget };
+/// Copied actual decode-owner facts for one synchronous window. Defaults are
+/// unavailable, never evidence that zero attempts or a greedy attempt occurred.
+pub const WindowDecodeObservation = struct {
+    available: bool = false,
+    attempts_started: usize = 0,
+    attempts_completed: usize = 0,
+    fallback_attempts: usize = 0,
+    accepted_temperature: ?f32 = null,
+    accepted_termination: Termination = .unknown,
+    recognized: bool = false,
+    silent: bool = false,
+    truncated: bool = false,
+    failure: ?anyerror = null,
+    overflowed: bool = false,
+
+    pub fn beginAttempt(self: *@This()) void {
+        if (self.attempts_started != 0) self.add(&self.fallback_attempts, 1);
+        self.add(&self.attempts_started, 1);
+    }
+    pub fn completeAttempt(self: *@This()) void {
+        self.add(&self.attempts_completed, 1);
+    }
+    fn add(self: *@This(), target: *usize, count: usize) void {
+        target.* = std.math.add(usize, target.*, count) catch {
+            self.overflowed = true;
+            return;
+        };
+    }
+    pub fn accept(self: *@This(), result: *const TranscribeResult) void {
+        self.accepted_temperature = result.temperature;
+        self.accepted_termination = result.selected_attempt_termination;
+        self.silent = result.silent;
+        self.truncated = result.truncated;
+        self.recognized = !result.silent and std.mem.trim(u8, result.text, " \t\r\n").len != 0;
+    }
+    pub fn provenGreedySpeech(self: @This()) bool {
+        return self.available and !self.overflowed and self.failure == null and
+            self.attempts_started == 1 and self.attempts_completed == 1 and self.fallback_attempts == 0 and
+            self.accepted_temperature != null and self.accepted_temperature.? == 0 and
+            self.accepted_termination == .eos and self.recognized and !self.silent and !self.truncated;
+    }
+};
+
+/// Invocation-local aggregate. A returned complete transcript is independent
+/// of whether every window supplied an actual decode-owner observation.
+pub const DecodeObservation = struct {
+    planned_windows: ?usize = null,
+    decoded_windows: usize = 0,
+    observed_windows: usize = 0,
+    unknown_windows: usize = 0,
+    skipped_silent_windows: usize = 0,
+    attempts_started: usize = 0,
+    attempts_completed: usize = 0,
+    fallback_attempts: usize = 0,
+    accepted_windows: usize = 0,
+    greedy_windows: usize = 0,
+    silent_windows: usize = 0,
+    truncated_windows: usize = 0,
+    accepted_temperature_min: ?f32 = null,
+    accepted_temperature_max: ?f32 = null,
+    returned: bool = false,
+    output_complete: bool = false,
+    speech_recognized: bool = false,
+    failure: ?anyerror = null,
+    overflowed: bool = false,
+
+    fn add(self: *@This(), target: *usize, count: usize) void {
+        target.* = std.math.add(usize, target.*, count) catch {
+            self.overflowed = true;
+            return;
+        };
+    }
+    pub fn skipSilent(self: *@This()) void {
+        self.add(&self.skipped_silent_windows, 1);
+    }
+    pub fn recordWindow(self: *@This(), value: WindowDecodeObservation) void {
+        self.add(&self.decoded_windows, 1);
+        if (!value.available) {
+            self.add(&self.unknown_windows, 1);
+            return;
+        }
+        self.add(&self.observed_windows, 1);
+        self.add(&self.attempts_started, value.attempts_started);
+        self.add(&self.attempts_completed, value.attempts_completed);
+        self.add(&self.fallback_attempts, value.fallback_attempts);
+        self.overflowed = self.overflowed or value.overflowed;
+        if (value.failure) |err| self.failure = err;
+        if (value.silent) self.add(&self.silent_windows, 1);
+        if (value.truncated) self.add(&self.truncated_windows, 1);
+        if (value.provenGreedySpeech()) self.add(&self.greedy_windows, 1);
+        if (value.accepted_temperature) |temperature| {
+            self.add(&self.accepted_windows, 1);
+            self.accepted_temperature_min = if (self.accepted_temperature_min) |previous| @min(previous, temperature) else temperature;
+            self.accepted_temperature_max = if (self.accepted_temperature_max) |previous| @max(previous, temperature) else temperature;
+        }
+    }
+    pub fn provenGreedySpeech(self: @This()) bool {
+        const planned = self.planned_windows orelse return false;
+        return self.returned and self.output_complete and self.speech_recognized and self.failure == null and !self.overflowed and planned != 0 and
+            self.decoded_windows == planned and self.observed_windows == planned and self.unknown_windows == 0 and
+            self.skipped_silent_windows == 0 and self.greedy_windows == planned and self.accepted_windows == planned and
+            self.attempts_started == planned and self.attempts_completed == planned and self.fallback_attempts == 0;
+    }
+};
+
 pub const TranscribeResult = struct {
+    decode_observation: WindowDecodeObservation = .{},
+    termination: Termination = .unknown,
+    selected_attempt_termination: Termination = .unknown,
     text: []const u8,
     language: ?[]const u8,
     allocator: std.mem.Allocator,
@@ -155,6 +270,9 @@ pub fn maxPromptPrefixTokens(max_length: usize) usize {
 }
 
 pub const TranscriptionPipeline = struct {
+    /// Explicit cold caller contract, set only at reviewed server factories.
+    /// Public init remains unqualified; live mutex state is never consulted.
+    incremental_cleanup_contract: enum { unqualified, no_enclosing_lanes } = .unqualified,
     batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
@@ -255,6 +373,33 @@ pub const TranscriptionPipeline = struct {
         sample_rate: u32,
         prompt_prefix: []const i32,
     ) !TranscribeResult {
+        var observation: WindowDecodeObservation = .{};
+        return self.transcribePcmConditionedObserved(samples, sample_rate, prompt_prefix, &observation);
+    }
+
+    /// The borrowed observation is written only during this synchronous call;
+    /// it is never retained by a Session, runtime, decoder, or callback.
+    pub fn transcribePcmConditionedObserved(
+        self: *TranscriptionPipeline,
+        samples: []const f32,
+        sample_rate: u32,
+        prompt_prefix: []const i32,
+        observation: *WindowDecodeObservation,
+    ) !TranscribeResult {
+        observation.* = .{ .available = true };
+        return self.transcribePcmConditionedObserving(samples, sample_rate, prompt_prefix, observation) catch |err| {
+            observation.failure = err;
+            return err;
+        };
+    }
+
+    fn transcribePcmConditionedObserving(
+        self: *TranscriptionPipeline,
+        samples: []const f32,
+        sample_rate: u32,
+        prompt_prefix: []const i32,
+        observation: *WindowDecodeObservation,
+    ) !TranscribeResult {
         try self.output_token_budget.check();
         const consumed_before = self.output_token_budget.consumed;
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
@@ -281,6 +426,7 @@ pub const TranscriptionPipeline = struct {
             .host_preprocess_bytes = std.math.add(usize, pcm_bytes, mel_bytes) catch return error.ResourceLimitExceeded,
         });
         defer encoder_permit.deinit();
+        try stage_runtime.prepareEncoderPermit(self.encoder, self.decoder, self.batch_dispatch, self.execution_control, true, &encoder_permit);
 
         const mel_started = platform.time.monotonicNs();
         const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));
@@ -292,23 +438,26 @@ pub const TranscriptionPipeline = struct {
         const mel_shape = [_]i64{ 1, @intCast(n_mels), @intCast(n_frames) };
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
-        const encoder_outputs = if (self.batch_dispatch) |dispatch|
-            try dispatch.run(allocator, self.encoder, &encoder_permit, null, &.{mel_tensor}, self.execution_control)
+        const RootInput = @import("../execution/owned_incremental_input.zig");
+        var input_cleanup: RootInput.Cleanup = if (self.incremental_cleanup_contract == .no_enclosing_lanes)
+            try RootInput.Cleanup.beginForPairWithoutEnclosingLanes(self.encoder, self.decoder, self.execution_control)
         else
-            try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
-        defer {
-            for (encoder_outputs) |*t| {
-                var mt = t.*;
-                mt.deinit();
-            }
-            allocator.free(encoder_outputs);
-        }
-        if (encoder_outputs.len == 0) return error.NoEncoderOutput;
+            .unqualified;
+        defer input_cleanup.finish();
+        var encoder_outputs = try stage_runtime.encodeForIncrementalWithPermit(allocator, self.encoder, self.decoder, &.{mel_tensor}, self.batch_dispatch, self.execution_control, &encoder_permit);
+        var encoder_outputs_live = true;
+        defer if (encoder_outputs_live) encoder_outputs.deinit(allocator);
         timing.encoder_ns = platform.time.monotonicNs() -| encoder_started;
-        const enc_seq_len: usize = if (encoder_outputs[0].shape.len >= 2) @intCast(encoder_outputs[0].shape[1]) else 1;
+        const enc_seq_len: usize = switch (encoder_outputs) {
+            .host => |outputs| if (outputs.len == 0) return error.NoEncoderOutput else if (outputs[0].shape.len >= 2) @intCast(outputs[0].shape[1]) else 1,
+            .resident => |value| @intCast(value.shape[1]),
+        };
         const enc_mask = try allocator.alloc(i64, enc_seq_len);
         defer allocator.free(enc_mask);
         @memset(enc_mask, 1);
+        var owned_input = try RootInput.OwnedIncrementalInput.take(allocator, &encoder_outputs, self.decoder, &input_cleanup);
+        encoder_outputs_live = false;
+        defer owned_input.deinit();
 
         // 2. Decode, retrying at rising temperature when the greedy pass
         //    fails the reference guards (repetitive text or low confidence).
@@ -317,15 +466,19 @@ pub const TranscriptionPipeline = struct {
         defer if (chosen) |*attempt| attempt.deinit(allocator);
         for (temperatures, 0..) |temperature, attempt_index| {
             if (attempt_index > 0 and (!self.config.temperature_fallback or self.output_token_budget.remaining == 0)) break;
-            var attempt = try self.decodeAttempt(encoder_outputs[0], enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
+            observation.beginAttempt();
+            var attempt = try self.decodeAttempt(&owned_input.encoder, if (owned_input.source) |*source| source else null, enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
+            observation.completeAttempt();
             errdefer attempt.deinit(allocator);
             const needs_fallback = attempt.compression_ratio > self.config.compression_ratio_threshold or
                 attempt.avg_logprob < self.config.logprob_threshold;
-            if (chosen) |*previous| previous.deinit(allocator);
-            chosen = attempt;
+            replaceChosenAttempt(allocator, &chosen, attempt);
             if (!needs_fallback) break;
         }
-        return self.finishWindow(&chosen.?, windowDurationMs(samples.len, sample_rate, context_seconds), timing, self.output_token_budget.consumed - consumed_before);
+        var result = try self.finishWindow(&chosen.?, windowDurationMs(samples.len, sample_rate, context_seconds), timing, self.output_token_budget.consumed - consumed_before);
+        observation.accept(&result);
+        result.decode_observation = observation.*;
+        return result;
     }
 
     /// Materialize owned, valid UTF-8 text before window stitching and byte
@@ -392,6 +545,9 @@ pub const TranscriptionPipeline = struct {
             .compression_ratio = attempt.compression_ratio,
             .temperature = attempt.temperature,
             .silent = silent,
+            .termination = if (silent) .silence else attempt.termination,
+            .selected_attempt_termination = attempt.termination,
+
             .truncated = !attempt.completed and (!silent or self.output_token_budget.remaining == 0),
             .output_tokens = output_tokens,
         };
@@ -416,6 +572,8 @@ pub const TranscriptionPipeline = struct {
 
     /// One full decode of the window at `temperature` (0 = greedy).
     const Attempt = struct {
+        termination: Termination = .unknown,
+
         completed: bool = false,
         generated: std.ArrayListUnmanaged(i32),
         detected_language: ?[]const u8,
@@ -429,9 +587,15 @@ pub const TranscriptionPipeline = struct {
         }
     };
 
+    fn replaceChosenAttempt(allocator: std.mem.Allocator, chosen: *?Attempt, next: Attempt) void {
+        if (chosen.*) |*previous| previous.deinit(allocator);
+        chosen.* = next;
+    }
+
     fn decodeAttempt(
         self: *TranscriptionPipeline,
-        encoder_output: backends.Tensor,
+        encoder_output: *const stage_runtime.EncoderOutputs,
+        incremental_source: ?*const decoder_stage.RetainedEncoderSource,
         enc_seq_len: usize,
         enc_mask: []const i64,
         prompt_prefix: []const i32,
@@ -477,20 +641,13 @@ pub const TranscriptionPipeline = struct {
         var logprob_sum: f64 = 0;
         var no_speech_prob: f32 = 0;
 
-        // Native Whisper sessions decode through the KV cache; ONNX merged
-        // bundles keep their own incremental state; anything else re-runs
-        // the full prefix per step.
-        var native_decoder: ?session_factory.WhisperNativeDecoder = try session_factory.whisperNativeDecoder(
-            self.decoder,
-            allocator,
-            self.execution_control,
-            encoder_output.asFloat32(),
-            enc_seq_len,
-        );
-        defer if (native_decoder) |*decoder| decoder.deinit();
-        timing.kv_cached = native_decoder != null;
-        var incremental = if (native_decoder != null) null else @import("seq2seq_decode.zig").State.init(allocator, self.decoder, encoder_output, enc_mask, self.config.vocab_size);
-        defer if (incremental) |*state| state.deinit();
+        // Complete only already-known contiguous forced positions, using the
+        // exact same operation as later iterations. Dynamic slots stay pending.
+        whisper_prompt.appendKnownForced(dec_ids, &dec_len, forced, &forced_index, offset);
+        const initial_query_rows: ?usize = if (dec_len < max_len and !(dec_len >= prompt_end and self.output_token_budget.remaining == 0)) dec_len else null;
+        var decoder_runtime = try decoder_stage.Decoder.initWithSource(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control, .{ .expected_initial_query_rows = initial_query_rows }, incremental_source);
+        defer decoder_runtime.deinit();
+        timing.kv_cached = decoder_runtime.native != null;
         // Suppression list handed to the device token-choice kernel.
         var suppress_scratch = std.ArrayListUnmanaged(i32).empty;
         defer suppress_scratch.deinit(allocator);
@@ -498,18 +655,16 @@ pub const TranscriptionPipeline = struct {
             @as(usize, @intCast(rules.timestamp_begin)) < self.config.vocab_size;
 
         var completed = false;
+        var termination: Termination = .context_limit;
         while (dec_len < max_len) {
-            if (forced_index < forced.len and forced[forced_index].position + offset == dec_len) {
-                if (forced[forced_index].token_id) |token_id| {
-                    dec_ids[dec_len] = token_id;
-                    dec_len += 1;
-                    forced_index += 1;
-                    continue;
-                }
-            }
+            whisper_prompt.appendKnownForced(dec_ids, &dec_len, forced, &forced_index, offset);
+            if (dec_len == max_len) break;
 
             const generated_position = dec_len;
-            if (generated_position >= prompt_end and self.output_token_budget.remaining == 0) break;
+            if (generated_position >= prompt_end and self.output_token_budget.remaining == 0) {
+                termination = .output_budget;
+                break;
+            }
             if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
             const step_started = platform.time.monotonicNs();
             const dynamic_language_slot = forced_index < forced.len and
@@ -517,80 +672,38 @@ pub const TranscriptionPipeline = struct {
                 forced[forced_index].token_id == null and
                 generated_position == offset + 1;
 
-            var native_logits: ?[]f32 = null;
-            defer if (native_logits) |row| allocator.free(row);
-            var dec_outputs: []backends.Tensor = &.{};
-            defer {
-                for (dec_outputs) |*t| {
-                    var mt = t.*;
-                    mt.deinit();
+            var stats_request: ?whisper_arch.StatsRequest = null;
+            if (decoder_runtime.native != null and temperature == 0 and !dynamic_language_slot) {
+                const free_text = generated_position >= prompt_end;
+                suppress_scratch.clearRetainingCapacity();
+                if (free_text) {
+                    try suppress_scratch.appendSlice(allocator, self.config.decode.suppress_tokens);
+                    if (generated_position == prompt_end) try suppress_scratch.appendSlice(allocator, self.config.decode.begin_suppress_tokens);
+                    if (rules_active) try suppress_scratch.append(allocator, rules.no_timestamps);
                 }
-                if (dec_outputs.len > 0) allocator.free(dec_outputs);
-            }
-            var last_logits: []const f32 = &.{};
-            // Greedy steps let the device choose the token and report the
-            // log-sum-exp terms, so the vocabulary row never leaves the GPU.
-            var step_stats: ?ops.WhisperLogitsStatsRaw = null;
-            if (native_decoder) |*decoder| {
-                const pending = dec_ids[decoder.positions()..dec_len];
-                if (temperature == 0 and !dynamic_language_slot) {
-                    const free_text = generated_position >= prompt_end;
-                    suppress_scratch.clearRetainingCapacity();
-                    if (free_text) {
-                        try suppress_scratch.appendSlice(allocator, self.config.decode.suppress_tokens);
-                        if (generated_position == prompt_end) try suppress_scratch.appendSlice(allocator, self.config.decode.begin_suppress_tokens);
-                        if (rules_active) try suppress_scratch.append(allocator, rules.no_timestamps);
-                    }
-                    const vocab = self.config.vocab_size;
-                    const window = if (free_text and rules_active)
-                        whisper_timestamps.ruleWindow(rules, generated.items, vocab)
-                    else
-                        whisper_timestamps.RuleWindow{ .text_allowed = true, .ts_min = vocab, .ts_max = vocab };
-                    const request = whisper_arch.StatsRequest{
-                        .params = .{
-                            .out_dim = @intCast(vocab),
-                            .suppress_count = @intCast(suppress_scratch.items.len),
-                            .ts_begin = if (free_text and rules_active) @intCast(rules.timestamp_begin) else @intCast(vocab),
-                            .text_allowed = @intFromBool(window.text_allowed),
-                            .ts_min = @intCast(window.ts_min),
-                            .ts_max = @intCast(window.ts_max),
-                            .eot = if (self.config.eos_token_id >= 0) @intCast(self.config.eos_token_id) else @intCast(vocab),
-                            .probe_id = if (free_text and generated_position == prompt_end and self.config.no_timestamps_id > 0) @intCast(self.config.no_timestamps_id - 1) else @intCast(vocab),
-                        },
-                        .suppress = suppress_scratch.items,
-                    };
-                    switch (try decoder.stepWith(pending, .{ .stats = request })) {
-                        .stats => |stats| step_stats = stats,
-                        .logits => |row| {
-                            native_logits = row;
-                            last_logits = row;
-                        },
-                        .none, .encoded => return error.NoDecoderOutput,
-                    }
-                } else {
-                    native_logits = try decoder.step(pending);
-                    last_logits = native_logits.?;
-                }
-            } else {
-                const dec_seq: i64 = @intCast(dec_len);
-                const dec_shape = [_]i64{ 1, dec_seq };
-                var dec_tensor = try backends.Tensor.initInt64(allocator, "input_ids", &dec_shape, dec_ids[0..dec_len]);
-                defer dec_tensor.deinit();
-                const enc_hidden = encoder_output.borrowedView("encoder_hidden_states");
-                dec_outputs = if (incremental) |*state| try state.stepOutputs(dec_ids[0..dec_len], self.batch_dispatch, self.execution_control) else if (self.batch_dispatch) |dispatch| try dispatch.run(allocator, self.decoder, null, null, &.{ dec_tensor, enc_hidden }, self.execution_control) else try self.decoder.runWithControl(
-                    &.{ dec_tensor, enc_hidden },
-                    allocator,
-                    self.execution_control,
-                );
-                if (dec_outputs.len == 0) return error.NoDecoderOutput;
-                const logits = dec_outputs[0].asFloat32();
-                const vocab_size = if (dec_outputs[0].shape.len >= 3)
-                    @as(usize, @intCast(dec_outputs[0].shape[2]))
+                const vocab = self.config.vocab_size;
+                const window = if (free_text and rules_active)
+                    whisper_timestamps.ruleWindow(rules, generated.items, vocab)
                 else
-                    return error.InvalidLogitsShape;
-                if (vocab_size == 0 or logits.len < vocab_size) return error.InvalidLogitsShape;
-                last_logits = logits[logits.len - vocab_size ..];
+                    whisper_timestamps.RuleWindow{ .text_allowed = true, .ts_min = vocab, .ts_max = vocab };
+                stats_request = whisper_arch.StatsRequest{
+                    .params = .{
+                        .out_dim = @intCast(vocab),
+                        .suppress_count = @intCast(suppress_scratch.items.len),
+                        .ts_begin = if (free_text and rules_active) @intCast(rules.timestamp_begin) else @intCast(vocab),
+                        .text_allowed = @intFromBool(window.text_allowed),
+                        .ts_min = @intCast(window.ts_min),
+                        .ts_max = @intCast(window.ts_max),
+                        .eot = if (self.config.eos_token_id >= 0) @intCast(self.config.eos_token_id) else @intCast(vocab),
+                        .probe_id = if (free_text and generated_position == prompt_end and self.config.no_timestamps_id > 0) @intCast(self.config.no_timestamps_id - 1) else @intCast(vocab),
+                    },
+                    .suppress = suppress_scratch.items,
+                };
             }
+            var decoder_row = try decoder_runtime.step(dec_ids[0..dec_len], stats_request, self.batch_dispatch);
+            defer decoder_row.deinit();
+            const step_stats = decoder_row.stats;
+            const last_logits = decoder_row.logits;
             const vocab_size = last_logits.len;
             const step_ns = platform.time.monotonicNs() -| step_started;
             if (generated_position >= prompt_end) {
@@ -652,6 +765,7 @@ pub const TranscriptionPipeline = struct {
                 try self.output_token_budget.consume();
                 if (best_token == self.config.eos_token_id) {
                     completed = true;
+                    termination = .eos;
                     break;
                 }
             }
@@ -667,11 +781,23 @@ pub const TranscriptionPipeline = struct {
             // shape, so the device can choose tokens and keep the grammar
             // itself while the host runs one step ahead. Anything the
             // backend declines leaves the loop on the synchronous path.
-            if (native_decoder) |*decoder| {
+            if (decoder_runtime.native) |*decoder| {
                 if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len and self.output_token_budget.remaining != 0) {
-                    if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
-                        completed = true;
-                        break;
+                    switch (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
+                        .declined => {},
+                        .eos => {
+                            termination = .eos;
+                            completed = true;
+                            break;
+                        },
+                        .context_limit => {
+                            termination = .context_limit;
+                            break;
+                        },
+                        .output_budget => {
+                            termination = .output_budget;
+                            break;
+                        },
                     }
                 }
             }
@@ -683,6 +809,8 @@ pub const TranscriptionPipeline = struct {
         defer allocator.free(text);
         return .{
             .generated = generated,
+            .termination = termination,
+
             .completed = completed,
             .detected_language = detected_language,
             .no_speech_prob = no_speech_prob,
@@ -695,8 +823,8 @@ pub const TranscriptionPipeline = struct {
     /// Greedy free-text steps with one step in flight: while the frame
     /// for position p runs, the host encodes the frame for p+1 (embedding
     /// the token slot the frame for p writes), then waits for p and
-    /// submits p+1. Returns true when decoding finished here (end of text
-    /// or the length limit); false when the backend could not pipeline
+    /// submits p+1. Returns an actual EOS or context-limit reason when decoding finished
+    /// here; declined means the backend could not pipeline
     /// and the caller must continue synchronously from `dec_len`, which
     /// is then consistent with the decoder cache.
     fn decodePipelined(
@@ -710,19 +838,10 @@ pub const TranscriptionPipeline = struct {
         rules_active: bool,
         logprob_sum: *f64,
         timing: *Timing,
-    ) !bool {
+    ) !PipelinedTermination {
         const allocator = self.allocator;
         const max_len = try self.output_token_budget.decodeEnd(dec_len.*, self.config.max_length);
         const trace = platform.env.getenvBool("TERMITE_WHISPER_TRACE_PIPELINE");
-        if (!decoder.setPipelined(true)) {
-            if (trace) std.debug.print("whisper_pipeline: declined (backend cannot pipeline)\n", .{});
-            return false;
-        }
-        defer _ = decoder.setPipelined(false);
-        // Whatever happens, no frame may outlive this call: the cache slabs
-        // it writes are freed with the decoder.
-        defer decoder.drain();
-
         suppress_scratch.clearRetainingCapacity();
         try suppress_scratch.appendSlice(allocator, self.config.decode.suppress_tokens);
         if (rules_active) try suppress_scratch.append(allocator, rules.no_timestamps);
@@ -732,14 +851,15 @@ pub const TranscriptionPipeline = struct {
         };
         const vocab = self.config.vocab_size;
         const state = whisper_timestamps.grammarState(rules, generated.items, vocab, rules_active);
-        if (!decoder.seedGrammar(&state)) {
-            if (trace) std.debug.print("whisper_pipeline: declined (grammar seed)\n", .{});
-            return false;
-        }
+        var stage = pending_step.PipelinedStage(session_factory.WhisperNativeDecoder).begin(decoder, &state) orelse {
+            if (trace) std.debug.print("whisper_pipeline: declined (backend pipeline or grammar seed)\n", .{});
+            return .declined;
+        };
+        defer stage.deinit();
         var mode: u32 = ops.whisper_logits_mode_device_window | ops.whisper_logits_mode_choose;
         if (rules_active) mode |= ops.whisper_logits_mode_timestamps;
         if (eot_allowed) mode |= ops.whisper_logits_mode_eot_allowed;
-        var params = ops.WhisperLogitsParams{
+        const params = ops.WhisperLogitsParams{
             .out_dim = @intCast(vocab),
             .suppress_count = @intCast(suppress_scratch.items.len),
             .ts_begin = if (rules_active) @intCast(rules.timestamp_begin) else @intCast(vocab),
@@ -752,20 +872,9 @@ pub const TranscriptionPipeline = struct {
         };
 
         // The first in-flight step embeds the token the host just chose.
-        var slot: usize = 0;
-        params.token_slot = 0;
-        params.stats_slot = 0;
         var step_started = platform.time.monotonicNs();
-        const pending = dec_ids[decoder.positions()..dec_len.*];
-        const first = decoder.stepWith(pending, .{ .pipelined = .{ .params = params, .suppress = suppress_scratch.items } }) catch |err| switch (err) {
-            error.UnsupportedOperation => {
-                if (trace) std.debug.print("whisper_pipeline: declined (first step unsupported)\n", .{});
-                return false;
-            },
-            else => return err,
-        };
-        if (first != .encoded) return false;
-        try decoder.submit();
+        if (!try stage.encodePrefix(dec_ids[0..dec_len.*], params, suppress_scratch.items)) return .declined;
+        try stage.submit();
         var steps: usize = 0;
         defer if (trace) std.debug.print("whisper_pipeline: {d} steps in flight mode\n", .{steps});
 
@@ -774,18 +883,11 @@ pub const TranscriptionPipeline = struct {
             if (self.execution_control) |control| try control.update(.executing, @intCast(position), @intCast(self.config.max_length));
             // Encode the next step while this one runs; it reads the token
             // this step's choice kernel writes to `slot`.
-            var lookahead = false;
-            if (position + 1 < max_len) {
-                params.token_slot = @intCast(1 - slot);
-                params.stats_slot = @intCast(1 - slot);
-                const placeholder = [_]i64{0};
-                const next = decoder.stepWith(&placeholder, .{ .pipelined = .{ .params = params, .suppress = suppress_scratch.items, .device_token_slot = slot } }) catch |err| switch (err) {
-                    error.UnsupportedOperation => null,
-                    else => return err,
-                };
-                lookahead = next != null and next.? == .encoded;
-            }
-            const stats = (try decoder.awaitStats(slot)) orelse return error.NoDecoderOutput;
+            const lookahead = if (position + 1 < max_len)
+                try stage.encodeLookahead(params, suppress_scratch.items)
+            else
+                false;
+            const stats = try stage.awaitStats();
             steps += 1;
             if (trace and !lookahead and position + 1 < max_len) std.debug.print("whisper_pipeline: lookahead unsupported at position {d}\n", .{position});
             const now = platform.time.monotonicNs();
@@ -797,8 +899,8 @@ pub const TranscriptionPipeline = struct {
             try self.output_token_budget.consume();
             if (token == self.config.eos_token_id) {
                 // The encoded lookahead, if any, predicted past the end.
-                if (lookahead) decoder.discard();
-                return true;
+                if (lookahead) stage.discardLookahead();
+                return .eos;
             }
             dec_ids[dec_len.*] = token;
             dec_len.* += 1;
@@ -807,10 +909,10 @@ pub const TranscriptionPipeline = struct {
                 // Either the length limit or a backend that could not
                 // encode the lookahead; the cache is consistent with
                 // `dec_len` either way.
-                return false;
+                if (self.output_token_budget.remaining == 0) return .output_budget;
+                return if (dec_len.* >= max_len) .context_limit else .declined;
             }
-            try decoder.submit();
-            slot = 1 - slot;
+            try stage.submitLookahead();
         }
     }
 
@@ -964,6 +1066,186 @@ test "exhausted transcription fails before touching model resources" {
     try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
 }
 
+fn checkTranscriptionPendingFault(fail_on_encode: usize, choice_token: i32, expected: ?PipelinedTermination, remaining: ?usize) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    if (!platform.env.getenvBool("TERMITE_WHISPER_ENABLE_PIPELINED_DECODE")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const fixture = @import("../ops/media_residency_test.zig");
+    const Probe = struct {
+        compute: native.NativeCompute,
+        fail_on_encode: usize,
+        choice_token: i32,
+        encodes: usize = 0,
+        submits: usize = 0,
+        waits: usize = 0,
+        active: bool = false,
+        submitted: bool = false,
+        fn get(raw: *anyopaque) *@This() {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("compute", compute);
+        }
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+        fn pipeline(_: *anyopaque, _: bool) bool {
+            return true;
+        }
+        fn begin(raw: *anyopaque) !bool {
+            get(raw).active = true;
+            return true;
+        }
+        fn activeFrame(raw: *anyopaque) bool {
+            return get(raw).active;
+        }
+        fn submit(raw: *anyopaque) !void {
+            const self = get(raw);
+            self.active = false;
+            self.submitted = true;
+            self.submits += 1;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self = get(raw);
+            self.submitted = false;
+            self.waits += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            get(raw).active = false;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            get(raw).active = false;
+        }
+        fn scope(_: *anyopaque) !bool {
+            return true;
+        }
+        fn regime(_: *anyopaque, _: ops.DecoderRuntimeFrameRegime) !void {}
+        fn grammar(_: *anyopaque, _: *const ops.WhisperGrammarState) bool {
+            return true;
+        }
+        fn deviceEmbedding(raw: *anyopaque, weight: ops.CT, _: usize, width: usize) !?ops.CT {
+            return try get(raw).compute.computeBackend().embeddingLookup(weight, &.{1}, 1, width);
+        }
+        fn encode(raw: *anyopaque, logits: ops.CT, _: *const ops.WhisperLogitsParams, _: []const i32) !bool {
+            const self = get(raw);
+            // Numerical Native projection really completed before this callback;
+            // frame callbacks only bound its asynchronous lifecycle for the test.
+            const values = try self.compute.computeBackend().toFloat32(logits, std.testing.allocator);
+            defer std.testing.allocator.free(values);
+            try std.testing.expectEqual(@as(usize, 4), values.len);
+            self.encodes += 1;
+            if (self.encodes == self.fail_on_encode) return error.UnsupportedOperation;
+            return true;
+        }
+        fn read(raw: *anyopaque, _: usize, stats: *ops.WhisperLogitsStatsRaw) bool {
+            @memset(stats, 0);
+            stats[whisper_timestamps.stats_choice_token] = @bitCast(@as(u32, @intCast(get(raw).choice_token)));
+            return true;
+        }
+    };
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try fixture.putWeight(&weights, "model.decoder.embed_tokens.weight", &.{ 4, 4 }, null);
+    try fixture.putWeight(&weights, "model.decoder.embed_positions.weight", &.{ 8, 4 }, null);
+    try fixture.putWeight(&weights, "model.decoder.layer_norm.weight", &.{4}, 1);
+    try fixture.putWeight(&weights, "model.decoder.layer_norm.bias", &.{4}, 0);
+    var probe = Probe{ .compute = native.NativeCompute.init(a, &weights, null), .fail_on_encode = fail_on_encode, .choice_token = choice_token };
+    defer probe.compute.deinit();
+    const base = probe.compute.computeBackend();
+    const config = whisper_arch.Config{ .d_model = 4, .decoder_layers = 0, .decoder_attention_heads = 1, .vocab_size = 4, .max_target_positions = 8 };
+    const encoder = try base.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    var cache = whisper_arch.DecodeCache.init(&base, a, config, encoder, 1) catch |err| {
+        base.free(encoder);
+        return err;
+    };
+    const warm = try whisper_arch.decoderStepCachedLogits(&base, a, config, &.{0}, &cache);
+    a.free(warm);
+    var table = base.vtable.*;
+    table.backendKind = Probe.kind;
+    table.regions.commands = .{ .setPipelinedFrames = Probe.pipeline, .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitFrame = Probe.submit, .waitSubmittedFrame = Probe.wait, .submitAndWaitFrame = Probe.finish, .cancelFrame = Probe.cancel };
+    table.regions.decoder.beginPlannedComputeScope = Probe.scope;
+    table.regions.decoder.setActiveFrameRegime = Probe.regime;
+    table.regions.token_selection.writeGrammar = Probe.grammar;
+    table.regions.token_selection.encodeLogitsStats = Probe.encode;
+    table.regions.token_selection.readLogitsStats = Probe.read;
+    table.embeddingLookupDeviceToken = Probe.deviceEmbedding;
+    var backend = base;
+    backend.vtable = &table;
+    var decoder = session_factory.WhisperNativeDecoder{ .allocator = a, .cb = .{ .backend = backend, .guard = .{}, .owns_backend = false }, .config = config, .encoder_hidden = encoder, .cache = cache, .gate = null };
+    defer decoder.deinit();
+    var task = TranscriptionPipeline.init(a, undefined, undefined, undefined, .{ .vocab_size = 4, .max_length = 4, .eos_token_id = 3, .max_output_tokens = remaining });
+    var tokens = [_]i64{ 0, 1, 0, 0 };
+    var length: usize = 2;
+    var generated = std.ArrayListUnmanaged(i32).empty;
+    defer generated.deinit(a);
+    var suppressed = std.ArrayListUnmanaged(i32).empty;
+    defer suppressed.deinit(a);
+    var logprob: f64 = 0;
+    var timing = Timing{};
+    if (fail_on_encode == 0) {
+        try std.testing.expectError(error.InferenceOutputTokensExceeded, task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing));
+        try std.testing.expect(!probe.active and !probe.submitted);
+        return;
+    }
+    if (expected) |reason| {
+        const actual = try task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing);
+        try std.testing.expectEqual(reason, actual);
+        try std.testing.expect(!probe.active and !probe.submitted);
+        if (reason == .eos) {
+            try std.testing.expectEqual(@as(usize, 0), generated.items.len);
+            try std.testing.expectEqual(@as(usize, 2), length);
+        } else {
+            try std.testing.expectEqual(@as(usize, 2), generated.items.len);
+            try std.testing.expectEqual(@as(usize, 4), length);
+        }
+        return;
+    }
+    try std.testing.expectError(error.UnsupportedOperation, task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing));
+    try std.testing.expectEqual(fail_on_encode, probe.encodes);
+    try std.testing.expect(!probe.active and !probe.submitted);
+    try std.testing.expectEqual(@as(usize, 0), generated.items.len);
+    try std.testing.expectEqual(@as(usize, 2), length);
+    try std.testing.expectEqual(fail_on_encode - 1, probe.submits);
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+}
+
+test "transcription initial pipeline error cannot decline after actual decoder projection" {
+    try checkTranscriptionPendingFault(1, 1, null, null);
+}
+test "transcription lookahead error cannot publish after actual decoder projection" {
+    try checkTranscriptionPendingFault(2, 1, null, null);
+}
+
+test "transcription selected fallback cannot inherit previous attempt EOS termination" {
+    const a = std.testing.allocator;
+    const Make = struct {
+        fn attempt(allocator: std.mem.Allocator, termination: Termination) !TranscriptionPipeline.Attempt {
+            var generated = std.ArrayListUnmanaged(i32).empty;
+            try generated.append(allocator, 1);
+            return .{ .generated = generated, .detected_language = null, .no_speech_prob = 0, .avg_logprob = 0, .compression_ratio = 0, .temperature = 0, .termination = termination };
+        }
+    };
+    var chosen: ?TranscriptionPipeline.Attempt = null;
+    defer if (chosen) |*attempt| attempt.deinit(a);
+    TranscriptionPipeline.replaceChosenAttempt(a, &chosen, try Make.attempt(a, .eos));
+    try std.testing.expect(chosen.?.termination == .eos);
+    TranscriptionPipeline.replaceChosenAttempt(a, &chosen, try Make.attempt(a, .context_limit));
+    try std.testing.expect(chosen.?.termination == .context_limit);
+    TranscriptionPipeline.replaceChosenAttempt(a, &chosen, try Make.attempt(a, .unknown));
+    try std.testing.expect(chosen.?.termination == .unknown);
+    const other_path = TranscribeResult{ .text = "", .language = null, .allocator = a };
+    try std.testing.expect(other_path.termination == .unknown and other_path.selected_attempt_termination == .unknown);
+}
+
+test "transcription actual pipelined EOT and context limit have distinct termination evidence" {
+    try checkTranscriptionPendingFault(std.math.maxInt(usize), 3, .eos, null);
+    try checkTranscriptionPendingFault(std.math.maxInt(usize), 1, .context_limit, null);
+}
+
+test "transcription actual last output budget slot can be EOS while a partial prefix reports exhaustion" {
+    try checkTranscriptionPendingFault(std.math.maxInt(usize), 3, .eos, 1);
+    try checkTranscriptionPendingFault(0, 1, .output_budget, 1);
+}
+
 const utf8_test_tokenizer =
     \\{"model":{"type":"BPE","vocab":{"ok":0,"Ã":1,"©":2,"ä":3,"¸":4,"ĸ":5,"ð":6,"Ł":7,"ĺ":8,"Ģ":9},"merges":[]},"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false},"decoder":{"type":"ByteLevel"}}
 ;
@@ -1076,4 +1358,67 @@ test "Whisper UTF-8 result materialization releases every failed allocation" {
     defer hf.deinitSelf();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkUtf8Window, .{ hf.tokenizer(), @as([]const i32, &.{ 0, 1, 2, 3 }), @as([]const u8, "oké"), true, false });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkUtf8Window, .{ hf.tokenizer(), @as([]const i32, &.{1}), @as([]const u8, ""), true, false });
+}
+
+test "transcription decode observation distinguishes missing silence truncation retries and greedy EOS" {
+    var absent: WindowDecodeObservation = .{};
+    try std.testing.expect(!absent.provenGreedySpeech());
+    absent.available = true;
+    try std.testing.expect(!absent.provenGreedySpeech());
+    var value: WindowDecodeObservation = .{ .available = true };
+    value.beginAttempt();
+    try std.testing.expect(!value.provenGreedySpeech());
+    value.completeAttempt();
+    var result = TranscribeResult{ .allocator = std.testing.allocator, .text = "spoken", .language = null, .temperature = 0, .selected_attempt_termination = .eos };
+    value.accept(&result);
+    try std.testing.expect(value.provenGreedySpeech());
+    for ([_]Termination{ .unknown, .context_limit, .output_budget, .silence }) |termination| {
+        result.selected_attempt_termination = termination;
+        value.accept(&result);
+        try std.testing.expect(!value.provenGreedySpeech());
+    }
+    result.selected_attempt_termination = .eos;
+    result.silent = true;
+    value.accept(&result);
+    try std.testing.expect(!value.provenGreedySpeech());
+    result.silent = false;
+    result.truncated = true;
+    value.accept(&result);
+    try std.testing.expect(!value.provenGreedySpeech());
+    result.truncated = false;
+    value.accept(&result);
+    value.beginAttempt();
+    value.completeAttempt();
+    result.temperature = 0.2;
+    value.accept(&result);
+    try std.testing.expectEqual(@as(usize, 2), value.attempts_started);
+    try std.testing.expectEqual(@as(usize, 1), value.fallback_attempts);
+    try std.testing.expectEqual(@as(?f32, 0.2), value.accepted_temperature);
+    try std.testing.expect(!value.provenGreedySpeech());
+    value.attempts_started = std.math.maxInt(usize);
+    value.beginAttempt();
+    try std.testing.expect(value.overflowed);
+    try std.testing.expect(!value.provenGreedySpeech());
+}
+
+test "transcription observed adapter retains cancellation and zero-budget before any Session access" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var pipeline = TranscriptionPipeline.init(std.testing.allocator, undefined, undefined, undefined, .{});
+    pipeline.execution_control = .{ .check_fn = Cancel.check };
+    var observed: WindowDecodeObservation = .{};
+    try std.testing.expectError(error.Cancelled, pipeline.transcribePcmConditionedObserved(&.{1}, 16000, &.{}, &observed));
+    try std.testing.expect(observed.available);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), observed.failure);
+    try std.testing.expectEqual(@as(usize, 0), observed.attempts_started);
+    try std.testing.expect(observed.accepted_temperature == null and !observed.provenGreedySpeech());
+    pipeline.execution_control = null;
+    pipeline.output_token_budget.remaining = 0;
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditionedObserved(&.{1}, 16000, &.{}, &observed));
+    try std.testing.expectEqual(@as(?anyerror, error.InferenceOutputTokensExceeded), observed.failure);
+    try std.testing.expectEqual(@as(usize, 0), observed.attempts_completed);
+    try std.testing.expect(!observed.provenGreedySpeech());
 }

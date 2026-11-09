@@ -25,6 +25,20 @@ pub const ForcedDecoderId = struct {
     token_id: ?i32,
 };
 
+/// The same contiguous fixed-token operation used before construction and
+/// after a generated language/hole. Null slots and gaps remain model decisions.
+/// The caller has already validated sorted positions against this buffer.
+pub fn appendKnownForced(ids: []i64, length: *usize, forced: []const ForcedDecoderId, forced_index: *usize, offset: usize) void {
+    while (length.* < ids.len and forced_index.* < forced.len) {
+        const next = forced[forced_index.*];
+        if (next.position + offset != length.*) break;
+        const token = next.token_id orelse break;
+        ids[length.*] = token;
+        length.* += 1;
+        forced_index.* += 1;
+    }
+}
+
 pub const LanguageToken = struct {
     token_id: i32,
     code: []const u8,
@@ -630,4 +644,28 @@ test "decode settings fall back to the fixed Whisper token layout" {
     decode.start_of_prev_id = decode.start_of_prev_id orelse 13 - 2;
     try std.testing.expectEqual(@as(?i32, 11), decode.start_of_prev_id);
     try std.testing.expectEqual(@as(i32, 14), decode.timestamp_begin_id);
+}
+
+test "initial declared Whisper query follows the exact contiguous forced prefix through language slots holes and previous text" {
+    var ids = [_]i64{ 99, 10, 11, 0, 0, 0, 0, 0 };
+    const forced = [_]ForcedDecoderId{ .{ .position = 1, .token_id = 2 }, .{ .position = 2, .token_id = null }, .{ .position = 3, .token_id = 4 }, .{ .position = 5, .token_id = 6 } };
+    var length: usize = 3; // previous text rows and the original start token
+    var next: usize = 0;
+    appendKnownForced(&ids, &length, &forced, &next, 2);
+    try std.testing.expectEqual(@as(usize, 4), length);
+    try std.testing.expectEqual(@as(usize, 1), next);
+    try std.testing.expectEqualSlices(i64, &.{ 99, 10, 11, 2 }, ids[0..length]);
+    // Actual language generation consumes the null slot, then the SAME helper
+    // appends its known successor and stops at the original positional hole.
+    ids[length] = 3;
+    length += 1;
+    next += 1;
+    appendKnownForced(&ids, &length, &forced, &next, 2);
+    try std.testing.expectEqual(@as(usize, 6), length);
+    try std.testing.expectEqual(@as(usize, 3), next);
+    ids[length] = 5;
+    length += 1;
+    appendKnownForced(&ids, &length, &forced, &next, 2);
+    try std.testing.expectEqual(@as(usize, 8), length);
+    try std.testing.expectEqualSlices(i64, &.{ 99, 10, 11, 2, 3, 4, 5, 6 }, &ids);
 }

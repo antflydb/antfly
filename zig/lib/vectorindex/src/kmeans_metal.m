@@ -109,9 +109,12 @@ static void antfly_kmeans_metal_debug_context_create_failure(
     );
 }
 
+#include "kmeans_distance.msl.h"
+
 static NSString *antfly_kmeans_metal_source(void) {
     return @"#include <metal_stdlib>\n"
            "using namespace metal;\n"
+           ANTFLY_TILE_DISTANCE_MSL
            "struct Params { uint point_count; uint cluster_count; uint dims; int metric; uint update_block_size; uint update_block_count; };\n"
            "kernel void kmeans_assign(device const float* points [[buffer(0)]],\n"
            "                         device const float* centroids [[buffer(1)]],\n"
@@ -125,29 +128,7 @@ static NSString *antfly_kmeans_metal_source(void) {
            "    uint best_cluster = 0;\n"
            "    for (uint cluster = 0; cluster < p.cluster_count; cluster++) {\n"
            "        const uint centroid_base = cluster * p.dims;\n"
-           "        float dot = 0.0f;\n"
-           "        float point_norm_sq = 0.0f;\n"
-           "        float centroid_norm_sq = 0.0f;\n"
-           "        float l2 = 0.0f;\n"
-           "        for (uint dim = 0; dim < p.dims; dim++) {\n"
-           "            const float point = points[point_base + dim];\n"
-           "            const float centroid = centroids[centroid_base + dim];\n"
-           "            const float delta = point - centroid;\n"
-           "            dot += point * centroid;\n"
-           "            point_norm_sq += point * point;\n"
-           "            centroid_norm_sq += centroid * centroid;\n"
-           "            l2 += delta * delta;\n"
-           "        }\n"
-           "        float distance = l2;\n"
-           "        if (p.metric == 1) {\n"
-           "            distance = -dot;\n"
-           "        } else if (p.metric == 2) {\n"
-           "            if (point_norm_sq == 0.0f || centroid_norm_sq == 0.0f) {\n"
-           "                distance = 1.0f;\n"
-           "            } else {\n"
-           "                distance = 1.0f - dot * rsqrt(point_norm_sq * centroid_norm_sq);\n"
-           "            }\n"
-           "        }\n"
+           "        const float distance = antfly_tile_distance(points + point_base, centroids + centroid_base, p.dims, p.metric);\n"
            "        if (distance < best) {\n"
            "            best = distance;\n"
            "            best_cluster = cluster;\n"

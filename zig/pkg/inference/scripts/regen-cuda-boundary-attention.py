@@ -30,7 +30,30 @@ import tempfile
 
 ARTIFACTS = Path(__file__).resolve().parents[1] / "src/ops/cuda/artifacts"
 DIRECTIONS = ("forward", "backward")
+ARCHITECTURES = {"sm_89": "cubin", "sm_80": "sm80.cubin", "sm_120": "sm120.cubin"}
 OPTIONS = ("-std=c++17", "-O3", "-DNDEBUG", "--fmad=false")
+
+
+def source_name(direction, arch):
+    target = "_sm120" if arch == "sm_120" else ""
+    return f"gliner25_boundary_attention_{direction}{target}.cu"
+
+
+def source_files(arch):
+    files = [source_name(direction, arch) for direction in DIRECTIONS]
+    if arch == "sm_120":
+        files.append("gliner25_boundary_attention_sm120.cuh")
+    return files
+
+
+def validate_retained_sources(prior, sources, selected):
+    for arch in ARCHITECTURES:
+        if arch in selected:
+            continue
+        for name in source_files(arch):
+            if prior.get("source_sha256", {}).get(name) != sources[name]:
+                raise RuntimeError(f"source changed for retained {arch}: {name}")
+
 
 
 def sha(data):
@@ -48,37 +71,57 @@ def main():
         type=Path,
         default=Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")),
     )
+    parser.add_argument("--architectures", nargs="+", choices=tuple(ARCHITECTURES), default=tuple(ARCHITECTURES))
     args = parser.parse_args()
     nvcc = args.cuda / "bin/nvcc"
     version = subprocess.check_output([nvcc, "--version"], text=True)
+    # Partial regeneration preserves legacy images and their trainer identities.
+    # A closed manifest still verifies every shipped byte and source hash.
+    prior_path = args.output_dir / "gliner25_boundary_attention.json"
+    if not prior_path.exists():
+        prior_path = ARTIFACTS / "gliner25_boundary_attention.json"
+    prior = json.loads(prior_path.read_text()) if prior_path.exists() else {}
     outputs = {}
-    sources = {}
-    for direction in DIRECTIONS:
-        source_name = f"gliner25_boundary_attention_{direction}.cu"
-        source = (ARTIFACTS / source_name).read_bytes()
-        sources[source_name] = sha(source)
-        with tempfile.TemporaryDirectory(prefix="gliner25-boundary-") as temp:
-            src = Path(temp) / source_name
-            src.write_bytes(source)
-            for suffix, arch in (("cubin", "sm_89"), ("sm80.cubin", "sm_80")):
-                name = f"gliner25_boundary_attention_{direction}.{suffix}"
+    for name, expected in prior.get("artifacts", {}).items():
+        path = prior_path.parent / name
+        data = path.read_bytes()
+        if sha(data) != expected:
+            raise RuntimeError(f"invalid prior artifact: {path}")
+        outputs[name] = data
+    compiler_by_arch = dict(prior.get("compiler_by_arch", {}))
+    for arch, suffix in ARCHITECTURES.items():
+        if any(f"gliner25_boundary_attention_{d}.{suffix}" in outputs for d in DIRECTIONS):
+            compiler_by_arch.setdefault(arch, prior.get("compiler", version.strip()))
+    sources = {
+        name: sha((ARTIFACTS / name).read_bytes())
+        for arch in ARCHITECTURES for name in source_files(arch)
+    }
+    if prior:
+        validate_retained_sources(prior, sources, args.architectures)
+    with tempfile.TemporaryDirectory(prefix="gliner25-boundary-") as temp:
+        for name in sources:
+            (Path(temp) / name).write_bytes((ARTIFACTS / name).read_bytes())
+        for arch in args.architectures:
+            for direction in DIRECTIONS:
+                source = Path(temp) / source_name(direction, arch)
+                name = f"gliner25_boundary_attention_{direction}.{ARCHITECTURES[arch]}"
                 out = Path(temp) / name
                 subprocess.run(
-                    [
-                        str(nvcc),
-                        "-cubin",
-                        f"-arch={arch}",
-                        *OPTIONS,
-                        str(src),
-                        "-o",
-                        str(out),
-                    ],
+                    [str(nvcc), "-cubin", f"-arch={arch}", *OPTIONS, str(source), "-o", str(out)],
                     check=True,
                 )
                 outputs[name] = out.read_bytes()
+    for arch in args.architectures:
+        compiler_by_arch[arch] = version.strip()
     metadata = {
+        "compiler_by_arch": compiler_by_arch,
+        "source_files_by_arch": {arch: source_files(arch) for arch in ARCHITECTURES},
+        "profile_by_arch": {
+            arch: "gliner25_boundary_attention_warp_d32_v2" if arch == "sm_120" else "gliner25_boundary_attention_native_d32_v1"
+            for arch in ARCHITECTURES
+        },
         "profile": "gliner25_boundary_attention_native_d32_v1",
-        "compiler": version.strip(),
+        "compiler": version.strip() if set(args.architectures) == set(ARCHITECTURES) else prior.get("compiler", version.strip()),
         "options": list(OPTIONS),
         "source_sha256": sources,
         "artifacts": {name: sha(data) for name, data in outputs.items()},

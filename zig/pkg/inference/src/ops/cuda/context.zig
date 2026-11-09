@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const driver_mod = @import("driver.zig");
+const artifact = @import("artifact.zig");
 const allocation_ledger = @import("allocation_ledger.zig");
 // Orders internal retains and allocation publication against the final
 // release/state-query/reconciliation boundary. External retainers may keep
@@ -43,6 +44,7 @@ pub const DeviceInfo = struct {
     name_len: usize = 0,
     compute_major: i32 = 0,
     compute_minor: i32 = 0,
+    multiprocessor_count: i32 = 0,
 
     pub fn nameSlice(self: *const DeviceInfo) []const u8 {
         return self.name[0..self.name_len];
@@ -50,7 +52,9 @@ pub const DeviceInfo = struct {
 };
 
 pub const RuntimeStats = struct {
+    /// Legacy accepted launch API events, including capture recording and graphs.
     kernel_launches: usize = 0,
+    graph_submissions: usize = 0,
     stream_syncs: usize = 0,
 };
 
@@ -89,6 +93,10 @@ pub const GraphExecUpdateOutcome = struct {
 };
 
 pub const CudaContext = struct {
+    /// Borrowed only during an explicitly bound actual Stage numerical lane.
+    /// Stage clears it before any model unlock; no constructor epoch is cached.
+    prepared_cache_funding: ?*@import("prepared_cache.zig").Funding = null,
+
     driver: CudaDriver,
     device: CUdevice,
     ctx: CUcontext,
@@ -99,12 +107,42 @@ pub const CudaContext = struct {
     video_decoder_cache: ?*anyopaque = null,
     video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
     video_cache_budget: @import("video_cache_budget.zig").CacheBudget = .{},
+    // Borrowed ONLY through a synchronous checked decoder-close call. This
+    // pure callback context grants no numerical authority and is cleared before
+    // returning; no construction epoch/operation token enters persistent cache.
+    video_callback_cleanup: ?struct {
+        boundary: ?*const @import("../../execution/retirement_sink.zig").Epoch,
+        outside_execution: bool,
+    } = null,
     stats: RuntimeStats = .{},
+    observation: std.atomic.Value(?*@import("graph_observation.zig").State) = .init(null),
+    observation_enable_failed: std.atomic.Value(bool) = .init(false),
     device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
     debug_graph_capture_id: usize = 0,
     debug_graph_capture_param_trace_count: usize = 0,
     debug_graph_capture_tensor_trace_count: usize = 0,
+
+    pub fn enableRuntimeObservation(self: *CudaContext) void {
+        _ = self.device_allocations.enableObservation(@import("../../execution/allocation_registry.zig").metadataAllocator());
+        self.enableRuntimeObservationWithAllocator(std.heap.page_allocator);
+    }
+    fn enableRuntimeObservationWithAllocator(self: *CudaContext, allocator: std.mem.Allocator) void {
+        if (self.observation.load(.acquire) != null) return;
+        const candidate = @import("graph_observation.zig").State.create(allocator) catch {
+            self.observation_enable_failed.store(true, .release);
+            return;
+        };
+        if (self.observation.cmpxchgStrong(null, candidate, .acq_rel, .acquire)) |_| candidate.deinit();
+        self.observation_enable_failed.store(false, .release);
+    }
+    pub fn runtimeObservation(self: *const CudaContext) ?@import("../../execution/runtime_telemetry.zig").Cuda {
+        if (self.observation.load(.acquire)) |state| return state.snapshot();
+        return if (self.observation_enable_failed.load(.acquire)) .{ .state = .allocation_failed } else null;
+    }
+    fn graphObservationApi(self: *const CudaContext) @import("graph_observation.zig").Api {
+        return .{ .get_nodes = self.driver.fns.cuGraphGetNodes, .get_type = self.driver.fns.cuGraphNodeGetType, .get_child = self.driver.fns.cuGraphChildGraphNodeGetGraph };
+    }
 
     pub fn initDefault() driver_mod.Error!CudaContext {
         var driver = try CudaDriver.open();
@@ -127,6 +165,25 @@ pub const CudaContext = struct {
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
 
         checkStep(&driver, "cuDeviceComputeCapability", driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device)) catch |err| return err;
+        info.multiprocessor_count = try queryMultiprocessorCount(&driver, device);
+
+        // Reject incompatible images before retaining a context or allocating
+        // device storage. Do not confuse toolkit installation with driver API
+        // capability, or impose the PTX compiler floor on bundled native code.
+        _ = artifact.contract.admit(artifact.profile, info.driver_version, info.compute_major, info.compute_minor) catch |err| {
+            if (err == error.CudaDriverTooOld) {
+                const path = try artifact.contract.loadPath(artifact.profile, info.compute_major, info.compute_minor);
+                const required = artifact.contract.requiredDriver(path);
+                std.log.err("CUDA {s} on {s} (sm_{d}{d}) needs driver API {d}.{d} for {s} code; found {d}.{d}. Upgrade the NVIDIA driver{s}.", .{
+                    artifact.mode,                                  info.nameSlice(),                                                                                       info.compute_major, info.compute_minor,
+                    @divTrunc(required, 1000),                      @divTrunc(@mod(required, 1000), 10),                                                                    @tagName(path),     @divTrunc(info.driver_version, 1000),
+                    @divTrunc(@mod(info.driver_version, 1000), 10), if (path == .ptx) "; use the fatbin build on supported GPUs to avoid PTX JIT" else " to R580 or newer",
+                });
+            } else {
+                std.log.err("CUDA {s} artifact cannot run on {s} (sm_{d}{d}); use a matching fatbin or portable build on compute capability 7.5 or newer.", .{ artifact.mode, info.nameSlice(), info.compute_major, info.compute_minor });
+            }
+            return err;
+        };
 
         var ctx: CUcontext = null;
         lockPrimaryLifecycle();
@@ -140,13 +197,17 @@ pub const CudaContext = struct {
         checkStep(&driver, "cuStreamCreate", driver.fns.cuStreamCreate(&stream, 0)) catch |err| return err;
         errdefer _ = driver.fns.cuStreamDestroy(stream);
 
-        return .{
+        var result = CudaContext{
             .driver = driver,
             .device = device,
             .ctx = ctx,
             .stream = stream,
             .info = info,
         };
+        // New temporary contexts are not yet shared. Observe them before
+        // constructor work can submit numerical commands in an active scope.
+        if (@import("../../execution/allocation_registry.zig").enabled()) result.enableRuntimeObservation();
+        return result;
     }
 
     /// Called under the session execution lock. Keep cache admission attached
@@ -180,6 +241,8 @@ pub const CudaContext = struct {
     /// Leave driver entry points loaded for host-only cleanup after a lost
     /// context has relinquished all in-flight device references.
     pub fn releaseResources(self: *CudaContext) void {
+        defer self.device_allocations.releaseObservation();
+        if (self.observation.swap(null, .acq_rel)) |state| state.deinit();
         lockPrimaryLifecycle();
         defer primary_lifecycle_mutex.unlock();
         const primary = @intFromPtr(self.ctx);
@@ -220,9 +283,30 @@ pub const CudaContext = struct {
         try self.driver.check(self.driver.fns.cuCtxSetCurrent(self.ctx));
     }
 
+    /// Raw driver status preserves existing checked and silent cleanup paths.
+    /// Counters observe explicit successful host wait APIs, not implicit waits
+    /// inside a vendor operation/free or measured CPU blocking time.
+    pub inline fn synchronizeStreamResult(self: *CudaContext, stream: CUstream) driver_mod.CUresult {
+        const result = self.driver.fns.cuStreamSynchronize(stream);
+        if (self.observation.load(.acquire)) |state| state.hostSynchronization(false, result);
+        return result;
+    }
+    pub inline fn synchronizeEventResult(self: *CudaContext, event: CUevent) driver_mod.CUresult {
+        const result = self.driver.fns.cuEventSynchronize(event);
+        if (self.observation.load(.acquire)) |state| state.hostSynchronization(true, result);
+        return result;
+    }
+    /// A GPU dependency is distinct from a host wait. Owned-stream recording
+    /// is separate; another stream's capture state is deliberately unknown.
+    pub inline fn waitStreamEventResult(self: *CudaContext, stream: CUstream, event: CUevent, flags: c_uint) driver_mod.CUresult {
+        const result = self.driver.fns.cuStreamWaitEvent(stream, event, flags);
+        if (self.observation.load(.acquire)) |state| state.streamDependency(stream == self.stream, self.debug_graph_capture_active, result);
+        return result;
+    }
+
     pub fn synchronize(self: *CudaContext) driver_mod.Error!void {
         try self.makeCurrent();
-        try self.driver.check(self.driver.fns.cuStreamSynchronize(self.stream));
+        try self.driver.check(self.synchronizeStreamResult(self.stream));
         self.stats.stream_syncs += 1;
     }
 
@@ -252,7 +336,7 @@ pub const CudaContext = struct {
     pub fn waitEvent(self: *CudaContext, event: CUevent) driver_mod.Error!void {
         if (event == null) return error.InvalidCudaState;
         try self.makeCurrent();
-        try self.driver.check(self.driver.fns.cuStreamWaitEvent(self.stream, event, 0));
+        try self.driver.check(self.waitStreamEventResult(self.stream, event, 0));
     }
 
     pub fn beginStreamCapture(self: *CudaContext, mode: driver_mod.CUstreamCaptureMode) driver_mod.Error!void {
@@ -295,6 +379,7 @@ pub const CudaContext = struct {
             try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, 0));
         }
         if (exec == null) return error.InvalidCudaState;
+        if (self.observation.load(.acquire)) |state| state.register(self.graphObservationApi(), graph, exec);
         return exec;
     }
 
@@ -307,13 +392,19 @@ pub const CudaContext = struct {
         outcome.update_result = result_info.result;
         outcome.error_node = result_info.errorNode;
         outcome.error_from_node = result_info.errorFromNode;
+        if (outcome.success()) if (self.observation.load(.acquire)) |state| {
+            state.register(self.graphObservationApi(), graph, exec);
+        };
         return outcome;
     }
 
     pub fn launchGraph(self: *CudaContext, exec: CUgraphExec) driver_mod.Error!void {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuGraphLaunch(exec, self.stream));
-        self.noteKernelLaunch();
+        // Preserve legacy API-event counters without calling this an eager kernel.
+        self.stats.kernel_launches += 1;
+        self.stats.graph_submissions += 1;
+        if (self.observation.load(.acquire)) |state| state.graphCall(exec, self.debug_graph_capture_active);
     }
 
     /// Return the driver's authoritative stream-capture state when the
@@ -377,13 +468,40 @@ pub const CudaContext = struct {
     pub fn endProfileEventPairUs(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!u64 {
         defer self.destroyProfileEventPair(pair);
         try self.recordProfileEnd(pair);
-        try self.driver.check(self.driver.fns.cuEventSynchronize(pair.end));
+        try self.driver.check(self.synchronizeEventResult(pair.end));
         return self.readProfileEventPairUs(pair);
+    }
+
+    /// Retained-cache payload owners keep failed handles/quota. Observation
+    /// retires only after the actual SDK destruction succeeds.
+    pub fn destroyGraphChecked(self: *CudaContext, graph: *CUgraph) !void {
+        const value = graph.*;
+        if (value == null) return;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuGraphDestroy(value));
+        graph.* = null;
+    }
+
+    pub fn destroyGraphExecChecked(self: *CudaContext, exec: *CUgraphExec) !void {
+        const value = exec.*;
+        if (value == null) return;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuGraphExecDestroy(value));
+        if (self.observation.load(.acquire)) |state| state.retire(value);
+        exec.* = null;
+    }
+    pub fn destroyEventChecked(self: *CudaContext, event: *CUevent) !void {
+        const value = event.*;
+        if (value == null) return;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuEventDestroy(value));
+        event.* = null;
     }
 
     pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {
         if (exec == null) return;
         self.makeCurrent() catch {};
+        if (self.observation.load(.acquire)) |state| state.retire(exec);
         _ = self.driver.fns.cuGraphExecDestroy(exec);
     }
 
@@ -408,10 +526,38 @@ pub const CudaContext = struct {
         _ = self.driver.fns.cuEventDestroy(event);
     }
 
+    /// Canonical project-owned driver submission. Preserve exact config and
+    /// stream and observe only after the original driver.check succeeds.
+    pub inline fn launchKernel(self: *CudaContext, function: driver_mod.CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared_bytes: c_uint, stream: CUstream, params: ?[*]?*anyopaque, extra: ?[*]?*anyopaque) driver_mod.Error!void {
+        try self.driver.check(self.driver.fns.cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared_bytes, stream, params, extra));
+        self.noteObservedKernel(stream);
+        @import("../../execution/runtime_observation.zig").cudaKernel(@intFromPtr(self), @intFromPtr(function), @intFromPtr(stream), false, .{ gx, gy, gz }, .{ bx, by, bz }, shared_bytes, self.debug_graph_capture_active, stream != self.stream);
+    }
+    pub inline fn launchCooperativeKernel(self: *CudaContext, launch: anytype, function: driver_mod.CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared_bytes: c_uint, stream: CUstream, params: ?[*]?*anyopaque) driver_mod.Error!void {
+        try self.driver.check(launch(function, gx, gy, gz, bx, by, bz, shared_bytes, stream, params));
+        self.noteObservedKernel(stream);
+        @import("../../execution/runtime_observation.zig").cudaKernel(@intFromPtr(self), @intFromPtr(function), @intFromPtr(stream), true, .{ gx, gy, gz }, .{ bx, by, bz }, shared_bytes, self.debug_graph_capture_active, stream != self.stream);
+    }
+    inline fn noteObservedKernel(self: *CudaContext, stream: CUstream) void {
+        if (self.observation.load(.acquire)) |state| {
+            if (stream == self.stream) state.kernelCall(self.debug_graph_capture_active) else state.foreignKernelCall();
+        }
+    }
+
     pub fn noteKernelLaunch(self: *CudaContext) void {
         self.stats.kernel_launches += 1;
     }
 };
+
+// Query the actual cold property before retaining a primary context. A default
+// or fabricated DeviceInfo never supplies device capacity authority.
+fn queryMultiprocessorCount(driver: *const CudaDriver, device: CUdevice) driver_mod.Error!i32 {
+    const attribute = driver.fns.cuDeviceGetAttribute orelse return error.CudaSymbolMissing;
+    var count: c_int = 0;
+    try checkStep(driver, "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)", attribute(&count, 16, device));
+    if (count <= 0) return error.InvalidCudaState;
+    return count;
+}
 
 fn checkStep(driver: *const CudaDriver, step: []const u8, result: driver_mod.CUresult) driver_mod.Error!void {
     if (result != driver_mod.CUDA_SUCCESS) {
@@ -424,4 +570,140 @@ pub fn probeDefault() driver_mod.Error!DeviceInfo {
     var ctx = try CudaContext.initDefault();
     defer ctx.deinit();
     return ctx.info;
+}
+test "CUDA explicit wait helpers preserve arguments statuses and host dependency recording scopes" {
+    const Fake = struct {
+        threadlocal var result: driver_mod.CUresult = driver_mod.CUDA_SUCCESS;
+        threadlocal var expected_stream: CUstream = null;
+        threadlocal var expected_event: CUevent = null;
+        threadlocal var expected_flags: c_uint = 0;
+        fn stream(value: CUstream) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(value == expected_stream);
+            return result;
+        }
+        fn event(value: CUevent) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(value == expected_event);
+            return result;
+        }
+        fn depend(value: CUstream, completion: CUevent, flags: c_uint) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(value == expected_stream and completion == expected_event and flags == expected_flags);
+            return result;
+        }
+    };
+    const state = try @import("graph_observation.zig").State.create(std.testing.allocator);
+    defer state.deinit();
+    var context: CudaContext = undefined;
+    context.observation.store(null, .release);
+    context.observation_enable_failed.store(false, .release);
+    context.driver = undefined;
+    context.driver.fns.cuStreamSynchronize = Fake.stream;
+    context.driver.fns.cuEventSynchronize = Fake.event;
+    context.driver.fns.cuStreamWaitEvent = Fake.depend;
+    context.observation.store(state, .release);
+    context.stream = @ptrFromInt(1);
+    context.debug_graph_capture_active = false;
+    context.stats = .{};
+    Fake.result = driver_mod.CUDA_SUCCESS;
+    Fake.expected_stream = context.stream;
+    Fake.expected_event = @ptrFromInt(2);
+    Fake.expected_flags = 7;
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.synchronizeStreamResult(context.stream));
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.synchronizeEventResult(Fake.expected_event));
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(context.stream, Fake.expected_event, 7));
+    context.debug_graph_capture_active = true;
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(context.stream, Fake.expected_event, 7));
+    Fake.expected_stream = @ptrFromInt(3);
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(Fake.expected_stream, Fake.expected_event, 7));
+    Fake.result = 1;
+    try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.synchronizeEventResult(Fake.expected_event));
+    try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.waitStreamEventResult(Fake.expected_stream, Fake.expected_event, 7));
+    const counters = state.snapshot().counters.?;
+    try std.testing.expectEqual(@as(u64, 1), counters.host_stream_synchronizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.host_event_synchronizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.failed_host_synchronizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.gpu_stream_dependencies);
+    try std.testing.expectEqual(@as(u64, 1), counters.capture_recording_stream_wait_events);
+    try std.testing.expectEqual(@as(u64, 1), counters.foreign_stream_wait_event_calls);
+    try std.testing.expectEqual(@as(u64, 1), counters.failed_gpu_stream_dependencies);
+    try std.testing.expectEqual(@as(usize, 0), context.stats.stream_syncs);
+    // The optional observer does not alter a silent cleanup caller's driver
+    // status handling, even when no observation owner has been installed.
+    context.observation.store(null, .release);
+    try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.synchronizeStreamResult(Fake.expected_stream));
+}
+
+test "CUDA observation cold installation publishes one complete state and retires racing candidates" {
+    const BarrierAllocator = struct {
+        arrivals: std.atomic.Value(usize) = .init(0),
+        frees: std.atomic.Value(usize) = .init(0),
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = std.heap.page_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+            _ = self.arrivals.fetchAdd(1, .acq_rel);
+            while (self.arrivals.load(.acquire) < 2) std.atomic.spinLoopHint();
+            return result;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.frees.fetchAdd(1, .monotonic);
+            std.heap.page_allocator.rawFree(bytes, alignment, ret_addr);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    const Worker = struct {
+        fn run(context: *CudaContext, allocator: std.mem.Allocator) void {
+            context.enableRuntimeObservationWithAllocator(allocator);
+        }
+    };
+    var allocator = BarrierAllocator{};
+    var context: CudaContext = undefined;
+    context.device_allocations = .{};
+    defer context.device_allocations.releaseObservation();
+    context.observation = .init(null);
+    context.observation_enable_failed = .init(false);
+    defer if (context.observation.swap(null, .acq_rel)) |state| state.deinit();
+    var future = try std.testing.io.concurrent(Worker.run, .{ &context, allocator.allocator() });
+    defer future.await(std.testing.io);
+    Worker.run(&context, allocator.allocator());
+    future.await(std.testing.io);
+    const installed = context.observation.load(.acquire) orelse return error.MissingObservationState;
+    try std.testing.expectEqual(@as(usize, 2), allocator.arrivals.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), allocator.frees.load(.monotonic));
+    context.enableRuntimeObservation();
+    try std.testing.expect(context.observation.load(.acquire) == installed);
+    try std.testing.expect(context.runtimeObservation().?.counters != null);
+    context.observation.store(null, .release);
+    installed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), allocator.frees.load(.monotonic));
+}
+
+test "CUDA cold multiprocessor query rejects missing and malformed properties before context ownership" {
+    const Fake = struct {
+        threadlocal var count: c_int = 0;
+        threadlocal var calls: usize = 0;
+        fn attribute(value: *c_int, kind: c_int, device: CUdevice) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(kind == 16 and device == 7);
+            calls += 1;
+            value.* = count;
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    // Only the queried field is initialized: no context, allocation, or opaque
+    // driver operation may be touched by these cold property controls.
+    var driver: CudaDriver = undefined;
+    driver.fns.cuDeviceGetAttribute = null;
+    Fake.calls = 0;
+    try std.testing.expectError(error.CudaSymbolMissing, queryMultiprocessorCount(&driver, 7));
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+    driver.fns.cuDeviceGetAttribute = Fake.attribute;
+    for ([_]c_int{ 0, -1 }) |invalid| {
+        Fake.count = invalid;
+        try std.testing.expectError(error.InvalidCudaState, queryMultiprocessorCount(&driver, 7));
+    }
+    Fake.count = 17; // Explicit simulated property, never an actual GPU witness.
+    try std.testing.expectEqual(@as(i32, 17), try queryMultiprocessorCount(&driver, 7));
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expectEqual(@as(i32, 0), (DeviceInfo{}).multiprocessor_count);
 }

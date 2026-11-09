@@ -11,7 +11,7 @@
 .address_size 64
 
 	// .globl	lighton_silu_up_bf16
-// _ZZ22lighton_rms_input_bf16E7partial has been demoted
+// _ZZ20antfly_rms_tree_bf16PtPKfS1_jjffE7partial has been demoted
 
 .visible .entry lighton_silu_up_bf16(
 	.param .u64 lighton_silu_up_bf16_param_0,
@@ -155,15 +155,15 @@ $L__BB1_2:
 	ret;
 
 }
-	// .globl	lighton_rms_input_bf16
-.visible .entry lighton_rms_input_bf16(
-	.param .u64 lighton_rms_input_bf16_param_0,
-	.param .u64 lighton_rms_input_bf16_param_1,
-	.param .u64 lighton_rms_input_bf16_param_2,
-	.param .u32 lighton_rms_input_bf16_param_3,
-	.param .u32 lighton_rms_input_bf16_param_4,
-	.param .f32 lighton_rms_input_bf16_param_5,
-	.param .f32 lighton_rms_input_bf16_param_6
+	// .globl	antfly_rms_tree_bf16
+.visible .entry antfly_rms_tree_bf16(
+	.param .u64 antfly_rms_tree_bf16_param_0,
+	.param .u64 antfly_rms_tree_bf16_param_1,
+	.param .u64 antfly_rms_tree_bf16_param_2,
+	.param .u32 antfly_rms_tree_bf16_param_3,
+	.param .u32 antfly_rms_tree_bf16_param_4,
+	.param .f32 antfly_rms_tree_bf16_param_5,
+	.param .f32 antfly_rms_tree_bf16_param_6
 )
 {
 	.reg .pred 	%p<11>;
@@ -171,17 +171,17 @@ $L__BB1_2:
 	.reg .b32 	%r<41>;
 	.reg .b64 	%rd<21>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ22lighton_rms_input_bf16E7partial[1024];
+	.shared .align 4 .b8 _ZZ20antfly_rms_tree_bf16PtPKfS1_jjffE7partial[1024];
 
-	ld.param.u64 	%rd4, [lighton_rms_input_bf16_param_0];
-	ld.param.u64 	%rd5, [lighton_rms_input_bf16_param_1];
-	ld.param.u64 	%rd6, [lighton_rms_input_bf16_param_2];
-	ld.param.u32 	%r17, [lighton_rms_input_bf16_param_3];
-	ld.param.u32 	%r16, [lighton_rms_input_bf16_param_4];
-	ld.param.f32 	%f5, [lighton_rms_input_bf16_param_5];
-	ld.param.f32 	%f6, [lighton_rms_input_bf16_param_6];
-	cvta.to.global.u64 	%rd1, %rd4;
-	cvta.to.global.u64 	%rd2, %rd5;
+	ld.param.u64 	%rd4, [antfly_rms_tree_bf16_param_0];
+	ld.param.u64 	%rd5, [antfly_rms_tree_bf16_param_1];
+	ld.param.u64 	%rd6, [antfly_rms_tree_bf16_param_2];
+	ld.param.u32 	%r17, [antfly_rms_tree_bf16_param_3];
+	ld.param.u32 	%r16, [antfly_rms_tree_bf16_param_4];
+	ld.param.f32 	%f5, [antfly_rms_tree_bf16_param_5];
+	ld.param.f32 	%f6, [antfly_rms_tree_bf16_param_6];
+	cvta.to.global.u64 	%rd1, %rd5;
+	cvta.to.global.u64 	%rd2, %rd4;
 	cvta.to.global.u64 	%rd3, %rd6;
 	mov.u32 	%r1, %ctaid.x;
 	setp.ge.u32 	%p1, %r1, %r17;
@@ -201,7 +201,7 @@ $L__BB2_2:
 $L__BB2_3:
 	add.s32 	%r18, %r37, %r3;
 	mul.wide.u32 	%rd7, %r18, 4;
-	add.s64 	%rd8, %rd2, %rd7;
+	add.s64 	%rd8, %rd1, %rd7;
 	ld.global.f32 	%f9, [%rd8];
 	fma.rn.f32 	%f27, %f9, %f9, %f27;
 	add.s32 	%r37, %r37, %r4;
@@ -210,7 +210,7 @@ $L__BB2_3:
 
 $L__BB2_4:
 	shl.b32 	%r19, %r39, 2;
-	mov.u32 	%r20, _ZZ22lighton_rms_input_bf16E7partial;
+	mov.u32 	%r20, _ZZ20antfly_rms_tree_bf16PtPKfS1_jjffE7partial;
 	add.s32 	%r7, %r20, %r19;
 	st.shared.f32 	[%r7], %f27;
 	bar.sync 	0;
@@ -239,7 +239,7 @@ $L__BB2_7:
 $L__BB2_8:
 	setp.ge.u32 	%p7, %r39, %r16;
 	cvt.rn.f32.u32 	%f13, %r16;
-	ld.shared.f32 	%f14, [_ZZ22lighton_rms_input_bf16E7partial];
+	ld.shared.f32 	%f14, [_ZZ20antfly_rms_tree_bf16PtPKfS1_jjffE7partial];
 	div.rn.f32 	%f15, %f14, %f13;
 	add.f32 	%f16, %f15, %f5;
 	rsqrt.approx.f32 	%f4, %f16;
@@ -254,7 +254,7 @@ $L__BB2_11:
 	add.s64 	%rd16, %rd3, %rd15;
 	add.s32 	%r30, %r39, %r3;
 	mul.wide.u32 	%rd17, %r30, 4;
-	add.s64 	%rd18, %rd2, %rd17;
+	add.s64 	%rd18, %rd1, %rd17;
 	ld.global.f32 	%f22, [%rd18];
 	mul.f32 	%f23, %f4, %f22;
 	ld.global.f32 	%f24, [%rd16];
@@ -266,7 +266,7 @@ $L__BB2_11:
 	add.s32 	%r35, %r34, 32767;
 	shr.u32 	%r36, %r35, 16;
 	mul.wide.u32 	%rd19, %r30, 2;
-	add.s64 	%rd20, %rd1, %rd19;
+	add.s64 	%rd20, %rd2, %rd19;
 	st.global.u16 	[%rd20], %r36;
 	add.s32 	%r39, %r39, %r8;
 	setp.lt.u32 	%p10, %r39, %r16;
@@ -280,7 +280,7 @@ $L__BB2_10:
 	add.rn.f32 	%f18, %f17, %f6;
 	add.s32 	%r23, %r39, %r3;
 	mul.wide.u32 	%rd11, %r23, 4;
-	add.s64 	%rd12, %rd2, %rd11;
+	add.s64 	%rd12, %rd1, %rd11;
 	ld.global.f32 	%f19, [%rd12];
 	mul.f32 	%f20, %f4, %f19;
 	mul.f32 	%f21, %f18, %f20;
@@ -291,7 +291,7 @@ $L__BB2_10:
 	add.s32 	%r28, %r27, 32767;
 	shr.u32 	%r29, %r28, 16;
 	mul.wide.u32 	%rd13, %r23, 2;
-	add.s64 	%rd14, %rd1, %rd13;
+	add.s64 	%rd14, %rd2, %rd13;
 	st.global.u16 	[%rd14], %r29;
 	add.s32 	%r39, %r39, %r8;
 	setp.lt.u32 	%p9, %r39, %r16;

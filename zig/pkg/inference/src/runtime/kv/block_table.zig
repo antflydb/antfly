@@ -19,6 +19,8 @@ const block = @import("block.zig");
 pub const SequenceBlockTable = struct {
     blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty,
     tail_tokens: u16 = 0,
+    /// Conservative end of shared pages; COW can leave unique holes inside.
+    /// Physical refcounts remain the write authority.
     shared_prefix_blocks: u32 = 0,
 
     pub fn deinit(self: *SequenceBlockTable, allocator: std.mem.Allocator) void {
@@ -35,7 +37,13 @@ pub const SequenceBlockTable = struct {
     }
 
     pub fn append(self: *SequenceBlockTable, allocator: std.mem.Allocator, id: block.KvBlockId) !void {
-        try self.blocks.append(allocator, id);
+        try self.blocks.ensureUnusedCapacity(allocator, 1);
+        self.appendAssumeCapacity(id);
+    }
+
+    /// Caller reserved publication metadata before obtaining the owned page.
+    pub fn appendAssumeCapacity(self: *SequenceBlockTable, id: block.KvBlockId) void {
+        self.blocks.appendAssumeCapacity(id);
         self.tail_tokens = 0;
     }
 
@@ -80,29 +88,24 @@ pub const SequenceBlockTable = struct {
         return (self.blocks.items.len - 1) * page_size_tokens + self.tail_tokens;
     }
 
-    /// Remove `count` tokens from the tail of the sequence. Returns block IDs
-    /// of any fully emptied trailing blocks so the caller can release them.
-    /// Does NOT deallocate blocks itself — the returned slice borrows internal storage.
-    pub fn dropTailTokens(self: *SequenceBlockTable, page_size_tokens: u16, count: usize) usize {
-        if (count == 0) return 0;
+    /// Remove tokens and return the borrowed removed ID tail. The backing
+    /// table must remain alive and unmodified until the caller finishes its
+    /// release loop. Neither shrinking the table nor iterating allocates.
+    pub fn dropTailTokens(self: *SequenceBlockTable, page_size_tokens: u16, count: usize) []const block.KvBlockId {
+        const previous = self.blocks.items;
+        if (count == 0) return previous[previous.len..];
         const current = self.tokenCount(page_size_tokens);
         if (count >= current) {
-            const dropped = self.blocks.items.len;
             self.reset();
-            return dropped;
+            return previous;
         }
         const target = current - count;
-        // How many blocks are needed to hold `target` tokens?
-        const needed_blocks = (target + page_size_tokens - 1) / page_size_tokens;
-        const excess_blocks = if (self.blocks.items.len > needed_blocks) self.blocks.items.len - needed_blocks else 0;
-        self.blocks.items.len -= excess_blocks;
-        if (self.blocks.items.len > 0) {
-            const rem: u16 = @intCast(target % page_size_tokens);
-            self.tail_tokens = if (rem == 0) page_size_tokens else rem;
-        } else {
-            self.tail_tokens = 0;
-        }
-        return excess_blocks;
+        const needed_blocks = (target - 1) / page_size_tokens + 1;
+        self.blocks.items.len = needed_blocks;
+        const rem: u16 = @intCast(target % page_size_tokens);
+        self.tail_tokens = if (rem == 0) page_size_tokens else rem;
+        self.shared_prefix_blocks = @intCast(@min(self.shared_prefix_blocks, needed_blocks));
+        return previous[needed_blocks..];
     }
 };
 
@@ -136,4 +139,23 @@ test "block table dropFrontBlocks updates shared prefix and tokens" {
     try std.testing.expectEqual(@as(block.KvBlockId, 12), table.blocks.items[1]);
     try std.testing.expectEqual(@as(u32, 1), table.shared_prefix_blocks);
     try std.testing.expectEqual(@as(u16, 2), table.tail_tokens);
+}
+
+test "block table tail removal borrows exact removed IDs and clamps shared prefix without allocation" {
+    const a = std.testing.allocator;
+    var table = SequenceBlockTable{};
+    defer table.deinit(a);
+    for ([_]block.KvBlockId{ 7, 9, 11, 13 }) |id| try table.appendExisting(a, id);
+    table.tail_tokens = 2;
+    table.markSharedPrefix(4);
+    const original = table.blocks.items.ptr;
+    const removed = table.dropTailTokens(4, 7);
+    try std.testing.expectEqualSlices(block.KvBlockId, &.{ 11, 13 }, removed);
+    try std.testing.expect(removed.ptr == original + 2);
+    try std.testing.expectEqual(@as(usize, 7), table.tokenCount(4));
+    try std.testing.expectEqual(@as(u32, 2), table.shared_prefix_blocks);
+    const remainder = table.dropTailTokens(4, 99);
+    try std.testing.expectEqualSlices(block.KvBlockId, &.{ 7, 9 }, remainder);
+    try std.testing.expectEqual(@as(usize, 0), table.tokenCount(4));
+    try std.testing.expectEqual(@as(u32, 0), table.shared_prefix_blocks);
 }

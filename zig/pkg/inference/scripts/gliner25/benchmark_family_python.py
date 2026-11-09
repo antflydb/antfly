@@ -29,6 +29,14 @@ import argparse
 import base64
 from collections.abc import Mapping
 import csv
+import email.parser
+import io
+import stat
+import zipfile
+import tarfile
+import posixpath
+import shutil
+import urllib.request
 import contextlib
 import datetime as dt
 import hashlib
@@ -428,7 +436,471 @@ def verify_record_tree(
     return {"files": len(actual), "record_files": len(records), "tree_sha256": digest}
 
 
+def _portable_tree(root: Path, expected: dict[str, Any]) -> dict[str, Any]:
+    """Compare a complete authenticated payload set, including all metadata bytes."""
+    if root.is_symlink() or not root.is_dir():
+        raise BenchmarkError("portable runtime root is absent or symlinked")
+    actual = {}
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise BenchmarkError("portable runtime contains a symlink")
+        if path.is_file():
+            actual[path.relative_to(root).as_posix()] = path
+    if set(actual) != set(expected):
+        raise BenchmarkError("portable runtime payload inventory differs")
+    for relative, fact in expected.items():
+        parts = Path(relative).parts
+        if not parts or Path(relative).is_absolute() or ".." in parts:
+            raise BenchmarkError("portable runtime payload path escapes")
+        path = actual[relative]
+        if path.stat().st_size != fact["bytes"] or sha256(path) != fact["sha256"] or stat.S_IMODE(path.stat().st_mode) != fact["mode"]:
+            raise BenchmarkError(f"portable runtime payload identity differs: {relative}")
+    return {"files": len(actual)}
+
+
+def _portable_wheels(root: Path, scope: dict[str, Any], destination: Path | None = None) -> dict[str, Any]:
+    """Authenticate raw wheels and prove the complete installed-payload manifest."""
+    if destination is not None and (destination.is_symlink() or (destination.exists() and (not destination.is_dir() or any(destination.iterdir())))):
+        raise BenchmarkError("portable wheel extraction target is not fresh")
+    all_files = {}
+    package_names = set()
+    for wheel in scope["wheels"]:
+        name = wheel["filename"]
+        if Path(name).name != name or not name.endswith(".whl"):
+            raise BenchmarkError("portable wheel filename escapes")
+        path = root / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != wheel["bytes"] or sha256(path) != wheel["sha256"]:
+            raise BenchmarkError("portable wheel artifact identity differs")
+        with zipfile.ZipFile(path) as archive:
+            entries = [entry for entry in archive.infolist() if not entry.is_dir()]
+            names = [entry.filename for entry in entries]
+            if len(names) != len(set(names)):
+                raise BenchmarkError("portable wheel contains duplicate paths")
+            for entry in entries:
+                parts = Path(entry.filename).parts
+                if not parts or Path(entry.filename).is_absolute() or ".." in parts or stat.S_ISLNK(entry.external_attr >> 16):
+                    raise BenchmarkError("portable wheel path escapes or is a symlink")
+                # Import roots are unrelocated; the authenticated SymPy manpage is retained as inert raw payload.
+                if parts[0].endswith(".data") and parts[1:4] != ("data", "share", "man"):
+                    raise BenchmarkError("portable wheel requires unsupported relocation")
+            records = [name for name in names if name.endswith(".dist-info/RECORD") and len(Path(name).parts) == 2]
+            metadata = [name for name in names if name.endswith(".dist-info/METADATA") and len(Path(name).parts) == 2]
+            if len(records) != 1 or len(metadata) != 1:
+                raise BenchmarkError("portable wheel metadata inventory differs")
+            record = records[0]
+            if hashlib.sha256(archive.read(record)).hexdigest() != wheel["record_sha256"] or hashlib.sha256(archive.read(metadata[0])).hexdigest() != wheel["metadata_sha256"]:
+                raise BenchmarkError("portable wheel metadata identity differs")
+            message = email.parser.BytesParser().parsebytes(archive.read(metadata[0]))
+            package = normalized(message["Name"])
+            if package in package_names or package != wheel["name"] or message["Version"] != wheel["version"] or scope["packages"].get(package) != wheel["version"]:
+                raise BenchmarkError("portable wheel package identity differs")
+            package_names.add(package)
+            rows = csv.reader(io.StringIO(archive.read(record).decode("utf-8")))
+            seen = set()
+            for row in rows:
+                if len(row) != 3 or row[0] in seen or row[0] not in names:
+                    raise BenchmarkError("portable wheel RECORD inventory differs")
+                relative, encoded, size = row
+                seen.add(relative)
+                raw = archive.read(relative)
+                digest = hashlib.sha256(raw).digest()
+                if relative == record:
+                    if encoded or size:
+                        raise BenchmarkError("portable wheel RECORD self-row differs")
+                elif not encoded.startswith("sha256=") or not size.isdigit() or len(raw) != int(size) or base64.urlsafe_b64encode(digest).rstrip(b"=").decode() != encoded[7:]:
+                    raise BenchmarkError("portable wheel RECORD payload differs")
+                if relative in all_files:
+                    raise BenchmarkError("portable wheels have overlapping payloads")
+                all_files[relative] = {"sha256": digest.hex(), "bytes": len(raw), "wheel": name, "mode": (archive.getinfo(relative).external_attr >> 16) & 0o777 or 0o644}
+                if destination is not None:
+                    target = destination / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(raw)
+                    target.chmod(all_files[relative]["mode"])
+            if seen != set(names):
+                raise BenchmarkError("portable wheel contains unrecorded payload")
+    if package_names != set(scope["packages"]):
+        raise BenchmarkError("portable wheel package inventory differs")
+    return all_files
+
+
+def _portable_prefix(root: Path, expected: dict[str, Any]) -> None:
+    actual = {p.relative_to(root).as_posix(): p for p in root.rglob("*") if p.is_file() or p.is_symlink()}
+    if set(actual) != set(expected):
+        raise BenchmarkError("portable interpreter payload inventory differs")
+    for relative, fact in expected.items():
+        path = actual[relative]
+        if fact["kind"] == "symlink":
+            if not path.is_symlink() or os.readlink(path) != fact["target"] or not path.resolve().is_relative_to(root.resolve()):
+                raise BenchmarkError("portable interpreter symlink differs")
+        elif path.is_symlink() or path.stat().st_size != fact["bytes"] or sha256(path) != fact["sha256"] or stat.S_IMODE(path.stat().st_mode) != fact["mode"]:
+            raise BenchmarkError("portable interpreter payload identity differs")
+
+
+def _portable_python(path: Path, recipe: dict[str, Any], destination: Path | None = None) -> dict[str, Any]:
+    if destination is not None and (destination.is_symlink() or (destination.exists() and (not destination.is_dir() or any(destination.iterdir())))):
+        raise BenchmarkError("portable Python extraction target is not fresh")
+    artifact = recipe["archive"]
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != artifact["bytes"] or sha256(path) != artifact["sha256"]:
+        raise BenchmarkError("portable Python archive identity differs")
+    if recipe["omit_python_bytecode"] is not True:
+        raise BenchmarkError("portable Python bytecode policy differs")
+    files = {}
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        seen = set()
+        for member in members:
+            parts = Path(member.name).parts
+            if len(parts) < 2 or parts[0] != "python" or ".." in parts or Path(member.name).is_absolute() or member.name in seen:
+                raise BenchmarkError("portable Python archive path differs")
+            seen.add(member.name)
+            if member.isdir():
+                continue
+            if member.name.endswith(".pyc") or "__pycache__" in parts:
+                continue  # Deterministic removal of the official archive's four build-time pyc files.
+            relative = Path(*parts[1:]).as_posix()
+            if relative in files:
+                raise BenchmarkError("portable Python archive path is duplicated")
+            if member.issym():
+                target = posixpath.normpath(posixpath.join(posixpath.dirname(relative), member.linkname))
+                if Path(member.linkname).is_absolute() or target == ".." or target.startswith("../"):
+                    raise BenchmarkError("portable Python symlink escapes")
+                files[relative] = {"kind": "symlink", "target": member.linkname}
+            elif member.isfile():
+                raw = archive.extractfile(member).read()
+                files[relative] = {"kind": "file", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "mode": member.mode & 0o777}
+            else:
+                raise BenchmarkError("portable Python archive has unsupported entry type")
+        for relative in files:
+            if any(files.get(parent.as_posix(), {}).get("kind") == "symlink" for parent in Path(relative).parents):
+                raise BenchmarkError("portable Python archive has a symlink parent")
+        if destination is not None:
+            for relative, fact in files.items():
+                if fact["kind"] == "file":
+                    target = destination / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(archive.extractfile("python/" + relative).read())
+                    target.chmod(fact["mode"])
+            for relative, fact in files.items():
+                if fact["kind"] == "symlink":
+                    target = destination / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(fact["target"])
+    return files
+
+
+def _portable_dependency_check(payload: dict[str, Any]) -> dict[str, Any]:
+    """One checker for acquisition and both reference boundaries; no model imports."""
+    import tomllib
+    original_path = sys.path[:]
+    sys.path.insert(0, payload["runtime"])
+    try:
+        import packaging
+        from packaging.requirements import Requirement
+        from packaging.specifiers import SpecifierSet
+        from packaging.tags import sys_tags
+        from packaging.utils import canonicalize_name, parse_wheel_filename
+        if not Path(packaging.__file__).resolve().is_relative_to(Path(payload["runtime"]).resolve()):
+            raise BenchmarkError("unowned Packaging source")
+        project = tomllib.loads(Path(payload["pyproject"]).read_text())
+        base = project["project"]["dependencies"]
+        if base != payload["base"]:
+            raise BenchmarkError("pinned source BASE requirements changed")
+        checked = 0
+        rows = [{"owner": "pinned GLiNER BASE", "text": text} for text in base] + payload["requirements"]
+        for row in rows:
+            requirement = Requirement(row["text"])
+            if requirement.marker is not None and not requirement.marker.evaluate({"extra": ""}):
+                continue
+            version = payload["versions"].get(canonicalize_name(requirement.name))
+            if version is None or not requirement.specifier.contains(version):
+                raise BenchmarkError(f"unsatisfied dependency {row['owner']}: {row['text']} (actual {version})")
+            checked += 1
+        tags = set(sys_tags())
+        for wheel in payload["wheels"]:
+            if not parse_wheel_filename(wheel["filename"])[3] & tags:
+                raise BenchmarkError(f"incompatible wheel {wheel['filename']}")
+            if wheel["requires_python"] is not None and not SpecifierSet(wheel["requires_python"]).contains(sys.version.split()[0]):
+                raise BenchmarkError("incompatible Python requirement")
+        exception = payload["local_transformers_exception"]
+        declared = next(text for text in project["project"]["optional-dependencies"]["local"] if Requirement(text).name == "transformers")
+        if declared != exception["source_declared"] or payload["versions"]["transformers"] != exception["frozen_required"]:
+            raise BenchmarkError("frozen local Transformers exception changed")
+        return {"source_base_requirements": base, "active_requirements_checked": checked,
+                "wheel_abis_checked": len(payload["wheels"]), "python": sys.version.split()[0],
+                "local_transformers_exception": exception}
+    finally:
+        sys.path[:] = original_path
+
+
+def _portable_source_dependencies(root: Path, recipe: dict[str, Any]) -> dict[str, Any]:
+    source = recipe["source_dependencies"]
+    if source["revision"] != strict_json(CONTRACT)["upstream_python"]["revision"]:
+        raise BenchmarkError("portable source dependency revision differs")
+    artifact = source["pyproject"]
+    name = artifact["filename"]
+    if Path(name).name != name:
+        raise BenchmarkError("portable source dependency filename escapes")
+    project = root / "wheels" / name
+    if project.is_symlink() or not project.is_file() or project.stat().st_size != artifact["bytes"] or sha256(project) != artifact["sha256"]:
+        raise BenchmarkError("portable source dependency artifact differs")
+    versions = {}
+    wheels = []
+    requirements = []
+    for scope in recipe["wheels"].values():
+        versions.update(scope["packages"])
+        for wheel in scope["wheels"]:
+            with zipfile.ZipFile(root / "wheels" / wheel["filename"]) as archive:
+                metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA") and len(Path(name).parts) == 2)
+                message = email.parser.BytesParser().parsebytes(archive.read(metadata))
+                requirements.extend({"owner": wheel["name"], "text": text} for text in message.get_all("Requires-Dist", []))
+                wheels.append({"filename": wheel["filename"], "requires_python": message.get("Requires-Python")})
+    return _portable_dependency_check({"runtime": str(root / "runtime"), "pyproject": str(project), "base": source["base_requirements"],
+                                       "versions": versions, "wheels": wheels, "requirements": requirements,
+                                       "local_transformers_exception": source["local_transformers_exception"]})
+
+
+def _portable_acquisition_dependencies(root: Path, recipe: dict[str, Any], prefix: Path) -> dict[str, Any]:
+    # Bootstrap may have a different Python/Packaging. Before any model import,
+    # invoke the exact same checker once in the authenticated clean interpreter.
+    code = ("import sys,json;from pathlib import Path;p=json.load(sys.stdin);sys.path.insert(0,p['driver']);"
+            "import benchmark_family_python as b;print(json.dumps(b._portable_source_dependencies(Path(p['root']),p['recipe'])))")
+    try:
+        checked = subprocess.run([str(prefix / "bin/python3.12"), "-I", "-B", "-c", code],
+                                 input=json.dumps({"driver": str(HERE), "root": str(root), "recipe": recipe}),
+                                 text=True, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired as error:
+        raise BenchmarkError("portable dependency interpreter startup/check timed out") from error
+    if checked.returncode != 0:
+        raise BenchmarkError(f"portable source dependency closure failed: {checked.stderr.strip()}")
+    return json.loads(checked.stdout)
+
+
+def _portable_contract(contract: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected = contract["oracle_runtime_decide_1b"]
+    legacy = strict_json(RUNTIME_CONTRACT_1B)["oracle_runtime_decide_1b"]
+    for key in ("python", "unicode", "isolated_packages", "external_packages", "rope_contract", "transformers_distribution"):
+        if expected[key] != legacy[key]:
+            raise BenchmarkError(f"portable runtime changes frozen contract: {key}")
+    recipe = contract["portable_runtime"]
+    if recipe["schema"] != "authenticated-wheel-recipes-v2" or recipe["historical_byte_identity"] is not False:
+        raise BenchmarkError("portable runtime identity schema differs")
+    if recipe["platform"] != {"system": platform.system(), "machine": platform.machine()}:
+        raise BenchmarkError("portable runtime platform differs")
+    if "source_dependencies" not in recipe:
+        raise BenchmarkError("portable pinned source dependency contract missing")
+    if recipe["wheels"]["isolated"]["packages"] != {normalized(k): v for k, v in expected["isolated_packages"].items()}:
+        raise BenchmarkError("portable isolated package inventory differs")
+    for name, version in expected["external_packages"].items():
+        if recipe["wheels"]["external"]["packages"].get(normalized(name)) != version:
+            raise BenchmarkError("portable external package inventory differs")
+    return expected, recipe
+
+
+def _portable_download(artifact: dict[str, Any], target: Path, caches: list[Path]) -> None:
+    if Path(artifact["filename"]).name != artifact["filename"] or not artifact["url"].startswith("https://"):
+        raise BenchmarkError("portable artifact URL or filename differs")
+    for cache in caches:
+        source = cache / artifact["filename"]
+        if source.exists():
+            if source.is_symlink() or source.stat().st_size != artifact["bytes"] or sha256(source) != artifact["sha256"]:
+                raise BenchmarkError("portable cached artifact identity differs")
+            shutil.copyfile(source, target)
+            return
+    with urllib.request.urlopen(artifact["url"], timeout=120) as response, target.open("xb") as output:
+        if not response.geturl().startswith("https://"):
+            raise BenchmarkError("portable artifact redirect is not HTTPS")
+        count = 0
+        while chunk := response.read(1024 * 1024):
+            count += len(chunk)
+            if count > artifact["bytes"]:
+                raise BenchmarkError("portable downloaded artifact exceeds pinned size")
+            output.write(chunk)
+    if target.stat().st_size != artifact["bytes"] or sha256(target) != artifact["sha256"]:
+        raise BenchmarkError("portable downloaded artifact identity differs")
+
+
+def acquire_portable_runtime(destination: Path, contract_path: Path, caches: list[Path]) -> dict[str, Any]:
+    contract = strict_json(contract_path)
+    if contract.get("format_version") != 2:
+        raise BenchmarkError("runtime acquisition requires explicit format2")
+    expected, recipe = _portable_contract(contract)
+    destination = destination.expanduser().absolute()
+    if destination.exists() or destination.is_symlink():
+        raise BenchmarkError("runtime acquisition destination already exists")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{destination.name}.partial-", dir=destination.parent))
+    published = False
+    try:
+        archives = stage / "wheels"
+        archives.mkdir()
+        artifacts = [recipe["interpreter"]["archive"], recipe["source_dependencies"]["pyproject"], *[wheel for scope in recipe["wheels"].values() for wheel in scope["wheels"]]]
+        if len({artifact["filename"] for artifact in artifacts}) != len(artifacts):
+            raise BenchmarkError("portable artifact names overlap")
+        for artifact in artifacts:
+            _portable_download(artifact, archives / artifact["filename"], caches)
+        prefix_name = recipe["interpreter"]["prefix_name"]
+        if Path(prefix_name).name != prefix_name:
+            raise BenchmarkError("portable interpreter prefix escapes")
+        prefix = stage / "python" / prefix_name
+        prefix_files = _portable_python(archives / recipe["interpreter"]["archive"]["filename"], recipe["interpreter"], prefix)
+        _portable_prefix(prefix, prefix_files)
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"}
+        subprocess.run([str(prefix / "bin/python3.12"), "-I", "-B", "-m", "venv", "--without-pip", "--symlinks", str(stage / "venv")], env=env, check=True)
+        for scope, target in (("isolated", stage / "runtime"), ("external", stage / "venv/lib/python3.12/site-packages")):
+            target.mkdir(parents=True, exist_ok=True)
+            if any(target.iterdir()):
+                raise BenchmarkError("portable payload target is not empty")
+            facts = _portable_wheels(archives, recipe["wheels"][scope], target)
+            _portable_tree(target, facts)
+        dependencies = _portable_acquisition_dependencies(stage, recipe, prefix)
+        # Only generated venv launch metadata is relocated; archive code/metadata is unchanged.
+        for path in [stage / "venv/pyvenv.cfg", *list((stage / "venv/bin").iterdir())]:
+            if path.is_symlink():
+                target = os.readlink(path)
+                if target.startswith(str(stage)):
+                    relative = os.path.relpath(stage / target[len(str(stage)) + 1:], path.parent)
+                    path.unlink()
+                    path.symlink_to(relative)
+            elif path.is_file():
+                text = path.read_text()
+                path.write_text(text.replace(str(stage), str(destination)))
+        # Validate the clean interpreter before publication, without importing model packages.
+        check = "import sys,unicodedata,json;print(json.dumps([sys.version.split()[0],unicodedata.unidata_version,sys.base_prefix]))"
+        actual = json.loads(subprocess.check_output([str(prefix / "bin/python3.12"), "-I", "-B", "-c", check], env=env, text=True))
+        if actual[:2] != [expected["python"], expected["unicode"]] or Path(actual[2]).resolve() != prefix.resolve():
+            raise BenchmarkError("acquired Python/Unicode/source differs")
+        _portable_prefix(prefix, prefix_files)
+        stage.rename(destination)
+        published = True
+        # The final venv is checked after its generated absolute home is in its final location.
+        actual = json.loads(subprocess.check_output([str(destination / "venv/bin/python"), "-I", "-B", "-c", check], env=env, text=True))
+        if actual[:2] != [expected["python"], expected["unicode"]] or Path(actual[2]).resolve() != (destination / "python" / prefix_name).resolve():
+            raise BenchmarkError("published Python/Unicode/source differs")
+        receipt = {"status": "acquired_authenticated_runtime_quality_pending", "contract_sha256": sha256(contract_path), "destination": str(destination),
+                   "artifacts": len(artifacts), "historical_byte_identity": False, "python": actual[0], "unicode": actual[1], "model_engines_executed": False, "dependency_closure": dependencies}
+        atomic_write(destination / "acquisition-receipt.json", receipt)
+        return receipt
+    except BaseException:
+        if published:
+            destination.rename(stage)  # Preserve failed data/loggable stage; never leave a ready marker.
+        raise
+
+
+def acquire_runtime_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Acquire the explicit pinned Decide v2 runtime; no model execution")
+    parser.add_argument("--runtime-contract", type=Path, required=True)
+    parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--archive-cache", type=Path, action="append", default=[])
+    args = parser.parse_args(argv)
+    print(json.dumps(acquire_portable_runtime(args.destination, args.runtime_contract, args.archive_cache), indent=2))
+    return 0
+
+
+def _portable_runtime_payloads(runtime_dir: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    expected, recipe = _portable_contract(contract)
+    if platform.python_version() != expected["python"] or unicodedata.unidata_version != expected["unicode"]:
+        raise BenchmarkError("portable Python/Unicode runtime differs")
+    if runtime_dir.is_symlink():
+        raise BenchmarkError("portable runtime root is symlinked")
+    runtime_dir = runtime_dir.expanduser().resolve()
+    root = runtime_dir.parent
+    archives = root / "wheels"
+    facts = {scope: _portable_wheels(archives, recipe["wheels"][scope]) for scope in ("isolated", "external")}
+    isolated = _portable_tree(runtime_dir, facts["isolated"])
+    external_root = root / "venv/lib/python3.12/site-packages"
+    external = _portable_tree(external_root, facts["external"])
+    for directory, scope in ((runtime_dir, "isolated"), (external_root, "external")):
+        actual = {normalized(dist.metadata["Name"]): dist.version for dist in importlib.metadata.distributions(path=[str(directory)])}
+        if actual != recipe["wheels"][scope]["packages"]:
+            raise BenchmarkError("portable installed distribution inventory differs")
+    prefix_name = recipe["interpreter"]["prefix_name"]
+    if Path(prefix_name).name != prefix_name:
+        raise BenchmarkError("portable interpreter prefix escapes")
+    prefix = root / "python" / prefix_name
+    if Path(sys.base_prefix).resolve() != prefix.resolve() or Path(sys.executable).resolve() != (prefix / "bin/python3.12").resolve():
+        raise BenchmarkError("portable interpreter source differs")
+    _portable_prefix(prefix, _portable_python(archives / recipe["interpreter"]["archive"]["filename"], recipe["interpreter"]))
+    dependencies = _portable_source_dependencies(root, recipe)
+    if Path(family.__file__).resolve() != (HERE / "verify_family_contract.py").resolve():
+        raise BenchmarkError("portable family verifier source differs")
+    for name, digest in recipe["driver_sources"].items():
+        if Path(name).name != name or sha256(HERE / name) != digest:
+            raise BenchmarkError("portable benchmark source differs")
+    for name in expected["external_packages"]:
+        if Path(importlib.metadata.distribution(name).locate_file("")).resolve() != external_root.resolve():
+            raise BenchmarkError("portable external import source differs")
+    return {"runtime_schema": recipe["schema"], "historical_byte_identity": False,
+            "qualification": "new_authenticated_runtime_requires_frozen_quality_checks",
+            "python": expected["python"], "unicode": expected["unicode"],
+            "isolated_packages": recipe["wheels"]["isolated"]["packages"], "external_packages": recipe["wheels"]["external"]["packages"],
+            "artifact_recipe_sha256": hashlib.sha256(json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "isolated_payload": isolated, "external_payload": external, "runtime_dir": str(runtime_dir), "dependency_closure": dependencies}
+
+
+def verify_portable_runtime_dir(runtime_dir: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    identity = _portable_runtime_payloads(runtime_dir, contract)
+    if any(name in sys.modules for name in ("torch", "transformers", "gliner2", "pydantic")):
+        raise BenchmarkError("portable model dependencies were imported before verification")
+    root = runtime_dir.expanduser().resolve().parent
+    prefix = root / "python" / contract["portable_runtime"]["interpreter"]["prefix_name"]
+    external = root / "venv" / "lib" / "python3.12" / "site-packages"
+    allowed = (prefix.resolve(), external.resolve(), HERE.resolve())
+    for entry in sys.path:
+        if not entry or not any(Path(entry).resolve().is_relative_to(parent) for parent in allowed):
+            raise BenchmarkError("portable runtime has an unowned import path")
+    return identity
+
+
+def _portable_torch_virtual(module_name: str, module: Any, torch_root: Path) -> bool:
+    registrations = {"torch.ops": ("torch._ops", "_Ops", "ops", "_ops.py"),
+                     "torch.classes": ("torch._classes", "_Classes", "classes", "_classes.py")}
+    registration = registrations.get(module_name)
+    if registration is None:
+        return False
+    definition_name, type_name, export, filename = registration
+    definition = sys.modules.get(definition_name)
+    package = sys.modules.get("torch")
+    if definition is None or package is None:
+        raise BenchmarkError(f"portable Torch virtual definition absent: {module_name}")
+    defined = vars(definition)
+    source = defined.get("__file__")
+    expected_type = defined.get(type_name)
+    if (source is None or Path(source).resolve() != (torch_root / filename).resolve()
+            or type(module) is not expected_type or getattr(expected_type, "__module__", None) != definition_name
+            or defined.get(export) is not module or vars(package).get(export) is not module
+            or sys.modules.get(module_name) is not module
+            or getattr(module, "__file__", None) != filename
+            or vars(module).get("__name__") != module_name):
+        raise BenchmarkError(f"portable Torch virtual registration differs: {module_name}")
+    return True
+
+
+def verify_portable_import_sources(runtime_dir: Path, upstream: Path) -> None:
+    verify_source(upstream, strict_json(CONTRACT))
+    external = runtime_dir.resolve().parent / "venv" / "lib" / "python3.12" / "site-packages"
+    roots = {"torch": external / "torch", "pydantic": external / "pydantic",
+             "transformers": runtime_dir.resolve() / "transformers", "gliner2": upstream.resolve() / "gliner2"}
+    entry_only = {"requests": external / "requests", "urllib3": external / "urllib3", "charset_normalizer": external / "charset_normalizer"}
+    roots.update(entry_only)
+    for name, root in roots.items():
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.origin is None or not Path(spec.origin).resolve().is_relative_to(root):
+            raise BenchmarkError(f"portable module import source differs: {name}")
+        if name in entry_only:
+            continue  # Requests legitimately aliases other independently authenticated packages.
+        for module_name, module in tuple(sys.modules.items()):
+            if module_name == name or module_name.startswith(name + "."):
+                if name == "torch" and _portable_torch_virtual(module_name, module, root):
+                    continue
+                source = getattr(module, "__file__", None)
+                if source and not Path(source).resolve().is_relative_to(root):
+                    raise BenchmarkError(f"portable loaded module source differs: {module_name}")
+
+
 def verify_runtime_dir(runtime_dir: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    if contract.get("format_version") == 2:
+        return verify_portable_runtime_dir(runtime_dir, contract)
     runtime_dir = runtime_dir.expanduser().resolve()
     expected = contract["oracle_runtime_decide_1b"]
     actual_python = platform.python_version()
@@ -958,6 +1430,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         runtime_contract = strict_json(args.runtime_contract)
         runtime = verify_runtime_dir(args.runtime_dir, runtime_contract)
         activate(args.runtime_dir, args.upstream)
+        if runtime_contract.get("format_version") == 2:
+            verify_portable_import_sources(args.runtime_dir, args.upstream)
     else:
         runtime = runtime_identity(contract)
         sys.path.insert(0, str(args.upstream.resolve()))
@@ -1035,6 +1509,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if holdout is not None and sha256(SHORT_HOLDOUT) != SHORT_HOLDOUT_SHA256:
         raise BenchmarkError("short holdout changed during benchmark")
+
+    if args.profile == "decide_1b" and runtime_contract.get("format_version") == 2:
+        if _portable_runtime_payloads(args.runtime_dir, runtime_contract) != runtime:
+            raise BenchmarkError("portable runtime changed during benchmark")
+        verify_portable_import_sources(args.runtime_dir, args.upstream)
 
     imports = {
         name: str(Path(module.__file__).resolve())
@@ -1138,6 +1617,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "acquire-runtime":
+        return acquire_runtime_main(sys.argv[2:])
     try:
         args = parse_args()
         report = run(args)

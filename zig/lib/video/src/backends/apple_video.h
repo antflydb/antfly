@@ -70,3 +70,10 @@ int av_prepared_wait(void *, uint64_t);
 uint32_t av_preparer_tone_mask(void *, uint32_t);
 void av_preparation_cache_suspend(void *);
 int32_t av_preparation_cache_resume(void *, size_t);
+
+// Authored video-owned MTLBuffer/MTLTexture allocatedSize only. Stable borrowed
+// interval nodes and copied values; no inference callbacks or external CV backing.
+uintptr_t av_owned_resource_interval_begin(void *, size_t);
+void av_owned_resource_interval_snapshot(void *, uint64_t *);
+void av_owned_resource_interval_finish(void *, uint64_t *);
+int32_t av_owned_resource_observation_check(void *);

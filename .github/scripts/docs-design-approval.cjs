@@ -43,6 +43,11 @@ async function main({github, context, core, reviewerLogin}) {
   const getPR = async () => (await github.rest.pulls.get(args)).data;
   const pr = await getPR();
   if (!eligible(pr)) return core.notice('Human review required: PR is outside the docs/design exception.');
+  // Large/incomplete change sets cannot qualify for this exception. Do not
+  // turn the expected human-review route into a failed comparison check.
+  if (!Number.isInteger(pr.changed_files) || pr.changed_files < 1 || pr.changed_files >= 300) {
+    return core.notice('Human review required: change set is outside the bounded docs/design exception.');
+  }
   const {data: access} = await github.rest.repos.getCollaboratorPermissionLevel({
     ...context.repo, username: pr.user.login,
   });

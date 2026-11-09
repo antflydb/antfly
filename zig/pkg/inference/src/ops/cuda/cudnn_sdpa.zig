@@ -17,6 +17,7 @@
 //! The ABI is loaded dynamically so ordinary CUDA installations do not gain
 //! a link-time cuDNN dependency.
 const std = @import("std");
+const platform = @import("antfly_platform");
 
 // Covers the unmerged vision patches of full-resolution OCR pages, including
 // square pages. Decoder tokens are reduced by the model's spatial merger.
@@ -27,21 +28,42 @@ const Handle = ?*anyopaque;
 const Status = c_int;
 const success: Status = 0;
 
-const DescriptorType = enum(c_int) { enginecfg = 3, engineheur = 4, execution_plan = 5, operation_graph = 15, variant_pack = 16, tensor = 17, sdpa_fwd = 41, diagonal_band = 44 };
-const AttributeType = enum(c_int) { handle = 0, data_type = 1, boolean = 2, int64 = 3, float = 4, void_ptr = 6, heur_mode = 8, pointwise_mode = 14, backend_descriptor = 15 };
+const backend = @import("cudnn_backend.zig");
+const DescriptorType = backend.DescriptorType;
+const AttributeType = backend.AttributeType;
 
 const Table = struct {
     get_version: *const fn () callconv(.c) usize,
     create: *const fn (*Handle) callconv(.c) Status,
     destroy: *const fn (Handle) callconv(.c) Status,
     set_stream: *const fn (Handle, ?*anyopaque) callconv(.c) Status,
-    create_desc: *const fn (DescriptorType, *Desc) callconv(.c) Status,
-    destroy_desc: *const fn (Desc) callconv(.c) Status,
-    set: *const fn (Desc, c_int, AttributeType, i64, ?*const anyopaque) callconv(.c) Status,
-    get: *const fn (Desc, c_int, AttributeType, i64, *i64, ?*anyopaque) callconv(.c) Status,
-    finalize: *const fn (Desc) callconv(.c) Status,
-    execute: *const fn (Handle, Desc, Desc) callconv(.c) Status,
+    create_desc: @FieldType(backend.Api, "create_desc"),
+    destroy_desc: @FieldType(backend.Api, "destroy_desc"),
+    set: @FieldType(backend.Api, "set"),
+    get: @FieldType(backend.Api, "get"),
+    finalize: @FieldType(backend.Api, "finalize"),
+    execute: @FieldType(backend.Api, "execute"),
 };
+
+// A failed SDK destruction does not surrender ownership. Checked primitives
+// preserve the exact pointer for a caller-owned retry; production void
+// destructors fail closed before forgetting it or unloading its library.
+fn destroyDescriptorChecked(f: *const Table, owner: *Desc) !void {
+    if (owner.* == null) return;
+    if (f.destroy_desc(owner.*) != success) return error.CudnnDescriptorDestroyFailed;
+    owner.* = null;
+}
+fn destroyDescriptor(f: *const Table, owner: *Desc) void {
+    destroyDescriptorChecked(f, owner) catch platform.inference_process_supervisor.restartWorker();
+}
+fn destroyHandleChecked(f: *const Table, owner: *Handle) !void {
+    if (owner.* == null) return;
+    if (f.destroy(owner.*) != success) return error.CudnnHandleDestroyFailed;
+    owner.* = null;
+}
+fn destroyHandle(f: *const Table, owner: *Handle) void {
+    destroyHandleChecked(f, owner) catch platform.inference_process_supervisor.restartWorker();
+}
 
 pub const Layout = struct { dims: [4]i64, strides: [4]i64 };
 
@@ -102,21 +124,31 @@ const Plan = struct {
     workspace_bytes: usize = 0,
 
     fn deinit(self: *Plan, f: *const Table) void {
+        self.deinitChecked(f) catch platform.inference_process_supervisor.restartWorker();
+    }
+    fn deinitChecked(self: *Plan, f: *const Table) !void {
         inline for (.{ "execution", "engine_config", "graph", "operation", "subgraph" }) |field| {
-            if (@field(self, field) != null) _ = f.destroy_desc(@field(self, field));
+            try destroyDescriptorChecked(f, &@field(self, field));
         }
         for (&self.masks) |*d| {
-            if (d.* != null) _ = f.destroy_desc(d.*);
+            try destroyDescriptorChecked(f, d);
         }
         for (&self.scores) |*d| {
-            if (d.* != null) _ = f.destroy_desc(d.*);
+            try destroyDescriptorChecked(f, d);
         }
         inline for (.{ "negative_inf", "right_bound", "left_bound", "seq_len_kv", "seq_len_q", "scale", "o", "v", "k", "q" }) |field| {
-            if (@field(self, field) != null) _ = f.destroy_desc(@field(self, field));
+            try destroyDescriptorChecked(f, &@field(self, field));
         }
         self.* = .{};
     }
 };
+
+/// Vendor-default SDPA does not expose instruction quantum, online traversal
+/// or row-reduction order. Fixed schedules require a separately proven backend.
+pub const NumericalContract = enum { vendor_selected, flash_bf16, efficient_bf16 };
+pub fn supportsNumericalContract(contract: NumericalContract) bool {
+    return contract == .vendor_selected;
+}
 
 pub const Key = struct {
     batch: usize = 0,
@@ -129,19 +161,20 @@ pub const Key = struct {
     padding_mask: bool = false,
     ocr_vision: bool = false,
     florence_vision: bool = false,
-    whisper_encoder: bool = false,
+    dense_seq2seq: bool = false,
     dtype: enum { bf16, f16 } = .bf16,
+    numerical_contract: NumericalContract = .vendor_selected,
 
     fn eql(a: Key, b: Key) bool {
-        return a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
-            a.sequence == b.sequence and a.dim == b.dim and a.florence_vision == b.florence_vision and a.whisper_encoder == b.whisper_encoder and a.dtype == b.dtype and a.ocr_vision == b.ocr_vision and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
+        return a.numerical_contract == b.numerical_contract and a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
+            a.sequence == b.sequence and a.dim == b.dim and a.florence_vision == b.florence_vision and a.dense_seq2seq == b.dense_seq2seq and a.dtype == b.dtype and a.ocr_vision == b.ocr_vision and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
             @as(u32, @bitCast(a.scale)) == @as(u32, @bitCast(b.scale));
     }
 };
 
 fn keyFingerprint(key: Key) usize {
     var value: usize = key.batch;
-    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @intFromBool(key.whisper_encoder)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
+    inline for (.{ @as(usize, @backingInt(key.numerical_contract)), key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @intFromBool(key.dense_seq2seq)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
         value = (value ^ part) *% 0x9e3779b1;
     return value;
 }
@@ -172,7 +205,7 @@ pub const Module = struct {
     }
 
     pub fn init(stream: ?*anyopaque) !Module {
-        var lib = std.DynLib.open("libcudnn.so.9") catch return error.CudnnUnavailable;
+        var lib = try @import("libraries.zig").openCudnnLibrary();
         errdefer lib.close();
         const f = Table{
             .get_version = try symbol(&lib, @TypeOf(@as(Table, undefined).get_version), "cudnnGetVersion"),
@@ -189,15 +222,21 @@ pub const Module = struct {
         const version = f.get_version();
         if (version < 91300) return error.CudnnVersionUnsupported;
         var handle: Handle = null;
+        errdefer destroyHandle(&f, &handle);
         try check(f.create(&handle));
-        errdefer _ = f.destroy(handle);
         try check(f.set_stream(handle, stream));
         return .{ .lib = lib, .f = f, .handle = handle, .version = version };
     }
 
+    /// Library remains loaded until every owned descriptor/handle died.
+    /// A failed checked retirement leaves that handle and later owners intact.
+    fn retireOwnedChecked(self: *Module) !void {
+        for (&self.plans) |*entry| try entry.deinitChecked(&self.f);
+        try destroyHandleChecked(&self.f, &self.handle);
+        self.plan_count = 0;
+    }
     pub fn deinit(self: *Module) void {
-        for (&self.plans) |*entry| entry.deinit(&self.f);
-        if (self.handle != null) _ = self.f.destroy(self.handle);
+        self.retireOwnedChecked() catch platform.inference_process_supervisor.restartWorker();
         self.lib.close();
         self.* = undefined;
     }
@@ -242,8 +281,8 @@ pub const Module = struct {
         if (key.padding_mask != (lengths != 0)) return error.InvalidShape;
         const entry = try self.getPlan(key) orelse return false;
         var variant: Desc = null;
+        defer destroyDescriptor(&self.f, &variant);
         try check(self.f.create_desc(.variant_pack, &variant));
-        defer _ = self.f.destroy_desc(variant);
         var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
         var scale = key.scale;
         var left: i32 = @intCast(key.local_window_radius + 1);
@@ -269,6 +308,10 @@ pub const Module = struct {
     }
 
     fn getPlan(self: *Module, key: Key) !?*Plan {
+        if (!supportsNumericalContract(key.numerical_contract)) {
+            self.stats_.plan_declines += 1;
+            return null;
+        }
         if (!eligible(key, self.version)) return null;
         for (self.plans[0..self.plan_count]) |*p| if (p.key.eql(key)) {
             self.stats_.plan_hits += 1;
@@ -287,7 +330,11 @@ pub const Module = struct {
         self.stats_.plan_misses += 1;
         var candidate: Plan = .{ .key = key };
         errdefer candidate.deinit(&self.f);
-        self.buildPlan(&candidate) catch {
+        self.buildPlan(&candidate) catch |err| {
+            // An explicitly selected physical policy may decline unsupported
+            // metadata, but an SDK allocation/execution failure is not a hint
+            // to replay the operation using another schedule.
+            if (key.dense_seq2seq and err != error.CudnnUnsupported) return err;
             candidate.deinit(&self.f);
             if (self.declined_count < self.declined.len) {
                 self.declined[self.declined_count] = fingerprint;
@@ -369,8 +416,8 @@ pub const Module = struct {
         try check(self.f.set(p.graph, 801, .backend_descriptor, 1, @ptrCast(&op)));
         try check(self.f.finalize(p.graph));
         var heur: Desc = null;
+        defer destroyDescriptor(&self.f, &heur);
         try check(self.f.create_desc(.engineheur, &heur));
-        defer _ = self.f.destroy_desc(heur);
         var graph = p.graph;
         var mode: c_int = 3;
         try check(self.f.set(heur, 201, .backend_descriptor, 1, @ptrCast(&graph)));
@@ -383,8 +430,10 @@ pub const Module = struct {
         var configs: [8]Desc = @splat(null);
         var created: usize = 0;
         defer {
-            for (configs[0..created]) |config| {
-                if (config != null and config != p.engine_config) _ = self.f.destroy_desc(config);
+            // Also owns a descriptor published by a failed create before
+            // the loop increments created. A selected config moves to Plan.
+            for (&configs) |*config| {
+                if (config.* != p.engine_config) destroyDescriptor(&self.f, config);
             }
         }
         while (created < requested) : (created += 1) try check(self.f.create_desc(.enginecfg, &configs[created]));
@@ -393,18 +442,14 @@ pub const Module = struct {
         if (count <= 0 or count > @as(i64, @intCast(requested))) return error.CudnnUnsupported;
         for (configs[0..@intCast(count)]) |config| {
             var execution: Desc = null;
+            defer destroyDescriptor(&self.f, &execution);
             try check(self.f.create_desc(.execution_plan, &execution));
-            var ec = config;
-            var handle2 = self.handle;
-            if (self.f.set(execution, 400, .handle, 1, @ptrCast(&handle2)) == success and
-                self.f.set(execution, 401, .backend_descriptor, 1, @ptrCast(&ec)) == success and
-                self.f.finalize(execution) == success)
-            {
+            if (try self.configureExecution(execution, config, p.key.dense_seq2seq)) {
                 p.engine_config = config;
                 p.execution = execution;
+                execution = null;
                 break;
             }
-            _ = self.f.destroy_desc(execution);
         }
         if (p.execution == null) return error.CudnnUnsupported;
         var workspace: i64 = 0;
@@ -413,6 +458,21 @@ pub const Module = struct {
         if (count != 1 or workspace < 0) return error.CudnnUnsupported;
         p.workspace_bytes = @intCast(workspace);
         self.stats_.workspace_high_water = @max(self.stats_.workspace_high_water, p.workspace_bytes);
+    }
+
+    fn configureExecution(self: *Module, execution: Desc, config: Desc, strict_errors: bool) !bool {
+        var ec = config;
+        var handle = self.handle;
+        const first = self.f.set(execution, 400, .handle, 1, @ptrCast(&handle));
+        if (first != success and (first == 9 or !strict_errors)) return false;
+        try check(first);
+        const second = self.f.set(execution, 401, .backend_descriptor, 1, @ptrCast(&ec));
+        if (second != success and (second == 9 or !strict_errors)) return false;
+        try check(second);
+        const final = self.f.finalize(execution);
+        if (final != success and (final == 9 or !strict_errors)) return false;
+        try check(final);
+        return true;
     }
 
     fn tensor(self: *Module, out: *Desc, uid: i64, layout: Layout, dtype: c_int, by_value: bool) !void {
@@ -448,7 +508,7 @@ pub const Module = struct {
 
 fn eligible(key: Key, version: usize) bool {
     if (key.batch == 0 or key.sequence == 0 or !std.math.isFinite(key.scale)) return false;
-    if (key.whisper_encoder) {
+    if (key.dense_seq2seq) {
         return key.dtype == .f16 and !key.florence_vision and !key.ocr_vision and !key.padding_mask and
             key.local_window_radius == 0 and key.batch <= 8 and key.sequence <= 1500 and key.dim == 64 and
             key.q_heads == key.kv_heads and (key.q_heads == 6 or key.q_heads == 8 or key.q_heads == 12 or key.q_heads == 16 or key.q_heads == 20) and key.scale == 0.125;
@@ -488,6 +548,7 @@ fn scoreLayout(batch: usize, heads: usize, sequence: usize) !Layout {
 }
 
 fn check(status: Status) !void {
+    if (status == 9) return error.CudnnUnsupported;
     if (status != success) return error.CudnnFailure;
 }
 
@@ -616,12 +677,307 @@ test "LightOnOCR3 CUDA Florence F16 plans isolate dtype windows and encoder mask
 }
 
 test "Whisper cuDNN encoder isolates FP16 plans from vision and rejects unsupported geometry" {
-    var key = Key{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 1500, .dim = 64, .scale = 0.125, .dtype = .f16, .whisper_encoder = true };
+    var key = Key{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 1500, .dim = 64, .scale = 0.125, .dtype = .f16, .dense_seq2seq = true };
     try std.testing.expect(eligible(key, 91500));
     var other = key;
-    other.whisper_encoder = false;
+    other.dense_seq2seq = false;
     try std.testing.expect(!Key.eql(key, other));
     try std.testing.expect(!eligible(other, 91500));
     key.sequence = 1501;
     try std.testing.expect(!eligible(key, 91500));
+}
+
+test "cuDNN cold unsupported metadata remains distinct from allocation and execution failure" {
+    try std.testing.expectError(error.CudnnUnsupported, check(9));
+    try std.testing.expectError(error.CudnnFailure, check(2));
+    try std.testing.expectError(error.CudnnFailure, check(8));
+}
+
+test "cuDNN dense seq2seq actual cold plan failure destroys descriptors and only caches unsupported" {
+    const Fake = struct {
+        var failure: Status = 0;
+        var live: usize = 0;
+        var calls: usize = 0;
+        fn create(_: DescriptorType, descriptor: *Desc) callconv(.c) Status {
+            live += 1;
+            calls += 1;
+            descriptor.* = @ptrFromInt(live);
+            return 0;
+        }
+        fn set(_: Desc, _: c_int, _: AttributeType, _: i64, _: ?*const anyopaque) callconv(.c) Status {
+            return failure;
+        }
+        fn destroy(_: Desc) callconv(.c) Status {
+            std.debug.assert(live > 0);
+            live -= 1;
+            return 0;
+        }
+    };
+    const key = Key{ .batch = 1, .q_heads = 6, .kv_heads = 6, .sequence = 2, .dim = 64, .scale = 0.125, .dtype = .f16, .dense_seq2seq = true };
+    for ([_]Status{ 9, 2, 8 }) |status| {
+        Fake.failure = status;
+        Fake.live = 0;
+        Fake.calls = 0;
+        // No real library/driver or numerical entry is initialized. Only the
+        // actual cold descriptor path may be reached by this metadata query.
+        var module = Module{ .lib = undefined, .f = undefined, .handle = null, .version = 91500 };
+        module.f.create_desc = Fake.create;
+        module.f.set = Fake.set;
+        module.f.destroy_desc = Fake.destroy;
+        if (status == 9) {
+            try std.testing.expect((try module.workspaceBytesFor(key)) == null);
+            try std.testing.expectEqual(@as(usize, 1), module.declined_count);
+            try std.testing.expect((try module.workspaceBytesFor(key)) == null);
+            try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+        } else {
+            try std.testing.expectError(error.CudnnFailure, module.workspaceBytesFor(key));
+            try std.testing.expectEqual(@as(usize, 0), module.declined_count);
+            try std.testing.expectError(error.CudnnFailure, module.workspaceBytesFor(key));
+            try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+        }
+        try std.testing.expectEqual(@as(usize, 0), Fake.live);
+        try std.testing.expectEqual(@as(usize, 0), module.plan_count);
+    }
+}
+
+const CudnnRetirementFault = struct {
+    var alive: [128]bool = @splat(false);
+    var kinds: [128]DescriptorType = @splat(.tensor);
+    var next: usize = 0;
+    var fail_id: usize = 0;
+    var fail_kind: ?DescriptorType = null;
+    var execution_set_status: Status = 0;
+    var execution_sets: usize = 0;
+    var handle_failure: bool = false;
+    fn reset() void {
+        alive = @splat(false);
+        kinds = @splat(.tensor);
+        next = 0;
+        fail_id = 0;
+        fail_kind = null;
+        execution_set_status = 0;
+        execution_sets = 0;
+        handle_failure = false;
+    }
+    fn own(kind: DescriptorType) Desc {
+        next += 1;
+        std.debug.assert(next < alive.len);
+        alive[next] = true;
+        kinds[next] = kind;
+        return @ptrFromInt(next);
+    }
+    fn create(kind: DescriptorType, out: *Desc) callconv(.c) Status {
+        out.* = own(kind);
+        return if (fail_kind == kind) 2 else 0;
+    }
+    fn destroy(desc: Desc) callconv(.c) Status {
+        const id = @intFromPtr(desc.?);
+        std.debug.assert(id < alive.len and alive[id]);
+        if (id == fail_id) return 9;
+        alive[id] = false;
+        return 0;
+    }
+    fn destroyHandle(handle: Handle) callconv(.c) Status {
+        return if (handle_failure) 8 else destroy(handle);
+    }
+    fn set(desc: Desc, attribute: c_int, _: AttributeType, _: i64, _: ?*const anyopaque) callconv(.c) Status {
+        if (kinds[@intFromPtr(desc.?)] == .execution_plan and attribute == 400) {
+            execution_sets += 1;
+            if (execution_sets == 1) return execution_set_status;
+        }
+        return 0;
+    }
+    fn finalize(_: Desc) callconv(.c) Status {
+        return 0;
+    }
+    fn get(_: Desc, attribute: c_int, _: AttributeType, requested: i64, count: *i64, value: ?*anyopaque) callconv(.c) Status {
+        if (attribute == 202) {
+            count.* = 2;
+            return 0;
+        }
+        if (attribute == 402 and requested == 1) {
+            count.* = 1;
+            const bytes: *i64 = @ptrCast(@alignCast(value.?));
+            bytes.* = 512;
+            return 0;
+        }
+        return 3;
+    }
+    fn table() Table {
+        var result: Table = undefined;
+        result.create_desc = create;
+        result.destroy_desc = destroy;
+        result.destroy = @This().destroyHandle;
+        result.set = set;
+        result.finalize = finalize;
+        result.get = get;
+        return result;
+    }
+    fn live() usize {
+        var result: usize = 0;
+        for (alive) |present| result += @intFromBool(present);
+        return result;
+    }
+    fn plan() Plan {
+        var result = Plan{ .key = .{ .batch = 7 }, .workspace_bytes = 512 };
+        inline for (@typeInfo(Plan).@"struct".field_names, @typeInfo(Plan).@"struct".field_types) |name, T| {
+            if (comptime T == Desc) {
+                @field(result, name) = own(.tensor);
+            } else if (comptime @typeInfo(T) == .array) {
+                if (comptime @typeInfo(T).array.child == Desc) {
+                    for (&@field(result, name)) |*item| item.* = own(.tensor);
+                }
+            }
+        }
+        return result;
+    }
+    fn expectOwned(value: *const Plan) !void {
+        var count: usize = 0;
+        inline for (@typeInfo(Plan).@"struct".field_names, @typeInfo(Plan).@"struct".field_types) |name, T| {
+            if (comptime T == Desc) {
+                if (@field(value, name)) |pointer| {
+                    try std.testing.expect(alive[@intFromPtr(pointer)]);
+                    count += 1;
+                }
+            } else if (comptime @typeInfo(T) == .array) {
+                if (comptime @typeInfo(T).array.child == Desc) for (@field(value, name)) |item| {
+                    if (item) |pointer| {
+                        try std.testing.expect(alive[@intFromPtr(pointer)]);
+                        count += 1;
+                    }
+                };
+            }
+        }
+        try std.testing.expectEqual(live(), count);
+    }
+};
+
+test "cuDNN checked plan destruction preserves every failed descriptor and supports exact retry" {
+    const Fault = CudnnRetirementFault;
+    Fault.reset();
+    var initial = Fault.plan();
+    const descriptor_count = Fault.next;
+    const initial_table = Fault.table();
+    try initial.deinitChecked(&initial_table);
+    try std.testing.expectEqual(@as(usize, 20), descriptor_count);
+    for (1..descriptor_count + 1) |failure| {
+        Fault.reset();
+        var plan = Fault.plan();
+        const f = Fault.table();
+        Fault.fail_id = failure;
+        try std.testing.expectError(error.CudnnDescriptorDestroyFailed, plan.deinitChecked(&f));
+        try std.testing.expect(Fault.alive[failure]);
+        try std.testing.expectEqual(@as(usize, 7), plan.key.batch);
+        try std.testing.expectEqual(@as(usize, 512), plan.workspace_bytes);
+        try Fault.expectOwned(&plan);
+        Fault.fail_id = 0;
+        try plan.deinitChecked(&f);
+        try std.testing.expectEqualDeep(Plan{}, plan);
+        try std.testing.expectEqual(@as(usize, 0), Fault.live());
+        try plan.deinitChecked(&f);
+    }
+}
+
+test "cuDNN checked module retirement keeps failed handle until successful retry" {
+    const Fault = CudnnRetirementFault;
+    Fault.reset();
+    var module = Module{ .lib = undefined, .f = Fault.table(), .handle = Fault.own(.tensor), .version = 91500 };
+    module.plans[0] = .{ .q = Fault.own(.tensor), .execution = Fault.own(.execution_plan) };
+    module.plan_count = 1;
+    const handle = module.handle;
+    Fault.handle_failure = true;
+    try std.testing.expectError(error.CudnnHandleDestroyFailed, module.retireOwnedChecked());
+    try std.testing.expectEqual(handle, module.handle);
+    try std.testing.expectEqual(@as(usize, 1), Fault.live());
+    Fault.handle_failure = false;
+    try module.retireOwnedChecked();
+    try std.testing.expect(module.handle == null and module.plan_count == 0);
+    try std.testing.expectEqual(@as(usize, 0), Fault.live());
+}
+
+test "cuDNN actual cold builder cleans SDK-published descriptors on failed temporary create" {
+    const Fault = CudnnRetirementFault;
+    const key = Key{ .batch = 1, .q_heads = 6, .kv_heads = 6, .sequence = 2, .dim = 64, .scale = 0.125, .dtype = .f16, .dense_seq2seq = true };
+    for ([_]DescriptorType{ .engineheur, .enginecfg, .execution_plan }) |kind| {
+        Fault.reset();
+        Fault.fail_kind = kind;
+        var module = Module{ .lib = undefined, .f = Fault.table(), .handle = null, .version = 91500 };
+        try std.testing.expectError(error.CudnnFailure, module.workspaceBytesFor(key));
+        try std.testing.expectEqual(@as(usize, 0), module.plan_count);
+        try std.testing.expectEqual(@as(usize, 0), Fault.live());
+    }
+}
+
+test "cuDNN actual cold candidate only retries unsupported execution metadata and preserves SDK errors" {
+    const Fault = CudnnRetirementFault;
+    const key = Key{ .batch = 1, .q_heads = 6, .kv_heads = 6, .sequence = 2, .dim = 64, .scale = 0.125, .dtype = .f16, .dense_seq2seq = true };
+    for ([_]Status{ 9, 2, 8 }) |status| {
+        Fault.reset();
+        Fault.execution_set_status = status;
+        var module = Module{ .lib = undefined, .f = Fault.table(), .handle = null, .version = 91500 };
+        if (status == 9) {
+            try std.testing.expectEqual(@as(?usize, 512), try module.workspaceBytesFor(key));
+            try std.testing.expectEqual(@as(usize, 2), Fault.execution_sets);
+            try std.testing.expectEqual(@as(usize, 1), module.plan_count);
+            try module.retireOwnedChecked();
+        } else {
+            try std.testing.expectError(error.CudnnFailure, module.workspaceBytesFor(key));
+            try std.testing.expectEqual(@as(usize, 1), Fault.execution_sets);
+            try std.testing.expectEqual(@as(usize, 0), module.plan_count);
+            try std.testing.expectEqual(@as(usize, 0), module.declined_count);
+        }
+        try std.testing.expectEqual(@as(usize, 0), Fault.live());
+    }
+}
+
+test "cuDNN actual variant create error retains plan and retires SDK-published temporary" {
+    const Fault = CudnnRetirementFault;
+    Fault.reset();
+    const key = Key{ .batch = 1, .q_heads = 6, .kv_heads = 6, .sequence = 2, .dim = 64, .scale = 0.125, .dtype = .f16, .dense_seq2seq = true };
+    var module = Module{ .lib = undefined, .f = Fault.table(), .handle = null, .version = 91500 };
+    module.plans[0] = .{ .key = key, .execution = Fault.own(.execution_plan) };
+    module.plan_count = 1;
+    Fault.fail_kind = .variant_pack;
+    // Real executeFor/getPlan entrypoints stop before numerical execute; its
+    // table slot is deliberately undefined and must never be borrowed.
+    try std.testing.expectError(error.CudnnFailure, module.executeVision(key, 8, 16, 24, 32, 0));
+    try std.testing.expect(module.plans[0].execution != null);
+    try std.testing.expectEqual(@as(usize, 1), Fault.live());
+    try module.retireOwnedChecked();
+    try std.testing.expectEqual(@as(usize, 0), Fault.live());
+}
+
+test "cuDNN legacy candidate retry remains unchanged while explicit dense SDK errors propagate" {
+    const Fault = CudnnRetirementFault;
+    for ([_]bool{ false, true }) |strict| {
+        Fault.reset();
+        Fault.execution_set_status = 2;
+        const key = Key{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 2, .dim = 64, .scale = 0.125, .dtype = if (strict) .f16 else .bf16, .dense_seq2seq = strict };
+        var module = Module{ .lib = undefined, .f = Fault.table(), .handle = null, .version = 91500 };
+        if (strict) {
+            try std.testing.expectError(error.CudnnFailure, module.workspaceBytesFor(key));
+            try std.testing.expectEqual(@as(usize, 1), Fault.execution_sets);
+        } else {
+            try std.testing.expectEqual(@as(?usize, 512), try module.workspaceBytesFor(key));
+            try std.testing.expectEqual(@as(usize, 2), Fault.execution_sets);
+            try module.retireOwnedChecked();
+        }
+        try std.testing.expectEqual(@as(usize, 0), Fault.live());
+    }
+}
+
+test "cuDNN SDPA fixed numerical contracts decline before cache or SDK access" {
+    try std.testing.expect(supportsNumericalContract(.vendor_selected));
+    var module: Module = undefined;
+    module.stats_ = .{};
+    for ([_]NumericalContract{ .flash_bf16, .efficient_bf16 }) |contract| {
+        const key = Key{ .batch = 1, .q_heads = 4, .kv_heads = 2, .sequence = 15, .dim = 256, .numerical_contract = contract };
+        try std.testing.expect(!supportsNumericalContract(contract));
+        try std.testing.expect((try module.workspaceBytesFor(key)) == null);
+        var vendor = key;
+        vendor.numerical_contract = .vendor_selected;
+        try std.testing.expect(!key.eql(vendor));
+        try std.testing.expect(keyFingerprint(key) != keyFingerprint(vendor));
+    }
+    try std.testing.expectEqual(@as(u64, 2), module.stats_.plan_declines);
 }

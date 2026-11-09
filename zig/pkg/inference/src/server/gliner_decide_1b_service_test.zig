@@ -63,7 +63,17 @@ fn ownershipSnapshot(node: *Node) OwnershipSnapshot {
             const loaded = entry.*;
             if (loaded.resource_lease) |lease| result.model = result.model.merge(lease.amounts) catch result.model;
             if (loaded.tokenizer_resource_lease) |lease| result.tokenizer_load = result.tokenizer_load.merge(lease.amounts) catch result.tokenizer_load;
-            result.weight_cache = result.weight_cache.merge(factory.sharedCacheAdmissionAmounts(loaded.session)) catch result.weight_cache;
+            if (factory.sharedCacheAdmissionSnapshot(loaded.session)) |cache| cache_once: {
+                // load_lock keeps all actual Model/cache identities alive.
+                var prior_iterator = node.model_manager.loaded.valueIterator();
+                while (prior_iterator.next()) |prior| {
+                    if (prior == entry) break; // exact map slot, including aliased Model values
+                    if (factory.sharedCacheAdmissionSnapshot(prior.*.session)) |previous| {
+                        if (previous.identity == cache.identity) break :cache_once;
+                    }
+                }
+                result.weight_cache = result.weight_cache.merge(cache.amounts) catch result.weight_cache;
+            }
             result.workspace = result.workspace.merge(factory.glinerBoundaryWorkspaceAdmissionAmounts(loaded.session)) catch result.workspace;
         }
     }
@@ -427,7 +437,17 @@ fn expectIdleWithActiveHandles(node: *Node, active_handles: usize) !memory.Admis
             try std.testing.expectEqual(active_handles, loaded.active_handles);
             if (loaded.resource_lease) |lease| retained = try retained.merge(lease.amounts);
             if (loaded.tokenizer_resource_lease) |lease| retained = try retained.merge(lease.amounts);
-            retained = try retained.merge(factory.sharedCacheAdmissionAmounts(loaded.session));
+            if (factory.sharedCacheAdmissionSnapshot(loaded.session)) |cache| cache_once: {
+                // load_lock keeps all actual Model/cache identities alive.
+                var prior_iterator = node.model_manager.loaded.valueIterator();
+                while (prior_iterator.next()) |prior| {
+                    if (prior == entry) break; // exact map slot, including aliased Model values
+                    if (factory.sharedCacheAdmissionSnapshot(prior.*.session)) |previous| {
+                        if (previous.identity == cache.identity) break :cache_once;
+                    }
+                }
+                retained = try retained.merge(cache.amounts);
+            }
             // Currently zero for ModernBERT span sessions; retaining this
             // architecture-aware reader keeps the ownership assertion valid
             // if a boundary session ever shares this helper.

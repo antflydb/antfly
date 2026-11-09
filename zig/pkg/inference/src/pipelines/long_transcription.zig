@@ -23,6 +23,7 @@
 //! stitches the results into timed segments.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const audio = @import("audio.zig");
 const vad = @import("vad.zig");
 const transcription = @import("transcription.zig");
@@ -99,6 +100,7 @@ pub fn makeSegment(allocator: std.mem.Allocator, text: []const u8, start_ms: u64
 }
 
 pub const Result = struct {
+    decode_observation: transcription.DecodeObservation = .{},
     allocator: std.mem.Allocator,
     segments: []Segment,
     /// Segment texts joined with single spaces.
@@ -169,9 +171,28 @@ pub fn transcribeLong(
     sample_rate: u32,
     options: Options,
 ) !Result {
+    var decode_observation: transcription.DecodeObservation = .{};
+    const profile = platform.env.getenvBool("ANTFLY_INFERENCE_PROFILE_TRANSCRIPTION");
+    const profile_start = if (profile) platform.time.monotonicNs() else 0;
+    defer if (profile) logDecodeObservation(&decode_observation, profile_start);
+    return transcribeLongObserved(allocator, transcriber, samples, sample_rate, options, &decode_observation) catch |err| {
+        decode_observation.failure = err;
+        return err;
+    };
+}
+
+fn transcribeLongObserved(
+    allocator: std.mem.Allocator,
+    transcriber: anytype,
+    samples: []const f32,
+    sample_rate: u32,
+    options: Options,
+    decode_observation: *transcription.DecodeObservation,
+) !Result {
     if (sample_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
     const windows = try planWindows(allocator, samples, sample_rate, options);
     defer allocator.free(windows);
+    decode_observation.planned_windows = windows.len;
 
     var segments = std.ArrayListUnmanaged(Segment).empty;
     errdefer {
@@ -195,8 +216,8 @@ pub fn transcribeLong(
     else
         try allocator.alloc(i32, 0);
     defer allocator.free(initial_tokens);
-    var previous_tokens: []i32 = try allocator.alloc(i32, 0);
-    defer allocator.free(previous_tokens);
+    var previous_tokens = std.ArrayListUnmanaged(i32).empty;
+    defer previous_tokens.deinit(allocator);
     var prefix = std.ArrayListUnmanaged(i32).empty;
     defer prefix.deinit(allocator);
 
@@ -204,23 +225,38 @@ pub fn transcribeLong(
         if (options.control) |control| try control.check();
         const window_samples = samples[window.start..window.end];
         if (window_samples.len == 0) continue;
-        if (options.skip_silent_windows and try audio.digitalSilence(window_samples)) continue;
+        if (options.skip_silent_windows and try audio.digitalSilence(window_samples)) {
+            decode_observation.skipSilent();
+            continue;
+        }
         // Only the source-sample check establishes verified silence. A model
         // no-speech prediction over a window with activity is abstention.
         silent = false;
 
         prefix.clearRetainingCapacity();
         try prefix.appendSlice(allocator, initial_tokens);
-        if (options.condition_on_previous) try prefix.appendSlice(allocator, previous_tokens);
+        if (options.condition_on_previous) try prefix.appendSlice(allocator, previous_tokens.items);
 
-        var result: transcription.TranscribeResult = transcriber.transcribePcmConditioned(window_samples, sample_rate, prefix.items) catch |err| switch (err) {
-            error.InferenceOutputTokensExceeded => {
-                truncated = true;
-                break;
-            },
-            else => return err,
+        var window_observation: transcription.WindowDecodeObservation = .{};
+        const Transcriber = switch (@typeInfo(@TypeOf(transcriber))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(transcriber),
+        };
+        var result: transcription.TranscribeResult = (if (comptime @hasDecl(Transcriber, "transcribePcmConditionedObserved"))
+            transcriber.transcribePcmConditionedObserved(window_samples, sample_rate, prefix.items, &window_observation)
+        else
+            transcriber.transcribePcmConditioned(window_samples, sample_rate, prefix.items)) catch |err| {
+            decode_observation.recordWindow(window_observation);
+            switch (err) {
+                error.InferenceOutputTokensExceeded => {
+                    truncated = true;
+                    break;
+                },
+                else => return err,
+            }
         };
         defer result.deinit();
+        decode_observation.recordWindow(if (window_observation.available) window_observation else result.decode_observation);
         timing.add(result.timing);
         truncated = truncated or result.truncated;
         // A retained prefix cannot establish coverage of a later active
@@ -251,17 +287,22 @@ pub fn transcribeLong(
             }
         }
         if (options.condition_on_previous) {
-            allocator.free(previous_tokens);
-            previous_tokens = try allocator.dupe(i32, result.tokens);
+            previous_tokens.clearRetainingCapacity();
+            try previous_tokens.appendSlice(allocator, result.tokens);
         }
     }
 
     if (options.control) |control| try control.check();
     const text = try joinSegments(allocator, segments.items);
     errdefer allocator.free(text);
+    const owned_segments = try segments.toOwnedSlice(allocator);
+    decode_observation.returned = true;
+    decode_observation.output_complete = !truncated and !unresolved;
+    decode_observation.speech_recognized = !silent and !unresolved;
     return .{
+        .decode_observation = decode_observation.*,
         .allocator = allocator,
-        .segments = try segments.toOwnedSlice(allocator),
+        .segments = owned_segments,
         .text = text,
         .language = language,
         .duration_ms = vad.samplesToMs(sample_rate, samples.len),
@@ -272,6 +313,12 @@ pub fn transcribeLong(
         .output_tokens = output_tokens,
         .timing = timing,
     };
+}
+
+/// One optional record at the actual windowed invocation boundary. This is
+/// factual decode-owner metadata, not a decoding control or numerical trace.
+fn logDecodeObservation(value: *const transcription.DecodeObservation, start_ns: u64) void {
+    std.log.info("transcription_decode_profile: scope=invocation owner={x} start_ns={d} returned={} output_complete={} speech_recognized={} planned_windows={any} decoded_windows={d} observed_windows={d} unknown_windows={d} skipped_silent_windows={d} attempts_started={d} attempts_completed={d} fallback_attempts={d} accepted_windows={d} greedy_windows={d} silent_windows={d} truncated_windows={d} accepted_temperature_min={any} accepted_temperature_max={any} failure={any} overflowed={} proven_greedy_speech={}", .{ @intFromPtr(value), start_ns, value.returned, value.output_complete, value.speech_recognized, value.planned_windows, value.decoded_windows, value.observed_windows, value.unknown_windows, value.skipped_silent_windows, value.attempts_started, value.attempts_completed, value.fallback_attempts, value.accepted_windows, value.greedy_windows, value.silent_windows, value.truncated_windows, value.accepted_temperature_min, value.accepted_temperature_max, value.failure, value.overflowed, value.provenGreedySpeech() });
 }
 
 pub fn joinSegments(allocator: std.mem.Allocator, segments: []const Segment) ![]u8 {
@@ -660,4 +707,79 @@ test "long transcription preserves unresolved active windows after a recognized 
     var silent_tail = try transcribeLong(a, &complete, samples, 16000, .{});
     defer silent_tail.deinit();
     try std.testing.expect(!silent_tail.unresolved);
+}
+
+const ObservedDecodeFixture = struct {
+    base: FakeTranscriber,
+    retry_second: bool = false,
+
+    pub fn encodePromptText(self: *@This(), allocator: std.mem.Allocator, text: []const u8) ![]i32 {
+        return self.base.encodePromptText(allocator, text);
+    }
+    pub fn lockLanguage(self: *@This(), code: []const u8) bool {
+        return self.base.lockLanguage(code);
+    }
+    pub fn transcribePcmConditionedObserved(self: *@This(), samples: []const f32, sample_rate: u32, prefix: []const i32, observation: *transcription.WindowDecodeObservation) !transcription.TranscribeResult {
+        observation.* = .{ .available = true };
+        observation.beginAttempt();
+        var result = self.base.transcribePcmConditioned(samples, sample_rate, prefix) catch |err| {
+            observation.failure = err;
+            return err;
+        };
+        observation.completeAttempt();
+        if (self.retry_second and self.base.calls == 2) {
+            observation.beginAttempt();
+            observation.completeAttempt();
+            result.temperature = 0.2;
+        }
+        result.selected_attempt_termination = .eos;
+        observation.accept(&result);
+        result.decode_observation = observation.*;
+        return result;
+    }
+};
+
+fn longDecodeObservationCase(a: std.mem.Allocator) !void {
+    // Leave room for the quiet-frame midpoint cut: an exact two-window
+    // duration can produce a short third window. This fixture needs two
+    // actual decodes to distinguish one accepted retry from greedy speech.
+    const samples: [16]f32 = @splat(0.125);
+    var observed = ObservedDecodeFixture{ .base = .{ .allocator = a } };
+    var full = try transcribeLong(a, &observed, &samples, 10, .{ .max_window_s = 1, .skip_silent_windows = false });
+    defer full.deinit();
+    try std.testing.expectEqual(@as(usize, 2), observed.base.calls);
+    try std.testing.expectEqual(@as(?usize, 2), full.decode_observation.planned_windows);
+    try std.testing.expectEqual(@as(usize, 2), full.decode_observation.observed_windows);
+    try std.testing.expectEqual(@as(usize, 2), full.decode_observation.attempts_started);
+    try std.testing.expect(full.decode_observation.provenGreedySpeech());
+    var retry = ObservedDecodeFixture{ .base = .{ .allocator = a }, .retry_second = true };
+    var retried = try transcribeLong(a, &retry, &samples, 10, .{ .max_window_s = 1, .skip_silent_windows = false });
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(usize, 3), retried.decode_observation.attempts_completed);
+    try std.testing.expectEqual(@as(usize, 1), retried.decode_observation.fallback_attempts);
+    try std.testing.expectEqual(@as(?f32, 0), retried.decode_observation.accepted_temperature_min);
+    try std.testing.expectEqual(@as(?f32, 0.2), retried.decode_observation.accepted_temperature_max);
+    try std.testing.expect(!retried.decode_observation.provenGreedySpeech());
+    var legacy = FakeTranscriber{ .allocator = a };
+    var unknown = try transcribeLong(a, &legacy, &samples, 10, .{ .max_window_s = 1, .skip_silent_windows = false });
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(usize, 2), unknown.decode_observation.unknown_windows);
+    try std.testing.expect(unknown.decode_observation.accepted_temperature_min == null);
+    try std.testing.expect(!unknown.decode_observation.provenGreedySpeech());
+    const silence: [samples.len]f32 = @splat(0);
+    var silent = ObservedDecodeFixture{ .base = .{ .allocator = a } };
+    var skipped = try transcribeLong(a, &silent, &silence, 10, .{ .max_window_s = 1 });
+    defer skipped.deinit();
+    try std.testing.expectEqual(@as(usize, 0), silent.base.calls);
+    try std.testing.expectEqual(@as(usize, 2), skipped.decode_observation.skipped_silent_windows);
+    try std.testing.expect(skipped.decode_observation.output_complete and !skipped.decode_observation.speech_recognized);
+    try std.testing.expect(!skipped.decode_observation.provenGreedySpeech());
+}
+
+test "windowed transcription carries actual decode observations without treating missing or silence as greedy" {
+    try longDecodeObservationCase(std.testing.allocator);
+}
+
+test "windowed transcription observations preserve allocation-failure ownership and propagation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, longDecodeObservationCase, .{});
 }
