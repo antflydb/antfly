@@ -441,7 +441,8 @@ extension ClientTests {
       #expect(request.url?.path == "/ai/v1/dictate")
       let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
       let text = body["transcript_text"] as! String
-      #expect(text.utf8.count <= 65536)
+      #expect(text.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes)
+      #expect(body["max_tokens"] as? Int == VoiceFormatting.Plan.cleanupTokenBudget(for: text))
       return (200, "text/event-stream", try formattingEvents(raw: text, text: text))
     }
     var preset = Configuration().presets[0]
@@ -479,25 +480,66 @@ extension ClientTests {
 }
 
 extension ClientTests {
-  @Test func oversizedWholeUtteranceRewriteKeepsOneGenerationContext() async throws {
-    FixtureProtocol.reply = { request in
-      #expect(request.url?.path == "/ai/v1/generate")
-      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
-      let messages = body["messages"] as! [[String: String]]
-      #expect(messages[0]["content"]!.contains("Preserve the whole argument"))
-      let text = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
-      #expect(text.utf8.count > 65536)
-      return (200, "application/json", try portableReply(text))
+  @Test(arguments: [DictationMode.rewrite, .clean])
+  func oversizedWholeUtteranceFailsBeforeGenerationWithRawRecovery(mode: DictationMode) async throws
+  {
+    FixtureProtocol.reply = { _ in
+      Issue.record("An oversized whole utterance reached generation")
+      return (500, "application/json", "{}")
     }
     var preset = Configuration().presets[0]
-    preset.mode = .rewrite
+    preset.mode = mode
+    if mode == .clean { preset.processing = .wholeUtterance }
     preset.instructions = "Preserve the whole argument"
     preset.cleanupModel = "generators/cleanup"
     let raw = String(repeating: "word new paragraph ", count: 1400)
+    do {
+      _ = try await client().cleanupText(raw, preset: preset, dictionary: [], formatting: .init())
+      Issue.record("Accepted an utterance larger than the output budget")
+    } catch let error as DictationError {
+      #expect(error.rawTranscript == raw)
+      #expect(error.localizedDescription.contains("whole-utterance cleanup capacity"))
+    }
+  }
+
+  @Test(arguments: [false, true])
+  func markerHeavyCleanupFitsOutputBudgetOnBothBackends(runtime: Bool) async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let text: String
+      if runtime {
+        #expect(request.url?.path == "/ai/v1/generate")
+        let messages = body["messages"] as! [[String: String]]
+        text = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
+      } else {
+        #expect(request.url?.path == "/ai/v1/dictate")
+        text = body["transcript_text"] as! String
+      }
+      let outputBudget = body["max_tokens"] as! Int
+      // Simulate a byte-fallback tokenizer, rather than letting the echo
+      // fixture return unlimited marker output regardless of max_tokens.
+      #expect(text.utf8.count + 1024 <= outputBudget)
+      guard text.utf8.count <= outputBudget else {
+        return (200, "application/json", try portableReply("partial", finish: "length"))
+      }
+      return runtime
+        ? (200, "application/json", try portableReply(text))
+        : (200, "text/event-stream", try formattingEvents(raw: text, text: text))
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    if runtime {
+      preset.model = "openai/whisper-tiny"
+      preset.transcriberRoute = .runtime
+      preset.cleanupModel = "google/gemma-3-1b-it"
+    }
+    let raw = String(repeating: "a new line ", count: 1000)
     let result = try await client().cleanupText(
       raw, preset: preset, dictionary: [], formatting: .init())
-    #expect(result.text == String(repeating: "word\n\n", count: 1400))
+    #expect(result.text == String(repeating: "a\n", count: 1000))
+    #expect(result.raw == raw)
   }
+
 }
 
 private actor FormattingPhaseLog {

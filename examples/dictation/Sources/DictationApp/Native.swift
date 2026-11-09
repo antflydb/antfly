@@ -425,49 +425,51 @@ final class CaptureConverter: @unchecked Sendable {
         let captured = try await probe.context()
         try validate()
         try validateFrontmost()
+        try PasteConfirmation.requireSelection(
+          pressEnter: pressEnter, hasSelection: captured.selection != nil)
         context = captured
         if smartSpacing, captured.selection?.length == 0 {
           inserted = VoiceFormatting.spaced(
             original, before: captured.before, after: captured.after)
         }
         return inserted
-      }
-    ) { ownership in
-      try validate()
-      try validateFrontmost()
-      try ownership()
-      guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
-        let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)
-      else { throw DictationError.invalid("Cannot generate paste event.") }
-      down.flags = .maskCommand
-      up.flags = .maskCommand
-      down.post(tap: .cghidEventTap)
-      up.post(tap: .cghidEventTap)
-      if pressEnter {
-        guard let selection = context?.selection else {
-          throw DictationError.invalid(
-            "Paste sent; Enter was not sent because the target cannot confirm insertion.")
-        }
-        try await PasteConfirmation.wait(
-          validate: {
-            try validate()
-            try validateFrontmost()
-            try ownership()
-            try await probe.validate()
-          }, confirmed: { try await probe.confirms(inserted, at: selection.location) })
-        try await probe.validate()
+      },
+      operation: { ownership in
         try validate()
         try validateFrontmost()
         try ownership()
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
-          let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false)
-        else { throw DictationError.invalid("Paste sent; cannot generate Enter event.") }
-        down.flags = []
-        up.flags = []
-        down.postToPid(pid)
-        up.postToPid(pid)
-      }
-    }
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)
+        else { throw DictationError.invalid("Cannot generate paste event.") }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        if pressEnter {
+          guard let selection = context?.selection else {
+            throw DictationError.invalid(
+              "Paste sent; Enter was not sent because the target cannot confirm insertion.")
+          }
+          try await PasteConfirmation.wait(
+            validate: {
+              try validate()
+              try validateFrontmost()
+              try ownership()
+              try await probe.validate()
+            }, confirmed: { try await probe.confirms(inserted, at: selection.location) })
+          try await probe.validate()
+          try validate()
+          try validateFrontmost()
+          try ownership()
+          guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false)
+          else { throw DictationError.invalid("Paste sent; cannot generate Enter event.") }
+          down.flags = []
+          up.flags = []
+          down.postToPid(pid)
+          up.postToPid(pid)
+        }
+      })
   }
 }
 

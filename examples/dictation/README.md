@@ -96,13 +96,24 @@ External raw runtimes must permit generation for the selected cleanup model.
 Protected requests keep the selected Clean/Rewrite style. Full-size user rewrite
 instructions are preserved; when internal marker rules would exceed `/dictate`'s
 instruction limit, cleanup uses the portable generation contract instead.
-Expanded Clean-mode transcripts are batched by encoded UTF-8 size, without
-splitting markers or words, and restored in order. Rewrite and explicit Whole
-utterance processing retain one generation context using the portable contract;
-model context/output limits still apply, and incomplete output fails closed. Response sizes are bounded, and truncated or
-incomplete generation cannot become insertable text. Formatting markers own
+Clean-mode cleanup batches are limited to 3,072 encoded UTF-8 bytes and request
+up to 4,096 output tokens on both backends. Each request budgets one token per
+input byte plus 1,024 tokens. The conservative byte bound accounts for
+byte-fallback tokenizers and reserves 1,024 tokens for cleanup changes; it includes
+marker expansion, not just spoken text. Markers and words are never split, and
+batches are restored in order. A single word larger than this capacity is rejected
+with the original transcript available for recovery.
+Rewrite and explicit Whole utterance processing preserve one generation context.
+If their encoded input exceeds this capacity, the app reports the limit before
+calling a model and preserves the raw transcript. Choose Clean with Automatic
+processing, shorten the recording, or insert the original transcript. Model
+context limits still apply; responses are bounded, and truncated or incomplete
+output cannot become insertable text. Formatting markers own
 surrounding line-break whitespace; quoted literal contents remain unchanged.
 
+Enter confirmation prerequisites are checked before Paste is posted. Failed or
+canceled insertion attempts retain the clipboard payload for the normal 750 ms
+delivery grace period; successful confirmation can restore it immediately.
 Clipboard intent is reserved before preservation or preparation begins. A newer
 operation immediately invalidates older key actions without losing the original
 clipboard snapshot. Provider waits are cancellable and time out after five

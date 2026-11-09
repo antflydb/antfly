@@ -29,6 +29,14 @@ and spaces between separate insertions. A trailing “press enter” command is 
 separate opt-in: it can submit a message and requires a confirmed paste into the
 original field. See the example README for supported commands and limitations.
 
+With voice formatting enabled, Clean-mode cleanup uses bounded batches that
+account for both formatting markers and the model's output budget. Rewrite and
+Whole utterance modes preserve a single generation context; oversized inputs are
+rejected before generation with the raw transcript available to insert or copy.
+Enter requires a readable cursor position before any paste is sent. Failed or
+canceled insertion attempts preserve the clipboard payload for the normal
+delivery grace period rather than restoring it while Paste may still be queued.
+
 ## The Result
 
 A desktop or browser client records while a key is held, posts the clip, and pastes the reply. The reply is written text, not a raw transcript: fillers and false starts are gone, punctuation is in, and names from your dictionary are spelled your way.

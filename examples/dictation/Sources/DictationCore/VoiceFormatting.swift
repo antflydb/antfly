@@ -51,6 +51,9 @@ public enum VoiceFormatting {
         continue
       }
       if [39, 0x2019].contains(unit), word(index - 1), word(index + 1) { continue }
+      // A trailing possessive apostrophe cannot open a quotation. An active
+      // straight quotation can still close after a word (e.g. 'new line').
+      if unit == 39, word(index - 1), stack.last != unit { continue }
       if stack.last == unit {
         stack.removeLast()
         if stack.isEmpty { result.append(NSRange(location: start, length: index + 1 - start)) }
@@ -76,6 +79,13 @@ public enum VoiceFormatting {
   /// Created before generation. The model sees only opaque, request-specific
   /// markers, never executable voice commands or the contents of literal spans.
   public struct Plan: Sendable {
+    // Byte-fallback tokenizers need at most one token per UTF-8 byte. Leave
+    // 1,024 tokens for punctuation/rewriting within our 4,096 output budget.
+    public static let maxCleanupBatchBytes = 3072
+    static let cleanupOutputTokens = 4096
+    static func cleanupTokenBudget(for text: String) -> Int {
+      min(cleanupOutputTokens, text.utf8.count + 1024)
+    }
     public let input: String
     public let hasCleanupText: Bool
     public let pressEnter: Bool
@@ -181,7 +191,7 @@ public enum VoiceFormatting {
     }
     /// Size the wire form, not the transcript. Never split a marker or UTF-8
     /// word; callers preserve boundary whitespace across independent cleanups.
-    public func batches(maxBytes: Int = 65536) throws -> [Batch] {
+    public func batches(maxBytes: Int = Plan.maxCleanupBatchBytes) throws -> [Batch] {
       guard maxBytes > 0 else { throw DictationError.invalid("Invalid cleanup batch limit.") }
       var result: [Batch] = []
       var text = ""
@@ -317,6 +327,13 @@ public enum VoiceFormatting {
 }
 
 @MainActor public enum PasteConfirmation {
+  public static func requireSelection(pressEnter: Bool, hasSelection: Bool) throws {
+    guard !pressEnter || hasSelection else {
+      throw DictationError.invalid(
+        "Enter requires a text field that can confirm insertion. Nothing was pasted; copy the transcript manually."
+      )
+    }
+  }
   public static func wait(
     timeout: TimeInterval = 8,
     now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },

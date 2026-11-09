@@ -10,6 +10,10 @@ extension AntflyClient {
   func portableCleanup(
     _ text: String, preset: Preset, dictionary: [String], protectedInstructions: String
   ) async throws -> String {
+    guard text.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes else {
+      throw DictationError.invalid(
+        "Cleanup input exceeds the output capacity. Shorten the recording.")
+    }
     var rules = """
       You are a dictation cleanup engine. Return only the cleaned transcript, without wrappers or commentary.
       Preserve meaning, facts, names, numbers and wording. Remove filler words, stutters, repeated words and false starts.
@@ -42,7 +46,7 @@ extension AntflyClient {
       "messages": [
         ["role": "system", "content": rules], ["role": "user", "content": "Transcript:\n" + text],
       ],
-      "max_tokens": min(4096, text.utf8.count / 3 * 2 + 64), "temperature": 0,
+      "max_tokens": VoiceFormatting.Plan.cleanupTokenBudget(for: text), "temperature": 0,
     ]
     let data = try JSONSerialization.data(withJSONObject: body)
     try await inferenceGate.enter()

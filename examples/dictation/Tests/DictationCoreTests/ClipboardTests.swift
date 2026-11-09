@@ -14,7 +14,7 @@ private actor ClipboardClock {
   func advance() {
     let waiting = waiters
     waiters = []
-    waiting.forEach { $0.resume() }
+    for continuation in waiting { continuation.resume() }
   }
 }
 @MainActor private final class FakeClipboard {
@@ -269,8 +269,7 @@ private actor ReadFailure {
       prepare: { text in
         _ = board.write("external")
         return text
-      }
-    ) { _ in Issue.record("Paste sent after clipboard changed") }
+      }, operation: { _ in Issue.record("Paste sent after clipboard changed") })
     Issue.record("Preparation accepted a changed clipboard")
   } catch {}
   #expect(board.text == "external" && board.restores == 0)
@@ -371,4 +370,109 @@ private actor ReadFailure {
   #expect(board.text == "original" && board.count == 0)
   while await provider.pending() == 0 { await Task.yield() }
   await provider.advance()
+}
+
+@Test @MainActor func unconfirmableEnterFailsBeforeWritingOrPostingPaste() async throws {
+  let board = FakeClipboard()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count }, writeText: { board.write($0) },
+    restore: { board.restore($0) })
+  do {
+    try await coordinator.withPaste(
+      "dictation", restoreAfterOperation: true,
+      prepare: { text in
+        try PasteConfirmation.requireSelection(pressEnter: true, hasSelection: false)
+        return text
+      }, operation: { _ in Issue.record("Posted Paste without confirmation prerequisites") })
+    Issue.record("Accepted an unconfirmable Enter")
+  } catch let error as DictationError {
+    #expect(error.localizedDescription.contains("Nothing was pasted"))
+  }
+  await coordinator.finishRestoration()
+  #expect(board.text == "original" && board.count == 0 && board.restores == 0)
+  try PasteConfirmation.requireSelection(pressEnter: false, hasSelection: false)
+  try PasteConfirmation.requireSelection(pressEnter: true, hasSelection: true)
+}
+
+@Test(arguments: [false, true]) @MainActor
+func failedPostedPasteRetainsPayloadUntilDeliveryGraceEnds(
+  userCopied: Bool
+) async throws {
+  let board = FakeClipboard()
+  let clock = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count }, writeText: { board.write($0) },
+    restore: { board.restore($0) }, sleep: { await clock.sleep() })
+  do {
+    try await coordinator.withPaste("dictation", restoreAfterOperation: true) { ownership in
+      try ownership()
+      // Posting Cmd-V returns before the target consumes the clipboard.
+      throw DictationError.invalid("Confirmation failed after posting Paste")
+    }
+    Issue.record("Expected confirmation failure")
+  } catch is DictationError {}
+  while await clock.pending() == 0 { await Task.yield() }
+  #expect(board.text == "dictation" && board.restores == 0)
+  if userCopied { _ = board.write("new user copy") }
+  await clock.advance()
+  await coordinator.finishRestoration()
+  #expect(board.text == (userCopied ? "new user copy" : "original"))
+  #expect(board.restores == (userCopied ? 0 : 1))
+}
+
+@Test @MainActor func canceledPostedPasteRetainsPayloadAndShutdownWaitsForGrace() async throws {
+  let board = FakeClipboard()
+  let confirmation = ClipboardClock()
+  let delivery = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count }, writeText: { board.write($0) },
+    restore: { board.restore($0) }, sleep: { await delivery.sleep() })
+  let task = Task { @MainActor in
+    try await coordinator.withPaste("dictation", restoreAfterOperation: true) { ownership in
+      try ownership()
+      await confirmation.sleep()
+      try Task.checkCancellation()
+    }
+  }
+  while await confirmation.pending() == 0 { await Task.yield() }
+  task.cancel()
+  await confirmation.advance()
+  do {
+    try await task.value
+    Issue.record("Expected cancellation")
+  } catch is CancellationError {}
+  while await delivery.pending() == 0 { await Task.yield() }
+  #expect(board.text == "dictation" && board.restores == 0)
+  var drained = false
+  let shutdown = Task { @MainActor in
+    await coordinator.finishRestoration()
+    drained = true
+  }
+  for _ in 0..<10 { await Task.yield() }
+  #expect(!drained)
+  await delivery.advance()
+  await shutdown.value
+  #expect(drained && board.text == "original" && board.restores == 1)
+}
+
+@Test @MainActor func failedNewPreparationRetainsTheEarlierPostedPayload() async throws {
+  let board = FakeClipboard()
+  let delivery = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count }, writeText: { board.write($0) },
+    restore: { board.restore($0) }, sleep: { await delivery.sleep() })
+  try await coordinator.paste("first dictation") {}
+  while await delivery.pending() == 0 { await Task.yield() }
+  do {
+    try await coordinator.withPaste(
+      "second dictation", restoreAfterOperation: true,
+      prepare: { _ in throw DictationError.invalid("New field cannot confirm insertion") },
+      operation: { _ in Issue.record("Failed preparation posted Paste") })
+    Issue.record("Expected preparation failure")
+  } catch is DictationError {}
+  while await delivery.pending() < 2 { await Task.yield() }
+  #expect(board.text == "first dictation" && board.restores == 0)
+  await delivery.advance()
+  await coordinator.finishRestoration()
+  #expect(board.text == "original" && board.restores == 1)
 }

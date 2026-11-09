@@ -146,17 +146,16 @@ public actor AntflyClient {
           protectedPreset.mode = .rewrite
         }
         var cleaned = ""
-        let batches = try plan.batches()
         let requiresWhole =
           preset.outputMode == .rewrite || preset.processingStrategy == .wholeUtterance
-        if requiresWhole && batches.count > 1 {
-          // The generation contract has no transcript_text limit. Preserve the
-          // whole rewrite context; incomplete model output still fails closed.
-          cleaned = try await portableCleanup(
-            plan.input, preset: preset, dictionary: dictionary,
-            protectedInstructions: plan.instructions)
+        guard !requiresWhole || plan.input.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes
+        else {
+          throw DictationError.invalid(
+            "This transcript exceeds the whole-utterance cleanup capacity. Use Clean with Automatic processing, shorten the recording, or insert the original transcript."
+          )
         }
-        for batch in (requiresWhole && batches.count > 1 ? [] : batches) {
+        let batches = try plan.batches()
+        for batch in batches {
           try Task.checkCancellation()
           guard batch.needsCleanup else {
             cleaned += batch.text
@@ -196,6 +195,9 @@ public actor AntflyClient {
     var body = dictationBody(preset: preset, dictionary: dictionary)
     body["audio"] = ""
     body["transcript_text"] = text
+    // Do not let the server's prose-based heuristic under-budget opaque
+    // formatting markers; the caller sizes batches against this output cap.
+    body["max_tokens"] = VoiceFormatting.Plan.cleanupTokenBudget(for: text)
     do {
       let result = try await consumeDictation(
         request("ai/v1/dictate", body: encode(body)), cleanup: true, events: events,

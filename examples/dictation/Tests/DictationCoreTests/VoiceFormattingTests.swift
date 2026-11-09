@@ -140,7 +140,39 @@ import Testing
   let plan = VoiceFormatting.Plan(
     String(repeating: "Résumé new paragraph ‘new line’ ", count: 2000))
   let batches = try plan.batches()
-  #expect(batches.count > 1 && batches.allSatisfy { $0.text.utf8.count <= 65536 })
+  #expect(
+    batches.count > 1
+      && batches.allSatisfy { $0.text.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes })
   #expect(batches.map(\.text).joined() == plan.input)
   #expect(try plan.restore(batches.map(\.text).joined()).text == plan.render().text)
+}
+
+@Test func possessiveApostrophesDoNotSwallowFormattingOrEnterCommands() {
+  for possessive in ["users'", "users’", "James'", "James’"] {
+    let raw = "The \(possessive) accounts new line Next item press enter"
+    let result = VoiceFormatting.format(raw, pressEnter: true)
+    #expect(result.text == "The \(possessive) accounts\nNext item")
+    #expect(result.pressEnter)
+  }
+  for quotation in ["'new line'", "'press enter'", "'users'", "'yes'"] {
+    let raw = "Say \(quotation) new line Next item press enter"
+    let result = VoiceFormatting.format(raw, pressEnter: true)
+    #expect(result.text == "Say \(quotation)\nNext item")
+    #expect(result.pressEnter)
+  }
+}
+
+@Test func batchCapacityIncludesExactBoundaryAndMarkerExpansion() throws {
+  let limit = VoiceFormatting.Plan.maxCleanupBatchBytes
+  let exact = VoiceFormatting.Plan(String(repeating: "x", count: limit))
+  #expect(try exact.batches().count == 1)
+  let overflow = VoiceFormatting.Plan(String(repeating: "x", count: limit) + " y")
+  #expect(try overflow.batches().count == 2)
+  let markers = VoiceFormatting.Plan(String(repeating: "a new line ", count: 1000))
+  let batches = try markers.batches()
+  #expect(batches.count > 1)
+  #expect(
+    batches.allSatisfy { $0.text.utf8.count + 1024 <= VoiceFormatting.Plan.cleanupOutputTokens })
+  #expect(batches.map(\.text).joined() == markers.input)
+  #expect(try markers.restore(batches.map(\.text).joined()) == markers.render())
 }

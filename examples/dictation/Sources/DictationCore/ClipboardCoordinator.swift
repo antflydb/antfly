@@ -73,14 +73,14 @@ import Foundation
     cancelRestoration()
     let superseded = Array(snapshotWaiters.values)
     snapshotWaiters.removeAll()
-    superseded.forEach { $0() }
+    for cancel in superseded { cancel() }
     active += 1
     defer {
       active -= 1
       if active == 0 {
         let waiting = idleWaiters
         idleWaiters = []
-        waiting.forEach { $0.resume() }
+        for continuation in waiting { continuation.resume() }
       }
     }
     if ownedCount != count() {
@@ -111,7 +111,9 @@ import Foundation
     } catch {
       if generation != operationID { throw error }
       if let previousLease {
-        restoreIfOwned(previousLease, generation: operationID)
+        // A preceding operation may already have posted Paste against this
+        // shared lease, even though the newer preparation failed before write.
+        scheduleRestoration(previousLease, generation: operationID)
       } else if ownedCount == nil {
         saved = nil
       }
@@ -128,7 +130,9 @@ import Foundation
         }
       }
     } catch {
-      restoreIfOwned(lease, generation: operationID)
+      // A posted paste is asynchronous. Even a failed/canceled confirmation
+      // must leave the payload available for the normal delivery grace period.
+      scheduleRestoration(lease, generation: operationID)
       throw error
     }
     guard generation == operationID, ownedCount == lease else { return }
@@ -136,6 +140,11 @@ import Foundation
       restoreIfOwned(lease, generation: operationID)
       return
     }
+    scheduleRestoration(lease, generation: operationID)
+  }
+  private func scheduleRestoration(_ lease: Int, generation operationID: UUID) {
+    guard generation == operationID, ownedCount == lease else { return }
+    cancelRestoration()
     let sleep = self.sleep
     restoration = Task { [weak self] in
       do {
