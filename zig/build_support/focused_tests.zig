@@ -49,14 +49,11 @@ pub fn aggregationModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     root.addImport("antfly_reranking", reranking);
     root.addImport("antfly_regex", regex);
     const cypher = @import("../lib/cypher/build_support.zig").createModule(b, b.path("lib/cypher"), target, optimize);
-    cypher.addImport("cypher_regex_capture", regex.import_table.get("antfly_capture_regex").?);
+    cypher.addImport("cypher_regex_capture", captures);
     root.addImport("cypher", cypher);
     const cache_budget = module(b, "lib/runtime/src/cache_budget.zig", target, optimize);
     cache_budget.addImport("antfly_platform", platform);
     root.addImport("antfly_cache_budget", cache_budget);
-    const cypher = module(b, "lib/cypher/root.zig", target, optimize);
-    cypher.addImport("cypher_regex_capture", captures);
-    root.addImport("cypher", cypher);
     platform_build.addMacosSdkPaths(b, root, target);
     return root;
 }
