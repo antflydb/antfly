@@ -19,12 +19,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-from verify_release_ledger import verify_payload
+from verify_release_ledger import inferred_scope, verify_payload
 
 
 def clean_prefix(prefix: str) -> str:
@@ -103,6 +106,36 @@ class S3Reader:
         return names
 
 
+class PublicReader:
+    def __init__(self, base_url: str, max_bytes: int = 256 * 1024) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.max_bytes = max_bytes
+
+    def read_optional(self, key: str) -> bytes | None:
+        if key.startswith("/") or ".." in key.split("/") or "\\" in key:
+            raise ValueError("Invalid public release object key")
+        try:
+            with urlopen(
+                Request(
+                    self.base_url + "/" + key,
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "User-Agent": "Antfly-Release/1.0",
+                    },
+                ),
+                timeout=30,
+            ) as response:
+                body = response.read(self.max_bytes + 1)
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise
+            exc.close()
+            return None
+        if len(body) > self.max_bytes:
+            raise ValueError("Public release metadata exceeds its size limit")
+        return body
+
+
 class LocalReader:
     def __init__(self, root: Path, bucket: str) -> None:
         self.root = root
@@ -154,12 +187,18 @@ def restore_verified_payload(
     tag: str,
     commit: str,
     ledger_sha256: str,
+    scope: str | None = None,
 ) -> None:
     if out_dir.exists() and any(out_dir.iterdir()):
         raise SystemExit(f"release payload directory must be empty: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ledger_bytes = reader.read("artifacts.json")
+    if hashlib.sha256(ledger_bytes).hexdigest() != ledger_sha256:
+        raise SystemExit("release ledger digest differs")
+    ledger = json.loads(ledger_bytes)
+    if ledger.get("tag") != tag or ledger.get("commit") != commit:
+        raise SystemExit("release ledger does not match the requested tag and commit")
     names = payload_names(ledger_bytes)
     expected_names = {"artifacts.json", *names}
     actual_names = reader.list_names()
@@ -169,9 +208,17 @@ def restore_verified_payload(
             f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
         )
     (out_dir / "artifacts.json").write_bytes(ledger_bytes)
+    if scope:
+        names = [
+            entry["name"]
+            for entry in json.loads(ledger_bytes)["artifacts"]
+            if inferred_scope(entry) == scope
+        ]
     for name in names:
         (out_dir / name).write_bytes(reader.read(name))
-    verify_payload(out_dir / "artifacts.json", out_dir, tag, commit, ledger_sha256)
+    verify_payload(
+        out_dir / "artifacts.json", out_dir, tag, commit, ledger_sha256, scope
+    )
 
 
 def restore_payload(
@@ -181,12 +228,13 @@ def restore_payload(
     tag: str,
     commit: str,
     ledger_sha256: str,
+    scope: str | None = None,
 ) -> None:
     prefix = clean_prefix(prefix)
     if not prefix:
         raise SystemExit("object-storage release prefix cannot be empty")
     restore_verified_payload(
-        PrefixedReader(reader, prefix), out_dir, tag, commit, ledger_sha256
+        PrefixedReader(reader, prefix), out_dir, tag, commit, ledger_sha256, scope
     )
     print(f"restored verified immutable objects from {prefix}")
 
@@ -202,6 +250,7 @@ def main() -> int:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ledger-sha256", required=True)
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--scope", choices=("runtime", "cli", "support"))
     parser.add_argument("--local-root", type=Path, default=Path("dist/objectstorage"))
     args = parser.parse_args()
 
@@ -217,6 +266,7 @@ def main() -> int:
         args.tag,
         args.commit,
         args.ledger_sha256,
+        args.scope,
     )
     return 0
 

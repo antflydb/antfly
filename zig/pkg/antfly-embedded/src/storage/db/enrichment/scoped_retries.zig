@@ -33,10 +33,11 @@ pub const SourceStamp = struct {
     }
 };
 const header_magic = "ESQ2";
+const empty_cursor_header_magic = "ESQ3";
 const snapshot_magic = "ESR2";
 const ticket_magic = "EST2";
 pub const max_ticket_bytes = 4 + 4 + max_document_key_bytes + 8 + 1 + 32 + 1 + 48 + 8 + 8 + 2 + max_budgets * 40;
-const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 2 + max_documents;
+const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 1 + 2 + max_documents;
 comptime {
     // Every admitted combination fits, including maximum opaque keys, every
     // producer budget, both source identities, and a partial-record cursor.
@@ -91,6 +92,7 @@ pub const State = struct {
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
+    empty_scan_document: bool = false,
     tickets: std.ArrayListUnmanaged(Ticket) = .empty,
     persisted_slots: std.StaticBitSet(max_documents) = .empty,
     logical_budgets: std.AutoHashMapUnmanaged(BudgetKey, BudgetCounts) = .empty,
@@ -165,7 +167,7 @@ pub const State = struct {
         if (parsed.value.scan_document.len != 0) result.scan_document = try a.dupe(u8, parsed.value.scan_document);
         errdefer result.deinit(a);
         for (parsed.value.tickets, 0..) |wire, slot| {
-            if (wire.document.len == 0 or wire.document.len > 90_000 or (wire.budgets.len == 0 or wire.budgets.len > max_budgets) or wire.revision == 0) return error.InvalidEnrichmentState;
+            if (wire.document.len > 90_000 or (wire.budgets.len == 0 or wire.budgets.len > max_budgets) or wire.revision == 0) return error.InvalidEnrichmentState;
             _ = std.base64.standard.Decoder.calcSizeForSlice(wire.document) catch return error.InvalidEnrichmentState;
             var ticket = Ticket{ .document = try a.dupe(u8, wire.document), .sequence = wire.sequence, .source_digest = wire.source_digest, .source_stamp = wire.source_stamp, .slot = @intCast(slot), .deadline_ms = wire.deadline_ms, .revision = wire.revision };
             errdefer ticket.deinit(a);
@@ -200,7 +202,7 @@ pub const State = struct {
         return bytes;
     }
     pub fn isHeader(bytes: []const u8) bool {
-        return std.mem.startsWith(u8, bytes, header_magic);
+        return std.mem.startsWith(u8, bytes, header_magic) or std.mem.startsWith(u8, bytes, empty_cursor_header_magic);
     }
     pub const Header = struct { state: State, slots: [max_documents]u8 = undefined, count: usize };
     pub fn decodeHeader(a: A, raw: []const u8) !Header {
@@ -212,6 +214,10 @@ pub const State = struct {
         result.state.config_hash = try reader.int(u64);
         result.state.scanned_sequence = try reader.int(u64);
         result.state.scan_document = try reader.key(a, max_document_key_bytes);
+        if (std.mem.startsWith(u8, raw, empty_cursor_header_magic)) {
+            if (try reader.int(u8) != 1 or result.state.scan_document.len != 0) return error.InvalidEnrichmentState;
+            result.state.empty_scan_document = true;
+        }
         result.count = try reader.int(u16);
         if (result.count > max_documents) return error.InvalidEnrichmentState;
         var used: std.StaticBitSet(max_documents) = .empty;
@@ -227,13 +233,15 @@ pub const State = struct {
         if (self.tickets.items.len > max_documents) return error.InvalidEnrichmentState;
         const cursor_len = try binary.keyLength(self.scan_document);
         if (cursor_len > max_document_key_bytes) return error.InvalidEnrichmentState;
-        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + 2 + self.tickets.items.len);
+        const empty_cursor = self.empty_scan_document and self.scan_document.len == 0;
+        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + @intFromBool(empty_cursor) + 2 + self.tickets.items.len);
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
-        writer.put(header_magic);
+        writer.put(if (empty_cursor) empty_cursor_header_magic else header_magic);
         writer.int(u64, self.config_hash);
         writer.int(u64, self.scanned_sequence);
         try writer.key(self.scan_document);
+        if (empty_cursor) writer.int(u8, 1);
         writer.int(u16, @intCast(self.tickets.items.len));
         var used: std.StaticBitSet(max_documents) = .empty;
         for (self.tickets.items) |ticket| {
@@ -245,7 +253,7 @@ pub const State = struct {
     }
     fn validateTicket(ticket: Ticket) !void {
         const n = try binary.keyLength(ticket.document);
-        if (n == 0 or n > max_document_key_bytes or ticket.revision == 0 or ticket.budgets.items.len == 0 or ticket.budgets.items.len > max_budgets) return error.InvalidEnrichmentState;
+        if (n > max_document_key_bytes or ticket.revision == 0 or ticket.budgets.items.len == 0 or ticket.budgets.items.len > max_budgets) return error.InvalidEnrichmentState;
         var earliest: u64 = std.math.maxInt(u64);
         for (ticket.budgets.items) |budget| {
             if (budget.fingerprint == 0 or budget.revision == 0 or budget.revision > ticket.revision) return error.InvalidEnrichmentState;
@@ -348,6 +356,7 @@ pub const State = struct {
     pub fn clearScanDocument(self: *State, a: A) void {
         if (self.scan_document.len != 0) a.free(self.scan_document);
         self.scan_document = "";
+        self.empty_scan_document = false;
     }
     pub fn scanDocumentAlloc(self: State, a: A) ![]u8 {
         const size = try std.base64.standard.Decoder.calcSizeForSlice(self.scan_document);
@@ -357,15 +366,19 @@ pub const State = struct {
         return bytes;
     }
     pub fn setScanDocument(self: *State, a: A, group: Group) !void {
-        if (group.doc_key.len == 0 or group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
+        if (group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
         const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(group.doc_key.len));
         _ = std.base64.standard.Encoder.encode(encoded, group.doc_key);
         self.clearScanDocument(a);
         self.scan_document = encoded;
+        self.empty_scan_document = group.doc_key.len == 0;
         self.scanned_sequence = group.sequence;
     }
+    pub fn hasScanDocument(self: State) bool {
+        return self.empty_scan_document or self.scan_document.len != 0;
+    }
     pub fn completedSequence(self: State) u64 {
-        return self.scanned_sequence -| @as(u64, if (self.scan_document.len != 0) 1 else 0);
+        return self.scanned_sequence -| @as(u64, if (self.hasScanDocument()) 1 else 0);
     }
     pub fn prior(self: State, fingerprint: u64) Budget {
         var result = Budget{ .fingerprint = fingerprint };
@@ -383,7 +396,7 @@ pub const State = struct {
         return self.parkStamped(a, group, deadline_ms, budget, source_digest, null);
     }
     pub fn parkStamped(self: *State, a: A, group: Group, deadline_ms: u64, budget: Budget, source_digest: ?[32]u8, stamp: ?SourceStamp) !void {
-        if (group.doc_key.len == 0 or group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
+        if (group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
         if (self.budget_index_valid) {
             try self.logical_budgets.ensureUnusedCapacity(a, 1);
             try self.logical_present.ensureUnusedCapacity(a, 1);
@@ -758,4 +771,32 @@ test "scoped retry workset indexed budgets survive replacement retirement and al
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "privacy retry workset preserves empty document tickets and exclusive cursors" {
+    const a = std.testing.allocator;
+    var state = State{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = "", .sequence = 2 }, 100, .{ .fingerprint = 17, .failures = 1 }, null);
+    try state.setScanDocument(a, .{ .doc_key = "", .sequence = 3 });
+    try std.testing.expect(state.hasScanDocument());
+    try std.testing.expectEqual(@as(u64, 2), state.completedSequence());
+    const bytes = try state.encode(a);
+    defer a.free(bytes);
+    var restored = try State.decode(a, bytes);
+    defer restored.deinit(a);
+    try std.testing.expect(restored.hasScanDocument());
+    try std.testing.expectEqual(@as(u64, 2), restored.completedSequence());
+    const due = try restored.due(a, 100);
+    defer due.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+    try std.testing.expectEqualStrings("", due.groups[0].doc_key);
+    restored.clearScanDocument(a);
+    try std.testing.expect(!restored.hasScanDocument());
+    try std.testing.expectEqual(@as(u64, 3), restored.completedSequence());
+    const legacy = try restored.encode(a);
+    defer a.free(legacy);
+    var roundtrip = try State.decode(a, legacy);
+    defer roundtrip.deinit(a);
+    try std.testing.expect(!roundtrip.hasScanDocument());
 }

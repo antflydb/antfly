@@ -1,4 +1,5 @@
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+import { encodeGraphParameter } from "./graph-wire.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -15,8 +16,17 @@ import {
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import {
   createMemoryClient,
+  type MemoryCallOptions,
+  type MemoryEpisodeQuery,
+  type MemoryHistoryQuery,
+  type MemoryListQuery,
+  type MemoryPageQuery,
   type MemoryPaths,
+  type MemoryRememberInput,
   type MemorySchemas,
+  type MemoryScopeOptions,
+  memoryMutationHeaders,
+  memoryScopeHeaders,
   type OrdinaryPaths,
 } from "./memory.js";
 import type { components, paths } from "./public-api.js";
@@ -51,6 +61,11 @@ import type {
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
   GlobalQueryRequest,
+  GraphCatalogEntry,
+  GraphDefinition,
+  GraphQueryRequest,
+  GraphQueryResult,
+  GraphWriteStatus,
   IndexMaintenanceRequest,
   IndexMaintenanceResponse,
   IndexStatus,
@@ -110,6 +125,25 @@ import type {
 export interface RestoreOptions {
   /** Stable key used to safely retry creation of the same restore job. */
   idempotencyKey?: string;
+}
+
+export interface GraphDiagnostic {
+  /** Server-confirmed write disposition for a failed statement. */
+  write_outcome?: "not_started" | "aborted" | "committed" | "unknown";
+  code: string;
+  message: string;
+  /** UTF-8 byte offsets into the submitted query. */
+  span?: { start: number; end: number };
+}
+
+export class GraphExecutionError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly diagnostic: GraphDiagnostic
+  ) {
+    super(`Graph query failed (${diagnostic.code}): ${diagnostic.message}`);
+    this.name = "GraphExecutionError";
+  }
 }
 
 export class SQLExecutionError extends Error {
@@ -184,7 +218,7 @@ export interface RestoreJobPage {
 }
 
 export interface IndexOperations {
-  list(tableName: string): Promise<IndexStatus[]>;
+  list(tableName: string, scope?: { database: string; namespace: string }): Promise<IndexStatus[]>;
   get(tableName: string, indexName: string): Promise<IndexStatus>;
   create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
@@ -308,6 +342,14 @@ export class HierarchyCursorStaleError extends Error {
 }
 
 export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
+// Match api/public_limits.zig. Findings carry a raw-key cursor and may return
+// one oversized finding; keep these allowances scoped to the findings endpoint.
+const MAX_PRIVACY_CURSOR_BYTES = 3 + Math.ceil(((DEFAULT_WRITE_MAX_REQUEST_BYTES + 137) * 4) / 3);
+const MAX_PRIVACY_FINDINGS_REQUEST_BYTES =
+  MAX_PRIVACY_CURSOR_BYTES + 6 * DEFAULT_WRITE_MAX_REQUEST_BYTES + 8192;
+const MAX_PRIVACY_FINDINGS_RESPONSE_BYTES =
+  MAX_PRIVACY_CURSOR_BYTES + 7 * DEFAULT_WRITE_MAX_REQUEST_BYTES + 8 * 1024 * 1024 + 8192;
+
 export const DEFAULT_WRITE_MAX_RESPONSE_BYTES = 1 << 20;
 const MAX_ERROR_RESPONSE_BYTES = 1 << 20;
 
@@ -487,20 +529,29 @@ function relationalNumberReplacer(_key: string, value: unknown): unknown {
 
 export async function readLimitedResponseBytes(
   response: Response,
-  maxBytes: number
+  maxBytes: number,
+  signal?: AbortSignal
 ): Promise<{ bytes: Uint8Array<ArrayBuffer>; truncated: boolean }> {
   if (!response.body) {
+    signal?.throwIfAborted();
     return { bytes: new Uint8Array(0), truncated: false };
   }
 
   const reader = response.body.getReader();
+  const onAbort = () => {
+    void reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let truncated = false;
 
   try {
     while (true) {
+      signal?.throwIfAborted();
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       const remaining = maxBytes - total;
       if (remaining <= 0) {
@@ -517,6 +568,7 @@ export async function readLimitedResponseBytes(
       total += value.byteLength;
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     if (truncated) {
       try {
         await reader.cancel();
@@ -538,9 +590,10 @@ export async function readLimitedResponseBytes(
 
 export async function readLimitedResponseText(
   response: Response,
-  maxBytes: number
+  maxBytes: number,
+  signal?: AbortSignal
 ): Promise<{ text: string; truncated: boolean }> {
-  const { bytes, truncated } = await readLimitedResponseBytes(response, maxBytes);
+  const { bytes, truncated } = await readLimitedResponseBytes(response, maxBytes, signal);
   return { text: new TextDecoder().decode(bytes), truncated };
 }
 
@@ -566,6 +619,9 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** A literal table name uses default.public; scoped names are explicit. */
+export type PrivacyTableTarget = string | components["schemas"]["CatalogTableTarget"];
+
 export class AntflyClient {
   private client: Client<paths>;
   private memoryTransport?: Client<MemoryPaths>;
@@ -577,6 +633,11 @@ export class AntflyClient {
       baseUrl: normalizeBaseUrl(config.baseUrl),
     };
     this.client = this.buildClient();
+  }
+
+  /** Normalized endpoint used by this client, without credentials. */
+  get baseUrl(): string {
+    return this.config.baseUrl;
   }
 
   /** Typed ordinary endpoints, including system catalog lifecycle routes. */
@@ -618,7 +679,7 @@ export class AntflyClient {
       headers.Authorization = authHeader;
     }
 
-    return createClient<paths>({
+    const client = createClient<paths>({
       baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
       bodySerializer: (body) => {
@@ -628,6 +689,19 @@ export class AntflyClient {
         return JSON.stringify(body);
       },
     });
+    // A graph query can mutate data. Protect wrappers and the typed API alike,
+    // including catalog mutations, without changing unrelated read requests.
+    client.use({
+      onRequest({ schemaPath, request }) {
+        if (
+          schemaPath === "/db/v1/graphs/{graphName}/query" ||
+          (schemaPath === "/db/v1/graphs/{graphName}" &&
+            ["POST", "PUT", "DELETE"].includes(request.method))
+        )
+          return new Request(request, { redirect: "error" });
+      },
+    });
+    return client;
   }
 
   private requestHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -645,61 +719,292 @@ export class AntflyClient {
     return headers;
   }
 
-  /** Native temporal memory. All calls share the client's authenticated transport. */
+  /**
+   * Native temporal memory. All calls share the client's authenticated transport.
+   * Every helper takes optional scope options (`database`, `namespace`, `branch`);
+   * mutations also take `idempotencyKey` (a random UUID when omitted). Passing a
+   * string where options are accepted is the legacy positional idempotency key.
+   */
   readonly memory = {
-    create: (body: MemorySchemas["MemoryCreateSpaceRequest"], key: string) =>
+    /** Create a space from a `{ space, config }` body (POST). */
+    create: (
+      body: MemorySchemas["MemoryCreateSpaceRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces", {
         body,
-        params: { header: { "Idempotency-Key": key } },
+        params: { header: memoryMutationHeaders(options) },
       }),
-    inspect: (space: string) =>
-      this.memoryApi.GET("/memory/v1/spaces/{space}", { params: { path: { space } } }),
-    observe: (space: string, body: MemorySchemas["MemoryObservationRequest"], key: string) =>
+    /** Create `space` at its own path (PUT) with an optional config. */
+    put: (
+      space: string,
+      config: MemorySchemas["MemorySpaceConfig"] = {},
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.PUT("/memory/v1/spaces/{space}", {
+        body: config,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    inspect: (space: string, options?: MemoryScopeOptions & { cursor?: string; limit?: number }) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}", {
+        params: {
+          path: { space },
+          query: { cursor: options?.cursor, limit: options?.limit },
+          header: memoryScopeHeaders(options),
+        },
+      }),
+    /** Replace the space configuration at `expected_revision`. */
+    configure: (
+      space: string,
+      body: MemorySchemas["MemoryConfigureRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.PATCH("/memory/v1/spaces/{space}", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    observe: (
+      space: string,
+      body: MemorySchemas["MemoryObservationRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/observations", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    assertions: (space: string, body: MemorySchemas["MemoryAssertionRequest"], key: string) =>
+    /**
+     * Observe one text evidence item (id defaults to a random UUID). Assertions
+     * without `evidence` cite it. The result carries the `evidenceId` used.
+     */
+    remember: async (
+      space: string,
+      input: MemoryRememberInput,
+      options?: string | MemoryCallOptions
+    ) => {
+      const { text, id, sourceId, evidence, assertions, ...observation } = input;
+      const headers = memoryMutationHeaders(options);
+      const evidenceId =
+        id ??
+        (typeof options === "string" || options?.idempotencyKey !== undefined
+          ? Array.from(
+              new Uint8Array(
+                await globalThis.crypto.subtle.digest(
+                  "SHA-256",
+                  new TextEncoder().encode(`antfly-memory-remember:${headers["Idempotency-Key"]}`)
+                )
+              ),
+              (byte) => byte.toString(16).padStart(2, "0")
+            ).join("")
+          : globalThis.crypto.randomUUID());
+      const result = await this.memory.observe(
+        space,
+        {
+          ...observation,
+          ...(id === undefined ? { scoped_evidence_ids: true } : {}),
+          evidence: [
+            {
+              ...evidence,
+              id: evidenceId,
+              text,
+              ...(sourceId === undefined ? {} : { source_id: sourceId }),
+            },
+          ],
+          ...(assertions
+            ? {
+                assertions: assertions.map((assertion) => ({
+                  ...assertion,
+                  evidence: assertion.evidence ?? [{ id: evidenceId }],
+                })),
+              }
+            : {}),
+        },
+        {
+          ...(typeof options === "string" ? {} : options),
+          idempotencyKey: headers["Idempotency-Key"],
+        }
+      );
+      return { ...result, evidenceId: result.data?.evidence_ids?.[0] ?? evidenceId };
+    },
+    assertions: (
+      space: string,
+      body: MemorySchemas["MemoryAssertionRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/assertions", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    recall: (space: string, body: MemorySchemas["MemoryRecallRequest"]) =>
+    recall: (
+      space: string,
+      body: MemorySchemas["MemoryRecallRequest"],
+      options?: MemoryScopeOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/recall", {
         body,
-        params: { path: { space } },
+        params: { path: { space }, header: memoryScopeHeaders(options) },
       }),
-    explain: (space: string, id: string, body: MemorySchemas["MemoryExplainRequest"] = {}) =>
+    /** Small session-start context: pinned and high-utility memories within a token budget. */
+    brief: (
+      space: string,
+      body: MemorySchemas["MemoryBriefRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/brief", {
+        body,
+        params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    /** Read-only review of duplicates, conflicts and stale memories; changes nothing. */
+    consolidate: (
+      space: string,
+      body: MemorySchemas["MemoryConsolidationRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/consolidation", {
+        body,
+        params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    /** Record memory IDs actually consumed; reuse idempotencyKey on retries. */
+    access: (space: string, memoryIds: string[], options?: string | MemoryCallOptions) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/accesses", {
+        body: { memory_ids: memoryIds },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    usage: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}/usage", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    /** Create review proposals, leaving acceptance to the curator verdict flow. */
+    prepareConsolidation: (
+      space: string,
+      body: MemorySchemas["MemoryConsolidationRequest"] = {},
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/consolidation-proposals", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    /** Prioritize a memory in the brief within its item and byte limits. */
+    pin: (space: string, id: string, options?: MemoryCallOptions & { reason?: string }) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/pins", {
+        body: { id, pinned: true, ...(options?.reason ? { reason: options.reason } : {}) },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    unpin: (space: string, id: string, options?: MemoryCallOptions & { reason?: string }) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/pins", {
+        body: { id, pinned: false, ...(options?.reason ? { reason: options.reason } : {}) },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    /** Record whether a task that used `used_memory_ids` succeeded; feeds recall utility. */
+    outcome: (
+      space: string,
+      body: MemorySchemas["MemoryOutcome"],
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/outcomes", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    list: (space: string, query?: MemoryListQuery, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories", {
+        params: { path: { space }, query, header: memoryScopeHeaders(options) },
+      }),
+    explain: (
+      space: string,
+      id: string,
+      body: MemorySchemas["MemoryExplainRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/memories/{id}/explain", {
         body,
-        params: { path: { space, id } },
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
       }),
-    explainResource: (space: string, body: MemorySchemas["MemoryExplainRequest"]) =>
+    explainResource: (
+      space: string,
+      body: MemorySchemas["MemoryExplainRequest"],
+      options?: MemoryScopeOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/explain", {
         body,
-        params: { path: { space } },
+        params: { path: { space }, header: memoryScopeHeaders(options) },
       }),
-    get: (space: string, id: string) =>
+    get: (space: string, id: string, options?: MemoryScopeOptions) =>
       this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}", {
-        params: { path: { space, id } },
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
       }),
-    correct: (space: string, body: MemorySchemas["MemoryCorrection"], key: string) =>
+    history: (
+      space: string,
+      id: string,
+      query?: MemoryHistoryQuery,
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}/history", {
+        params: { path: { space, id }, query, header: memoryScopeHeaders(options) },
+      }),
+    evidence: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/evidence/{id}", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    entities: (space: string, query?: MemoryPageQuery, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/entities", {
+        params: { path: { space }, query, header: memoryScopeHeaders(options) },
+      }),
+    entity: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/entities/{id}", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    episodes: (space: string, query?: MemoryEpisodeQuery, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/episodes", {
+        params: { path: { space }, query, header: memoryScopeHeaders(options) },
+      }),
+    episode: (
+      space: string,
+      id: string,
+      query?: MemoryEpisodeQuery,
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/episodes/{id}", {
+        params: { path: { space, id }, query, header: memoryScopeHeaders(options) },
+      }),
+    /** Poll the change feed from `cursor` (or `start`). */
+    changes: (
+      space: string,
+      body: MemorySchemas["MemoryChangeRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/changes", {
+        body,
+        params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    correct: (
+      space: string,
+      body: MemorySchemas["MemoryCorrection"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/corrections", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    forget: (space: string, body: MemorySchemas["MemoryForgetRequest"], key: string) =>
+    forget: (
+      space: string,
+      body: MemorySchemas["MemoryForgetRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/forget", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    operation: (space: string, id: string) =>
+    /** Run space maintenance as a durable operation. */
+    maintain: (space: string, options?: string | MemoryCallOptions) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/maintenance", {
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    operation: (space: string, id: string, options?: MemoryScopeOptions) =>
       this.memoryApi.GET("/memory/v1/spaces/{space}/operations/{id}", {
-        params: { path: { space, id } },
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
       }),
-    advance: (space: string, id: string, key: string) =>
+    advance: (space: string, id: string, options?: string | MemoryCallOptions) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/operations/{id}", {
-        params: { path: { space, id }, header: { "Idempotency-Key": key } },
+        params: { path: { space, id }, header: memoryMutationHeaders(options) },
       }),
   };
 
@@ -743,6 +1048,152 @@ export class AntflyClient {
         signal
       ),
   };
+
+  /** Table-scoped privacy administration, sharing this client's authentication. */
+  readonly privacy = {
+    get: (table: PrivacyTableTarget, signal?: AbortSignal) =>
+      this.privacyRequest<components["schemas"]["PrivacyStatus"]>(
+        table,
+        "",
+        "GET",
+        undefined,
+        undefined,
+        signal
+      ),
+    put: (
+      table: PrivacyTableTarget,
+      policy: components["schemas"]["PrivacyPolicy"],
+      options?: { ifMatch?: string; signal?: AbortSignal }
+    ) =>
+      this.privacyRequest<components["schemas"]["PrivacyStatus"]>(
+        table,
+        "",
+        "PUT",
+        policy,
+        options?.ifMatch,
+        options?.signal
+      ),
+    preview: (
+      table: PrivacyTableTarget,
+      request: components["schemas"]["PrivacyPreviewRequest"],
+      signal?: AbortSignal
+    ) =>
+      this.privacyRequest<components["schemas"]["PrivacyPreview"]>(
+        table,
+        "/preview",
+        "POST",
+        request,
+        undefined,
+        signal
+      ),
+    startScan: (
+      table: PrivacyTableTarget,
+      request: components["schemas"]["PrivacyScanRequest"] = {},
+      signal?: AbortSignal
+    ) =>
+      this.privacyRequest<components["schemas"]["PrivacyScan"]>(
+        table,
+        "/scans",
+        "POST",
+        request,
+        undefined,
+        signal
+      ),
+    getScan: (table: PrivacyTableTarget, scan: string, signal?: AbortSignal) =>
+      this.privacyRequest<components["schemas"]["PrivacyScan"]>(
+        table,
+        `/scans/${encodeURIComponent(scan)}`,
+        "GET",
+        undefined,
+        undefined,
+        signal
+      ),
+    findings: (
+      table: PrivacyTableTarget,
+      options?: {
+        cursor?: string;
+        document?: string;
+        field?: string;
+        category?: string;
+        policy_version?: string;
+        limit?: number;
+        signal?: AbortSignal;
+      }
+    ) => {
+      const { signal, ...body } = options ?? {};
+      return this.privacyRequest<components["schemas"]["PrivacyFindingsPage"]>(
+        table,
+        "/findings",
+        "POST",
+        body,
+        undefined,
+        signal
+      );
+    },
+  };
+
+  private async privacyRequest<T>(
+    table: PrivacyTableTarget,
+    suffix: string,
+    method: "GET" | "POST" | "PUT",
+    body?: unknown,
+    ifMatch?: string,
+    signal?: AbortSignal
+  ): Promise<{ data: T; etag?: string }> {
+    const tablePath =
+      typeof table === "string"
+        ? `/tables/${encodeURIComponent(table)}`
+        : `/databases/${encodeURIComponent(table.database ?? "default")}/namespaces/${encodeURIComponent(table.namespace ?? "public")}/tables/${encodeURIComponent(table.table)}`;
+    const response = await fetch(this.url(`/db/v1${tablePath}/privacy${suffix}`), {
+      method,
+      headers: this.requestHeaders(ifMatch === undefined ? undefined : { "If-Match": ifMatch }),
+      ...(body === undefined
+        ? {}
+        : {
+            body: encodeBoundedJSON(
+              body,
+              suffix === "/findings"
+                ? MAX_PRIVACY_FINDINGS_REQUEST_BYTES
+                : DEFAULT_WRITE_MAX_REQUEST_BYTES,
+              false
+            ),
+          }),
+      signal,
+      credentials: "same-origin",
+      redirect: "error",
+    });
+    const result = await readLimitedResponseText(
+      response,
+      response.ok
+        ? suffix === "/findings"
+          ? MAX_PRIVACY_FINDINGS_RESPONSE_BYTES
+          : 32 * 1024 * 1024
+        : MAX_ERROR_RESPONSE_BYTES
+    );
+    let parsed: unknown;
+    try {
+      parsed = parseJSON<unknown>(result.text);
+    } catch {
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          "Privacy request failed",
+          response.status,
+          result.text,
+          response.headers
+        );
+      throw new AntflyResponseError("Privacy response was not valid JSON");
+    }
+    if (!response.ok)
+      throw new AntflyHTTPError(
+        apiErrorMessage(parsed, "Privacy request failed"),
+        response.status,
+        parsed,
+        response.headers
+      );
+    if (result.truncated)
+      throw new AntflyResponseError("Privacy response exceeded the response limit");
+    return { data: parsed as T, etag: response.headers.get("ETag") ?? undefined };
+  }
 
   private async personalRequest<T>(
     path: string,
@@ -1951,6 +2402,124 @@ export class AntflyClient {
   /**
    * Table operations
    */
+  /** Named mappings from document tables and graph indexes to Cypher labels and types. */
+  graphs = {
+    execute: async (
+      graphName: string,
+      request: GraphQueryRequest,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<GraphQueryResult> => {
+      if (request.parameters !== undefined && request.typed_parameters !== undefined)
+        throw new Error("Choose parameters or typed_parameters");
+      const { parameters, ...body } = request;
+      const { data, error, response } = await this.client.POST("/db/v1/graphs/{graphName}/query", {
+        params: { path: { graphName } },
+        body: {
+          ...body,
+          ...(parameters !== undefined
+            ? { typed_parameters: encodeGraphParameter(parameters) }
+            : {}),
+        },
+        signal: options.signal,
+      });
+      if (error) {
+        const input = error as unknown as Record<string, unknown>;
+        const raw = input.span as { start?: unknown; end?: unknown } | undefined;
+        const span =
+          raw &&
+          typeof raw.start === "number" &&
+          Number.isSafeInteger(raw.start) &&
+          raw.start >= 0 &&
+          typeof raw.end === "number" &&
+          Number.isSafeInteger(raw.end) &&
+          raw.end >= raw.start
+            ? { start: raw.start, end: raw.end }
+            : undefined;
+        const writeOutcome = ["not_started", "aborted", "committed", "unknown"].includes(
+          String(input.write_outcome)
+        )
+          ? (input.write_outcome as GraphDiagnostic["write_outcome"])
+          : undefined;
+        throw new GraphExecutionError(response.status, {
+          code: typeof input.code === "string" ? input.code : "GraphExecutionFailed",
+          message: apiErrorMessage(error),
+          ...(span ? { span } : {}),
+          ...(writeOutcome ? { write_outcome: writeOutcome } : {}),
+        });
+      }
+      if (data === undefined || data.wire_version !== 1)
+        throw new Error("Graph query returned an unsupported result format");
+      return data as GraphQueryResult;
+    },
+    /** Inspect an admitted graph write after cancellation or a lost response. */
+    writeStatus: async (
+      transactionId: string,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<GraphWriteStatus> => {
+      if (!/^[0-9a-f]{32}$/i.test(transactionId))
+        throw new Error("Invalid graph write transaction ID");
+      const { data, error } = await this.client.GET("/db/v1/transactions/{transaction_id}/status", {
+        params: { path: { transaction_id: transactionId } },
+        signal: options.signal,
+      });
+      if (error) throw new Error(`Failed to inspect graph write: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to inspect graph write: empty response");
+      return data;
+    },
+    list: async (): Promise<GraphCatalogEntry[]> => {
+      const { data, error } = await this.client.GET("/db/v1/graphs");
+      if (error) throw new Error(`Failed to list graphs: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to list graphs: empty response");
+      return data;
+    },
+    get: async (graphName: string): Promise<GraphCatalogEntry> => {
+      const { data, error } = await this.client.GET("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+      });
+      if (error) throw new Error(`Failed to get graph: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to get graph: empty response");
+      return data;
+    },
+    create: async (
+      graphName: string,
+      definition: GraphDefinition
+    ): Promise<GraphCatalogEntry | CommittedMutationOutcome> => {
+      const { data, error } = await this.client.POST("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+        body: definition,
+      });
+      if (error) throw new Error(`Failed to create graph: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to create graph: empty response");
+      return data;
+    },
+    drop: async (graphName: string): Promise<CommittedMutationOutcome | undefined> => {
+      const { data, error, response } = await this.client.DELETE("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+      });
+      if (error) throw new Error(`Failed to drop graph: ${apiErrorMessage(error)}`);
+      if (response.status === 202) {
+        if (!data) throw new Error("Failed to drop graph: empty pending response");
+        return data;
+      }
+      return undefined;
+    },
+    update: async (
+      graphName: string,
+      expectedRevision: string,
+      definition: GraphDefinition
+    ): Promise<GraphCatalogEntry | CommittedMutationOutcome> => {
+      const { data, error, response } = await this.client.PUT("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+        body: { expected_revision: expectedRevision, definition },
+      });
+      if (response.status === 409)
+        throw new Error("Graph definition changed; reload the catalog before saving your edits.");
+      if (error) throw new Error(`Failed to update graph: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to update graph: empty response");
+      return data;
+    },
+  };
+
   tables = {
     /**
      * List all tables
@@ -1970,14 +2539,26 @@ export class AntflyClient {
     /**
      * Get table details and status
      */
-    get: async (tableName: string): Promise<Table | undefined> => {
-      const { data, error, response } = await this.client.GET("/db/v1/tables/{tableName}", {
-        params: { path: { tableName } },
-      });
+    get: async (
+      tableName: string,
+      scope?: { database: string; namespace: string }
+    ): Promise<Table | undefined> => {
+      const { data, error, response } = scope
+        ? await this.client.GET(
+            "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}",
+            {
+              params: {
+                path: { tableName, databaseName: scope.database, namespaceName: scope.namespace },
+              },
+            }
+          )
+        : await this.client.GET("/db/v1/tables/{tableName}", {
+            params: { path: { tableName } },
+          });
       if (!response.ok)
         throw new AntflyHTTPError(
           `Failed to get table: ${apiErrorMessage(error)}`,
-          response?.status ?? 0,
+          response.status,
           error
         );
       return data;
@@ -3573,10 +4154,19 @@ export class AntflyClient {
     /**
      * List all indexes for a table
      */
-    list: async (tableName: string) => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/indexes", {
-        params: { path: { tableName } },
-      });
+    list: async (tableName: string, scope?: { database: string; namespace: string }) => {
+      const { data, error } = scope
+        ? await this.client.GET(
+            "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes",
+            {
+              params: {
+                path: { tableName, databaseName: scope.database, namespaceName: scope.namespace },
+              },
+            }
+          )
+        : await this.client.GET("/db/v1/tables/{tableName}/indexes", {
+            params: { path: { tableName } },
+          });
       if (error) throw new Error(`Failed to list indexes: ${error.error}`);
       if (!data) throw new Error("Failed to list indexes: unexpected empty response");
       return data;

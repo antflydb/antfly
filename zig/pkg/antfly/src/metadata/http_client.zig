@@ -470,6 +470,15 @@ pub const MetadataHttpClient = struct {
         return try self.fetchRoutingSnapshotAt(base_uri, .POST, path, body, budget);
     }
 
+    pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
+        defer self.alloc.free(body);
+        var parsed = try self.fetchCatalogReadAt(metadata_api.PrivacyPolicyBinding, base_uri, .POST, routes.Routes.internal_privacy_policy_binding, body, budget);
+        errdefer parsed.deinit();
+        try parsed.value.validate();
+        return parsed;
+    }
+
     fn fetchRoutingSnapshotAt(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -478,6 +487,10 @@ pub const MetadataHttpClient = struct {
         body: ?[]const u8,
         budget: ?RequestBudget,
     ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return self.fetchCatalogReadAt(metadata_api.CatalogRoutingSnapshot, base_uri, method, path, body, budget);
+    }
+
+    fn fetchCatalogReadAt(self: *MetadataHttpClient, comptime Result: type, base_uri: []const u8, method: http_common.Method, path: []const u8, body: ?[]const u8, budget: ?RequestBudget) !std.json.Parsed(Result) {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
@@ -487,6 +500,7 @@ pub const MetadataHttpClient = struct {
             .method = method,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
+            .max_response_bytes = if (Result == metadata_api.PrivacyPolicyBinding) 4096 else null,
         };
         if (method == .POST) {
             request.body = body orelse "{}";
@@ -513,7 +527,7 @@ pub const MetadataHttpClient = struct {
         if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        var parsed = try parseJson(metadata_api.CatalogRoutingSnapshot, self.alloc, resp.body);
+        var parsed = try parseJson(Result, self.alloc, resp.body);
         errdefer parsed.deinit();
         try ensureRoutingBudget(budget);
         return parsed;
@@ -1151,7 +1165,12 @@ pub const MetadataHttpClient = struct {
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+            // Older peers reject an unknown private Call tag before dispatch.
+            // Only this exact response permits the authoritative legacy read;
+            // permission, identity and ordinary validation failures stay errors.
+            400 => if (input == .lake_source_owner_read and std.mem.eql(u8, response.body, "invalid catalog request"))
+                error.UnsupportedOperation
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
@@ -1493,6 +1512,53 @@ pub const MetadataHttpClient = struct {
             .version = parsed.value.version,
             .schema_json = try self.alloc.dupe(u8, parsed.value.schema_json),
         };
+    }
+
+    /// Privacy admission and checkpoint staging belong to the metadata owner.
+    /// A remote API issuer forwards one mutation, never stages local blobs.
+    pub fn forwardPrivacyMutation(self: *MetadataHttpClient, base_uri: []const u8, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: @import("antfly_local_sources").api_operation.RequestContext) !@import("../api/privacy.zig").Response {
+        try request.ensureActive();
+        const encoded = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(encoded);
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/tables/{s}/privacy{s}", .{ encoded, if (scan) "/scans" else "" });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        const timeout = (try request.remainingTimeoutMs()) orelse @as(u32, @intCast(@import("antfly_public_limits").Execution.max_timeout_ms));
+        var signal = http_common.RequestCancellation.fromToken(request.cancellation);
+        var timeout_buffer: [20]u8 = undefined;
+        const budget_header = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{@min(timeout, @import("antfly_public_limits").Execution.max_timeout_ms)});
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget_header },
+            .{ .name = "If-Match", .value = if_match orelse "" },
+        };
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        delivery.markNotSent();
+        var response = self.executeWithRetryPolicy(.{ .method = if (scan) .POST else .PUT, .uri = uri, .body = body, .content_type = "application/json", .headers = if (if_match != null) &headers else headers[0..1], .timeout_ms = timeout, .cancellation = &signal, .delivery_tracker = &delivery }, if (request.deadline_ns) |deadline| .{ .deadline_ns = deadline, .cancellation = &signal } else null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            // These outcomes prove non-admission independently of the
+            // executor's send telemetry. Preserve established failover rules.
+            error.NotLeader, error.RaftMutationRequestNotSent, error.ConnectionRefused => return err,
+            // Allocation, cancellation or decoding can fail while receiving an
+            // already-applied reply. Only explicit not-sent proof is replayable.
+            else => return if (delivery.load() == .not_sent) err else error.MetadataMutationOutcomeUnknown,
+        };
+        defer response.deinit(self.alloc);
+        // Decode the scalar outcome before allocating any reply storage. All
+        // subsequent response observations share the same ambiguity boundary.
+        const outcome: ?@import("../api/public_table_http.zig").MetadataMutationOutcome = if (responseHasHeaderValueAnyStatus(response, routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown)) .unknown else null;
+        return self.ownPrivacyMutationResponse(response, outcome) catch |err|
+            return @import("../api/privacy.zig").mutationObservationError(response.status, outcome, err);
+    }
+
+    fn ownPrivacyMutationResponse(self: *MetadataHttpClient, response: http_common.HttpResponse, outcome: ?@import("../api/public_table_http.zig").MetadataMutationOutcome) !@import("../api/privacy.zig").Response {
+        var result: @import("../api/privacy.zig").Response = .{ .response = .{ .status = response.status, .body = try self.alloc.dupe(u8, response.body), .json = true, .metadata_mutation_outcome = outcome } };
+        errdefer result.deinit(self.alloc);
+        result.etag = if (responseHeader(response, "ETag")) |etag| try self.alloc.dupe(u8, etag) else null;
+        if (responseHeader(response, "Retry-After")) |value| {
+            result.response.retry_after_seconds = std.fmt.parseUnsigned(u32, std.mem.trim(u8, value, " \t\r\n"), 10) catch null;
+        }
+        return result;
     }
 
     pub fn replaceTableDefinition(
@@ -3560,6 +3626,7 @@ fn consumerTests() type {
         test "metadata http client preserves extension ownership across forwarding" {
             const ExtensionOwnedExecutor = struct {
                 outcome: []const u8,
+
                 fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
                     const owned_name = try alloc.dupe(u8, name);
                     errdefer alloc.free(owned_name);
@@ -4794,4 +4861,34 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     const response = try client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted);
     defer a.free(response);
     try std.testing.expect(submitted);
+}
+
+test "metadata.lake index owner projection read negotiates older peers without weakening grants" {
+    const a = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        status: u16 = 400,
+        body: []const u8 = "invalid catalog request",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.indexOf(u8, request.body, "lake_source_owner_read") != null) {
+                try authority.verify("owner-read-secret", "owner-read-issuer", .read, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            }
+            return .{ .status = self.status, .headers = try alloc.alloc(http_common.Header, 0), .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    client.setting_authority_secret = "owner-read-secret";
+    client.setting_authority_issuer = "owner-read-issuer";
+    const owner: @import("../system_catalog/server_call.zig").Call = .{ .lake_source_owner_read = 4 };
+    try std.testing.expectError(error.UnsupportedOperation, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.body = "InvalidCatalogName";
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    executor.status = 403;
+    try std.testing.expectError(error.Forbidden, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    executor.status = 503;
+    executor.body = "NotLeader";
+    try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
 }

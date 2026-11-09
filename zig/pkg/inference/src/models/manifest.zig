@@ -286,6 +286,7 @@ pub const safetensors_index_candidates = [_][]const u8{
 /// decision describes the same metadata snapshot that listing parsed.
 pub const listing_compatibility_sidecars = [_][]const u8{
     "encoder_config/config.json",
+    "adapters/retrieval/adapter_config.json",
     "antfly_inference_bundle.json",
     "antfly_inference_variants.json",
     "gliner_config.json",
@@ -302,6 +303,10 @@ pub const listing_compatibility_sidecars = [_][]const u8{
 
 /// Resolved model configuration loaded from a model directory.
 pub const ModelManifest = struct {
+    managed_publication: ?[32]u8 = null,
+    /// Physical directory from which this metadata snapshot was discovered.
+    source_root: ?[]const u8 = null,
+    source_root_inode: ?@FieldType(std.Io.File.Stat, "inode") = null,
     allocator: std.mem.Allocator,
 
     // Identity
@@ -310,6 +315,8 @@ pub const ModelManifest = struct {
 
     // Files (allocated strings — absolute paths)
     onnx_path: ?[]const u8 = null,
+    /// Selected graph name under the captured directory, before resolving its leaf symlink.
+    onnx_logical_path: ?[]const u8 = null,
     safetensors_path: ?[]const u8 = null,
     safetensors_index_path: ?[]const u8 = null,
     gguf_path: ?[]const u8 = null,
@@ -317,6 +324,10 @@ pub const ModelManifest = struct {
     gliner_head_gguf_path: ?[]const u8 = null,
     gliner_head_safetensors_path: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    jina_adapter_config_path: ?[]const u8 = null,
+    jina_adapter_weights_path: ?[]const u8 = null,
+    /// Even an absent adapter is a captured selection, never a later default.
+    jina_adapter_selection_captured: bool = false,
     model_manifest_path: ?[]const u8 = null,
     tokenizer_json_path: ?[]const u8 = null,
     vocab_txt_path: ?[]const u8 = null,
@@ -521,9 +532,28 @@ pub const ModelManifest = struct {
         return copy;
     }
 
+    /// Validate native snapshot provenance without reopening or parsing metadata.
+    pub fn verifyBoundRoot(self: *const ModelManifest, io: std.Io, bound_root: []const u8) !void {
+        const root = self.source_root orelse return;
+        if (!std.mem.eql(u8, root, bound_root)) return error.ModelArtifactsChanging;
+        if (self.source_root_inode) |inode| {
+            const stat = try std.Io.Dir.cwd().statFile(io, bound_root, .{});
+            if (stat.kind != .directory or inode != stat.inode) return error.ModelArtifactsChanging;
+        }
+    }
+
+    fn verifySourceRoot(self: *const ModelManifest, requested: []const u8) !void {
+        if (self.source_root == null) return;
+        const current = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, requested, self.allocator);
+        defer self.allocator.free(current);
+        try self.verifyBoundRoot(std.Options.debug_io, current);
+    }
+
     pub fn deinit(self: *ModelManifest) void {
         if (self.gliner_boundary_bundle) |*receipt| receipt.deinit();
+        if (self.source_root) |p| self.allocator.free(p);
         if (self.onnx_path) |p| self.allocator.free(p);
+        if (self.onnx_logical_path) |p| self.allocator.free(p);
         if (self.safetensors_path) |p| self.allocator.free(p);
         if (self.safetensors_index_path) |p| self.allocator.free(p);
         if (self.gguf_path) |p| self.allocator.free(p);
@@ -531,6 +561,8 @@ pub const ModelManifest = struct {
         if (self.gliner_head_gguf_path) |p| self.allocator.free(p);
         if (self.gliner_head_safetensors_path) |p| self.allocator.free(p);
         if (self.config_path) |p| self.allocator.free(p);
+        if (self.jina_adapter_config_path) |p| self.allocator.free(p);
+        if (self.jina_adapter_weights_path) |p| self.allocator.free(p);
         if (self.model_manifest_path) |p| self.allocator.free(p);
         if (self.tokenizer_json_path) |p| self.allocator.free(p);
         if (self.vocab_txt_path) |p| self.allocator.free(p);
@@ -691,6 +723,33 @@ pub const ModelManifest = struct {
         if (self.safetensors_index_path != null) return .sharded_safetensors;
         if (self.gguf_path != null) return .gguf;
         return null;
+    }
+
+    pub const JinaRetrievalAdapter = struct { config: []const u8, weights: []const u8 };
+
+    pub fn jinaRetrievalAdapter(self: *const ModelManifest) !?JinaRetrievalAdapter {
+        if (self.jina_adapter_config_path == null and self.jina_adapter_weights_path == null) return null;
+        return .{ .config = self.jina_adapter_config_path orelse return error.IncompleteJinaV5Adapter, .weights = self.jina_adapter_weights_path orelse return error.IncompleteJinaV5Adapter };
+    }
+
+    pub const NativeCompanion = enum { none, gliner_gguf, gliner_safetensors, projector };
+
+    /// The tensor store and its construction proof must select the same
+    /// companion. Alternate exports never become dependencies implicitly.
+    pub fn nativeCompanion(self: *const ModelManifest) NativeCompanion {
+        if (!self.usesGgufWeights()) return .none;
+        if (self.isSplitGlinerBundle()) return if (self.gliner_head_gguf_path != null) .gliner_gguf else .gliner_safetensors;
+        if (self.gguf_projector_path != null) return .projector;
+        return .none;
+    }
+
+    pub fn nativeCompanionPath(self: *const ModelManifest) ?[]const u8 {
+        return switch (self.nativeCompanion()) {
+            .none => null,
+            .gliner_gguf => self.gliner_head_gguf_path,
+            .gliner_safetensors => self.gliner_head_safetensors_path,
+            .projector => self.gguf_projector_path,
+        };
     }
 
     pub fn usesGgufWeights(self: *const ModelManifest) bool {
@@ -946,7 +1005,7 @@ const onnx_subdirs = [_][]const u8{ "", "onnx" };
 fn ignoreNonResourceMetadataError(result: anytype) !void {
     const metadata_result: anyerror!void = result;
     metadata_result catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory, error.ChecksumMismatch, error.InvalidManagedDownload => return err,
         error.InvalidGlinerBoundaryConfig,
         error.UnsupportedGlinerArchitecture,
         error.UnsupportedGlinerBoundaryVersion,
@@ -981,18 +1040,28 @@ const ArtifactCatalog = struct {
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
     receipt: ?managed_receipt.ValidatedReceipt = null,
+    physical_root: ?[:0]const u8 = null,
+    root_inode: ?@FieldType(std.Io.File.Stat, "inode") = null,
+
+    fn storageRoot(self: *const ArtifactCatalog) []const u8 {
+        return self.physical_root orelse self.model_dir_path;
+    }
 
     fn initPublished(
         allocator: std.mem.Allocator,
         model_dir_path: []const u8,
     ) !ArtifactCatalog {
+        const physical_root = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, model_dir_path, allocator);
+        errdefer allocator.free(physical_root);
         return .{
             .allocator = allocator,
             .model_dir_path = model_dir_path,
+            .physical_root = physical_root,
+            .root_inode = (try std.Io.Dir.cwd().statFile(std.Options.debug_io, physical_root, .{})).inode,
             .receipt = try managed_receipt.loadValidated(
                 allocator,
                 std.Options.debug_io,
-                model_dir_path,
+                physical_root,
             ),
         };
     }
@@ -1001,19 +1070,24 @@ const ArtifactCatalog = struct {
         allocator: std.mem.Allocator,
         model_dir_path: []const u8,
     ) !ArtifactCatalog {
+        const physical_root = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, model_dir_path, allocator);
+        errdefer allocator.free(physical_root);
         return .{
             .allocator = allocator,
             .model_dir_path = model_dir_path,
+            .physical_root = physical_root,
+            .root_inode = (try std.Io.Dir.cwd().statFile(std.Options.debug_io, physical_root, .{})).inode,
             .receipt = try managed_receipt.loadValidatedPlan(
                 allocator,
                 std.Options.debug_io,
-                model_dir_path,
+                physical_root,
             ),
         };
     }
 
     pub fn deinit(self: *ArtifactCatalog) void {
         if (self.receipt) |*receipt| receipt.deinit();
+        if (self.physical_root) |root| self.allocator.free(root);
         self.* = undefined;
     }
 
@@ -1092,9 +1166,12 @@ const ArtifactCatalog = struct {
     fn readOptionalUnchecked(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
         if (self.receipt != null) {
             const artifact = self.find(name) orelse return null;
-            return try c_file.readFile(self.allocator, artifact.canonical_path);
+            const bytes = try c_file.readFile(self.allocator, artifact.canonical_path);
+            errdefer self.allocator.free(bytes);
+            try managed_receipt.verifyArtifactBytes(artifact, bytes);
+            return bytes;
         }
-        return c_file.readFileFromDir(self.allocator, self.model_dir_path, name) catch |err| switch (err) {
+        return c_file.readFileFromDir(self.allocator, self.storageRoot(), name) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -1102,7 +1179,26 @@ const ArtifactCatalog = struct {
 
     fn exists(self: *const ArtifactCatalog, relative_path: []const u8) !bool {
         if (self.receipt != null) return self.find(relative_path) != null;
-        return c_file.fileExistsInDirChecked(self.allocator, self.model_dir_path, relative_path);
+        return c_file.fileExistsInDirChecked(self.allocator, self.storageRoot(), relative_path);
+    }
+
+    /// Retain model format, logical name and external-data directory under a
+    /// physical parent. Constructors bind the leaf independently; resolving the
+    /// leaf here would discard context for extensionless content-addressed blobs.
+    fn resolveSource(self: *const ArtifactCatalog, relative: []const u8) !?[]u8 {
+        const canonical = (try self.resolve(relative)) orelse return null;
+        if (!std.mem.endsWith(u8, relative, ".onnx") and !std.mem.endsWith(u8, relative, ".gguf")) return canonical;
+        defer self.allocator.free(canonical);
+        return try self.logicalModelPath(relative);
+    }
+
+    fn logicalModelPath(self: *const ArtifactCatalog, relative: []const u8) ![]u8 {
+        const member = if (self.receipt != null) self.find(relative).?.path else relative;
+        const parent = try std.fs.path.join(self.allocator, &.{ self.storageRoot(), std.fs.path.dirname(member) orelse "." });
+        defer self.allocator.free(parent);
+        const physical_parent = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, parent, self.allocator);
+        defer self.allocator.free(physical_parent);
+        return try std.fs.path.join(self.allocator, &.{ physical_parent, std.fs.path.basename(member) });
     }
 
     fn resolve(self: *const ArtifactCatalog, relative_path: []const u8) !?[]u8 {
@@ -1113,7 +1209,7 @@ const ArtifactCatalog = struct {
         return managed_receipt.resolveContainedArtifactPath(
             self.allocator,
             std.Options.debug_io,
-            self.model_dir_path,
+            self.storageRoot(),
             relative_path,
         ) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return null,
@@ -1188,6 +1284,15 @@ const DirectGgufArtifact = struct {
             ancestor = parent;
         }
 
+        // An alias outside the installation still inherits the target's
+        // receipt. Check requested ancestors first so an unlisted/escaping
+        // file inside a managed directory cannot become an unmanaged alias.
+        if (!std.mem.eql(u8, resolved_requested_path, canonical_path)) {
+            const target = try DirectGgufArtifact.init(allocator, canonical_path);
+            allocator.free(canonical_path);
+            allocator.free(resolved_requested_path);
+            return target;
+        }
         return .{
             .allocator = allocator,
             .path = canonical_path,
@@ -1248,7 +1353,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
-        var manifest = ModelManifest{ .allocator = allocator };
+        var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (direct.catalog.receipt) |receipt| receipt.publication_generation else null };
         errdefer manifest.deinit();
         manifest.gguf_path = direct.takePath();
         try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(
@@ -1266,6 +1371,29 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
     return loadFromCatalog(allocator, &catalog);
+}
+
+/// Discover a directory source with physical IO and logical task hints kept
+/// separate. The requested alias is checked before publishing the snapshot,
+/// but is never reopened for metadata or weight discovery.
+pub fn loadFromDirectorySource(allocator: std.mem.Allocator, physical_dir: []const u8, requested_dir: []const u8) !ModelManifest {
+    var catalog = try ArtifactCatalog.initPublished(allocator, physical_dir);
+    defer catalog.deinit();
+    catalog.model_dir_path = requested_dir;
+    return loadFromCatalog(allocator, &catalog);
+}
+
+/// Parse execution/admission metadata under the same construction fence as
+/// weights. A receipt captured before a rename cannot authenticate sidecars
+/// reopened from the replacement installation.
+pub fn loadBoundFromDir(a: std.mem.Allocator, io: std.Io, path: []const u8, expected: ?[32]u8, comptime listing: bool) !ModelManifest {
+    var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, path);
+    defer lease.deinit(io);
+    if (!std.meta.eql(expected, try managed_receipt.publicationGeneration(a, io, path))) return error.ModelArtifactsChanging;
+    var manifest = if (listing) try loadListingFromDir(a, path) else try loadFromDir(a, path);
+    errdefer manifest.deinit();
+    if (!std.meta.eql(expected, manifest.managed_publication) or !std.meta.eql(expected, try managed_receipt.publicationGeneration(a, io, path))) return error.ModelArtifactsChanging;
+    return manifest;
 }
 
 /// Probe an explicit Antfly capability without opening architecture or tokenizer
@@ -1462,8 +1590,10 @@ fn validateGlinerSpecialtySidecars(manifest: *const ModelManifest) !void {
 
 fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !ModelManifest {
     const model_dir_path = catalog.model_dir_path;
-    var manifest = ModelManifest{ .allocator = allocator };
+    var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (catalog.receipt) |value| value.publication_generation else null };
     errdefer manifest.deinit();
+    manifest.source_root = try allocator.dupe(u8, catalog.storageRoot());
+    manifest.source_root_inode = catalog.root_inode;
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
@@ -1530,7 +1660,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     // explicitly resolved to its GGUF pair. The GGUF pair embeds projection
     // weights, so falling through to the default ONNX files would mix variants.
     if (!manifest.isClipclapGgufBundle()) {
-        if (manifest.onnx_path == null) manifest.onnx_path = try findFileInSubdirs(allocator, catalog, &onnx_candidates, &onnx_subdirs);
+        if (manifest.onnx_path == null) try findPrimaryOnnx(&manifest, catalog);
         if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, catalog, &visual_model_candidates, &onnx_subdirs);
         if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, catalog, &audio_model_candidates, &onnx_subdirs);
         if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, catalog, &text_projection_candidates, &onnx_subdirs);
@@ -1543,6 +1673,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, catalog, &safetensors_index_candidates, &.{""});
     if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, catalog, &.{"gliner_head.gguf"}, &.{""});
     if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, catalog, &.{"gliner_head.safetensors"}, &.{""});
+    try discoverJinaRetrievalAdapter(&manifest, catalog);
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer.json"}, &.{""});
@@ -1611,6 +1742,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     try applySentenceTransformersTaskSidecars(&manifest, allocator, catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
+    try manifest.verifySourceRoot(model_dir_path);
     try validateGlinerSpecialtySidecars(&manifest);
 
     return manifest;
@@ -1629,11 +1761,15 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
         manifest.gguf_path = direct.takePath();
+        manifest.managed_publication = if (direct.catalog.receipt) |receipt| receipt.publication_generation else null;
         return manifest;
     }
 
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
+    manifest.managed_publication = if (catalog.receipt) |value| value.publication_generation else null;
+    manifest.source_root = try allocator.dupe(u8, catalog.storageRoot());
+    manifest.source_root_inode = catalog.root_inode;
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
@@ -1717,7 +1853,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     try applyListingGlinerHint(&manifest, allocator, &catalog);
 
     if (!manifest.isClipclapGgufBundle()) {
-        if (manifest.onnx_path == null) manifest.onnx_path = try findFileInSubdirs(allocator, &catalog, &onnx_candidates, &onnx_subdirs);
+        if (manifest.onnx_path == null) try findPrimaryOnnx(&manifest, &catalog);
         if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, &catalog, &visual_model_candidates, &onnx_subdirs);
         if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, &catalog, &audio_model_candidates, &onnx_subdirs);
         if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, &catalog, &text_projection_candidates, &onnx_subdirs);
@@ -1729,6 +1865,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, &catalog, &safetensors_index_candidates, &.{""});
     if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, &catalog, &.{"gliner_head.gguf"}, &.{""});
     if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, &catalog, &.{"gliner_head.safetensors"}, &.{""});
+    try discoverJinaRetrievalAdapter(&manifest, &catalog);
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, &catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, &catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer.json"}, &.{""});
@@ -1745,6 +1882,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     try applySentenceTransformersTaskSidecars(&manifest, allocator, &catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
+    try manifest.verifySourceRoot(model_dir_path);
 
     return manifest;
 }
@@ -2477,6 +2615,28 @@ fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const g
     return null;
 }
 
+fn discoverJinaRetrievalAdapter(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
+    manifest.jina_adapter_selection_captured = true;
+    if (!std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5")) return;
+    manifest.jina_adapter_config_path = try catalog.resolve("adapters/retrieval/adapter_config.json");
+    manifest.jina_adapter_weights_path = try catalog.resolve("adapters/retrieval/adapter_model.safetensors");
+}
+
+fn findPrimaryOnnx(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
+    const a = manifest.allocator;
+    for (onnx_subdirs) |subdir| for (onnx_candidates) |name| {
+        const relative = try std.fs.path.join(a, &.{ subdir, name });
+        defer a.free(relative);
+        if (try catalog.resolve(relative)) |path| {
+            errdefer a.free(path);
+            // Use the same logical name/base contract as companion graphs.
+            manifest.onnx_logical_path = try catalog.logicalModelPath(relative);
+            manifest.onnx_path = path;
+            return;
+        }
+    };
+}
+
 fn findFileInSubdirs(
     allocator: std.mem.Allocator,
     catalog: *const ArtifactCatalog,
@@ -2491,7 +2651,7 @@ fn findFileInSubdirs(
                 try allocator.dupe(u8, candidate);
             defer allocator.free(relative_path);
 
-            if (try catalog.resolve(relative_path)) |path| {
+            if (try catalog.resolveSource(relative_path)) |path| {
                 return path;
             }
         }
@@ -2675,7 +2835,7 @@ fn resolvedWalkerEntryKind(io: std.Io, entry: Dir.Walker.Entry) !?std.Io.File.Ki
 
 fn discoverGgufPathsWithCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !DiscoveredGgufPaths {
     const io = std.Options.debug_io;
-    const base_dir = catalog.model_dir_path;
+    const base_dir = catalog.storageRoot();
     var selection: GgufSelection = .{};
     defer selection.deinit(allocator);
     errdefer selection.paths.deinit(allocator);
@@ -4266,12 +4426,9 @@ fn resolveArtifact(
     // Validate owned metadata even when a managed receipt omits this variant.
     if (!managed_receipt.artifactPathIsSafe(path)) return error.InvalidModelArtifactPath;
     const resolved = if (catalog) |value|
-        try value.resolve(path)
+        try value.resolveSource(path)
     else
-        managed_receipt.resolveContainedArtifactPath(allocator, std.Options.debug_io, model_dir_path, path) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => null,
-            else => return err,
-        };
+        try (ArtifactCatalog{ .allocator = allocator, .model_dir_path = model_dir_path }).resolveSource(path);
     if (resolved) |value| return value;
     if (requirement == .optional_variant) return null;
     return if (catalog != null and catalog.?.receipt != null) error.ModelArtifactNotPublished else error.FileNotFound;
@@ -7302,7 +7459,10 @@ test "bundle artifact paths stay within the canonical model root" {
     );
     const resolved = try resolveBundlePath(allocator, null, model_dir, "alias.gguf");
     defer allocator.free(resolved);
-    try std.testing.expect(std.mem.endsWith(u8, resolved, "model/artifacts/model.gguf"));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "model/alias.gguf"));
+    const physical = try Dir.cwd().realPathFileAlloc(io, resolved, allocator);
+    defer allocator.free(physical);
+    try std.testing.expect(std.mem.endsWith(u8, physical, "model/artifacts/model.gguf"));
 }
 
 test "managed receipt is authoritative for gguf discovery" {
@@ -8498,6 +8658,10 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
     const source = ModelManifest{
         .allocator = allocator,
         .gguf_path = "model.gguf",
+        .onnx_logical_path = "/captured/onnx/model.onnx",
+        .jina_adapter_config_path = "/captured/adapters/retrieval/adapter_config.json",
+        .jina_adapter_weights_path = "/captured/adapters/retrieval/adapter_model.safetensors",
+        .jina_adapter_selection_captured = true,
         .config_model_arch = "qwen3",
         .embedding_style = .qwen3_embedding,
         .hidden_size = 1024,
@@ -8744,7 +8908,7 @@ test "specialty canonical managed declarations pass extraction dispatch without 
 
         // The same synthesized declaration must survive listing and the next
         // extraction dispatch probe with config-derived specialty identity.
-        const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+        const fixtures = @import("../architectures/gliner/fixture_bytes.zig");
         try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
         try tmp.dir.deleteFile(io, "tokenizer.json");
         try tmp.dir.createDirPath(io, "encoder_config");
@@ -8780,7 +8944,7 @@ test "specialty canonical managed declarations pass extraction dispatch without 
 test "specialty listing avoids full tokenizer reads without authenticating execution" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/fixture_bytes.zig");
     inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -8886,7 +9050,7 @@ test "specialty assertion rejects config drift and never grants a profile" {
 test "specialty same-size config drift rejects managed origin and only hints for renamed raw copies" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/fixture_bytes.zig");
     inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -8928,4 +9092,31 @@ test "specialty same-size config drift rejects managed origin and only hints for
         try std.testing.expect(listing.gliner_specialty_profile == null);
         try std.testing.expectEqual(profile, listing.gliner_specialty_artifact_hint.?);
     }
+}
+
+test "model selection catalog pins metadata and graph names before an alias switch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        const file = try std.fs.path.join(a, &.{ name, "config.json" });
+        defer a.free(file);
+        try tmp.dir.writeFile(io, .{ .sub_path = file, .data = name });
+    }
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    var catalog = try ArtifactCatalog.initPublished(a, alias);
+    defer catalog.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    const bytes = (try catalog.readOptional("config.json")).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("first", bytes);
+    // A switched alias is not allowed to publish the old snapshot as current.
+    try std.testing.expectError(error.ModelArtifactsChanging, loadFromCatalog(a, &catalog));
 }

@@ -37,7 +37,7 @@ func (s *Service) serveManagement(w http.ResponseWriter, r *http.Request) {
 type localManagement struct{ s *Service }
 
 func (b localManagement) Capabilities(context.Context) (management.Capabilities, error) {
-	return management.Capabilities{Version: 1, Runtime: "standalone", PerSourceRuns: true, CancelRuns: true, ConfigureSources: true, PurgeSources: true, MediaProxy: true, SerializedRuns: true, ConfigurationUrl: "/v1/connections"}, nil
+	return management.Capabilities{ProcessingPresets: true, ProcessingJobs: true, SearchVersions: []int{1, 2}, ArtifactDiscovery: true, Version: 1, Runtime: "standalone", PerSourceRuns: true, CancelRuns: true, ConfigureSources: true, PurgeSources: true, MediaProxy: true, SerializedRuns: true, ConfigurationUrl: "/v1/connections"}, nil
 }
 func managementSource(source Source) management.Source {
 	var cfg map[string]any
@@ -50,7 +50,7 @@ func managementSource(source Source) management.Source {
 	if source.Permissions != nil {
 		perms = management.Permissions{Public: source.Permissions.Public, Readers: source.Permissions.Readers}
 	}
-	return management.Source{Streams: source.Streams, Id: source.ID, Name: source.Alias, Connection: source.Connection, Table: source.Table, Config: cfg, Permissions: perms, PermissionTtlSeconds: source.PermissionTTLSeconds, Publication: management.SourcePublication(publication), State: "configured"}
+	return management.Source{Processing: source.Processing, SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, Identity: management.SourceIdentity{Namespace: source.Identity.Namespace}, Streams: source.Streams, Id: source.ID, Name: source.Alias, Connection: source.Connection, Table: source.Table, Config: cfg, Permissions: perms, PermissionTtlSeconds: source.PermissionTTLSeconds, Publication: management.SourcePublication(publication), State: "configured"}
 }
 func (b localManagement) ListSources(ctx context.Context, limit int, cursor string) (management.SourcePage, error) {
 	b.s.mu.Lock()
@@ -68,6 +68,9 @@ func (b localManagement) ListSources(ctx context.Context, limit int, cursor stri
 		if err != nil {
 			return page, err
 		}
+		if size > management.SourcePageBudget {
+			return page, management.Failure(413, "source_declaration_too_large")
+		}
 		if len(page.Data) == limit || bytes+size > management.SourcePageBudget {
 			page.NextCursor = page.Data[len(page.Data)-1].Id
 			break
@@ -77,16 +80,33 @@ func (b localManagement) ListSources(ctx context.Context, limit int, cursor stri
 	}
 	return page, nil
 }
+func (b localManagement) searchPublisher() *Publisher {
+	b.s.mu.Lock()
+	profile := cloneProfile(b.s.profile)
+	b.s.mu.Unlock()
+	token := ""
+	if profile.DataPlaneTokenEnv != "" {
+		token = os.Getenv(profile.DataPlaneTokenEnv)
+	}
+	return &Publisher{Endpoint: profile.Endpoint, Token: token}
+}
 func (b localManagement) GetSource(ctx context.Context, id string) (management.Source, error) {
 	b.s.mu.Lock()
-	defer b.s.mu.Unlock()
-	for _, source := range b.s.profile.Sources {
+	profile := cloneProfile(b.s.profile)
+	b.s.mu.Unlock()
+	for _, source := range profile.Sources {
 		if source.ID == id {
-			return managementSource(source), nil
+			out := managementSource(source)
+			if source.SearchVersion == SearchVersion {
+				status := ObserveSearch(ctx, b.searchPublisher(), Binding{SearchVersion: source.SearchVersion, Table: source.Table, Streams: source.Streams, Artifacts: source.Artifacts})
+				out.SearchStatus = &status
+			}
+			return out, nil
 		}
 	}
 	return management.Source{}, management.Failure(404, "source_not_found")
 }
+
 func (b localManagement) legacy(ctx context.Context, method, path string, input any) ([]byte, error) {
 	raw, err := json.Marshal(input)
 	if err != nil {
@@ -107,15 +127,55 @@ func (b localManagement) legacy(ctx context.Context, method, path string, input 
 	return out.body.Bytes(), nil
 }
 func (b localManagement) PutSource(ctx context.Context, input management.Source) (management.Source, error) {
+	if input.SearchStatus != nil {
+		return management.Source{}, management.Failure(400, "read_only_search_status")
+	}
 	cfg, err := json.Marshal(input.Config)
 	if err != nil {
 		return management.Source{}, err
 	}
-	source := Source{Streams: input.Streams, ID: input.Id, Alias: input.Name, Connection: input.Connection, Table: input.Table, Config: cfg, Publication: string(input.Publication), Permissions: &Permissions{Public: input.Permissions.Public, Readers: input.Permissions.Readers}, PermissionTTLSeconds: input.PermissionTtlSeconds}
-	if _, err = b.legacy(ctx, "PUT", "/v1/sources/"+input.Id, source); err != nil {
+	source := Source{Processing: input.Processing, SearchVersion: input.SearchVersion, Artifacts: input.Artifacts, Identity: Identity{Namespace: input.Identity.Namespace}, Streams: input.Streams, ID: input.Id, Alias: input.Name, Connection: input.Connection, Table: input.Table, Config: cfg, Publication: string(input.Publication), Permissions: &Permissions{Public: input.Permissions.Public, Readers: input.Permissions.Readers}, PermissionTTLSeconds: input.PermissionTtlSeconds}
+	raw, err := b.legacy(ctx, "PUT", "/v1/sources/"+input.Id, source)
+	if err != nil {
 		return management.Source{}, err
 	}
-	return b.GetSource(ctx, input.Id)
+	var mutation struct {
+		Rekeys bool `json:"rekeys"`
+	}
+	if err = json.Unmarshal(raw, &mutation); err != nil {
+		return management.Source{}, err
+	}
+	// Omitted processing preserves the current private declaration atomically
+	// in the legacy mutation. Reconcile the persisted result, not the request.
+	b.s.mu.Lock()
+	for _, configured := range cloneProfile(b.s.profile).Sources {
+		if configured.ID == input.Id {
+			source = configured
+			break
+		}
+	}
+	b.s.mu.Unlock()
+	if source.Processing != nil {
+		publisher := b.searchPublisher()
+		if err := publisher.EnsureTable(ctx, source.Table); err != nil {
+			return management.Source{}, err
+		}
+		if err := ReconcileSourceSearch(ctx, publisher, source); err != nil {
+			return management.Source{}, err
+		}
+	}
+	b.s.mu.Lock()
+	profile := cloneProfile(b.s.profile)
+	b.s.mu.Unlock()
+	runner := Runner{Profile: profile, StateDir: b.s.runnerPath(), Publisher: b.searchPublisher()}
+	if !mutation.Rekeys {
+		if err := runner.RefreshSearchDiscovery(ctx, input.Id); err != nil {
+			return management.Source{}, err
+		}
+	}
+	out, err := b.GetSource(ctx, input.Id)
+	out.Rekeys = mutation.Rekeys
+	return out, err
 }
 func (b localManagement) RemoveSource(ctx context.Context, id string, purge bool) (management.Mutation, error) {
 	suffix := ""

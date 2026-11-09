@@ -80,7 +80,8 @@ fn matchesPrevious(previous: Batch, batch: Batch) bool {
 /// checkpoint. A stale/out-of-order predecessor is rejected before admission.
 /// Competing sources require an explicit conflict policy; this version owns
 /// one source epoch and key definition per table and rejects cross-source use.
-pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: []const u8) !u64 {
+pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Context, body: []const u8) !u64 {
+    const options = try unresolved_options.resolveOwner(a, context);
     if (body.len == 0 or body.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
     var parsed = try std.json.parseFromSlice(Batch, a, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -94,12 +95,15 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
     var queue_arena = std.heap.ArenaAllocator.init(a);
     defer queue_arena.deinit();
     const scratch = queue_arena.allocator();
-    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     const identity = try std.json.Stringify.valueAlloc(scratch, .{ batch.source, batch.epoch, batch.batch_id }, .{});
     const operation_id = &catalog.types.digestHex(identity);
     var admission = try store.beginAdmission(scratch, operation_id, payload);
     defer admission.deinit();
-    if (admission.observation.accepted) |accepted| return accepted;
+    if (admission.observation.accepted) |accepted| {
+        if (options.native_owner) |owner| try owner.committed(accepted, context);
+        return accepted;
+    }
     // Resolve an acknowledged retry before current-schema or checkpoint tests.
     // Source evolution cannot turn a durable exact replay into a new append.
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
@@ -130,7 +134,9 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
         }
     }
     try context.ensureActive();
-    return admission.append(covered);
+    const accepted = try admission.append(covered);
+    if (options.native_owner) |owner| try owner.committed(accepted, context);
+    return accepted;
 }
 fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
@@ -244,7 +250,7 @@ pub fn drainBounded(a: A, binding: Binding, options: Options, context: Context, 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer current.deinit(a);
     const cut = try coverage(a, current.table);
@@ -306,7 +312,7 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
-    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     return store.watermark(a);
 }
 
@@ -366,7 +372,7 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
-    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     const suffix = try store.range(a, cut);
     return normalizePending(a, cut, suffix.lsn, suffix.records);
 }

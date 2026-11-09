@@ -19,6 +19,8 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const indexed = @import("indexed.zig");
 pub const Source = struct {
+    search_version: u32 = 1,
+    artifacts: []const std.json.Value = &.{},
     fields: ?@import("record_view.zig").Fields = null,
     streams: []const @import("record_view.zig").Stream = &.{},
     publication: []const u8 = "text",
@@ -48,7 +50,7 @@ pub fn table(source: Source) !indexed.Table {
         for (id) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidSourceCatalog;
     }
     if (!std.mem.eql(u8, source.status, "searchable") and !std.mem.eql(u8, source.status, "pending") and !std.mem.eql(u8, source.status, "syncing") and !std.mem.eql(u8, source.status, "stale")) return error.InvalidSourceCatalog;
-    return .{ .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
+    return .{ .search_version = source.search_version, .artifacts = source.artifacts, .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
 }
 pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(32 * 1024 * 1024));

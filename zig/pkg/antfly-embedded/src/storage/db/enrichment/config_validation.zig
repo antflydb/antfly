@@ -37,11 +37,22 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
     return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
 }
 
+/// PDF input consumes a URI selected from the source document. Both literal
+/// fields and rendered URI templates are supported; text chunking is not.
+/// Share this check with storage admission to avoid accepting definitions that
+/// cannot be installed after metadata publication.
+pub fn validateEmbeddingInput(kind: types.EnrichmentKind, input: @import("enrichment_types.zig").EmbeddingInput, source_artifact_name: []const u8, chunk_size: u32, chunker_json: []const u8) !void {
+    if (input == .text) return;
+    if (kind != .embedding) return error.InvalidEnrichmentConfig;
+    try @import("enrichment_types.zig").validateEmbeddingInputShape(input, source_artifact_name.len == 0, chunk_size != 0 or chunker_json.len != 0);
+}
+
 /// Validates the context-free portion of a public enrichment definition.
 /// Dependency edges are validated by the catalog-aware caller, while this
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
     if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+    try validateEmbeddingInput(cfg.kind, cfg.embedding_input, cfg.source_artifact_name, cfg.chunk_size, cfg.chunker_json);
     if (cfg.kind == .group) {
         const source = cfg.source orelse return error.InvalidEnrichmentConfig;
         try source.validate();
@@ -92,7 +103,6 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
             if ((source_producer.type == .vector_labels or source_producer.type == .media_output) and cfg.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
             if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
             if (cfg.source_artifact_name.len > 0) {
-                if (cfg.field.len > 0 or cfg.template.len > 0) return error.InvalidEnrichmentConfig;
                 try validateUpstreamAssetProducer(alloc, cfg.producer_json);
             }
         },
@@ -344,22 +354,23 @@ test "producer JSON equality ignores object key order" {
 /// looking artifacts with weaker semantics. Fence it before storing the catalog.
 pub fn requiredReaderVersion(alloc: Allocator, cfg: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig) !u32 {
     const catalog = @import("../catalog/resolver_catalog.zig");
-    if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) return catalog.grouped_sources_reader_version;
-    if (cfg.kind != .asset or cfg.producer_json.len == 0) return 1;
+    const baseline: u32 = if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) catalog.grouped_sources_reader_version else 1;
+    if (cfg.kind != .asset or cfg.producer_json.len == 0) return baseline;
     var producer = try asset_producer.parseProducerConfig(alloc, cfg.producer_json);
     defer producer.deinit(alloc);
     if (producer.type == .generator) {
         var config = try @import("../../../generating/producer_config.zig").parse(alloc, producer.config_json);
         defer config.deinit(alloc);
-        if (config.output_schema != null) return catalog.generated_producers_reader_version;
+        if (config.output_schema != null) return @max(baseline, catalog.generated_producers_reader_version);
     } else if (producer.type == .extractor) {
-        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return catalog.generated_producers_reader_version;
+        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return @max(baseline, catalog.generated_producers_reader_version);
     } else if (producer.type == .decision) {
         const spec = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
         defer spec.deinit();
-        if (spec.value.decider.decision_method == .generated) return catalog.generated_producers_reader_version;
+        if (spec.value.decider.decision_method == .cascade) return @max(baseline, if (@import("antfly_decisions").cascade.requiresAgreement(spec.value.decider.cascade.?)) catalog.cascade_agreement_reader_version else catalog.decider_cascade_reader_version);
+        if (spec.value.decider.decision_method == .generated) return @max(baseline, catalog.generated_producers_reader_version);
     }
-    return 1;
+    return baseline;
 }
 
 pub fn priorSharesGroup(configs: anytype, name: []const u8, prior: []const u8) bool {

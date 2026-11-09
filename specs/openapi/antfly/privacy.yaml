@@ -1,0 +1,199 @@
+openapi: 3.0.3
+info:
+  title: Table privacy contracts
+  version: v1
+paths: {}
+components:
+  schemas:
+    PrivacyProducer:
+      type: object
+      additionalProperties: false
+      required: [type, config]
+      properties:
+        type:
+          type: string
+          enum: [extractor, generator]
+        revision:
+          type: string
+          description: Immutable provider/model deployment revision. The qualified default native model resolves its pinned revision automatically.
+        config:
+          description: Shared artifact producer configuration; privacy owns required categories and literal source spans. Credentials must use secret references or environment defaults.
+          anyOf:
+            - $ref: '../ai/extraction.yaml#/components/schemas/ExtractionConfig'
+            - $ref: '../ai/extraction.yaml#/components/schemas/GeneratedExtractorConfig'
+            - $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGeneratorProducerConfig'
+    PrivacyCategory:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128, pattern: '^[a-zA-Z0-9_]+$'}
+        description: {type: string}
+        threshold: {type: number, format: float, minimum: 0, maximum: 1}
+    PrivacyPolicy:
+      type: object
+      additionalProperties: false
+      required: [mode, fields]
+      properties:
+        mode:
+          type: string
+          enum: [monitor, redact_for_search_and_ai, redact_before_storage]
+          description: Policies, previews, and rescans require document storage without an external base source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
+        fields:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 512}
+          description: Literal source document field names, matching artifact source field semantics.
+        category_groups:
+          type: array
+          maxItems: 4
+          uniqueItems: true
+          items: {type: string, enum: [contact_details, personal_identifiers, financial, credentials]}
+        categories:
+          type: array
+          maxItems: 128
+          description: Add categories or override group categories. The union of explicit and expanded group categories must contain at most 128 distinct names.
+          items: {$ref: '#/components/schemas/PrivacyCategory'}
+        sensitivity: {type: string, enum: [conservative, balanced, thorough], default: balanced}
+        replacement: {type: string, enum: [category, mask, remove], default: category}
+        producer: {$ref: '#/components/schemas/PrivacyProducer'}
+        execution:
+          type: object
+          additionalProperties: false
+          properties:
+            batch_items: {type: integer, minimum: 1, maximum: 8, default: 8}
+            max_attempts: {type: integer, minimum: 1, maximum: 5, default: 3}
+    PrivacyFinding:
+      type: object
+      required: [document, field, category, start, end, policy_version]
+      properties:
+        document: {type: string}
+        field: {type: string}
+        category: {type: string}
+        start: {type: integer, minimum: 0}
+        end: {type: integer, minimum: 0}
+        confidence: {type: number, format: float, minimum: 0, maximum: 1}
+        policy_version: {type: string}
+        source_fingerprint: {type: string}
+        producer_revision: {type: string}
+      description: Half-open UTF-8 byte offsets into the immutable source field. Matched values are not persisted in findings. Confidence is omitted when unavailable.
+    PrivacyStatus:
+      type: object
+      required: [configured]
+      properties:
+        configured: {type: boolean}
+        policy: {$ref: '#/components/schemas/PrivacyPolicy'}
+        policy_version: {type: string}
+        resource_version: {type: integer, format: uint64}
+        generation: {type: integer, format: uint64}
+        scan_id: {type: string}
+        etag: {type: string}
+        resolved_producer: {$ref: '#/components/schemas/PrivacyProducer'}
+        external_processing: {type: boolean}
+        coverage:
+          type: object
+          properties:
+            available: {type: boolean}
+            refreshing: {type: boolean, description: A bounded background census is building the next complete result.}
+            started_at_millis: {type: integer, format: int64, description: Start of the published observation interval; counts are informational and are not an atomic cross-shard snapshot.}
+            completed_at_millis: {type: integer, format: int64, description: Completion of the published census. Counts refresh asynchronously as documents change and never authorize protected serving.}
+            total: {type: integer, format: uint64, nullable: true}
+            current: {type: integer, format: uint64, nullable: true}
+            pending: {type: integer, format: uint64, nullable: true}
+            failed: {type: integer, format: uint64, nullable: true}
+            with_findings: {type: integer, format: uint64, nullable: true}
+            protected_ready: {type: integer, format: uint64, nullable: true}
+            protected_blocked: {type: integer, format: uint64, nullable: true}
+            categories: {type: object, additionalProperties: {type: integer, format: uint64}}
+            fields: {type: object, additionalProperties: {type: integer, format: uint64}, description: Findings by field across current inspections; pending and failed sources contribute no counts.}
+            failed_known: {type: integer, format: uint64, description: Source-bound failures observed so far; failed remains null while other work is unclassified.}
+            failures: {description: "Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.", type: array, maxItems: 100, items: {type: object, additionalProperties: true}}
+            next_key: {type: string, nullable: true, description: Reserved for bounded internal census pages; omitted from public coverage snapshots.}
+    PrivacyPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [policy]
+      properties:
+        policy: {$ref: '#/components/schemas/PrivacyPolicy'}
+        sample:
+          type: object
+          additionalProperties: false
+          properties:
+            keys: {type: array, minItems: 1, maxItems: 50, uniqueItems: true, items: {type: string}}
+            limit: {type: integer, minimum: 1, maximum: 50, default: 10}
+    PrivacyPreview:
+      type: object
+      required: [policy_version, documents, sampled, complete_table_scan]
+      properties:
+        policy_version: {type: string}
+        sampled: {type: integer, minimum: 0}
+        complete_table_scan: {type: boolean, enum: [false]}
+        external_processing: {type: boolean}
+        documents:
+          type: array
+          items:
+            type: object
+            required: [document, fields]
+            properties:
+              document: {type: string}
+              fields:
+                type: array
+                items:
+                  type: object
+                  required: [field, original, text, findings]
+                  properties:
+                    field: {type: string}
+                    original: {type: string}
+                    text: {type: string}
+                    findings: {type: array, items: {$ref: '#/components/schemas/PrivacyFinding'}}
+    PrivacyScanRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        from_key: {type: string}
+        to_key: {type: string}
+        limit: {type: integer, minimum: 1, maximum: 1000, default: 100}
+    PrivacyScan:
+      type: object
+      required: [scan_id, policy_version, phase]
+      properties:
+        scan_id: {type: string}
+        policy_version: {type: string}
+        phase: {type: string, enum: [queued, running, processing, succeeded, failed, superseded]}
+        scanned: {type: integer, format: uint64}
+        reprocessed: {type: integer, format: uint64, description: Documents scheduled for inspection; processing verifies current receipts and publication before success.}
+        failed: {type: integer, format: uint64}
+        next_key: {type: string, nullable: true, deprecated: true, description: Reserved internal checkpoint; omitted from public scan status.}
+        skipped: {type: integer, format: uint64}
+        last_error: {type: string, nullable: true}
+        consecutive_errors: {type: integer, minimum: 0}
+        retry_after_millis: {type: integer, format: int64}
+        updated_at_millis: {type: integer, format: int64}
+        verification_cursor: {type: string, nullable: true, deprecated: true, description: Reserved internal checkpoint; omitted from public scan status.}
+        verification_current: {type: integer, format: uint64}
+        verification_pending: {type: integer, format: uint64}
+        verification_failed: {type: integer, format: uint64}
+        verification_blocked: {type: integer, format: uint64}
+        failures: {description: "Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.", type: array, nullable: true, maxItems: 100, items: {type: object, additionalProperties: true}}
+    PrivacyFindingsRequest:
+      type: object
+      additionalProperties: false
+      description: Findings filters and opaque continuation in the request body, avoiding URL limits for large document identifiers.
+      properties:
+        cursor: {type: string}
+        document: {type: string}
+        field: {type: string}
+        category: {type: string}
+        policy_version: {type: string}
+        limit: {type: integer, minimum: 1, maximum: 1000, default: 100}
+    PrivacyFindingsPage:
+      type: object
+      required: [findings, policy_version]
+      properties:
+        policy_version: {type: string}
+        findings: {type: array, items: {$ref: '#/components/schemas/PrivacyFinding'}}
+        next_cursor: {type: string, nullable: true, description: "Opaque continuation bound to the table, policy version, and filters. Pass it unchanged; its size depends on the document identifier."}
+        examined_documents: {type: integer, minimum: 0}
+        pending_documents: {type: integer, minimum: 0}

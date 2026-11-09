@@ -468,8 +468,12 @@ fn decodeBlockAlloc(
         },
         .zstandard => blk: {
             var in: std.Io.Reader = .fixed(encoded_block);
-            var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-            var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
+            // Keep the 8 MiB decoder workspace off the call stack. This
+            // function also serves null-codec blocks, and a shared Debug
+            // frame otherwise exceeds macOS main/thread stack budgets.
+            const window = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+            defer alloc.free(window);
+            var decompress: std.compress.zstd.Decompress = .init(&in, window, .{});
             const decoded = try decompress.reader.allocRemaining(alloc, .limited(max_decoded_block_bytes + 1));
             errdefer alloc.free(decoded);
             if (decoded.len > max_decoded_block_bytes) return error.AvroBlockTooLarge;
@@ -1010,24 +1014,20 @@ fn readJsonAvroIntArrayAlloc(alloc: Allocator, reader: *Reader, schema: std.json
 }
 
 fn readJsonAvroPartitionStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) !?[]u8 {
-    switch (schema) {
-        .array => |branches| {
-            const tag = try reader.readLong();
-            if (tag < 0) return error.InvalidIcebergDataManifest;
-            const tag_index = std.math.cast(usize, tag) orelse return error.InvalidIcebergDataManifest;
-            if (tag_index >= branches.items.len) return error.InvalidIcebergDataManifest;
-            const branch = branches.items[tag_index];
-            if (jsonTypeNameEql(branch, "null")) return null;
-            if (jsonTypeNameEql(branch, "string")) return try reader.readStringAlloc(alloc);
-            try skipJsonAvroValueAfterUnionTag(reader, branch);
-            return null;
-        },
-        else => {
-            if (jsonTypeNameEql(schema, "string")) return try reader.readStringAlloc(alloc);
-            try skipJsonAvroValue(reader, schema);
-            return null;
-        },
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return null;
+    if (jsonTypeNameEql(value_schema, "string")) return try reader.readStringAlloc(alloc);
+    if (jsonTypeNameEql(value_schema, "int") or jsonTypeNameEql(value_schema, "long")) {
+        const value = try reader.readLong();
+        if (jsonTypeNameEql(value_schema, "int") and std.math.cast(i32, value) == null) return error.InvalidIcebergDataManifest;
+        return try std.fmt.allocPrint(alloc, "{d}", .{value});
     }
+    if (jsonTypeNameEql(value_schema, "boolean")) {
+        const value = try reader.readByte();
+        if (value > 1) return error.InvalidIcebergDataManifest;
+        return try alloc.dupe(u8, if (value == 1) "true" else "false");
+    }
+    try skipJsonAvroValueAfterUnionTag(reader, value_schema);
+    return null;
 }
 
 fn readJsonAvroStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]u8 {
@@ -1846,6 +1846,34 @@ test "external lake manifest list skips standard nested partition summaries" {
     defer entry.deinit(a);
     try std.testing.expectEqual(@as(u64, 123), entry.manifest_length);
     try std.testing.expect(reader.eof());
+}
+
+test "iceberg avro manifest decoding fits a bounded worker stack" {
+    const alloc = std.testing.allocator;
+    var plain = try buildManifestListFixture(alloc, "null", true);
+    defer plain.deinit(alloc);
+    var compressed = try buildManifestListFixture(alloc, "zstandard", true);
+    defer compressed.deinit(alloc);
+    const Worker = struct {
+        inputs: [2][]const u8,
+        failure: ?anyerror = null,
+        fn check(self: *@This()) !void {
+            for (self.inputs) |input| {
+                var list = try parseManifestListAlloc(std.testing.allocator, input);
+                defer list.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+            }
+        }
+        fn run(self: *@This()) void {
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var worker: Worker = .{ .inputs = .{ plain.items, compressed.items } };
+    const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Worker.run, .{&worker});
+    thread.join();
+    if (worker.failure) |err| return err;
 }
 
 test "iceberg avro bootstrap inspection checks codec and header without decoding blocks" {

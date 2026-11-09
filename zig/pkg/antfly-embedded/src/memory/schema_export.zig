@@ -109,6 +109,22 @@ pub fn main(init: std.process.Init) !void {
         .{ "MemoryRecordPage", t.RecordPage },
         .{ "MemoryEntityPage", t.EntityPage },
         .{ "MemoryInspection", t.Inspection },
+        .{ "MemoryStatistics", t.Statistics },
+        .{ "MemoryAccess", t.Access },
+        .{ "MemoryUsage", t.Usage },
+        .{ "MemoryStoredEvidence", t.StoredEvidence },
+        .{ "MemoryResolvedEntity", t.ResolvedEntity },
+        .{ "MemoryUtility", t.Utility },
+        .{ "MemoryPin", t.Pin },
+        .{ "MemoryBriefRequest", t.BriefRequest },
+        .{ "MemoryBriefItem", t.BriefItem },
+        .{ "MemorySubjectCount", t.SubjectCount },
+        .{ "MemoryCount", t.Count },
+        .{ "MemoryBrief", t.Brief },
+        .{ "MemoryConsolidationRequest", t.ConsolidationRequest },
+        .{ "MemoryFinding", t.Finding },
+        .{ "MemorySpaceStats", t.SpaceStats },
+        .{ "MemoryConsolidation", t.Consolidation },
     }) |entry| try schemas.put(a, entry[0], try schema.wire(entry[1], a));
     try schemas.put(a, "_memory_mcp_tools", try @import("operations.zig").mcpTools(a));
     const bytes = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = schemas }, .{ .whitespace = .indent_2 });

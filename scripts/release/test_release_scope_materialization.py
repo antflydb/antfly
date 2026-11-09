@@ -116,51 +116,41 @@ def workflow_step():
 
 
 class ReleaseScopeTests(unittest.TestCase):
-    def test_cli_handoff_matches_registry_demand_for_all_policy_combinations(self):
+    def test_promotion_restores_sealed_scopes_without_bulk_reuploads(self):
         workflow = (ROOT / ".github/workflows/antfly-release.yml").read_text()
-
-        def artifact_step(job, action, artifact):
-            block = workflow.split(f"\n  {job}:\n", 1)[1]
-            block = re.split(r"\n  [\w-]+:\n", block, maxsplit=1)[0]
-            steps = re.split(r"\n      - ", block)
-            return next(
-                step
-                for step in steps
-                if f"uses: actions/{action}@" in step and f"name: {artifact}\n" in step
-            )
-
-        upload = artifact_step(
-            "prepare-release-promotion", "upload-artifact", "antfly-cli-snapshot"
-        )
-        download = artifact_step(
-            "preflight-publication", "download-artifact", "antfly-cli-snapshot"
-        )
-        for npm, pypi in ((False, False), (True, False), (False, True), (True, True)):
-            for step in (upload, download):
-                with self.subTest(npm=npm, pypi=pypi, step=step):
-                    expression = re.search(r"if: \$\{\{ (.*?) \}\}", step)[1]
-                    for registry, enabled in (("npm", npm), ("pypi", pypi)):
-                        expression = re.sub(
-                            rf"(?:steps\.identity|needs\.prepare-release-promotion)"
-                            rf"\.outputs\.publish_{registry}",
-                            repr(str(enabled).lower()),
-                            expression,
-                        )
-                    expression = expression.replace("||", " or ")
-                    self.assertEqual(
-                        eval(expression, {"__builtins__": {}}, {}), npm or pypi
-                    )
-
-        # Other jobs still need these scopes even when both registries are off.
+        prepare = workflow.split("\n  publish-cli-pypi:", 1)[0]
         for artifact in (
-            "antfly-release-payload",
+            "antfly-cli-snapshot",
             "antfly-release-runtime-archives",
-            "antfly-release-ledger",
+            "antfly-release-payload",
         ):
-            step = artifact_step(
-                "prepare-release-promotion", "upload-artifact", artifact
+            self.assertNotIn(
+                "name: " + artifact + "\n",
+                prepare[
+                    prepare.index(
+                        "      - name: Materialize and verify typed bundle scopes"
+                    ) :
+                ],
             )
-            self.assertNotIn("if:", step)
+        preflight = workflow.split("\n  preflight-publication:", 1)[1].split(
+            "\n  begin-release-channel:", 1
+        )[0]
+        download = preflight.split(
+            "      - uses: ./.github/actions/restore-release-scope", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn("scope: cli", download)
+        for npm, pypi in ((False, False), (True, False), (False, True), (True, True)):
+            expression = re.search(r"if: \$\{\{ (.*?) \}\}", download)[1]
+            for registry, enabled in (("npm", npm), ("pypi", pypi)):
+                expression = expression.replace(
+                    f"needs.prepare-release-promotion.outputs.publish_{registry}",
+                    repr(str(enabled).lower()),
+                )
+            self.assertEqual(
+                eval(expression.replace("||", " or "), {"__builtins__": {}}, {}),
+                npm or pypi,
+            )
+        self.assertIn("name: antfly-release-ledger", prepare)
 
     def test_real_workflow_step_supports_npm_only_and_legacy_wheel_snapshots(self):
         for legacy in (False, True):

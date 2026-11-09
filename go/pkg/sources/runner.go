@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Ownership includes previously attempted writes across interrupted inventories.
@@ -37,16 +38,27 @@ import (
 const maxOwnedSourceObjects = 1000000
 
 type Profile struct {
-	CatalogTable      string                `json:"catalog_table,omitempty"`
-	Version           int                   `json:"version"`
-	Endpoint          string                `json:"endpoint"`
-	DataPlaneTokenEnv string                `json:"data_plane_token_env,omitempty"`
-	Principals        []string              `json:"principals,omitempty"`
-	Connections       map[string]Connection `json:"connections"`
-	Sources           []Source              `json:"sources"`
+	LocalMigrations   map[string]LocalMigrationReceipt `json:"local_migrations,omitempty"`
+	CatalogTable      string                           `json:"catalog_table,omitempty"`
+	Version           int                              `json:"version"`
+	Endpoint          string                           `json:"endpoint"`
+	DataPlaneTokenEnv string                           `json:"data_plane_token_env,omitempty"`
+	Principals        []string                         `json:"principals,omitempty"`
+	Connections       map[string]Connection            `json:"connections"`
+	Sources           []Source                         `json:"sources"`
+}
+
+// Identity names the opaque prefix that scopes a source's row keys,
+// independent of its connection or config (see IdentityKey). Immutable once
+// set: Service rejects any later change.
+type Identity struct {
+	Namespace string `json:"namespace,omitempty"`
 }
 type Source struct {
-	Streams []TextStream `json:"streams,omitempty"`
+	Processing    *ProcessingDeclaration `json:"processing,omitempty"`
+	SearchVersion int                    `json:"search_version,omitempty"`
+	Artifacts     []ArtifactBinding      `json:"artifacts,omitempty"`
+	Streams       []SearchStream         `json:"streams,omitempty"`
 	// Publication defaults to native acquisition. Binary rows require a revision-enforcing
 	// fetch resolver, supplied by the source service or an embedding application.
 	Publication          string          `json:"publication,omitempty"`
@@ -57,6 +69,7 @@ type Source struct {
 	Config               json.RawMessage `json:"config"`
 	Permissions          *Permissions    `json:"permissions"`
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
+	Identity             Identity        `json:"identity,omitzero"`
 }
 type Runner struct {
 	// SourceID selects one source while retaining the complete profile/catalog.
@@ -173,9 +186,9 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		binding := Binding{SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
 		if len(binding.Streams) == 0 && source.Publication != "media" {
-			binding.Streams = DefaultTextStreams()
+			binding.Streams = DefaultSearchStreams(source.SearchVersion)
 		}
 		binding.Publication = source.Publication
 		if binding.Publication == "" {
@@ -208,6 +221,14 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 	for i, source := range r.Profile.Sources {
 		if r.SourceID != "" && source.ID != r.SourceID {
 			continue
+		}
+		if source.Processing != nil {
+			if err := r.Publisher.EnsureTable(ctx, source.Table); err != nil {
+				return err
+			}
+			if err := ReconcileProcessing(ctx, r.Publisher, source.Table, source.Processing); err != nil {
+				return err
+			}
 		}
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
@@ -266,7 +287,10 @@ func (r *Runner) validate() error {
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
 		}
-		if err := ValidateTextStreams(s.Streams); err != nil {
+		if err := ValidateProcessing(s.Processing); err != nil {
+			return err
+		}
+		if err := ValidateSearchBindings(s.SearchVersion, s.Streams, s.Artifacts); err != nil {
 			return err
 		}
 		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" && s.Publication != "native" {
@@ -281,6 +305,9 @@ func (r *Runner) validate() error {
 		}
 		if s.PermissionTTLSeconds != 0 && (s.PermissionTTLSeconds < 60 || s.PermissionTTLSeconds > 86400) {
 			return fmt.Errorf("permission TTL must be 60..86400 seconds")
+		}
+		if ns := s.Identity.Namespace; ns != "" && (len(ns) > 4096 || !utf8.ValidString(ns) || strings.ContainsAny(ns, "\x00\r\n")) {
+			return fmt.Errorf("invalid source identity namespace")
 		}
 	}
 	if !selected {
@@ -310,7 +337,11 @@ func canonicalID(id string) bool {
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
 	source.Streams = nil // Search/producer bindings do not change acquired bytes.
+	source.Artifacts = nil
+	source.SearchVersion = 0
+	source.Processing = nil
 	source.PermissionTTLSeconds = 0
+	source.Identity = Identity{} // Row keying, not acquisition; see IdentityKey.
 	identity, err := json.Marshal(struct {
 		Source     Source
 		Connection Connection
@@ -371,6 +402,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, "", err
 	}
+	if err := restoreInventoryRelativeKeys(s, connection.Provider, state.Published); err != nil {
+		return 0, "", err
+	}
 	if state.Owned == nil {
 		state.Owned = map[string]string{}
 	}
@@ -399,13 +433,8 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if c, ok := connector.(*CollaborationConnector); ok {
 		// Pool immutable provider transports/token sources, never per-acquisition
 		// cursors, scope caches, or hydration state across logical sources.
-		run := CollaborationConnector{
-			ProviderName: c.ProviderName, HTTPClient: c.HTTPClient, AccessToken: c.AccessToken,
-			Services: c.Services, APIBase: c.APIBase, GmailBase: c.GmailBase, CalendarBase: c.CalendarBase,
-			DriveBase: c.DriveBase, Extractor: c.Extractor, DownloadTransport: c.DownloadTransport,
-			NativeAttachments: c.NativeAttachments, ExtractorVersion: c.ExtractorVersion, accessAuditWindow: c.accessAuditWindow, accessWait: c.accessWait,
-		}
-		c, connector = &run, &run
+		run := c.newAcquisition()
+		c, connector = run, run
 		c.Baseline = state.Published
 		if r.Restart {
 			c.Baseline = nil
@@ -450,6 +479,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			return 0, "", err
 		}
 	}
+	if err := restoreInventoryRelativeKeys(s, connection.Provider, state.Pending); err != nil {
+		return 0, "", err
+	}
 	if !state.Pending.Authoritative || len(state.Pending.Objects) > sourceInventoryLimit(connection.Provider) {
 		return 0, "", fmt.Errorf("invalid persisted inventory authority")
 	}
@@ -478,11 +510,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := r.Publisher.EnsureTable(ctx, s.Table); err != nil {
 		return 0, "", err
 	}
-	providerIDs := make([]string, 0, len(state.Pending.Objects))
-	for _, item := range state.Pending.Objects {
-		providerIDs = append(providerIDs, item.ID)
-	}
-	writer, err := NewSyncWriter(r.Publisher, s.Table, s.ID, providerIDs, state.Pending.Authoritative)
+	writer, err := NewSyncWriterWithIdentity(r.Publisher, s.Table, s.ID, s.Identity.Namespace, state.Pending.Objects, state.Pending.Authoritative)
 	if err != nil {
 		return 0, "", err
 	}
@@ -549,7 +577,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if len(state.Owned) > maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget")
 		}
-		key, err := RecordKey(s.ID, item.ID)
+		key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
 		if err != nil {
 			return 0, "", err
 		}

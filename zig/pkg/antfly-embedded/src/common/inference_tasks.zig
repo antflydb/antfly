@@ -70,6 +70,7 @@ pub const Executor = struct {
         if (cfg.provider == .chatgpt) return error.UnsupportedInferenceFeature;
         cfg = try withGenerationOptions(cfg, overrides);
         var factory = try self.generationFactory(a, cfg);
+        factory.require_completion = overrides.require_completion;
         var generator = try factory.factory().create(a, cfg);
         defer generator.deinit();
         return generator.generate(a, cfg.model, messages);
@@ -251,12 +252,13 @@ pub const Executor = struct {
             if (item.id) |id| try decisions.put(a, &row, "id", .{ .string = id });
             try decisions.put(a, &row, "answers", if (value) |valid| valid.object.get("answers").? else .{ .array = std.array_list.Managed(Json).init(a) });
             if (value) |valid| try decisions.put(a, &row, "model", valid.object.get("model").?);
+            if (value) |valid| if (valid.object.get("cascade")) |trace| try decisions.put(a, &row, "cascade", trace);
             if (failure) |err| try decisions.put(a, &row, "error", .{ .string = @errorName(err) });
             try data.array.append(row);
         }
         const cfg = try self.view.providers.getDeciderConfig(name);
         var envelope = decisions.jsonObject();
-        try decisions.put(a, &envelope, "model", .{ .string = if (cfg.generator) |generator| generator.model else cfg.modelName() });
+        try decisions.put(a, &envelope, "model", .{ .string = if (cfg.decision_method == .cascade) name else if (cfg.generator) |generator| generator.model else cfg.modelName() });
         try decisions.put(a, &envelope, "data", data);
         var usage = decisions.jsonObject();
         try decisions.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, runtime.input_tokens) orelse return error.InvalidDecisionOutput });
@@ -347,8 +349,15 @@ pub const Executor = struct {
     }
 
     pub fn transcribe(self: Executor, a: std.mem.Allocator, name: []const u8, request: transcribing.Request) !transcribing.Response {
+        return self.transcribeWithAudio(a, name, request, null);
+    }
+
+    /// Borrow pre-acquired audio for providers that support it. No base64 or
+    /// downloader copy is needed for a framed dictation recording.
+    pub fn transcribeWithAudio(self: Executor, a: std.mem.Allocator, name: []const u8, request: transcribing.Request, audio: ?[]const u8) !transcribing.Response {
         try self.context.check();
         var cfg = try (self.view.transcribers orelse return error.ModelNotFound).getConfig(name);
+        if (audio != null and !cfg.provider.supportsResolvedAudio()) return error.UnsupportedInferenceFeature;
         const uses_default = cfg.provider == .antfly and cfg.resolvedUrl() == null;
         if (uses_default) if (self.antfly_provider) |provider| {
             const callback = provider.transcribe_audio_with_context orelse return error.UnsupportedInferenceFeature;
@@ -371,6 +380,7 @@ pub const Executor = struct {
         if (key) |value| cfg.bearer_token = try secrets.resolveReferenceOwned(a, self.secret_store, value);
         cfg.api_key = null;
         return transcribing.transcribeWithConfig(a, try self.providerHttp(), cfg, request, .{
+            .resolved_audio = audio,
             .credential_manager = if (self.provider_runtime) |runtime| &runtime.google_credentials else null,
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
@@ -454,6 +464,7 @@ pub const Executor = struct {
 };
 
 pub const GenerationOptions = struct {
+    require_completion: bool = false,
     max_tokens: ?i64 = null,
     max_completion_tokens: ?i64 = null,
     temperature: ?f32 = null,

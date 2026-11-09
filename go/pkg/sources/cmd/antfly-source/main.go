@@ -38,8 +38,17 @@ func main() {
 	}
 }
 func run() error {
+	if len(os.Args) >= 2 && os.Args[1] == "search" {
+		return searchCommand(os.Args[2:])
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "processing" {
+		return processingCommand(os.Args[2:])
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "serve" {
 		return serve(os.Args[2:])
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "migrate-local" {
+		return migrateLocal(os.Args[2:])
 	}
 	flags := flag.NewFlagSet("antfly-source sync", flag.ContinueOnError)
 	profile := flags.String("config", "", "source profile JSON")
@@ -47,7 +56,7 @@ func run() error {
 	catalog := flags.String("catalog-out", "", "portable search catalog path")
 	restart := flags.Bool("restart", false, "discard a failed pinned selection and enumerate afresh (retain ownership)")
 	if len(os.Args) < 2 || os.Args[1] != "sync" {
-		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]; or antfly-source serve --config FILE --state-dir DIR --public-url URL")
+		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]; or antfly-source serve --config FILE --state-dir DIR --public-url URL; or antfly-source migrate-local --source ID --from-connection NAME --to-connection NAME --to-bucket BUCKET [--server URL | (--config FILE --state-dir DIR --public-url URL)] [--from-prefix PREFIX] [--to-prefix PREFIX] [--dry-run]")
 	}
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		return err

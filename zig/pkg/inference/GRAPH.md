@@ -386,6 +386,133 @@ Offline artifacts are currently exact shape buckets. A different prompt can use 
 
 For PJRT whole-graph artifacts, `run-artifact --compare-host` compares artifact outputs against traced native graph captures for the same rendered prompt shape. The compare summary includes top-1 agreement plus last-logit and graph-output diffs, so a "sensible output" smoke test can be upgraded into an exact-shape correctness check.
 
+### Artifact memory admission
+
+Offline generation, draft models, tokenizer assets, and artifact execution share
+one invocation ledger. Explicit host, backend, combined, KV, and scratch caps
+apply across its CPU and GPU work. A request exceeding a cap rejects before
+provider construction; temporary occupancy remains retryable.
+
+PJRT execution requires a load-only executable exported with a versioned
+`pjrt_memory_plan`. Export records compiler residency/workspace statistics and
+SHA-256 identities for both executable bytes and the provider library. Re-export
+legacy executables after upgrading, and re-export when changing the provider.
+HLO export and `--validate` inspection remain available; managed execution of
+HLO or unprofiled executables returns `UnsupportedPjrtFeature` because compiling
+unknown native code cannot be admitted from encoded file size.
+
+The loader admits host serialized staging, host upload/download conversions,
+and the compiler footprint before initializing PJRT or creating a client. It reads
+executable bytes once, verifies
+both identities, deserializes the same buffer, and checks loaded statistics
+against the profile without increasing its lease. Staging allows an input copy
+and a provider copy; the input is freed after load, and the provider copy stays
+charged until client destruction. Profiles describe provider-reported compiled
+memory, not an OS isolation boundary for arbitrary third-party plugin code.
+
+This loader supports CPU and CUDA profiles. CUDA uses the first visible device, checks
+its physical capacity before client creation, and configures a bounded BFC pool
+with default-pool preallocation and extra transfer staging disabled. A separate
+2 MiB collective pool is explicitly charged; zero would select OpenXLA's
+unbounded automatic collective capacity. Code residency remains outside the
+allocator capacity. Both pools' alignment/fragmentation headroom is charged.
+Unified CUDA devices
+share the host envelope. Other providers must supply an admission contract before
+this loader can execute their artifacts.
+
+CLI generation uses one artifact execution path for both single-token and
+multi-token requests. It encodes the prompt once, preserving BOS and thinking
+options, and uses the same admission layer for prefill and every loaded decode
+variant. Resident code is summed, while arguments and KV/scratch
+share their largest phase envelope. Inputs load one at a time, each verified
+before deserialization; serialized staging is bounded by retained provider
+copies plus the largest input. The executor owns the client and leases until
+all runtimes and executable handles close. Cached runtimes retain their executor,
+client, graph metadata, and accounting domain across graph-cache eviction.
+Unsupported HLO or unprofiled caches
+are skipped during automatic lookup so they cannot mask a profiled executable.
+
+Managed CLI generation loads only the contiguous decode variants needed by the
+requested token count. Its prefill keeps the exact prompt shape, including under
+memory pressure; admission does not reduce it to a different artifact bucket.
+The native graph keeps KV page geometry without allocating duplicate CPU KV
+storage: the managed executable owns and admits that storage.
+
+Managed requests select complete contiguous prefill/decode chains before
+constructing the provider. Mode preference applies only among compatible chains
+that cover the requested token count, so incomplete embedded packages cannot
+hide complete input-parameter packages or standalone chains. Selection caches
+request-relevant sidecar metadata, checks executable availability without reading
+its bytes, and passes the parsed manifests directly to the admitted loader.
+Raw package/sidecar reads, parser arenas, catalog indexes, and selected manifest
+copies acquire host admission before allocating and remain charged until freed.
+File reads use the opened descriptor's exact size, avoiding geometric growth
+peaks; file growth or truncation during the read is rejected. Temporary metadata
+uses a reclaiming allocator even when the request allocator is an arena. Explicit
+path-based loaders and `run-artifact` use the same accounting, sharing the
+invocation domain with tokenizer and executable residency.
+Executor-owned graph copies, shapes, binding names, and variant structures use
+an admission allocator retained through the last runtime's destruction. Package
+bookkeeping is admitted before allocation. Every metadata allocation consumes
+physical headroom, including small parser allocations: a bounded pending-credit
+batch amortizes OS probes, with an exact-size fallback under pressure. Unused
+headroom is returned before handing off construction and after loading; frees
+return only residency credit from their own pressure epoch.
+Construction admission uses the manager's pressure/reclamation path, including
+optional host caches, while retaining batched OS probes. Escaped metadata owners
+detach the borrowed manager and derive accounting lifetimes from retained owners.
+Loading admits and preallocates each runtime slot for the largest phase's
+semantic KV set. Slots borrow immutable executor binding names and identify entries by
+(layer, kind), so phase-specific aliases do not copy names or grow the cache on
+every token. Runtime creation remains valid after manager shutdown.
+
+Standalone selection streams a compact request header for large sidecars,
+skipping shape/binding arrays and unknown fields without retaining their values.
+Unrelated artifacts cannot exhaust the request's metadata budget. Matching files
+still undergo full admitted parsing, compatibility checks, and identity checks;
+inspection is only a filter and does not authorize execution.
+The loader still verifies executable/provider identity and loaded statistics;
+identity or deserialization failures do not trigger another candidate.
+
+A prefill-only executable never doubles as a decode executable,
+even for a one-token prompt. Standalone lookup prefers profiled embedded
+parameters, then profiled external inputs, and rejects duplicate matches within
+the selected mode.
+
+Managed packages reserve `Context.runtime_capacity` independent execution slots
+(default one) before client construction. Each slot includes its own arguments,
+KV, scratch, and host transfer envelope; code, graph metadata, and serialized
+provider copies are charged once. Runtime creation borrows a slot atomically and
+returns temporary-unavailability when all slots are occupied. Destruction frees
+retained KV before returning the slot; failed runtime allocation returns it too.
+PJRT prefill starts a fresh sequence and releases prior retained KV inside the
+runtime before allocating replacement outputs. This bound holds for direct
+runtime reuse, including an allocation failure followed by retry. Host output
+bookkeeping is allocated before native execution; execution errors destroy all
+returned native outputs and completion events before an execution slot can be
+returned.
+Capacity cannot grow beyond CUDA's already admitted fixed pool. Callers needing
+concurrent runtimes set the capacity when loading the executor, allowing full
+workspace concurrency without duplicating immutable executable residency.
+
+Managed CLI XLA generation defaults to whole-model load-only execution. Inline
+compilation, explicit partitioned generation, and speculative/multimodal XLA
+routes have no bounded compiler contract and return an unsupported-feature error;
+compile executable artifacts explicitly first. The `run-artifact` command still
+supports profiled partition executables. A missing matching executable reports
+`PjrtLoadOnlyArtifactsRequired` instead of falling back to unadmitted compilation.
+
+Bounded CUDA clients reject nonempty `XLA_FLAGS`, enabled
+`XLA_PJRT_GPU_HOST_MEMORY_PREALLOCATE`, and enabled `TF_FORCE_UNIFIED_MEMORY`
+before provider initialization. These process-wide policies can override the
+allocator capacity or preallocate host memory independently of Client_Create.
+CPU profiles are unaffected by these CUDA restrictions.
+
+Full recomputation reserves no host KV. Native paged partition materialization
+owns one host cache. Whole-model tracing retains page geometry without CPU KV
+storage; `--compare-host` acquires one reference cache and frees it before PJRT
+execution.
+
 ### Debug Artifacts
 
 Node-level artifacts are now part of the correctness workflow:
@@ -486,3 +613,67 @@ Near-term graph/backend work:
 > **Relocated:** The item-by-item graph/backend progress narrative that previously lived here (56 lines) is preserved verbatim in [docs/design/inference/history/graph-current-progress-history.md](../../../docs/design/inference/history/graph-current-progress-history.md). The durable ModelExecutor/ModelRuntime/PartitionExecutor split it described is decision 8 above.
 
 See also: [MULTIDEVICE.md](MULTIDEVICE.md) for multi-device inference, [FINETUNING.md](finetuning/FINETUNING.md) for training support.
+
+Compiled HLO and serialized PJRT executables are checked against the provider's
+native output count before use. Executor loading also verifies native F32 output
+types and exact dimensions against the supplied shapes, before publishing a runtime.
+A sidecar with a mismatched count, out-of-range input graph reference,
+or duplicate semantic ownership of a native output is rejected during loading.
+KV identity is `(layer_index, kind)` when a layer is supplied and `(name, kind)`
+otherwise. Admitted runtime slots preallocate a semantic hash index alongside
+retained entries; KV lookup and replacement require no per-step allocation and
+have expected constant cost per binding. Reset clears both entries and the index.
+
+The PJRT wrapper's function slots and executable argument layouts are checked
+against an independently vendored upstream C header by `zig/lib/pjrt`'s
+`zig build test`. The provider fixture must use the upstream table order; matching
+hand-written wrapper and fixture numbers alone do not establish ABI compatibility.
+
+KV selection, shape compatibility, cache capacity, and runtime lookup share the
+same identity implementation. Layerless names must match across phases; layered
+names may differ. A phase cannot give two outputs ownership of one logical KV
+state. Semantic input bindings are canonicalized by input position when cloned.
+Execution validates this ordering and traverses sparse bindings alongside inputs
+in linear time, without creating an index or copying names on each step.
+
+Logits output positions are resolved once for each phase before publication;
+decode phase selection uses binary search over the sorted sequence lengths.
+F32 readback queries the provider's host-transfer size rather than physical device
+storage, validates element type, logical dimensions, and checked byte count before
+allocation, and releases completion events on failures. Whole-model readback also
+checks runtime dimensions against the admitted logits shape before slicing.
+
+Each admitted runtime slot also owns its graph-indexed value table and a bounded
+bookkeeping arena sized for the largest phase. Argument/output handle lists,
+ownership flags, upload shapes, and readback layout metadata use that arena;
+only the admitted transfer buffers and returned logits use the request allocator.
+Per-token cleanup visits bound inputs rather than scanning the whole graph.
+Readback requests explicit untiled row-major host layout for both size discovery
+and transfer. Native device padding is charged to device execution memory and
+never determines logical host size or retained-KV compatibility. KV matching
+checks native F32 type and logical dimensions (with dynamic input dimensions
+acting as wildcards). New KV is published only after logits allocation succeeds,
+so failed decode readback can retry against the previous cache generation.
+
+Before native execution, an admitted runtime keeps only KV consumed by the
+selected phase and rebuilds its semantic index using slot-owned liveness marks.
+After successful logits readback/allocation it replaces that input generation
+with the new outputs. Historical phase identities cannot accumulate beyond the
+admitted per-phase input/output peak. All native Execute inputs are explicitly
+non-donatable, including duplicate references to one retained buffer; may-alias
+executables cannot consume the old generation needed by a failed decode retry.
+The enclosing resource envelope configures unified-device ceilings. Metadata
+suballocations reuse that stable policy and retain batched physical-pressure
+checks, avoiding a fresh OS limit probe for each parser allocation.
+
+Standalone discovery evaluates parameter modes in priority order. It streams a
+compact header before parsing a candidate's shapes or bindings at every file
+size, and releases an incomplete mode's catalog before considering fallback.
+Lower-priority large sidecars and small JSON files with large metadata expansion
+cannot force full parsing while a complete preferred mode is selected. Package
+and standalone lookup still share parsed metadata within the active mode;
+ambiguity and selected-chain identity/deserialization errors remain errors.
+Native upload helpers share one ownership guard for returned buffers and
+completion events. Completion failure destroys the buffer that cannot be handed
+to the caller. The standalone upload regression checks successful and failed
+ownership transfers without suppressing production native-error diagnostics.

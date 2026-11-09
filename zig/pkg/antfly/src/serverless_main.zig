@@ -225,6 +225,12 @@ pub fn runFromIterator(
         return err;
     };
     defer srv.deinitWithDeadline(supervisor.deadline());
+    var sql_configuration = std.heap.ArenaAllocator.init(alloc);
+    defer sql_configuration.deinit();
+    const sql_deployment = @import("serverless/sql/deployment.zig");
+    const sql_config = try sql_deployment.Config.fromEnv(sql_configuration.allocator(), init.environ_map, if (secret_store) |*store| store else null);
+    const sql = if (sql_config) |cfg| try sql_deployment.Owned.init(alloc, runtime_io, cfg, bootstrap.role, bootstrap.node_config, bootstrap.secret_store, .serverless, null) else null;
+    if (sql) |owned| owned.attachServer(&srv);
     srv.start() catch |err| {
         reportStartupError(err);
         return err;
@@ -273,7 +279,7 @@ const ServerlessHealthSource = struct {
     fn readiness(self: *ServerlessHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
             .ptr = self,
-            .vtable = &.{ .check = checkReady },
+            .vtable = &.{ .check = checkReady, .sql_check = checkSqlReady },
         };
     }
 
@@ -287,6 +293,11 @@ const ServerlessHealthSource = struct {
     fn checkReady(ptr: *anyopaque) bool {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
         return self.supervisor.currentState() == .ready and self.srv.runtimeStatus().validated;
+    }
+
+    fn checkSqlReady(ptr: *anyopaque) bool {
+        const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
+        return self.srv.sql_owned != null and checkReady(ptr);
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -314,6 +325,7 @@ fn writeServerlessPrometheus(writer: *std.Io.Writer, run_stats: anytype, query_m
     try append(writer, "antfly_serverless_sparse_queries_total", "counter", "Sparse query executions", query_metrics.sparse_queries);
     try antfly.db.query_metrics.writePrometheus(writer);
     try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+    try @import("antfly_readers").pipeline_metrics.writePrometheus(writer);
 }
 
 fn parseEnvOptionalInt(

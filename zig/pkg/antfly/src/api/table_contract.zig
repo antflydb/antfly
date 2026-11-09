@@ -947,6 +947,16 @@ fn validateCreateTableIndexesValue(value: std.json.Value) !void {
     }
 }
 
+fn stringifyNormalizedDecisionProducer(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    const raw = try stringifyJsonAlloc(alloc, value);
+    errdefer alloc.free(raw);
+    if (try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(alloc, raw, &.{ "config", "decider" })) |normalized| {
+        alloc.free(raw);
+        return normalized;
+    }
+    return raw;
+}
+
 fn normalizeArtifactEnrichmentConfigJson(
     alloc: std.mem.Allocator,
     object: anytype,
@@ -975,7 +985,7 @@ fn normalizeArtifactEnrichmentConfigJson(
     if (producer) |typed| {
         if (typed != .null) {
             if (has_producer_json or (transcriber != null and transcriber.? != .null)) return error.InvalidArtifactEnrichmentRequest;
-            const producer_json = try stringifyJsonAlloc(alloc, typed);
+            const producer_json = try stringifyNormalizedDecisionProducer(alloc, typed);
             defer alloc.free(producer_json);
             try appendField(alloc, &out, "producer_json", .{ .string = producer_json }, &first);
         }
@@ -1000,7 +1010,7 @@ fn normalizeArtifactEnrichmentConfigJson(
         while (it.next()) |entry| {
             if (std.mem.eql(u8, entry.key_ptr.*, "transcriber") or std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
-                const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
+                const producer_json = try stringifyNormalizedDecisionProducer(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
                 try appendField(alloc, &out, entry.key_ptr.*, .{ .string = producer_json }, &first);
             } else {
@@ -1012,7 +1022,7 @@ fn normalizeArtifactEnrichmentConfigJson(
         while (it.next()) |entry| {
             if (std.mem.eql(u8, entry.key_ptr.*, "transcriber") or std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
-                const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
+                const producer_json = try stringifyNormalizedDecisionProducer(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
                 try appendField(alloc, &out, entry.key_ptr.*, .{ .string = producer_json }, &first);
             } else {
@@ -1037,6 +1047,11 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
             try validatePublicArtifactEnrichmentField(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
+    const mode = if (@hasField(Object, "map")) object.map.get("embedding_input") else object.get("embedding_input");
+    if (mode) |input| if (input == .string and std.mem.eql(u8, input.string, "pdf_page_images")) {
+        const kind = (if (@hasField(Object, "map")) object.map.get("kind") else object.get("kind")) orelse return error.InvalidArtifactEnrichmentRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) return error.InvalidArtifactEnrichmentRequest;
+    };
 }
 
 fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
@@ -1316,9 +1331,26 @@ fn appendCanonicalPublicValue(
     // preserve their internal null values while canonicalizing public config.
     if (field_name) |name| {
         if (std.mem.eql(u8, name, "producer_json")) {
-            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+            if (value == .string) {
+                const normalized = try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(alloc, value.string, &.{ "config", "decider" });
+                defer if (normalized) |raw| alloc.free(raw);
+                const encoded = try stringifyJsonAlloc(alloc, normalized orelse value.string);
+                defer alloc.free(encoded);
+                return out.appendSlice(alloc, encoded);
+            }
+            const encoded = try stringifyNormalizedDecisionProducer(alloc, value);
             defer alloc.free(encoded);
             return out.appendSlice(alloc, encoded);
+        }
+        if (std.mem.eql(u8, name, "adjudicate") and value == .object) {
+            const raw = try stringifyJsonAlloc(alloc, value);
+            defer alloc.free(raw);
+            if (try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(alloc, raw, &.{"decider"})) |normalized| {
+                defer alloc.free(normalized);
+                const parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{ .parse_numbers = false });
+                defer parsed.deinit();
+                return appendCanonicalPublicValue(alloc, out, parsed.value, null);
+            }
         }
     }
 
@@ -2536,6 +2568,7 @@ test "external lake public compatibility normalization preserves exact schema li
         }
     };
     try Check.run(std.testing.allocator);
+    // Remapping may avoid allocations depending on the backing heap's layout.
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator,
@@ -2558,4 +2591,109 @@ test "grouped enrichment public normalization retains typed source and finite pr
     try std.testing.expectError(error.InvalidArtifactEnrichmentRequest, parseArtifactEnrichmentRequest(a, "turns",
         \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","field":"text","max_bytez":1}}
     ));
+}
+
+test "resolver adjudication public policy omits disabled guards before metadata forwarding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const request =
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong"},"when":{"probability_between":[0.3,0.9]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}]}
+    ;
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, request, .{});
+    const baseline = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(baseline);
+    const disabled_json = try std.mem.replaceOwned(u8, scratch, request, "\"when\":", "\"require_agreement\":false,\"when\":");
+    const disabled = try std.json.parseFromSliceLeaky(std.json.Value, scratch, disabled_json, .{});
+    const normalized = try normalizeIndexConfigJson(a, disabled.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    try std.testing.expectEqualStrings(baseline, normalized);
+    const producer =
+        \\{"type":"decision","config":{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong"},"require_agreement":false,"when":{"probability_between":[0.3,0.9]}}]}},"questions":[]}}
+    ;
+    const envelope = try std.fmt.allocPrint(scratch, "{{\"kind\":\"asset\",\"field\":\"text\",\"producer\":{s}}}", .{producer});
+    const artifact = try parseArtifactEnrichmentRequest(a, "c", envelope);
+    defer a.free(artifact);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "require_agreement") == null);
+    // The graph shorthand embeds the producer as an object; legacy enrichment
+    // forwarding embeds it as a JSON string. Both must preserve epoch 30.
+    for ([_]std.json.Value{
+        try std.json.parseFromSliceLeaky(std.json.Value, scratch, producer, .{}),
+        .{ .string = producer },
+    }) |wire| {
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(a);
+        try appendCanonicalPublicValue(a, &output, wire, "producer_json");
+        try std.testing.expect(std.mem.indexOf(u8, output.items, "require_agreement") == null);
+    }
+}
+
+test "PDF embedding input public contract round trips and validates modes" {
+    const a = std.testing.allocator;
+    const config = "{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{\"provider\":\"ollama\",\"model\":\"fixture\"},\"sources\":[{\"artifact\":\"pages\"}],\"enrichments\":[{\"name\":\"pages\",\"kind\":\"embedding\",\"template\":\"{{{content.resource.uri}}}\",\"embedding_input\":\"pdf_page_images\",\"expected_dims\":3}]}";
+    const normalized = try parseCreateIndexRequest(a, "pdf_vectors", config);
+    defer a.free(normalized);
+    const created = try indexes_api.encodeCreatedIndexConfig(a, "pdf_vectors", normalized);
+    defer a.free(created);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"embedding_input\":\"pdf_page_images\"") != null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config, .{});
+    const enrichment = &value.object.getPtr("enrichments").?.array.items[0];
+    try enrichment.object.put(arena.allocator(), "embedding_input", .{ .string = "typo" });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "pdf_vectors", .{ .include_name = true, .default_type = true }));
+    try enrichment.object.put(arena.allocator(), "embedding_input", .{ .string = "pdf_page_images" });
+    try enrichment.object.put(arena.allocator(), "kind", .{ .string = "asset" });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "pdf_vectors", .{ .include_name = true, .default_type = true }));
+}
+
+test "PDF embedding input public contract rejects conflicting producer modes and text chunking" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources").api_local_indexes;
+    const types = @import("antfly_local_sources").storage_db_types;
+    const text = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "pdf_uri", .expected_dims = 3 };
+    var pdf = text;
+    pdf.embedding_input = .pdf_page_images;
+    try std.testing.expect(!try local.artifactEnrichmentConfigsEqual(a, text, pdf));
+    try std.testing.expect(try local.artifactEnrichmentConfigsEqual(a, pdf, pdf));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{ text, pdf }));
+    try local.validateArtifactEnrichmentConfigDefinitions(a, &.{ pdf, pdf });
+    pdf.field = "";
+    pdf.template = "{{{content.resource.uri}}}";
+    try local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf});
+    pdf.chunk_size = 128;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
+    pdf.chunk_size = 0;
+    pdf.chunker_json = "{}";
+    try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
+    pdf.chunker_json = "";
+    pdf.kind = .asset;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
+}
+
+test "PDF embedding input public contract rejects upstream producers before publication" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources").api_local_indexes;
+    const types = @import("antfly_local_sources").storage_db_types;
+    const links = types.EnrichmentConfig{ .name = "links", .kind = .chunk, .field = "body", .chunk_size = 512 };
+    var pages = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "text", .source_artifact_name = "links", .embedding_input = .pdf_page_images, .expected_dims = 3 };
+    for ([_][]const u8{ "links", "turns", "missing" }) |upstream| {
+        pages.source_artifact_name = upstream;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigs(a, &.{ links, pages }));
+    }
+    pages.source_artifact_name = "links";
+    pages.embedding_input = .text;
+    try local.validateArtifactEnrichmentConfigs(a, &.{ links, pages });
+    const request = "{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{\"provider\":\"ollama\",\"model\":\"fixture\"},\"sources\":[{\"artifact\":\"pages\"}],\"enrichments\":[{\"name\":\"links\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"pages\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"links\",\"embedding_input\":\"pdf_page_images\",\"expected_dims\":3}]}";
+    try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "pdf_vectors", request));
+}
+
+test "PDF embedding input public contract rejects sparse consumers" {
+    const a = std.testing.allocator;
+    const pdf = "{\"vectors\":{\"type\":\"embeddings\",\"sparse\":true,\"sources\":[{\"artifact\":\"pages\"}],\"enrichments\":[{\"name\":\"pages\",\"kind\":\"embedding\",\"field\":\"uri\",\"embedding_input\":\"pdf_page_images\"}]}}";
+    try std.testing.expectError(error.InvalidEnrichmentConfig, indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, pdf));
+    const text = try std.mem.replaceOwned(u8, a, pdf, "pdf_page_images", "text");
+    defer a.free(text);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, text);
 }

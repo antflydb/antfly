@@ -18,7 +18,7 @@ FILES = {
 # Keep this post-generation check tied to the endpoint body contract rather
 # than the canonical model's historical name.
 REQUIRED_BODY = re.compile(
-    r"(body:\s+(?:GlobalStatefulQueryRequest|StatefulQueryRequest)\s+\|\s+File)"
+    r"(body:\s+(?:GlobalStatefulQueryRequest|StatefulQueryRequest|InferenceDictateRequest)\s+\|\s+File)"
     r"\s+\|\s+Unset\s*=\s*UNSET"
 )
 SCOPED_MERGE = Path("api/data_operations/linear_merge.py")
@@ -159,6 +159,15 @@ def fix_generated_client(root: Path) -> None:
                 f"required-body signatures={count}, NDJSON headers={source.count(NDJSON_HEADER)}"
             )
         updates[path] = REQUIRED_BODY.sub(r"\1", source)
+
+    path = root / "api/default/dictate.py"
+    source = path.read_text(encoding="utf-8")
+    if (
+        len(REQUIRED_BODY.findall(source)) != 5
+        or source.count('headers["Content-Type"] = "application/vnd.antfly.attachments.v1"') != 1
+    ):
+        raise RuntimeError("unexpected generated shape in dictate: required binary/JSON body")
+    updates[path] = REQUIRED_BODY.sub(r"\1", source)
 
     path = root / SCOPED_MERGE
     source = path.read_text(encoding="utf-8")

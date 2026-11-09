@@ -61,6 +61,7 @@ check_memory() {
 }
 
 check_sources() {
+  python3 "$repo_root/scripts/ci/check_source_native.py"
   section "Checking portable source ingestion"
   (
     cd "$repo_root/go/pkg/sources"

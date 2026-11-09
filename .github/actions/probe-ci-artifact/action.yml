@@ -1,0 +1,39 @@
+name: Probe temporary CI storage
+description: Check a small real upload, duplicate upload, receipt, and verified restore
+inputs:
+  gcs-enabled:
+    description: Enable GCS transfer, resolved by the calling workflow
+    default: 'false'
+  namespace:
+    description: release or vopr
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ENABLED: ${{ inputs.gcs-enabled }}
+      run: |
+        set -euo pipefail
+        test "$ENABLED" = true
+        mkdir -p "$RUNNER_TEMP/ci-probe/input/nested"
+        printf '%s\n' 'CI artifact exchange verification' > "$RUNNER_TEMP/ci-probe/input/nested/fixture.txt"
+    - uses: ./.github/actions/upload-ci-artifact
+      with:
+        gcs-enabled: ${{ inputs.gcs-enabled }}
+        name: storage-probe-a
+        path: ${{ runner.temp }}/ci-probe/input/
+        namespace: ${{ inputs.namespace }}
+    - uses: ./.github/actions/upload-ci-artifact
+      with:
+        gcs-enabled: ${{ inputs.gcs-enabled }}
+        name: storage-probe-b
+        path: ${{ runner.temp }}/ci-probe/input/
+        namespace: ${{ inputs.namespace }}
+    - uses: ./.github/actions/download-ci-artifact
+      with:
+        name: storage-probe-a
+        path: ${{ runner.temp }}/ci-probe/restored
+        namespace: ${{ inputs.namespace }}
+    - shell: bash
+      run: cmp "$RUNNER_TEMP/ci-probe/input/nested/fixture.txt" "$RUNNER_TEMP/ci-probe/restored/nested/fixture.txt"

@@ -31,10 +31,29 @@ pub const OpenOptions = struct {
 };
 
 pub const Api = struct {
+    pub const GraphScope = support.single_source_cypher.Scope;
+    pub const GraphDiagnostic = support.cypher.compiler.Diagnostic;
     allocator: Allocator,
     db: embedded_db.DB,
     table_name: []u8,
     semantic_resolver: ?query_contract.SemanticResolver,
+    fn graphHost(self: *Api) support.single_source_cypher.Host(@TypeOf(self.db.inner.*)) {
+        return .{ .root = self.db.inner, .table = self.table_name, .alloc = self.allocator, .writable = self.db.open_mode == .writer };
+    }
+    pub fn graphCatalogJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        return self.graphHost().catalogJson(alloc, body);
+    }
+    pub fn cypherJsonWithDiagnostic(self: *Api, alloc: Allocator, graph: []const u8, body: []const u8, diagnostic: *support.cypher.compiler.Diagnostic, scope: *GraphScope) ![]u8 {
+        return self.graphHost().queryJson(alloc, graph, body, diagnostic, scope);
+    }
+    pub fn cypherJson(self: *Api, alloc: Allocator, graph: []const u8, body: []const u8) ![]u8 {
+        var diagnostic: support.cypher.compiler.Diagnostic = .{};
+        var scope: GraphScope = .{};
+        return self.cypherJsonWithDiagnostic(alloc, graph, body, &diagnostic, &scope);
+    }
+    pub fn graphWriteStatusJson(self: *Api, alloc: Allocator, id: []const u8) ![]u8 {
+        return self.graphHost().statusJson(alloc, id);
+    }
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
         return .{
@@ -100,7 +119,7 @@ pub const Api = struct {
         var owned = try batch_api.parseBatchRequest(alloc, body);
         defer owned.deinit(alloc);
 
-        try self.db.batch(owned.req);
+        try self.db.batch(embedded_db.types.fromPublicMutation(owned.req));
         return try batch_api.encodeBatchResponse(alloc, owned.result());
     }
 
@@ -451,6 +470,96 @@ fn namedBoolMutationJson(alloc: Allocator, field_name: []const u8, name: []const
     try appendJsonString(alloc, &out, name);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "embedded api Cypher catalog and writes share portable retained graph values" {
+    const a = std.testing.allocator;
+    var storage = support.lsm_storage.MemoryStorage.init(a);
+    defer storage.deinit();
+    var api = try Api.openHosted(a, "/portable-cypher", .{ .db = .{ .storage = storage.storage(), .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } } });
+    defer api.close();
+    const index = try api.addIndexJson(a, "{\"name\":\"links\",\"kind\":\"graph\",\"config_json\":\"{}\"}");
+    defer a.free(index);
+    const seeded = try api.batchJson(a, "{\"inserts\":{\"a\":{\"id\":\"a\"},\"b\":{\"id\":\"b\"}},\"sync_level\":\"full_index\"}");
+    defer a.free(seeded);
+    const definition = try api.graphCatalogJson(a, "{\"action\":\"put\",\"name\":\"knowledge\",\"definition\":{\"labels\":[{\"name\":\"Document\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"KNOWS\",\"index\":\"links\",\"source_label\":\"Document\",\"target_label\":\"Document\",\"stored_type\":\"knows\"}]}}");
+    defer a.free(definition);
+    const write = "{\"query\":\"MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:KNOWS {since:2020}]->(b) RETURN r.since\",\"write_request_id\":\"00112233445566778899aabbccddeeff\"}";
+    const result = try api.cypherJson(a, "knowledge", write);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"committed\"") != null);
+    try std.testing.expectError(error.CypherWriteRequestAlreadyUsed, api.cypherJson(a, "knowledge", write));
+    const rows = try api.cypherJson(a, "knowledge", "{\"query\":\"MATCH (a)-[r:KNOWS]->(b) RETURN a.id,r.since,b.id\"}");
+    defer a.free(rows);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "\"value\":\"2020\"") != null);
+    const status = try api.graphWriteStatusJson(a, "00112233445566778899aabbccddeeff");
+    defer a.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"disposition\":\"committed\"") != null);
+    const identities = try api.cypherJson(a, "knowledge", "{\"query\":\"MATCH (n:Document) RETURN antfly.documentKey(n)\"}");
+    defer a.free(identities);
+    var identity_rows = try std.json.parseFromSlice(std.json.Value, a, identities, .{});
+    defer identity_rows.deinit();
+    const node_rows = identity_rows.value.object.get("rows").?.array.items;
+    if (node_rows.len != 2) std.debug.print("portable graph node identities: {s}\n", .{identities});
+    try std.testing.expectEqual(@as(usize, 2), node_rows.len);
+    // Visibility is evaluated in the source scan. Reserved graph records must
+    // consume progress without being parsed as user documents by that filter.
+    const Visibility = struct {
+        examined: usize = 0,
+        found: usize = 0,
+        fn progress(ptr: ?*anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.examined += count;
+        }
+        fn visit(ptr: ?*anyopaque, entry: embedded_db.types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expectEqualStrings("a", entry.id);
+            self.found += 1;
+        }
+    };
+    var visible: Visibility = .{};
+    try api.db.inner.visitCypherDocuments(a, "", "", .{ .include_documents = true, .fields = &.{"id"}, .include_all_fields = false, .filter_query_json = "{\"term\":{\"id\":\"a\"}}", .limit = 64 }, .{ .borrow_documents = true, .context = &visible, .visit = Visibility.visit, .progress = Visibility.progress });
+    try std.testing.expectEqual(@as(usize, 1), visible.found);
+    try std.testing.expect(visible.examined >= 2);
+    // The portable host must expose owner COUNT as well as row reads. Wide
+    // count-only values stay borrowed at its retained cut, including hosted IO.
+    const body = try a.alloc(u8, 512 << 10);
+    defer a.free(body);
+    @memset(body, 'x');
+    for (0..8) |batch_number| {
+        var batch_arena = std.heap.ArenaAllocator.init(a);
+        defer batch_arena.deinit();
+        const scratch = batch_arena.allocator();
+        var inserts = std.json.ObjectMap.empty;
+        for (0..4) |offset| {
+            const number = batch_number * 4 + offset;
+            var fields = std.json.ObjectMap.empty;
+            try fields.put(scratch, "body", if (number % 2 == 0) .null else .{ .string = body });
+            try inserts.put(scratch, try std.fmt.allocPrint(scratch, "n{d}", .{number}), .{ .object = fields });
+        }
+        const payload = try std.json.Stringify.valueAlloc(scratch, .{ .inserts = std.json.Value{ .object = inserts }, .sync_level = "full_index" }, .{});
+        const written = try api.batchJson(a, payload);
+        a.free(written);
+    }
+    const counted = try api.cypherJson(a, "knowledge", "{\"query\":\"MATCH (n:Document) RETURN count(*),count(n.body),count(n.missing)\",\"limits\":{\"memory_bytes\":8388608}}");
+    defer a.free(counted);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, counted, .{});
+    defer parsed.deinit();
+    const counts = parsed.value.object.get("rows").?.array.items[0].array.items;
+    for (counts, [_][]const u8{ "34", "16", "0" }) |value, expected| try std.testing.expectEqualStrings(expected, value.object.get("value").?.string);
+    try std.testing.expect(parsed.value.object.get("stats").?.object.get("memory_bytes").?.integer < 8 << 20);
+    for ([_][]const u8{ "true", "false", "n.missing IS NULL", "n.id='a'" }, [_][]const u8{ "16", "0", "16", "0" }) |predicate, expected| {
+        const query = try std.fmt.allocPrint(a, "MATCH (n:Document) WHERE {s} RETURN count(n.body)", .{predicate});
+        defer a.free(query);
+        const request = try std.json.Stringify.valueAlloc(a, .{ .query = query, .limits = .{ .memory_bytes = 1 << 20 } }, .{});
+        defer a.free(request);
+        const bounded = try api.cypherJson(a, "knowledge", request);
+        defer a.free(bounded);
+        var bounded_value = try std.json.parseFromSlice(std.json.Value, a, bounded, .{});
+        defer bounded_value.deinit();
+        try std.testing.expectEqualStrings(expected, bounded_value.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
+        try std.testing.expect(bounded_value.value.object.get("stats").?.object.get("memory_bytes").?.integer < 1 << 20);
+    }
 }
 
 test "embedded api round-trips batch lookup scan and search over memory-backed durable lsm" {
@@ -1422,4 +1531,109 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         defer alloc.free(hybrid_after);
         try std.testing.expect(std.mem.indexOf(u8, hybrid_after, "\"doc:vec:a\"") != null);
     }
+}
+
+test "embedded api Cypher document scans project wide inputs before owning output" {
+    const a = std.testing.allocator;
+    var storage = support.lsm_storage.MemoryStorage.init(a);
+    defer storage.deinit();
+    var api = try Api.openHosted(a, "/portable-document-projection", .{ .db = .{ .storage = storage.storage(), .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } } });
+    defer api.close();
+    const body = try a.alloc(u8, 2 << 20);
+    defer a.free(body);
+    @memset(body, 'x');
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .inserts = .{
+        .a = .{ .id = "a", .tenant = "keep", .body = body },
+        .b = .{ .id = "b", .tenant = "skip", .body = body },
+    }, .sync_level = "full_index" }, .{});
+    defer a.free(payload);
+    const seeded = try api.batchJson(a, payload);
+    defer a.free(seeded);
+    const catalog = try api.graphCatalogJson(a,
+        \\{"action":"put","name":"demand","definition":{"labels":[{"name":"D","table":"docs"},{"name":"Wide","table":"docs","where":{"body":"unmatched"}}],"relationships":[]}}
+    );
+    defer a.free(catalog);
+    for ([_][]const u8{
+        "MATCH(n:D) RETURN sum(1)",
+        "MATCH(n:D) RETURN sum(CASE WHEN n.body IS NOT NULL THEN 1 ELSE 0 END)",
+        "MATCH(n:D) WHERE n.body IS NOT NULL RETURN sum(1)",
+    }) |query| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .query = query, .limits = .{ .memory_bytes = 1 << 20 } }, .{});
+        defer a.free(request);
+        const response = try api.cypherJson(a, "demand", request);
+        defer a.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("2", parsed.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
+        try std.testing.expect(parsed.value.object.get("stats").?.object.get("memory_bytes").?.integer < 1 << 20);
+    }
+    for ([_][]const u8{ "", "{\"term\":{\"tenant\":\"keep\"}}" }, [_]usize{ 2, 1 }) |filter, expected| {
+        const buffer = try a.alloc(u8, 256 << 10);
+        defer a.free(buffer);
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        const scratch = fixed.allocator();
+        var result = try api.db.inner.scan(scratch, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"id"}, .filter_query_json = filter });
+        defer result.deinit(scratch);
+        try std.testing.expectEqual(expected, result.documents.len);
+        // Another read cannot invalidate the first result's owned JSON.
+        var next = try api.db.inner.scan(scratch, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{} });
+        defer next.deinit(scratch);
+        for (result.documents) |document| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, document.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+            try std.testing.expectEqualStrings(document.id, parsed.value.object.get("id").?.string);
+        }
+    }
+}
+
+test "embedded api Cypher relational counts account for rejected storage candidates" {
+    const a = std.testing.allocator;
+    var storage = support.lsm_storage.MemoryStorage.init(a);
+    defer storage.deinit();
+    var api = try Api.openHosted(a, "/portable-relational-count", .{ .db = .{ .storage = storage.storage(), .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } } });
+    defer api.close();
+    const schema = try api.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"body":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer a.free(schema);
+    const batch = try api.batchJson(a,
+        \\{"inserts":{"a":{"id":"a","tenant":"keep","body":"present"},"b":{"id":"b","tenant":"skip","body":"present"},"c":{"id":"c","tenant":"skip","body":"present"}},"sync_level":"full_index"}
+    );
+    defer a.free(batch);
+    const definition = try api.graphCatalogJson(a,
+        \\{"action":"put","name":"g","definition":{"labels":[{"name":"Keep","table":"docs","where":{"tenant":"keep"}}],"relationships":[]}}
+    );
+    defer a.free(definition);
+    // Projection decoding may grow the reader arena. Exercise every failure
+    // point before ownership and schema/index pins transfer to the reader.
+    const DbPointer = @TypeOf(api.db.inner);
+    const ProjectionInit = struct {
+        fn run(allocator: Allocator, db: DbPointer) !void {
+            var reader = try db.beginRelationalRows(allocator, .{
+                .fields = &.{"body"},
+                .cypher_presence_fields = &.{"body"},
+                .cypher_projection_json = "[{\"name\":\"body\",\"mode\":\"value\"}]",
+            });
+            defer reader.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, ProjectionInit.run, .{api.db.inner});
+    try std.testing.expectError(error.CypherAnchorBudgetExceeded, api.cypherJson(a, "g",
+        \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":1}}
+    ));
+    const result = try api.cypherJson(a, "g",
+        \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":3}}
+    );
+    defer a.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("1", parsed.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("stats").?.object.get("scanned_anchors").?.integer);
+    // A total scan budget larger than the session page bound remains valid.
+    const large_budget = try api.cypherJson(a, "g",
+        \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":16384}}
+    );
+    defer a.free(large_budget);
+    try std.testing.expect(std.mem.indexOf(u8, large_budget, "\"value\":\"1\"") != null);
 }

@@ -6908,6 +6908,7 @@ pub const MetadataAdminVoprSource = struct {
             // VOPR's public catalog façade does not own the private
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
+            .lake_source_owner_read,
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
@@ -6949,6 +6950,11 @@ pub const MetadataAdminVoprSource = struct {
                 .metadata_epoch = try store.writeValidationRevision(group_id),
             }, .{}),
             .write_validation => |name| try store.tableWriteValidation(alloc, group_id, name),
+            .table_record_read => |name| blk: {
+                const table = try store.tableByName(alloc, group_id, name);
+                defer if (table) |value| metadata_table_manager.freeTable(alloc, value);
+                break :blk try std.json.Stringify.valueAlloc(alloc, table, .{});
+            },
             .query_definition => |name| blk: {
                 const definition = try store.queryTableDefinition(alloc, group_id, name);
                 defer if (definition) |value| value.deinit(alloc);

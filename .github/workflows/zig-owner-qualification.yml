@@ -1,0 +1,441 @@
+name: Zig operation owner qualification
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
+      full_validation:
+        type: boolean
+        default: false
+      cache_matrices:
+        type: boolean
+        default: false
+      macos_cache_runner:
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      cache_matrices:
+        description: Run the production archive/cache qualification matrices
+        type: boolean
+        default: true
+      macos_cache_runner:
+        description: Optional existing self-hosted Apple Silicon label with at least 36 GiB RAM
+        type: string
+        default: ''
+  push:
+    branches: [main]
+    paths: ['zig/**', '.github/actions/setup-native-build-tools/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    - cron: '17 4 * * 0'
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache/global
+
+concurrency:
+  group: zig-operation-owners-${{ inputs.pr_number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || inputs.pr_number != '' }}
+
+jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: ${{ inputs.full_validation && 'full' || 'zig' }}
+
+  changes:
+    needs: admission
+    runs-on: ubuntu-latest
+    outputs:
+      owners: ${{ steps.diff.outputs.owners }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: diff
+        env:
+          BASE_SHA: ${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]]; then
+            echo 'owners=true' >> "$GITHUB_OUTPUT"
+          else
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            git diff --name-only FETCH_HEAD HEAD > changed-paths.txt
+            if grep -Eq '^(zig/|.github/actions/setup-native-build-tools/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
+              echo 'owners=true' >> "$GITHUB_OUTPUT"
+            else
+              echo 'owners=false' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  hosted-policy:
+    name: Owner policy and consumer compilation / ${{ matrix.runner }}
+    needs: [admission, changes]
+    if: needs.changes.outputs.owners == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+      - name: Negative guard and transport receipt tests
+        run: |
+          python3 -m unittest discover -s zig/tools -p 'test_check_image_owner*.py'
+          python3 -m unittest discover -s zig/tools -p 'test_check_owner_archive_symbols.py'
+          python3 -m unittest discover -s zig/tools -p 'test_check_lake_execution_runtime.py'
+      - name: Guard callback/native/error ABI identities
+        working-directory: zig
+        run: zig test --dep antfly_test_error_logs -Mroot=lib/runtime/src/runtime_boundary_test_root.zig -Mantfly_test_error_logs=pkg/antfly-embedded/src/test_error_logs.zig --test-runner pkg/antfly-embedded/src/test_runner.zig -lc
+      - name: Validate concurrent physical family attribution
+        working-directory: zig
+        run: zig test pkg/antfly/src/api/lake_execution_probe_metrics.zig -lc
+      - name: Decode Iceberg manifests on a bounded worker stack
+        working-directory: zig
+        run: zig test --dep antfly_hash -Mroot=pkg/antfly-embedded/src/lake_avro_worker_test_root.zig -Mantfly_hash=lib/hash/src/mod.zig -lc --test-filter 'iceberg avro'
+      - name: Compile the PDF consumer without scheduling its owner
+        working-directory: zig
+        run: python3 tools/run_bounded_zig_build.py -- build opaque-pdf-consumer-compile -Dshared-image-operations=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+
+  functional:
+    name: Native owner equivalence / Linux x86_64
+    needs: [admission, changes]
+    if: needs.changes.outputs.owners == 'true'
+    runs-on: arc-antfly-heavy-runtime
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: '21474836480'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Verify the actual ARC native memory profile
+        working-directory: zig
+        run: |
+          test "$(uname -s):$(uname -m)" = Linux:x86_64
+          python3 -c 'import sys; sys.path.insert(0, "tools"); from run_bounded_zig_build import detect_memory_limit; assert detect_memory_limit() >= 24 * 1024**3, "ARC qualification requires its actual 24 GiB pod"'
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+      - name: Record native profile
+        env:
+          EXPECTED_ARCH: x86_64
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          mkdir -p .benchmark-results/owner-qualification
+          uname -a > .benchmark-results/owner-qualification/host.txt
+          zig version > .benchmark-results/owner-qualification/zig.txt
+      # Behavioral checks omit debug information; the production archive job
+      # below retains symbols for ownership and trace diagnostics.
+      - name: Source/native image, retained PDF, and lake equivalence
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test mutation-resource-frame-test runtime-io-abi-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/equivalence.log
+          python3 tools/check_image_owner_transport.py --build-log ../.benchmark-results/owner-qualification/equivalence.log --report ../.benchmark-results/owner-qualification/image-equivalence.json
+          python3 tools/run_bounded_zig_build.py -- build lake-integration-test '-Dtest-filter=external lake execution' -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/lake-source.log
+      - name: Qualify the C library with inference
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          python3 tools/run_bounded_zig_build.py -- build capi capi-smoke -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+          stat -c '%s' zig-out/lib/libantfly.so > ../.benchmark-results/owner-qualification/libantfly-debug-stripped-bytes.txt
+      - name: Whole lake operation runtime and allocation probe
+        working-directory: zig
+        run: python3 tools/check_lake_execution_runtime.py --report ../.benchmark-results/owner-qualification/lake-runtime.json --rows 1024 --rounds 4
+      - name: Qualify optimized image equivalence and lake attempts
+        if: inputs.full_validation || github.event_name == 'schedule' || inputs.cache_matrices
+        working-directory: zig
+        run: |
+          python3 tools/check_image_owner_transport.py --optimize fast --report ../.benchmark-results/owner-qualification/image-releasefast.json --timeout 1800
+          python3 tools/check_lake_execution_runtime.py --optimize fast --report ../.benchmark-results/owner-qualification/lake-releasefast.json --rows 1024 --rounds 4
+      - name: Reopen pinned catalog and artifact clients through real S3-compatible I/O
+        run: scripts/test-lake-s3-integration.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          retention-days: 14
+          name: lake-s3-compatible-linux
+          path: .benchmark-results/lake-s3/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          retention-days: 14
+          name: operation-owner-linux-x86_64
+          path: .benchmark-results/owner-qualification/
+
+  # The PR orchestrator itself uses workflow_dispatch. Its event name is not
+  # an opt-in to expensive cache matrices; use the admitted input instead.
+  media-cache:
+    name: Native media cache matrix / Linux x86_64
+    needs: [admission, changes]
+    if: needs.changes.outputs.owners == 'true' && (github.event_name == 'schedule' || inputs.cache_matrices)
+    runs-on: arc-antfly-heavy-runtime
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: '21474836480'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Verify the actual ARC native memory profile
+        working-directory: zig
+        run: |
+          test "$(uname -s):$(uname -m)" = Linux:x86_64
+          python3 -c 'import sys; sys.path.insert(0, "tools"); from run_bounded_zig_build import detect_memory_limit; assert detect_memory_limit() >= 24 * 1024**3, "ARC qualification requires its actual 24 GiB pod"'
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+      - name: Verify provider/client/contract invalidation
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          mkdir -p ../.benchmark-results/owner-cache
+          python3 tools/check_image_owner_cache.py --report ../.benchmark-results/owner-cache/image.json --timeout 1800
+          python3 tools/check_media_owner_cache.py --retained --optimize debug --report ../.benchmark-results/owner-cache/pdf.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          retention-days: 14
+          name: media-owner-cache-linux-x86_64
+          path: .benchmark-results/owner-cache/
+
+  linux-production-ownership:
+    needs: [admission, changes]
+    if: needs.changes.outputs.owners == 'true'
+    name: Production archive ownership / native Linux x86_64
+    # Reuse the established 24 GiB pod/20 GiB compiler profile. Hosted Linux
+    # cannot admit the existing 20 GiB storage reservation; never override it.
+    runs-on: arc-antfly-heavy-runtime
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    timeout-minutes: 150
+    env:
+      ANTFLY_ZIG_MAX_RSS: '21474836480'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Verify the actual ARC native memory profile
+        working-directory: zig
+        run: |
+          test "$(uname -s):$(uname -m)" = Linux:x86_64
+          python3 -c 'import sys; sys.path.insert(0, "tools"); from run_bounded_zig_build import detect_memory_limit; assert detect_memory_limit() >= 24 * 1024**3, "ARC qualification requires its actual 24 GiB pod"'
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+      - name: Build and guard actual unstripped production archives
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          test "$(uname -s):$(uname -m)" = Linux:x86_64
+          mkdir -p ../.benchmark-results/production-owners
+          uname -a > ../.benchmark-results/production-owners/host.txt
+          python3 tools/run_bounded_zig_build.py -- build antfly runtime-archives capi capi-smoke opaque-read-session-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=false -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/production-owners/build.log
+          python3 tools/check_owner_archive_symbols.py --report ../.benchmark-results/production-owners/symbols.json
+      - name: Production lake owner/client/contract cache matrix
+        if: github.event_name == 'schedule' || inputs.cache_matrices
+        working-directory: zig
+        run: |
+          python3 tools/check_lake_execution_cache.py --report ../.benchmark-results/production-owners/lake-cache.json --timeout 1800
+          python3 tools/check_public_mutation_cache.py --report ../.benchmark-results/production-owners/public-mutation-cache.json
+          python3 tools/check_read_session_owner_cache.py --report ../.benchmark-results/production-owners/read-session-cache.json
+          python3 tools/check_read_session_owner_cache.py --profile capture --report ../.benchmark-results/production-owners/statement-capture-cache.json
+          python3 tools/check_read_session_owner_cache.py --profile publication --strip --report ../.benchmark-results/production-owners/publication-lease-cache.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          retention-days: 14
+          name: production-operation-owners-linux-x86_64
+          path: .benchmark-results/production-owners/
+
+  macos-production-cache:
+    name: Production lake matrix / self-hosted Apple Silicon
+    needs: [admission, changes]
+    if: needs.changes.outputs.owners == 'true' && inputs.macos_cache_runner != ''
+    runs-on: [self-hosted, macOS, ARM64, '${{ inputs.macos_cache_runner }}']
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+      - name: Preserve native macOS production reservations
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n hw.memsize)" -ge 38654705664
+          mkdir -p ../.benchmark-results/owner-cache
+          sw_vers > ../.benchmark-results/owner-cache/host.txt
+          python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test opaque-read-session-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+          python3 tools/check_image_owner_cache.py --report ../.benchmark-results/owner-cache/image-macos.json --timeout 1800
+          python3 tools/check_media_owner_cache.py --retained --optimize debug --report ../.benchmark-results/owner-cache/pdf-macos.json
+          python3 tools/check_lake_execution_cache.py --report ../.benchmark-results/owner-cache/lake-macos.json --timeout 1800
+          python3 tools/check_lake_execution_runtime.py --report ../.benchmark-results/owner-cache/lake-runtime-macos.json --rows 1024 --rounds 4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          retention-days: 14
+          name: production-lake-cache-macos-arm64
+          path: .benchmark-results/owner-cache/

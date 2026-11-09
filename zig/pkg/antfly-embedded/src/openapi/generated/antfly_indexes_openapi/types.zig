@@ -732,6 +732,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
@@ -777,6 +779,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -831,6 +834,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {
@@ -1403,6 +1410,7 @@ pub const CreatedEmbeddingsIndex = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
+    external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
@@ -1434,6 +1442,7 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -1488,6 +1497,10 @@ pub const CreatedEmbeddingsIndex = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {
@@ -1572,6 +1585,7 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
+    external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
@@ -1598,6 +1612,7 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -1637,6 +1652,10 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {
@@ -1724,6 +1743,8 @@ pub const CreatedEnrichmentConfig = struct {
     template: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
     expected_dims: ?i64 = null,
+    /// Effective embedding input mode; PDF pages are rasterized before embedding.
+    embedding_input: ?[]const u8 = null,
     /// Optional stable model/token-space identifier asserted for this embedding artifact.
     vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
@@ -1745,6 +1766,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "expected_dims", "expected_dims", true },
+        .{ "embedding_input", "embedding_input", true },
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
@@ -1792,6 +1814,10 @@ pub const CreatedEnrichmentConfig = struct {
         }
         if (self.expected_dims) |value| {
             try jw.objectField("expected_dims");
+            try jw.write(value);
+        }
+        if (self.embedding_input) |value| {
+            try jw.objectField("embedding_input");
             try jw.write(value);
         }
         if (self.vector_space) |value| {
@@ -2945,6 +2971,8 @@ pub const DocumentExtractionConfig = struct {
     etag: ?[]const u8 = null,
     /// Static checksum recorded as source version metadata.
     checksum: ?[]const u8 = null,
+    /// Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+    checksum_algorithm: ?[]const u8 = null,
     /// Static source version. Together with the other metadata it lets extraction skip unchanged sources.
     version: ?[]const u8 = null,
     /// Static last-modified timestamp recorded as source version metadata.
@@ -2968,6 +2996,7 @@ pub const DocumentExtractionConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "etag", "etag", true },
         .{ "checksum", "checksum", true },
+        .{ "checksum_algorithm", "checksum_algorithm", true },
         .{ "version", "version", true },
         .{ "last_modified", "last_modified", true },
         .{ "credentials", "credentials", true },
@@ -3007,6 +3036,10 @@ pub const DocumentExtractionConfig = struct {
         }
         if (self.checksum) |value| {
             try jw.objectField("checksum");
+            try jw.write(value);
+        }
+        if (self.checksum_algorithm) |value| {
+            try jw.objectField("checksum_algorithm");
             try jw.write(value);
         }
         if (self.version) |value| {
@@ -3298,6 +3331,8 @@ pub const DocumentExtractionReaderConfig = struct {
 
 /// How PDF pages are rasterized for OCR.
 pub const DocumentExtractionRenderConfig = struct {
+    /// PDF image sampling, separate from model resizing and normalization. `auto` smooths continuous-tone images while preserving one-bit scan coverage during minification. `pdf` honors the PDF's interpolation declarations. `smooth` uses bilinear sampling even for one-bit images (except stencil masks), which can soften fine lines. Effective policy, version, resolution, DPI and geometry are recorded in unit provenance.
+    sampling: ?[]const u8 = null,
     /// Render resolution in dots per inch.
     dpi: ?i64 = null,
     /// `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
@@ -3309,6 +3344,7 @@ pub const DocumentExtractionRenderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "sampling", "sampling", true },
         .{ "dpi", "dpi", true },
         .{ "resolution", "resolution", true },
         .{ "max_pixels", "max_pixels", true },
@@ -3325,6 +3361,10 @@ pub const DocumentExtractionRenderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.sampling) |value| {
+            try jw.objectField("sampling");
+            try jw.write(value);
+        }
         if (self.dpi) |value| {
             try jw.objectField("dpi");
             try jw.write(value);
@@ -3432,7 +3472,7 @@ pub const DocumentExtractionSourceConfig = struct {
     content_type_field: ?[]const u8 = null,
     /// Row field holding the source ETag.
     etag_field: ?[]const u8 = null,
-    /// Row field holding the source checksum.
+    /// Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field.
     checksum_field: ?[]const u8 = null,
     /// Row field holding the source version.
     version_field: ?[]const u8 = null,
@@ -3903,6 +3943,8 @@ pub const EmbeddingsIndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
@@ -3944,6 +3986,7 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -3985,6 +4028,10 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {
@@ -4587,6 +4634,8 @@ pub const EnrichmentConfig = struct {
     template: ?[]const u8 = null,
     /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor).
     source_artifact_name: ?[]const u8 = null,
+    /// pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
+    embedding_input: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
     /// Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
@@ -4623,6 +4672,7 @@ pub const EnrichmentConfig = struct {
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
+        .{ "embedding_input", "embedding_input", true },
         .{ "expected_dims", "expected_dims", true },
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
@@ -4670,6 +4720,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.source_artifact_name) |value| {
             try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.embedding_input) |value| {
+            try jw.objectField("embedding_input");
             try jw.write(value);
         }
         if (self.expected_dims) |value| {
@@ -7275,7 +7329,7 @@ pub const GraphMatch = struct {
     }
 };
 
-/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
+/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     from: antfly_graph_identifier_openapi.GraphIdentifier,
@@ -9023,7 +9077,7 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+    /// Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
     decider: antfly_common_openapi.DeciderConfig,
     /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,
@@ -10090,6 +10144,8 @@ pub const IndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
@@ -10163,6 +10219,7 @@ pub const IndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
@@ -10256,6 +10313,10 @@ pub const IndexConfig = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {

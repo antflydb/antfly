@@ -45,6 +45,32 @@ pub fn storageCompileMaxRss(os: std.Target.Os.Tag, measured_sdk27: bool, measure
     return @as(u64, if (os == .macos and measured_cross) 16 else if (measured_sdk27) 14 else if (os == .macos and !measured_darwin) 24 else 16) * gib;
 }
 
+/// Physical storage has a separate compiler owner from the runtime adapter.
+/// Apply native measurements only to their qualified host/target/profile.
+pub fn nativeStorageCompileMaxRss(host: std.Target, target: std.Target, optimize: std.lang.Optimize, fallback: u64) u64 {
+    if (std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        host.os.tag == .linux and host.cpu.arch == .x86_64 and
+        target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
+        optimize == .debug)
+    {
+        // Main run 42491033320: 17,237,008,384 bytes. 18 GiB provides
+        // >=10% headroom while admitting a 2 GiB compile in a 20 GiB lane.
+        return @max(fallback, 18 * 1024 * 1024 * 1024);
+    }
+    return fallback;
+}
+
+test "native Debug storage covers its peak and retains small compiler overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib: u64 = 1024 * 1024 * 1024;
+    const peak: u64 = 17_237_008_384;
+    const claim = nativeStorageCompileMaxRss(linux, linux, .debug, 16 * gib);
+    try std.testing.expect(claim >= peak + peak / 10);
+    try std.testing.expect(claim + 2 * gib <= 20 * gib);
+    try std.testing.expectEqual(16 * gib, nativeStorageCompileMaxRss(linux, linux, .fast, 16 * gib));
+    try std.testing.expectEqual(24 * gib, nativeStorageCompileMaxRss(linux, linux, .debug, 24 * gib));
+}
+
 test "cross Darwin provider claims retain peak margins and admit storage with inference" {
     const gib = 1024 * 1024 * 1024;
     const storage = storageCompileMaxRss(.macos, false, false, true);
@@ -405,6 +431,7 @@ pub fn nativeExecutableLink(b: *std.Build, object: *std.Build.Step.Compile, name
     const target = object.root_module.resolved_target.?.result;
     const link = b.addSystemCommand(&.{"python3"});
     link.addFileArg(b.path("tools/native_executable_link.py"));
+    link.addFileInput(b.path("tools/macho_merged_globals.py"));
     const deployment = target.os.version_range.semver.min;
     link.addArgs(&.{ "--arch", if (target.cpu.arch == .aarch64) "arm64" else "x86_64", "--deployment", b.fmt("{d}.{d}.{d}", .{ deployment.major, deployment.minor, deployment.patch }), "--sdk" });
     link.addDirectoryArg(b.named_lazy_paths.get("antfly_macos_sdk_root").?);

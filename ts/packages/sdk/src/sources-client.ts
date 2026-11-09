@@ -26,7 +26,27 @@ export interface SourceDefinition {
   config: Record<string, unknown>;
   permissions: { public: boolean; readers: string[] };
   permission_ttl_seconds?: number;
-  publication?: "text" | "media";
+  publication?: "native" | "text" | "media";
+  search_version?: 1 | 2;
+  streams?: SearchStream[];
+  artifacts?: ArtifactBinding[];
+  processing?: ProcessingDeclaration;
+  identity?: { namespace?: string };
+}
+
+/** Durable migration lineage returned by the companion; clients cannot mutate it directly. */
+export interface LocalMigrationReceipt {
+  version: 1;
+  source_id: string;
+  table: string;
+  namespace: string;
+  from_connection: string;
+  from_prefix: string;
+  from_binding: string;
+  to_connection: string;
+  to_bucket: string;
+  to_prefix: string;
+  to_binding: string;
 }
 
 export interface SourceProfile {
@@ -37,6 +57,7 @@ export interface SourceProfile {
   principals?: string[];
   connections: Record<string, SourceConnection>;
   sources: SourceDefinition[];
+  readonly local_migrations?: Record<string, LocalMigrationReceipt>;
 }
 
 export interface SourceSyncJob {
@@ -144,7 +165,7 @@ export class StandaloneSourcesClient extends SourceTransport {
   putSource(
     source: SourceDefinition,
     signal?: AbortSignal
-  ): Promise<{ version: 1; state: string }> {
+  ): Promise<{ version: 1; state: string; rekeys: boolean }> {
     return this.request("PUT", `/v1/sources/${encodeURIComponent(source.id)}`, source, signal);
   }
   removeSource(id: string, signal?: AbortSignal): Promise<{ version: 1; state: string }> {
@@ -160,8 +181,24 @@ export class StandaloneSourcesClient extends SourceTransport {
     );
   }
 
-  sync(options: { restart?: boolean; signal?: AbortSignal } = {}): Promise<SourceSyncJob> {
-    return this.request("POST", "/v1/sync", { restart: options.restart ?? false }, options.signal);
+  sync(
+    options: {
+      sourceId?: string;
+      restart?: boolean;
+      requestKey?: string;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<SourceSyncJob> {
+    return this.request(
+      "POST",
+      "/v1/sync",
+      {
+        source_id: options.sourceId,
+        restart: options.restart ?? false,
+        request_key: options.requestKey,
+      },
+      options.signal
+    );
   }
   /** Apply durable purge intents independently of ingestion credentials. */
   runPurges(signal?: AbortSignal): Promise<SourceSyncJob> {
@@ -186,6 +223,16 @@ export type {
   RunPage,
   Source,
   SourcePage,
+  SearchStream,
+  TextStream,
+  ArtifactBinding,
+  RetrievalBindings,
+  VectorSpace,
+  ProcessingDeclaration,
+  SearchStatus,
+  ProcessingPreset,
+  ProcessingPreview,
+  ProcessingJobRequest,
 } from "./sources-types.js";
 
 import type {
@@ -196,6 +243,16 @@ import type {
   RunPage,
   Source,
   SourcePage,
+  SearchStream,
+  TextStream,
+  ArtifactBinding,
+  RetrievalBindings,
+  VectorSpace,
+  ProcessingDeclaration,
+  SearchStatus,
+  ProcessingPreset,
+  ProcessingPreview,
+  ProcessingJobRequest,
 } from "./sources-types.js";
 
 /** Common management API. baseUrl includes the runtime's /sources/v1 mount. */
@@ -214,8 +271,33 @@ export class SourcesClient extends SourceTransport {
   source(id: string, signal?: AbortSignal): Promise<Source> {
     return this.request("GET", `/sources/${encodeURIComponent(id)}`, undefined, signal);
   }
+  previewProcessing(
+    id: string,
+    input: ProcessingPreset,
+    signal?: AbortSignal
+  ): Promise<ProcessingPreview> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/processing-preview`,
+      input,
+      signal
+    );
+  }
+  processingJob(
+    id: string,
+    input: ProcessingJobRequest,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown>> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/processing-jobs`,
+      input,
+      signal
+    );
+  }
   putSource(source: Source, signal?: AbortSignal): Promise<Source> {
-    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, source, signal);
+    const { search_status: _observed, ...desired } = source;
+    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, desired, signal);
   }
   removeSource(
     id: string,

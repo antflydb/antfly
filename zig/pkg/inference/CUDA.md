@@ -921,7 +921,17 @@ probing happens at model load, after checking the host's native-call isolation p
 Without a usable device, `auto` keeps the ordinary fallback order. Set
 `ANTFLY_INFERENCE_PREFERRED_BACKEND=native` to opt out.
 The native generation CLI checks load budgets for each resolved backend before
-constructing its session, including draft models. `auto` uses CUDA's weight tier
+constructing its session. Target, draft, and artifact-created host managers share
+one invocation ledger, retaining model and tokenizer-cache reservations until
+close. Generation admits target/draft KV and scratch atomically beside retained
+models, reducing prefill chunks when necessary. Explicit combined caps span CPU
+and GPU allocations on every platform. Artifact lookup and execution reuse one
+admitted tokenizer; native artifact preparation does not load another tokenizer.
+XLA execution reserves declared buffers before loading, then requires PJRT
+compiled-memory statistics to admit code, padding, and workspace before uploads
+and execution. Plugins without usable memory statistics fail closed. Device
+reservations remain held through buffer, executable, and client teardown; CPU
+PJRT plugins charge their allocations to host memory. `auto` uses CUDA's weight tier
 and residency estimate when CUDA is selected; CPU fallback uses the host tier.
 Budget rejection follows the model loader's fallback and CUDA A4B safety policy.
 

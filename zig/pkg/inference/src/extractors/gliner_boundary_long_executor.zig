@@ -119,7 +119,7 @@ fn hashOptions(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
             // These carry ownership/cancellation/validator execution, not
             // semantics. Compiled validator expressions live in schema IDs.
             if (comptime !std.mem.eql(u8, reflected_name, "control") and !std.mem.eql(u8, reflected_name, "check_context") and !std.mem.eql(u8, reflected_name, "check_fn") and
-                !std.mem.eql(u8, reflected_name, "regex_context") and !std.mem.eql(u8, reflected_name, "validate_value_fn") and !std.mem.eql(u8, reflected_name, "scope"))
+                !std.mem.eql(u8, reflected_name, "regex_context") and !std.mem.eql(u8, reflected_name, "validate_value_fn") and !std.mem.eql(u8, reflected_name, "scope") and !std.mem.eql(u8, reflected_name, "independent_rows"))
             {
                 hash.update(reflected_name);
                 hash.update("\x00");

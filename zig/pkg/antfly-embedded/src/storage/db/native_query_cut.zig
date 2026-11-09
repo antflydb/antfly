@@ -95,6 +95,12 @@ pub fn validateWithSourceProof(a: A, io: std.Io, root: []const u8, request: Requ
     defer parsed.deinit();
     const manifest = parsed.value;
     if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id)) return error.CatalogGenerationChanged;
+    if ((manifest.request.indexes == null) != (request.indexes == null)) return error.CatalogGenerationChanged;
+    if (request.indexes) |expected| {
+        const actual = manifest.request.indexes.?;
+        if (expected.len != actual.len) return error.CatalogGenerationChanged;
+        for (expected, actual) |lhs, rhs| if (!std.mem.eql(u8, lhs, rhs)) return error.CatalogGenerationChanged;
+    }
     if (manifest.files.len > seal.max_files) return error.CatalogGenerationChanged;
     for (manifest.files) |file| {
         try cancellation.check();
@@ -131,6 +137,62 @@ pub fn readLease(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancella
     }
     return .{ .io = io, .file = file };
 }
+const ReadLeaseOwner = struct {
+    allocator: A,
+    guard: Guard,
+
+    fn release(raw: *anyopaque) callconv(.c) void {
+        const self: *ReadLeaseOwner = @ptrCast(@alignCast(raw));
+        const allocator = self.allocator;
+        self.guard.deinit();
+        allocator.destroy(self);
+    }
+};
+pub fn readLeaseOwned(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancellation: Cancellation) !@import("native_query_cut_contract.zig").ReadLease {
+    var guard = try readLease(a, io, db_path, id, cancellation);
+    errdefer guard.deinit();
+    const owner = try a.create(ReadLeaseOwner);
+    owner.* = .{ .allocator = a, .guard = guard };
+    return .{ .context = owner, .release = ReadLeaseOwner.release };
+}
+
+test "native query owned read lease releases failed admission and closes exactly once" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-owned-read-lease");
+    defer directory.cleanup();
+    const db_path = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(db_path);
+    const id: [64]u8 = @splat('a');
+    var parent = try lock(a, io, db_path, .none);
+    defer parent.deinit();
+    const path = try std.fmt.allocPrint(a, "{s}.query-pins/{s}.lease", .{ db_path, id });
+    defer a.free(path);
+    const exclusive = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+    defer exclusive.close(io);
+
+    // The path allocation succeeds; boxing fails after the shared lock was
+    // acquired. The failed owner must neither retain the lock nor leak memory.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, readLeaseOwned(failing.allocator(), io, db_path, &id, .none));
+    try std.testing.expect(try exclusive.tryLock(io, .exclusive));
+    exclusive.unlock(io);
+
+    var lease = try readLeaseOwned(a, io, db_path, &id, .none);
+    defer lease.deinit() catch unreachable;
+    try std.testing.expect(!try exclusive.tryLock(io, .exclusive));
+    try lease.deinit();
+    try lease.deinit();
+    try std.testing.expect(try exclusive.tryLock(io, .exclusive));
+    exclusive.unlock(io);
+
+    var invalid: @import("native_query_cut_contract.zig").ReadLease = .{ .version = 0, .context = @ptrFromInt(1), .release = @ptrFromInt(0x1000) };
+    try std.testing.expectError(error.UnsupportedVersion, invalid.deinit());
+    invalid.version = 1;
+    invalid.release = null;
+    try std.testing.expectError(error.InvalidArgument, invalid.deinit());
+}
+
 pub fn lock(a: A, io: std.Io, db_path: []const u8, cancellation: Cancellation) !Guard {
     const parent = try std.fmt.allocPrint(a, "{s}.query-pins", .{db_path});
     defer a.free(parent);
@@ -156,6 +218,17 @@ pub fn discardInvalidCache(a: A, io: std.Io, parent: []const u8, id: []const u8,
     defer lease.unlock(io);
     try std.Io.Dir.cwd().deleteTree(io, root);
     try std.Io.Dir.cwd().deleteFile(io, lease_path);
+}
+
+/// Dispose of a statement-owned local cut after its final reader closes.
+/// Call under the publication guard; a remaining reader prevents deletion.
+/// Cursor generations published to the repository must use expiry instead.
+pub fn discardStatement(a: A, io: std.Io, db_path: []const u8, id: []const u8) !void {
+    const parent = try std.fmt.allocPrint(a, "{s}.query-pins", .{db_path});
+    defer a.free(parent);
+    const root = try pathAlloc(a, db_path, id);
+    defer a.free(root);
+    try discardInvalidCache(a, io, parent, id, root);
 }
 
 /// Bounded admission and restart-safe expiry. Call under the store guard.
@@ -397,6 +470,37 @@ test "external lake native cache recomputes shared extent bytes after idle evict
         defer a.free(root);
         if (i < 2) try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, root, .{})) else try std.Io.Dir.accessAbsolute(io, root, .{});
     }
+}
+
+test "statement cut cleanup protects readers and immediately frees admission" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("statement-cut-release");
+    defer directory.cleanup();
+    const db_path = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(db_path);
+    const id: [64]u8 = @splat('a');
+    const next: [64]u8 = @splat('b');
+    const root = try pathAlloc(a, db_path, &id);
+    defer a.free(root);
+    try fs_paths.createDirPathPortable(io, root);
+    const manifest_path = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{root});
+    defer a.free(manifest_path);
+    const bytes = try std.json.Stringify.valueAlloc(a, Manifest{ .request = .{ .id = &id, .table_id = 7, .expires_ms = nowMs() + 30_000 }, .namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .sequence = 1, .files = &.{} }, .{});
+    defer a.free(bytes);
+    _ = try backup.writeFileDurable(io, manifest_path, bytes);
+    var guard = try lock(a, io, db_path, .none);
+    defer guard.deinit();
+    {
+        var reader = try readLease(a, io, db_path, &id, .none);
+        defer reader.deinit();
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, discardStatement(a, io, db_path, &id));
+        try std.Io.Dir.accessAbsolute(io, root, .{});
+    }
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, admit(a, io, db_path, &next, .{ .max_cuts = 1 }, .none));
+    try discardStatement(a, io, db_path, &id);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, root, .{}));
+    try admit(a, io, db_path, &next, .{ .max_cuts = 1 }, .none);
 }
 
 test "logical value source reuse proof requires a validated complete cut" {

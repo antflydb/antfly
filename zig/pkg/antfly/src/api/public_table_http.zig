@@ -18,7 +18,7 @@ const ant_json = @import("antfly-json");
 const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
 const graph_query_mod = @import("antfly_local_sources").graph_query;
@@ -379,6 +379,7 @@ pub const TableApi = struct {
         MemoryBudgetExceeded,
         InferenceEndpointAccessDenied,
         ModelNotFound,
+        AmbiguousModelIdentifier,
         InternalFailure,
     };
 
@@ -1656,13 +1657,14 @@ pub fn handleTableBatch(
 ) !OwnedResponse {
     resetLastBatchFailureName();
     last_ambiguous_batch_txn_id = null;
-    var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
+    var public_request = @import("antfly_local_sources").api_batch.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
             error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
             else => return err,
         }
     };
+    var batch_req = batch_api.takePublic(&public_request);
     defer batch_req.deinit(alloc);
 
     return executeOwnedTableBatch(alloc, table_name, batch_req, api);
@@ -2609,7 +2611,8 @@ pub fn handlePutArtifactEnrichment(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
         error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
-        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "model not found") },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found while validating the enrichment or existing table configuration; inspect authenticated model discovery\",\"retryable\":false}"), .json = true },
+        error.AmbiguousModelIdentifier => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"ambiguous_model\",\"message\":\"model selection matches multiple installed artifacts; specify a variant and revision\",\"retryable\":false}"), .json = true },
         error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, inference_endpoint_access_denied_message) },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index source has no matching embedding enrichment") },
@@ -2617,7 +2620,12 @@ pub fn handlePutArtifactEnrichment(
         error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment producer is not runnable") },
         error.EmbeddingArtifactDimensionRequired => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment must declare positive expected_dims") },
         error.ConflictingEmbeddingArtifactDimensions => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index sources declare different dimensions") },
-        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment update failed") },
+        error.InternalFailure => return .{ .status = 500, .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .@"error" = "internal_error",
+            .message = "artifact enrichment update failed; inspect server logs using request_id",
+            .request_id = api.request.request_id,
+            .retryable = false,
+        }, .{}), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
 }
@@ -6882,5 +6890,43 @@ test "public artifact enrichment preserves permanent inference budget and retrya
         defer parsed.deinit();
         try std.testing.expectEqual(retryable, parsed.value.object.get("retryable").?.bool);
         try std.testing.expectEqualStrings(if (retryable) "index_probe_unavailable" else "MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+    }
+}
+
+test "public artifact enrichment preserves missing ambiguous and internal failures" {
+    const Backend = struct {
+        failure: TableApi.ExecutePutArtifactEnrichmentError,
+        fn put(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: operation.RequestContext) TableApi.ExecutePutArtifactEnrichmentError!void {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).failure;
+        }
+    };
+    var backend = Backend{ .failure = error.ModelNotFound };
+    const api: TableApi = .{ .ptr = &backend, .request = .{ .request_id = "enrichment-test" }, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+        .execute_put_artifact_enrichment = Backend.put,
+    } };
+    for ([_]struct { anyerror, u16, []const u8 }{
+        .{ error.ModelNotFound, 404, "model_not_found" },
+        .{ error.AmbiguousModelIdentifier, 409, "ambiguous_model" },
+        .{ error.InternalFailure, 500, "internal_error" },
+    }) |case| {
+        backend.failure = @errorCast(case[0]);
+        var response = try handlePutArtifactEnrichment(std.testing.allocator, "docs", "ocr", "{}", api);
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case[1], response.status);
+        try std.testing.expect(response.json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case[2], parsed.value.object.get("error").?.string);
+        try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+        if (case[0] == error.InternalFailure) try std.testing.expectEqualStrings("enrichment-test", parsed.value.object.get("request_id").?.string);
     }
 }

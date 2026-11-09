@@ -176,14 +176,21 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if branch.get("description", "").startswith(
-                "Relevance, filtering, backward/offset pagination"
-            )
+            if len(branch.get("allOf", [])) == 2
+            and branch["allOf"][0]
+            == {
+                "required": ["hierarchy"],
+                "properties": {"hierarchy": {"required": ["children"]}},
+            }
+            and "anyOf" in branch["allOf"][1]
         )
         rejected_child_fields = {
             item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
         }
         allowed_child_fields = {
+            # Source traversal now permits filtering; unit traversal retains
+            # its separate conditional rejection below.
+            "filter_query",
             "table",
             "table_target",
             "fields",
@@ -239,6 +246,15 @@ class McpSchemaFragmentTests(unittest.TestCase):
         invalid_wait = copy.deepcopy(with_read_requirement)
         invalid_wait["read_requirements"]["wait_ms"] = 60001
         self.assertTrue(list(validator.iter_errors(invalid_wait)))
+
+        filtered_members = copy.deepcopy(valid)
+        filtered_members["hierarchy"]["children"].update(
+            level="member", artifact="extraction"
+        )
+        filtered_members["filter_query"] = {
+            "term": {"path": "/tenant", "value": "acme"}
+        }
+        self.assertEqual([], list(validator.iter_errors(filtered_members)))
 
         invalid_variants = []
         for field, value in (

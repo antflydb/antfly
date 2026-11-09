@@ -3026,6 +3026,9 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    if (cfg.external_vector_space) |space| {
+        if (!external or sparse or space.len == 0 or space.len > 4096) return error.InvalidCreateTableRequest;
+    }
     const publication_policy = cfg.publication_policy orelse .progressive;
     if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
     if (external and cfg.publication_policy != null) return error.InvalidCreateTableRequest;
@@ -3109,7 +3112,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer embedder_cfg.deinit(alloc);
             if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
             _ = parseEmbedderProvider(embedder_cfg) catch return error.UnsupportedCreateTableRequest;
-            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
+            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, semantic_producer_json, options.inference_api_url, options.inference_api_key);
         } else null;
         defer if (embedder_json) |raw| alloc.free(raw);
         if (embedder_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -3184,7 +3187,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         _ = try parseEmbedderProvider(embedder_cfg);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, semantic_producer_json, options.inference_api_url, options.inference_api_key);
     } else null;
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -3246,6 +3249,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try out.append(alloc, '}');
     } else {
         try out.appendSlice(alloc, ",\"external\":true");
+        if (cfg.external_vector_space) |space| {
+            try out.appendSlice(alloc, ",\"external_vector_space\":");
+            try appendJsonString(alloc, &out, space);
+        }
     }
 
     if (embedder_json) |embedder| {
@@ -5305,9 +5312,15 @@ fn buildManagedEmbeddingEntry(
         .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
         .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+        // `base_url` is the endpoint this embedder will call (explicit, catalog
+        // pinned, or the node default). Only the node default endpoint
+        // receives the node credential.
         .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(
             alloc,
-            embedder_cfg.api_key orelse options.inference_api_key,
+            embedder_cfg.api_key orelse if (sameAntflyInferenceEndpoint(base_url, options.inference_api_url))
+                options.inference_api_key
+            else
+                null,
             "ANTFLY_INFERENCE_API_KEY",
         ),
         .ollama, .bedrock, .vertex => null,
@@ -7263,6 +7276,34 @@ fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_
     return try normalizeAntflyInferenceBaseUrl(alloc, raw);
 }
 
+/// The node default credential is scoped by the effective endpoint; see
+/// `execution_context.isDefaultEndpoint`.
+fn sameAntflyInferenceEndpoint(endpoint: []const u8, default_endpoint: ?[]const u8) bool {
+    return execution_context.isDefaultEndpoint(endpoint, default_endpoint);
+}
+
+test "node default inference endpoint matching ignores the api suffix only" {
+    try std.testing.expect(sameAntflyInferenceEndpoint("http://shared:8080/ai/v1", "http://shared:8080"));
+    try std.testing.expect(sameAntflyInferenceEndpoint("http://shared:8080/", "http://shared:8080/ai/v1/"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://third-party:8080/ai/v1", "http://shared:8080/ai/v1"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("", "http://shared:8080"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080", null));
+    // Background embedding uses the same scoping guard: route paths stay
+    // case-sensitive and interior slashes stay significant.
+    try std.testing.expect(sameAntflyInferenceEndpoint("HTTP://Shared:8080/tenantA/ai/v1", "http://shared:8080/tenantA"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080/tenanta/ai/v1", "http://shared:8080/tenantA/ai/v1"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080/tenantA//ai/v1", "http://shared:8080/tenantA/ai/v1"));
+}
+
+fn effectiveEndpointIsDefault(alloc: std.mem.Allocator, cfg: embeddings_types.Config, semantic_producer_json: ?[]const u8, inference_api_url: ?[]const u8) !bool {
+    const producer = semantic_producer_json orelse
+        return cfg.url.len == 0 or sameAntflyInferenceEndpoint(cfg.url, inference_api_url);
+    var identity = std.json.parseFromSlice(std.json.Value, alloc, producer, .{}) catch
+        return error.InvalidEmbeddingArtifactProducer;
+    defer identity.deinit();
+    return sameAntflyInferenceEndpoint(try semanticIdentityStringField(identity.value, "endpoint"), inference_api_url);
+}
+
 fn configuredDefaultAntflyInferenceURL(options: InitOptions) ?[]const u8 {
     const value = options.inference_api_url orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -8235,6 +8276,8 @@ fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
     raw_value: std.json.Value,
+    semantic_producer_json: ?[]const u8,
+    inference_api_url: ?[]const u8,
     inference_api_key: ?[]const u8,
 ) ![]u8 {
     const base_json = try embeddings_types.stringifyAlloc(alloc, cfg);
@@ -8242,7 +8285,14 @@ fn stringifyManagedEmbedderConfigAlloc(
 
     const requests_per_minute = configObjectU32(raw_value, "requests_per_minute");
     const burst = configObjectU32(raw_value, "burst");
-    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)))
+    // The node credential belongs to the node endpoint. Scope it by the
+    // effective endpoint this index executes against: its durable
+    // semantic_producer identity when present (an older index stays pinned to
+    // the endpoint it was created with), otherwise its own URL. An index that
+    // names another (possibly third-party) endpoint, or is pinned to a former
+    // default, never inherits the current key.
+    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)) and
+        try effectiveEndpointIsDefault(alloc, cfg, semantic_producer_json, inference_api_url))
         inference_api_key
     else
         null;
@@ -8944,6 +8994,20 @@ test "managed embedder preserves coverage policy in storage config" {
     ,
         config_json,
     );
+    var external_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3,\"external_vector_space\":\"recipe-v1\"}", .{});
+    defer external_config.deinit();
+    const physical = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "authored", external_config.value, .{});
+    defer std.testing.allocator.free(physical);
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator, "{\"external\":true,\"external_vector_space\":\"recipe-v1\"}", physical);
+    for ([_][]const u8{
+        "{\"external\":false,\"dimension\":3,\"external_vector_space\":\"recipe-v1\"}",
+        "{\"external\":true,\"sparse\":true,\"external_vector_space\":\"recipe-v1\"}",
+        "{\"external\":true,\"dimension\":3,\"external_vector_space\":\"\"}",
+    }) |raw| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "invalid", invalid.value, .{}));
+    }
 }
 
 test "managed embedder rejects unsupported execution namespaces" {

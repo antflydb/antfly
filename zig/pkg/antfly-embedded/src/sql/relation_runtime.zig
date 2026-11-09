@@ -16,31 +16,122 @@
 //! Typed relational iterator execution. All physical cursors open together;
 //! hash join retains one build side and streams the probe side under quota.
 
-/// Search requests are execution-local, including statement captures used by
-/// mutation inputs. Never write parameter values into the immutable plan.
+/// Search requests and graph predicate operands bind per invocation, including
+/// mutation captures. Never write parameter values into the immutable plan.
 pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
-    const has_search = for (input_scans) |scan| {
-        if (scan.request.search != null) break true;
+    const needs_binding = for (input_scans) |scan| {
+        if (scan.request.search != null or scan.request.graph_conditions.len != 0 or scan.request.graph_predicates.len != 0) break true;
     } else false;
-    return if (has_search) bound: {
+    return if (needs_binding) bound: {
         const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
-        for (bound_scans) |*scan| if (scan.request.search) |original| {
-            const search = try a.create(catalog.Scan.Search);
-            search.* = original.*;
-            scan.request.search = search;
-            const expression = search.expression;
-            const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
-            if (request != .string) return error.InvalidSqlParameters;
-            search.request_text = request.string;
-            if (expression.limit) |input| {
-                const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
-                const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
-                if (number < 1 or number > 10000) return error.InvalidSqlParameters;
-                search.limit = @intCast(number);
+        for (bound_scans) |*scan| {
+            if (scan.request.graph_conditions.len != 0) {
+                var conditions: std.ArrayList(catalog.Condition) = .empty;
+                try conditions.appendSlice(a, scan.request.conditions);
+                condition_loop: for (scan.request.graph_conditions) |condition| {
+                    const operand = condition.operand.evaluateInstruction(a, condition.operand.root, parameters) catch |err| {
+                        // Speculation is not an evaluation demand: a residual
+                        // may short-circuit or see no rows. Defer data errors
+                        // and speculative work ceilings to that original plan.
+                        if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
+                        return err;
+                    };
+                    // Binding may discover duplicates across separate SQL
+                    // conjuncts or inner/outer pushdown passes. Do not inflate
+                    // graph expression depth and execution work with them.
+                    for (conditions.items) |existing| {
+                        if (existing.op == condition.op and std.mem.eql(u8, existing.column, condition.column) and sameGraphOperand(existing.datum(), operand)) continue :condition_loop;
+                    }
+                    try conditions.append(a, .{ .column = condition.column, .op = condition.op, .value = operand.value, .operand = operand });
+                }
+                scan.request.conditions = try conditions.toOwnedSlice(a);
+                scan.request.graph_conditions = &.{};
             }
-        };
+            if (scan.request.graph_predicates.len != 0) {
+                var filters: std.ArrayList(catalog.Scan.GraphFilter) = .empty;
+                try filters.appendSlice(a, scan.request.graph_filters);
+                for (scan.request.graph_predicates) |predicate| {
+                    const filter = bindGraphPredicate(a, predicate, parameters) catch |err| {
+                        if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
+                        return err;
+                    };
+                    try filters.append(a, filter);
+                }
+                scan.request.graph_filters = try filters.toOwnedSlice(a);
+                scan.request.graph_predicates = &.{};
+            }
+            if (scan.request.search) |original| {
+                const search = try a.create(catalog.Scan.Search);
+                search.* = original.*;
+                scan.request.search = search;
+                const expression = search.expression;
+                const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
+                if (request != .string) return error.InvalidSqlParameters;
+                search.request_text = request.string;
+                if (expression.limit) |input| {
+                    const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
+                    const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
+                    if (number < 1 or number > 10000) return error.InvalidSqlParameters;
+                    search.limit = @intCast(number);
+                }
+            }
+        }
         break :bound bound_scans;
     } else input_scans;
+}
+
+fn bindGraphPredicate(a: Allocator, predicate: catalog.Scan.GraphPredicate, parameters: []const std.json.Value) anyerror!catalog.Scan.GraphFilter {
+    return switch (predicate) {
+        .comparison => |condition| blk: {
+            const value = try condition.operand.evaluateInstruction(a, condition.operand.root, parameters);
+            break :blk .{ .comparison = .{ .column = condition.column, .op = condition.op, .value = value.value, .operand = value } };
+        },
+        .all, .any => |children| blk: {
+            const filters = try a.alloc(catalog.Scan.GraphFilter, children.len);
+            for (children, filters) |child, *filter| filter.* = try bindGraphPredicate(a, child, parameters);
+            break :blk if (predicate == .all) .{ .all = filters } else .{ .any = filters };
+        },
+    };
+}
+
+// Deduplication is deliberately representation preserving: cross-domain SQL
+// promotions can be non-transitive. Exact NUMERIC/array payloads and structured
+// JSON stay in residual evaluation rather than acquiring an approximate key.
+fn sameGraphOperand(left: scalar.Datum, right: scalar.Datum) bool {
+    if (left.sql_null or right.sql_null) return left.sql_null and right.sql_null;
+    if (left.numeric != null or right.numeric != null or left.array != null or right.array != null or left.patterns != null or right.patterns != null) return false;
+    if (std.meta.activeTag(left.value) != std.meta.activeTag(right.value)) return false;
+    return switch (left.value) {
+        .integer => |value| value == right.value.integer,
+        .bool => |value| value == right.value.bool,
+        .float => |value| @as(u64, @bitCast(value)) == @as(u64, @bitCast(right.value.float)),
+        .string => |value| std.mem.eql(u8, value, right.value.string),
+        .number_string => |value| std.mem.eql(u8, value, right.value.number_string),
+        else => false,
+    };
+}
+
+test "graph condition deduplication preserves exact operand domains and NULL semantics" {
+    try std.testing.expect(sameGraphOperand(scalar.Datum.fromJson(.{ .integer = 1 }), scalar.Datum.fromJson(.{ .integer = 1 })));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.{ .integer = 1 }), scalar.Datum.fromJson(.{ .float = 1 })));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.{ .float = 0.0 }), scalar.Datum.fromJson(.{ .float = -0.0 })));
+    try std.testing.expect(sameGraphOperand(scalar.Datum.fromJson(.null), scalar.Datum.fromJson(.null)));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.null), scalar.Datum.json(.null)));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.{ .string = "1" }), scalar.Datum.fromJson(.{ .number_string = "1" })));
+}
+
+/// The enclosing SELECT owns a predicate outside the relation's source tree.
+/// Attach that predicate at the same execution-local boundary as inner WHEREs.
+/// Mutation captures use this helper before their shared read cut is opened.
+pub fn outerGraphScans(a: Allocator, relation: *const binding.Bound, predicate: ?scalar.Program) ![]const catalog.StatementScan {
+    const program = predicate orelse return relation.scans;
+    const has_graph = for (relation.scans) |scan| {
+        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+    } else false;
+    if (!has_graph) return relation.scans;
+    const scans = try a.dupe(catalog.StatementScan, relation.scans);
+    try binding.attachGraphConditions(a, relation.root, program, scans);
+    return scans;
 }
 
 const std = @import("std");
@@ -108,6 +199,180 @@ const SetTestBackend = struct {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
 };
+
+test "SQL weighted relational operators retain bags and unwind failed negotiation" {
+    const Fixture = struct {
+        const This = @This();
+        fn checkpoint(_: *anyopaque) !void {}
+        saturated: bool = false,
+        dimension_count: usize = 3,
+        weighted_dimension: bool = false,
+        opened: usize = 0,
+        closed: usize = 0,
+        const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "v", .path = "v", .type = .integer, .element_type = .int64, .nullable = false }} };
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            var result = table;
+            result.physical_name = name.table;
+            return result;
+        }
+        fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedBackendCall;
+        }
+        const State = struct {
+            a: Allocator,
+            owner: *This,
+            position: usize = 0,
+            weighted: bool = false,
+            dimension: bool = false,
+            fn enable(ptr: *anyopaque, _: catalog.Multiplicity) !bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.position != 0) return false;
+                self.weighted = true;
+                return true;
+            }
+            fn next(ptr: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const count = if (self.dimension) self.owner.dimension_count else if (self.weighted) @as(usize, 1) else 100;
+                const wanted = @min(limit, count - self.position);
+                const rows = try a.alloc(catalog.Row, wanted);
+                const weights = try a.alloc(u64, wanted);
+                for (rows, weights, 0..) |*row, *weight, index| {
+                    const cells = try a.alloc(Datum, 1);
+                    cells[0] = if (self.dimension and self.owner.dimension_count == 3 and self.position + index == 2) .{} else Datum.json(.{ .integer = if (self.dimension) @intCast(2 + (self.position + index) % 2) else 2 });
+                    row.* = try catalog.Row.fromDatums(a, "row", try catalog.Row.TypedLayout.init(a, &.{"v"}), cells);
+                    weight.* = if (self.weighted) (if (self.owner.saturated) @as(u64, std.math.maxInt(i64)) + 1 else 100) else 1;
+                }
+                self.position += wanted;
+                return .{ .rows = rows, .multiplicities = if (self.weighted) weights else null, .after = if (self.position < count) "next" else null };
+            }
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.owner.closed += 1;
+                self.a.destroy(self);
+            }
+        };
+        fn open(ptr: *anyopaque, a: Allocator, input: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const state = try a.create(State);
+            state.* = .{ .a = a, .owner = self, .dimension = std.mem.eql(u8, input.physical_name, "dim") };
+            self.opened += 1;
+            return .{ .ptr = state, .next = State.next, .close = State.close, .enable_weights = if (state.dimension and !self.weighted_dimension) null else State.enable };
+        }
+        const Statement = struct {
+            a: Allocator,
+            cursors: []catalog.Cursor,
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                for (self.cursors) |cursor| cursor.close(cursor.ptr);
+                self.a.free(self.cursors);
+                self.a.destroy(self);
+            }
+        };
+        fn openStatement(ptr: *anyopaque, a: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const state = try a.create(Statement);
+            errdefer a.destroy(state);
+            const cursors = try a.alloc(catalog.Cursor, scans.len);
+            errdefer a.free(cursors);
+            var opened: usize = 0;
+            errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+            for (scans, cursors) |input, *cursor| {
+                cursor.* = (try open(ptr, a, input.table, input.request)).?;
+                opened += 1;
+            }
+            state.* = .{ .a = a, .cursors = cursors };
+            return .{ .ptr = state, .cursors = cursors, .close = Statement.close };
+        }
+        fn spillRun(a: Allocator, weighted: bool) !void {
+            var self: @This() = .{ .dimension_count = 4096, .weighted_dimension = weighted };
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &self, .checkpoint = checkpoint, .async_writes = false };
+            defer manager.deinit();
+            const backend: catalog.Backend = .{ .ptr = &self, .spill_manager = &manager, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } };
+            var compiled = try @import("compiler.zig").compile(a, "SELECT sum(d.v),count(*) FROM docs d FULL JOIN dim x ON d.v=x.v", .{});
+            defer compiled.deinit();
+            var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 5000 });
+            defer result.deinit();
+            try std.testing.expectEqualStrings(if (weighted) "40960000" else "409600", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings(if (weighted) "20684800" else "206848", result.output.rows[0][1].string);
+            try std.testing.expect(manager.written_bytes > 0);
+            try std.testing.expectEqual(@as(usize, 0), manager.files);
+            try std.testing.expectEqual(self.opened, self.closed);
+        }
+        const cases = [_]struct { sql: []const u8, sum: []const u8, count: []const u8 }{
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v) d", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs WHERE v>=2) d", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) d", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT CAST(3 AS BIGINT) AS v) d", .sum = "203", .count = "101" },
+            .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k) x", .sum = "600", .count = "100" },
+            .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM (SELECT 3 AS k) x CROSS JOIN docs d", .sum = "600", .count = "100" },
+            .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k UNION ALL SELECT 4 AS k) x", .sum = "1400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k UNION ALL SELECT 4 AS k) x CROSS JOIN docs d", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v DESC LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT 2 AS k UNION ALL SELECT 2 AS k UNION ALL SELECT NULL AS k) x ON d.v=x.k", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d LEFT JOIN (SELECT 3 AS k) x ON d.v=x.k", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k) x RIGHT JOIN docs d ON d.v=x.k", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN dim x ON d.v=x.v", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM dim x JOIN docs d ON d.v=x.v", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN dim x ON d.v=x.v", .sum = "200", .count = "102" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d WHERE d.v IN(SELECT v FROM dim)", .sum = "200", .count = "100" },
+            .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM cached", .sum = "200", .count = "100" },
+            .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM (SELECT v FROM cached UNION ALL SELECT v FROM cached) d", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN docs x ON d.v=x.v", .sum = "20000", .count = "10000" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN docs x ON d.v=x.v AND d.v=3", .sum = "200", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d CROSS JOIN docs x", .sum = "20000", .count = "10000" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT v FROM docs UNION ALL SELECT v FROM docs) x ON d.v=x.v", .sum = "40000", .count = "20000" },
+        };
+        fn run(a: Allocator, only: ?usize) !void {
+            var self: @This() = .{};
+            const backend: catalog.Backend = .{ .ptr = &self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } };
+            for (cases, 0..) |case, index| {
+                if (only) |selected| if (selected != index) continue;
+                var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
+                defer result.deinit();
+                try std.testing.expectEqualStrings(case.sum, result.output.rows[0][0].string);
+                try std.testing.expectEqualStrings(case.count, result.output.rows[0][1].string);
+            }
+            if (only == null or only.? == cases.len) {
+                self.weighted_dimension = true;
+                defer self.weighted_dimension = false;
+                var compiled = try @import("compiler.zig").compile(a, "SELECT sum(d.v),sum(x.v),count(*),count(DISTINCT x.v) FROM docs d FULL JOIN dim x ON d.v=x.v", .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
+                defer result.deinit();
+                try std.testing.expectEqualStrings("20000", result.output.rows[0][0].string);
+                try std.testing.expectEqualStrings("20300", result.output.rows[0][1].string);
+                try std.testing.expectEqualStrings("10200", result.output.rows[0][2].string);
+                try std.testing.expectEqualStrings("2", result.output.rows[0][3].string);
+            }
+            if (only == null or only.? == cases.len + 1) {
+                var compiled = try @import("compiler.zig").compile(a, "SELECT count(*) FROM (SELECT 1/(v-2) AS bad FROM docs LIMIT 1 OFFSET 100) d", .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 100 });
+                defer result.deinit();
+                try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
+            }
+            self.saturated = true;
+            if (only == null or only.? == cases.len + 2) {
+                var compiled = try @import("compiler.zig").compile(a, "SELECT d.v FROM docs d CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) x ORDER BY d.v DESC LIMIT 3 OFFSET 5", .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+                for (result.output.rows) |row| try std.testing.expectEqualStrings("2", row[0].string);
+            }
+            try std.testing.expectEqual(self.opened, self.closed);
+        }
+    };
+    try Fixture.run(std.testing.allocator, null);
+    try Fixture.spillRun(std.testing.allocator, false);
+    try Fixture.spillRun(std.testing.allocator, true);
+    // Each query owns a separate statement and cursor cohort. Enumerate every
+    // allocation failure per query, avoiding quadratic replay of earlier cases.
+    for (0..Fixture.cases.len + 3) |index|
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(?usize, index)});
+}
 
 test "SQL row membership executes captured typed relations with NULL-aware truth and query boundaries" {
     const Case = struct { sql: []const u8, rows: []const u8 };
@@ -712,6 +977,7 @@ fn Engine(comptime Context: type) type {
         const Self = @This();
         context: Context,
         cursors: []const catalog.Cursor,
+        ordered_scan: ?usize = null,
         visited: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
@@ -777,14 +1043,37 @@ fn Engine(comptime Context: type) type {
             const memory_bytes = if (self.context.spill != null) self.context.limits.retained_bytes / 16 else self.context.limits.retained_bytes;
             const replay = try Replay.create(self.context.alloc, node.columns.len, memory_bytes, self.context.spill);
             errdefer replay.deinit();
-            const iterator = try Iterator.createContext(self, node, null, mask != 0);
-            defer iterator.deinit();
+            const fields = try self.context.arena.alloc([]const u8, node.columns.len);
+            for (node.columns, fields) |column, *field| field.* = column.internal;
+            const plan = if (mask == 0 and WeightedReader.Plan.replayOrderSafe(node, 0)) try WeightedReader.Plan.init(self.context.arena, node, &.{.{ .fields = fields, .multiplicity = .exact }}, self.cursors) else null;
             var scratch = std.heap.ArenaAllocator.init(self.context.alloc);
             defer scratch.deinit();
-            while (try iterator.next(scratch.allocator())) |values| {
-                if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                try replay.append(values);
-                _ = scratch.reset(.free_all);
+            if (plan != null and WeightedReader.hasProducer(self, plan.?)) {
+                const reader = try WeightedReader.create(self, plan.?);
+                defer reader.deinit();
+                while (!reader.done) {
+                    _ = scratch.reset(.free_all);
+                    const a = scratch.allocator();
+                    var page = try reader.next(a, @intCast(self.context.limits.executionRows()));
+                    defer page.deinit();
+                    const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
+                    if (slots.len != 1 or slots[0] != 0) return error.InvalidSqlBackendResponse;
+                    for (page.rows, 0..) |row_value, weight_index| {
+                        const weight = page.weight(weight_index);
+                        if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                        const values = try a.alloc(Datum, node.columns.len);
+                        for (node.columns, values) |column, *value| value.* = try row_value.cell(column.internal);
+                        try replay.appendCount(values, weight);
+                    }
+                }
+            } else {
+                const iterator = try Iterator.createContext(self, node, null, mask != 0);
+                defer iterator.deinit();
+                while (try iterator.next(scratch.allocator())) |values| {
+                    if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                    try replay.append(values);
+                    _ = scratch.reset(.free_all);
+                }
             }
             try replay.finish();
             try cache.put(if (mask != 0) self.context.alloc else self.cache_arena.allocator(), node, replay);
@@ -956,6 +1245,7 @@ fn Engine(comptime Context: type) type {
             pages: usize = 0,
             eof: bool = false,
             emitted: bool = false,
+            remote_join: ?catalog.RelationCursor = null,
             hash_join: ?*operators.HashJoin = null,
             membership_index: ?*operators.TupleMembership = null,
             borrowed_membership: bool = false,
@@ -1032,6 +1322,12 @@ fn Engine(comptime Context: type) type {
                 switch (node.operation) {
                     .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
                     .join => |join| {
+                        if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
+                            if (engine.context.backend.distributed_join) |remote| {
+                                self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters, engine.context.backend.distributed_context);
+                                if (self.remote_join != null) return self;
+                            }
+                        }
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
                         self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
@@ -1050,6 +1346,7 @@ fn Engine(comptime Context: type) type {
                 return self;
             }
             pub fn deinit(self: *Iterator) void {
+                if (self.remote_join) |remote| remote.close(remote.ptr);
                 if (self.prepared_reader) |reader| reader.close();
                 if (self.cached_reader) |reader| reader.close();
                 if (self.result_cursor) |cursor| cursor.close();
@@ -1090,6 +1387,9 @@ fn Engine(comptime Context: type) type {
             }
             fn nextBatchMeasured(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 if (maximum == 0) return .{ .rows = &.{} };
+                try self.engine.checkpoint();
+                // Cost samples borrow the producer's page. Replay them before
+                // advancing any producer, including a distributed child join.
                 if (self.sampled) |sample| {
                     const count = @min(maximum, sample.len() - self.sampled_index);
                     if (count != 0) {
@@ -1097,15 +1397,16 @@ fn Engine(comptime Context: type) type {
                         source.* = sample;
                         const selection = try a.alloc(usize, count);
                         for (selection, 0..) |*index, i| index.* = self.sampled_index + i;
+                        const result = try source.select(a, selection);
                         self.sampled_index += count;
-                        return source.select(a, selection);
+                        return result;
                     }
                     self.sampled = null;
                 }
+                if (self.remote_join) |remote| return remote.next(remote.ptr, a, maximum);
                 const previous_demand = self.batch_demand;
                 self.batch_demand = if (previous_demand) |prior| @min(prior, maximum) else maximum;
                 defer self.batch_demand = previous_demand;
-                try self.engine.checkpoint();
                 if (self.cached_reader) |reader| return reader.nextBatch(a, maximum) catch |err| {
                     if (failure) |out| {
                         out.* = err;
@@ -1271,6 +1572,10 @@ fn Engine(comptime Context: type) type {
                         return row;
                     }
                     self.sampled = null;
+                }
+                if (self.remote_join) |remote| {
+                    const batch = try remote.next(remote.ptr, alloc, 1);
+                    return if (batch.len() == 0) null else try batch.row(alloc, 0);
                 }
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
@@ -1863,7 +2168,7 @@ fn Engine(comptime Context: type) type {
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
                     const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
-                        const input = (if (context.binding.scalars.predicate == null)
+                        const input = (if (context.binding.scalars.predicate == null or self.engine.ordered_scan != null)
                             try self.left.?.nextDemand(scratch, wanted - rows.items.len)
                         else
                             try self.left.?.next(scratch)) orelse break;
@@ -2606,6 +2911,505 @@ fn Engine(comptime Context: type) type {
             }
         };
 
+        const WeightedReader = struct {
+            const Plan = @import("weighted_relation.zig").Plan;
+            engine: *Self,
+            plan: Plan,
+            left: ?*WeightedReader = null,
+            right: ?*WeightedReader = null,
+            ordinary: ?*Iterator = null,
+            fallback: bool = false,
+            side_count: usize = 0,
+            side_weight: catalog.Count = catalog.Count.init(0),
+            replay_reader: ?*Replay.Reader = null,
+            membership_index: ?*operators.TupleMembership = null,
+            unmatched_index: usize = 0,
+            graph_done: bool = false,
+            cross_arena: ?std.heap.ArenaAllocator = null,
+            join_scratch: ?std.heap.ArenaAllocator = null,
+            cross_page: ?catalog.Page = null,
+            cross_row: usize = 0,
+            join_hash: ?*operators.HashJoin = null,
+            join_probe: ?operators.HashJoin.Probe = null,
+            join_matched: bool = false,
+            window_cursor: ?*@import("result_cursor.zig").Cursor = null,
+            singleton_ready: bool = false,
+            tagged: bool = false,
+            compressed: bool = false,
+            pending_error: ?anyerror = null,
+            done: bool = false,
+            closed: bool = false,
+            slots: []const usize,
+
+            /// Native compressed producers take precedence over a join
+            /// reduction that would consume unit rows. Inspect capability
+            /// metadata only: sampling a join arm would advance its graph
+            /// cursor and make later weight negotiation impossible.
+            fn hasProducer(engine: *Self, plan: Plan) bool {
+                return switch (plan.terminal) {
+                    .ordinary => false,
+                    .scan => blk: {
+                        const cursor = engine.cursors[plan.source.operation.scan.index];
+                        break :blk cursor.enable_weights != null or cursor.enable_aggregate_weights != null;
+                    },
+                    .cross => |join| hasProducer(engine, join.child.*) or hasProducer(engine, join.build.*),
+                    .replay => |replay| hasProducer(engine, replay.child.*),
+                    .window => |window| hasProducer(engine, window.child.*),
+                    .union_all => |set| hasProducer(engine, set.left.*) or hasProducer(engine, set.right.*),
+                };
+            }
+            fn create(engine: *Self, plan: Plan) anyerror!*WeightedReader {
+                const a = engine.context.arena;
+                const self = try a.create(WeightedReader);
+                const slots = try a.alloc(usize, plan.requests.len);
+                for (slots, 0..) |*slot, index| slot.* = index;
+                self.* = .{ .engine = engine, .plan = plan, .slots = slots };
+                errdefer self.deinit();
+                switch (plan.terminal) {
+                    .scan => {
+                        const cursor = engine.cursors[plan.source.operation.scan.index];
+                        self.tagged = if (cursor.enable_aggregate_weights) |enable| try enable(cursor.ptr, plan.physical) else false;
+                        const exact = for (plan.physical) |request| {
+                            if (request.multiplicity == .exact) break true;
+                        } else false;
+                        const capped = for (plan.physical) |request| {
+                            if (request.multiplicity == .capped) break true;
+                        } else false;
+                        const weighted = self.tagged or if (cursor.enable_weights) |enable| try enable(cursor.ptr, if (exact) .exact else if (capped) .capped else .presence) else false;
+                        self.compressed = weighted;
+                        if (!weighted) self.fallback = true;
+                    },
+                    .ordinary => self.fallback = true,
+                    .replay => |replay| {
+                        self.compressed = hasProducer(engine, replay.child.*);
+                        self.replay_reader = try (try engine.staticRows(plan.source.operation.materialized_ref)).openReader();
+                    },
+                    .union_all => |set| {
+                        self.left = try create(engine, set.left.*);
+                        self.right = try create(engine, set.right.*);
+                        self.compressed = self.left.?.compressed or self.right.?.compressed;
+                    },
+                    .window => |window| {
+                        var context = engine.context;
+                        context.binding = plan.source.operation.query.binding;
+                        if (!try context.hasRowLimit(plan.source.operation.query.statement.limit)) {
+                            self.fallback = true;
+                            return self;
+                        }
+                        self.left = try create(engine, window.child.*);
+                        self.compressed = self.left.?.compressed;
+                    },
+                    .cross => |join| {
+                        self.left = try create(engine, join.child.*);
+                        self.right = try create(engine, join.build.*);
+                        self.compressed = self.left.?.compressed or self.right.?.compressed;
+                    },
+                }
+                return self;
+            }
+            fn deinit(self: *WeightedReader) void {
+                if (self.closed) return;
+                self.closed = true;
+                if (self.left) |child| child.deinit();
+                if (self.right) |child| child.deinit();
+                if (self.ordinary) |iterator| iterator.deinit();
+                if (self.replay_reader) |reader| reader.close();
+                if (self.membership_index) |index| index.deinit();
+                if (self.window_cursor) |cursor| cursor.close();
+                if (self.join_hash) |hash| hash.deinit();
+                if (self.cross_page) |*page| page.deinit();
+                if (self.cross_arena) |*arena| arena.deinit();
+                if (self.join_scratch) |*arena| arena.deinit();
+            }
+            fn buildWeight(a: Allocator, values: []const Datum) !catalog.Count {
+                const cell = values[values.len - 2];
+                if (cell.sql_null) return error.InvalidSqlBackendResponse;
+                if (cell.value == .string) return catalog.Count.parse(a, cell.value.string);
+                const low = values[values.len - 1];
+                if (cell.value != .integer or low.sql_null or low.value != .integer or cell.value.integer < 0 or low.value.integer < 0 or cell.value.integer > 0xffffffff or low.value.integer > 0xffffffff) return error.InvalidSqlBackendResponse;
+                return catalog.Count.init((@as(u64, @intCast(cell.value.integer)) << 32) | @as(u64, @intCast(low.value.integer)));
+            }
+            fn combineWeight(self: *WeightedReader, left: catalog.Count, right: catalog.Count, add: bool, active: []const usize) !catalog.Count {
+                const exact = for (active) |slot| {
+                    if (self.plan.requests[slot].multiplicity == .exact) break true;
+                } else false;
+                if (exact) return if (add) left.add(self.engine.context.arena, right) else left.multiply(self.engine.context.arena, right);
+                const cap: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+                return catalog.Count.init(@min(cap, if (add) left.cap(cap) +| right.cap(cap) else left.cap(cap) *| right.cap(cap)));
+            }
+            fn cloneValues(a: Allocator, values: []const Datum) ![]const Datum {
+                const result = try a.alloc(Datum, values.len);
+                for (values, result) |value, *out| out.* = try operators.cloneDatum(a, value);
+                return result;
+            }
+            fn node(self: *WeightedReader) *const binding.Node {
+                return if (self.plan.stages.len != 0) self.plan.stages[0].node else self.plan.source;
+            }
+            fn row(a: Allocator, columns: []const binding.Column, values: []const Datum) !catalog.Row {
+                const names = try a.alloc([]const u8, columns.len);
+                for (columns, names) |column, *name| name.* = column.internal;
+                return catalog.Row.fromDatums(a, "", try catalog.Row.TypedLayout.init(a, names), values);
+            }
+            fn next(self: *WeightedReader, a: Allocator, limit: u32) anyerror!catalog.Page {
+                try self.engine.context.checkpoint();
+                var page = try self.raw(a, limit);
+                defer page.deinit();
+                try page.validateWeights();
+                var rows: std.ArrayList(catalog.Row) = .empty;
+                var weights: std.ArrayList(catalog.Count) = .empty;
+                var inputs: std.ArrayList(?catalog.AggregateInput) = .empty;
+                const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
+                const multiplicities = page.multiplicities orelse return error.InvalidSqlBackendResponse;
+                if (page.rows.len != multiplicities.len or page.rows.len > limit) return error.InvalidSqlBackendResponse;
+                for (page.rows, 0..) |input, weight_index| {
+                    const weight = try page.weight(weight_index).clone(a);
+                    try self.engine.context.checkpoint();
+                    const projected = (try self.plan.project(a, self.engine.context, input, slots)) orelse continue;
+                    try rows.append(a, projected);
+                    try weights.append(a, weight);
+                    if (page.aggregate_inputs) |arguments| try inputs.append(a, if (arguments[weight_index]) |argument| try argument.clone(a) else null);
+                }
+                self.done = page.after == null;
+                var result = try catalog.Page.counted(a, rows.items, weights.items, try a.dupe(usize, slots), if (self.done) null else "weighted");
+                result.aggregate_inputs = if (page.aggregate_inputs != null) inputs.items else null;
+                return result;
+            }
+            fn prepareWindow(self: *WeightedReader) !void {
+                const Cursor = @import("result_cursor.zig").Cursor;
+                const query = self.plan.source.operation.query;
+                var context = self.engine.context;
+                context.binding = query.binding;
+                context.binding.relation = null;
+                const limit = try context.count(query.statement.limit, context.limits.scan_rows);
+                var skip = try context.offsetCount(query.statement.offset);
+                if (limit > context.limits.scan_rows or skip > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                const capacity = std.math.add(usize, skip, limit) catch return error.InvalidSqlLimit;
+                const cursor = if (context.spill) |manager| try Cursor.create(context.alloc, manager, self.plan.source.columns.len + 1) else try Cursor.createMemory(context.alloc, self.plan.source.columns.len + 1, context.limits.retained_bytes / 4);
+                errdefer cursor.close();
+                const Sink = struct {
+                    cursor: *Cursor,
+                    a: Allocator,
+                    fn append(ptr: *anyopaque, values: []const Datum, weight: usize) !void {
+                        const state: *@This() = @ptrCast(@alignCast(ptr));
+                        const stored = try state.a.alloc(Datum, values.len + 1);
+                        defer state.a.free(stored);
+                        @memcpy(stored[0..values.len], values);
+                        stored[values.len] = Datum.json(.{ .integer = @intCast(weight) });
+                        try Cursor.append(state.cursor, stored);
+                    }
+                };
+                var sink: Sink = .{ .cursor = cursor, .a = context.alloc };
+                const orders = try context.arena.alloc(operators.Order, query.binding.order_keys.len);
+                for (query.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
+                var top: ?operators.TopK = if (orders.len != 0) try operators.TopK.initWithSpill(context.alloc, capacity, orders, context.limits.retained_bytes / 4, context.spill) else null;
+                defer if (top) |*operator| operator.deinit();
+                var arena = std.heap.ArenaAllocator.init(context.alloc);
+                defer arena.deinit();
+                var emitted: usize = 0;
+                var ordinal: usize = 0;
+                while (limit != 0) {
+                    _ = arena.reset(.retain_capacity);
+                    const a = arena.allocator();
+                    var page = try self.left.?.next(a, context.limits.executionRows());
+                    defer page.deinit();
+                    for (page.rows, page.multiplicities.?) |input, weight| {
+                        try context.checkpoint();
+                        const cells = try query.binding.scalars.cells(a, input);
+                        if (!try query.binding.scalars.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
+                        var selected_weight: usize = 0;
+                        if (top == null) {
+                            const discarded = @min(skip, weight);
+                            skip -= discarded;
+                            selected_weight = @intCast(@min(weight - discarded, limit - emitted));
+                            // SQL does not evaluate an unordered projection
+                            // for rows discarded by OFFSET or LIMIT.
+                            if (selected_weight == 0) continue;
+                        }
+                        const values = try a.alloc(Datum, query.statement.columns.len);
+                        for (query.statement.columns, query.binding.columns, values, 0..) |column, definition, *value, i| {
+                            const program = if (i < query.binding.scalars.projections.len) query.binding.scalars.projections[i] else null;
+                            const cell = if (program) |p| try context.evaluate(a, p, cells) else try input.cell(column.field);
+                            value.* = try describe.coerceDatum(a, cell, definition.type, definition.element_type);
+                        }
+                        if (top) |*operator| {
+                            const keys = try a.alloc(Datum, orders.len);
+                            for (query.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
+                                .output => |i| values[i],
+                                .column => |column| try describe.coerceDatum(a, try input.cell(column.path), column.type, column.element_type),
+                                .expression => |i| try context.evaluate(a, query.binding.scalars.orders[i].?, cells),
+                            };
+                            try operator.addWeighted(.{ .values = values, .keys = keys, .ordinal = ordinal }, weight);
+                            ordinal += 1;
+                        } else {
+                            try Sink.append(&sink, values, selected_weight);
+                            emitted += selected_weight;
+                            if (emitted == limit) break;
+                        }
+                    }
+                    if (page.after == null or (top == null and emitted == limit)) break;
+                }
+                if (top) |*operator| try operator.drainWeightedBags(context.alloc, skip, limit, false, .{ .ptr = &sink, .append = Sink.append });
+                self.window_cursor = cursor;
+            }
+            fn raw(self: *WeightedReader, a: Allocator, limit: u32) anyerror!catalog.Page {
+                if (self.done) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
+                if (self.fallback and self.ordinary == null) self.ordinary = try Iterator.create(self.engine, self.plan.source);
+                if (self.ordinary) |iterator| {
+                    if (self.pending_error) |err| return err;
+                    var failure: ?anyerror = null;
+                    const batch = try iterator.nextBatch(a, limit, &failure);
+                    if (batch.len() == 0) if (failure) |err| return err;
+                    self.pending_error = failure;
+                    const rows = try a.alloc(catalog.Row, batch.len());
+                    for (rows, 0..) |*output, index| {
+                        const values = try a.alloc(Datum, self.plan.source.columns.len);
+                        for (values, 0..) |*value, column| value.* = try operators.cloneDatum(a, try batch.cell(a, index, column));
+                        output.* = try row(a, self.plan.source.columns, values);
+                    }
+                    const weights = try a.alloc(u64, rows.len);
+                    @memset(weights, 1);
+                    return .{ .rows = rows, .multiplicities = weights, .aggregate_slots = self.slots, .after = if (rows.len != 0 or failure != null) "ordinary" else null };
+                }
+                switch (self.plan.terminal) {
+                    .ordinary => unreachable,
+                    .scan => {
+                        const scan = self.plan.source.operation.scan;
+                        const cursor = self.engine.cursors[scan.index];
+                        var page = try cursor.next(cursor.ptr, a, limit);
+                        defer page.deinit();
+                        try page.validateWeights();
+                        if (page.rows.len > limit or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
+                        self.engine.visited += page.rows.len;
+                        if ((page.aggregate_slots != null) != self.tagged) return error.InvalidSqlBackendResponse;
+                        const weights = page.multiplicities orelse return error.InvalidSqlBackendResponse;
+                        const rows = try a.alloc(catalog.Row, page.rows.len);
+                        for (page.rows, rows) |input, *output| {
+                            const values = try a.alloc(Datum, self.plan.source.columns.len);
+                            for (scan.source_columns, self.plan.source.columns, values) |name, column, *value| {
+                                const cell = try @import("joined_mutation.zig").cell(a, input, name);
+                                value.* = try operators.cloneDatum(a, try describe.coerceDatum(a, cell, column.type, column.element_type));
+                            }
+                            output.* = try row(a, self.plan.source.columns, values);
+                        }
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .exact_multiplicities = try page.cloneWeights(a), .aggregate_inputs = try page.cloneAggregateInputs(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots orelse self.slots), .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                    },
+                    .replay => {
+                        var rows: std.ArrayList(catalog.Row) = .empty;
+                        var weights: std.ArrayList(catalog.Count) = .empty;
+                        while (rows.items.len < limit) {
+                            const bag = try self.replay_reader.?.nextWeighted() orelse break;
+                            try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, bag.values)));
+                            try weights.append(a, try bag.count.clone(a));
+                        }
+                        return catalog.Page.counted(a, rows.items, weights.items, self.slots, if (rows.items.len == limit) "replay" else null);
+                    },
+                    .union_all => {
+                        const child = if (!self.left.?.done) self.left.? else self.right.?;
+                        var page = try child.next(a, limit);
+                        defer page.deinit();
+                        const rows = try a.alloc(catalog.Row, page.rows.len);
+                        for (page.rows, rows) |input, *output| {
+                            const values = try a.alloc(Datum, self.plan.source.columns.len);
+                            for (child.node().columns, self.plan.source.columns, values) |source, target, *value| {
+                                value.* = try describe.coerceDatum(a, try input.cell(source.internal), target.type, target.element_type);
+                            }
+                            output.* = try row(a, self.plan.source.columns, values);
+                        }
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .exact_multiplicities = try page.cloneWeights(a), .aggregate_inputs = try page.cloneAggregateInputs(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
+                    },
+                    .window => {
+                        if (self.window_cursor == null) try self.prepareWindow();
+                        var rows: std.ArrayList(catalog.Row) = .empty;
+                        var weights: std.ArrayList(catalog.Count) = .empty;
+                        while (rows.items.len < limit) {
+                            const values = try self.window_cursor.?.next(a) orelse break;
+                            const weight = values[values.len - 1];
+                            if (weight.sql_null or weight.value != .integer or weight.value.integer <= 0) return error.InvalidSqlBackendResponse;
+                            try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values[0 .. values.len - 1])));
+                            try weights.append(a, catalog.Count.init(@intCast(weight.value.integer)));
+                        }
+                        return catalog.Page.counted(a, rows.items, weights.items, self.slots, if (rows.items.len == limit) "window" else null);
+                    },
+                    .cross => |join| {
+                        const operation = self.plan.source.operation.join;
+                        const graph_outer = operation.kind == .full or (operation.kind == .left and join.graph_left) or (operation.kind == .right and !join.graph_left);
+                        const build_outer = operation.kind == .full or (operation.kind == .left and !join.graph_left) or (operation.kind == .right and join.graph_left);
+                        if (!self.singleton_ready) {
+                            // Build the pinned dimension before advancing the
+                            // graph. HashJoin owns admitted memory and spills;
+                            // temporary decoded rows never accumulate in the
+                            // statement arena.
+                            if (operation.membership != null) {
+                                self.membership_index = try operators.TupleMembership.create(self.engine.context.alloc, operation.right_keys.len, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes / 16, .work = self.engine.context.limits.scan_rows *| 64 }, .{ .ptr = self.engine, .call = Iterator.membershipCheckpoint });
+                            } else if (!join.factor_only) {
+                                self.join_hash = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes / 16, .spill = self.engine.context.spill });
+                            }
+                            var page_arena = std.heap.ArenaAllocator.init(self.engine.context.alloc);
+                            defer page_arena.deinit();
+                            var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
+                            defer scratch.deinit();
+                            while (true) {
+                                _ = page_arena.reset(.free_all);
+                                var build_page = try self.right.?.next(page_arena.allocator(), @min(self.engine.context.limits.page_rows, 256));
+                                defer build_page.deinit();
+                                for (build_page.rows, 0..) |build_row, build_index| {
+                                    const build_weight = build_page.weight(build_index);
+                                    _ = scratch.reset(.free_all);
+                                    const temporary = scratch.allocator();
+                                    const values = try temporary.alloc(Datum, join.singleton.columns.len);
+                                    for (join.singleton.columns, values) |column, *value| value.* = try build_row.cell(column.internal);
+                                    try self.engine.checkpoint();
+                                    if (self.side_count >= self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                                    self.side_count += 1;
+                                    if (join.factor_only) self.side_weight = try (try self.combineWeight(self.side_weight, build_weight, true, self.slots)).clone(self.engine.context.arena);
+                                    if (join.factor_only) continue;
+                                    const programs = if (join.graph_left) operation.right_keys else operation.left_keys;
+                                    const keys = try temporary.alloc(Datum, programs.len);
+                                    for (programs, keys) |program, *key| key.* = try self.engine.context.evaluate(temporary, program, values);
+                                    if (self.membership_index) |index| {
+                                        const correlations = operation.membership.?.correlations;
+                                        const null_correlation = for (keys[0..correlations]) |key| {
+                                            if (key.sql_null) break true;
+                                        } else false;
+                                        if (!null_correlation) try index.add(keys);
+                                    } else {
+                                        // Two unsigned 32-bit limbs survive Datum's signed
+                                        // integer codec, including the overflow sentinel.
+                                        const payload = try temporary.alloc(Datum, values.len + 2);
+                                        @memcpy(payload[0..values.len], values);
+                                        if (build_weight.exact()) |small| {
+                                            payload[values.len] = Datum.json(.{ .integer = @intCast(small >> 32) });
+                                            payload[values.len + 1] = Datum.json(.{ .integer = @intCast(small & 0xffffffff) });
+                                        } else {
+                                            payload[values.len] = Datum.json(.{ .string = try build_weight.text(temporary) });
+                                            payload[values.len + 1] = .{};
+                                        }
+                                        try self.join_hash.?.add(payload, keys);
+                                    }
+                                }
+                                if (build_page.after == null) break;
+                            }
+                            if (self.membership_index) |index| try index.seal();
+                            self.right.?.deinit();
+                            self.singleton_ready = true;
+                        }
+                        var rows: std.ArrayList(catalog.Row) = .empty;
+                        var weights: std.ArrayList(catalog.Count) = .empty;
+                        if (self.graph_done) {
+                            if (build_outer) while (rows.items.len < limit) {
+                                const match = try self.join_hash.?.unmatched(&self.unmatched_index) orelse break;
+                                const side = try match.materializeValues(a);
+                                const values = try a.alloc(Datum, self.plan.source.columns.len);
+                                @memset(values, .{});
+                                for (self.plan.source.columns, values) |column, *value| {
+                                    for (join.singleton.columns, 0..) |source, i| if (std.mem.eql(u8, source.internal, column.internal)) {
+                                        value.* = try operators.cloneDatum(a, side[i]);
+                                        break;
+                                    };
+                                }
+                                try rows.append(a, try row(a, self.plan.source.columns, values));
+                                try weights.append(a, try buildWeight(a, side));
+                            };
+                            return catalog.Page.counted(a, rows.items, weights.items, self.slots, if (rows.items.len == limit) "unmatched" else null);
+                        }
+                        if (self.side_count == 0 and !graph_outer and operation.membership == null) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
+                        if (self.cross_page == null) {
+                            if (self.cross_arena == null) self.cross_arena = std.heap.ArenaAllocator.init(self.engine.context.alloc);
+                            _ = self.cross_arena.?.reset(.retain_capacity);
+                            self.cross_page = try self.left.?.next(self.cross_arena.?.allocator(), limit);
+                            self.cross_row = 0;
+                        }
+                        const page = &self.cross_page.?;
+                        while (self.cross_row < page.rows.len and rows.items.len < limit) {
+                            try self.engine.checkpoint();
+                            if (self.join_scratch == null) self.join_scratch = .init(self.engine.context.alloc);
+                            _ = self.join_scratch.?.reset(.retain_capacity);
+                            const candidate = self.join_scratch.?.allocator();
+                            const input = page.rows[self.cross_row];
+                            const graph_values = try candidate.alloc(Datum, self.left.?.node().columns.len);
+                            for (self.left.?.node().columns, graph_values) |column, *value| value.* = try input.cell(column.internal);
+                            if (self.membership_index) |index| {
+                                const keys = try candidate.alloc(Datum, operation.left_keys.len);
+                                for (operation.left_keys, keys) |program, *key| key.* = try self.engine.context.evaluate(candidate, program, graph_values);
+                                const null_correlation = for (keys[0..operation.membership.?.correlations]) |key| {
+                                    if (key.sql_null) break true;
+                                } else false;
+                                const truth = if (null_correlation) .no else try index.probe(keys);
+                                const values = try candidate.alloc(Datum, graph_values.len + 1);
+                                @memcpy(values[0..graph_values.len], graph_values);
+                                values[graph_values.len] = switch (truth) {
+                                    .yes => Datum.json(.{ .bool = true }),
+                                    .no => Datum.json(.{ .bool = false }),
+                                    .unknown => .{},
+                                };
+                                try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values)));
+                                try weights.append(a, try page.weight(self.cross_row).clone(a));
+                                self.cross_row += 1;
+                                continue;
+                            }
+                            var single: ?[]const Datum = null;
+                            var match_index: ?usize = null;
+                            if (self.join_hash) |hash| {
+                                if (self.join_probe == null) {
+                                    const temporary = self.cross_arena.?.allocator();
+                                    const programs = if (join.graph_left) operation.left_keys else operation.right_keys;
+                                    const keys = try temporary.alloc(Datum, programs.len);
+                                    for (programs, keys) |program, *key| key.* = try self.engine.context.evaluate(temporary, program, graph_values);
+                                    self.join_probe = try hash.probe(keys);
+                                }
+                                if (try self.join_probe.?.next()) |match| {
+                                    single = try match.materializeValues(candidate);
+                                    match_index = match.index;
+                                }
+                            }
+                            if (!join.factor_only and single == null and (!graph_outer or self.join_matched)) {
+                                self.join_probe = null;
+                                self.join_matched = false;
+                                self.cross_row += 1;
+                                continue;
+                            }
+                            const values = try candidate.alloc(Datum, self.plan.source.columns.len);
+                            for (self.plan.source.columns, values) |column, *value| {
+                                const cell = for (join.singleton.columns, 0..) |source, i| {
+                                    if (std.mem.eql(u8, source.internal, column.internal)) break if (single) |items| items[i] else Datum{};
+                                } else try input.cell(column.internal);
+                                value.* = cell;
+                            }
+                            if (single != null) {
+                                if (operation.condition) |program| {
+                                    const accepted = try self.engine.context.evaluate(candidate, program, values);
+                                    if (accepted.sql_null) continue;
+                                    if (accepted.value != .bool) return error.SqlTypeMismatch;
+                                    if (!accepted.value.bool) continue;
+                                }
+                                self.join_matched = true;
+                                if (build_outer) try self.join_hash.?.markMatched(match_index.?);
+                            }
+                            try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values)));
+                            const weight = page.weight(self.cross_row);
+                            const factor = if (join.factor_only) self.side_weight else if (single) |items| try buildWeight(candidate, items) else catalog.Count.one;
+                            const multiplied = try self.combineWeight(weight, factor, false, page.aggregate_slots.?);
+                            try weights.append(a, try multiplied.clone(a));
+                            if (single == null) {
+                                self.join_probe = null;
+                                self.join_matched = false;
+                                self.cross_row += 1;
+                            }
+                        }
+                        const slots = try a.dupe(usize, page.aggregate_slots.?);
+                        const exhausted = self.cross_row == page.rows.len;
+                        const done = exhausted and page.after == null;
+                        if (exhausted) {
+                            page.deinit();
+                            self.cross_page = null;
+                        }
+                        self.graph_done = done;
+                        return catalog.Page.counted(a, rows.items, weights.items, slots, if (done and !build_outer) null else "cross");
+                    },
+                }
+            }
+        };
+
         const Adapter = struct {
             engine: *Self,
             iterator: *Iterator,
@@ -2613,14 +3417,25 @@ fn Engine(comptime Context: type) type {
             ordinal: u64 = 0,
             opened: bool = false,
             pending_failure: ?anyerror = null,
+            weighted: bool = false,
+            partitioned: bool = false,
+            weighted_reader: ?*WeightedReader = null,
+            requested_fields: ?[]const []const u8 = null,
+            ordered: []const catalog.Scan.Order = &.{},
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
-                if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
+                // A distributed relation already owns its join. This shortcut may
+                // inspect local build/probe children only for local iterators.
+                if (self.opened or self.iterator.remote_join != null or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
                 const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
+                const fields = try self.engine.context.arena.alloc([]const u8, self.iterator.node.columns.len);
+                for (self.iterator.node.columns, fields) |column, *field| field.* = column.internal;
+                if (try @import("weighted_relation.zig").Plan.init(self.engine.context.arena, self.iterator.node, &.{.{ .fields = fields, .multiplicity = .exact }}, self.engine.cursors)) |weighted_plan|
+                    if (WeightedReader.hasProducer(self.engine, weighted_plan)) return null;
                 const build_side: u1 = if (self.iterator.flipped_join) 0 else 1;
                 if (!try self.iterator.right.?.sampleReduction(plan.keys[build_side])) return null;
                 const cursor = try @import("join_aggregate.zig").open(a, self.engine, self.iterator, plan);
@@ -2681,15 +3496,99 @@ fn Engine(comptime Context: type) type {
                 self.ordinal += batch.len();
                 return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
             }
-            fn open(ptr: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            fn untouched(self: *Adapter) bool {
+                return self.ordinal == 0 and self.pending_failure == null and self.iterator.pages == 0 and
+                    !self.iterator.apply_mode and self.iterator.recursive_id == null;
+            }
+            fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (!self.untouched()) return false;
+                const a = self.engine.context.arena;
+                const fields = self.requested_fields orelse blk: {
+                    const names = try a.alloc([]const u8, self.iterator.node.columns.len);
+                    for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
+                    break :blk names;
+                };
+                const plan = (try @import("weighted_relation.zig").Plan.init(a, self.iterator.node, &.{.{ .fields = fields, .multiplicity = multiplicity }}, self.engine.cursors)) orelse return false;
+                const reader = try WeightedReader.create(self.engine, plan);
+                if (!reader.compressed) {
+                    reader.deinit();
+                    return false;
+                }
+                self.weighted_reader = reader;
+                self.weighted = true;
+                return self.weighted;
+            }
+            fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *operators.Grouped) !bool {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (!self.untouched()) return false;
+                const plan = (try @import("weighted_relation.zig").Plan.initWithParameters(self.engine.context.arena, self.iterator.node, requests, self.engine.cursors, self.engine.context.parameters)) orelse return false;
+                if (plan.terminal != .scan) return false;
+                for (plan.physical) |request| if (request.observer == null) return false;
+                const cursor = self.engine.cursors[plan.source.operation.scan.index];
+                const enable = cursor.enable_groups orelse return false;
+                return enable(cursor.ptr, plan.physical, orders, grouped);
+            }
+            fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (!self.untouched()) return false;
+                const plan = (try @import("weighted_relation.zig").Plan.initWithParameters(self.engine.context.arena, self.iterator.node, requests, self.engine.cursors, self.engine.context.parameters)) orelse return false;
+                const reader = try WeightedReader.create(self.engine, plan);
+                if (!reader.compressed) {
+                    reader.deinit();
+                    return false;
+                }
+                self.weighted_reader = reader;
+                self.partitioned = true;
+                self.weighted = true;
+                return true;
+            }
+            fn nextWeighted(self: *Adapter, a: Allocator, limit: u32) !catalog.Page {
+                const reader = self.weighted_reader orelse return error.InvalidSqlBackendResponse;
+                self.iterator.pages += 1;
+                if (self.iterator.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                const wanted: u32 = @intCast(@min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + reader.plan.width * @sizeOf(Datum) * 16))));
+                var page = try reader.next(a, wanted);
+                const rows = try a.dupe(catalog.Row, page.rows);
+                page.rows = rows;
+                for (rows) |*output| {
+                    self.ordinal += 1;
+                    output.id = try std.fmt.allocPrint(a, "{d}", .{self.ordinal});
+                }
+                if (!self.partitioned) page.aggregate_slots = null;
+                if (page.after != null) page.after = try std.fmt.allocPrint(a, "weighted:{d}", .{self.iterator.pages});
+                return page;
+            }
+            fn countRows(ptr: *anyopaque) !?u64 {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                // Only an untouched physical scan is transparent to exact
+                // cardinality. Filters, joins, derived projections and other
+                // operators must retain their own row/error semantics.
+                if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return null;
+                const scan_node = self.iterator.node.operation.scan;
+                const cursor = self.engine.cursors[scan_node.index];
+                return if (cursor.count_rows) |count_rows| try count_rows(cursor.ptr) else null;
+            }
+            fn open(ptr: *anyopaque, _: Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened) return error.InvalidSqlBackendResponse;
                 self.opened = true;
-                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .close = close };
+                self.requested_fields = try self.engine.context.arena.dupe([]const u8, request.fields);
+                const ordered = request.order.len != 0 and request.order.len == self.ordered.len and same: {
+                    for (request.order, self.ordered) |requested, known| {
+                        if (!std.mem.eql(u8, requested.column, known.column) or requested.descending != known.descending or requested.nulls_first != known.nulls_first) break :same false;
+                    }
+                    break :same true;
+                };
+                return .{ .order_satisfied = ordered, .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_groups = enableGroups, .enable_aggregate_weights = enableAggregateWeights, .close = close };
             }
-            fn close(_: *anyopaque) void {}
+            fn close(ptr: *anyopaque) void {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.weighted_reader) |reader| reader.deinit();
+            }
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.weighted) return self.nextWeighted(alloc, limit);
                 // Row adapters share the same memory-aware demand ceiling as
                 // typed pages; an aggregate does not need oversized row pages.
                 const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
@@ -2737,7 +3636,64 @@ fn Source(comptime Context: type) type {
             if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
-            const scans = try bindSearchScans(search_arena.allocator(), relation.scans, context.parameters);
+            var scans = try bindSearchScans(search_arena.allocator(), try outerGraphScans(search_arena.allocator(), relation, context.binding.scalars.predicate), context.parameters);
+            // A transparent graph scan preserves its physical cursor's order.
+            // Negotiate before capturing the statement cut; never reopen a
+            // captured cursor or propagate order through joins/derived errors.
+            var ordered: []const catalog.Scan.Order = &.{};
+            var ordered_scan: ?usize = null;
+            if (context.statement_capture == null and context.backend.vtable.supports_scan_order and context.binding.aggregate == null and context.binding.window == null and !relation.statement.count_all) negotiate: {
+                const requested = try describe.scanOrder(context.arena, context.binding, relation.statement);
+                if (requested.len == 0) break :negotiate;
+                const physical = try search_arena.allocator().alloc(catalog.Scan.Order, requested.len);
+                var scan_index: ?usize = null;
+                for (requested, physical) |key, *out| {
+                    const index = for (relation.root.columns, 0..) |column, index| {
+                        if (std.mem.eql(u8, column.internal, key.column)) break index;
+                    } else break :negotiate;
+                    const origin = binding.scanColumn(relation.root, index) orelse break :negotiate;
+                    if (scan_index) |known| if (known != origin.scan_index) break :negotiate;
+                    scan_index = origin.scan_index;
+                    out.* = key;
+                    out.column = origin.name;
+                }
+                const index = scan_index orelse break :negotiate;
+                if (scans[index].table.graph == null) break :negotiate;
+                const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
+                changed[index].request.order = physical;
+                // A costing row_goal is never a source cap. Grant a separate
+                // exact-prefix proof across identity frames and a completely
+                // consumed predicate, without fallible outputs or cardinality observers.
+                license: {
+                    if (relation.statement.limit == null or relation.statement.scalar_cardinality_limit or binding.rowPreservingScan(relation.root) != index) break :license;
+                    for (context.binding.scalars.projections) |program| if (program) |value| {
+                        if (value.instructions.len != 1 or value.root != 0) break :license;
+                        switch (value.instructions[0].operation) {
+                            .column, .literal => {},
+                            else => break :license,
+                        }
+                    };
+                    if (context.binding.scalars.predicate) |program| {
+                        const certificate = (try binding.orderedGraphPredicate(search_arena.allocator(), relation.root, program, index)) orelse break :license;
+                        const filter = bindGraphPredicate(search_arena.allocator(), certificate, context.parameters) catch |err| {
+                            if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) break :license;
+                            return err;
+                        };
+                        changed[index].request.exact_graph_filter = filter;
+                    } else if (relation.statement.predicate != null) break :license;
+                    const request = changed[index].request;
+                    if (request.primary_key != null or request.after != null or request.graph_source_ordinals) break :license;
+                    if (request.exact_graph_filter == null and (request.conditions.len != 0 or request.graph_filters.len != 0 or request.graph_conditions.len != 0 or request.graph_predicates.len != 0)) break :license;
+                    const skip = self.engine.context.offsetCount(relation.statement.offset) catch break :license;
+                    const limit = self.engine.context.count(relation.statement.limit, std.math.maxInt(usize)) catch break :license;
+                    const maximum = skip +| limit;
+                    if (maximum == 0 or maximum > context.limits.scan_rows) break :license;
+                    changed[index].request.ordered_window = maximum;
+                }
+                ordered_scan = index;
+                scans = changed;
+                ordered = requested;
+            }
             if (scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);
@@ -2751,6 +3707,9 @@ fn Source(comptime Context: type) type {
                     self.single_list[0] = self.single.?;
                     self.engine.cursors = &self.single_list;
                 } else return error.SqlStatementSnapshotRequired;
+            }
+            if (ordered_scan) |index| {
+                if (self.engine.cursors[index].order_satisfied) self.engine.ordered_scan = index else ordered = &.{};
             }
             const Estimate = struct {
                 fn rows(raw: *anyopaque, node: *const binding.Node) ?u64 {
@@ -2783,11 +3742,14 @@ fn Source(comptime Context: type) type {
                 break :fallback relation.root;
             };
             self.iterator = try Engine(Context).Iterator.create(&self.engine, root);
-            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
+            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table, .ordered = ordered };
             return self;
         }
         fn close(self: *Self) void {
-            if (self.iterator) |iterator| iterator.deinit();
+            if (self.iterator) |iterator| {
+                if (self.adapter.weighted_reader) |reader| reader.deinit();
+                iterator.deinit();
+            }
             self.engine.deinit();
             if (self.read) |read| read.close(read.ptr);
             if (self.single) |cursor| cursor.close(cursor.ptr);
@@ -2802,6 +3764,22 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.nextColumns(&self.adapter, alloc, limit);
         }
+        fn enableWeights(raw: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.enableWeights(&self.adapter, multiplicity);
+        }
+        fn enableGroups(raw: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *operators.Grouped) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.enableGroups(&self.adapter, requests, orders, grouped);
+        }
+        fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.enableAggregateWeights(&self.adapter, requests);
+        }
+        fn countRows(raw: *anyopaque) !?u64 {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.countRows(&self.adapter);
+        }
         fn closeCursor(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));
             self.close();
@@ -2811,7 +3789,7 @@ fn Source(comptime Context: type) type {
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
     const owner = try Source(@TypeOf(context)).create(context);
-    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .enable_weights = @TypeOf(owner.*).enableWeights, .enable_groups = @TypeOf(owner.*).enableGroups, .enable_aggregate_weights = @TypeOf(owner.*).enableAggregateWeights, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
@@ -3795,4 +4773,211 @@ test "native projection refinements benchmark hybrid JSON projections" {
         try std.testing.expect(after.peak < before.peak);
         std.debug.print("HYBRID_JSON_PROJECTION sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_scalar_reads={d} after_scalar_reads={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.reads, after.reads });
     }
+}
+
+test "transparent graph relations forward order requests and certificates through SQL execution" {
+    const Fixture = struct {
+        position: usize = 0,
+        examined: usize = 0,
+        certify: bool,
+        negotiated: bool = false,
+        window: ?u64 = null,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn graph(_: *anyopaque, a: Allocator, definition: @import("ast.zig").GraphTable) !catalog.Table {
+            const graph_binding = try a.create(catalog.graph_relation.Binding);
+            graph_binding.* = .{ .catalog_json = "{}", .definition = definition, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{}, .relationships = &.{} }, .dependencies = &.{} };
+            return .{ .id = 1, .physical_name = "graph", .schema_version = 1, .graph = graph_binding, .columns = &.{.{ .name = "score", .path = "score", .type = .integer }} };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.negotiated = request.order.len == 1 and std.mem.eql(u8, request.order[0].column, "score") and request.order[0].descending and request.order[0].nulls_first;
+            self.position = 0;
+            self.window = request.ordered_window;
+            return .{ .ptr = self, .next = next, .close = close, .order_satisfied = self.negotiated and self.certify };
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const maximum = if (self.certify and self.negotiated) self.window orelse 13000 else 13000;
+            const end = @min(maximum, self.position + limit);
+            const rows = try a.alloc(catalog.Row, end - self.position);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{"score"});
+            for (rows, self.position..) |*row_value, index| row_value.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(if (self.certify and self.negotiated) 12999 - index else index) })});
+            self.examined += rows.len;
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < maximum) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_][]const u8{
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0 ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score IS NOT NULL ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score IS NULL OR g.score IS NOT NULL ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score IS NOT NULL AND g.score>=0 ORDER BY g.score DESC LIMIT 5",
+        "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d WHERE d.s>=0 AND d.s<13000 ORDER BY d.s DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0 OR g.score IN (1,2,NULL) ORDER BY g.score DESC LIMIT 5",
+        "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d ORDER BY d.s DESC LIMIT 5",
+        "SELECT d.score FROM (SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0) d ORDER BY d.score DESC LIMIT 5",
+    }) |text| for ([_]bool{ true, false }) |certify| {
+        var fixture: Fixture = .{ .certify = certify };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_graph = Fixture.graph, .supports_scan_order = true, .scan = SetTestBackend.scan, .open_scan = Fixture.open, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expect(fixture.negotiated);
+        try std.testing.expectEqual(@as(?u64, if (std.mem.indexOf(u8, text, "WHERE g.score>=0) d") == null) 5 else null), fixture.window);
+        if (fixture.examined != (if (certify) @as(usize, 5) else 13000)) std.debug.print("graph scan examined={d} certified={} window={any}: {s}\n", .{ fixture.examined, certify, fixture.window, text });
+        try std.testing.expectEqual(@as(usize, if (certify) 5 else 13000), fixture.examined);
+        try std.testing.expectEqual(@as(usize, 5), result.output.rows.len);
+        for (result.output.rows, 0..) |row_values, index| {
+            const cell = row_values[0];
+            const actual = if (cell == .integer) cell.integer else try std.fmt.parseInt(i64, if (cell == .number_string) cell.number_string else cell.string, 10);
+            try std.testing.expectEqual(@as(i64, @intCast(12999 - index)), actual);
+        }
+    };
+}
+
+test "SQL scalar observer admission survives filtered identity frames" {
+    const Fixture = struct {
+        negotiated: bool = false,
+        text: []const u8,
+        position: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn graph(_: *anyopaque, a: Allocator, definition: @import("ast.zig").GraphTable) !catalog.Table {
+            const graph_binding = try a.create(catalog.graph_relation.Binding);
+            graph_binding.* = .{ .catalog_json = "{}", .definition = definition, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{}, .relationships = &.{} }, .dependencies = &.{} };
+            return .{ .id = 1, .physical_name = "graph", .schema_version = 1, .graph = graph_binding, .columns = &.{.{ .name = "score", .path = "score", .type = .integer }} };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = next, .close = close, .enable_aggregate_weights = enable };
+        }
+        fn filter(input: catalog.Scan.GraphFilter) !void {
+            switch (input) {
+                .comparison => |condition| try std.testing.expectEqualStrings("score", condition.column),
+                .all, .any => |children| for (children) |child| try filter(child),
+            }
+        }
+        fn enable(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (requests.len == 1 and requests[0].observer == null) {
+                // Ordinary weight negotiation retries after the provider
+                // declines the complete three-observer plan.
+                try std.testing.expect(self.negotiated);
+                return false;
+            }
+            try std.testing.expectEqual(@as(usize, 3), requests.len);
+            for (requests) |request| {
+                if (request.observer == null or request.observer_filter == null) std.debug.print("missing observer={any} field={s} filter={any}: {s}\n", .{ request.observer, request.observer_field orelse "<none>", request.observer_filter, self.text });
+                try std.testing.expect(request.observer != null);
+                try std.testing.expectEqualStrings("score", request.observer_field.?);
+                try std.testing.expect(request.observer_filter != null);
+                try filter(request.observer_filter.?);
+            }
+            self.negotiated = true;
+            // A provider may decline. SQL still applies its original predicate.
+            return false;
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(3, self.position + limit);
+            const rows = try a.alloc(catalog.Row, end - self.position);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{"score"});
+            for (rows, self.position..) |*row, i| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(i) })});
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < 3) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_][]const u8{
+        "SELECT count(DISTINCT score),min(score),max(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score>=1",
+        "SELECT count(DISTINCT s),min(s),max(s) FROM (SELECT score AS s FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score>=1) d WHERE s=1 OR s=2",
+        "SELECT count(DISTINCT score),min(score),max(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score>= $1",
+        "SELECT count(DISTINCT score),min(score),max(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score IS NULL OR score>=1",
+    }) |text| {
+        var fixture: Fixture = .{ .text = text };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_graph = Fixture.graph, .scan = SetTestBackend.scan, .open_scan = Fixture.open, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, if (std.mem.indexOf(u8, text, "$1") != null) &.{.{ .integer = 1 }} else &.{}, .{});
+        defer result.deinit();
+        if (!fixture.negotiated) std.debug.print("not negotiated: {s}\n", .{text});
+        try std.testing.expect(fixture.negotiated);
+        for (result.output.rows[0], [_][]const u8{ "2", "1", "2" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual.string);
+    }
+}
+
+test "distributed SQL sampled remote children replay before batch and scalar pulls" {
+    const Runtime = @import("runtime.zig");
+    const Fixture = struct {
+        count: usize,
+        position: usize = 0,
+        pulls: usize = 0,
+        duplicate: bool,
+        cells: [256][2]Datum = undefined,
+        rows: [256][]const Datum = undefined,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn next(raw: *anyopaque, _: Allocator, maximum: usize) !@import("execution_batch.zig").Batch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pulls += 1;
+            const count = @min(maximum, self.count - self.position);
+            for (0..count) |index| {
+                const ordinal = self.position + index;
+                self.cells[index] = .{ Datum.json(.{ .integer = @intCast(if (self.duplicate) ordinal / 10 else ordinal) }), Datum.json(.{ .integer = @intCast(ordinal) }) };
+                self.rows[index] = &self.cells[index];
+            }
+            self.position += count;
+            return .{ .rows = self.rows[0..count] };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 3, 300 }) |total| for ([_]bool{ false, true }) |duplicate| for ([_]bool{ false, true }) |scalar_pull| {
+        var fixture: Fixture = .{ .count = total, .duplicate = duplicate };
+        var source = std.heap.ArenaAllocator.init(a);
+        defer source.deinit();
+        const node: binding.Node = .{ .columns = &.{}, .operation = .{ .prepared_rows = &.{} } };
+        var engine: Engine(Runtime.Context) = .{ .context = .{ .alloc = a, .arena = source.allocator(), .backend = .{ .ptr = &fixture, .vtable = &.{ .checkpoint = Fixture.checkpoint, .resolve = undefined, .scan = undefined, .mutate = undefined } }, .binding = undefined, .parameters = &.{}, .limits = .{} }, .cursors = &.{}, .cache_arena = .init(a) };
+        defer engine.deinit();
+        const iterator = try Engine(Runtime.Context).Iterator.create(&engine, &node);
+        defer iterator.deinit();
+        iterator.remote_join = .{ .ptr = &fixture, .next = Fixture.next, .close = Fixture.close };
+        const reduced = try iterator.sampleReduction(&.{0});
+        try std.testing.expectEqual(total != 0 and duplicate, reduced);
+        const sample_count = @min(total, 128);
+        try std.testing.expectEqual(sample_count, fixture.position);
+        if (sample_count > 0 and !scalar_pull) {
+            for (0..3) |fail_index| {
+                var failed_work = std.heap.ArenaAllocator.init(a);
+                defer failed_work.deinit();
+                var failing = std.testing.FailingAllocator.init(failed_work.allocator(), .{ .fail_index = fail_index });
+                try std.testing.expectError(error.OutOfMemory, iterator.nextBatch(failing.allocator(), 7, null));
+                try std.testing.expectEqual(@as(usize, 0), iterator.sampled_index);
+                try std.testing.expectEqual(@as(usize, 1), fixture.pulls);
+            }
+        }
+        var index: usize = 0;
+        while (true) {
+            if (scalar_pull) {
+                const row = try iterator.next(source.allocator()) orelse break;
+                try std.testing.expectEqual(@as(i64, @intCast(index)), row[1].value.integer);
+                index += 1;
+            } else {
+                const batch = try iterator.nextBatch(source.allocator(), 7, null);
+                if (batch.len() == 0) break;
+                for (0..batch.len()) |row| {
+                    try std.testing.expectEqual(@as(i64, @intCast(index)), (try batch.cell(source.allocator(), row, 1)).value.integer);
+                    index += 1;
+                }
+            }
+            if (index <= sample_count) try std.testing.expectEqual(@as(usize, 1), fixture.pulls);
+        }
+        try std.testing.expectEqual(total, index);
+    };
 }

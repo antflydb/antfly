@@ -81,7 +81,7 @@ static void load_bridge(void) {
     }
     if (!bridge_handle) return;
     uint32_t (*abi_version)(void) = (uint32_t (*)(void))dlsym(bridge_handle, "antfly_apple_bridge_abi_version");
-    if (!abi_version || abi_version() != 1) { load_status = 15; return; }
+    if (!abi_version || abi_version() != 2) { load_status = 15; return; }
     invoke_bridge = (antfly_apple_invoke_fn)dlsym(bridge_handle, "antfly_apple_invoke");
     load_status = invoke_bridge ? 0 : 15;
     // Intentionally never dlclose, even on ABI failure. The Swift runtime may

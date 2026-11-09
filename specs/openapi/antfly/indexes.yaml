@@ -223,6 +223,11 @@ components:
         checksum:
           type: string
           description: Static checksum recorded as source version metadata.
+        checksum_algorithm:
+          type: string
+          enum: [sha256]
+          description: |-
+            Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
         version:
           type: string
           description: Static source version. Together with the other metadata it lets extraction skip unchanged sources.
@@ -281,7 +286,7 @@ components:
           description: Row field holding the source ETag.
         checksum_field:
           type: string
-          description: Row field holding the source checksum.
+          description: Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field.
         version_field:
           type: string
           description: Row field holding the source version.
@@ -427,6 +432,17 @@ components:
       type: object
       description: How PDF pages are rasterized for OCR.
       properties:
+        sampling:
+          type: string
+          enum: [auto, pdf, smooth]
+          default: auto
+          description: |-
+            PDF image sampling, separate from model resizing and normalization.
+            `auto` smooths continuous-tone images while preserving one-bit scan
+            coverage during minification. `pdf` honors the PDF's interpolation
+            declarations. `smooth` uses bilinear sampling even for one-bit images
+            (except stencil masks), which can soften fine lines. Effective policy,
+            version, resolution, DPI and geometry are recorded in unit provenance.
         dpi:
           type: integer
           minimum: 72
@@ -775,7 +791,12 @@ components:
       properties:
         decider:
           $ref: "config.yaml#/components/schemas/DeciderConfig"
-          description: Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+          description: >-
+            Frozen typed, generated or cascade decider configuration. Standalone generated
+            verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds
+            to probabilistic stages and require categorical zero-or-one terminal verdicts. A
+            cascade answer is validated against the stage that produced it, and the receipt
+            keeps the response's stage trace.
         template:
           type: string
           minLength: 1
@@ -1058,6 +1079,10 @@ components:
         template: { type: string }
         source_artifact_name: { type: string }
         expected_dims: { type: integer, minimum: 0 }
+        embedding_input:
+          type: string
+          enum: [text, pdf_page_images]
+          description: Effective embedding input mode; PDF pages are rasterized before embedding.
         vector_space:
           type: string
           minLength: 1
@@ -1080,6 +1105,7 @@ components:
         publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
         external: { type: boolean, default: false }
+        external_vector_space: { type: string }
         sparse: { type: boolean, default: false }
         dimension: { type: integer, minimum: 1 }
         field: { type: string }
@@ -1295,6 +1321,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor)."
+        embedding_input:
+          type: string
+          enum: [text, pdf_page_images]
+          default: text
+          description: pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -2223,6 +2254,11 @@ components:
           type: boolean
           default: false
           description: "When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template."
+        external_vector_space:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: "Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model."
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -5429,9 +5465,11 @@ components:
         edges. A fixed
         single-hop relationship preserves physical self-loops and may bind two
         distinct aliases to the same node identity. Variable-length expansion
-        uses node-simple paths: a (table, key) identity is visited at most once
-        within one expanded edge path, except when closing onto an already bound
-        target alias for an explicit cycle. Exact distributed and serverless
+        uses Cypher relationship-simple trails: nodes may repeat, but the same
+        physical relationship cannot be reused anywhere within one MATCH group.
+        Each optional group has its own relationship scope. Parallel relationship
+        IDs remain distinct. A zero-hop path binds both endpoints to the same
+        node identity without reading an edge. Exact distributed and serverless
         execution rejects planner-required reverse variable expansion when the
         source tables of unnamed intermediate nodes cannot be proven. Express
         cross-table multi-hop patterns as explicit single-hop edges with a
@@ -5452,12 +5490,12 @@ components:
           description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
         min_hops:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 64
           default: 1
         max_hops:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 64
           default: 1
         edge_weight:

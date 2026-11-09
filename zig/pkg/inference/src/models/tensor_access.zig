@@ -41,6 +41,7 @@ pub const Descriptor = struct {
 const OnnxSpec = struct {
     path: []const u8,
     prefix: []const u8,
+    external_base_dir: ?[]const u8 = null,
 };
 
 pub const Record = struct {
@@ -317,7 +318,7 @@ pub const OnnxInitializerAccess = struct {
         var specs = std.ArrayListUnmanaged(OnnxSpec).empty;
         defer specs.deinit(allocator);
 
-        try appendUniqueOnnxSpec(allocator, &specs, manifest.onnx_path);
+        if (manifest.onnx_path) |path| try specs.append(allocator, .{ .path = path, .prefix = defaultOnnxPrefix(manifest.onnx_logical_path orelse path), .external_base_dir = if (manifest.onnx_logical_path) |logical| std.fs.path.dirname(logical) else null });
         try appendUniqueOnnxSpecWithPrefix(allocator, &specs, manifest.visual_model_path, "vision_model.");
         try appendUniqueOnnxSpecWithPrefix(allocator, &specs, manifest.audio_model_path, "audio_model.");
         try appendUniqueOnnxSpecWithPrefix(allocator, &specs, manifest.text_projection_path, "text_projection.");
@@ -347,7 +348,7 @@ pub const OnnxInitializerAccess = struct {
         for (specs.items, 0..) |spec, file_index| {
             const path = try allocator.dupe(u8, spec.path);
             errdefer allocator.free(path);
-            const base_dir = try allocator.dupe(u8, std.fs.path.dirname(spec.path) orelse ".");
+            const base_dir = try allocator.dupe(u8, spec.external_base_dir orelse std.fs.path.dirname(spec.path) orelse ".");
             errdefer allocator.free(base_dir);
             const prefix = try allocator.dupe(u8, spec.prefix);
             errdefer allocator.free(prefix);
@@ -688,15 +689,6 @@ pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.Mod
         return access.tensorAccess();
     }
     return error.NoTensorStoreFound;
-}
-
-fn appendUniqueOnnxSpec(
-    allocator: std.mem.Allocator,
-    specs: *std.ArrayListUnmanaged(OnnxSpec),
-    maybe_path: ?[]const u8,
-) !void {
-    const path = maybe_path orelse return;
-    try appendUniqueOnnxSpecWithPrefix(allocator, specs, path, defaultOnnxPrefix(path));
 }
 
 fn appendUniqueOnnxSpecWithPrefix(

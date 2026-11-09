@@ -19,6 +19,7 @@ const std = @import("std");
 pub const enabled = @import("engine_selection.zig").enabled;
 const db = @import("db/db.zig");
 const DB = db.DB;
+const graph_mod = @import("../graph/graph.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("db/types.zig");
 const BatchProfile = db.BatchProfile;
@@ -27,6 +28,7 @@ const SearchWithDenseProfileResult = db.SearchWithDenseProfileResult;
 const SearchWithCapturedRequestResult = db.SearchWithCapturedRequestResult;
 const schema_mod = @import("schema.zig");
 const OpenOptions = db.OpenOptions;
+pub const session_contract = @import("read_session_contract.zig");
 const native = @import("antfly_runtime_abi").native_abi;
 const callback = @import("antfly_runtime_abi").callback_abi;
 pub const Failure = @import("native_outcome.zig").Failure;
@@ -44,6 +46,58 @@ pub const PortableExportOptions = struct {
 };
 
 pub const VTable = struct {
+    hasPublicationReadLease: *const fn ([]const u8, ?native.IoBorrow) Outcome(bool),
+    acquirePublicationReadLease: *const fn (Allocator, []const u8, ?native.IoBorrow) Outcome(?@import("read_session_values.zig").PublicationReadLease),
+    openCypherPinnedRelationalSession: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(session_contract.Handle),
+    openCypherPinnedDocumentSession: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(session_contract.Handle),
+    materializeRestoreSourceDecoder: *const fn (*const @import("db/generation_lifecycle.zig").StagedGeneration, Allocator, native.IoBorrow, []const u8, OpenOptions, @import("restore_decoder_contract.zig").Plan) Outcome(void),
+    enqueueGeneratedArtifactCatalog: *const fn (*DB) Outcome(void),
+    captureQueryCutAtStatementFence: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request, fence: session_contract.Handle, cancellation: types.CancellationToken) Outcome(void),
+    releaseStatementQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request) Outcome(void),
+    graphEdgesForCypherPageAt: *const fn (
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        cursor: ?graph_mod.CypherEdgeScanCursor,
+        limits: graph_mod.EdgePageLimits,
+        ttl_now_ns: u64,
+    ) Outcome(graph_mod.CypherEdgePage),
+    graphEdgesForCypherPageAuthorizedAt: *const fn (
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        cursor: ?graph_mod.CypherEdgeScanCursor,
+        limits: graph_mod.EdgePageLimits,
+        ttl_now_ns: u64,
+        principal_proof: []const u8,
+        database: []const u8,
+    ) Outcome(graph_mod.CypherEdgePage),
+    graphEdgesForCypherCapturePageAuthorizedAt: *const fn (self: *DB, fence: session_contract.Handle, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) Outcome(graph_mod.CypherEdgePage),
+    cypherDocumentScanOptions: *const fn (self: *DB, alloc: Allocator, input: types.ScanOptions) Outcome(types.ScanOptions),
+    acquireCypherReadAuthority: *const fn (self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) Outcome(DB.CypherReadLease),
+    permitsCypherDocument: *const fn (self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) Outcome(bool),
+    cypherFieldDerivedEdgeType: *const fn (self: *const DB, index_name: []const u8, edge_type: []const u8) Outcome(bool),
+    getCypherPinnedDocument: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, types.LookupOptions) Outcome(?types.LookupResult),
+    getCypherDocuments: *const fn (*DB, Allocator, []const []const u8, types.ScanOptions, u64) Outcome([]?types.LookupResult),
+    getCypherPinnedDocuments: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const []const u8, types.ScanOptions) Outcome([]?types.LookupResult),
+    captureCypherSelectedSnapshot: *const fn (*DB, Allocator, session_contract.Handle, []const []const u8, u64, types.CancellationToken) Outcome(DB.CypherPinnedSnapshot),
+    captureCypherPinnedSnapshot: *const fn (*DB, Allocator, session_contract.Handle, @import("cypher").catalog.Graph, []const u8) Outcome(DB.CypherPinnedSnapshot),
+    visitCypherDocuments: *const fn (*DB, Allocator, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
+    visitCypherPinnedDocuments: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
+    scanCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(types.ScanResult),
+    cypherAdjacencyRoutes: *const fn (*DB, Allocator) Outcome([]const @import("cypher").backend.AdjacencyRoute),
+    cypherPinnedAdjacencyRoutes: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot) Outcome([]const @import("cypher").backend.AdjacencyRoute),
+    graphEdgesForCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, []const []const u8, graph_mod.EdgeDirection, ?graph_mod.CypherEdgeScanCursor, graph_mod.EdgePageLimits) Outcome(graph_mod.CypherEdgePage),
+    cypherPinnedSnapshotDeinit: *const fn (*DB.CypherPinnedSnapshot) Outcome(void),
+    cypherGraphIndexIdentity: *const fn (self: *const DB, alloc: Allocator, index_name: []const u8) Outcome(?@import("cypher").catalog.IndexIdentity),
+    hasRetainedQueryCut: *const fn (self: *const DB) Outcome(bool),
+    searchCypherCut: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) Outcome(types.SearchResult),
     portableExportToWriterWithOptions: *const fn (Allocator, *@import("docstore.zig").DocStore, WriterBorrow, PortableExportOptions) Outcome(void),
     openVerifiedRestoreSource: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) Outcome(DB),
     restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, cancellation: types.CancellationToken) Outcome(void),
@@ -76,8 +130,8 @@ pub const VTable = struct {
     sourcePinReconcileReleasedWithBudget: *const fn (db: *DB, budget: @import("db/source_pin_gc.zig").Budget) Outcome(@import("db/source_pin_gc.zig").Work),
     writeCorruptEmbeddingArtifactInDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, doc_key: []const u8, index_name: []const u8) Outcome(bool),
     writeConfigureRestoreOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, bootstrap: @import("db/restore_staging_contract.zig").OwnerBootstrap, allow_canceled: bool, hot_standby_replay: bool) Outcome(void),
-    writeCreateManagedDbEnrichments: *const fn (allocator: std.mem.Allocator, raw_indexes_json: []const u8, runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, local_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, source_table: []const u8, store: ?*@import("../common/secrets.zig").FileStore, remote: ?*const @import("write.zig").scraping.RemoteContentConfig) Outcome(@import("write.zig").ManagedDbEnrichmentSet),
-    writeReconfigureManagedDbEnrichmentRuntime: *const fn (ignored_allocator: std.mem.Allocator, db: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) Outcome(void),
+    writeCreateManagedDbEnrichments: *const fn (allocator: std.mem.Allocator, raw_indexes_json: []const u8, runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, local_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, inference_api_key: ?[]const u8, source_table: []const u8, store: ?*@import("../common/secrets.zig").FileStore, remote: ?*const @import("write.zig").scraping.RemoteContentConfig) Outcome(@import("write.zig").ManagedDbEnrichmentSet),
+    writeReconfigureManagedDbEnrichmentRuntime: *const fn (ignored_allocator: std.mem.Allocator, db: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, inference_api_key: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) Outcome(void),
     writePrepareManagedSchemaBeforeIndexLoad: *const fn (alloc: std.mem.Allocator, mode: @import("../api/write_contract.zig").ManagedDbOpenMode, schema_json: ?[]const u8) Outcome(?@import("db/mod.zig").SchemaBeforeIndexLoad),
     writeOpenManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions: *const fn (alloc: std.mem.Allocator, path: []const u8, indexes_json: []const u8, lsm_cache: ?*@import("lsm_backend/mod.zig").Cache, hbc_cache: ?*@import("hbc_adapter.zig").Cache, lsm_root_generation: u64, resource_manager: ?*@import("resource_manager.zig").ResourceManager, mode: @import("../api/write_contract.zig").ManagedDbOpenMode, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, identity_namespace: ?@import("db/doc_identity.zig").Namespace, options: @import("write.zig").ManagedDbOpenOptions) Outcome(@import("db/mod.zig").DB),
     writeLoadLocalTableSchemaJson: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB) Outcome(?[]u8),
@@ -92,18 +146,18 @@ pub const VTable = struct {
     writeValidateTableBatchAgainstLocalSchema: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, writes: []const @import("db/mod.zig").types.BatchWrite, deletes: []const []const u8, transforms: []const @import("db/mod.zig").types.DocumentTransform) Outcome(void),
     writeApplyLocalTableSchemaJson: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, schema_json: []const u8) Outcome(void),
     writePrepareOwnerSchemaBeforeIndexLoad: *const fn (alloc: std.mem.Allocator, schema_json: []const u8) Outcome(?@import("db/mod.zig").SchemaBeforeIndexLoad),
-    writeConfigureStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(void),
-    writeConfigureStorageKernelOwnerDbAtOpen: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: bool) Outcome(bool),
+    writeConfigureStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(void),
+    writeConfigureStorageKernelOwnerDbAtOpen: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: u8) Outcome(bool),
     writeOpenStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, path: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) Outcome(@import("db/mod.zig").DB),
     writeRepairStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, group_id: u64, schema_json: []const u8, indexes_json: []const u8, cancellation: @import("db/mod.zig").types.CancellationToken) Outcome(void),
-    writeReconcileStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, target_index_name: ?[]const u8, advance_index_repair: bool, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult),
+    writeReconcileStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, target_index_name: ?[]const u8, advance_index_repair: bool, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult),
     writeRepairStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, target_index_name: ?[]const u8, advance_index_repair: bool, options: @import("db/mod.zig").types.ArtifactRepairRunOptions) Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult),
     writeValidateProvisionedDbIdentityNamespaceWithPolicy: *const fn (expected: ?@import("db/doc_identity.zig").Namespace, validation: @import("../api/write_contract.zig").StartupCatchUpMetadata.IdentityValidation, db: *const @import("db/mod.zig").DB) Outcome(void),
     writeBatchUsesDurableTransactionContract: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, req: @import("db/mod.zig").types.BatchRequest) Outcome(bool),
     writeTransactionUsesDurableContract: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, txn_id: @import("db/mod.zig").types.TxnId) Outcome(bool),
     writeApplyGraphMetricActionToDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, index_name: []const u8, metric_name: []const u8, action: []const u8) Outcome(@import("db/mod.zig").types.GraphMetricStatus),
     writeRunGraphMetricMaintenanceOrActionJsonAlloc: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, body: []const u8) Outcome([]u8),
-    writeReconfigureManagedDbEnrichmentRuntimePaused: *const fn (ignored_allocator: std.mem.Allocator, db: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) Outcome(void),
+    writeReconfigureManagedDbEnrichmentRuntimePaused: *const fn (ignored_allocator: std.mem.Allocator, db: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, inference_api_key: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) Outcome(void),
     writeExportPortableBackupFileWithSource: *const fn (alloc: std.mem.Allocator, store: *@import("db/mod.zig").docstore.DocStore, path: []const u8, io: native.IoBorrow, sealed: ?@import("write.zig").PortableCohortSource) Outcome(void),
     managedDbEnrichmentSetDeinit: *const fn (*@import("write.zig").ManagedDbEnrichmentSet, Allocator) Outcome(void),
     nativeBackupSnapshotDeinit: *const fn (*@import("write.zig").NativeBackupShardSnapshot, Allocator) Outcome(void),
@@ -150,7 +204,7 @@ pub const VTable = struct {
     importPortableRestoreFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, options: PortableRestoreImportOptions) Outcome(void),
     importPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, target_identity: @import("db/doc_identity.zig").Namespace) Outcome(void),
     importCohortPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, proof: @import("portable_backup.zig").CohortProof, cancellation: types.CancellationToken) Outcome(void),
-    openRelationalReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(*DB.RelationalReadSession),
+    openRelationalReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(session_contract.Handle),
     search: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest) Outcome(types.SearchResult),
     searchWithCapturedRequest: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest) Outcome(db.SearchWithCapturedRequestResult),
     preflightSearchRequest: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, max_work: u32) Outcome(@import("db/query/search_exec.zig").RuntimePreflightSummary),
@@ -158,7 +212,6 @@ pub const VTable = struct {
     relationalTopologyStatus: *const fn (*DB) Outcome(DB.RelationalTopologyStatus),
     failGraphMetricPlannedBuild: *const fn (*DB, Allocator, []const u8, []const u8, []const u8) Outcome(types.GraphMetricStatus),
     runDenseArtifactRebuildMaintenanceWithProgress: *const fn (*DB, Allocator, ?*anyopaque, ?db.ReplayProgressHook, @import("named_callback.zig").Dispatch) Outcome(bool),
-    queryReadLeaseRelease: *const fn (*DB.QueryReadLease) Outcome(void),
 
     authorizeOfflineVectorMigrationCandidate: *const fn (self: *DB, stage: *const @import("db/generation_lifecycle.zig").StagedGeneration) Outcome(void),
     setQueryVisibilityHook: *const fn (self: *DB, hook: ?db.QueryVisibilityHook) Outcome(void),
@@ -260,9 +313,9 @@ pub const VTable = struct {
     completeSplitBootstrap: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, base_delta_sequence: u64, marker: @import("db/range_state.zig").SplitBootstrapMarker) Outcome(bool),
     split: *const fn (self: *DB, curr_range: types.ByteRange, split_key: []const u8, dest_dir1: []const u8, dest_dir2: []const u8, prepare_only: bool) Outcome(void),
     drainSnapshotMaintenance: *const fn (self: *DB, deadline_ns: u64) Outcome(void),
-    sealBackupCohort: *const fn (self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) Outcome(@import("db/native_backup_seal.zig").Handle),
-    exportBackupCohort: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, id: []const u8, cancellation: types.CancellationToken) Outcome(u64),
-    exportBackupCohortPortable: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: WriterBorrow, options: PortableExportOptions, cancellation: types.CancellationToken) Outcome(void),
+    sealBackupCohort: *const fn (self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) Outcome(@import("db/native_backup_seal_contract.zig").Handle),
+    exportBackupCohort: *const fn (self: *DB, handle: @import("db/native_backup_seal_contract.zig").Handle, id: []const u8, cancellation: types.CancellationToken) Outcome(u64),
+    exportBackupCohortPortable: *const fn (self: *DB, handle: @import("db/native_backup_seal_contract.zig").Handle, writer: WriterBorrow, options: PortableExportOptions, cancellation: types.CancellationToken) Outcome(void),
     mergeDocumentsPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
     mergeCleanupKeysPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
     repairVerifiedPrimarySnapshot: *const fn (alloc: std.mem.Allocator, staged: *const @import("db/generation_lifecycle.zig").StagedGeneration, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt, root_generation: u64) Outcome(void),
@@ -328,39 +381,16 @@ pub const VTable = struct {
     generatedCoverageReplayNeeded: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(bool),
     generatedCoverageRecoveryOwnedByInitialBuild: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(bool),
     ensureGeneratedCoverageRecoveryIntents: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(usize),
-    beginQueryReadLease: *const fn (self: *DB) Outcome(DB.QueryReadLease),
+    beginQueryReadLease: *const fn (self: *DB) Outcome(DB.QueryReadLease.Protocol.Handle),
     searchRequestAtCurrentIdentityGeneration: *const fn (self: *DB, req: types.SearchRequest) Outcome(types.SearchRequest),
     graphHasIncomingEdgesForInternalReadBoundedAt: *const fn (self: *DB, alloc: std.mem.Allocator, index_name: []const u8, keys: []const []const u8, expected: @import("db/catalog/index_manager.zig").IndexManager.CoverageIdentity, identity_read_generation: ?u64, ttl_now_ns: u64, max_scanned_rows: usize) Outcome(@import("../graph/graph.zig").GraphIndex.IncomingProbeResult),
     catchUpPendingDerivedReplayWithProgress: *const fn (*DB, *anyopaque, db.ReplayProgressHook, @import("named_callback.zig").Dispatch) Outcome(void),
-    relationalSnapshotDeinit: *const fn (*DB.RelationalStatementSnapshot) Outcome(void),
-    statementFenceRelease: *const fn (*DB.StatementReadFence) Outcome(void),
-    documentRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, u32) Outcome(DB.DocumentRows),
-    documentRowsLookupProjectedBatch: *const fn (*DB.DocumentRows, []const []const u8, []const []const u8, usize) Outcome(DB.DocumentRows.ProjectedBatch),
-    documentRowsLookupBatch: *const fn (*DB.DocumentRows, []const []const u8, usize) Outcome(DB.DocumentRows.Batch),
-    documentRowsLookup: *const fn (*DB.DocumentRows, []const u8) Outcome([]const u8),
-    documentRowsReleasePage: *const fn (*DB.DocumentRows) Outcome(void),
-    documentRowsDeinit: *const fn (*DB.DocumentRows) Outcome(void),
-    relationalRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, []const []const u8, u32) Outcome(@import("db/relational_rows.zig").Reader),
-    relationalReaderDeinit: *const fn (self: *@import("db/relational_rows.zig").Reader) Outcome(void),
-    relationalReaderNextPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
-    relationalReaderNextTypedPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
-    relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
-    relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
-    relationalSessionDeinit: *const fn (session: *@import("db/relational_read_session.zig").Session) Outcome(void),
-    relationalSessionCheckpoint: *const fn (session: *const @import("db/relational_read_session.zig").Session) Outcome(void),
-    relationalSessionRangeProofs: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) Outcome([]@import("range_protection.zig").Proof),
-    relationalSessionNextTypedPage: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
-    relationalSessionNormalizeRows: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite) Outcome([]types.BatchWrite),
-    documentSessionDeinit: *const fn (self: *@import("db/document_rows.zig").Session) Outcome(void),
-    documentSessionRangeProofs: *const fn (self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator) Outcome([]@import("range_protection.zig").Proof),
-    documentSessionNormalizeRows: *const fn (self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) Outcome([]types.BatchWrite),
-    documentSessionNext: *const fn (self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, limit: u32) Outcome(@import("relational_read_view.zig").View.Page),
-    captureRelationalStatementSnapshot: *const fn (self: *DB) Outcome(DB.RelationalStatementSnapshot),
-    beginRelationalRows: *const fn (self: *DB, alloc: std.mem.Allocator, request: @import("db/relational_rows.zig").Request) Outcome(@import("db/relational_rows.zig").Reader),
-    openDocumentReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(*DB.DocumentReadSession),
-    openRelationalReadSessionAtSnapshot: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) Outcome(*DB.RelationalReadSession),
-    tryStatementReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
-    tryEmbeddedBackupReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
+    captureRelationalStatementSnapshot: *const fn (self: *DB) Outcome(session_contract.Statement),
+    beginRelationalRows: *const fn (self: *DB, alloc: std.mem.Allocator, request: @import("read_reader_values.zig").Request) Outcome(session_contract.Handle),
+    openDocumentReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(session_contract.Handle),
+    openRelationalReadSessionAtSnapshot: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?session_contract.Handle) Outcome(session_contract.Handle),
+    tryStatementReadFence: *const fn (self: *DB) Outcome(?@import("read_session_contract.zig").Handle),
+    tryEmbeddedBackupReadFence: *const fn (self: *DB) Outcome(?@import("read_session_contract.zig").Handle),
     catchUpPendingDerivedReplay: *const fn (self: *DB) Outcome(void),
     derivedAsyncAppendDerivedBatchRecord: *const fn (self: *DB, derived_batch: @import("db/derived/derived_types.zig").DerivedBatch) Outcome(u64),
     runDerivedUntil: *const fn (self: *DB, sequence: u64) Outcome(void),
@@ -417,7 +447,7 @@ pub const VTable = struct {
     graphHydrateKeysForInternalRead: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, keys: []const []const u8) Outcome([]types.SearchHit),
     scanVisit: *const fn (*DB, Allocator, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
     trySnapshotDenseSearch: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) Outcome(?db.SearchWithDenseProfileResult),
-    snapshotInternal: *const fn (self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut.zig").Request) Outcome(u64),
+    snapshotInternal: *const fn (self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut_contract.zig").Request) Outcome(u64),
     navigateHierarchyChildren: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest) Outcome(types.SearchResult),
     searchDense: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) Outcome(types.SearchResult),
     searchSparse: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) Outcome(types.SearchResult),
@@ -429,8 +459,8 @@ pub const VTable = struct {
     applyReplicatedDerivedEffect: *const fn (self: *DB, change: @import("db/derived/change_journal.zig").Record, primary: ?@import("db/replication_effects.zig").primary_effect.View, sequence: u64) Outcome(u64),
     applyDocumentArtifactChildRangeBatch: *const fn (self: *DB, child_batch: db.DocumentArtifactChildRangeApplyBatch) Outcome(u64),
     batchNativeInitialChildApply: *const fn (self: *DB, req: types.BatchRequest, receipt: db.OrderedApplyReceipt) Outcome(void),
-    captureQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) Outcome(void),
-    openQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) Outcome(DB),
+    captureQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) Outcome(void),
+    openQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) Outcome(DB),
     runSourcePinCleanupStep: *const fn (self: *DB) Outcome(bool),
     runLsmMaintenanceStepBestEffort: *const fn (self: *DB) Outcome(bool),
     getDocumentArtifactManifest: *const fn (self: *DB, alloc: std.mem.Allocator, doc_key: []const u8, artifact_name: []const u8) Outcome(?types.DocumentArtifactManifest),
@@ -492,7 +522,6 @@ pub const VTable = struct {
     batchInternal: *const fn (*DB, types.BatchRequest, ?*BatchProfile, BatchExecutionOptions) Outcome(void),
     searchWithDenseProfile: *const fn (*DB, Allocator, types.SearchRequest) Outcome(SearchWithDenseProfileResult),
     searchWithCapturedRequestAndExecutionContext: *const fn (*DB, Allocator, types.SearchRequest, types.ExecutionContext) Outcome(SearchWithCapturedRequestResult),
-    searchLease: *const fn (DB.QueryReadLease, Allocator, types.SearchRequest) Outcome(SearchWithDenseProfileResult),
     sync: *const fn (*DB, bool) Outcome(void),
     syncIndexes: *const fn (*DB, bool) Outcome(void),
     snapshot: *const fn (*DB, []const u8) Outcome(u64),
@@ -528,7 +557,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 29,
+    version: u32 = 38,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -538,12 +567,45 @@ pub const Descriptor = extern struct {
     resource_manager_layout: native.TypeContract,
     prepared_owner_layout: native.TypeContract,
     prepared_allocator_layout: native.TypeContract,
+    prepared_commit_disposition_layout: native.TypeContract,
+    prepared_commit_disposition_state_layout: native.TypeContract,
     embedding_memo_layout: native.TypeContract,
     async_context_layout: native.TypeContract,
     enrichment_runtime_layout: native.TypeContract,
-    relationalReader_layout: native.TypeContract,
-    relationalSession_layout: native.TypeContract,
-    documentSession_layout: native.TypeContract,
+    read_session_release_layout: native.TypeContract,
+    read_reader_typed_cells_layout: native.TypeContract,
+    read_reader_datum_layout: native.TypeContract,
+    read_numeric_value_layout: native.TypeContract,
+    read_numeric_kind_layout: native.TypeContract,
+    read_array_value_layout: native.TypeContract,
+    read_array_dimension_layout: native.TypeContract,
+    read_array_element_type_layout: native.TypeContract,
+    read_array_stored_view_layout: native.TypeContract,
+    read_array_stored_validation_layout: native.TypeContract,
+    read_session_handle_layout: native.TypeContract,
+    retained_query_lease_layout: native.TypeContract,
+    publication_read_lease_layout: native.TypeContract,
+    query_read_lease_handle_layout: native.TypeContract,
+    query_read_lease_operations_layout: native.TypeContract,
+    read_reader_request_layout: native.TypeContract,
+    read_reader_filter_layout: native.TypeContract,
+    read_reader_hydrated_layout: native.TypeContract,
+    read_reader_typed_layout: native.TypeContract,
+    read_reader_ordinal_view_layout: native.TypeContract,
+    document_source_kind_layout: native.TypeContract,
+    document_source_layout: native.TypeContract,
+    document_field_layout: native.TypeContract,
+    document_batch_layout: native.TypeContract,
+    document_projected_batch_layout: native.TypeContract,
+    read_session_kind_layout: native.TypeContract,
+    read_session_budget_layout: native.TypeContract,
+    read_session_operations_layout: native.TypeContract,
+    restore_decoder_plan_layout: native.TypeContract,
+    restore_decoder_format_layout: native.TypeContract,
+    relational_page_layout: native.TypeContract,
+    relational_row_layout: native.TypeContract,
+    read_view_page_layout: native.TypeContract,
+    read_view_row_layout: native.TypeContract,
 
     index_manager_layout: native.TypeContract,
     index_manager_fields: [*]const FieldLayout,
@@ -628,6 +690,7 @@ test "logical query engine allocator normalization preserves custom quotas" {
 }
 
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
+    @setEvalBranchQuota(100_000);
     const descriptor = antfly_storage_engine_get_descriptor_v29();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
@@ -661,7 +724,7 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
             break :blk BackupPlan{ .value = plan, .io = io };
         } else value;
     }
-    const outcome = try Boundary.call(name, descriptor.dispatch, method, wire_args);
+    const outcome = try Boundary.callRemote(name, descriptor.dispatch, method, wire_args);
     if (outcome.failure.ptr) |ptr| return @import("storage_engine_errors").fromName(ptr[0..outcome.failure.len]);
     return outcome.value;
 }
@@ -670,19 +733,52 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 29 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 38 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
         !descriptor.resource_manager_layout.matches(resource_manager_layout) or
         !descriptor.prepared_owner_layout.matches(prepared_owner_layout) or
         !descriptor.prepared_allocator_layout.matches(prepared_allocator_layout) or
+        !descriptor.prepared_commit_disposition_layout.matches(prepared_commit_disposition_layout) or
+        !descriptor.prepared_commit_disposition_state_layout.matches(prepared_commit_disposition_state_layout) or
         !descriptor.embedding_memo_layout.matches(embedding_memo_layout) or
         !descriptor.async_context_layout.matches(async_context_layout) or
         !descriptor.enrichment_runtime_layout.matches(enrichment_runtime_layout) or
-        !descriptor.relationalReader_layout.matches(relationalReader_layout) or
-        !descriptor.relationalSession_layout.matches(relationalSession_layout) or
-        !descriptor.documentSession_layout.matches(documentSession_layout) or
+        !descriptor.read_session_release_layout.matches(read_session_release_layout) or
+        !descriptor.read_reader_typed_cells_layout.matches(read_reader_typed_cells_layout) or
+        !descriptor.read_reader_datum_layout.matches(read_reader_datum_layout) or
+        !descriptor.read_numeric_value_layout.matches(read_numeric_value_layout) or
+        !descriptor.read_numeric_kind_layout.matches(read_numeric_kind_layout) or
+        !descriptor.read_array_value_layout.matches(read_array_value_layout) or
+        !descriptor.read_array_dimension_layout.matches(read_array_dimension_layout) or
+        !descriptor.read_array_element_type_layout.matches(read_array_element_type_layout) or
+        !descriptor.read_array_stored_view_layout.matches(read_array_stored_view_layout) or
+        !descriptor.read_array_stored_validation_layout.matches(read_array_stored_validation_layout) or
+        !descriptor.read_session_handle_layout.matches(read_session_handle_layout) or
+        !descriptor.retained_query_lease_layout.matches(retained_query_lease_layout) or
+        !descriptor.publication_read_lease_layout.matches(publication_read_lease_layout) or
+        !descriptor.query_read_lease_handle_layout.matches(query_read_lease_handle_layout) or
+        !descriptor.query_read_lease_operations_layout.matches(query_read_lease_operations_layout) or
+        !descriptor.read_reader_request_layout.matches(read_reader_request_layout) or
+        !descriptor.read_reader_filter_layout.matches(read_reader_filter_layout) or
+        !descriptor.read_reader_hydrated_layout.matches(read_reader_hydrated_layout) or
+        !descriptor.read_reader_typed_layout.matches(read_reader_typed_layout) or
+        !descriptor.read_reader_ordinal_view_layout.matches(read_reader_ordinal_view_layout) or
+        !descriptor.document_source_kind_layout.matches(document_source_kind_layout) or
+        !descriptor.document_source_layout.matches(document_source_layout) or
+        !descriptor.document_field_layout.matches(document_field_layout) or
+        !descriptor.document_batch_layout.matches(document_batch_layout) or
+        !descriptor.document_projected_batch_layout.matches(document_projected_batch_layout) or
+        !descriptor.read_session_kind_layout.matches(read_session_kind_layout) or
+        !descriptor.read_session_budget_layout.matches(read_session_budget_layout) or
+        !descriptor.read_session_operations_layout.matches(read_session_operations_layout) or
+        !descriptor.restore_decoder_plan_layout.matches(restore_decoder_plan_layout) or
+        !descriptor.restore_decoder_format_layout.matches(restore_decoder_format_layout) or
+        !descriptor.relational_page_layout.matches(relational_page_layout) or
+        !descriptor.relational_row_layout.matches(relational_row_layout) or
+        !descriptor.read_view_page_layout.matches(read_view_page_layout) or
+        !descriptor.read_view_row_layout.matches(read_view_row_layout) or
         !descriptor.index_manager_layout.matches(index_manager_layout) or
         !descriptor.algebraic_index_layout.matches(algebraic_index_layout) or
         !descriptor.docstore_layout.matches(docstore_layout) or
@@ -707,6 +803,8 @@ pub const prepared_owner_layout = blk: {
     break :blk native.TypeContract.of(DB.PreparedBatchOwner);
 };
 pub const prepared_allocator_layout = native.TypeContract.of(@import("db/execution_resources.zig").PreparedRowAllocator);
+pub const prepared_commit_disposition_layout = native.TypeContract.of(@import("db/execution_resources.zig").PreparedCommitDisposition);
+pub const prepared_commit_disposition_state_layout = native.TypeContract.of(@import("db/execution_resources.zig").PreparedCommitDisposition.State);
 pub const embedding_memo_layout = native.TypeContract.of(@import("db/execution_resources.zig").GeneratedEmbeddingMemo);
 
 pub const async_context_layout = blk: {
@@ -719,17 +817,67 @@ pub const enrichment_runtime_layout = blk: {
     break :blk native.TypeContract.of(@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime);
 };
 
-pub const relationalReader_layout = blk: {
+// Shared immutable transport values replace private session layout borrows.
+pub const read_session_kind_layout = native.TypeContract.of(session_contract.Kind);
+pub const read_session_budget_layout = native.TypeContract.of(@import("read_session_values.zig").Budget);
+pub const query_read_lease_handle_layout = blk: {
     @setEvalBranchQuota(100_000);
-    break :blk native.TypeContract.of(@import("db/relational_rows.zig").Reader);
+    break :blk native.TypeContract.of(DB.QueryReadLease.Protocol.Handle);
 };
-pub const relationalSession_layout = blk: {
+pub const query_read_lease_operations_layout = blk: {
     @setEvalBranchQuota(100_000);
-    break :blk native.TypeContract.of(@import("db/relational_read_session.zig").Session);
+    break :blk native.TypeContract.of(DB.QueryReadLease.Protocol.Operations);
 };
-pub const documentSession_layout = blk: {
+pub const read_reader_request_layout = blk: {
     @setEvalBranchQuota(100_000);
-    break :blk native.TypeContract.of(@import("db/document_rows.zig").Session);
+    break :blk native.TypeContract.of(@import("read_reader_values.zig").Request);
+};
+pub const read_reader_filter_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_reader_values.zig").RowFilter);
+};
+pub const read_reader_hydrated_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_reader_values.zig").Hydrated);
+};
+pub const read_reader_typed_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_reader_values.zig").TypedLayout);
+};
+pub const read_reader_ordinal_view_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_reader_values.zig").OrdinalRowView);
+};
+pub const publication_read_lease_layout = native.TypeContract.of(@import("read_session_values.zig").PublicationReadLease);
+pub const retained_query_lease_layout = native.TypeContract.of(@import("db/native_query_cut_contract.zig").ReadLease);
+pub const read_session_handle_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(session_contract.Handle);
+};
+pub const read_session_operations_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(session_contract.Operations);
+};
+pub const restore_decoder_format_layout = native.TypeContract.of(@import("restore_decoder_contract.zig").Format);
+pub const restore_decoder_plan_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("restore_decoder_contract.zig").Plan);
+};
+pub const relational_page_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_session_values.zig").Page);
+};
+pub const relational_row_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_session_values.zig").Row);
+};
+pub const read_view_page_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("relational_read_view.zig").View.Page);
+};
+pub const read_view_row_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("relational_read_view.zig").View.Row);
 };
 
 pub const index_manager_layout = blk: {
@@ -788,3 +936,78 @@ pub const native_manifest_layout = blk: {
 };
 
 pub const writer_layout = native.TypeContract.of(std.Io.Writer);
+
+pub const document_source_kind_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_document_values.zig").SourceKind);
+};
+
+pub const document_source_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_document_values.zig").Source);
+};
+
+pub const document_field_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_document_values.zig").FieldValue);
+};
+
+pub const document_batch_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_document_values.zig").Batch);
+};
+
+pub const document_projected_batch_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("read_document_values.zig").ProjectedBatch);
+};
+
+pub const read_session_release_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(session_contract.Release);
+};
+
+pub const read_reader_typed_cells_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../sql/catalog.zig").Row.TypedCells);
+};
+
+pub const read_reader_datum_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../sql/catalog.zig").Row.Cell);
+};
+
+pub const read_numeric_value_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../sql/numeric_value.zig").Value);
+};
+
+pub const read_numeric_kind_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../sql/numeric_value.zig").Kind);
+};
+
+pub const read_array_value_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../sql/array_value.zig").Value);
+};
+
+pub const read_array_dimension_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../sql/array_value.zig").Dimension);
+};
+
+pub const read_array_element_type_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../common/sql_builtin_type.zig").Type);
+};
+
+pub const read_array_stored_view_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../common/sql_array_layout.zig").View);
+};
+
+pub const read_array_stored_validation_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("../common/sql_array_layout.zig").View.Validation);
+};

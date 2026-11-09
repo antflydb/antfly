@@ -14,10 +14,13 @@
 // limitations under the License.
 
 pub const antfly_sources = @import("source_owner_physical.zig");
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 
 test {
     _ = @import("serverless/configured_object_store_support.zig");
     _ = @import("api/lake_ordering_keys.zig");
+    _ = @import("api/lake_owned_serving_test.zig");
+    _ = @import("metadata/lake_source_owner_view.zig");
     _ = @import("api/lake_native_refresh_test.zig");
     _ = @import("serverless/lake_wal.zig");
     _ = @import("serverless/lake_ingestion.zig");
@@ -41,6 +44,10 @@ test {
     _ = @import("api/lake_sql_integration_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
+    _ = @import("api/lake_execution_native_test.zig");
+    _ = @import("api/lake_execution_memory_test.zig");
+    _ = @import("api/lake_execution_s3_test.zig");
+    _ = @import("api/lake_execution_errors.zig");
     _ = @import("api/lake_index_build_replay.zig");
     _ = @import("api/lake_index_publication_builders.zig");
     _ = @import("api/lake_index_build_pipeline.zig");
@@ -114,6 +121,22 @@ test {
 }
 
 comptime {
+    _ = @import("serverless/sql/expression.zig");
+    _ = @import("serverless/sql/state.zig");
+    _ = @import("serverless/sql/plan.zig");
+    _ = @import("serverless/sql/bridge.zig");
+    _ = @import("serverless/sql/lake_source.zig");
+    _ = @import("serverless/sql/runner.zig");
+    _ = @import("serverless/sql/runtime.zig");
+    _ = @import("serverless/sql/runtime_test.zig");
+    _ = @import("serverless/sql/cancellation.zig");
+    _ = @import("serverless/sql/transport.zig");
+    _ = @import("serverless/sql/discovery.zig");
+    _ = @import("common/http/std_http_executor.zig");
+    _ = @import("serverless/sql/routing.zig");
+    _ = @import("serverless/sql/scheduler.zig");
+    _ = @import("serverless/sql/driver.zig");
+    _ = @import("serverless/sql/exchange.zig");
     _ = @import("serverless/lake_snapshot_pins.zig");
     _ = @import("serverless/lake_compaction.zig");
     _ = @import("serverless/lake_vacuum.zig");

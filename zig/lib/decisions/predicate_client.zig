@@ -26,6 +26,7 @@ fn is(value: ?V, expected: []const u8) bool {
     return v == .string and std.mem.eql(u8, v.string, expected);
 }
 pub fn probabilities(row: V, names: []const []const u8, output: []f64) !void {
+    if (@import("cascade.zig").agreementBlocked(row) catch return error.InvalidDecisionResponse) return error.DecisionAbstained;
     if (names.len == 0 or names.len > max_questions or output.len != names.len) return error.InvalidDecisionResponse;
     const answers = field(row, "answers") orelse return error.InvalidDecisionResponse;
     if (answers != .array or answers.array.items.len != names.len) return error.InvalidDecisionResponse;
@@ -97,4 +98,27 @@ test "predicate decoding validates reordered names duplicates and numeric domain
             try std.testing.expectEqualSlices(f64, &.{ 0, 1 }, &scores);
         }
     }
+}
+
+test "predicate convenience clients cannot accept a guarded cascade veto" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var row = try std.json.parseFromSliceLeaky(V, a,
+        \\{"answers":[{"name":"yes","type":"predicate","probability":0.99}]}
+    , .{});
+    var scores: [1]f64 = undefined;
+    for ([_][]const u8{
+        \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["yes"]}
+        ,
+        \\{"agreement_status":"unverified"}
+    }) |metadata| {
+        try row.object.put(a, "cascade", try std.json.parseFromSliceLeaky(V, a, metadata, .{}));
+        try std.testing.expectError(error.DecisionAbstained, probabilities(row, &.{"yes"}, &scores));
+    }
+    try row.object.put(a, "cascade", try std.json.parseFromSliceLeaky(V, a,
+        \\{"agreement_status":"agreed","agreed":true}
+    , .{}));
+    try probabilities(row, &.{"yes"}, &scores);
+    try std.testing.expectEqual(@as(f64, 0.99), scores[0]);
 }
