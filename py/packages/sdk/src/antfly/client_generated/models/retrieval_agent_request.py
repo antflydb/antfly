@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.agent_context_management import AgentContextManagement
     from ..models.agent_decision import AgentDecision
     from ..models.chain_link import ChainLink
     from ..models.chat_message import ChatMessage
@@ -57,6 +58,18 @@ class RetrievalAgentRequest:
                 They cannot be weakened by generated operations.
                  Example: [{'table': 'docs', 'semantic_search': 'How do I configure OAuth?', 'indexes': ['doc_embeddings'],
                 'limit': 10}].
+            context_management (AgentContextManagement | Unset): Opt-in conversation/evidence preparation before agent model
+                calls. The
+                summarizer uses the same GeneratorConfig, secrets and provider dispatch
+                as generation; omitted summarizer inherits the effective generator
+                (the first link when a chain is configured). Summary calls have no
+                fallback or retries and consume the agent's model-call budget.
+                A remote summarizer receives the selected conversation and tool evidence.
+                Input accounting conservatively charges serialized UTF-8 bytes plus
+                framing and tool schemas. Configure windows supported by both models.
+                Failure returns a typed error without replacing authoritative history.
+                Derived memory is request-local; continuations supply authoritative
+                history/research_state and are prepared again. This does not alter KV caches.
             messages (list[ChatMessage] | Unset): Optional conversational context for the current turn. Decisions remain the
                 authoritative continuation input for bounded agent interactions.
             agent_knowledge (str | Unset): Domain-specific knowledge to include in the agent's system prompt.
@@ -126,6 +139,7 @@ class RetrievalAgentRequest:
 
     query: str
     queries: list[QueryRequest]
+    context_management: AgentContextManagement | Unset = UNSET
     messages: list[ChatMessage] | Unset = UNSET
     agent_knowledge: str | Unset = UNSET
     accumulated_filters: list[FilterSpec] | Unset = UNSET
@@ -152,6 +166,10 @@ class RetrievalAgentRequest:
         for queries_item_data in self.queries:
             queries_item = queries_item_data.to_dict()
             queries.append(queries_item)
+
+        context_management: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context_management, Unset):
+            context_management = self.context_management.to_dict()
 
         messages: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.messages, Unset):
@@ -221,6 +239,8 @@ class RetrievalAgentRequest:
                 "queries": queries,
             }
         )
+        if context_management is not UNSET:
+            field_dict["context_management"] = context_management
         if messages is not UNSET:
             field_dict["messages"] = messages
         if agent_knowledge is not UNSET:
@@ -260,6 +280,7 @@ class RetrievalAgentRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.agent_context_management import AgentContextManagement
         from ..models.agent_decision import AgentDecision
         from ..models.chain_link import ChainLink
         from ..models.chat_message import ChatMessage
@@ -278,6 +299,13 @@ class RetrievalAgentRequest:
             queries_item = QueryRequest.from_dict(queries_item_data)
 
             queries.append(queries_item)
+
+        _context_management = d.pop("context_management", UNSET)
+        context_management: AgentContextManagement | Unset
+        if isinstance(_context_management, Unset):
+            context_management = UNSET
+        else:
+            context_management = AgentContextManagement.from_dict(_context_management)
 
         _messages = d.pop("messages", UNSET)
         messages: list[ChatMessage] | Unset = UNSET
@@ -359,6 +387,7 @@ class RetrievalAgentRequest:
         retrieval_agent_request = cls(
             query=query,
             queries=queries,
+            context_management=context_management,
             messages=messages,
             agent_knowledge=agent_knowledge,
             accumulated_filters=accumulated_filters,

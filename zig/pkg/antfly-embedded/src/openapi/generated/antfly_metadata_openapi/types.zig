@@ -13,6 +13,208 @@ const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_sort_openapi = @import("antfly_sort_openapi");
 const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
 
+/// Summary usage is separate from destination generation usage; retries are always zero.
+pub const AgentContextDiagnostics = struct {
+    contract_version: ?i64 = null,
+    original_input_tokens: ?i64 = null,
+    effective_input_tokens: ?i64 = null,
+    retained_messages: ?i64 = null,
+    compacted_messages: ?i64 = null,
+    batches: ?i64 = null,
+    retries: ?i64 = null,
+    summary_input_tokens: ?i64 = null,
+    summary_output_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "contract_version", "contract_version", true },
+        .{ "original_input_tokens", "original_input_tokens", true },
+        .{ "effective_input_tokens", "effective_input_tokens", true },
+        .{ "retained_messages", "retained_messages", true },
+        .{ "compacted_messages", "compacted_messages", true },
+        .{ "batches", "batches", true },
+        .{ "retries", "retries", true },
+        .{ "summary_input_tokens", "summary_input_tokens", true },
+        .{ "summary_output_tokens", "summary_output_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.contract_version) |value| {
+            try jw.objectField("contract_version");
+            try jw.write(value);
+        }
+        if (self.original_input_tokens) |value| {
+            try jw.objectField("original_input_tokens");
+            try jw.write(value);
+        }
+        if (self.effective_input_tokens) |value| {
+            try jw.objectField("effective_input_tokens");
+            try jw.write(value);
+        }
+        if (self.retained_messages) |value| {
+            try jw.objectField("retained_messages");
+            try jw.write(value);
+        }
+        if (self.compacted_messages) |value| {
+            try jw.objectField("compacted_messages");
+            try jw.write(value);
+        }
+        if (self.batches) |value| {
+            try jw.objectField("batches");
+            try jw.write(value);
+        }
+        if (self.retries) |value| {
+            try jw.objectField("retries");
+            try jw.write(value);
+        }
+        if (self.summary_input_tokens) |value| {
+            try jw.objectField("summary_input_tokens");
+            try jw.write(value);
+        }
+        if (self.summary_output_tokens) |value| {
+            try jw.objectField("summary_output_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const AgentContextEvent = struct {
+    counting_method: []const u8,
+    latency_ms: i64,
+    summary_provider: ?[]const u8 = null,
+    summary_model: ?[]const u8 = null,
+    diagnostics: AgentContextDiagnostics,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "counting_method", "counting_method", false },
+        .{ "latency_ms", "latency_ms", false },
+        .{ "summary_provider", "summary_provider", true },
+        .{ "summary_model", "summary_model", true },
+        .{ "diagnostics", "diagnostics", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("counting_method");
+        try jw.write(self.counting_method);
+        try jw.objectField("latency_ms");
+        try jw.write(self.latency_ms);
+        if (self.summary_provider) |value| {
+            try jw.objectField("summary_provider");
+            try jw.write(value);
+        }
+        if (self.summary_model) |value| {
+            try jw.objectField("summary_model");
+            try jw.write(value);
+        }
+        try jw.objectField("diagnostics");
+        try jw.write(self.diagnostics);
+        try jw.endObject();
+    }
+};
+
+/// Opt-in conversation/evidence preparation before agent model calls. The summarizer uses the same GeneratorConfig, secrets and provider dispatch as generation; omitted summarizer inherits the effective generator (the first link when a chain is configured). Summary calls have no fallback or retries and consume the agent's model-call budget. A remote summarizer receives the selected conversation and tool evidence. Input accounting conservatively charges serialized UTF-8 bytes plus framing and tool schemas. Configure windows supported by both models. Failure returns a typed error without replacing authoritative history. Derived memory is request-local; continuations supply authoritative history/research_state and are prepared again. This does not alter KV caches.
+pub const AgentContextManagement = struct {
+    /// Inspect only reports; reject fails oversized prompts; window drops eligible exchanges; compact summarizes them.
+    mode: ?[]const u8 = null,
+    /// Destination model capacity including reserved generation output.
+    context_window_tokens: i64,
+    /// Compaction threshold and final input ceiling; defaults to context_window_tokens minus reserved_output_tokens.
+    target_input_tokens: ?i64 = null,
+    /// Must cover every destination generator's configured output limit.
+    reserved_output_tokens: ?i64 = null,
+    /// Prior completed user turns retained verbatim. Current question, most recent exchange and open tool transactions are always retained.
+    keep_recent_turns: ?i64 = null,
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Independent summary capacity, including instructions, schema, prior memory, one complete exchange and summary output.
+    summarizer_context_window_tokens: ?i64 = null,
+    summary_output_tokens: ?i64 = null,
+    /// Maximum summary calls per preparation. No automatic retries or provider fallback.
+    max_summary_batches: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "context_window_tokens", "context_window_tokens", false },
+        .{ "target_input_tokens", "target_input_tokens", true },
+        .{ "reserved_output_tokens", "reserved_output_tokens", true },
+        .{ "keep_recent_turns", "keep_recent_turns", true },
+        .{ "summarizer", "summarizer", false },
+        .{ "summarizer_context_window_tokens", "summarizer_context_window_tokens", true },
+        .{ "summary_output_tokens", "summary_output_tokens", true },
+        .{ "max_summary_batches", "max_summary_batches", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        try jw.objectField("context_window_tokens");
+        try jw.write(self.context_window_tokens);
+        if (self.target_input_tokens) |value| {
+            try jw.objectField("target_input_tokens");
+            try jw.write(value);
+        }
+        if (self.reserved_output_tokens) |value| {
+            try jw.objectField("reserved_output_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_turns) |value| {
+            try jw.objectField("keep_recent_turns");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("summarizer");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.summarizer_context_window_tokens) |value| {
+            try jw.objectField("summarizer_context_window_tokens");
+            try jw.write(value);
+        }
+        if (self.summary_output_tokens) |value| {
+            try jw.objectField("summary_output_tokens");
+            try jw.write(value);
+        }
+        if (self.max_summary_batches) |value| {
+            try jw.objectField("max_summary_batches");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const AgentDecision = struct {
     /// The question being answered
     question_id: []const u8,
@@ -10898,6 +11100,7 @@ pub const RerankerProfile = struct {
 
 /// Request for the research agent. The agent plans sub-questions, runs a bounded retrieval researcher per sub-question in parallel, reflects on coverage, and writes a long-form report whose `[E#]` citations resolve to a deduplicated evidence registry. Researchers are ordinary retrieval-agent runs over `queries` with the same authorization, mandatory predicates and tool policy. They cannot widen tables, filters, tools or budgets.
 pub const ResearchAgentRequest = struct {
+    context_management: ?AgentContextManagement = null,
     /// The research question.
     query: []const u8,
     /// Authorized table scopes, as for the retrieval agent. `filter_query` and `exclusion_query` are mandatory predicates for every researcher. May be empty when web search is enabled.
@@ -10933,6 +11136,7 @@ pub const ResearchAgentRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_management", "context_management", true },
         .{ "query", "query", false },
         .{ "queries", "queries", false },
         .{ "messages", "messages", true },
@@ -10962,6 +11166,10 @@ pub const ResearchAgentRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
         try jw.objectField("query");
         try jw.write(self.query);
         try jw.objectField("queries");
@@ -11038,6 +11246,8 @@ pub const ResearchAgentRequest = struct {
 
 /// Result from the research agent.
 pub const ResearchAgentResult = struct {
+    /// Per-model-call preparation diagnostics, also emitted as context_management SSE events.
+    context_management: ?[]const AgentContextEvent = null,
     /// Unique response ID.
     id: ?[]const u8 = null,
     /// Writer model.
@@ -11065,6 +11275,7 @@ pub const ResearchAgentResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_management", "context_management", true },
         .{ "id", "id", true },
         .{ "model", "model", true },
         .{ "created_at", "created_at", true },
@@ -11095,6 +11306,10 @@ pub const ResearchAgentResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
         if (self.id) |value| {
             try jw.objectField("id");
             try jw.write(value);
@@ -12579,6 +12794,7 @@ pub const RestoreRequest = struct {
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
+    context_management: ?AgentContextManagement = null,
     /// User's natural language query
     query: []const u8,
     /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
@@ -12620,6 +12836,7 @@ pub const RetrievalAgentRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_management", "context_management", true },
         .{ "query", "query", false },
         .{ "queries", "queries", false },
         .{ "messages", "messages", true },
@@ -12651,6 +12868,10 @@ pub const RetrievalAgentRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
         try jw.objectField("query");
         try jw.write(self.query);
         try jw.objectField("queries");
@@ -12735,6 +12956,8 @@ pub const RetrievalAgentRequest = struct {
 
 /// Result from the retrieval agent
 pub const RetrievalAgentResult = struct {
+    /// Per-model-call preparation diagnostics, also emitted as context_management SSE events.
+    context_management: ?[]const AgentContextEvent = null,
     /// Unique response ID for logging and tracing
     id: ?[]const u8 = null,
     /// LLM model used for generation
@@ -12786,6 +13009,7 @@ pub const RetrievalAgentResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_management", "context_management", true },
         .{ "id", "id", true },
         .{ "model", "model", true },
         .{ "created_at", "created_at", true },
@@ -12822,6 +13046,10 @@ pub const RetrievalAgentResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
         if (self.id) |value| {
             try jw.objectField("id");
             try jw.write(value);

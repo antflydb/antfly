@@ -213,6 +213,13 @@ pub fn create(ctx: Context) Suite {
     }
     // Keep backend packaging covered even when CUDA implementation tests are
     // excluded. A CPU/Metal test product must not retain a device image.
+    const context_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{"server.context_management."},
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = 6 * 1024 * 1024 * 1024,
+    });
+    ctx.step("test-context-management", "Verify native context adapter and checkpoint contracts").dependOn(&ctx.addRunArtifact(context_tests).step);
     const artifact_module = b.createModule(.{
         .root_source_file = ctx.path("src/ops/cuda/artifact.zig"),
         .target = ctx.target,

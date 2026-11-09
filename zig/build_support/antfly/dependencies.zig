@@ -681,6 +681,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    const chat_context_mod = b.modules.get("antfly_chat_context") orelse b.addModule("antfly_chat_context", .{ .root_source_file = b.path("lib/chat_context/root.zig") });
+    generating_mod.addImport("antfly_chat_context", chat_context_mod);
     generating_mod.addImport("antfly-json", json_mod);
     generating_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     generating_mod.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig") });

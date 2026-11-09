@@ -33219,6 +33219,135 @@ components:
             documents and/or generated response. Requires steps.generation for
 
             generation-quality evaluators (faithfulness, completeness, etc.).
+    AgentContextEvent:
+      type: object
+      required:
+        - diagnostics
+        - counting_method
+        - latency_ms
+      properties:
+        counting_method:
+          type: string
+        latency_ms:
+          type: integer
+          format: int64
+        summary_provider:
+          type: string
+        summary_model:
+          type: string
+        diagnostics:
+          $ref: '#/components/schemas/AgentContextDiagnostics'
+    AgentContextDiagnostics:
+      type: object
+      description: Summary usage is separate from destination generation usage; retries are always zero.
+      properties:
+        contract_version:
+          type: integer
+          format: int64
+        original_input_tokens:
+          type: integer
+          format: int64
+        effective_input_tokens:
+          type: integer
+          format: int64
+        retained_messages:
+          type: integer
+          format: int64
+        compacted_messages:
+          type: integer
+          format: int64
+        batches:
+          type: integer
+          format: int64
+        retries:
+          type: integer
+          format: int64
+        summary_input_tokens:
+          type: integer
+          format: int64
+        summary_output_tokens:
+          type: integer
+          format: int64
+    AgentContextManagement:
+      type: object
+      description: >
+        Opt-in conversation/evidence preparation before agent model calls. The
+
+        summarizer uses the same GeneratorConfig, secrets and provider dispatch
+
+        as generation; omitted summarizer inherits the effective generator
+
+        (the first link when a chain is configured). Summary calls have no
+
+        fallback or retries and consume the agent's model-call budget.
+
+        A remote summarizer receives the selected conversation and tool evidence.
+
+        Input accounting conservatively charges serialized UTF-8 bytes plus
+
+        framing and tool schemas. Configure windows supported by both models.
+
+        Failure returns a typed error without replacing authoritative history.
+
+        Derived memory is request-local; continuations supply authoritative
+
+        history/research_state and are prepared again. This does not alter KV caches.
+      required:
+        - context_window_tokens
+      properties:
+        mode:
+          type: string
+          enum:
+            - inspect
+            - reject
+            - window
+            - compact
+          default: compact
+          description: Inspect only reports; reject fails oversized prompts; window drops eligible exchanges;
+            compact summarizes them.
+        context_window_tokens:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          description: Destination model capacity including reserved generation output.
+        target_input_tokens:
+          type: integer
+          minimum: 1
+          description: Compaction threshold and final input ceiling; defaults to context_window_tokens
+            minus reserved_output_tokens.
+        reserved_output_tokens:
+          type: integer
+          minimum: 1
+          default: 4000
+          description: Must cover every destination generator's configured output limit.
+        keep_recent_turns:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          minimum: 0
+          maximum: 4096
+          default: 2
+          description: Prior completed user turns retained verbatim. Current question, most recent exchange
+            and open tool transactions are always retained.
+        summarizer:
+          $ref: '#/components/schemas/GeneratorConfig'
+        summarizer_context_window_tokens:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          default: 8192
+          description: Independent summary capacity, including instructions, schema, prior memory, one
+            complete exchange and summary output.
+        summary_output_tokens:
+          type: integer
+          minimum: 1
+          maximum: 32768
+          default: 1024
+        max_summary_batches:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 8
+          description: Maximum summary calls per preparation. No automatic retries or provider fallback.
     RetrievalAgentRequest:
       type: object
       description: >
@@ -33254,6 +33383,8 @@ components:
         - query
         - queries
       properties:
+        context_management:
+          $ref: '#/components/schemas/AgentContextManagement'
         query:
           type: string
           description: User's natural language query
@@ -33435,6 +33566,12 @@ components:
         - hits
         - status
       properties:
+        context_management:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentContextEvent'
+          description: Per-model-call preparation diagnostics, also emitted as context_management SSE
+            events.
         id:
           type: string
           description: Unique response ID for logging and tracing
@@ -34120,6 +34257,8 @@ components:
         - query
         - queries
       properties:
+        context_management:
+          $ref: '#/components/schemas/AgentContextManagement'
         query:
           type: string
           description: The research question.
@@ -34195,6 +34334,12 @@ components:
         - status
         - research_state
       properties:
+        context_management:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentContextEvent'
+          description: Per-model-call preparation diagnostics, also emitted as context_management SSE
+            events.
         id:
           type: string
           description: Unique response ID.
@@ -57204,6 +57349,14 @@ components:
         facts:
           type: string
           description: Compacted evidence attributed to this completed tool call.
+        source_ids:
+          x-go-type-skip-optional-pointer: false
+          maxItems: 4096
+          type: array
+          items:
+            type: string
+          description: Exact source identities attributed to this tool result. Optional for legacy checkpoints;
+            summaries must preserve server-supplied identities without shortening or substitution.
     InferenceContextUnresolvedToolCall:
       type: object
       additionalProperties: false
