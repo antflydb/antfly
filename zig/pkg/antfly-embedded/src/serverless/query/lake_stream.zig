@@ -1069,7 +1069,10 @@ pub const Stream = struct {
                     self.page_cursor.?.position = row_begin;
                     self.page_cursor.?.row_end = row_end;
                     self.page_cursor.?.shared_reader = self.source.scanner.shared_reader;
-                    self.page_cursor.?.selected_hydration = self.selection != null and self.filter == null;
+                    // SQL installs a visibility filter even for an exact row
+                    // selection. Keep that mask authoritative without disabling
+                    // selected-chunk I/O; late projection still gates payloads.
+                    self.page_cursor.?.selected_hydration = self.selection != null;
                     if (self.resume_at) |position| if (group.ordinal == position.group) {
                         self.page_cursor.?.position = position.row;
                     };
