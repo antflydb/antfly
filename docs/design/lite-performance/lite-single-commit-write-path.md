@@ -486,31 +486,70 @@ observed in this session were either unchanged (full-text, which passed)
 or anomalously high (graph/dense, under contention) -- neither supports a
 lower number yet.
 
-### 7.3 Sparse vector per-write cost: not yet fixed
+### 7.3 Sparse vector per-write cost: term-meta/term-range merged
 
 `SparseIndex.installInlineSparsePublication` → `native_catalog_backend.
 Backend.applyExternallyCommittedMutations` → persistent-treap `put` per
 mutation is architecturally proportional to the write's own size: with
 `sparse_terms = 32` (the harness's dimension count) and every term
 brand-new (the harness's deterministic token ids never repeat across the
-128 documents it writes), each write durably touches roughly 2 (forward/
-reverse) + 5 per term (chunk, chunk-range-meta, term-meta, term-catalog
-entry, term-range-meta) + 2 (counters) ≈ 164 keys, each a `mem_ordered.
-Tree.put` -- an O(log n) persistent-treap path copy, each node copy its
-own `allocator.create` plus three `allocator.dupe`s. Dense goes through
-the same backend at a handful of keys per write; the ~6x throughput gap
-(0.6-0.8 vs. 4.4-4.5 writes/s) is explained by that ratio of key count
-times Debug `GeneralPurposeAllocator`'s per-call stack-capture cost, not
-by an algorithmic defect in the business logic -- `addToPostings`'s
-"append to an existing chunk" path, the one case that really would rewrite
-an unnecessarily large existing posting list, is never exercised by this
-harness's non-colliding term ids. No fix attempted this session: the
-only concrete lever found (merging the chunk and chunk-range-meta writes
-into one key, cutting one `put` of five per term) is a durable key-format
-change with broad blast radius (every other `readChunkRangeMeta` caller)
-that was not safe to land and verify under this session's build/test
-turnaround and host contention. Left for a follow-up with a quiet host
-and real profiling (the file's own `WriteProfile` counters are already
-wired for the bulk-append path but not the incremental one `stageIncremental
-Mutations` uses; extending them there first would turn this from an
-estimate into a measurement before cutting anything).
+128 documents it writes), each write used to durably touch roughly 2
+(forward/reverse) + 5 per term (chunk, chunk-range-meta, term-meta,
+term-catalog entry, term-range-meta) + 2 (counters) ≈ 164 keys, each a
+`mem_ordered.Tree.put` -- an O(log n) persistent-treap path copy, each
+node copy its own `allocator.create` plus three `allocator.dupe`s.
+
+A term's meta (max_weight, chunk_count) and its doc-id range (min/max
+across chunks) were two separate records even though every call site
+reads or writes them as a pair; merged into one (§7.3's own commit,
+`perf(sparse): merge term meta + term range into one record per term`).
+For the inline/incremental path specifically, an insert-only touch also
+no longer defers its range update at all -- it was always correct to
+extend the range immediately (there is no cheaper "batch it" version of
+an extend-only update), unlike a delete, which still defers to a full
+chunk rescan since only that can correctly *shrink* a range. New term
+steady-state: 5 keys/term → 4 (chunk, chunk-range-meta, the combined
+term record, term-catalog once); a re-touched term: 4 → 2.
+
+Debug harness result (same host, same load regime as the rest of this
+table, so treat the absolute numbers as noisy -- `primary-only` moved
+too, from this session's own load swings -- but the sparse-vs-everything-
+else *ratio* is the real signal): sparse-vector-visible went from
+0.6-0.7 writes/s to 1.0-1.1, while primary-only/dense/graph were all
+simultaneously *lower* than their own §7's figures under this run's
+heavier load. Sparse moving up while its neighbors moved down under the
+same contention is not a load artifact.
+
+The chunk + chunk-range-meta pair (also always co-accessed, and the
+larger remaining write-count lever) is deliberately NOT merged:
+`encodeChunk`'s own payload is a documented "compatible Go v1 payload"
+wire format, and the pair's readers extend into segment split/handoff
+classification (`handoffTermPostings`/`pruneTermPostings`/
+`accumulateSplitPlanningStats`) and a direct query-time chunk scan --
+materially larger, riskier blast radius than the meta+range pair
+actually cut. Left for a follow-up with more verification budget; the
+file's own `WriteProfile` counters are still only wired for the
+bulk-append path, not the incremental one `stageIncrementalMutations`
+uses -- extending them there first would turn the next attempt's sizing
+from an estimate into a measurement before cutting anything.
+
+Verification: `zig build sparse-test` -- 84/84 pass (0 leaked),
+including a new regression test for the one correctness-sensitive
+interaction this change introduces (a term touched by both an insert
+and a delete in the same deferred batch must not have the insert's
+immediate write and the delete's deferred recompute clobber each
+other) and that the range shrinks correctly across a close/reopen.
+
+### 7.4 Full crash sweep family: green
+
+All 23 `crash sweep`/`crash sweep exhaustive` tests in
+`crash_consistency_test.zig` pass (0 leaked) on top of every fix in
+this section (§7.1's idle-flush fix, §7.2's background-commit batching,
+§7.3's sparse term-record merge), including `crash sweep: sustained
+full_index writes survive a crash during ride-along merge and
+retirement` -- the one test perf/lwa-postmerge owns and is separately
+fixing for its known intermittent `AcknowledgedWriteLost` signature.
+It passed cleanly here; that satisfies this session's gate (everything
+else green, and this one either green or failing with its own known
+signature, never a hang or a new failure mode) without this session
+needing to reproduce or touch its bug.
