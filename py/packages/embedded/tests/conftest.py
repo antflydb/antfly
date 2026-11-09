@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -82,3 +83,34 @@ def require_native() -> None:
 @pytest.fixture()
 def aflite_path(tmp_path: Path) -> Path:
     return tmp_path / "db.aflite"
+
+
+def _native_report_root() -> Path | None:
+    value = os.environ.get("ANTFLY_SDK_NATIVE_REPORT_DIR")
+    if not value:
+        return None
+    root = Path(value)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def pytest_runtest_logstart(nodeid, location):
+    del location
+    if root := _native_report_root():
+        (root / "current-test.txt").write_text(nodeid + "\n")
+
+
+def pytest_runtest_logreport(report):
+    # JUnit is finalized only when pytest exits normally. Preserve completed
+    # phases and the active identity even if CI kills a stuck native call.
+    if root := _native_report_root():
+        event = {
+            "nodeid": report.nodeid,
+            "phase": report.when,
+            "seconds": report.duration,
+            "outcome": report.outcome,
+        }
+        if report.failed:
+            event["failure"] = report.longreprtext[-65536:]
+        with (root / "timings.jsonl").open("a") as output:
+            output.write(json.dumps(event) + "\n")
