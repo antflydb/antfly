@@ -803,9 +803,15 @@ test "lite write amplification cpu attribution" {
 
     alloc_site_histogram.reset();
     native.PageWriteMetrics.reset();
+    native.PageDecodeMetrics.resetCrc();
     histogram_armed.store(true, .monotonic);
     const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-attrib", .primary_only, updates);
     histogram_armed.store(false, .monotonic);
+    const crc = native.PageDecodeMetrics.crcSnapshot();
+    std.debug.print("  CRC: calls/write={d:.3} bytes/write={d:.1}\n", .{
+        @as(f64, @floatFromInt(crc.calls)) / @as(f64, @floatFromInt(updates)),
+        @as(f64, @floatFromInt(crc.bytes)) / @as(f64, @floatFromInt(updates)),
+    });
 
     std.debug.print("lite write amplification CPU attribution (updates={d}):\n", .{updates});
     printReport("primary-only", report);

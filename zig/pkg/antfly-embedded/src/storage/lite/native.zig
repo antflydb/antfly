@@ -4388,7 +4388,7 @@ const PageLinkCopy = struct {
     key: ?[]u8,
 };
 
-const PageDecodeMetrics = struct {
+pub const PageDecodeMetrics = struct {
     var crc_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var crc_bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var extent_decodes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
@@ -4396,6 +4396,16 @@ const PageDecodeMetrics = struct {
     // (debugging the item-2 write-amplification fix), not load-bearing.
     var index_editor_cache_hits: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var index_editor_cache_misses: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+
+    pub fn crcSnapshot() struct { calls: u64, bytes: u64 } {
+        if (!builtin.is_test) return .{ .calls = 0, .bytes = 0 };
+        return .{ .calls = crc_calls.load(.monotonic), .bytes = crc_bytes.load(.monotonic) };
+    }
+    pub fn resetCrc() void {
+        if (!builtin.is_test) return;
+        crc_calls.store(0, .monotonic);
+        crc_bytes.store(0, .monotonic);
+    }
 };
 
 /// Diagnostic-only pwrite attribution by `PageKind` (perf/lwa-cpu's

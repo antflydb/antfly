@@ -106,6 +106,33 @@ fn order(_: void, a: Retirement, b: Retirement) std.math.Order {
     return if (epoch == .eq) std.math.order(b.id, a.id) else epoch;
 }
 
+/// `pending`'s keys are already-well-distributed page/object ids, not
+/// strings or composite records, so `AutoContext(u64)`'s default (a full
+/// Wyhash pass over 8 bytes -- the same streaming byte-mixing algorithm used
+/// for arbitrary-length buffers) is more work than this key shape needs. A
+/// single avalanche-finalizer multiply/shift round (the splitmix64/MurmurHash3
+/// finalizer) gives the same good bucket distribution for a fixed 8-byte key
+/// at a fraction of the cost, with no change to what gets stored or how
+/// retirement/rehash logic reasons about it. Zero-sized, so every plain
+/// (non-Context-suffixed) HashMapUnmanaged method keeps working unchanged;
+/// only the one explicit-context `rehash` call needs updating to match.
+const FastU64Context = struct {
+    pub fn hash(self: @This(), key: u64) u64 {
+        _ = self;
+        var x = key;
+        x ^= x >> 33;
+        x *%= 0xff51afd7ed558ccd;
+        x ^= x >> 33;
+        x *%= 0xc4ceb9fe1a85ec53;
+        x ^= x >> 33;
+        return x;
+    }
+    pub fn eql(self: @This(), a: u64, b: u64) bool {
+        _ = self;
+        return a == b;
+    }
+};
+
 pub const State = struct {
     allocator: Allocator,
     counts: std.ArrayList(u32) = .empty,
@@ -113,7 +140,7 @@ pub const State = struct {
     bitmap: [8]std.ArrayList(u64) = @splat(.empty),
     free_pages: u64 = 0,
     data_pending: u64 = 0,
-    pending: std.AutoHashMapUnmanaged(u64, Retirement) = .empty,
+    pending: std.HashMapUnmanaged(u64, Retirement, FastU64Context, std.hash_map.default_max_load_percentage) = .empty,
     pending_removals_since_rehash: usize = 0,
     stale_heap_items: usize = 0,
     heap: Heap,
@@ -675,7 +702,7 @@ pub const State = struct {
         // scan the entire retained capacity. Rehash without allocating at safe
         // boundaries; the linear sweep is amortized over prior removals.
         if (self.pending_removals_since_rehash >= @max(@as(usize, 64), @as(usize, self.pending.capacity()) / 16)) {
-            self.pending.rehash(std.hash_map.AutoContext(u64){});
+            self.pending.rehash(FastU64Context{});
             self.pending_removals_since_rehash = 0;
         }
     }
