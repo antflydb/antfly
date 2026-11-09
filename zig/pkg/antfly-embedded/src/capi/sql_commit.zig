@@ -1085,3 +1085,160 @@ test "capi SQL outcome refusals after an unresolved decision are not unknown" {
     // Committed-pending visibility is not an unknown outcome.
     try std.testing.expectEqualStrings("AF001", errors.describe(error.CommitVisibilityNotSatisfied).code);
 }
+
+// Repro for a previously-reported loss on `commitCoordinatedLocal`'s fused
+// autocommit path (lite-single-commit-write-path.md §3.3c): on a table with
+// a UNIQUE constraint, INSERT item-0, INSERT item-1, UPDATE item-0, then
+// close and reopen. The coordinator's two localization tips are both
+// exercised here: a `SELECT` right after each INSERT (before any reopen)
+// isolates whether item-1 ever becomes visible on this same handle at all,
+// and the explicit `_id` list in each SELECT (rather than a bare row count)
+// tells `item-0`/`item-1` apart instead of just counting rows.
+test "capi SQL outcome relational unique autocommit two inserts and an update survive reopen" {
+    const api = @import("db.zig");
+    const alloc = std.testing.allocator;
+    var directory = try api.TestDirectory.init("relational-unique-two-inserts");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+    const wrapper = try api.openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, true);
+    var id = try api.publishHandle(wrapper);
+
+    const Fx = struct {
+        fn sqlOk(hid: ?*anyopaque, request: []const u8) !void {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice(request), &output);
+            if (code != .ok) {
+                std.debug.print("unexpected {s} for {s}: {s}\n", .{ @tagName(code), request, std.mem.span(h.capi.lastErrorDetail()) });
+                return error.TestUnexpectedResult;
+            }
+        }
+        /// Returns the set of `_id` values currently visible via SELECT,
+        /// sorted, so a caller can assert exactly which rows are present
+        /// instead of just how many.
+        fn ids(hid: ?*anyopaque) ![2]bool {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice("{\"statement\":\"SELECT _id FROM t\"}"), &output);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
+            defer parsed.deinit();
+            var found: [2]bool = .{ false, false };
+            for (parsed.value.object.get("rows").?.array.items) |row| {
+                const row_id = row.array.items[0].string;
+                if (std.mem.eql(u8, row_id, "item-0")) found[0] = true;
+                if (std.mem.eql(u8, row_id, "item-1")) found[1] = true;
+            }
+            return found;
+        }
+    };
+
+    try Fx.sqlOk(id, "{\"statement\":\"CREATE TABLE t (n BIGINT UNIQUE)\"}");
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-0',100)\"}");
+    try std.testing.expectEqual([2]bool{ true, false }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-1',200)\"}");
+    // Localizes the bug to this call itself vs. a later reopen: item-1 must
+    // be visible on the SAME handle immediately after its own INSERT
+    // returned success.
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"UPDATE t SET n = 150 WHERE _id = 'item-0'\"}");
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    api.antfly_db_close(id);
+    const reopened = try api.openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, false);
+    id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+}
+
+// Same repro as above, but through the exact open path the (now-reverted)
+// capi crash-sim harness used: a `.manual` BackendRuntime with the sim's
+// passthrough IO (`storage/lite/crash_sim_io.zig`'s `SimIo`, armed with no
+// crash plan -- the harness's own "discovery pass"), rather than production
+// `openLiteHandleAlloc`'s hosted connection/owner machinery. If this also
+// passes, the earlier reported loss was specific to the harness's own
+// scenario/checkpoint code, not to this open path or to `commitCoordinatedLocal`.
+test "capi SQL outcome relational unique autocommit two inserts and an update survive reopen under sim io" {
+    const api = @import("db.zig");
+    const db_mod = api.db_mod;
+    const sim_io = @import("../storage/lite/crash_sim_io.zig");
+    const alloc = std.testing.allocator;
+    var directory = try api.TestDirectory.init("relational-unique-simio");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+
+    const sim = try sim_io.SimIo.init(alloc, std.testing.io);
+    defer sim.deinit();
+    sim.setRunLabel("relational-unique-simio");
+
+    const Fx = struct {
+        fn sqlOk(hid: ?*anyopaque, request: []const u8) !void {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice(request), &output);
+            if (code != .ok) {
+                std.debug.print("unexpected {s} for {s}: {s}\n", .{ @tagName(code), request, std.mem.span(h.capi.lastErrorDetail()) });
+                return error.TestUnexpectedResult;
+            }
+        }
+        fn ids(hid: ?*anyopaque) ![2]bool {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice("{\"statement\":\"SELECT _id FROM t\"}"), &output);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
+            defer parsed.deinit();
+            var found: [2]bool = .{ false, false };
+            for (parsed.value.object.get("rows").?.array.items) |row| {
+                const row_id = row.array.items[0].string;
+                if (std.mem.eql(u8, row_id, "item-0")) found[0] = true;
+                if (std.mem.eql(u8, row_id, "item-1")) found[1] = true;
+            }
+            return found;
+        }
+    };
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = sim.io() },
+    });
+    defer runtime.deinit();
+    var id = try api.openLiteHandleWithRuntime(alloc, path, sim.io(), runtime.ptr(), .{
+        .create = true,
+        .hosted = false,
+        .no_sync = false,
+    });
+
+    try Fx.sqlOk(id, "{\"statement\":\"CREATE TABLE t (n BIGINT UNIQUE)\"}");
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-0',100)\"}");
+    try std.testing.expectEqual([2]bool{ true, false }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-1',200)\"}");
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"UPDATE t SET n = 150 WHERE _id = 'item-0'\"}");
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    api.closeLiteRuntimeHandle(id);
+
+    var runtime2 = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = sim.io() },
+    });
+    defer runtime2.deinit();
+    id = try api.openLiteHandleWithRuntime(alloc, path, sim.io(), runtime2.ptr(), .{
+        .create = false,
+        .hosted = false,
+        .no_sync = false,
+    });
+    defer api.closeLiteRuntimeHandle(id);
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+}

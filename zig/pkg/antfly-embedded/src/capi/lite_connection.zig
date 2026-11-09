@@ -1312,6 +1312,26 @@ pub const WriterLane = struct {
     /// truly remote process (or a different in-process `Owner`) a bounded
     /// wait, not an indefinite one, even under continuous local traffic.
     pub fn checkin(self: *WriterLane, connection: *Connection, store: *NativeStore) void {
+        self.checkinImpl(connection, store, false);
+    }
+
+    /// Like `checkin`, but for a suspend of unbounded duration (an inline
+    /// provider call during a lane-managed write -- `HandleGuard.
+    /// suspendQuery`), not the bounded durability wait `checkin` itself
+    /// guards. `checkin`'s fairness-quantum grace period before giving the
+    /// lease up for a foreign waiter is sized for an fsync, not for
+    /// however long this call's suspend lasts, so never park speculatively
+    /// here on "nobody is waiting on it yet": only a same-process writer
+    /// already polling (`waiting != 0`, zero cost either way, exactly as
+    /// `checkin`) gets the warm handoff; otherwise release the kernel
+    /// lease now, so a foreign waiter that arrives during the suspend --
+    /// however long it runs -- is never stuck behind a lease this process
+    /// is not even using.
+    pub fn checkinForSuspend(self: *WriterLane, connection: *Connection, store: *NativeStore) void {
+        self.checkinImpl(connection, store, true);
+    }
+
+    fn checkinImpl(self: *WriterLane, connection: *Connection, store: *NativeStore, force_release: bool) void {
         const io = h.handleLockIo();
         connection.detach();
         self.mutex.lockUncancelable(io);
@@ -1333,7 +1353,7 @@ pub const WriterLane = struct {
         }
         const own_pid = antfly_platform.process.currentId() orelse 0;
         const now = std.Io.Clock.awake.now(io).nanoseconds;
-        const foreign_overdue = lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
+        const foreign_overdue = force_release or (lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns);
         if (!foreign_overdue) {
             self.parked = lease;
             self.checked_out = false;
