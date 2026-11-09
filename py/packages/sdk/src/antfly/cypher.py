@@ -130,6 +130,7 @@ class GraphOperations:
         limits: Mapping[str, int] | None = None,
     ) -> GraphQueryResult:
         """Execute once. Inspect a retained write ID after uncertain delivery."""
+        body: dict[str, Any]
         if isinstance(query, GraphQueryRequest):
             if parameters is not None or write_request_id is not None or limits is not None:
                 raise ValueError("Choose a request model or query options")

@@ -8,6 +8,10 @@ import SwiftUI
 
 @MainActor final class Store: ObservableObject {
   @Published var config = Configuration()
+  let runtime: ManagedRuntime
+  private var runtimeModeTask: Task<Void, Never>?
+  private var modelSetupTask: Task<Void, Never>?
+  @Published private(set) var settingUpModel = false
   @Published var history: [HistoryEntry] = []
   @Published var state = RecordingState.idle
   @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
@@ -153,6 +157,7 @@ import SwiftUI
       ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("AntflyDictation")
     self.directory = directory
+    runtime = ManagedRuntime(directory: directory)
     archive = HistoryArchive(
       file: directory.appendingPathComponent("history.json"), beforeWrite: historyArchiveBeforeWrite
     )
@@ -216,7 +221,14 @@ import SwiftUI
         directory: self.directory.appendingPathComponent("outbox"), paused: true, archive: archive,
         upload: historyUpload ?? { entry, destination in
           let token = await MainActor.run { Credentials.read(server: destination.server) }
-          try await AntflyClient(server: destination.server, token: token).saveHistory(
+          let password =
+            destination.server == ManagedRuntime.origin
+            ? await MainActor.run { Credentials.read(server: ManagedRuntime.credentialAccount) }
+            : ""
+          try await AntflyClient(
+            server: destination.server, token: token,
+            basicPassword: password.isEmpty ? nil : password
+          ).saveHistory(
             entry, table: destination.table)
         }, changed: { [weak self] status in await self?.updateHistoryStatus(status) })
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
@@ -232,13 +244,15 @@ import SwiftUI
       historySyncStatus = historyPersistenceWarning!
     }
     if loadedSettings, config.retainHistory, settingsLoadError == nil {
-      let legacyDestination = HistoryDestination(server: config.server, table: config.table)
+      let legacyDestination = HistoryDestination(
+        server: config.usesManagedRuntime ? ManagedRuntime.origin : config.server,
+        table: config.table)
       let epoch = historyEpoch
       enqueueHistoryWork {
         await self.restoreHistoryDestinations(legacyDestination: legacyDestination, epoch: epoch)
       }
     }
-    if registerHotkey { loadCredential(for: config.server) }
+    if registerHotkey, !config.usesManagedRuntime { loadCredential(for: config.server) }
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
     hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
     if registerHotkey {
@@ -250,14 +264,27 @@ import SwiftUI
         },
         insert: { [weak self] in self?.insertOriginal() },
         retry: { [weak self] in self?.retryCleanup() })
+      runtime.changed = { [weak self] in self?.refreshModels() }
+      if config.usesManagedRuntime { runtime.start() }
       refreshModels()
     }
   }
   private func client(_ snapshot: Configuration? = nil, token suppliedToken: String? = nil) throws
     -> AntflyClient
   {
-    let settings = snapshot ?? config
+    var settings = snapshot ?? config
     if let clientFactory { return try clientFactory(settings) }
+    if settings.usesManagedRuntime {
+      guard runtime.ready else { throw DictationError.invalid(runtime.status) }
+      settings.server = ManagedRuntime.origin
+      return try AntflyClient(configuration: settings, basicPassword: runtime.password)
+    }
+    if settings.server == ManagedRuntime.origin {
+      let password = credentialReader(ManagedRuntime.credentialAccount)
+      if !password.isEmpty {
+        return try AntflyClient(configuration: settings, basicPassword: password)
+      }
+    }
     return try AntflyClient(
       configuration: settings, token: suppliedToken ?? credentialReader(settings.server))
   }
@@ -365,10 +392,14 @@ import SwiftUI
       historyRevision += 1
     }
     // Unloaded credentials are different from a token explicitly cleared by the user.
-    if credentialOrigin != config.server && !credentialEdited { loadCredential(for: config.server) }
-    try credentialWriter(token, config.server)
-    credentialOrigin = config.server
-    credentialEdited = false
+    if !config.usesManagedRuntime {
+      if credentialOrigin != config.server && !credentialEdited {
+        loadCredential(for: config.server)
+      }
+      try credentialWriter(token, config.server)
+      credentialOrigin = config.server
+      credentialEdited = false
+    }
     try write(JSONEncoder().encode(config), to: settingsFile)
     var shortcutIssue: String?
     do { try registerShortcut() } catch {
@@ -403,7 +434,8 @@ import SwiftUI
         if recoveringSettings {
           await self.restoreHistoryDestinations(
             legacyDestination: HistoryDestination(
-              server: self.config.server, table: self.config.table), epoch: epoch)
+              server: self.config.usesManagedRuntime ? ManagedRuntime.origin : self.config.server,
+              table: self.config.table), epoch: epoch)
         } else {
           try await self.resumeHistoryUploads()
         }
@@ -442,7 +474,12 @@ import SwiftUI
     guard !terminating, state == .idle, !working, !capturingShortcut else { return }
     do {
       if let settingsLoadError { throw DictationError.invalid(settingsLoadError) }
-      let snapshot = try config.validated()
+      var snapshot = try config.validated()
+      if snapshot.usesManagedRuntime, clientFactory == nil {
+        guard runtime.ready else { throw DictationError.invalid(runtime.status) }
+        snapshot.server = ManagedRuntime.origin
+        snapshot.connectionMode = .external
+      }
       guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
         throw DictationError.invalid("Allow microphone access in Settings before recording.")
       }
@@ -826,7 +863,9 @@ import SwiftUI
         try Task.checkCancellation()
         guard let self, discoveryGeneration == revision else { return }
         _ = try snapshot.validated()
-        if loadCredentials && credentialOrigin != snapshot.server && !credentialEdited {
+        if loadCredentials && !snapshot.usesManagedRuntime
+          && credentialOrigin != snapshot.server && !credentialEdited
+        {
           loadCredential(for: snapshot.server)
         }
         let data = try await client(snapshot, token: token).models()
@@ -834,7 +873,83 @@ import SwiftUI
         let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
         guard discoveryGeneration == revision else { return }
         models = catalog.data
+        if state == .idle, !working {
+          config.selectAvailableManagedTranscriber(
+            from: catalog, supportsApple: runtime.supportsAppleSpeech)
+        }
       } catch { /* Explicit Discover models surfaces connection/readiness errors. */  }
+    }
+  }
+  func runtimeModeChanged() {
+    let previous = runtimeModeTask
+    previous?.cancel()
+    models = []
+    runtimeModeTask = Task {
+      await previous?.value
+      guard !Task.isCancelled else { return }
+      if config.usesManagedRuntime { runtime.start() } else { await runtime.stop() }
+      guard !Task.isCancelled else { return }
+      refreshModels()
+    }
+  }
+  private func runModelSetup(_ action: @escaping @MainActor () async throws -> Void) {
+    guard !working, !terminating, state == .idle, config.usesManagedRuntime else { return }
+    working = true
+    settingUpModel = true
+    message = "Setting up local recognition…"
+    modelSetupTask = Task {
+      defer {
+        if !terminating { working = false }
+        settingUpModel = false
+        modelSetupTask = nil
+      }
+      do {
+        try Task.checkCancellation()
+        try await action()
+        try Task.checkCancellation()
+        guard !terminating else { throw CancellationError() }
+        _ = try persistSettings()
+      } catch is CancellationError {
+        message = "Model setup canceled."
+        if !terminating, config.usesManagedRuntime { runtime.start() }
+      } catch {
+        message = error.localizedDescription
+      }
+    }
+  }
+  func cancelModelSetup() {
+    modelSetupTask?.cancel()
+    runtime.cancelDownload()
+  }
+  func installLocalWhisper() {
+    runModelSetup {
+      try await self.runtime.installWhisper()
+      try Task.checkCancellation()
+      for index in self.config.presets.indices {
+        self.config.presets[index].automaticallySelectLocalTranscriber = false
+        self.config.presets[index].model = "transcribers/whisper"
+        self.config.presets[index].transcriberRoute = .gateway
+        self.config.presets[index].cleanupModel = ""
+      }
+      self.message = "Whisper selected. The local engine is restarting."
+    }
+  }
+  func useLocalApple() {
+    guard runtime.supportsAppleSpeech else {
+      message =
+        "Native Apple providers are unavailable in the pinned Antfly release. Use Whisper or an external Apple-enabled server."
+      return
+    }
+    runModelSetup {
+      try await self.runtime.enableAppleAssets()
+      try Task.checkCancellation()
+      for index in self.config.presets.indices {
+        self.config.presets[index].automaticallySelectLocalTranscriber = false
+        self.config.presets[index].model = "transcribers/apple-speech"
+        self.config.presets[index].transcriberRoute = .gateway
+        self.config.presets[index].cleanupModel = ""
+      }
+      self.message = "Apple speech selected. The engine will report asset and locale readiness."
     }
   }
   func connectionChanged() {
@@ -913,6 +1028,21 @@ import SwiftUI
     await historyDeletionTask?.value
     await historyPersistenceTask?.value
     await audioArchiveTask?.value
+    runtimeModeTask?.cancel()
+    await runtimeModeTask?.value
+    cancelModelSetup()
+    await modelSetupTask?.value
+    await runtime.stop()
+  }
+  /// Sparkle may fail or the user may cancel after local work has drained.
+  /// Keep the current installed app usable when no replacement was installed.
+  func resumeAfterFailedUpdate() {
+    guard terminating else { return }
+    terminating = false
+    working = false
+    do { try registerShortcut() } catch { shortcutStatus = error.localizedDescription }
+    if config.usesManagedRuntime { runtime.start() }
+    message = "Update canceled or failed. The current app is ready to use."
   }
   func retry() {
     guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
@@ -959,8 +1089,10 @@ import SwiftUI
     discoveryGeneration = UUID()
     run {
       self.discovery = try await self.client(token: self.token).models()
-      self.models = try JSONDecoder().decode(ModelCatalog.self, from: Data(self.discovery.utf8))
-        .data
+      let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(self.discovery.utf8))
+      self.models = catalog.data
+      self.config.selectAvailableManagedTranscriber(
+        from: catalog, supportsApple: self.runtime.supportsAppleSpeech)
       self.message =
         "Models discovered. Apple native status and installed locales are included below; transcription checks the requested locale."
     }
@@ -984,11 +1116,12 @@ import SwiftUI
       var incoming = try await self.client().loadSettings(
         table: current.table, profile: current.profile)
       // A snapshot cannot silently change the connection or credential scope.
+      incoming.connectionMode = current.connectionMode
       incoming.server = current.server
       incoming.table = current.table
       incoming.profile = current.profile
       self.config = incoming
-      self.loadCredential(for: incoming.server)
+      if !incoming.usesManagedRuntime { self.loadCredential(for: incoming.server) }
       _ = try self.persistSettings()
       self.message = "Settings replaced from Antfly."
     }
@@ -1023,7 +1156,8 @@ import SwiftUI
     else { return nil }
     var entry = original
     entry.destination =
-      entry.destination ?? HistoryDestination(server: snapshot.server, table: snapshot.table)
+      entry.destination
+      ?? HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table)
     let bounded = HistoryArchive.bounded([entry] + history)
     guard bounded.contains(where: { $0.id == entry.id }) else {
       historyPersistenceWarning =
@@ -1095,7 +1229,8 @@ import SwiftUI
     let epoch = historyEpoch
     let entries = history
     runHistory {
-      let snapshot = try self.config.validated()
+      var snapshot = try self.config.validated()
+      if snapshot.usesManagedRuntime { snapshot.server = ManagedRuntime.origin }
       guard self.settingsLoadError == nil, self.config.retainHistory else {
         throw DictationError.invalid(
           "Enable and save history retention before uploading local history.")
@@ -1111,7 +1246,7 @@ import SwiftUI
           try await outbox.enqueue(
             entry,
             destination: entry.destination
-              ?? HistoryDestination(server: snapshot.server, table: snapshot.table))
+              ?? HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table))
         }
         guard self.historyEpoch == epoch, self.config.retainHistory else { return }
         self.historyPersistenceWarning = nil
@@ -1164,7 +1299,8 @@ import SwiftUI
           var destinations = held.destinations[entry.id] ?? []
           if let original = entry.destination { destinations.insert(original) }
           if destinations.isEmpty {
-            destinations.insert(HistoryDestination(server: snapshot.server, table: snapshot.table))
+            destinations.insert(
+              HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table))
           }
           for destination in destinations { groups[destination, default: []].insert(entry.id) }
         }
@@ -1192,6 +1328,7 @@ import SwiftUI
         try Task.checkCancellation()
         var connection = snapshot
         connection.server = destination.server
+        connection.connectionMode = .external
         connection.table = destination.table
         try await client(connection).deleteHistory(
           ids: Array(matching).sorted(), table: destination.table)
@@ -1346,7 +1483,7 @@ import SwiftUI
       perform {
         let imported = try Configuration.decode(Data(contentsOf: url))
         self.config = imported
-        self.loadCredential(for: imported.server)
+        if !imported.usesManagedRuntime { self.loadCredential(for: imported.server) }
         _ = try self.persistSettings()
         self.message = "Settings imported."
       }
