@@ -238,7 +238,7 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
                 report.runs += 1;
                 runOneCrash(allocator, scenario, barrier_seq, when, power_loss, &report) catch |err| {
                     const placeholder = Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
-                    try report.fail(placeholder, when, power_loss, "harness error: {s}", .{@errorName(err)});
+                    try report.fail(placeholder, when, power_loss, "scenario={s} harness error: {s}", .{ scenario.name, @errorName(err) });
                 };
             }
         }
@@ -278,7 +278,7 @@ fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when:
         if (power_loss == .drop_unsynced) {
             sim.applyPowerLoss() catch |pl_err| {
                 const barrier = sim.crash_barrier orelse Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
-                try report.fail(barrier, when, power_loss, "applyPowerLoss failed: {s}", .{@errorName(pl_err)});
+                try report.fail(barrier, when, power_loss, "scenario={s} barrier_thread={d} applyPowerLoss failed: {s}", .{ scenario.name, barrier.thread_id, @errorName(pl_err) });
                 return;
             };
         }
@@ -308,11 +308,11 @@ fn checkInvariants(
 
     if (scenario.via_db) {
         checkCheckpointsViaDb(allocator, path, outcome, checkpoints, scenario.search_index, scenario.search_field, scenario.retirement) catch |err| {
-            try report.fail(placeholder, when, power_loss, "db invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
+            try report.fail(placeholder, when, power_loss, "scenario={s} barrier_thread={d} db invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
         };
     } else {
         checkCheckpointsViaNative(allocator, path, outcome, checkpoints) catch |err| {
-            try report.fail(placeholder, when, power_loss, "native invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
+            try report.fail(placeholder, when, power_loss, "scenario={s} barrier_thread={d} native invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
         };
     }
 }
@@ -2441,15 +2441,35 @@ test "crash sweep: commit failing after staging under a persistent io fault does
     const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
     const platform_time = @import("antfly_platform").time;
     const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    var hang_detected = false;
     while (!closer.done.load(.acquire)) {
-        if (platform_time.monotonicNs() >= deadline_ns) {
-            thread.detach();
-            return error.ShutdownHangDetected;
+        if (!hang_detected and platform_time.monotonicNs() >= deadline_ns) {
+            // `close()` is taking far longer than it should under a
+            // persistent fault -- that is the regression this test exists
+            // to catch, and it is reported below. But this thread still
+            // holds a reference to this function's own stack locals
+            // (`handle`, `sim`, `tmp`'s backing directory, `path`), all of
+            // which this function's own `defer`s would tear down the
+            // moment it returns. Previously this detached the thread and
+            // returned immediately, which let it keep running against a
+            // freed `SimIo` (and a deleted temp directory) for an
+            // unbounded time -- exactly the cross-scenario background-task
+            // leak `registerSelf` now fails loudly on in every *later*
+            // scenario's `SimIo.init`, not this one. Clear the fault
+            // instead: the retry loop(s) `close()` is stuck behind back
+            // off and retry every `retry_ms`, so clearing it lets the very
+            // next attempt succeed, and this loop keeps waiting
+            // (unboundedly, but only after the actual cause is gone) so
+            // this function never returns while `thread` can still touch
+            // its locals.
+            hang_detected = true;
+            sim.setIoFaultPlan(null);
         }
         std.Thread.yield() catch {};
     }
     thread.join();
     handle_open = false;
+    if (hang_detected) return error.ShutdownHangDetected;
 }
 
 fn reportFailures(report: *const SweepReport) !void {

@@ -68,6 +68,17 @@ pub const Barrier = struct {
     /// (destination) path; `old_path` carries the source.
     path: []const u8,
     old_path: ?[]const u8 = null,
+    /// `std.Thread.getCurrentId()` of whichever thread actually made this
+    /// call. A barrier whose `thread_id` is not the scenario's own driving
+    /// thread is either a legitimate same-run background worker (started
+    /// and joined within this same scenario) or -- the thing this field
+    /// exists to make visible in a failure report -- a caller left over
+    /// from a *previous* scenario's `SimIo` that outlived that scenario's
+    /// `deinit()` and is now racing this one's barrier count/sequence.
+    /// Defaults to 0 (never a real thread id) only for the synthetic
+    /// placeholder `Barrier`s `runOneCrash`/`checkInvariants` construct when
+    /// no real barrier fired.
+    thread_id: std.Thread.Id = 0,
 };
 
 pub const When = enum { before, after };
@@ -173,6 +184,12 @@ pub const SimIo = struct {
     /// `init`. Not owned -- callers must keep it alive for this `SimIo`'s
     /// lifetime (a comptime/static string is simplest).
     run_label: []const u8 = "",
+    /// The thread that called `init` -- this scenario's own driving thread.
+    /// A recorded `Barrier.thread_id` that differs from this is either a
+    /// same-run background worker (started and joined within this
+    /// scenario, harmless) or a leaked caller from a stale `SimIo`; see
+    /// `Barrier.thread_id`'s doc comment.
+    owner_thread_id: std.Thread.Id = 0,
 
     /// fd (File or Dir handle, both `std.posix.fd_t`) -> logical path. Paths
     /// are exactly the strings callers passed to `dirCreateFile`/`dirOpenFile`
@@ -245,6 +262,7 @@ pub const SimIo = struct {
             .real = real,
             .vtable = real.vtable.*,
             .id = next_sim_io_id.fetchAdd(1, .monotonic),
+            .owner_thread_id = std.Thread.getCurrentId(),
         };
         self.vtable.dirCreateFile = vtDirCreateFile;
         self.vtable.dirOpenFile = vtDirOpenFile;
@@ -380,6 +398,7 @@ pub const SimIo = struct {
             .kind = kind,
             .path = owned_path,
             .old_path = owned_old,
+            .thread_id = std.Thread.getCurrentId(),
         });
 
         const plan = self.crash_plan orelse return false;
@@ -503,25 +522,31 @@ var registry_mutex: SpinMutex = .{};
 var registry: std.AutoHashMapUnmanaged(?*anyopaque, *SimIo) = .empty;
 var registry_allocator: Allocator = std.heap.page_allocator;
 
-fn registerSelf(real_userdata: ?*anyopaque, self: *SimIo) !void {
+/// A still-registered entry at the point a new `SimIo` tries to claim the
+/// same real `userdata` means the previous `SimIo` was never
+/// `unregisterSelf`'d before this new one takes its place -- i.e. its
+/// owning sub-run's `deinit` has not run yet (most likely because a
+/// background worker thread from that sub-run's `DB` outlived
+/// `DB.close()` and is still mid-flight). This is never legitimate (see
+/// `registry`'s doc comment: at most one live `SimIo` per real `userdata`,
+/// always true for this package's strictly sequential enumerate/replay
+/// passes), so `registerSelf` fails loudly instead of silently clobbering
+/// the stale entry and letting the leaked caller's later vtable calls get
+/// misattributed to the new instance -- exactly the cross-sub-run state
+/// leak that corrupted barrier counting the crash sweep depends on being
+/// deterministic.
+pub const StaleSimIoRegistration = error{StaleSimIoRegistration};
+
+fn registerSelf(real_userdata: ?*anyopaque, self: *SimIo) (Allocator.Error || StaleSimIoRegistration)!void {
     registry_mutex.lock();
     defer registry_mutex.unlock();
-    // A still-registered entry here means the previous `SimIo` for this
-    // same real `userdata` was never `unregisterSelf`'d before this new one
-    // takes its place -- i.e. its owning sub-run's `deinit` has not run yet
-    // (most likely because a background worker thread from that sub-run's
-    // `DB` outlived `DB.close()` and is still mid-flight). `put` would
-    // silently clobber that stale entry; log it unconditionally (not
-    // gated behind `debug_log`) because any later vtable call the leaked
-    // caller makes will be misattributed to *this* new instance instead of
-    // erroring loudly, which is exactly the cross-sub-run state leak this
-    // instrumentation exists to catch.
     const existing = registry.get(real_userdata);
     if (existing) |stale| {
         std.debug.print(
-            "[sim_io] WARNING registerSelf id={d} label={s} thread={d} userdata={*} clobbers still-registered id={d} label={s} -- that sub-run's deinit has not run; a leaked caller will misattribute future calls to this new instance\n",
+            "[sim_io] FATAL registerSelf id={d} label={s} thread={d} userdata={*} clobbers still-registered id={d} label={s} -- that sub-run's deinit has not run (a background worker thread outlived DB.close()); failing instead of letting the leaked caller misattribute future calls to this new instance\n",
             .{ self.id, self.run_label, std.Thread.getCurrentId(), real_userdata, stale.id, stale.run_label },
         );
+        return error.StaleSimIoRegistration;
     }
     try registry.put(registry_allocator, real_userdata, self);
 }
