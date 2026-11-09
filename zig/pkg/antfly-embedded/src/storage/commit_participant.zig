@@ -173,8 +173,8 @@ pub const View = struct {
     /// delete capability wired (see `delete_fn`).
     pub fn deleteReplay(self: View, key: []const u8) !void {
         if (!isAllowedReplayKey(key)) return error.InvalidCommitMetadata;
-        const delete = self.delete_fn orelse return error.ReplayDeleteUnsupported;
-        return delete(self.ptr, key);
+        const delete_fn = self.delete_fn orelse return error.ReplayDeleteUnsupported;
+        return delete_fn(self.ptr, key);
     }
 
     /// The view and every returned slice are borrowed only through callback
