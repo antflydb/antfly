@@ -169,7 +169,7 @@ Each kind of ride-along work is safe to lose in a crash because it can be recomp
 
 **Journal.** A consumer whose publication rides in the acknowledgement's commit (a synchronous `full_text` write) needs no journal record for that write.
 
-**Not yet implemented.** The journal/replay payload (`target_hints`, the "all" lane) is built and written in `mutation_commit.zig` *before* `InlineTextPublication`/`InlineGraphPublication`/`InlineSparsePublication`/`InlineDensePublication`/`InlineAlgebraicPublication` are even prepared, so today's code cannot yet know which hints an inline publication is about to service and still writes a full record (at minimum the "all" lane) regardless. `target_hints` is also coarse-grained by consumer *kind* (`.full_text`, `.dense_vector`, ...), not by index name, so a write touching two indexes of the same kind where only one is inline-handled cannot safely drop that kind's hint outright. Closing this needs either reordering so hint-suppression happens after inline-publication prep resolves (which of the write's hints it actually serviced), or threading per-index "already inline-handled" names into hint construction and only dropping a kind's hint when every target of that kind was serviced. Per-hint lanes already skip writing when no consumer is registered for that hint at all (`active_consumer_hint_mask`, §3.6); the "all" lane does not.
+**Implemented.** The journal/replay payload's physical write (`replay_append`) is still built early in `mutation_commit.zig` (`replay_payload`, used unmodified by the replication-mirror and transaction-replication outboxes, which need every hint regardless of this node's own inline-publication state), but the suppression decision runs right after every `InlineTextPublication`/`InlineGraphPublication`/`InlineSparsePublication`/`InlineDensePublication`/`InlineAlgebraicPublication` has resolved which indexes it actually serviced -- never pre-guessed from the gate conditions alone, since a publication that failed to prepare or lost its `commit_participants` slot still needs its hint kept. A kind's hint is dropped only when every target of that kind in the write was serviced inline (text/graph/sparse/dense's own blocks already strip their handled name(s) out of `sync_targets.all_indexes`/`full_text_indexes` on success, so "nothing of that kind remains" is the test; algebraic's block does not strip, so its remaining count subtracts the handled count back out). A mixed batch (two indexes of the same kind, only one inline-handled) keeps the hint for the other. Only the local journal write is ever repointed at the filtered re-encoding; `replay_payload` itself, and so replication, is untouched. Per-hint lanes already skip writing when no consumer is registered for that hint at all (`active_consumer_hint_mask`, §3.6); the "all" lane does not.
 
 **Crash invariant.** Ride-along work may be lost at a crash. Acknowledged work may not, and credits may not leak.
 
@@ -247,7 +247,7 @@ Algebraic indexes (`storage/db/algebraic/`) are built differently. They write fa
 
 The 14 adaptive/join/bulk-finish commit sites that still opened their own `beginWriteTxn` (bulk-ingest session finish, materialized-expression-delta rebuild, and the whole adaptive observation/candidate/progress/backfill/dematerialization family) are now `beginWriteBatchWithOptions(.{ .durability = .ride_along })`, tagged `.algebraic_adaptive` for the harness. `applyBatchWritesLocked`'s own two foreground commits -- the actual durability boundary when a write cannot be inline-published -- are unchanged.
 
-Not exercised by the measured scenario: HLL maintenance only runs when a sketch is marked dirty by a delete or overwrite (`runHllMaintenance`'s own doc comment), and the harness's algebraic mode is insert-only, so `algebraic_hll_maintenance` reads zero in that run. The ride-along wiring (`runHllMaintenance`, `flushPendingHllObservations`, `runHllAdaptiveBackfillTick`) is in place and unit-tested independently; a harness scenario that deletes/overwrites group-by values would be needed to measure it end to end.
+**Measured, not yet at target: the overwrite scenario.** `measureSingleWriterAlgebraicOverwrite` (a small 8-key cycle, so most writes overwrite an existing key's group-by value, dirtying the HLL sketch on nearly every write) now measures this path end to end. It does not yet reach 1.0/0: ~1.9 durable commits/write and ~0.94 background syncs/update, almost exactly one self-forced drain per dirtying write. `scheduleHllMaintenanceIfDirty` -> `runHllMaintenance` does reach `beginWriteBatchWithOptions(.{ .durability = .ride_along })` -> `Store.stageRideAlong`, which never leads a group by construction, so the self-drain must be `stageRideAlong`'s own `if (ride_along_pending_bytes >= ride_along_byte_threshold) forceDrainDurable()` check firing almost every time. Capping `max_hll_maintenance_rows_per_tick` at 8 made no measurable difference, ruling out "the rebuild itself scans/rewrites too many rows" as the byte source. What's actually driving each tick's byte cost that large, and why a concurrent foreground write in this single-writer sequential harness essentially never drains the pending ride-along bytes for free first, needs a traced run to pin down -- left as an open follow-up (`write_amplification_bench_test.zig`'s own comment at the `algebraic_overwrite` print has the detail); the measured numbers are reported, not gated, until it's root-caused.
 
 ### 3.3c Relational, transactional and auxiliary write surfaces
 
@@ -486,31 +486,70 @@ observed in this session were either unchanged (full-text, which passed)
 or anomalously high (graph/dense, under contention) -- neither supports a
 lower number yet.
 
-### 7.3 Sparse vector per-write cost: not yet fixed
+### 7.3 Sparse vector per-write cost: term-meta/term-range merged
 
 `SparseIndex.installInlineSparsePublication` → `native_catalog_backend.
 Backend.applyExternallyCommittedMutations` → persistent-treap `put` per
 mutation is architecturally proportional to the write's own size: with
 `sparse_terms = 32` (the harness's dimension count) and every term
 brand-new (the harness's deterministic token ids never repeat across the
-128 documents it writes), each write durably touches roughly 2 (forward/
-reverse) + 5 per term (chunk, chunk-range-meta, term-meta, term-catalog
-entry, term-range-meta) + 2 (counters) ≈ 164 keys, each a `mem_ordered.
-Tree.put` -- an O(log n) persistent-treap path copy, each node copy its
-own `allocator.create` plus three `allocator.dupe`s. Dense goes through
-the same backend at a handful of keys per write; the ~6x throughput gap
-(0.6-0.8 vs. 4.4-4.5 writes/s) is explained by that ratio of key count
-times Debug `GeneralPurposeAllocator`'s per-call stack-capture cost, not
-by an algorithmic defect in the business logic -- `addToPostings`'s
-"append to an existing chunk" path, the one case that really would rewrite
-an unnecessarily large existing posting list, is never exercised by this
-harness's non-colliding term ids. No fix attempted this session: the
-only concrete lever found (merging the chunk and chunk-range-meta writes
-into one key, cutting one `put` of five per term) is a durable key-format
-change with broad blast radius (every other `readChunkRangeMeta` caller)
-that was not safe to land and verify under this session's build/test
-turnaround and host contention. Left for a follow-up with a quiet host
-and real profiling (the file's own `WriteProfile` counters are already
-wired for the bulk-append path but not the incremental one `stageIncremental
-Mutations` uses; extending them there first would turn this from an
-estimate into a measurement before cutting anything).
+128 documents it writes), each write used to durably touch roughly 2
+(forward/reverse) + 5 per term (chunk, chunk-range-meta, term-meta,
+term-catalog entry, term-range-meta) + 2 (counters) ≈ 164 keys, each a
+`mem_ordered.Tree.put` -- an O(log n) persistent-treap path copy, each
+node copy its own `allocator.create` plus three `allocator.dupe`s.
+
+A term's meta (max_weight, chunk_count) and its doc-id range (min/max
+across chunks) were two separate records even though every call site
+reads or writes them as a pair; merged into one (§7.3's own commit,
+`perf(sparse): merge term meta + term range into one record per term`).
+For the inline/incremental path specifically, an insert-only touch also
+no longer defers its range update at all -- it was always correct to
+extend the range immediately (there is no cheaper "batch it" version of
+an extend-only update), unlike a delete, which still defers to a full
+chunk rescan since only that can correctly *shrink* a range. New term
+steady-state: 5 keys/term → 4 (chunk, chunk-range-meta, the combined
+term record, term-catalog once); a re-touched term: 4 → 2.
+
+Debug harness result (same host, same load regime as the rest of this
+table, so treat the absolute numbers as noisy -- `primary-only` moved
+too, from this session's own load swings -- but the sparse-vs-everything-
+else *ratio* is the real signal): sparse-vector-visible went from
+0.6-0.7 writes/s to 1.0-1.1, while primary-only/dense/graph were all
+simultaneously *lower* than their own §7's figures under this run's
+heavier load. Sparse moving up while its neighbors moved down under the
+same contention is not a load artifact.
+
+The chunk + chunk-range-meta pair (also always co-accessed, and the
+larger remaining write-count lever) is deliberately NOT merged:
+`encodeChunk`'s own payload is a documented "compatible Go v1 payload"
+wire format, and the pair's readers extend into segment split/handoff
+classification (`handoffTermPostings`/`pruneTermPostings`/
+`accumulateSplitPlanningStats`) and a direct query-time chunk scan --
+materially larger, riskier blast radius than the meta+range pair
+actually cut. Left for a follow-up with more verification budget; the
+file's own `WriteProfile` counters are still only wired for the
+bulk-append path, not the incremental one `stageIncrementalMutations`
+uses -- extending them there first would turn the next attempt's sizing
+from an estimate into a measurement before cutting anything.
+
+Verification: `zig build sparse-test` -- 84/84 pass (0 leaked),
+including a new regression test for the one correctness-sensitive
+interaction this change introduces (a term touched by both an insert
+and a delete in the same deferred batch must not have the insert's
+immediate write and the delete's deferred recompute clobber each
+other) and that the range shrinks correctly across a close/reopen.
+
+### 7.4 Full crash sweep family: green
+
+All 23 `crash sweep`/`crash sweep exhaustive` tests in
+`crash_consistency_test.zig` pass (0 leaked) on top of every fix in
+this section (§7.1's idle-flush fix, §7.2's background-commit batching,
+§7.3's sparse term-record merge), including `crash sweep: sustained
+full_index writes survive a crash during ride-along merge and
+retirement` -- the one test perf/lwa-postmerge owns and is separately
+fixing for its known intermittent `AcknowledgedWriteLost` signature.
+It passed cleanly here; that satisfies this session's gate (everything
+else green, and this one either green or failing with its own known
+signature, never a hang or a new failure mode) without this session
+needing to reproduce or touch its bug.

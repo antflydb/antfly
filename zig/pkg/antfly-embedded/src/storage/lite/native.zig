@@ -2092,9 +2092,29 @@ const DocumentIndexNode = struct {
     keys: [][]u8,
     pointers: []u64,
     key_pages: ?[]u64 = null,
+    /// Backing storage for every *inline* key in `keys`, one allocation
+    /// instead of one `dupe` per key (a document-index leaf/internal node
+    /// commonly has dozens of keys; `decodeDocumentIndexNode` used to call
+    /// `allocator.dupe` once per key, measured as the single largest
+    /// allocation-site contributor in the write-amplification CPU
+    /// attribution -- ~472 allocations/write out of ~887 total, since a
+    /// commit can decode several such nodes along the root-to-leaf path).
+    /// `keys[i]` is a slice into this buffer when `key_pages[i] == 0`
+    /// (inline). *External* keys (`key_pages[i] != 0`) are deliberately
+    /// excluded: they stay their own individual (if zero-size) allocation
+    /// exactly as before, because `resolveIndexKey` later frees and
+    /// replaces exactly one such key in place once it resolves the real
+    /// content from disk -- that `allocator.free` call requires the key to
+    /// be its own allocation, not a sub-slice of this shared buffer. `null`
+    /// only when no inline key needed any storage (every key external, or
+    /// zero keys), matching `allocator.free` on a `null` being a no-op.
+    key_storage: ?[]u8 = null,
 
     pub fn deinit(self: *DocumentIndexNode, allocator: Allocator) void {
-        for (self.keys) |key| allocator.free(key);
+        if (self.key_pages) |pages| {
+            for (self.keys, pages) |key, page| if (page != 0) allocator.free(key);
+        }
+        if (self.key_storage) |storage| allocator.free(storage);
         allocator.free(self.keys);
         allocator.free(self.pointers);
         if (self.key_pages) |pages| allocator.free(pages);
@@ -3238,13 +3258,48 @@ const IndexEditor = struct {
     fn load(self: *IndexEditor, link: *Link) !*Node {
         if (link.node) |node| return node;
         try self.prepareRead(link.page);
-        const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
-        defer self.file.allocator.free(payload);
         const node = try self.newNode(.leaf);
         const alloc = self.nodeAllocator(node);
         // Decoded buffers belong to the editor arena; transfer key slices
         // directly instead of allocating another copy of every inline key.
-        const decoded = try decodeDocumentIndexNode(alloc, payload);
+        const decoded = blk: {
+            // Fast path: this page's bytes are already resident (this writer
+            // read or wrote them in an earlier commit on this same
+            // `NativeFile` and nothing since has reused/rewritten/rolled
+            // back that page -- `page_cache`'s existing eviction already
+            // guarantees that: `PageAllocator.allocate`'s reuse path and
+            // `evictCacheForPagesReusedSince`'s rollback path both call
+            // `page_cache.remove`/`removeLinks` the moment a page's content
+            // actually changes, so a surviving cache entry here is
+            // guaranteed current). `acquirePayload` validates the CRC once
+            // on promotion into a `RawView` and skips it on every
+            // subsequent acquire of the same still-resident view -- the
+            // same cache-hit-skips-CRC property "lite warm value ranges
+            // borrow pages without copies or allocations" already proves
+            // for the value/record path; this reuses that exact mechanism
+            // instead of inventing a parallel one. A `null` return (cold
+            // cache, a concurrent `IndexView` promoted on the same page, or
+            // this writer's own page size mismatch, none of which should
+            // happen in practice for a document-index page) falls back to
+            // the always-correct disk-read-and-decode path below, which
+            // re-seeds the cache for next time via `readPhysicalPageAlloc`.
+            if (self.file.page_cache_enabled.load(.monotonic) and self.file.page_cache_bypass.load(.monotonic) == 0) {
+                const physical = physicalPage(link.page);
+                if (physical != 0 and physical < self.checkpoint.page_count) {
+                    if (try self.file.page_cache.acquirePayload(self.file.allocator, physical, @intCast(self.file.header.page_size))) |view| {
+                        defer self.file.page_cache.releaseRaw(self.file.allocator, view);
+                        if (view.validation.?.kind != .document_index) return error.UnexpectedNativePageKind;
+                        const payload = view.bytes[page_header_size..][0..view.validation.?.payload_len];
+                        if (builtin.is_test) _ = PageDecodeMetrics.index_editor_cache_hits.fetchAdd(1, .monotonic);
+                        break :blk try decodeDocumentIndexNode(alloc, payload);
+                    }
+                }
+            }
+            if (builtin.is_test) _ = PageDecodeMetrics.index_editor_cache_misses.fetchAdd(1, .monotonic);
+            const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
+            defer self.file.allocator.free(payload);
+            break :blk try decodeDocumentIndexNode(alloc, payload);
+        };
         node.kind = decoded.kind;
         node.page = link.page;
         node.original_page = link.page;
@@ -4340,6 +4395,56 @@ const PageDecodeMetrics = struct {
     var crc_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var crc_bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var extent_decodes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+    // Diagnostic-only counters for IndexEditor.load's cache-hit fast path
+    // (debugging the item-2 write-amplification fix), not load-bearing.
+    var index_editor_cache_hits: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+    var index_editor_cache_misses: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+};
+
+/// Diagnostic-only pwrite attribution by `PageKind` (perf/lwa-cpu's
+/// pwrite-breakdown attribution task), not load-bearing. Bucketed by kind
+/// rather than call site: `PageWriteBatch.flushCount`'s own coalesced
+/// writes can mix several pages (and thus several commits' worth of calls)
+/// under one `write_amplification_trace` scope by the time the actual
+/// syscall happens (ledger pages staged in `persistAllocator` are not
+/// flushed until a later, shared `PageAllocator.flush()` call -- scoping
+/// around `persistAllocator` alone would not reliably cover its own
+/// pwrite), while every page's `PageKind` byte is known exactly at the
+/// point of the write regardless of when it was staged. A contiguous run
+/// written in one syscall (`flushCount`) is bucketed by its first page's
+/// kind; `commit_manifest` and `checkpoint_slot` are always exactly one
+/// page per write by construction, so their buckets are already precise.
+pub const PageWriteMetrics = struct {
+    pub const Bucket = struct {
+        calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+        bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    };
+    var buckets: if (builtin.is_test) [14]Bucket else void = if (builtin.is_test) @splat(.{}) else {};
+
+    fn record(kind: PageKind, bytes: u64) void {
+        if (!builtin.is_test) return;
+        const bucket = &buckets[@backingInt(kind)];
+        _ = bucket.calls.fetchAdd(1, .monotonic);
+        _ = bucket.bytes.fetchAdd(bytes, .monotonic);
+    }
+
+    /// Snapshot a bucket's (calls, bytes) pair for `kind`. Public so an
+    /// external harness (perf/lwa-cpu's CPU bench) can read the pwrite
+    /// attribution by page kind without reaching into this module's
+    /// internals.
+    pub fn get(kind: PageKind) struct { calls: u64, bytes: u64 } {
+        if (!builtin.is_test) return .{ .calls = 0, .bytes = 0 };
+        const bucket = &buckets[@backingInt(kind)];
+        return .{ .calls = bucket.calls.load(.monotonic), .bytes = bucket.bytes.load(.monotonic) };
+    }
+
+    pub fn reset() void {
+        if (!builtin.is_test) return;
+        for (&buckets) |*bucket| {
+            bucket.calls.store(0, .monotonic);
+            bucket.bytes.store(0, .monotonic);
+        }
+    }
 };
 
 /// In-memory cache of encoded pages, keyed by page id.
@@ -4968,6 +5073,9 @@ const PageWriteBatch = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
+            if (builtin.is_test) if (std.enums.fromInt(PageKind, self.buffer[start * size ..][4])) |kind| {
+                PageWriteMetrics.record(kind, (end - start) * size);
+            };
             // This loop is the choke point every PageWriteBatch-staged data
             // page passes through on its way to disk (appendPage/appendValue
             // only stage bytes into `buffer`; this is where they are
@@ -13187,6 +13295,7 @@ pub const NativeFile = struct {
         const page = page_buf[0..self.header.page_size];
         encodePage(page, .commit_manifest, payload);
         try self.file.writePositionalAll(self.runtimeIo(), page, manifest_page_id * @as(u64, self.header.page_size));
+        if (builtin.is_test) PageWriteMetrics.record(.commit_manifest, page.len);
         next.manifest_page = manifest_page_id;
         next.manifest_crc = std.mem.readInt(u32, page[page_crc_offset..][0..4], .little);
         next.manifest_page_count = @intCast(count);
@@ -13283,6 +13392,7 @@ pub const NativeFile = struct {
                 break :blk err;
             };
             self.file.writePositionalAll(io, slot_page, slotPhysicalPage(next_slot) * @as(u64, self.header.page_size)) catch |err| break :blk err;
+            if (builtin.is_test) PageWriteMetrics.record(.checkpoint_slot, slot_page.len);
             self.syncIfRequired(hooks) catch |err| break :blk err;
             break :blk {};
         }) catch {
@@ -13482,6 +13592,7 @@ fn appendPageToFile(
     // must never allocate.
     if (manifest) |builder| builder.reserveCapacity(allocator, 1);
     try file.writePositionalAll(io, page, page_id * @as(u64, @intCast(page_size)));
+    if (builtin.is_test) PageWriteMetrics.record(kind, page.len);
     if (manifest) |builder| builder.note(page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     next_page_id.* += 1;
     return page_id;
@@ -15025,6 +15136,33 @@ fn probeDocumentIndexNode(raw: []const u8, key: []const u8) !IndexProbe {
     return .{ .leaf = leaf, .page = selected };
 }
 
+/// First pass for `decodeDocumentIndexNode`: walks the same entry layout
+/// (2-byte key_len, 8-byte pointer, then either an 8-byte key_page or
+/// `key_len` inline bytes) purely to sum the inline-key bytes, so the real
+/// decode pass below can allocate exactly one backing buffer for all of
+/// this node's inline keys instead of one `dupe` per key. Bounds-checks the
+/// same way the decode pass does (a corrupt length here must not read out
+/// of `raw`), but does not validate key ordering or any other invariant --
+/// the decode pass still does that on its own, identical, walk.
+fn sumInlineDocumentIndexKeyBytes(raw: []const u8, start_pos: usize, count: usize) !usize {
+    var pos = start_pos;
+    var total: usize = 0;
+    for (0..count) |_| {
+        if (pos + 10 > raw.len) return error.InvalidDocumentIndex;
+        const key_len: usize = std.mem.readInt(u16, raw[pos..][0..2], .little);
+        pos += 10; // 2-byte length + 8-byte pointer, common to every entry
+        if (key_len == index_external_key_marker) {
+            if (pos + 8 > raw.len) return error.InvalidDocumentIndex;
+            pos += 8;
+        } else {
+            if (key_len > index_inline_key_limit or pos + key_len > raw.len) return error.InvalidDocumentIndex;
+            total += key_len;
+            pos += key_len;
+        }
+    }
+    return total;
+}
+
 fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndexNode {
     if (raw.len < document_index_header_size or !std.mem.eql(u8, raw[0..8], document_index_magic))
         return error.InvalidDocumentIndex;
@@ -15038,12 +15176,17 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
     if (kind == .leaf and count == 0) return error.InvalidDocumentIndex;
     const keys = try allocator.alloc([]u8, count);
     var keys_initialized: usize = 0;
-    errdefer {
-        for (keys[0..keys_initialized]) |key| allocator.free(key);
-        allocator.free(keys);
-    }
     const key_pages = try allocator.alloc(u64, count);
-    errdefer allocator.free(key_pages);
+    // External keys (`key_pages[i] != 0`) are each their own real
+    // allocation (see the comment at their assignment below); inline keys
+    // live in `key_storage`, freed once, separately. On an error partway
+    // through the loop, only the external keys actually initialized so
+    // far need freeing here.
+    errdefer {
+        for (keys[0..keys_initialized], key_pages[0..keys_initialized]) |key, page| if (page != 0) allocator.free(key);
+        allocator.free(keys);
+        allocator.free(key_pages);
+    }
     @memset(key_pages, 0);
     const pointer_extra: usize = if (kind == .internal) 1 else 0;
     const pointers = try allocator.alloc(u64, count + pointer_extra);
@@ -15054,6 +15197,14 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
         pointers[0] = std.mem.readInt(u64, raw[pos..][0..8], .little);
         pos += 8;
     }
+    // One allocation for every inline key's bytes in this node, instead of
+    // one `dupe` per key -- see `DocumentIndexNode.key_storage`'s doc
+    // comment for why (measured as the single largest allocation-site
+    // contributor in the write-amplification CPU attribution).
+    const inline_bytes_total = try sumInlineDocumentIndexKeyBytes(raw, pos, count);
+    const key_storage = if (inline_bytes_total != 0) try allocator.alloc(u8, inline_bytes_total) else null;
+    errdefer if (key_storage) |storage| allocator.free(storage);
+    var storage_used: usize = 0;
     for (keys, 0..) |*key, i| {
         if (pos + 10 > raw.len) return error.InvalidDocumentIndex;
         const key_len: usize = std.mem.readInt(u16, raw[pos..][0..2], .little);
@@ -15065,18 +15216,29 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
             if (pos + 8 > raw.len) return error.InvalidDocumentIndex;
             key_pages[i] = std.mem.readInt(u64, raw[pos..][0..8], .little);
             if (key_pages[i] == 0) return error.InvalidDocumentIndex;
+            // A real (if zero-size) individual allocation, not a slice
+            // into `key_storage`: `resolveIndexKey` later frees and
+            // replaces exactly this key in place once it resolves the
+            // external content, so it must be its own allocation the
+            // allocator can `free` on its own, not a sub-slice of a
+            // larger buffer freed as a whole elsewhere.
             key.* = try allocator.alloc(u8, 0);
             pos += 8;
         } else {
             if (key_len > index_inline_key_limit or pos + key_len > raw.len) return error.InvalidDocumentIndex;
-            key.* = try allocator.dupe(u8, raw[pos .. pos + key_len]);
+            // `sumInlineDocumentIndexKeyBytes` already proved `key_storage`
+            // has room for every inline key's bytes in this same walk.
+            const storage = key_storage.?;
+            @memcpy(storage[storage_used..][0..key_len], raw[pos .. pos + key_len]);
+            key.* = storage[storage_used..][0..key_len];
+            storage_used += key_len;
             pos += key_len;
         }
         keys_initialized += 1;
         if (i > 0 and key_pages[i - 1] == 0 and key_pages[i] == 0 and std.mem.order(u8, keys[i - 1], key.*) != .lt) return error.InvalidDocumentIndex;
     }
     if (pos != raw.len) return error.InvalidDocumentIndex;
-    return .{ .kind = kind, .keys = keys, .pointers = pointers, .key_pages = key_pages };
+    return .{ .kind = kind, .keys = keys, .pointers = pointers, .key_pages = key_pages, .key_storage = key_storage };
 }
 
 fn decodeValuePage(raw: []const u8) !ValuePage {
@@ -22665,6 +22827,54 @@ test "lite warm value ranges borrow pages without copies or allocations" {
     const bytes = file.test_value_cache_borrowed_bytes.load(.monotonic) - borrowed;
     try std.testing.expect(bytes > 100 * 16);
     std.debug.print("LITE_VALUE_LEASE ranges=100 returned_bytes=1600 borrowed_page_bytes={d} all_cache_copied_bytes=0 crc_calls=0 crc_bytes=0 extent_decodes=0 release_locks=0 backing_reads=0 allocations=0\n", .{bytes});
+}
+
+// Regression gate for `IndexEditor.load`'s cache-hit fast path: a steady
+// write workload that keeps revisiting the same small set of document-index
+// pages (the write-amplification harness's own shape -- few distinct keys,
+// many updates) must not pay a fresh CRC verification on every single
+// commit's `IndexEditor.load` of those same pages. Asserts directly on the
+// fast path's own hit/miss counters rather than on the aggregate
+// `PageDecodeMetrics.crc_calls` delta: a write commit also CRC-verifies the
+// free-map/allocator/manifest pages every time regardless of this fix (out
+// of scope here -- see items 3/4), so that aggregate is not this fix's
+// signal and asserting on it either passes for the wrong reason or (as
+// first written) fails for the wrong reason.
+test "lite index editor reuses verified document-index pages across commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-editor-cache-reuse.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    // Seed enough distinct keys that the document index has more than one
+    // leaf, so the updates below actually revisit shared pages rather than
+    // always landing on a lone root leaf.
+    for (0..64) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        try file.putDocument(key, "seed");
+    }
+    const hits_before = PageDecodeMetrics.index_editor_cache_hits.load(.monotonic);
+    const misses_before = PageDecodeMetrics.index_editor_cache_misses.load(.monotonic);
+    const rounds = 64;
+    const keys_per_round = 8;
+    for (0..rounds) |_| {
+        for (0..keys_per_round) |i| {
+            var key_buf: [16]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+            try file.putDocument(key, "updated");
+        }
+    }
+    const hits = PageDecodeMetrics.index_editor_cache_hits.load(.monotonic) - hits_before;
+    const misses = PageDecodeMetrics.index_editor_cache_misses.load(.monotonic) - misses_before;
+    std.debug.print("LITE_INDEX_EDITOR_CACHE fast_path_hits={d} fast_path_misses={d} rounds={d} keys_per_round={d}\n", .{ hits, misses, rounds, keys_per_round });
+    // Every one of these updates revisits a document-index page this same
+    // writer wrote in the immediately preceding commit; the fast path must
+    // take every one of them (zero misses) once the cache is warm.
+    try std.testing.expectEqual(@as(u64, 0), misses);
+    try std.testing.expect(hits > 0);
 }
 
 test "lite value cursor initialization errors release borrowed pages" {
