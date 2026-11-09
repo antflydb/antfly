@@ -22082,20 +22082,28 @@ pub const DB = struct {
     }
 
     fn elideLocalLeannVectorsAfterReplayFallible(self: *DB) !void {
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        if (!self.core.index_manager.localLeannElisionPending()) return;
-        try self.core.index_manager.elideLocalLeannVectors();
+        while (true) {
+            {
+                try self.lockApplySharedForPortableRuntime();
+                defer self.core.unlockApplyShared();
+                if (!self.core.index_manager.localLeannElisionPending()) return;
+            }
+            {
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                try self.core.index_manager.elideLocalLeannVectors();
+            }
+        }
     }
 
     pub fn syncIndexes(self: *DB, force: bool) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("syncIndexes", .{ self, force });
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        try self.core.index_manager.syncAll(force);
-        // Transient LEANN (local mode): stored vectors the just-synced graphs
-        // cover become stubs, under the apply lock that orders primary writes.
-        try self.core.index_manager.elideLocalLeannVectors();
+        {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            try self.core.index_manager.syncAll(force);
+        }
+        try self.elideLocalLeannVectorsAfterReplayFallible();
     }
 
     pub const PreparedMergeArtifacts = local_mutation.PreparedMergeArtifacts;
@@ -54529,14 +54537,18 @@ fn elideLocalLeannVectorsAsync(ctx: *AsyncContext) void {
 }
 
 fn elideLocalLeannVectorsAsyncFallible(ctx: *AsyncContext) !void {
-    {
-        try lockApplySharedForPortableRuntimeAsync(ctx);
-        defer ctx.apply_mutex.unlockShared();
-        if (!ctx.index_manager.localLeannElisionPending()) return;
+    while (true) {
+        {
+            try lockApplySharedForPortableRuntimeAsync(ctx);
+            defer ctx.apply_mutex.unlockShared();
+            if (!ctx.index_manager.localLeannElisionPending()) return;
+        }
+        {
+            try lockApplyForPortableRuntimeAsync(ctx);
+            defer ctx.apply_mutex.unlockExclusive();
+            try ctx.index_manager.elideLocalLeannVectors();
+        }
     }
-    try lockApplyForPortableRuntimeAsync(ctx);
-    defer ctx.apply_mutex.unlockExclusive();
-    try ctx.index_manager.elideLocalLeannVectors();
 }
 
 /// Inline replay (no derived workers): same as `elideLocalLeannVectorsAsync`.
@@ -54549,10 +54561,20 @@ fn elideLocalLeannVectorsContext(ctx: *const BatchExecutionContext) void {
 }
 
 fn elideLocalLeannVectorsContextFallible(ctx: *const BatchExecutionContext) !void {
-    try lockApplyForPortableRuntimeContext(ctx);
-    defer ctx.apply_mutex.unlockExclusive();
-    if (!ctx.index_manager.localLeannElisionPending()) return;
-    try ctx.index_manager.elideLocalLeannVectors();
+    while (true) {
+        {
+            try enforcePortableRuntimeGateOptional(ctx.portable_runtime_activation_pending);
+            ctx.apply_mutex.lockShared();
+            defer ctx.apply_mutex.unlockShared();
+            try enforcePortableRuntimeGateOptional(ctx.portable_runtime_activation_pending);
+            if (!ctx.index_manager.localLeannElisionPending()) return;
+        }
+        {
+            try lockApplyForPortableRuntimeContext(ctx);
+            defer ctx.apply_mutex.unlockExclusive();
+            try ctx.index_manager.elideLocalLeannVectors();
+        }
+    }
 }
 
 fn replicationMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*MutationBarrier {

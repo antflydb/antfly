@@ -1806,12 +1806,14 @@ pub fn reembedDenseDocuments(
     defer slots.deinit(alloc);
     var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
     defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
+    var source_cache = ReembedChunkSourceCache{};
+    defer source_cache.deinit(runtime.alloc);
     for (requests, 0..) |request, i| {
         // Page-image inputs embed rendered pages, not the document source;
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
         if (request.input_kind != .document) {
-            const text = (try reembedChunkTextAlloc(runtime, request, &chunk_cache)) orelse continue;
+            const text = (try reembedChunkTextAlloc(runtime, request, &chunk_cache, &source_cache)) orelse continue;
             texts.append(alloc, text) catch |err| {
                 runtime.alloc.free(text);
                 return err;
@@ -1858,26 +1860,58 @@ pub fn reembedDenseDocuments(
 /// when the document or the chunk is gone (for example, after an edit the
 /// graph has not caught up with). Chunks carrying model metadata (media
 /// windows, model outputs) and stored chunk inputs are not supported.
+const ReembedChunkSourceCache = struct {
+    const Entry = struct {
+        sources: ChunkEmbeddingSourceSet,
+        by_key: std.StringHashMapUnmanaged(usize) = .empty,
+    };
+    entries: std.StringHashMapUnmanaged(*Entry) = .empty,
+
+    fn deinit(self: *ReembedChunkSourceCache, alloc: Allocator) void {
+        var it = self.entries.iterator();
+        while (it.next()) |item| {
+            const entry = item.value_ptr.*;
+            entry.by_key.deinit(alloc);
+            entry.sources.deinit(alloc);
+            alloc.destroy(entry);
+            alloc.free(item.key_ptr.*);
+        }
+        self.entries.deinit(alloc);
+    }
+};
+
 fn reembedChunkTextAlloc(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    source_cache: *ReembedChunkSourceCache,
 ) !?[]u8 {
     if (request.input_kind != .inline_chunks) return error.ReembedUnsupportedInput;
-    const parent = (try internal_keys.decodeDocumentComponentAlloc(runtime.alloc, request.doc_key)) orelse return null;
-    defer runtime.alloc.free(parent);
+    const alloc = runtime.alloc;
+    const parent = (try internal_keys.decodeDocumentComponentAlloc(alloc, request.doc_key)) orelse return null;
+    defer alloc.free(parent);
     var parent_request = request;
     parent_request.doc_key = parent;
-    var source_set = try chunkEmbeddingSourceSetForRequest(runtime, parent_request, requestArtifactName(request), chunk_cache);
-    defer source_set.deinit(runtime.alloc);
-    for (source_set.sources) |*source| {
-        if (!std.mem.eql(u8, source.key, request.doc_key)) continue;
-        if (source.metadata != null) return error.ReembedUnsupportedInput;
-        const text = source.text;
-        source.text = source.text[0..0]; // The caller owns it now.
-        return text;
-    }
-    return null;
+    const worker_key = try workerChunkCacheKey(alloc, parent_request);
+    defer alloc.free(worker_key);
+    const cache_key = try workerChunkCacheTupleKeyAlloc(alloc, &.{ requestArtifactName(request), worker_key });
+    defer alloc.free(cache_key);
+    const entry = source_cache.entries.get(cache_key) orelse create: {
+        const entry = try alloc.create(ReembedChunkSourceCache.Entry);
+        errdefer alloc.destroy(entry);
+        entry.* = .{ .sources = try chunkEmbeddingSourceSetForRequest(runtime, parent_request, requestArtifactName(request), chunk_cache) };
+        errdefer entry.sources.deinit(alloc);
+        errdefer entry.by_key.deinit(alloc);
+        for (entry.sources.sources, 0..) |source, i| try entry.by_key.put(alloc, source.key, i);
+        const owned_key = try alloc.dupe(u8, cache_key);
+        errdefer alloc.free(owned_key);
+        try source_cache.entries.put(alloc, owned_key, entry);
+        break :create entry;
+    };
+    const index = entry.by_key.get(request.doc_key) orelse return null;
+    const source = entry.sources.sources[index];
+    if (source.metadata != null) return error.ReembedUnsupportedInput;
+    return try alloc.dupe(u8, source.text);
 }
 
 /// Whether rendered content parts are text only, so the vector they embed is
@@ -6089,6 +6123,18 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     try std.testing.expectEqual(@as(usize, 1), probe.texts.items.len);
     try std.testing.expectEqualStrings(wanted.text, probe.texts.items[0]);
     try std.testing.expectEqual(@as(f32, @floatFromInt(wanted.text.len)), out[0]);
+
+    // Several requested keys from one parent reuse one indexed source set.
+    {
+        var worker_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+        defer freeWorkerChunkCache(alloc, &worker_cache);
+        var sources = ReembedChunkSourceCache{};
+        defer sources.deinit(alloc);
+        const text = (try reembedChunkTextAlloc(&runtime, requests[0], &worker_cache, &sources)).?;
+        defer alloc.free(text);
+        try std.testing.expect((try reembedChunkTextAlloc(&runtime, requests[1], &worker_cache, &sources)) == null);
+        try std.testing.expectEqual(@as(usize, 1), sources.entries.count());
+    }
 
     // Stored-chunk inputs are not re-chunked from the document.
     requests[0].input_kind = .materialized_chunks;

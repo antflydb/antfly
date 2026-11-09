@@ -1404,6 +1404,7 @@ pub const IndexManager = struct {
     dense_reembedder: ?DenseReembedder = null,
     /// Recently re-embedded vectors of transient LEANN indexes (32 MiB).
     leann_reembed_cache: leann_store_mod.ReembedCache = .{ .limit_bytes = 32 << 20 },
+    leann_range_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     text_main_backend: persistent_mod.MainBackend,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
@@ -8872,6 +8873,7 @@ pub const IndexManager = struct {
     pub fn updateRange(self: *IndexManager, byte_range: docstore_mod.ByteRange) void {
         self.byte_range = byte_range;
         for (self.graph_indexes.items) |*entry| entry.index.reconcileOwnershipRange(byte_range.start, byte_range.end);
+        self.leann_range_pending.store(true, .release);
         self.dropLeannKeysOutOfRange() catch |err| {
             std.log.warn("leann range drop deferred err={s}", .{@errorName(err)});
         };
@@ -8884,19 +8886,19 @@ pub const IndexManager = struct {
     /// replica, which runs this at the same apply position, agrees.
     /// Idempotent, so reopening with the same range is harmless. Takes only
     /// the LEANN records mutex (callers may hold the catalog lock).
-    fn dropLeannKeysOutOfRange(self: *IndexManager) !void {
-        var any = false;
-        for (self.dense_indexes.items) |*entry| if (entry.index.leann != null) {
-            any = true;
-        };
-        if (!any) return;
+    pub fn dropLeannKeysOutOfRange(self: *IndexManager) !void {
         self.lockAtomicWithBackoff(&self.leann_records_mutex);
         defer self.leann_records_mutex.unlock();
+        try self.dropLeannKeysOutOfRangeLocked();
+    }
+
+    fn dropLeannKeysOutOfRangeLocked(self: *IndexManager) !void {
         for (self.dense_indexes.items) |*entry| {
             const store = entry.index.leann orelse continue;
-            const dropped = try store.dropKeysWhere(@as(*const IndexManager, self), IndexManager.keyInRange);
+            const dropped = try store.dropKeysWhere(@as(*const IndexManager, self), IndexManager.leannKeyInRange);
             if (dropped > 0) std.log.info("leann range drop index={s} keys={d}", .{ entry.config.name, dropped });
         }
+        self.leann_range_pending.store(false, .release);
     }
 
     pub fn validateRangeTransition(self: *IndexManager, byte_range: docstore_mod.ByteRange) !void {
@@ -9050,7 +9052,8 @@ pub const IndexManager = struct {
     /// `elideLocalLeannVectors` needs. Call with the apply lock held (shared
     /// is enough).
     pub fn localLeannElisionPending(self: *IndexManager) bool {
-        if (self.leann_replication) return false;
+        if (self.leann_replication or self.primary_store == null) return false;
+        if (self.leann_range_pending.load(.acquire)) return true;
         for (self.dense_indexes.items) |*entry| {
             if (!entry.leann_transient) continue;
             const leann_store = entry.index.leann orelse continue;
@@ -9068,11 +9071,12 @@ pub const IndexManager = struct {
         const store = self.primary_store orelse return;
         var guard = self.lockLeannRecords();
         defer guard.unlock();
+        if (self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRangeLocked();
         for (self.dense_indexes.items) |*entry| {
             if (!entry.leann_transient) continue;
             const leann_store = entry.index.leann orelse continue;
             if (leann_store.isReplicated()) continue;
-            const pending = try leann_store.pendingElideAlloc(self.alloc);
+            const pending = try leann_store.pendingElideAlloc(self.alloc, 128);
             defer leann_store_mod.LeannStore.freeElide(self.alloc, pending);
             if (pending.len == 0) continue;
             var txn = try store.beginWriteTxn();
@@ -9080,6 +9084,7 @@ pub const IndexManager = struct {
             _ = try self.elideLeannVectorsTxn(&txn, entry.config.name, pending);
             try txn.commit();
             leann_store.clearElided(pending.len);
+            return; // Release the apply lock before processing another batch.
         }
     }
 
@@ -12181,6 +12186,7 @@ pub const IndexManager = struct {
 
     pub fn load(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, true, false);
+        try self.dropLeannKeysOutOfRange();
     }
 
     /// Restore activation deliberately stays single-threaded. Individual
@@ -12198,6 +12204,7 @@ pub const IndexManager = struct {
         defer self.load_parallelism = previous_parallelism;
         self.load_parallelism = 1;
         try self.loadWithBackfill(store, true, false);
+        try self.dropLeannKeysOutOfRange();
     }
 
     fn resetRestoreLoadAttempt(self: *IndexManager) void {
@@ -12226,6 +12233,7 @@ pub const IndexManager = struct {
 
     pub fn loadDeferredBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, false);
+        try self.dropLeannKeysOutOfRange();
     }
 
     fn selectedIndex(names: ?[]const []const u8, name: []const u8) bool {
@@ -12267,10 +12275,12 @@ pub const IndexManager = struct {
         }
         self.status_only_index_configs = try retained.toOwnedSlice(self.alloc);
         try self.refreshGeneratedEnrichmentTargetCache();
+        try self.dropLeannKeysOutOfRange();
     }
 
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, true);
+        try self.dropLeannKeysOutOfRange();
     }
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
@@ -17384,6 +17394,7 @@ pub const IndexManager = struct {
     pub fn planLeannRecords(self: *IndexManager, alloc: Allocator) ![]LeannProposal {
         var guard = self.lockLeannRecords();
         defer guard.unlock();
+        if (self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRangeLocked();
         return self.planLeannRecordsLocked(alloc);
     }
 
@@ -17393,6 +17404,7 @@ pub const IndexManager = struct {
         var guard = self.lockLeannRecords();
         defer guard.unlock();
         try self.drainLeannRecordsLocked(store);
+        if (self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRangeLocked();
         return self.planLeannRecordsLocked(alloc);
     }
 
@@ -17667,8 +17679,17 @@ pub const IndexManager = struct {
         defer alloc.free(chunk);
         const left = LeannSplitLeft{ .split_key = "m" };
         try std.testing.expect(!left.keep(chunk));
-        const right = LeannSplitLeft{ .split_key = "zz" };
+        const right = LeannSplitLeft{ .split_key = "zz{" };
         try std.testing.expect(right.keep(chunk));
+        // The range predicate decodes long binary document components without
+        // allocating and honors inclusive starts and exclusive ends.
+        var manager: IndexManager = undefined;
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        manager.alloc = failing.allocator();
+        manager.byte_range = .{ .start = doc, .end = "" };
+        try std.testing.expect(manager.leannKeyInRange(chunk));
+        manager.byte_range = .{ .start = "", .end = doc };
+        try std.testing.expect(!manager.leannKeyInRange(chunk));
     }
 
     pub fn handoffDenseFrom(self: *IndexManager, src: *IndexManager, dest_store: *docstore_mod.DocStore, split_key: []const u8, collect_skip_doc_keys: bool) ![]DenseSplitHandoff {
@@ -19350,6 +19371,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !hbc_mod.SearchResults {
+        if (entry.index.leann != null and self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRange();
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -19386,6 +19408,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !hbc_mod.ProfiledSearchResults {
+        if (entry.index.leann != null and self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRange();
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -19422,6 +19445,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !dense_exact.SearchOutcome {
+        if (entry.index.leann != null and self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRange();
         try checkDenseSearchCancelled(req);
         if (entry.leann_transient) {
             // Exact scoring would re-embed every candidate. LEANN's own search
@@ -33506,7 +33530,9 @@ pub const IndexManager = struct {
             const vector = vectors[j * d ..][0..d];
             @memcpy(out[slot * d ..][0..d], vector);
             found[slot] = true;
-            if (elided_digests.items[j]) |dg| manager.leann_reembed_cache.put(manager.alloc, incarnation, elided_keys.items[j], dg, vector) catch {};
+            if (elided_digests.items[j]) |dg| if (leann_store_mod.vectorDigest(vector) == dg) {
+                manager.leann_reembed_cache.put(manager.alloc, incarnation, elided_keys.items[j], dg, vector) catch {};
+            };
         }
     }
 
@@ -34400,6 +34426,33 @@ pub const IndexManager = struct {
             vector_id
         else
             null;
+    }
+
+    /// Compare an encoded document component without allocating. Unknown or
+    /// malformed internal keys are retained so a parse failure cannot delete data.
+    fn leannKeyInRange(self: *const IndexManager, key: []const u8) bool {
+        if (!internal_keys.isInternalUserKey(key)) return self.byte_range.contains(key);
+        const end = internal_keys.findComponentTerminator(key, 1) orelse return true;
+        const body = key[1..end];
+        const Compare = struct {
+            fn order(encoded: []const u8, bound: []const u8) ?std.math.Order {
+                var i: usize = 0;
+                var j: usize = 0;
+                while (i < encoded.len and j < bound.len) : (j += 1) {
+                    const b = encoded[i];
+                    if (b == 0) {
+                        if (i + 1 >= encoded.len or encoded[i + 1] != 0xff) return null;
+                        i += 2;
+                    } else i += 1;
+                    if (b != bound[j]) return if (b < bound[j]) .lt else .gt;
+                }
+                if (i == encoded.len and j == bound.len) return .eq;
+                return if (i == encoded.len) .lt else .gt;
+            }
+        };
+        if (self.byte_range.start.len != 0 and (Compare.order(body, self.byte_range.start) orelse return true) == .lt) return false;
+        if (self.byte_range.end.len != 0 and (Compare.order(body, self.byte_range.end) orelse return true) != .lt) return false;
+        return true;
     }
 
     fn keyInRange(self: *const IndexManager, key: []const u8) bool {
@@ -52734,7 +52787,7 @@ test "auto leann stubs text-derived vectors and keeps media-derived ones" {
     while (start < n) : (start += 100) try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", writes[start..@min(start + 100, n)]);
     try manager.syncAll(true);
     try std.testing.expect(manager.localLeannElisionPending());
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
     try std.testing.expect(!manager.localLeannElisionPending());
 
     for (artifact_keys, 0..) |k, i| {
@@ -52836,7 +52889,7 @@ test "auto leann media_vectors int8 keeps an int8 copy of media vectors" {
     while (start < n) : (start += 100) try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", writes[start..@min(start + 100, n)]);
     try manager.syncAll(true);
     try std.testing.expect(manager.localLeannElisionPending());
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
     try std.testing.expect(!manager.localLeannElisionPending());
 
     for (artifact_keys, 0..) |k, i| {
@@ -52900,6 +52953,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         vectors: []const [dims]f32,
         calls: usize = 0,
         documents: usize = 0,
+        wrong_key: ?usize = null,
 
         fn embed(ctx: *anyopaque, _: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, d: u32, out: []f32, found: []bool) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -52909,6 +52963,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
                 try std.testing.expectEqualStrings("body", request.source_field);
                 for (self.keys, 0..) |k, j| if (std.mem.eql(u8, k, request.doc_key)) {
                     @memcpy(out[i * d ..][0..d], &self.vectors[j]);
+                    if (self.wrong_key == j) out[i * d] += 100;
                     found[i] = true;
                 };
             }
@@ -52969,13 +53024,42 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
 
         // Sync, then elide: every covered vector becomes a stub.
         try manager.syncAll(true);
+        const before_batch = entry.index.leann.?.pendingElideCount();
+        try std.testing.expect(before_batch > 128);
         try manager.elideLocalLeannVectors();
+        try std.testing.expectEqual(before_batch - 128, entry.index.leann.?.pendingElideCount());
+        try std.testing.expectEqual(@as(usize, 128), try stubCount(alloc, &store, &keys));
+        while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
         try std.testing.expectEqual(@as(usize, n), try stubCount(alloc, &store, &keys));
-        try manager.elideLocalLeannVectors(); // idempotent
+        while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors(); // idempotent
         {
-            const pending = try entry.index.leann.?.pendingElideAlloc(alloc);
+            const pending = try entry.index.leann.?.pendingElideAlloc(alloc, 128);
             defer leann_store_mod.LeannStore.freeElide(alloc, pending);
             try std.testing.expectEqual(@as(usize, 0), pending.len);
+        }
+
+        // A query that sees source revision B while the durable stub still
+        // describes A must never cache B under A's digest. When A returns,
+        // the next query must recompute it before the cache can serve it.
+        {
+            var loader = IndexManager.DenseVectorLoadContext{ .manager = &manager, .index_name = @constCast("leann_idx") };
+            const ids = [_]u64{177};
+            const metadata = [_][]const u8{keys[177]};
+            var out: [dims]f32 = undefined;
+            var found = [_]bool{false};
+            var elapsed: u64 = 0;
+            embedder.wrong_key = 177;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expect(found[0] and out[0] != vectors[177][0]);
+            const before = embedder.documents;
+            embedder.wrong_key = null;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expectEqual(before + 1, embedder.documents);
+            try std.testing.expectEqualSlices(f32, &vectors[177], &out);
+            const after = embedder.documents;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expectEqual(after, embedder.documents);
+            manager.leann_reembed_cache.deinit(alloc);
         }
 
         // Searches re-embed only the candidates the bounds cannot settle,
@@ -53352,6 +53436,13 @@ test "replicated leann indexes converge from leader-planned records" {
     // leader-planned deletes, and the replicas still agree byte for byte.
     leader.updateRange(.{ .start = "", .end = "doc:0150" });
     follower.updateRange(.{ .start = "", .end = "doc:0150" });
+    // Crash before the delete records are committed. The persisted graph
+    // still contains moved keys, and range was installed before index open.
+    follower.deinit();
+    follower = try IndexManager.initWithOptions(alloc, path_b, .{ .leann_replication = true });
+    follower.updateRange(.{ .start = "", .end = "doc:0150" });
+    try follower.loadDeferredBackfill(&store_b);
+    try std.testing.expect(follower.denseIndex("leann_idx").?.index.leann.?.replicated.?.stats().dirty > 0);
     while (true) {
         const proposals = try leader.planLeannRecords(alloc);
         defer IndexManager.freeLeannProposals(alloc, proposals);
@@ -53512,7 +53603,7 @@ test "transient leann keeps vectors another index still reads" {
     try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", &writes);
     try std.testing.expect(manager.denseIndex("leann_idx").?.index.leann.?.index != null);
     try manager.syncAll(true);
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
 
     // Every artifact still holds its vector.
     for (keys) |k| {
@@ -53588,7 +53679,7 @@ fn checkPersistentBackfillAfterElision(hbc_json: []const u8) !void {
     for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = produced[i] };
     try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", &writes);
     try manager.syncAll(true);
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
 
     // Added later: its backfill reads the stubs and re-embeds them.
     try manager.addAllNoBackfill(&store, &.{.{ .name = "hbc_idx", .kind = .dense_vector, .config_json = hbc_json }});
@@ -53614,7 +53705,7 @@ fn checkPersistentBackfillAfterElision(hbc_json: []const u8) !void {
         defer alloc.free(stored);
         try std.testing.expectEqualSlices(f32, &vectors[i], stored);
     }
-    try manager.elideLocalLeannVectors(); // the HBC consumer keeps them stored
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors(); // the HBC consumer keeps them stored
     const after_backfill = embedder.documents;
     var results = try hbc.index.searchWithRequest(.{ .query = &vectors[42], .k = 3 });
     defer results.deinit();
@@ -53679,7 +53770,7 @@ test "transient leann persists at replay checkpoints and keeps authored vectors"
     defer alloc.free(authored);
     try store.put(authored_key, authored);
     try manager.syncAll(true);
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
     for (keys, 0..) |k, i| {
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, k, "leann_idx");
         defer alloc.free(artifact_key);

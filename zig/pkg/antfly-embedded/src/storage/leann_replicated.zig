@@ -360,11 +360,13 @@ pub const ReplicatedState = struct {
         while (live.next()) |k| if (!keep(ctx, k.*)) try Collect.add(self, &doomed, &seen, k.*);
         for (self.replica.buffer_keys.items) |k| if (!keep(ctx, k)) try Collect.add(self, &doomed, &seen, k);
         for (doomed.items) |key| {
+            // Install retryable deletion intent before releasing the only
+            // binding for a key that may not yet have reached the graph.
+            try self.markDirty(key, delete_digest);
             if (self.bindings.fetchRemove(key)) |kv| {
                 _ = self.key_of.remove(kv.value);
                 self.alloc.free(kv.key);
             }
-            try self.markDirty(key, delete_digest);
         }
         return doomed.items.len;
     }

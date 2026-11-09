@@ -94,6 +94,11 @@ pub const VectorLoader = struct {
     load_batch_timed: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void = null,
 };
 
+const ElideNode = struct {
+    entry: ElideEntry,
+    next: ?*ElideNode = null,
+};
+
 const Node = struct {
     vector_id: u64,
     /// Owned. Kept for deleted nodes until the next rebuild is not needed:
@@ -130,9 +135,10 @@ pub const LeannStore = struct {
     /// Transient storage, local mode: keys (owned) and vector digests the
     /// graph covers whose stored vectors may still be full. Persisted with
     /// the store so a crash before the owner elides them loses nothing.
-    elide: std.ArrayListUnmanaged(ElideEntry) = .empty,
-    /// Entries of `elide` covered by the last persisted state; only these
-    /// may be elided, since later ones exist only in memory.
+    elide_first: ?*ElideNode = null,
+    elide_last: ?*ElideNode = null,
+    elide_count: usize = 0,
+    /// Entries covered by the last persisted state.
     elide_durable: usize = 0,
     /// Set in replicated mode; the local-mode fields above stay empty.
     replicated: ?*replicated_mod.ReplicatedState = null,
@@ -209,7 +215,6 @@ pub const LeannStore = struct {
         self.node_of.deinit(self.alloc);
         self.pending.deinit(self.alloc);
         self.pending_of.deinit(self.alloc);
-        self.elide.deinit(self.alloc);
         self.alloc.free(self.path);
         self.alloc.destroy(self);
     }
@@ -223,8 +228,13 @@ pub const LeannStore = struct {
         for (self.pending.items) |p| self.freePending(p);
         self.pending.clearRetainingCapacity();
         self.pending_of.clearRetainingCapacity();
-        for (self.elide.items) |e| self.alloc.free(e.key);
-        self.elide.clearRetainingCapacity();
+        while (self.elide_first) |node| {
+            self.elide_first = node.next;
+            self.alloc.free(node.entry.key);
+            self.alloc.destroy(node);
+        }
+        self.elide_last = null;
+        self.elide_count = 0;
         self.elide_durable = 0;
     }
 
@@ -232,7 +242,15 @@ pub const LeannStore = struct {
         if (!self.opts.transient or key.len == 0) return;
         const owned = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(owned);
-        try self.elide.append(self.alloc, .{ .key = owned, .digest = replica_mod.vectorDigest(vector) });
+        try self.appendElideOwned(.{ .key = owned, .digest = replica_mod.vectorDigest(vector) });
+    }
+
+    fn appendElideOwned(self: *LeannStore, entry: ElideEntry) !void {
+        const node = try self.alloc.create(ElideNode);
+        node.* = .{ .entry = entry };
+        if (self.elide_last) |last| last.next = node else self.elide_first = node;
+        self.elide_last = node;
+        self.elide_count += 1;
     }
 
     /// Replay of a document whose stored vector is already an elided stub:
@@ -262,16 +280,22 @@ pub const LeannStore = struct {
     /// Transient storage, local mode: copies of the keys whose stored vector
     /// the persisted graph covers (free with `freeElide`). Replicated mode
     /// uses elide records instead.
-    pub fn pendingElideAlloc(self: *LeannStore, alloc: Allocator) ![]ElideEntry {
+    pub fn pendingElideAlloc(self: *LeannStore, alloc: Allocator, limit: usize) ![]ElideEntry {
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
-        const items = self.elide.items[0..self.elide_durable];
-        const out = try alloc.alloc(ElideEntry, items.len);
+        const count = @min(limit, self.elide_durable);
+        const out = try alloc.alloc(ElideEntry, count);
         var made: usize = 0;
-        errdefer freeElide(alloc, out[0..made]);
-        for (items, out) |e, *o| {
-            o.* = .{ .key = try alloc.dupe(u8, e.key), .digest = e.digest };
+        errdefer {
+            for (out[0..made]) |entry| alloc.free(entry.key);
+            alloc.free(out);
+        }
+        var node = self.elide_first;
+        for (out) |*item| {
+            const current = node.?;
+            item.* = .{ .key = try alloc.dupe(u8, current.entry.key), .digest = current.entry.digest };
             made += 1;
+            node = current.next;
         }
         return out;
     }
@@ -294,9 +318,15 @@ pub const LeannStore = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         const n = @min(count, self.elide_durable);
-        for (self.elide.items[0..n]) |e| self.alloc.free(e.key);
-        self.elide.replaceRangeAssumeCapacity(0, n, &.{});
+        for (0..n) |_| {
+            const node = self.elide_first.?;
+            self.elide_first = node.next;
+            self.alloc.free(node.entry.key);
+            self.alloc.destroy(node);
+        }
+        self.elide_count -= n;
         self.elide_durable -= n;
+        if (self.elide_first == null) self.elide_last = null;
         if (n > 0) self.dirty = true;
     }
 
@@ -700,7 +730,12 @@ pub const LeannStore = struct {
         if (self.replicated) |state| {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
-            return state.dropKeysWhere(ctx, keep);
+            const count = state.dropKeysWhere(ctx, keep) catch |err| {
+                self.dirty = true; // A partial mutation must still be persisted.
+                return err;
+            };
+            if (count != 0) self.dirty = true;
+            return count;
         }
         var ids = std.ArrayListUnmanaged(u64).empty;
         defer ids.deinit(self.alloc);
@@ -819,7 +854,7 @@ pub const LeannStore = struct {
         defer self.alloc.free(bytes);
         try self.persist(bytes);
         self.dirty = false;
-        self.elide_durable = self.elide.items.len;
+        self.elide_durable = self.elide_count;
     }
 
     /// The persisted file, or null when it was never written.
@@ -895,8 +930,10 @@ pub const LeannStore = struct {
             try wr.writeInt(u64, blob.len, .little);
             try wr.writeAll(blob);
         } else try wr.writeByte(0);
-        try wr.writeInt(u32, @intCast(self.elide.items.len), .little);
-        for (self.elide.items) |e| {
+        try wr.writeInt(u32, @intCast(self.elide_count), .little);
+        var elide_node = self.elide_first;
+        while (elide_node) |node| : (elide_node = node.next) {
+            const e = node.entry;
             try wr.writeInt(u32, @intCast(e.key.len), .little);
             try wr.writeAll(e.key);
             try wr.writeInt(u64, e.digest, .little);
@@ -955,9 +992,9 @@ pub const LeannStore = struct {
                 const key = try self.alloc.dupe(u8, r.take(len) catch return error.InvalidLeannStore);
                 errdefer self.alloc.free(key);
                 const digest = r.takeInt(u64, .little) catch return error.InvalidLeannStore;
-                try self.elide.append(self.alloc, .{ .key = key, .digest = digest });
+                try self.appendElideOwned(.{ .key = key, .digest = digest });
             }
-            self.elide_durable = self.elide.items.len;
+            self.elide_durable = self.elide_count;
         }
         if (r.bufferedLen() != 0) return error.InvalidLeannStore;
     }
@@ -1256,6 +1293,42 @@ fn addAll(alloc: Allocator, store: *LeannStore, data: []const f32, dims: usize, 
         });
     }
     try store.apply(items.items, &.{});
+}
+
+test "leann elision queue bounds batches and persists remaining work" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const dims = 16;
+    const data = try testData(alloc, 300, dims);
+    defer alloc.free(data);
+    var vectors = TestVectors{ .data = data, .dims = dims };
+    const opts = Options{ .dims = dims, .metric = .l2_squared, .transient = true };
+    {
+        var store = try LeannStore.open(alloc, testing.io, dir, opts);
+        defer store.deinit();
+        store.setLoader(vectors.loader());
+        try addAll(alloc, store, data, dims, 0, 300);
+        try store.sync();
+        try testing.expectEqual(@as(usize, 300), store.pendingElideCount());
+        const first = try store.pendingElideAlloc(alloc, 37);
+        defer LeannStore.freeElide(alloc, first);
+        try testing.expectEqual(@as(usize, 37), first.len);
+        store.clearElided(first.len);
+        try testing.expectEqual(@as(usize, 263), store.pendingElideCount());
+        try store.sync();
+    }
+    var reopened = try LeannStore.open(alloc, testing.io, dir, opts);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(usize, 263), reopened.pendingElideCount());
+    while (reopened.pendingElideCount() != 0) {
+        const batch = try reopened.pendingElideAlloc(alloc, 37);
+        defer LeannStore.freeElide(alloc, batch);
+        try testing.expect(batch.len <= 37);
+        reopened.clearElided(batch.len);
+    }
 }
 
 test "leann search budget counts reembedding time only" {

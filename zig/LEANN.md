@@ -530,8 +530,9 @@ Three modes:
     Derived replay persists the graph, then writes their stubs under the
     exclusive apply lock once its own locks are released: at the end of each
     dense catch-up session with background workers, and after inline replay
-    without them. `DB.syncIndexes` does the same after syncing. Stubs may land
-    just after a `full_index` write returns.
+    without them. `DB.syncIndexes` does the same after syncing. Each transaction
+    processes at most 128 entries and releases the apply lock between batches.
+    Stubs may land just after a `full_index` write returns.
 - **Re-embedding.** The index manager's `DenseReembedder` (installed by the
   DB; it calls `enrichment_runtime.reembedDenseDocuments`) renders each
   document's field or template exactly as the dense producer does and
@@ -540,8 +541,11 @@ Three modes:
   (`chunkEmbeddingSourceSetForRequest`, the producer's own path) and embeds
   that chunk's text, which is all `store_chunks: false` needs. Search recomputes go through a
   batch loader, so one query makes one embedder call per recompute batch;
-  candidates whose embedding is still stored are read instead. Without an
-  enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
+  candidates whose embedding is still stored are read instead. Chunks from
+  the same parent reuse one indexed source set per batch. A recomputed vector
+  enters the LRU only if its digest matches the stub, preventing an edit made
+  ahead of enrichment from poisoning a previous revision's cache entry.
+  Without an enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
 - **Vector blocks.** LEANN indexes stay out of HBC's shared vector-block
   plane (`IndexManager.denseIndexUsesVectorBlocks`): it would otherwise keep
   a float32 copy of every embedding transient storage drops, and its
