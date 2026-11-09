@@ -1925,8 +1925,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
-            var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
-                (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
+            // derived_changed_flags defaults to true for every write (it is
+            // only cleared for proven semantic no-ops), so "some write's
+            // content changed" is true for almost every ordinary commit.
+            // Advancing the lifecycle generation only matters for fencing
+            // stale graph retirement stamps against fresh graph artifacts;
+            // without any graph index there is nothing to fence, so a store
+            // with no graph indexes configured no longer pays a
+            // document_index write for this on every primary-only update.
+            var graph_lifecycle_generation: u64 = if (S.ownerField(self, "core").*.index_manager.hasGraphIndexes() and
+                (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
+                    (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null)))
                 try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &write_buffers.store_writes, &write_buffers.owned_store_values)
             else
                 0;

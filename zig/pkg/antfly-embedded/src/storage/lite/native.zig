@@ -4468,7 +4468,14 @@ pub const DocumentIndexKeyLog = struct {
     fn record(comptime op: []const u8, leaf_original_page: u64, key: []const u8) void {
         if (!builtin.is_test) return;
         if (!armed.load(.monotonic)) return;
-        std.debug.print("DOCIDX_KEY op={s} leaf_original_page={d} key_len={d} key={s}\n", .{ op, leaf_original_page, key.len, key });
+        var hex_buf: [256]u8 = undefined;
+        var pos: usize = 0;
+        for (key) |byte| {
+            if (pos + 2 > hex_buf.len) break;
+            _ = std.fmt.bufPrint(hex_buf[pos..][0..2], "{x:0>2}", .{byte}) catch break;
+            pos += 2;
+        }
+        std.debug.print("DOCIDX_KEY op={s} leaf_original_page={d} key_len={d} key_hex={s}\n", .{ op, leaf_original_page, key.len, hex_buf[0..pos] });
     }
 };
 
@@ -5182,6 +5189,19 @@ pub const VacuumImage = struct {
 };
 
 pub const ReaderCoordinator = @import("reader_coordinator.zig").Coordinator;
+
+/// Off by default. Crash/durability investigations (regression B: an
+/// acknowledged full_index write surviving to a stale checkpoint after a
+/// ride-along merge/retirement) flip this on for the duration of their own
+/// run to log every recovery candidate's slot index/commit_sequence/verify
+/// result, and every ride-along (non-durable) commit's resulting
+/// commit_sequence and whether durable_header moved.
+pub var recovery_debug_log: bool = false;
+
+fn recoveryDebugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!recovery_debug_log) return;
+    std.debug.print("[native-recovery] " ++ fmt ++ "\n", args);
+}
 
 var test_header_fingerprint_hashes: std.atomic.Value(u64) = .init(0);
 
@@ -11303,6 +11323,24 @@ pub const NativeFile = struct {
         kind: PageKind,
         checkpoint: CheckpointSlot,
     ) ![]u8 {
+        // Mirrors ledgerRead's fix: a cache hit already holds a
+        // CRC-validated page, so borrow its payload instead of duplicating
+        // the whole page just to decode and immediately discard the copy.
+        // A packed record reference names one record inside a shared
+        // record_bundle page, not the page's own payload -- unpackRecordPage
+        // (inside readPageAllocForCheckpoint) does that extraction, so those
+        // references must keep going through the slow path below.
+        if (page_id & packed_record_flag == 0 and page_id != 0 and page_id < checkpoint.page_count) {
+            const physical = physicalPage(page_id);
+            const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+            if (use_cache) {
+                if (try self.page_cache.acquirePayload(allocator, physical, @intCast(self.header.page_size))) |view| {
+                    defer self.page_cache.releaseRaw(allocator, view);
+                    if (view.validation.?.kind != kind) return error.UnexpectedNativePageKind;
+                    return try allocator.dupe(u8, view.bytes[page_header_size..][0..view.validation.?.payload_len]);
+                }
+            }
+        }
         const page = try self.readPageAllocForCheckpoint(allocator, page_id, checkpoint);
         defer allocator.free(page);
         return try decodePagePayloadAlloc(allocator, page, kind);
@@ -13202,12 +13240,19 @@ pub const NativeFile = struct {
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
             if (changed) {
+                const was_durable_header_null = self.durable_header == null;
                 if (self.durable_header == null) self.durable_header = previous;
                 self.header.checkpoints[self.header.active_checkpoint] = next;
+                recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
+                    next.commit_sequence,
+                    was_durable_header_null,
+                    self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
+                });
             }
             return;
         }
         if (changed) {
+            recoveryDebugLog("durable commit commit_sequence={d} durable_header_was_set={}", .{ next.commit_sequence, self.durable_header != null });
             const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
             if (!manifest_prepared) try self.syncIfRequired(hooks);
             try self.publishCheckpoint(next, manifest_prepared, hooks);
@@ -14801,12 +14846,25 @@ fn recoverActiveCheckpoint(
         candidates += 1;
     }
     if (candidates == 0) return error.InvalidNativeCheckpoint;
+    if (recovery_debug_log) for (order[0..candidates], 0..) |index, rank| {
+        const slot = header.checkpoints[index];
+        recoveryDebugLog("candidate rank={d} slot_index={d} commit_sequence={d} presynced={} manifest_page={d} manifest_page_count={d}", .{ rank, index, slot.commit_sequence, slot.presynced, slot.manifest_page, slot.manifest_page_count });
+    };
     for (order[0..candidates], 0..) |index, rank| {
         const slot = header.checkpoints[index];
-        if (!verifyManifest(file, io, slot, header.page_size)) continue;
-        if (rank == 0) return .{ .index = index };
-        if (!allow_truncate) return .{ .index = index };
+        const verified = verifyManifest(file, io, slot, header.page_size);
+        recoveryDebugLog("verify slot_index={d} commit_sequence={d} verified={}", .{ index, slot.commit_sequence, verified });
+        if (!verified) continue;
+        if (rank == 0) {
+            recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (top candidate, no fallback)", .{ index, slot.commit_sequence });
+            return .{ .index = index };
+        }
+        if (!allow_truncate) {
+            recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (fallback rank={d}, read-only, no truncate)", .{ index, slot.commit_sequence, rank });
+            return .{ .index = index };
+        }
         const truncated_size = try checkpointPrefixSize(slot, header.page_size);
+        recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (fallback rank={d}, truncating to {d} bytes)", .{ index, slot.commit_sequence, rank, truncated_size });
         try file.setLength(io, truncated_size);
         return .{ .index = index, .truncated_to = truncated_size };
     }
