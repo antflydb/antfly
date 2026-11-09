@@ -149550,6 +149550,44 @@ test "privacy primed roots preserve durable retry deadlines and healthy consumer
     try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
 }
 
+test "db publication witness compact and legacy prefixes retire only the deleted document" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-witness-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .primary_backend = .{ .mem = .{} },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer db.close();
+    const document = try a.alloc(u8, internal_keys.inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'x');
+    try db.batch(.{ .writes = &.{ .{ .key = document, .value = "{}" }, .{ .key = "neighbor", .value = "{}" } }, .sync_level = .write });
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, document, "asset", "proof");
+    defer a.free(artifact);
+    const neighbor = try internal_keys.artifactNamedPrefixAlloc(a, "neighbor", "asset", "proof");
+    defer a.free(neighbor);
+    const privacy = @import("../../privacy/local_publication.zig");
+    const local = @import("artifact_local_publication.zig");
+    const metadata = [_][]u8{ try privacy.key(a, artifact), try privacy.legacyKey(a, artifact), try local.key(a, artifact), try local.legacyKey(a, artifact) };
+    defer for (metadata) |key| a.free(key);
+    const neighbor_key = try privacy.key(a, neighbor);
+    defer a.free(neighbor_key);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        for (metadata) |key| try write.put(key, "proof");
+        try write.put(neighbor_key, "published neighbor");
+        try write.commit();
+    }
+    try db.batch(.{ .deletes = &.{document}, .sync_level = .write });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    for (metadata) |key| try std.testing.expectError(error.NotFound, read.get(key));
+    try std.testing.expectEqualStrings("published neighbor", try read.get(neighbor_key));
+}
+
 test "privacy discovery regenerates completed artifacts whose local publication witness was not restored" {
     const a = std.testing.allocator;
     const privacy = @import("../../privacy/document.zig");

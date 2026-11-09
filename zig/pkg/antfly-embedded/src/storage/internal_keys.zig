@@ -362,6 +362,109 @@ pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
     return null;
 }
 
+/// Versioned publication witnesses hash only an oversized document prefix.
+/// Keeping the artifact suffix preserves per-document prefix retirement. This
+/// threshold is part of the v2 key format; small existing keys stay unchanged.
+pub const inline_document_metadata_prefix_bytes: usize = 64 * 1024;
+pub fn documentMetadataDigestPrefixLen(key: []const u8) ?usize {
+    if (key.len <= inline_document_metadata_prefix_bytes or key[0] != user_namespace) return null;
+    const end = (findComponentTerminator(key, 1) orelse return null) + 2;
+    return if (end > inline_document_metadata_prefix_bytes) end else null;
+}
+pub fn documentMetadataKeyAlloc(a: Allocator, legacy: []const u8, compact: []const u8, artifact: []const u8) ![]u8 {
+    const end = documentMetadataDigestPrefixLen(artifact) orelse return std.mem.concat(a, u8, &.{ legacy, artifact });
+    var digest: [32]u8 = undefined;
+    Sha256.hash(artifact[0..end], &digest, .{});
+    return std.mem.concat(a, u8, &.{ compact, &digest, artifact[end..] });
+}
+/// New witnesses are authoritative when present. Only absence permits the
+/// legacy lookup; cancellation, read failures and stale proofs never do.
+pub fn readDocumentMetadata(a: Allocator, read: anytype, legacy: []const u8, compact: []const u8, artifact: []const u8) ![]const u8 {
+    const selected = try documentMetadataKeyAlloc(a, legacy, compact, artifact);
+    defer a.free(selected);
+    return read.get(selected) catch |err| {
+        if (err != error.NotFound or documentMetadataDigestPrefixLen(artifact) == null) return err;
+        const old = try std.mem.concat(a, u8, &.{ legacy, artifact });
+        defer a.free(old);
+        return read.get(old);
+    };
+}
+
+test "document publication metadata bounds opaque IDs and preserves prefix retirement" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'z');
+    document[17] = 0;
+    document[18] = 0xff;
+    const prefix = try documentExactPrefixAlloc(a, document);
+    defer a.free(prefix);
+    const first = try artifactNamedPrefixAlloc(a, document, "asset", "first");
+    defer a.free(first);
+    const second = try artifactNamedPrefixAlloc(a, document, "asset", "second");
+    defer a.free(second);
+    const root = try documentMetadataKeyAlloc(a, "old:", "v2:", prefix);
+    defer a.free(root);
+    const left = try documentMetadataKeyAlloc(a, "old:", "v2:", first);
+    defer a.free(left);
+    const right = try documentMetadataKeyAlloc(a, "old:", "v2:", second);
+    defer a.free(right);
+    try std.testing.expectEqual(@as(usize, 3 + 32), root.len);
+    try std.testing.expect(left.len < 128 and right.len < 128);
+    try std.testing.expect(std.mem.startsWith(u8, left, root));
+    try std.testing.expect(std.mem.startsWith(u8, right, root));
+    try std.testing.expect(!std.mem.eql(u8, left, right));
+    document[document.len - 1] = 'x';
+    const neighbor = try artifactNamedPrefixAlloc(a, document, "asset", "first");
+    defer a.free(neighbor);
+    const neighbor_key = try documentMetadataKeyAlloc(a, "old:", "v2:", neighbor);
+    defer a.free(neighbor_key);
+    try std.testing.expect(!std.mem.startsWith(u8, neighbor_key, root));
+    const small = try documentMetadataKeyAlloc(a, "old:", "v2:", "small");
+    defer a.free(small);
+    try std.testing.expectEqualStrings("old:small", small);
+}
+
+test "document publication metadata reads prefer compact proofs and preserve legacy failures" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'x');
+    const artifact = try artifactNamedPrefixAlloc(a, document, "asset", "proof");
+    defer a.free(artifact);
+    const compact = try documentMetadataKeyAlloc(a, "legacy:", "v2:", artifact);
+    defer a.free(compact);
+    const legacy = try std.mem.concat(a, u8, &.{ "legacy:", artifact });
+    defer a.free(legacy);
+    const Fake = struct {
+        compact: []const u8,
+        legacy: []const u8,
+        value: ?[]const u8 = null,
+        failure: ?anyerror = null,
+        legacy_reads: usize = 0,
+        pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, selected, self.compact)) {
+                if (self.failure) |err| return err;
+                return self.value orelse error.NotFound;
+            }
+            if (!std.mem.eql(u8, selected, self.legacy)) return error.TestUnexpectedResult;
+            self.legacy_reads += 1;
+            return "legacy proof";
+        }
+    };
+    var fake = Fake{ .compact = compact, .legacy = legacy };
+    try std.testing.expectEqualStrings("legacy proof", try readDocumentMetadata(a, &fake, "legacy:", "v2:", artifact));
+    try std.testing.expectEqual(@as(usize, 1), fake.legacy_reads);
+    fake.value = "stale compact proof";
+    try std.testing.expectEqualStrings("stale compact proof", try readDocumentMetadata(a, &fake, "legacy:", "v2:", artifact));
+    try std.testing.expectEqual(@as(usize, 1), fake.legacy_reads);
+    inline for (.{ error.Canceled, error.ReadTransientFailure }) |failure| {
+        fake.failure = failure;
+        try std.testing.expectError(failure, readDocumentMetadata(a, &fake, "legacy:", "v2:", artifact));
+        try std.testing.expectEqual(@as(usize, 1), fake.legacy_reads);
+    }
+}
+
 /// Exclusive cut after one document's complete physical key family. The
 /// terminator ends in zero, so incrementing its final byte cannot overflow or
 /// skip a logical key extending this one (including embedded NUL/0xff bytes).
