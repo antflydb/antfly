@@ -6009,7 +6009,7 @@ The latest-main merge retains the equivalent upstream prepared-row receipt fix.
 Kernel ABI 90 combines main's aggregation-budget and checked-borrow changes with
 the certified graph descriptor domains; callback ABI 11 remains the graph stride
 fence. Authenticated three-metadata/three-data qualification passed all 77 Cypher
-checks: three warm reads each used one 114-byte routing token and no routing
+checks: three warm reads each used one 115-byte routing token and no routing
 snapshot; a catalog revision change fetched a new snapshot before warm reuse.
 
 Compiled readiness projections validate their nested control header against the
@@ -6026,3 +6026,12 @@ revision-v1 envelopes, public rejection and mixed-effect rejection.
 Sole-control root counts exclude only the revision envelope's explicit scheme
 and mandatory zero timestamp; controls that disallow authored timestamps still
 reject nonzero timestamps.
+
+Final validation is pinned to origin/main `62186c31b3` (merge `4550e4d3bb`).
+The Debug build and graph, control-wire, native-capture, remote-routing, HTTP
+transport and compiled-owner gates passed. Focused service tests import their
+service explicitly so selected-owner and held-mutex cancellation assertions
+execute under their narrow filter. The authenticated six-node campaign passed
+77 checks; each of three warm reads used one 115-byte routing token without a
+snapshot. A revision change fetched the 11,140-byte ten-table/ten-range snapshot
+once, then subsequent reads returned to token-only validation.
