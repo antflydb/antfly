@@ -149680,6 +149680,32 @@ test "external vector compatibility declaration rejects missing and mismatched w
     try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
 }
 
+test "relational prepared writes validate orphan vector receipts before releasing parsed rows" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("relational-vector-receipt-lifetime");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"metadata":{"type":"json"},"revision":{"type":"text"},"embedding":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    // Preparation releases its parsed wrapper even without text consumers.
+    // A plain typed write must never dereference it during commit.
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{}" }}, .sync_level = .full_index });
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+    });
+    // Validation cannot be skipped merely because there are no vector writes:
+    // a matching receipt without its authored vector is an invalid assertion.
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "orphan", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+        .sync_level = .full_index,
+    }));
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+}
+
 test "scalar text asset chunks track parent updates and retirement" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("source-scalar-chunks");

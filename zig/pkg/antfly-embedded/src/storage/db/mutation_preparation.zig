@@ -1861,6 +1861,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 return;
                             };
                         };
+                        if (ctx.write_plan) |*pinned_write_plan| {
+                            index_manager_mod.IndexManager.validateExternalVectorSpacesInPlan(scratch_arena.allocator(), pinned_write_plan, prepared.extracted.dense_embeddings, prepared.parsedValue()) catch |err| {
+                                prepared.deinit(owner_alloc);
+                                ctx.fail(err);
+                                return;
+                            };
+                        }
                         prepared.releaseParsed();
                         ctx.rows[index] = prepared;
                         _ = scratch_arena.reset(.retain_capacity);
