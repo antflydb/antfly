@@ -6931,6 +6931,15 @@ pub const NativeFile = struct {
         return std.mem.readInt(u64, payload[8..16], .little);
     }
 
+    /// The inline drainRetirement call every foreground commit makes (inside
+    /// pageAllocatorFromFreeMapWithProof) is capped to this many pages,
+    /// independent of the much larger background-maintenance budget
+    /// (retirement_work_pages, reclaimPagesForMaintenanceWithCancel's own
+    /// separate call). Reclaiming cold, first-touch pages is background
+    /// maintenance's job; the foreground path only needs enough headroom
+    /// that a backlog never grows unbounded between maintenance turns.
+    const foreground_retirement_cap_pages: usize = 16;
+
     fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize) !usize {
         // A registering reader may still hold its shared inode lock before
         // publishing its epoch. Without the exclusive scan fence, even logical
@@ -12063,7 +12072,24 @@ pub const NativeFile = struct {
                 held.file.close(self.runtimeIo());
                 self.epoch_window = null;
             };
-            _ = try self.drainRetirement(state, checkpoint, self.retirement_work_pages);
+            // `retirement_work_pages` is the *background* maintenance budget
+            // (reclaimPagesForMaintenanceWithCancel passes it to its own,
+            // separate drainRetirement call at full size); its default of
+            // 128 is also `reclamation.Options.validate`'s floor for a valid
+            // configuration, so it can never be the all-the-way-to-zero
+            // sentinel the two other foreground-suppression call sites
+            // (reclaimPagesImpl, preparePublicationSequence) use to skip
+            // this drain entirely. Cap what this specific inline, every-
+            // commit call reads from cold pages for, instead of handing it
+            // the full background budget: every ordinary write was paying
+            // for up to 128 pages worth of reclamation scan on the
+            // foreground path regardless of how small an actual backlog it
+            // found. `@min` keeps every existing zero-budget suppression
+            // working exactly as before (min(0, cap) is still 0) while
+            // bounding the normal (128-budget) case to a few pages per
+            // commit; drainRetirement's own heaps already carry the cursor
+            // forward between calls; nothing here re-scans from the start.
+            _ = try self.drainRetirement(state, checkpoint, @min(self.retirement_work_pages, foreground_retirement_cap_pages));
             const can_reuse = self.free_pages_verified and (lock != null or (coordinated and self.reader_window_lock != null));
             return .{ .file = self, .free_pages = &.{}, .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count), .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
         }
