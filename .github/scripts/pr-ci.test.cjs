@@ -417,7 +417,11 @@ test('dictation source checks require admission and retain narrow path selection
     'examples/dictation/presets/default.json', 'examples/dictation/Package.swift',
     'examples/dictation/test.sh', 'examples/dictation/Package.resolved',
     'examples/dictation/Info.plist', 'examples/dictation/antfly.yaml',
-    '.github/workflows/dictation-example.yml']) {
+    '.github/workflows/dictation-example.yml',
+    'examples/dictation/release/policy.json',
+    'scripts/release/objectstore_channel.py',
+    'scripts/release/requirements.lock',
+    '.github/workflows/dictation-release.yml']) {
     assert.ok(selectSuites([file], f.pr, config).includes('dictation'), file);
   }
   for (const file of ['examples/dictation/README.md', 'docs/guides/inference.mdx',
