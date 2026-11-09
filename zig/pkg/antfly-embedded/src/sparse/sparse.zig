@@ -7951,6 +7951,97 @@ test "sparse batch delete removes from posting lists" {
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
 
+// Regression coverage for the v2 term-record merge (perf/lwa-commit-eff2):
+// a term's combined (meta, range) record must still track the TRUE range
+// after a delete shrinks it -- an insert can only extend the range in
+// place (always correct immediately), but a delete can only shrink it,
+// and correctly shrinking requires the full chunk rescan this still
+// triggers (recomputeTermRangeMeta/refreshTermRangeMeta), not the
+// immediate-write path insert-only touches now take.
+test "sparse term range shrinks correctly after deleting the boundary document" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "term-range-shrink");
+    defer cleanupTmp(path);
+
+    var idx = try SparseIndex.open(alloc, path, .{});
+    defer idx.close();
+
+    // Three docs sharing term 7, doc_id-ordered doc-a < doc-b < doc-c.
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "doc-a", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+        .{ .doc_id = "doc-b", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+        .{ .doc_id = "doc-c", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+    };
+    try idx.batch(&writes, &.{});
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-a", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-c", tm.max_doc_id);
+    }
+
+    // Delete the MIN boundary doc (default options: non-deferred delete
+    // path, recomputeTermRangeMeta runs immediately). The term still has
+    // doc-b/doc-c, so the range must shrink to [doc-b, doc-c] -- not stay
+    // stale at [doc-a, doc-c].
+    try idx.batch(&.{}, &.{"doc-a"});
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-b", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-c", tm.max_doc_id);
+    }
+
+    // Crash/restart proxy: the shrunk combined record (and the chunk it
+    // shares a write with) must have been durably committed, not just
+    // visible in this process's own open handle -- close and reopen
+    // before continuing.
+    idx.close();
+    idx = try SparseIndex.open(alloc, path, .{});
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-b", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-c", tm.max_doc_id);
+    }
+
+    // A fresh insert into the SAME term and a delete of a DIFFERENT doc in
+    // the SAME deferred batch: the insert's immediate combined write and
+    // the delete's deferred dirty-flag recompute must not clobber each
+    // other -- the final state must reflect both.
+    const more_writes = [_]SparseWrite{
+        .{ .doc_id = "doc-z", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+    };
+    try idx.batchWithOptions(&more_writes, &.{"doc-b"}, .{ .defer_term_range_updates = true });
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-c", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-z", tm.max_doc_id);
+    }
+
+    // Functional (recall) check end to end: only doc-c and doc-z remain.
+    const q_i7 = [_]u32{7};
+    const q_v7 = [_]f32{1.0};
+    const query7 = SparseVector{ .indices = &q_i7, .values = &q_v7 };
+    const results7 = try idx.search(alloc, &query7, 10);
+    defer SparseIndex.freeResults(alloc, results7);
+    try std.testing.expectEqual(@as(usize, 2), results7.len);
+}
+
 test "sparse constrained search filters before top-k ranking" {
     const alloc = std.testing.allocator;
     var pb: [256]u8 = undefined;
