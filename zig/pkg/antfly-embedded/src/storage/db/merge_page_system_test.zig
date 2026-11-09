@@ -425,6 +425,7 @@ test "relational index system retained merge tail fragments preserve deletes tim
         page.next = "b";
         page.timestamps = &.{123};
         try apply(&db, &index, seal(.{ .merge_replication = context, .merge_page = page, .writes = &.{.{ .key = "b", .value = "{\"id\":1,\"doubled\":2}" }} }));
+        if (!relational) try std.testing.expectError(error.NotFound, db.core.store.get(alloc, @import("../ttl.zig").document_version_watermark_key));
         page.sequence = 3;
         page.phase = .artifacts;
         page.next = "";

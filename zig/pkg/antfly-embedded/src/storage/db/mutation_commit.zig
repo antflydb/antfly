@@ -1407,10 +1407,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Max-merge the certified source floor with restored versions and
             // local admission, in the same transaction as the page receipt.
             var incoming_floor: u64 = if (effective_req.merge_page) |page| page.document_version_floor else 0;
-            if (opts.restore_timestamps) |timestamps| {
+            // An unversioned legacy apply must not introduce new allocator
+            // state on only the upgraded replicas of a rolling deployment.
+            // Copy senders carry an explicit protected floor; local/current
+            // admissions already require the document revision protocol.
+            if (document_revisions or incoming_floor != 0) if (opts.restore_timestamps) |timestamps| {
                 var versions = timestamps.valueIterator();
                 while (versions.next()) |version| incoming_floor = @max(incoming_floor, version.*);
-            }
+            };
             var persisted_floor = document_version;
             if (incoming_floor != 0 and relationalColumns(self) == null) {
                 const previous = if (document_version) |version| version else blk: {

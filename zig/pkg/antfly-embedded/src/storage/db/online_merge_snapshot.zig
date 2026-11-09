@@ -432,6 +432,10 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
         if (writes.items.len != 0 and key.len +| value.len > pages.max_bytes -| bytes) break;
         try writes.append(owned, .{ .key = key, .value = value });
         try timestamps.append(owned, timestamp);
+        // Legacy rows can predate allocator metadata. Transfer their versions
+        // through the negotiated floor too, rather than silently seeding state
+        // while replaying an old unversioned row command on mixed replicas.
+        if (flags != codec.doc_value_flag_relational_row) cache.document_version_floor = @max(cache.document_version_floor, timestamp);
         try ttl_sources.append(owned, ttl_source);
         has_ttl_sources = has_ttl_sources or ttl_source != null;
         bytes +|= key.len +| value.len;
@@ -921,7 +925,10 @@ test "time series online copy preserves empty snapshot and retained delete revis
     const online_io = @import("online_merge_io.zig");
     const io_contract = @import("online_merge_io_contract.zig");
     const ttl = @import("../ttl.zig");
-    for ([_]bool{ false, true }) |empty_snapshot| {
+    for (0..3) |scenario| {
+        const empty_snapshot = scenario == 1;
+        const legacy_snapshot = scenario == 2;
+        const snapshot_scheme: types.DocumentVersionScheme = if (legacy_snapshot) .legacy else .revision_v1;
         var donor_dir = try @import("../../common/test_directory.zig").TestDirectory.init("series-floor-donor");
         defer donor_dir.cleanup();
         var receiver_dir = try @import("../../common/test_directory.zig").TestDirectory.init("series-floor-receiver");
@@ -936,11 +943,11 @@ test "time series online copy preserves empty snapshot and retained delete revis
         try receiver.setSchemaJson(a, "{}");
         try receiver.updateRange(.{ .start = "m", .end = "z" });
         if (empty_snapshot) try receiver.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 500, .writes = &.{.{ .key = "m", .value = "{}" }} });
-        try server_test_adapter.applyOrdered(&donor, .{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "b", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&donor, .{ .document_version_scheme = snapshot_scheme, .timestamp_ns = 100, .writes = &.{.{ .key = "b", .value = "{}" }} }, .{ .term = 1, .index = 1 });
         try server_test_adapter.applyOrdered(&donor, if (empty_snapshot)
             .{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"b"} }
         else
-            .{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "b", .value = "{}" }} }, .{ .term = 1, .index = 2 });
+            .{ .document_version_scheme = snapshot_scheme, .timestamp_ns = 100, .writes = &.{.{ .key = "b", .value = "{}" }} }, .{ .term = 1, .index = 2 });
         const identity = try donor.relationalTopologyIdentity();
         const scope: source.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = receiver_options.identity_namespace.?, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
         try server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .admit = .{ .scope = scope, .ttl_sources = true } } }, .{ .term = 1, .index = 3 });
@@ -981,7 +988,7 @@ test "time series online copy preserves empty snapshot and retained delete revis
             defer prepared.deinit();
             const request = prepared.value.request orelse continue;
             const page = request.merge_page.?;
-            saw_snapshot_floor = saw_snapshot_floor or (page.phase == .rows and page.document_version_floor == 101);
+            saw_snapshot_floor = saw_snapshot_floor or (page.phase == .rows and page.document_version_floor == @as(u64, if (legacy_snapshot) 100 else 101));
             saw_delete_floor = saw_delete_floor or (request.deletes.len != 0 and page.document_version_floor == 201);
             // Private wire round-trip, lost acknowledgement, and both owners
             // reopening must preserve the authenticated floor and durable cursor.

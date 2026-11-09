@@ -289,7 +289,7 @@ pub const Session = struct {
             const logical = if (is_integrity or is_artifact) key else (try internal.decodeStoredDocumentRowKeyAlloc(owned, key)) orelse return error.RetainedEffectsCorrupt;
             const raw_len: usize = effect.value_len orelse 0;
             if (count != 0 and logical.len +| raw_len > max_bytes -| size) break;
-            if (self.admission.ttl_sources and internal.isPrimaryDocumentKey(key)) document_version_floor = @max(document_version_floor, effect.timestamp);
+            if (internal.isPrimaryDocumentKey(key)) document_version_floor = @max(document_version_floor, effect.timestamp);
             if (effect.value_len != null and raw_len +| logical.len > max_bytes and !internal.isRelationalRowKey(key) and !is_integrity) {
                 if (count != 0) break;
                 // A single oversized immutable after-image is streamed through
@@ -437,7 +437,7 @@ pub const Session = struct {
                 try ttl_sources.append(owned, effect.ttl_source);
                 has_sources = has_sources or effect.ttl_source != null;
             } else try deletes.append(owned, logical);
-            if (self.admission.ttl_sources and internal.isPrimaryDocumentKey(effect.key)) document_version_floor = @max(document_version_floor, timestamp);
+            if (internal.isPrimaryDocumentKey(effect.key)) document_version_floor = @max(document_version_floor, timestamp);
             size +|= bytes;
             count += 1;
             previous = effect.key;
