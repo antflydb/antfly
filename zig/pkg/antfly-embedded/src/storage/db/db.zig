@@ -149894,7 +149894,9 @@ test "time series graph TTL reconstructs revision lifetimes and validates before
     const original = try db.core.store.get(a, timestamp_key);
     defer a.free(original);
     try db.core.store.put(timestamp_key, "invalid");
+    graph.neighbor_source_sequence = 123;
     try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }}));
+    try std.testing.expectEqual(@as(u64, 0), graph.neighbor_source_sequence);
     {
         var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
         defer edges.deinit(a);

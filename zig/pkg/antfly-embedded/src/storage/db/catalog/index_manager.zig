@@ -29342,6 +29342,12 @@ pub const IndexManager = struct {
             });
         }
 
+        // Ordinary replay can temporarily withdraw an owner in an older
+        // window before replaying its latest artifacts. A producer must refresh
+        // again rather than treating that intermediate sidecar as current.
+        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
+            entry.invalidateNeighborSource();
+        // Retain the freshness fence even if authoritative validation fails.
         // Decode and validate authoritative contributions before changing the
         // graph. A malformed timestamp must not leave a partially applied edge.
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
@@ -29370,11 +29376,6 @@ pub const IndexManager = struct {
                 }
             }
         }
-        // Ordinary replay can temporarily withdraw an owner in an older
-        // window before replaying its latest artifacts. A producer must refresh
-        // again rather than treating that intermediate sidecar as current.
-        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
-            entry.invalidateNeighborSource();
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
         if (snapshots.items.len != 0) try entry.index.replaceContributionSnapshots(snapshots.items);
     }
