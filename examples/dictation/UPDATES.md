@@ -197,11 +197,34 @@ write succeeds, retry completes the other without replacing immutable assets.
 A lost response is resolved by reading the exact existing bytes on retry.
 
 Set repository variable `DICTATION_GITHUB_MIRROR=true` to enable a separate
-GitHub mirror job **after** canonical R2 publication. Mirror failures cannot block
-R2 feeds. Draft lookup includes the paginated releases listing because GitHub's
+GitHub mirror job **after** canonical R2 publication. The publisher exports the
+sealed ledger digest; the mirror restores those exact signed downloads from
+public R2 and verifies their identity, sizes, hashes, and feed before uploading.
+It does not fetch another Actions/GCS copy and needs no storage credentials.
+Mirror failures cannot block R2 feeds. Draft lookup includes the paginated releases listing because GitHub's
 by-tag endpoint excludes drafts. Reconciliation reads assets by numeric release
 ID, preserves verified uploads, and removes only empty matching draft placeholders.
 GitHub does not own the app channel or Antfly's Latest release marker.
+
+With `CI_ARTIFACT_GCS=true`, the unsigned and signed handoffs use the existing
+private GCS exchange and retain only small Actions receipts for ninety days.
+Their GCS objects expire at 120 days, covering the receipt/retry window and
+content reuse. With the switch disabled, the same helpers retain the original
+files in Actions for ninety days; readers also support historical Actions-only
+runs. Request and identity JSON records have explicit ninety-day retention.
+The unsigned build uses helpers pinned to the default-branch controller, separate
+from its source checkout. Signing and publication retain their protected gates.
+
+Before merging these handoffs, apply Colony's reviewed `ci-artifact-provider`
+condition update: only Dictation's exact main controller and storage probe are
+admitted to staging. This grants no container-publishing authority. Then run:
+
+```sh
+gh workflow run dictation-release.yml --repo antflydb/antfly --ref main
+```
+
+Manual dispatch only tests upload/reuse/verified restore; it cannot build, sign,
+or publish an app. A real release still starts through the tag-request workflow.
 
 If signing succeeded but publication failed, use **Re-run failed jobs** to reuse
 the signed artifact. Never re-sign an already reserved version: timestamps can

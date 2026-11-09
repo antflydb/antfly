@@ -16,6 +16,7 @@
 import base64
 import json
 import plistlib
+import re
 import tempfile
 import unittest
 import zipfile
@@ -207,6 +208,72 @@ class ReleaseTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
+    def workflow_jobs(self):
+        workflow = (
+            r.HERE.parents[2] / ".github/workflows/dictation-release.yml"
+        ).read_text()
+        return dict(
+            re.findall(
+                r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                workflow.split("jobs:\n", 1)[1],
+            )
+        )
+
+    def test_bulk_handoffs_use_pinned_gcs_helpers_with_ninety_day_receipts(self):
+        jobs = self.workflow_jobs()
+        for job, artifact in (
+            ("build", "dictation-unsigned"),
+            ("sign", "dictation-signed"),
+        ):
+            block = jobs[job]
+            self.assertIn("/.github/actions/upload-ci-artifact", block)
+            self.assertIn("gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}", block)
+            self.assertIn("name: " + artifact + "\n", block)
+            self.assertIn("retention-days: 90", block)
+        self.assertIn("path: release-controller", jobs["build"])
+        self.assertIn("ref: ${{ github.sha }}", jobs["build"])
+        self.assertIn(
+            "uses: ./release-controller/.github/actions/upload-ci-artifact",
+            jobs["build"],
+        )
+        self.assertIn("uses: ./.github/actions/download-ci-artifact", jobs["sign"])
+        self.assertIn("uses: ./.github/actions/download-ci-artifact", jobs["publish"])
+        self.assertIn("environment: dictation-release", jobs["sign"])
+        self.assertIn("environment: release-promotion", jobs["publish"])
+
+    def test_github_mirror_uses_publisher_pinned_r2_bytes_without_storage_authority(
+        self,
+    ):
+        jobs = self.workflow_jobs()
+        mirror = jobs["github-mirror"]
+        self.assertIn("restore-published", mirror)
+        self.assertIn("needs.publish.outputs.ledger_sha256", mirror)
+        self.assertNotIn("name: dictation-signed", mirror)
+        self.assertNotIn("id-token: write", mirror)
+        self.assertNotIn("AWS_", mirror)
+        self.assertNotIn("actions/download-ci-artifact", mirror)
+        publisher = jobs["publish"]
+        self.assertIn(
+            "ledger_sha256: ${{ steps.publish.outputs.ledger_sha256 }}", publisher
+        )
+        self.assertLess(
+            publisher.index("release.py publish"),
+            publisher.index('echo "ledger_sha256='),
+        )
+
+    def test_manual_probe_cannot_enter_the_signing_or_publication_chain(self):
+        jobs = self.workflow_jobs()
+        probe = jobs["artifact-storage-probe"]
+        self.assertIn("github.event_name == 'workflow_dispatch'", probe)
+        self.assertIn("github.ref == 'refs/heads/main'", probe)
+        self.assertIn("uses: ./.github/actions/probe-ci-artifact", probe)
+        self.assertNotIn("secrets.", probe)
+        self.assertNotIn("needs:", probe)
+        self.assertIn("github.event_name == 'workflow_run'", jobs["resolve"])
+        for job in ("build", "sign", "publish", "github-mirror"):
+            self.assertIn("needs:", jobs[job])
+            self.assertIn("resolve", jobs[job])
+
     def identity(self):
         identity = r.version("dictation/v1.0.0")
         identity.pop("order")
