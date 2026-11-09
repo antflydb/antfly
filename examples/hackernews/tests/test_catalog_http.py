@@ -1684,16 +1684,25 @@ def test_native_catalog_file_commit_read_and_restart(
                 stop()
                 start()
                 deadline = time.monotonic() + 180
+                scheduler_samples = []
                 while True:
                     scheduled = call("POST", maintenance, {"action": "status"})
                     progress = scheduled.get("state")
+                    sample = json.dumps(progress, sort_keys=True)
+                    if not scheduler_samples or scheduler_samples[-1][1] != sample:
+                        scheduler_samples.append(
+                            (round(deadline - time.monotonic(), 2), sample)
+                        )
+                        scheduler_samples = scheduler_samples[-32:]
                     if progress and progress.get("last_result"):
                         assert not progress.get("last_error"), scheduled
                         if json.loads(progress["last_result"])["complete"]:
                             break
-                    assert time.monotonic() < deadline, (
-                        tmp_path / "server.log"
-                    ).read_text()[-5000:]
+                    assert time.monotonic() < deadline, {
+                        "scheduled": scheduled,
+                        "samples": scheduler_samples,
+                        "server_log": (tmp_path / "server.log").read_text()[-5000:],
+                    }
                     time.sleep(0.2)
                 stop()
                 start()

@@ -1035,3 +1035,22 @@ host experiment. Warm latency remains approximately 7–9 ms, and cold queries
 remain dominated by seconds-scale setup. This establishes no material cold
 speedup. The demonstrated improvement is bounded memory and successful retained
 pagination/publication with the larger pending overlay described above.
+
+The transport correction in `32697344d1` passed a fresh ReleaseSafe server/Lite
+build: 96/96 steps and 141 public exports, with no internal exports. The server
+SHA-256 is `706c0b1d75b8d4c182fefc3de25f31541be49d368183e85847a7a8cc6f1628f7`;
+the matching Lite library is
+`d1c40c7dba354d648732b1974ff5f06b3f7ee15ea5525a2c1f731d1b4060e251`.
+The native HN maintenance/hierarchy/restart fixture passed in 164 seconds,
+including an explicit assertion rejecting `InvalidSocketOption` anywhere in
+the server log, including background work. One preceding run timed out at the
+unchanged 180-second scheduled-WAL-GC deadline with a saved reader-grace
+`waiting` result, zero recorded job failures and no invalid socket options.
+This separate timing observation remains recorded; no timeout, grace period or
+correctness assertion was relaxed. The fixture now retains at most 32 scheduler
+state transitions in timeout diagnostics.
+
+Main at `7db8b07aee` subsequently merged cleanly, without changing the transport
+sources or this HN fixture. The HTTP library gate passed again using its verified
+cache. The optimized binaries above precede that merge; full CI must validate
+the final merged revision after maintainer approval.
