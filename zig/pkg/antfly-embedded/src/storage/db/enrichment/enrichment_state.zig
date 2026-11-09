@@ -817,6 +817,19 @@ fn scopedRetryTicketKey(slot: u8) [scoped_retry_ticket_prefix.len + 1]u8 {
     key[scoped_retry_ticket_prefix.len] = slot;
     return key;
 }
+const scoped_retry_document_prefix = "\x00\x00__metadata__:enrichment_scoped_retry_document:v1:";
+fn scopedRetryDocumentKey(digest: [32]u8) [scoped_retry_document_prefix.len + 32]u8 {
+    return scoped_retry_document_prefix.* ++ digest;
+}
+pub fn loadScopedRetryDocument(a: Allocator, store: anytype, digest: [32]u8) ![]u8 {
+    var runtime = try initRuntimeStore(a, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(&scopedRetryDocumentKey(digest)) catch |err|
+        return if (err == error.NotFound) error.InvalidEnrichmentState else err;
+    return a.dupe(u8, raw);
+}
 
 /// One ownership-fenced transaction publishes the manifest, changed rows and
 /// retirements. A failed transaction leaves every dirty bit/old slot intact.
@@ -828,13 +841,196 @@ pub fn saveScopedRetryState(a: Allocator, store: anytype, state: *scoped_retries
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     try guard.validate(&txn);
+    for (prepared.documents) |document| try txn.put(&scopedRetryDocumentKey(document.digest), document.bytes);
     for (prepared.rows) |row| try txn.put(&scopedRetryTicketKey(row.slot), row.bytes);
     for (prepared.removed[0..prepared.removed_len]) |slot| txn.delete(&scopedRetryTicketKey(slot)) catch |err| if (err != error.NotFound) {
         return err;
     };
+    for (prepared.removed_documents[0..prepared.removed_document_count]) |digest|
+        txn.delete(&scopedRetryDocumentKey(digest)) catch |err| if (err != error.NotFound) return err;
     try txn.put(scoped_retry_key, prepared.header);
     try txn.commit();
     state.markPersisted();
+    state.releasePersistedDocuments(a);
+}
+
+test "durable enrichment scoped retry references oversized IDs atomically and reclaims unreferenced keys" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-key-references" });
+    defer store.deinit();
+    const Guard = struct {
+        canceled: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const key = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(key);
+    @memset(key, 'x');
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = key, .sequence = 7 }, 10, .{ .fingerprint = 1 }, null);
+    try state.setScanDocument(a, .{ .doc_key = key, .sequence = 7 });
+    {
+        const plan = try state.preparePersistence(a, false);
+        defer plan.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), plan.documents.len);
+        try std.testing.expect(plan.header.len + plan.rows[0].bytes.len < 512);
+    }
+    try std.testing.expectError(error.Canceled, saveScopedRetryState(a, &store, &state, Guard{ .canceled = true }));
+    try std.testing.expectEqual(@as(usize, 1), state.pending_documents.items.len);
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryDocument(a, &store, digest));
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    try std.testing.expectEqual(@as(usize, 0), state.pending_documents.items.len);
+    var restored = try loadScopedRetries(a, &store);
+    defer restored.deinit(a);
+    const Reader = struct {
+        store: *@TypeOf(store),
+        reads: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, id: [32]u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return loadScopedRetryDocument(allocator, self.store, id);
+        }
+    };
+    var reader = Reader{ .store = &store };
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &reader, .get = Reader.get };
+    try std.testing.expectEqual(@as(usize, 0), restored.pending_documents.items.len);
+    const cursor = try restored.scanDocumentAllocWithReferences(a, resolver);
+    defer a.free(cursor);
+    try std.testing.expectEqualSlices(u8, key, cursor);
+    const due = try restored.dueWithReferences(a, 10, resolver, 1);
+    defer due.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+    try std.testing.expectEqualSlices(u8, key, due.groups[0].doc_key);
+    try std.testing.expectEqual(@as(usize, 2), reader.reads);
+    restored.retire(a, due.tokens);
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    // The cursor still protects the same deduplicated key after ticket retirement.
+    const retained = try loadScopedRetryDocument(a, &store, digest);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(u8, key, retained);
+    restored.clearScanDocument(a);
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryDocument(a, &store, digest));
+}
+
+test "durable enrichment scoped retry flushes large identities before exceeding the staging budget" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-key-bounded-flush" });
+    defer store.deinit();
+    const Guard = struct {
+        canceled: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    const Publisher = struct {
+        state: *scoped_retries.State,
+        store: *@TypeOf(store),
+        canceled: bool = false,
+        calls: usize = 0,
+        pub fn save(self: *@This()) !void {
+            self.calls += 1;
+            try saveScopedRetryState(std.testing.allocator, self.store, self.state, Guard{ .canceled = self.canceled });
+        }
+    };
+    var publisher = Publisher{ .state = &state, .store = &store };
+    const first = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(first);
+    @memset(first, 'a');
+    const second = try a.dupe(u8, first);
+    defer a.free(second);
+    second[0] = 'b';
+    const limit = first.len * 2 - 1;
+    try state.parkBounded(a, .{ .doc_key = first, .sequence = 1 }, 10, .{ .fingerprint = 1 }, null, null, null, limit, &publisher);
+    // Repeated identities do not force another publication or retain a copy.
+    try state.parkBounded(a, .{ .doc_key = first, .sequence = 1 }, 10, .{ .fingerprint = 1 }, null, null, null, limit, &publisher);
+    try std.testing.expectEqual(@as(usize, 0), publisher.calls);
+    publisher.canceled = true;
+    try std.testing.expectError(error.Canceled, state.parkBounded(a, .{ .doc_key = second, .sequence = 2 }, 10, .{ .fingerprint = 2 }, null, null, null, limit, &publisher));
+    try std.testing.expectEqual(@as(usize, 1), state.tickets.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_documents.items.len);
+    publisher.canceled = false;
+    try state.parkBounded(a, .{ .doc_key = second, .sequence = 2 }, 10, .{ .fingerprint = 2 }, null, null, null, limit, &publisher);
+    try std.testing.expectEqual(@as(usize, 2), publisher.calls);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_documents.items.len);
+    try std.testing.expectEqualSlices(u8, second, state.pending_documents.items[0].bytes);
+    var restored = try loadScopedRetries(a, &store);
+    defer restored.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), restored.tickets.items.len);
+    try publisher.save();
+    var final = try loadScopedRetries(a, &store);
+    defer final.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), final.tickets.items.len);
+}
+
+test "durable enrichment scoped retry references cannot alias inline IDs and reject corrupted keys" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-key-identity" });
+    defer store.deinit();
+    const Guard = struct {
+        pub fn validate(_: @This(), _: anytype) !void {}
+    };
+    const key = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(key);
+    @memset(key, 'z');
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = key, .sequence = 7 }, 10, .{ .fingerprint = 1 }, null);
+    try state.park(a, .{ .doc_key = &digest, .sequence = 7 }, 10, .{ .fingerprint = 2 }, null);
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    const Reader = struct {
+        store: *@TypeOf(store),
+        reads: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, id: [32]u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return loadScopedRetryDocument(allocator, self.store, id);
+        }
+    };
+    var reader = Reader{ .store = &store };
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &reader, .get = Reader.get };
+    {
+        const due = try state.dueWithReferences(a, 10, resolver, 1);
+        defer due.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+        try std.testing.expectEqualSlices(u8, key, due.groups[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 1), reader.reads);
+        state.retire(a, due.tokens);
+    }
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryDocument(a, &store, digest));
+    {
+        const due = try state.dueWithReferences(a, 10, resolver, 1);
+        defer due.deinit(a);
+        try std.testing.expectEqualSlices(u8, &digest, due.groups[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 1), reader.reads);
+    }
+    try state.park(a, .{ .doc_key = key, .sequence = 8 }, 10, .{ .fingerprint = 3 }, null);
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(&scopedRetryDocumentKey(digest), "corrupt");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidEnrichmentState, state.dueWithReferences(a, 10, resolver, 0));
 }
 
 test "durable enrichment scoped retry persists incremental records and migrates legacy clocks" {
