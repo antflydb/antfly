@@ -3417,6 +3417,8 @@ pub const Store = struct {
             if (!pending) continue;
             const now = std.Io.Clock.awake.now(io).nanoseconds;
             if (now -| last_ns < @as(i96, @intCast(self.ride_along_idle_ns))) continue; // not idle long enough; re-check on the next wake.
+            const idle_flush_scope = wal_trace.scope(.ride_along_idle_flush);
+            defer idle_flush_scope.end();
             self.forceDrainDurable();
         }
     }

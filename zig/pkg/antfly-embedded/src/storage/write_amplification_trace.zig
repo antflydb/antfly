@@ -160,6 +160,15 @@ pub const Stage = enum(u8) {
     algebraic_bulk_finish,
     algebraic_hll_maintenance,
     algebraic_adaptive,
+    // `lite/docstore.zig`'s `rideAlongFlushLoop`: the idle-flush timer's own
+    // `forceDrainDurable` call, pushed around it so the harness can tell a
+    // drain the idle timer led (unavoidable without a foreground write
+    // following within `ride_along_idle_ns` of the last enqueue, bounded by
+    // how many times the timer can fire over the run) apart from any other
+    // background sync, which the single-commit write path's gates must
+    // still treat as a real amplification bug. See
+    // `lite-single-commit-write-path.md` §3.2a.
+    ride_along_idle_flush,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;

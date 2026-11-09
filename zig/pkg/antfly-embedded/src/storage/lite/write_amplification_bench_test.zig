@@ -468,6 +468,57 @@ const ModeReport = struct {
         return total;
     }
 
+    fn totalCommitsExcluding(self: ModeReport, excluded: wal_trace.Stage) u64 {
+        var total: u64 = 0;
+        for (std.meta.tags(wal_trace.Stage)) |s| {
+            if (s == excluded) continue;
+            const counts = self.report.stage(s);
+            total += counts.commits_calling_thread + counts.commits_background;
+        }
+        return total;
+    }
+
+    fn totalSyncsExcluding(self: ModeReport, lane: wal_trace.Lane, excluded: wal_trace.Stage) u64 {
+        var total: u64 = 0;
+        for (std.meta.tags(wal_trace.Stage)) |s| {
+            if (s == excluded) continue;
+            const counts = self.report.stage(s);
+            total += switch (lane) {
+                .calling_thread => counts.sync_calling_thread,
+                .background => counts.sync_background,
+            };
+        }
+        return total;
+    }
+
+    /// Durable commits/write, excluding any commit `rideAlongFlushLoop`'s
+    /// idle-flush timer itself led (`.ride_along_idle_flush`). A production
+    /// commit the idle timer leads is still a real, useful commit (it makes
+    /// otherwise-stranded ride-along work durable when no foreground writer
+    /// follows) -- it just isn't the single-commit write path's own
+    /// per-write amplification, so it gets its own separate bound
+    /// (`idleFlushDrains`) instead of tripping this one.
+    fn durableCommitsPerWriteExcludingIdleFlush(self: ModeReport) f64 {
+        return @as(f64, @floatFromInt(self.totalCommitsExcluding(.ride_along_idle_flush))) / @as(f64, @floatFromInt(self.updates));
+    }
+
+    /// Background syncs/update, excluding the idle-flush timer's own
+    /// syncs. See `durableCommitsPerWriteExcludingIdleFlush`.
+    fn backgroundSyncsPerUpdateExcludingIdleFlush(self: ModeReport) f64 {
+        return @as(f64, @floatFromInt(self.totalSyncsExcluding(.background, .ride_along_idle_flush))) / @as(f64, @floatFromInt(self.updates));
+    }
+
+    /// How many times `rideAlongFlushLoop`'s idle-flush timer itself led a
+    /// drain during this run. Unavoidable without a foreground write
+    /// following within `ride_along_idle_ns` of the last ride-along
+    /// enqueue -- bounded by how many times the timer can physically fire
+    /// over the run's own wall-clock duration (`elapsed_ns`), not by write
+    /// traffic, so the gate on this is `ceil(elapsed_ns / idle_window) + 1`
+    /// rather than zero.
+    fn idleFlushDrains(self: ModeReport) u64 {
+        return self.report.stage(.ride_along_idle_flush).commits_background;
+    }
+
     /// Every durable fsync this run issued, calling-thread and background
     /// combined, per logical update -- the harness's single "total I/O
     /// durability cost" number, as opposed to `perUpdate`'s calling-thread-
@@ -1005,17 +1056,6 @@ const RideAlongDiagnostic = struct {
     }
 };
 
-// A deliberately large idle window for both overwrite modes below: wide
-// enough that `rideAlongFlushLoop`'s barrier (a) never fires during the
-// measured loop (default build host timing has writes finish in well
-// under a second total; a day is orders of magnitude beyond that), so
-// whatever drains a ride-along HLL maintenance commit during the loop is
-// the next foreground write's own group formation picking it up "for
-// free," not the idle timer forcing it durable on its own. See
-// `docstore.Store.ride_along_idle_ns`'s doc comment: this is a test of
-// the barrier, not a production tuning value.
-const algebraic_overwrite_ride_along_idle_ns: u64 = 24 * std.time.ns_per_hour;
-
 /// Single-writer algebraic *overwrite* mode: same fixture and sync level as
 /// `measureSingleWriterAlgebraic`, but a small key cycle
 /// (`algebraic_overwrite_key_cycle`) so most writes overwrite an existing
@@ -1023,14 +1063,19 @@ const algebraic_overwrite_ride_along_idle_ns: u64 = 24 * std.time.ns_per_hour;
 /// only way to dirty and so exercise the HLL cardinality sketch's ride-along
 /// maintenance path (`runHllMaintenance`/`flushPendingHllObservations`),
 /// which the insert-only `algebraic` mode above never triggers. Opens with
-/// a deliberately large ride-along idle window (see above) so the loop
-/// measures steady-state "drained by the next foreground write" behavior,
-/// not the idle-flush timer; `antfly_db_force_sync_for_test` after the loop
+/// the production default `ride_along_idle_ns` (not overridden -- a prior
+/// version of this mode widened it to make the idle-flush timer never fire
+/// during the loop at all; that just hid a real, if rare, design flaw in
+/// the gate instead of fixing it, and the idle timer's own commits are a
+/// real barrier this mode should exercise, not route around). See
+/// `durableCommitsPerWriteExcludingIdleFlush`/`idleFlushDrains` for how the
+/// gates below separate "the idle timer did its job" from "something is
+/// actually amplifying." `antfly_db_force_sync_for_test` after the loop
 /// (not measured -- `wal_trace.snapshot()` runs first) drains whatever the
 /// very last write's own ride-along job left pending, with no later
 /// foreground write of its own to piggyback on, so the fixture closes clean.
 fn measureSingleWriterAlgebraicOverwrite(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
-    var fixture = try Fixture.openWithRideAlongIdle(alloc, name, .algebraic, algebraic_overwrite_ride_along_idle_ns);
+    var fixture = try Fixture.open(alloc, name, .algebraic);
     defer fixture.close();
 
     var key_buffer: [32]u8 = undefined;
@@ -1094,13 +1139,14 @@ const ConcurrentAlgebraicOverwriteWorker = struct {
 };
 
 /// 8-writer counterpart to `measureSingleWriterAlgebraicOverwrite`: same
-/// large idle window and explicit final drain, but continuous staggered
-/// traffic (no per-round barrier -- see `ConcurrentAlgebraicOverwriteWorker`)
-/// instead of a single sequential writer, so a ride-along HLL maintenance
-/// commit almost always finds another worker's own group forming to join
-/// well before any idle window could matter.
+/// production-default idle window and explicit final drain, but continuous
+/// staggered traffic (no per-round barrier -- see
+/// `ConcurrentAlgebraicOverwriteWorker`) instead of a single sequential
+/// writer, so a ride-along HLL maintenance commit almost always finds
+/// another worker's own group forming to join well before the idle timer
+/// would ever need to step in.
 fn measureConcurrentAlgebraicOverwrite(alloc: std.mem.Allocator, comptime name: []const u8, writers: usize, updates_per_writer: usize) !ModeReport {
-    var fixture = try Fixture.openWithRideAlongIdle(alloc, name, .algebraic, algebraic_overwrite_ride_along_idle_ns);
+    var fixture = try Fixture.open(alloc, name, .algebraic);
     defer fixture.close();
 
     wal_trace.reset();
@@ -1586,6 +1632,7 @@ const StagesJson = struct {
     algebraic_bulk_finish: StageJson,
     algebraic_hll_maintenance: StageJson,
     algebraic_adaptive: StageJson,
+    ride_along_idle_flush: StageJson,
     other: StageJson,
 };
 
@@ -1665,6 +1712,7 @@ fn modeJson(mode: ModeReport) ModeJson {
             .algebraic_bulk_finish = stageJson(mode, .algebraic_bulk_finish),
             .algebraic_hll_maintenance = stageJson(mode, .algebraic_hll_maintenance),
             .algebraic_adaptive = stageJson(mode, .algebraic_adaptive),
+            .ride_along_idle_flush = stageJson(mode, .ride_along_idle_flush),
             .other = stageJson(mode, .other),
         },
         .background_ops = .{
@@ -1774,20 +1822,49 @@ test "lite write amplification report" {
     // = 50ms) racing this Debug-build harness's own much slower (~250-
     // 300ms apart) write cadence and winning almost every time -- the
     // documented safety net working as designed, just triggered far more
-    // often than realistic traffic would hit it. Both modes now open with
-    // a deliberately huge idle window (`algebraic_overwrite_ride_along_idle_ns`,
-    // a Store/open option specifically for this -- see `docstore.Store.
-    // ride_along_idle_ns`) so the measured loop reflects only "did the
-    // next foreground write's own group formation drain this for free,"
-    // and the 8-writer mode now staggers its writers (no per-round
-    // barrier) for continuous rather than bursty traffic. The production
-    // 50ms default itself is deliberately NOT changed or tuned to this
-    // harness -- see the idle-flush-still-fires test below, which proves
-    // the opposite case (no foreground writer at all) still works.
-    try expectAtMost(algebraic_overwrite.durableCommitsPerWrite(), 1.0, "algebraic overwrite: durable commits/write");
-    try expectAtMost(algebraic_overwrite.perUpdate(.background), 0.0, "algebraic overwrite: background syncs/update");
-    try expectAtMost(algebraic_overwrite_concurrent.durableCommitsPerWrite(), 1.0, "algebraic overwrite, 8 writers: durable commits/write");
-    try expectAtMost(algebraic_overwrite_concurrent.perUpdate(.background), 0.0, "algebraic overwrite, 8 writers: background syncs/update");
+    // often than realistic traffic would hit it.
+    //
+    // GATE REDESIGNED: a prior version of this gate widened both modes'
+    // `ride_along_idle_ns` to 24 hours so the idle timer could never fire
+    // during the loop at all. That hid a real design flaw rather than
+    // fixing anything: with a wide-open idle window, a synchronous
+    // ride-along commit (HLL maintenance waiting on its own ticket) blocks
+    // until the window elapses, and with no foreground write to drain it
+    // in the meantime, nothing ever does -- a hang, not a product
+    // deadlock, but a hang. Both modes now open with the production
+    // default `ride_along_idle_ns` (`Fixture.open`, not overridden) and
+    // the gate instead tells "the idle timer did its job" apart from
+    // "something is actually amplifying": `rideAlongFlushLoop` tags every
+    // drain it leads as `.ride_along_idle_flush`
+    // (`write_amplification_trace.Stage`), so
+    // `durableCommitsPerWriteExcludingIdleFlush`/
+    // `backgroundSyncsPerUpdateExcludingIdleFlush` hard-gate at 1.0/0 same
+    // as before, excluding exactly those drains, and `idleFlushDrains`
+    // gets its own separate ceiling -- the timer can fire at most
+    // `ceil(elapsed_ns / ride_along_idle_ns) + 1` times over the run's own
+    // wall-clock duration, regardless of write traffic, so a count above
+    // that bound is a real bug (the timer firing far more often than its
+    // own period allows), not legitimate idle-flush activity. The
+    // 8-writer mode keeps its staggered (no per-round barrier) traffic
+    // shape so a ride-along HLL commit almost always finds another
+    // worker's own group forming to join well before the idle timer would
+    // ever need to step in; see the idle-flush-still-fires test in
+    // `storage/lite/docstore.zig`, which proves the opposite case (no
+    // foreground writer at all) still works.
+    try expectAtMost(algebraic_overwrite.durableCommitsPerWriteExcludingIdleFlush(), 1.0, "algebraic overwrite: durable commits/write (excluding idle-flush drains)");
+    try expectAtMost(algebraic_overwrite.backgroundSyncsPerUpdateExcludingIdleFlush(), 0.0, "algebraic overwrite: background syncs/update (excluding idle-flush drains)");
+    try expectAtMost(
+        @as(f64, @floatFromInt(algebraic_overwrite.idleFlushDrains())),
+        @as(f64, @floatFromInt(ceilDiv(algebraic_overwrite.elapsed_ns, default_ride_along_idle_ns) + 1)),
+        "algebraic overwrite: idle-flush drains",
+    );
+    try expectAtMost(algebraic_overwrite_concurrent.durableCommitsPerWriteExcludingIdleFlush(), 1.0, "algebraic overwrite, 8 writers: durable commits/write (excluding idle-flush drains)");
+    try expectAtMost(algebraic_overwrite_concurrent.backgroundSyncsPerUpdateExcludingIdleFlush(), 0.0, "algebraic overwrite, 8 writers: background syncs/update (excluding idle-flush drains)");
+    try expectAtMost(
+        @as(f64, @floatFromInt(algebraic_overwrite_concurrent.idleFlushDrains())),
+        @as(f64, @floatFromInt(ceilDiv(algebraic_overwrite_concurrent.elapsed_ns, default_ride_along_idle_ns) + 1)),
+        "algebraic overwrite, 8 writers: idle-flush drains",
+    );
 
     const report: ReportJson = .{
         .text_bytes = text_bytes,
@@ -2469,4 +2546,16 @@ fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
         std.debug.print("{s}: {d:.3} exceeds ceiling {d:.3}\n", .{ label, actual, ceiling });
         return error.WriteAmplificationCeilingExceeded;
     }
+}
+
+/// Mirrors `Store.ride_along_idle_ns`'s production default (50ms). Not read
+/// from a live `Store` -- the algebraic overwrite modes above no longer
+/// override it, so this is the window the real idle-flush timer is using,
+/// needed here only to bound how many times it could possibly have fired
+/// over one measured run's `elapsed_ns`.
+const default_ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms;
+
+fn ceilDiv(numerator: u64, denominator: u64) u64 {
+    if (denominator == 0) return 0;
+    return (numerator + denominator - 1) / denominator;
 }
