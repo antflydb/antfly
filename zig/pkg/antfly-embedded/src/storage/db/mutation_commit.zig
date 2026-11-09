@@ -3673,6 +3673,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // and simply falls back to the existing non-inline path for that
             // one index; it must never turn a write that would otherwise
             // succeed into a failure.
+            //
+            // Attempted regardless of `executor.hasWorkers()` -- mirroring
+            // text's own "Phase 2 round 2" fix above (the default Lite
+            // configuration runs with background index workers, so gating
+            // on no-workers would mean this fast path almost never engages).
+            // `InlineAlgebraicPublication.stage` reaches `Index.
+            // applyBatchWithOptionsView`, which takes the SAME `self.
+            // lockWrites()` mutex a worker's own `applyAlgebraicBatchByName
+            // WithOptions` -> `applyBatchWritesLocked` call takes, so the two
+            // are already mutually exclusive without needing `!hasWorkers()`
+            // as a proxy for "no concurrent worker apply".
             var inline_algebraic_publications: [2]?*InlineAlgebraicPublication = @splat(null);
             var inline_algebraic_handled_names: [2][]const u8 = undefined;
             var inline_algebraic_publication_count: usize = 0;
@@ -3680,7 +3691,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (maybe_prepared) |prepared| prepared.abort();
             };
             if (append_derived_replay and effective_req.sync_level == .full_index and
-                !S.ownerField(self, "executor").*.hasWorkers() and materialized_derived_batch != null)
+                materialized_derived_batch != null)
             {
                 for (sync_targets.all_indexes) |target_name| {
                     if (inline_algebraic_publication_count >= inline_algebraic_publications.len) break;
@@ -3945,11 +3956,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             // Same durability boundary as the inline text publications just
-            // above, for the algebraic ones.
+            // above, for the algebraic ones. Mirror each now-durable
+            // publication's sequence into the background worker's own
+            // bookkeeping the same way text does above (see
+            // `Executor.advanceAppliedSequenceIfContiguous`'s doc comment):
+            // without this, a registered algebraic worker's `applied_
+            // sequence` never advances past what catch-up itself sets, so
+            // every write's `waitForAll`/notify cycle finds this worker
+            // still behind target and runs a redundant catch-up turn --
+            // which, finding nothing left to replay, still persists its
+            // own applied-sequence advancement as a second durable commit.
             for (inline_algebraic_publications[0..inline_algebraic_publication_count], 0..) |maybe_prepared, i| {
                 if (maybe_prepared) |prepared| {
                     prepared.install();
                     inline_algebraic_publications[i] = null;
+                    if (S.ownerField(self, "executor").*.hasWorkers()) {
+                        _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_algebraic_handled_names[i], sequence);
+                    }
                 }
             }
             snapshot_mutation.release();
