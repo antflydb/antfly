@@ -2149,6 +2149,9 @@ export class AntflyClient {
             case "generation":
               callbacks.onGeneration?.(JSON.parse(frame.data));
               break;
+            case "context_management":
+              callbacks.onContextManagement?.(JSON.parse(frame.data));
+              break;
             case "step_started":
               callbacks.onStepStarted?.(JSON.parse(frame.data));
               break;
@@ -2349,6 +2352,9 @@ export class AntflyClient {
           switch (frame.event) {
             case "generation":
               callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "context_management":
+              callbacks.onContextManagement?.(JSON.parse(frame.data));
               break;
             case "step_started":
               callbacks.onStepStarted?.(JSON.parse(frame.data));

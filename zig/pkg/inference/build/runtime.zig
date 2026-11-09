@@ -437,6 +437,8 @@ pub fn create(config: Config) Graph {
     cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig")) });
     cloudflare_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    const chat_context_mod = b.modules.get("antfly_chat_context") orelse b.addModule("antfly_chat_context", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/chat_context/root.zig")) });
+    generating_mod.addImport("antfly_chat_context", chat_context_mod);
     reader_config_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     readers_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     transcribing_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);

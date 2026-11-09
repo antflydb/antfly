@@ -11,6 +11,7 @@ from ..models.research_phase import ResearchPhase
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.agent_context_event import AgentContextEvent
     from ..models.agent_question import AgentQuestion
     from ..models.agent_step import AgentStep
     from ..models.research_citation import ResearchCitation
@@ -46,6 +47,8 @@ class ResearchAgentResult:
             unmodified. Signatures are valid across a cluster that shares an
             internal service secret, otherwise only on the server that issued them
             and until it restarts; use durable jobs to resume across restarts.
+        context_management (list[AgentContextEvent] | Unset): Per-model-call preparation diagnostics, also emitted as
+            context_management SSE events.
         id (str | Unset): Unique response ID. Example: resr_cr3ig20h5tbs73e3ahrg.
         model (str | Unset): Writer model.
         created_at (int | Unset): Unix timestamp (seconds) when the response was created.
@@ -69,6 +72,7 @@ class ResearchAgentResult:
 
     status: AgentStatus
     research_state: ResearchState
+    context_management: list[AgentContextEvent] | Unset = UNSET
     id: str | Unset = UNSET
     model: str | Unset = UNSET
     created_at: int | Unset = UNSET
@@ -91,6 +95,13 @@ class ResearchAgentResult:
         status = self.status.value
 
         research_state = self.research_state.to_dict()
+
+        context_management: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.context_management, Unset):
+            context_management = []
+            for context_management_item_data in self.context_management:
+                context_management_item = context_management_item_data.to_dict()
+                context_management.append(context_management_item)
 
         id = self.id
 
@@ -174,6 +185,8 @@ class ResearchAgentResult:
                 "research_state": research_state,
             }
         )
+        if context_management is not UNSET:
+            field_dict["context_management"] = context_management
         if id is not UNSET:
             field_dict["id"] = id
         if model is not UNSET:
@@ -211,6 +224,7 @@ class ResearchAgentResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.agent_context_event import AgentContextEvent
         from ..models.agent_question import AgentQuestion
         from ..models.agent_step import AgentStep
         from ..models.research_citation import ResearchCitation
@@ -228,6 +242,15 @@ class ResearchAgentResult:
         status = AgentStatus(d.pop("status"))
 
         research_state = ResearchState.from_dict(d.pop("research_state"))
+
+        _context_management = d.pop("context_management", UNSET)
+        context_management: list[AgentContextEvent] | Unset = UNSET
+        if _context_management is not UNSET:
+            context_management = []
+            for context_management_item_data in _context_management:
+                context_management_item = AgentContextEvent.from_dict(context_management_item_data)
+
+                context_management.append(context_management_item)
 
         id = d.pop("id", UNSET)
 
@@ -336,6 +359,7 @@ class ResearchAgentResult:
         research_agent_result = cls(
             status=status,
             research_state=research_state,
+            context_management=context_management,
             id=id,
             model=model,
             created_at=created_at,

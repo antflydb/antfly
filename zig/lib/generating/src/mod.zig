@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const context_management = @import("context_management.zig");
 pub const anthropic_api = @import("anthropic_api");
 pub const cloudflare = @import("antfly_cloudflare_config");
 pub const localGenerationStatusError = @import("local_failure.zig").localGenerationStatusError;
@@ -252,7 +253,7 @@ pub const GenerateResult = struct {
     }
 };
 
-pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
+pub fn appleGenerationRequestAlloc(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, require_completion: bool) ![]u8 {
     try cfg.validate();
     if (cfg.provider != .apple) return error.InvalidGeneratorConfig;
     if (messages.len == 0 or messages.len > 128) return error.UnsupportedAppleGenerationOptions;
@@ -299,8 +300,13 @@ pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: [
         .messages = normalized,
         .max_tokens = cfg.max_tokens,
         .temperature = cfg.temperature,
-        .require_completion = control.require_completion,
+        .require_completion = require_completion,
     }, .{});
+    return request;
+}
+
+pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
+    const request = try appleGenerationRequestAlloc(alloc, cfg, messages, control.require_completion);
     defer alloc.free(request);
     return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc, .finish_reason = if (control.require_completion) .stop else null };
 }
@@ -1623,4 +1629,5 @@ pub const dictation = @import("dictation.zig");
 
 test {
     _ = dictation;
+    _ = context_management;
 }

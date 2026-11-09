@@ -11,6 +11,7 @@ from ..models.retrieval_strategy import RetrievalStrategy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.agent_context_event import AgentContextEvent
     from ..models.agent_question import AgentQuestion
     from ..models.agent_step import AgentStep
     from ..models.chat_message import ChatMessage
@@ -32,6 +33,8 @@ class RetrievalAgentResult:
     Attributes:
         status (AgentStatus): Shared bounded-agent execution status
         hits (list[QueryHit]): Retrieved query hits
+        context_management (list[AgentContextEvent] | Unset): Per-model-call preparation diagnostics, also emitted as
+            context_management SSE events.
         id (str | Unset): Unique response ID for logging and tracing Example: ragr_cr3ig20h5tbs73e3ahrg.
         model (str | Unset): LLM model used for generation Example: gemini-2.0-flash.
         created_at (int | Unset): Unix timestamp (seconds) when the response was created
@@ -68,6 +71,7 @@ class RetrievalAgentResult:
 
     status: AgentStatus
     hits: list[QueryHit]
+    context_management: list[AgentContextEvent] | Unset = UNSET
     id: str | Unset = UNSET
     model: str | Unset = UNSET
     created_at: int | Unset = UNSET
@@ -99,6 +103,13 @@ class RetrievalAgentResult:
         for hits_item_data in self.hits:
             hits_item = hits_item_data.to_dict()
             hits.append(hits_item)
+
+        context_management: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.context_management, Unset):
+            context_management = []
+            for context_management_item_data in self.context_management:
+                context_management_item = context_management_item_data.to_dict()
+                context_management.append(context_management_item)
 
         id = self.id
 
@@ -184,6 +195,8 @@ class RetrievalAgentResult:
                 "hits": hits,
             }
         )
+        if context_management is not UNSET:
+            field_dict["context_management"] = context_management
         if id is not UNSET:
             field_dict["id"] = id
         if model is not UNSET:
@@ -233,6 +246,7 @@ class RetrievalAgentResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.agent_context_event import AgentContextEvent
         from ..models.agent_question import AgentQuestion
         from ..models.agent_step import AgentStep
         from ..models.chat_message import ChatMessage
@@ -252,6 +266,15 @@ class RetrievalAgentResult:
             hits_item = QueryHit.from_dict(hits_item_data)
 
             hits.append(hits_item)
+
+        _context_management = d.pop("context_management", UNSET)
+        context_management: list[AgentContextEvent] | Unset = UNSET
+        if _context_management is not UNSET:
+            context_management = []
+            for context_management_item_data in _context_management:
+                context_management_item = AgentContextEvent.from_dict(context_management_item_data)
+
+                context_management.append(context_management_item)
 
         id = d.pop("id", UNSET)
 
@@ -353,6 +376,7 @@ class RetrievalAgentResult:
         retrieval_agent_result = cls(
             status=status,
             hits=hits,
+            context_management=context_management,
             id=id,
             model=model,
             created_at=created_at,

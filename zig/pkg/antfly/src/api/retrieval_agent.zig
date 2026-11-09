@@ -26,6 +26,7 @@ const generating_openapi = @import("antfly_generating_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const generating = @import("antfly_generating");
+const agent_context = @import("agent_context.zig");
 const platform_time = @import("antfly_platform").time;
 const query_api = @import("antfly_local_sources").api_query;
 const query_contract = @import("antfly_local_sources").api_query_contract;
@@ -364,6 +365,7 @@ pub const GenerationRunner = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        check: ?*const fn (*anyopaque) anyerror!void = null,
         execute_chain: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -372,13 +374,24 @@ pub const GenerationRunner = struct {
         ) anyerror!generating.GenerateResult,
     };
 
+    pub fn check(self: GenerationRunner) !void {
+        if (self.vtable.check) |check_fn| try check_fn(self.ptr);
+    }
+    pub fn control(self: GenerationRunner) agent_context.context.preparation.Control {
+        return .{ .ptr = self.ptr, .check_fn = self.vtable.check };
+    }
+
     pub fn executeChain(
         self: GenerationRunner,
         alloc: std.mem.Allocator,
         chain: []const generating.ChainLink,
         messages: []const generating.ChatMessage,
     ) !generating.GenerateResult {
-        return try self.vtable.execute_chain(self.ptr, alloc, chain, messages);
+        try self.check();
+        var result = try self.vtable.execute_chain(self.ptr, alloc, chain, messages);
+        errdefer result.deinit();
+        try self.check();
+        return result;
     }
 };
 
@@ -662,27 +675,19 @@ fn failAgentResult(
 ) !EncodedResponse {
     try live.finishPipeline(true);
     if (format == .json) return err;
-    if (if (kind == .retrieval) retryableReadFailure(err) else null) |payload| {
-        try live.emitValue("error", payload);
-        return .{
-            .content_type = "text/event-stream",
-            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
-        };
-    }
-    if (err == error.GenerationCapacityUnavailable) {
-        const payload = connections_api.generationCapacityFailure();
-        try live.emitValue("error", payload);
-        return .{
-            .content_type = "text/event-stream",
-            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
-        };
-    }
-    // Generation callbacks may originate in a separately compiled runtime.
+    if (agent_context.failure(err)) |detail| return sseFailureResult(alloc, live, detail.payload(err));
+    if (if (kind == .retrieval) retryableReadFailure(err) else null) |payload| return sseFailureResult(alloc, live, payload);
+    if (err == error.GenerationCapacityUnavailable) return sseFailureResult(alloc, live, connections_api.generationCapacityFailure());
+    // Only explicitly classified public errors cross the generation boundary.
     const name = if (kind == .generation) "GenerationFailed" else @errorName(err);
-    try live.emitValue("error", .{ .@"error" = name });
+    return sseFailureResult(alloc, live, .{ .@"error" = name });
+}
+
+fn sseFailureResult(alloc: std.mem.Allocator, live: *LiveEmitter, payload: anytype) !EncodedResponse {
+    try live.emitValue("error", payload);
     return .{
         .content_type = "text/event-stream",
-        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, .{ .@"error" = name }),
+        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
     };
 }
 
@@ -1079,6 +1084,7 @@ fn executeInternal(
     var previous_query_hits: []const QueryHit = &.{};
 
     var model_budget_exhausted = false;
+    var context_events: std.ArrayListUnmanaged(metadata_openapi.AgentContextEvent) = .empty;
     var model_usage: ?metadata_openapi.RetrievalAgentUsage = null;
     if (model_directed) {
         const outcome = executeModelTools(alloc, arena, .{
@@ -1099,6 +1105,7 @@ fn executeInternal(
             .hit_tables = &hit_tables,
             .steps = &steps_list,
             .strategies = &strategies,
+            .context_events = &context_events,
             .live = &live,
         }) catch |err|
             return failAgentResult(alloc, format, &live, err, .retrieval);
@@ -1606,7 +1613,29 @@ fn executeInternal(
 
     if (if (!model_directed) generation_cfg else null) |cfg| {
         const exec = generation_runner orelse return error.UnsupportedRetrievalAgentRequest;
-        const messages = try buildGenerationMessages(arena, request.query, hit_list.items, cfg);
+        var selected_source_ids: []const []const u8 = &.{};
+        var messages = try buildGenerationMessagesWithSources(arena, request.query, hit_list.items, cfg, if (request.context_management != null) &selected_source_ids else null);
+        var generation_calls: i64 = 1;
+        if (request.context_management) |config| {
+            // The assembled retrieved context is data from completed retrieval.
+            // Preserve the live user query separately from that evidence.
+            const evidence = try agent_context.completedEvidence(arena, messages[0], messages[1], request.query);
+            const prior = try agent_context.publicHistory(arena, request.messages);
+            const source = try std.mem.concat(arena, generating.ChatMessage, &.{ evidence[0..1], prior, evidence[1..] });
+            const summary_limit = config.max_summary_batches orelse 8;
+            if (summary_limit < 1 or summary_limit > 32) return error.InvalidContextRequest;
+            var budget = AgentGenerationBudget{ .runner = exec, .used = 1, .limit = exec_options.budget.max_model_calls orelse (summary_limit + 1) };
+            const prepared = agent_context.prepareWithSources(arena, &budget, config, cfg.chain, source, .{}, exec.control(), &.{.{ .tool_call_id = "antfly_context_evidence", .source_ids = selected_source_ids }}) catch |err| {
+                // Preserve transport cancellation and provider-specific HTTP
+                // handling; only classified context errors become SSE payloads.
+                if (agent_context.failure(err) == null) return err;
+                return failAgentResult(alloc, format, &live, err, .generation);
+            };
+            messages = prepared.messages;
+            generation_calls = budget.used;
+            try context_events.append(arena, prepared.event);
+            try live.emitValue("context_management", prepared.event);
+        }
         var result = exec.executeChain(alloc, cfg.chain, messages) catch |err|
             return failAgentResult(alloc, format, &live, err, .generation);
         defer result.deinit();
@@ -1614,7 +1643,7 @@ fn executeInternal(
         try live.emitTextChunks("generation", generated_content.?);
         if (cfg.chain.len > 0) model_used = try arena.dupe(u8, cfg.chain[0].generator.model);
         // Pipeline generation is one model call; report it like the loop does.
-        model_usage = .{ .llm_calls = 1, .resources_retrieved = @intCast(hit_list.items.len) };
+        model_usage = .{ .llm_calls = generation_calls, .resources_retrieved = @intCast(hit_list.items.len) };
         try appendStep(arena, &steps_list, &live, .{
             .kind = .generation,
             .name = "generation",
@@ -1663,6 +1692,7 @@ fn executeInternal(
         .created_at = 0,
         .status = if (model_budget_exhausted) .incomplete else .completed,
         .usage = model_usage,
+        .context_management = if (context_events.items.len > 0) context_events.items else null,
         .hits = try hit_list.toOwnedSlice(arena),
         .steps = steps,
         .strategy_used = detectAggregateStrategy(strategies.items),
@@ -1990,9 +2020,17 @@ const AgentGenerationBudget = struct {
     runner: GenerationRunner,
     used: i64 = 0,
     limit: i64,
+    reserved_destination_calls: i64 = 0,
+
+    pub fn executeChain(self: *@This(), alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+        try self.runner.check();
+        if (self.used >= self.limit - self.reserved_destination_calls) return error.AgentToolLimitExceeded;
+        return generate(self, alloc, chain, messages);
+    }
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.runner.check();
         if (self.used >= self.limit) return error.AgentToolLimitExceeded;
         self.used += 1;
         return self.runner.executeChain(alloc, chain, messages);
@@ -2045,6 +2083,7 @@ const ModelToolState = struct {
     steps: *std.ArrayListUnmanaged(AgentStep),
     strategies: *std.ArrayListUnmanaged(RetrievalStrategy),
     live: *LiveEmitter,
+    context_events: *std.ArrayListUnmanaged(metadata_openapi.AgentContextEvent),
 };
 
 fn executeModelTools(
@@ -2090,6 +2129,18 @@ fn executeModelTools(
     }
     const views = try arena.alloc(struct { query_index: usize, query_request: QueryRequest }, request.queries.len);
     for (views, request.queries, 0..) |*view, query, index| view.* = .{ .query_index = index, .query_request = modelQueryView(query) };
+    if (request.context_management != null) {
+        for (try agent_context.publicHistory(arena, request.messages)) |message| {
+            const encoded = try std.json.Stringify.valueAlloc(arena, message, .{});
+            if (encoded.len > history.limit_bytes -| history.bytes) return error.AgentContextLimitExceeded;
+            history.bytes += encoded.len;
+            if (message.tool_calls) |calls| for (calls) |call| {
+                if (history.ids.contains(call.id)) return error.InvalidAgentToolCall;
+                try history.ids.put(arena, call.id, {});
+            };
+            try history.messages.append(arena, message);
+        }
+    }
     try history.append(.user, try std.json.Stringify.valueAlloc(arena, .{
         .question = request.query,
         .authorized_queries = views,
@@ -2099,7 +2150,8 @@ fn executeModelTools(
     var outcome = ModelToolOutcome{ .model = base_chain[0].generator.model };
     var successful_searches: usize = 0;
     const rounds = if (request.require_decision_after) |limit| @min(max_rounds, @max(0, limit)) else max_rounds;
-    var budget = AgentGenerationBudget{ .runner = ctx.generator, .limit = rounds };
+    var budget = AgentGenerationBudget{ .runner = ctx.generator, .limit = @min(rounds, ctx.budget.max_model_calls orelse rounds) };
+    var context_state = agent_context.context.State{};
     const active_queries = try arena.dupe(RetrievalQueryRequest, request.queries);
     const executable = try arena.alloc(bool, request.queries.len);
     for (request.queries, executable, 0..) |query, *ready, index| ready.* = hasExecutablePlan(query) or agenticNavigation(request, index) != null;
@@ -2110,10 +2162,36 @@ fn executeModelTools(
     @memset(navigation, .{});
     var tool_context_tokens: usize = 0;
     const navigation_advanced = try arena.alloc(bool, request.queries.len);
-    while (budget.used < rounds) {
+    while (budget.used < budget.limit) {
         @memset(navigation_advanced, false);
         const chain = try agent_tools.withTools(arena, base_chain, try modelToolSchema(arena, executable, request, navigation, web_config != null, fetch_config != null));
-        var generated = AgentGenerationBudget.generate(&budget, alloc, chain, history.messages.items) catch |err| switch (err) {
+        var effective_messages: []const generating.ChatMessage = history.messages.items;
+        if (request.context_management) |config| {
+            budget.reserved_destination_calls = 1;
+            const prepared = agent_context.prepare(arena, &budget, config, chain, history.messages.items, context_state, budget.runner.control()) catch |err| switch (err) {
+                error.AgentToolLimitExceeded => {
+                    outcome.rounds = budget.used;
+                    outcome.exhausted = true;
+                    return outcome;
+                },
+                else => return err,
+            };
+            budget.reserved_destination_calls = 0;
+            if ((prepared.event.diagnostics.compacted_messages orelse 0) > 0) {
+                // Reclaim the accumulated tool allowance only after validated
+                // preparation. Authoritative results stay in history/hits.
+                tool_context_tokens = 0;
+                for (prepared.messages) |message| if (message.role == .tool) {
+                    if (message.content) |content| tool_context_tokens +|= agent_tools.estimateTokens(content.text);
+                };
+                if (prepared.next.memory) |memory| tool_context_tokens +|= agent_tools.estimateTokens(try agent_context.context.planner.renderMemory(arena, memory, .{}));
+            }
+            try state_ptrs.context_events.append(arena, prepared.event);
+            try live.emitValue("context_management", prepared.event);
+            context_state = prepared.next;
+            effective_messages = prepared.messages;
+        }
+        var generated = AgentGenerationBudget.generate(&budget, alloc, chain, effective_messages) catch |err| switch (err) {
             error.InvalidGeneratedToolArguments => {
                 outcome.rounds = budget.used;
                 try appendStep(arena, steps, live, .{ .kind = .planning, .name = "repair_tool_arguments", .action = "requested a corrected tool call after malformed model output", .status = .@"error" });
@@ -4089,6 +4167,16 @@ fn buildGenerationMessages(
     hits: []const QueryHit,
     cfg: ParsedGenerationConfig,
 ) ![]const generating.ChatMessage {
+    return buildGenerationMessagesWithSources(alloc, query, hits, cfg, null);
+}
+
+fn buildGenerationMessagesWithSources(
+    alloc: std.mem.Allocator,
+    query: []const u8,
+    hits: []const QueryHit,
+    cfg: ParsedGenerationConfig,
+    source_ids: ?*[]const []const u8,
+) ![]const generating.ChatMessage {
     const system_prompt = if (cfg.system_prompt) |prompt|
         prompt
     else if (cfg.generation_context) |context|
@@ -4102,6 +4190,7 @@ fn buildGenerationMessages(
     defer context_arena.deinit();
     const selected_hits = try selectHitsForGenerationContext(context_arena.allocator(), query, ordered_hits);
     try trimSelectedTreeBranches(context_arena.allocator(), selected_hits, ordered_hits);
+    if (source_ids) |out| out.* = try agent_context.hitIds(alloc, selected_hits);
     const documents_context = try buildGenerationDocumentsContext(alloc, query, selected_hits, cfg.document_renderer);
     defer alloc.free(documents_context);
 
@@ -12838,4 +12927,201 @@ test "retrieval agent optional probes tolerate preparation read churn and preser
             try std.testing.expectEqual(@as(usize, 1), fixture.scan_calls);
         }
     }
+}
+
+test "retrieval agent context compacts pipeline evidence through independent generator" {
+    const Fake = struct {
+        summaries: usize = 0,
+        generations: usize = 0,
+        fn query(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const text = try a.alloc(u8, 8000);
+            defer a.free(text);
+            @memset(text, 'x');
+            return .{ .json = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"status\":200,\"took\":1,\"hits\":{{\"hits\":[{{\"_id\":\"doc:42\",\"_score\":1.0,\"_source\":{{\"body\":\"deadline Friday {s}\"}}}}]}}}}]}}", .{text}) };
+        }
+        fn generate(raw: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                self.summaries += 1;
+                try std.testing.expectEqual(generating.Provider.anthropic, chain[0].generator.provider);
+                try std.testing.expect(chain[0].generator.tools_json == null);
+                return .{ .allocator = a, .finish_reason = .stop, .content = try a.dupe(u8,
+                    \\{"conversation":"doc:42 deadline Friday","tool_evidence":[{"tool_call_id":"antfly_context_evidence","tool_name":"assembled_evidence","facts":"doc:42 deadline Friday","source_ids":["doc:42"]}],"unresolved_tool_calls":[]}
+                ), .usage = .{ .input_tokens = 900, .output_tokens = 70 } };
+            }
+            self.generations += 1;
+            if (chain[0].generator.provider == .apple) {
+                const request_json = try generating.appleGenerationRequestAlloc(a, chain[0].generator, messages, false);
+                defer a.free(request_json);
+            } else try std.testing.expectEqualStrings("main", chain[0].generator.model);
+            const encoded = try std.json.Stringify.valueAlloc(a, messages, .{});
+            defer a.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "doc:42") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "Friday") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "conversation_memory") != null);
+            return .{ .allocator = a, .content = try a.dupe(u8, "doc:42 is due Friday") };
+        }
+    };
+    for ([_]bool{ false, true }) |apple| {
+        var fake = Fake{};
+        const original_body =
+            \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":4000,"target_input_tokens":2500,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32000,"summarizer":{"provider":"anthropic","model":"summary"}}}
+        ;
+        const body = if (apple) try std.mem.replaceOwned(u8, std.testing.allocator, original_body, "\"provider\":\"antfly\",\"model\":\"main\"", "\"provider\":\"apple\"") else try std.testing.allocator.dupe(u8, original_body);
+        defer std.testing.allocator.free(body);
+        const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        try std.testing.expectEqual(@as(usize, 1), fake.generations);
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.usage.?.llm_calls.?);
+        const event = parsed.value.context_management.?[0];
+        try std.testing.expectEqualStrings("anthropic", event.summary_provider.?);
+        try std.testing.expectEqual(@as(i64, 900), event.diagnostics.summary_input_tokens.?);
+        try std.testing.expect(event.diagnostics.effective_input_tokens.? <= 2500);
+    }
+}
+
+test "retrieval agent context absent and fitting policies avoid summarization" {
+    const Fake = struct {
+        fn query(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return .{ .json = try a.dupe(u8, "{\"responses\":[{\"status\":200,\"took\":1,\"hits\":{\"hits\":[{\"_id\":\"doc:a\",\"_score\":1,\"_source\":{\"body\":\"alpha\"}}]}}]}") };
+        }
+        fn generate(_: *anyopaque, a: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            try std.testing.expect(!std.mem.eql(u8, messages[0].content.?.text, agent_context.context.planner.summary_instruction));
+            return .{ .allocator = a, .content = try a.dupe(u8, "answer") };
+        }
+    };
+    var fake: u8 = 0;
+    inline for (.{ "", ",\"context_management\":{\"context_window_tokens\":32000}" }) |option| {
+        const body = "{\"query\":\"alpha\",\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"match\":\"alpha\"}}],\"stream\":false,\"generator\":{\"provider\":\"antfly\",\"model\":\"main\"},\"steps\":{\"generation\":{}}" ++ option ++ "}";
+        const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.usage.?.llm_calls.?);
+    }
+}
+
+test "retrieval agent context compacts older tool exchanges before the next model call" {
+    const Fake = struct {
+        searches: usize = 0,
+        summaries: usize = 0,
+        fn query(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.searches += 1;
+            const text = try a.alloc(u8, 8000);
+            defer a.free(text);
+            @memset(text, 'x');
+            return .{ .json = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"status\":200,\"took\":1,\"hits\":{{\"hits\":[{{\"_id\":\"doc:{d}\",\"_score\":1,\"_source\":{{\"body\":\"deadline Friday {s}\"}}}}]}}}}]}}", .{ self.searches, text }) };
+        }
+        fn generate(raw: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                self.summaries += 1;
+                return .{ .allocator = a, .content = try a.dupe(u8,
+                    \\{"conversation":"doc:1 is due Friday","tool_evidence":[{"tool_call_id":"search-1","tool_name":"search","facts":"doc:1 is due Friday","source_ids":["doc:1"]}],"unresolved_tool_calls":[]}
+                ) };
+            }
+            if (self.searches < 2) {
+                const calls = try a.alloc(generating.ToolCall, 1);
+                calls[0] = .{ .id = try std.fmt.allocPrint(a, "search-{d}", .{self.searches + 1}), .name = try a.dupe(u8, "search"), .arguments = try a.dupe(u8, "{\"query_index\":0}") };
+                return .{ .allocator = a, .content = try a.dupe(u8, ""), .tool_calls = calls };
+            }
+            try std.testing.expect(self.summaries > 0);
+            const context_text = try std.json.Stringify.valueAlloc(a, messages, .{});
+            defer a.free(context_text);
+            try std.testing.expect(std.mem.indexOf(u8, context_text, "doc:1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, context_text, "doc:2") != null);
+            return .{ .allocator = a, .content = try a.dupe(u8, "doc:1 and doc:2 are due Friday") };
+        }
+    };
+    for ([_]usize{ 3, 4, 6 }) |round_limit| {
+        var fake = Fake{};
+        const template =
+            \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"max_internal_iterations":0,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":32768,"target_input_tokens":20000,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32768,"summarizer":{"provider":"openai","model":"summary"}}}
+        ;
+        const body = try std.mem.replaceOwned(u8, std.testing.allocator, template, "\"max_internal_iterations\":0", if (round_limit == 3) "\"max_internal_iterations\":3" else if (round_limit == 4) "\"max_internal_iterations\":4" else "\"max_internal_iterations\":6");
+        defer std.testing.allocator.free(body);
+        const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        if (round_limit == 3) {
+            try std.testing.expectEqual(AgentStatus.incomplete, parsed.value.status);
+            try std.testing.expectEqual(@as(usize, 0), fake.summaries);
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.hits.len);
+            try std.testing.expectEqual(@as(i64, 2), parsed.value.usage.?.llm_calls.?);
+            continue;
+        }
+        try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
+        try std.testing.expectEqual(@as(usize, 2), fake.searches);
+        try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        try std.testing.expectEqual(@as(i64, 4), parsed.value.usage.?.llm_calls.?);
+    }
+}
+
+test "retrieval compaction validates exact structured source identities before destination dispatch" {
+    const Fake = struct {
+        ids: ?[]const u8,
+        generations: usize = 0,
+        fn query(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const text = try a.alloc(u8, 4000);
+            defer a.free(text);
+            @memset(text, 'x');
+            return .{ .json = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"status\":200,\"took\":1,\"hits\":{{\"hits\":[{{\"_id\":\"doc:1\",\"_score\":1,\"_source\":{{\"body\":\"{s}\"}}}},{{\"_id\":\"doc:1-extra\",\"_score\":1,\"_source\":{{\"body\":\"{s}\"}}}}]}}}}]}}", .{ text, text }) };
+        }
+        fn generate(raw: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "\"source_ids\":[\"doc:1\",\"doc:1-extra\"]") != null);
+                return .{ .allocator = a, .content = try std.fmt.allocPrint(a, "{{\"conversation\":\"doc:1 and doc:1-extra both appear in prose\",\"tool_evidence\":[{{\"tool_call_id\":\"antfly_context_evidence\",\"tool_name\":\"assembled_evidence\",\"facts\":\"doc:1 and doc:1-extra both appear in prose\"{s}{s}}}],\"unresolved_tool_calls\":[]}}", .{ if (self.ids != null) ",\"source_ids\":" else "", self.ids orelse "" }) };
+            }
+            self.generations += 1;
+            return .{ .allocator = a, .content = try a.dupe(u8, "answer") };
+        }
+    };
+    const cases = [_]struct { ids: ?[]const u8, err: ?anyerror }{
+        .{ .ids = null, .err = error.ContextSummaryMissingCitation },
+        .{ .ids = "[\"doc:1-extra\"]", .err = error.ContextSummaryMissingCitation },
+        .{ .ids = "[\"doc:1\",\"doc:1-extra\",\"invented\"]", .err = error.InvalidContextSummary },
+        .{ .ids = "[\"doc:1-extra\",\"doc:1-extra\"]", .err = error.InvalidContextSummary },
+        .{ .ids = "[\"doc:1\",\"doc:1-extra\"]", .err = null },
+    };
+    const body =
+        \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":4000,"target_input_tokens":2500,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32000,"summarizer":{"provider":"openai","model":"summary"}}}
+    ;
+    for (cases) |case| for ([_]enum { json, buffered_sse, live_sse }{ .json, .buffered_sse, .live_sse }) |transport| {
+        var fake = Fake{ .ids = case.ids };
+        var transcript = SseTranscript{};
+        defer transcript.bytes.deinit(std.testing.allocator);
+        const request_body = try std.mem.replaceOwned(u8, std.testing.allocator, body, "\"stream\":false", if (transport == .json) "\"stream\":false" else "\"stream\":true");
+        defer std.testing.allocator.free(request_body);
+        const result = executeWithOptions(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, request_body, if (transport == .live_sse) .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit } else null, .{});
+        if (case.err != null and transport == .json) {
+            try std.testing.expectError(case.err.?, result);
+        } else {
+            const encoded = try result;
+            defer std.testing.allocator.free(encoded.body);
+            if (transport != .json) {
+                const events = try parseSseEventsAlloc(std.testing.allocator, if (transport == .live_sse) transcript.bytes.items else encoded.body);
+                defer std.testing.allocator.free(events);
+                if (case.err) |err| {
+                    try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "error"));
+                    try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
+                    const payload = try std.json.parseFromSlice(agent_context.ErrorPayload, std.testing.allocator, firstSseEventData(events, "error").?, .{});
+                    defer payload.deinit();
+                    try std.testing.expectEqualStrings(@errorName(err), payload.value.code);
+                    try std.testing.expectEqualStrings(@errorName(err), payload.value.@"error");
+                    try std.testing.expectEqualStrings(agent_context.failure(err).?.message, payload.value.message);
+                    try std.testing.expect(!payload.value.retryable);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "error"));
+                    try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "done"));
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (case.err != null) 0 else 1), fake.generations);
+    };
 }

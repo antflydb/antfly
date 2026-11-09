@@ -118,7 +118,13 @@ restarting owners, so recovery must use the repository rather than colocated pin
 Query capture briefly closes write admission while derivations converge and
 manifests are sealed; deadlines, cancellation and WAL/capacity admission bound
 this work. The retained files never hold an apply lock across cursor pages.
-The shared maintenance scheduler warms coherent private generations in bounded
+Speculative native snapshot warming defaults off for standalone, embedded and
+distributed deployments, and on for serverless. Set
+`lake_indexes.query_cursors.background_warming` to explicitly enable or disable
+it. On-demand durable cursor capture and retained-generation recovery remain
+available regardless of this setting; disabling warming does not shorten an
+issued cursor's retention or remove already-retained generations.
+When enabled, the shared maintenance scheduler warms coherent private generations in bounded
 8 MiB upload turns with a ten-second I/O deadline. Capture has a two-second
 admission deadline. Chunk progress survives restart; foreground captures reuse
 immutable extent proofs. Failed turns back off, and close cancels and joins the
