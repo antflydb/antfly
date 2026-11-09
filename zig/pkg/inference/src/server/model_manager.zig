@@ -2964,9 +2964,15 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }
         var result: [32]u8 = undefined;
         hash.final(&result);
-        return result;
+        return imagePreprocessingRevision(manifest, result);
     }
-    return resolutionModelRevision(a, io, manifest);
+    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest));
+}
+
+fn imagePreprocessingRevision(manifest: manifest_mod.ModelManifest, artifacts: [32]u8) [32]u8 {
+    if (manifest.hasInput("image") and (manifest.isColqwenBundle() or std.mem.eql(u8, manifest.config_model_arch, "qwen2_vl")))
+        return @import("../architectures/qwen2vl_types.zig").preprocessingRevision(artifacts);
+    return artifacts;
 }
 
 const native_kv_identity = @import("../runtime/kv/attention_match_identity.zig");
@@ -20194,4 +20200,17 @@ test "model selection many-file ONNX model loads within a bounded descriptor bud
         a.free(actual);
     }
     try std.testing.expectEqualSlices(f32, &.{96}, actual[0].asFloat32());
+}
+
+test "model processor resampling revision only changes affected vision models" {
+    var inputs = [_][]const u8{"image"};
+    const artifacts: [32]u8 = @splat(7);
+    var manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .config_model_arch = "qwen2_vl", .inputs = &inputs };
+    const revision = imagePreprocessingRevision(manifest, artifacts);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &revision));
+    inputs[0] = "text";
+    try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+    inputs[0] = "image";
+    manifest.config_model_arch = "qwen3_5";
+    try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
 }

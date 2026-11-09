@@ -105,7 +105,26 @@ renderer. A photo page can induce invented or repeated tables when small
 lettering is aliased; an `OUTPUT_TRUNCATED` response does not by itself mean
 the legitimate transcription needs more tokens. Keep incomplete OCR unresolved.
 
-The OCR rendering profile smooths continuous-tone images independently of the
+Configure PDF sampling independently of model preprocessing:
+
+```json
+{"ocr":{"render":{"sampling":"auto","dpi":150,"resolution":"requested_dpi"},"reader":{"provider":"antfly","model":"lightonai/LightOnOCR-3-4B","max_tokens":2048}}}
+```
+
+- `auto` (default) smooths continuous-tone images and preserves one-bit ink
+  coverage during minification.
+- `pdf` honors source PDF interpolation declarations for reproducibility.
+- `smooth` explicitly uses bilinear sampling even for one-bit image color;
+  stencil masks keep their source rules. It can blur thin strokes.
+
+DPI, resolution, pixel/dimension caps and memory admission remain independent.
+Sampling does not raise those limits. Shared windows, embedding source identities
+and extraction fingerprints include the policy and its algorithm version.
+Units and chunks carry `ocr_render_policy` alongside requested/effective DPI and
+actual geometry. `resolved_profile` is null when a platform compatibility
+renderer supplies the pixels instead of the native sampler.
+
+The default OCR rendering profile smooths continuous-tone images independently of the
 PDF's `/Interpolate` setting. Exact rendering retains PDF sampling semantics,
 and one-bit scans retain coverage-preserving minification. Smoothing operates
 on the existing decoded image; it adds no full-page buffer or output pixels.
@@ -123,6 +142,38 @@ not proof of full-corpus accuracy or of a deployed server containing the
 rendering change. Inspect actual visible text, not only completion status.
 The corpus artifact definition and pool limits need not change for this fix;
 retry native extraction only after deploying a runtime with the rendering fix.
+
+## Model preprocessing and provider guidance
+
+PDF painting and model resizing are different operations. Resize filters,
+normalization, patch geometry and pixel/token limits belong to the pinned
+model's processor contract. `ocr.render.sampling` does not override them.
+Qwen2-VL honors supported nearest, bilinear or bicubic declarations. The native
+Qwen3.5/LightOn path implements Pillow-compatible antialiased bicubic and
+rejects conflicting declarations. Unknown/malformed filters fail closed.
+The corrected Qwen2/ColQwen image processor also versions its execution identity,
+so vectors produced by the earlier fixed filter cannot satisfy the new recipe.
+Existing derived units use the new `duf6` fingerprint format and are re-extracted
+when their older state marker is encountered; this does not require recreating
+a source table. Plan that regeneration with the same bounded job/admission limits.
+
+LightOn's [4B model card](https://huggingface.co/lightonai/LightOnOCR-3-4B#rendering-and-preprocessing-tips)
+recommends rendering at 400 DPI, then resizing to a 2048-pixel longest edge with
+aspect ratio preserved. Its [processor](https://huggingface.co/lightonai/LightOnOCR-3-4B/blob/main/processor_config.json)
+declares bicubic sampling. Pin the revision when reproducing this pipeline.
+Direct low-resolution painting is not equivalent to high-resolution rendering
+followed by antialiased reduction. This change retains the explicit 150-DPI
+default and existing caps; it does not silently allocate 400-DPI pages or claim
+exact reproduction of LightOn's reference pipeline.
+
+Hosted providers publish different input quality guidance:
+[Document AI](https://docs.cloud.google.com/document-ai/docs/file-types)
+recommends at least 200 DPI, generally 300 or higher;
+[Textract](https://docs.aws.amazon.com/textract/latest/dg/textract-best-practices.html)
+recommends at least 150 DPI and avoiding conversion/downsampling of supported
+originals. Neither recommendation establishes their internal sampling filter.
+[Tesseract](https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html) performs
+its own preprocessing and generally prefers at least 300 DPI.
 
 ## Large-page vLLM comparison
 

@@ -229,6 +229,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
         .native_text_diagnostics = unit.native_text_diagnostics,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = unit.ocr_render_policy,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -256,6 +257,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
             .ocr_used = unit.ocr_used,
             .ocr_attempted = unit.ocr_attempted,
             .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_render_policy = unit.ocr_render_policy,
             .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
             .ocr_rendered_width = unit.ocr_rendered_width,
             .ocr_rendered_height = unit.ocr_rendered_height,
@@ -295,6 +297,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_render_policy = unit.ocr_render_policy,
                 .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
                 .ocr_rendered_width = unit.ocr_rendered_width,
                 .ocr_rendered_height = unit.ocr_rendered_height,
@@ -350,6 +353,7 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
         .ocr_attempted = true,
         .ocr_used = true,
         .ocr_render_dpi = 150,
+        .ocr_render_policy = .{ .sampling = .smooth, .resolved_profile = .smooth },
         .ocr_confidence = 0.75,
         .ocr_bbox = .{ 0, 1, 4, 8 },
         .transcript_used = true,
@@ -456,4 +460,23 @@ test "ordered artifact inventory typed unit payload validates offsets before acc
         defer alloc.free(encoded);
         try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(alloc, encoded, identity));
     }
+}
+
+test "OCR sampling unit payload roundtrip authenticates rendering policy" {
+    const a = std.testing.allocator;
+    const unit = extraction.Unit{ .unit_id = @constCast("page:1"), .unit_type = @constCast("page"), .text = @constCast("text"), .method = @constCast("ocr_text"), .ocr_render_policy = .{ .sampling = .smooth, .resolved_profile = .smooth } };
+    const id = Identity{ .document = "doc", .producer = "units", .unit = unit.unit_id };
+    const fingerprint = try fingerprints.fingerprintAlloc(a, unit);
+    defer a.free(fingerprint);
+    const bytes = try encodeAlloc(a, id.document, id.producer, unit, fingerprint, "input", "application/pdf", .{ .range_id = "range:0" });
+    defer a.free(bytes);
+    var decoded = try decodeAlloc(a, bytes, id);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(unit.ocr_render_policy, decoded.unit.ocr_render_policy);
+    var changed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer changed.deinit();
+    try changed.value.object.getPtr("ocr_render_policy").?.object.put(changed.arena.allocator(), "sampling", .{ .string = "pdf" });
+    const altered = try std.json.Stringify.valueAlloc(a, changed.value, .{});
+    defer a.free(altered);
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(a, altered, id));
 }

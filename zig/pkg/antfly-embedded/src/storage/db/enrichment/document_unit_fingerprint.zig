@@ -22,14 +22,14 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// Persisted prefix for the canonical, injective unit-fingerprint encoding.
 /// Keeping the version in the value makes payload markers self-describing and
 /// lets readers distinguish them from the unversioned legacy digest.
-pub const current_prefix = "duf5:";
-pub const current_state_version: u8 = 5;
-const current_domain = "antfly-document-unit-fingerprint-v5";
+pub const current_prefix = "duf6:";
+pub const current_state_version: u8 = 6;
+const current_domain = "antfly-document-unit-fingerprint-v6";
 
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
 comptime {
-    if (@typeInfo(document_extraction.Unit).@"struct".field_names.len != 36) {
+    if (@typeInfo(document_extraction.Unit).@"struct".field_names.len != 37) {
         @compileError("document_extraction.Unit changed; update and version document_unit_fingerprint");
     }
 }
@@ -71,6 +71,7 @@ const Field = enum(u8) {
     native_text_quality = 34,
     native_text_diagnostics = 35,
     text_blocks = 36,
+    ocr_render_policy = 37,
 };
 
 /// Computes the current document-unit fingerprint without constructing an
@@ -94,6 +95,13 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedBool(&hasher, .ocr_used, unit.ocr_used);
     hashTaggedBool(&hasher, .ocr_attempted, unit.ocr_attempted);
     hashTaggedOptionalU16(&hasher, .ocr_render_dpi, unit.ocr_render_dpi);
+    hashTaggedBool(&hasher, .ocr_render_policy, unit.ocr_render_policy != null);
+    if (unit.ocr_render_policy) |policy| {
+        hashTaggedOptionalU16(&hasher, .ocr_render_policy, policy.version);
+        hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.sampling));
+        hashTaggedOptionalBytes(&hasher, .ocr_render_policy, if (policy.resolved_profile) |profile| @tagName(profile) else null);
+        hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.resolution));
+    }
     hashTaggedOptionalU16(&hasher, .ocr_effective_render_dpi, unit.ocr_effective_render_dpi);
     hashTaggedOptionalU32(&hasher, .ocr_rendered_width, unit.ocr_rendered_width);
     hashTaggedOptionalU32(&hasher, .ocr_rendered_height, unit.ocr_rendered_height);
@@ -245,6 +253,7 @@ pub fn storedPayloadLegacyFingerprintAlloc(alloc: Allocator, stored: []const u8)
         .ocr_used = try requiredBool(provenance, "ocr_used"),
         .ocr_attempted = try requiredBool(object, "ocr_attempted"),
         .ocr_render_dpi = try optionalInteger(u16, object, "ocr_render_dpi"),
+        .ocr_render_policy = if (object.get("ocr_render_policy")) |value| if (value == .null) null else std.json.parseFromValueLeaky(document_extraction.RenderPolicy, scratch, value, .{}) catch return error.InvalidDocumentExtractionState else null,
         .ocr_effective_render_dpi = try optionalInteger(u16, object, "ocr_effective_render_dpi"),
         .ocr_rendered_width = try optionalInteger(u32, object, "ocr_rendered_width"),
         .ocr_rendered_height = try optionalInteger(u32, object, "ocr_rendered_height"),
@@ -718,4 +727,21 @@ test "document unit fingerprint includes native quality diagnostics region style
     const visible = try fingerprintAlloc(alloc, enriched);
     defer alloc.free(visible);
     try std.testing.expect(!std.mem.eql(u8, structured, visible));
+}
+
+test "OCR sampling provenance participates in unit fingerprints" {
+    const a = std.testing.allocator;
+    const base = document_extraction.Unit{ .unit_id = @constCast("page:1"), .unit_type = @constCast("page"), .text = @constCast("text"), .method = @constCast("ocr_text"), .ocr_render_policy = .{} };
+    const baseline = try fingerprintAlloc(a, base);
+    defer a.free(baseline);
+    inline for (.{ "version", "sampling", "resolved_profile", "resolution" }) |field| {
+        var changed = base;
+        if (comptime std.mem.eql(u8, field, "version")) changed.ocr_render_policy.?.version += 1;
+        if (comptime std.mem.eql(u8, field, "sampling")) changed.ocr_render_policy.?.sampling = .pdf;
+        if (comptime std.mem.eql(u8, field, "resolved_profile")) changed.ocr_render_policy.?.resolved_profile = .exact;
+        if (comptime std.mem.eql(u8, field, "resolution")) changed.ocr_render_policy.?.resolution = .model_input;
+        const hash = try fingerprintAlloc(a, changed);
+        defer a.free(hash);
+        try std.testing.expect(!std.mem.eql(u8, baseline, hash));
+    }
 }

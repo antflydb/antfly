@@ -197,6 +197,7 @@ fn qwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config:
     const prep = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
     if (prep.patch_size != config.vision_patch_size or prep.merge_size != config.vision_spatial_merge_size or
         prep.temporal_patch_size != config.vision_temporal_patch_size or
+        prep.resample != .bicubic or
         !prep.do_resize or !prep.do_normalize or !prep.do_rescale or !prep.do_convert_rgb or
         !std.math.approxEqAbs(f32, prep.rescale_factor, 1.0 / 255.0, 1e-9) or
         !std.mem.eql(f32, &prep.image_mean, &.{ 0.5, 0.5, 0.5 }) or
@@ -21110,4 +21111,23 @@ test "execution batch phase metrics include coordinator backed direct prefill an
     const after = metrics.snapshot();
     try std.testing.expectEqual(after_prefill.counts[@backingInt(metrics.Phase.decode)] + 1, after.counts[@backingInt(metrics.Phase.decode)]);
     try std.testing.expect(after.totals_ns[@backingInt(metrics.Phase.decode)] > after_prefill.totals_ns[@backingInt(metrics.Phase.decode)]);
+}
+
+test "model processor resampling rejects native projector mismatch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    const config = gpt_mod.Config{ .family = .qwen3_5, .vision_patch_size = 16, .vision_spatial_merge_size = 2, .vision_temporal_patch_size = 2 };
+    for ([_]u8{ 0, 2, 3 }) |resample| {
+        const json = try std.fmt.allocPrint(a, "{{\"image_processor\":{{\"resample\":{d},\"patch_size\":16,\"merge_size\":2,\"temporal_patch_size\":2,\"image_mean\":[0.5,0.5,0.5],\"image_std\":[0.5,0.5,0.5]}}}}", .{resample});
+        defer a.free(json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "processor_config.json", .data = json });
+        if (resample == 3) {
+            const limits = try qwenVisionLimits(a, path, config);
+            try std.testing.expect(limits.max_merged_tokens > 0);
+        } else try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, qwenVisionLimits(a, path, config));
+    }
 }

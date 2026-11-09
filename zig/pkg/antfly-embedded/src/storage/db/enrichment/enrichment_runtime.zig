@@ -10142,6 +10142,8 @@ const CapturedInputFailure = struct {
 const SharedPdfTransform = struct {
     dpi: u16,
     resolution_policy: @FieldType(document_extraction_mod.Config, "ocr_render_resolution"),
+    sampling: document_extraction_mod.ImageSamplingPolicy,
+    policy_version: u16 = (document_extraction_mod.RenderPolicy{}).version,
     max_pixels: u64,
     max_dimension: u32,
     width: ?u32,
@@ -10157,6 +10159,7 @@ const SharedPdfTransform = struct {
         return .{
             .dpi = config.ocr_render_dpi,
             .resolution_policy = config.ocr_render_resolution,
+            .sampling = config.ocr_render_sampling,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, @as(u64, config.ocr_max_rendered_dimension) * config.ocr_max_rendered_dimension), pixels),
             .max_dimension = config.ocr_max_rendered_dimension,
             .width = if (config.ocr_render_resolution == .model_input) width else null,
@@ -11564,9 +11567,11 @@ const SharedPdfWindowScheduler = struct {
                 errdefer if (clone_owned) clone.deinit(alloc);
                 clone.ocr_attempted = true;
                 clone.ocr_render_dpi = consumer.config.ocr_render_dpi;
+                clone.ocr_render_policy = document_extraction_mod.renderPolicy(consumer.config);
                 switch (rendered) {
                     inline else => |batch| {
                         const page = batch.results[cursor].rendered.?;
+                        if (page.quality == .compatibility_backend) clone.ocr_render_policy.?.resolved_profile = null;
                         clone.ocr_effective_render_dpi = page.effective_dpi;
                         clone.ocr_rendered_width = page.width;
                         clone.ocr_rendered_height = page.height;
@@ -12091,10 +12096,13 @@ const RuntimePdfPageTextSpool = struct {
     }
 };
 
-test "shared PDF transform identity includes decoder and spatial limits" {
+test "shared PDF transform identity includes decoder spatial and OCR sampling limits" {
     var config = document_extraction_mod.Config{};
     const baseline = SharedPdfTransform.init(config, 1_000_000, null, null, 100, false);
     try std.testing.expect(std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, 224, 224, 100, false)));
+    config.ocr_render_sampling = .pdf;
+    try std.testing.expect(!baseline.canSupply(SharedPdfTransform.init(config, 1_000_000, null, null, 100, false)));
+    config.ocr_render_sampling = .auto;
     config.ocr_render_resolution = .model_input;
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, 224, 224, 100, false)));
     config.ocr_render_resolution = .requested_dpi;
@@ -13660,12 +13668,14 @@ const DocumentPreparationPipeline = struct {
                 .encoded => |batch| {
                     if (batch.results.len != 1) return;
                     const page = batch.results[0].rendered orelse return;
+                    unit.ocr_render_policy = document_extraction_mod.renderPolicy(self.config);
                     try recordRuntimePdfOcrPage(self.allocator(), unit, page);
                     media[0] = .{ .bytes = page.png, .mime_type = "image/png" };
                 },
                 .raster => |batch| {
                     if (batch.results.len != 1) return;
                     const page = batch.results[0].rendered orelse return;
+                    unit.ocr_render_policy = document_extraction_mod.renderPolicy(self.config);
                     try recordRuntimePdfOcrPage(self.allocator(), unit, page);
                     rasters[0] = .{ .bytes = page.bytes, .width = page.width, .height = page.height, .stride_bytes = page.stride, .format = .rgba8, .mime_type = antfly_image.rgba8_raster_mime_type, .item_id = unit.unit_id, .source_fingerprint = self.fingerprint.?, .page_number = unit.page_number };
                 },
@@ -13703,7 +13713,7 @@ const DocumentPreparationPipeline = struct {
             self.window = null;
         }
         fn samePolicy(a: document_extraction_mod.Config, b: document_extraction_mod.Config) bool {
-            return a.ocr_render_dpi == b.ocr_render_dpi and a.ocr_render_resolution == b.ocr_render_resolution and
+            return a.ocr_render_dpi == b.ocr_render_dpi and a.ocr_render_resolution == b.ocr_render_resolution and a.ocr_render_sampling == b.ocr_render_sampling and
                 a.ocr_max_rendered_pixels == b.ocr_max_rendered_pixels and a.ocr_max_rendered_dimension == b.ocr_max_rendered_dimension and
                 std.meta.eql(a.native_text, b.native_text) and std.meta.eql(a.ocr_quality, b.ocr_quality) and std.meta.eql(a.pdf_decode_limits, b.pdf_decode_limits) and
                 a.ocr_mode == b.ocr_mode and std.mem.eql(u8, document_extraction_mod.effectiveOcrPrompt(a), document_extraction_mod.effectiveOcrPrompt(b));
@@ -18835,12 +18845,13 @@ fn renderDocumentPdfPagePngAdaptiveAlloc(
             config.pdf_decode_limits.max_decoded_stream_bytes,
             config.pdf_decode_limits.max_working_set_bytes,
             0,
+            config.ocr_render_sampling,
             out_failure,
         );
     }
     var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, pdf_bytes, config.pdf_decode_limits);
     defer session.deinit();
-    return session.renderPagePngAdaptiveAlloc(alloc, page_number, config.ocr_render_dpi, max_pixels, max_dimension);
+    return session.renderPagePngAdaptiveWithSamplingAlloc(alloc, page_number, config.ocr_render_dpi, max_pixels, max_dimension, config.ocr_render_sampling);
 }
 
 fn boundaryFailureErrorName(failure: *const runtime_failure_abi.FailureIdentity, fallback: anyerror) []const u8 {
@@ -22282,6 +22293,7 @@ fn renderRuntimePdfWindow(
         try requests.append(alloc, .{
             .page_number = unit.page_number orelse 1,
             .requested_dpi = config.ocr_render_dpi,
+            .sampling = config.ocr_render_sampling,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, dimension_pixels), batch_policy.max_pixels),
             .resolution_policy = config.ocr_render_resolution,
             .max_dimension = config.ocr_max_rendered_dimension,
@@ -22871,6 +22883,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
+                units[idx].ocr_render_policy = document_extraction_mod.renderPolicy(config);
                 if (pdf_render_window == null or pdf_render_cursor >= pdf_render_window.?.unit_indices.len) {
                     if (pdf_render_window) |*window| {
                         const window_alloc = window.allocator();
@@ -23101,6 +23114,9 @@ fn validateRuntimeGeneratedTextRequest(policy: GeneratedTextBatchPolicy, request
 }
 
 fn recordRuntimePdfOcrPage(alloc: Allocator, unit: *document_extraction_mod.Unit, page: anytype) !void {
+    if (page.quality == .compatibility_backend) if (unit.ocr_render_policy) |*policy| {
+        policy.resolved_profile = null;
+    };
     unit.ocr_render_dpi = page.requested_dpi;
     unit.ocr_effective_render_dpi = page.effective_dpi;
     unit.ocr_rendered_width = page.width;
@@ -24176,6 +24192,7 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .source_sha256 = unit.source_sha256,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = unit.ocr_render_policy,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -24445,6 +24462,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = unit.ocr_render_policy,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -26912,6 +26930,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = chunk_artifact_mod.RenderPolicyProvenance.from(unit.ocr_render_policy),
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -31091,6 +31110,8 @@ fn pdfPageEmbeddingSourceHash(
     hasher.update(content_sha256);
     updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(page_number));
     updatePdfPageEmbeddingHashInt(&hasher, u16, render_config.ocr_render_dpi);
+    updatePdfPageEmbeddingHashInt(&hasher, u16, (document_extraction_mod.RenderPolicy{}).version);
+    updatePdfPageEmbeddingHashInt(&hasher, u16, @backingInt(render_config.ocr_render_sampling));
     updatePdfPageEmbeddingHashInt(&hasher, u8, @backingInt(render_config.ocr_render_resolution));
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.ocr_max_rendered_pixels);
     updatePdfPageEmbeddingHashInt(&hasher, u32, render_config.ocr_max_rendered_dimension);
@@ -31357,6 +31378,7 @@ const PdfEmbeddingWindowPreparer = struct {
         for (requests, 0..) |*page_request, i| page_request.* = .{
             .page_number = self.pending_pages[first_item + i],
             .requested_dpi = self.render_config.ocr_render_dpi,
+            .sampling = self.render_config.ocr_render_sampling,
             .resolution_policy = self.render_config.ocr_render_resolution,
             .max_pixels = @min(self.render_config.ocr_max_rendered_pixels, model_pixel_cap),
             .max_dimension = self.render_config.ocr_max_rendered_dimension,

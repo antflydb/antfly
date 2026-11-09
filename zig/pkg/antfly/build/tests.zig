@@ -2021,6 +2021,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const root_test_step = b.step("root-test", "Run root-module contracts and HTTP runtime regressions");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+    // Rendering policy contracts do not need the broad API/metadata anchors.
+    // Keep this inexpensive owner available for schema/provenance changes.
+    const render_policy_tests = b.addTest(.{
+        .name = "document-render-policy-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"OCR sampling"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-render-policy-test", "Run focused OCR rendering configuration, identity and provenance contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, render_policy_tests).step);
 
     const graph_capability_filters = selectTestFilters(b, &.{
         "unsupported graph diagnostics identify the rejected operation feature",

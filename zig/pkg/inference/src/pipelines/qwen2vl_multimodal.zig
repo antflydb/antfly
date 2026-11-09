@@ -182,6 +182,11 @@ pub fn parsePreprocessorConfig(allocator: std.mem.Allocator, json_bytes: []const
     };
 
     var config = PreprocessorConfig{};
+    if (obj.get("resample")) |value| {
+        if (value != .integer) return error.UnsupportedQwen2VlPreprocessorConfig;
+        const code = std.math.cast(u8, value.integer) orelse return error.UnsupportedQwen2VlPreprocessorConfig;
+        config.resample = std.enums.fromInt(qwen2vl_types.ImageResample, code) orelse return error.UnsupportedQwen2VlPreprocessorConfig;
+    }
     if (obj.get("do_resize")) |v| {
         if (jsonBool(v)) |value| config.do_resize = value;
     }
@@ -235,11 +240,19 @@ pub fn prepareImage(allocator: std.mem.Allocator, image_bytes: []const u8, confi
     if (!config.do_resize or !config.do_rescale or !config.do_normalize or !config.do_convert_rgb) {
         return error.UnsupportedQwen2VlPreprocessorConfig;
     }
+    if (!std.math.isFinite(config.rescale_factor) or config.rescale_factor <= 0) return error.UnsupportedQwen2VlPreprocessorConfig;
+    for (config.image_mean, config.image_std) |mean, std_dev| {
+        if (!std.math.isFinite(mean) or !std.math.isFinite(std_dev) or std_dev <= 0) return error.UnsupportedQwen2VlPreprocessorConfig;
+    }
     const decoded = try image.decode(allocator, image_bytes);
     defer decoded.deinit(allocator);
 
     const dims = try smartResize(decoded.width, decoded.height, config);
-    const pixel_values = try image.preprocessDecodedToSize(allocator, decoded, dims.width, dims.height, config.image_mean, config.image_std);
+    const pixel_values = try image.preprocessDecodedRectScaledWithResample(allocator, decoded, dims.width, dims.height, config.image_mean, config.image_std, config.rescale_factor, switch (config.resample) {
+        .nearest => .nearest,
+        .bilinear => .bilinear,
+        .bicubic => .pillow_bicubic,
+    });
     errdefer allocator.free(pixel_values);
 
     const patch_grid_h = dims.height / config.patch_size;
@@ -751,4 +764,37 @@ test "qwen admission image-token bound covers aligned preprocessing" {
         error.InvalidPreprocessorConfig,
         maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
     );
+}
+
+test "model processor resampling is declared independently of PDF sampling" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(qwen2vl_types.ImageResample.bicubic, (try parsePreprocessorConfig(a, "{}")).resample);
+    for ([_]struct { json: []const u8, filter: qwen2vl_types.ImageResample }{
+        .{ .json = "{\"resample\":0}", .filter = .nearest },
+        .{ .json = "{\"resample\":2}", .filter = .bilinear },
+        .{ .json = "{\"image_processor\":{\"resample\":3}}", .filter = .bicubic },
+    }) |case| try std.testing.expectEqual(case.filter, (try parsePreprocessorConfig(a, case.json)).resample);
+    for ([_][]const u8{ "{\"resample\":1}", "{\"resample\":999}", "{\"resample\":-1}", "{\"resample\":\"bicubic\"}", "{\"image_processor\":{\"resample\":null}}" }) |json|
+        try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, parsePreprocessorConfig(a, json));
+}
+
+test "model processor resampling changes prepared pixels without changing geometry" {
+    const a = std.testing.allocator;
+    const png = try @import("antfly_image").png.encodeRgba(a, 2, 1, &.{ 255, 0, 0, 255, 0, 0, 255, 255 });
+    defer a.free(png);
+    var config = PreprocessorConfig{ .resample = .nearest, .min_pixels = 8, .max_pixels = 8, .patch_size = 1, .merge_size = 1 };
+    var nearest = try prepareImage(a, png, config);
+    defer nearest.deinit();
+    config.resample = .bicubic;
+    var bicubic = try prepareImage(a, png, config);
+    defer bicubic.deinit();
+    try std.testing.expectEqual(nearest.resized_width, bicubic.resized_width);
+    try std.testing.expectEqual(nearest.resized_height, bicubic.resized_height);
+    try std.testing.expectEqual(nearest.image_grid_thw, bicubic.image_grid_thw);
+    try std.testing.expect(!std.mem.eql(f32, nearest.pixel_values, bicubic.pixel_values));
+    config.rescale_factor = 0;
+    try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, prepareImage(a, png, config));
+    config.rescale_factor = 1.0 / 255.0;
+    config.image_std[0] = 0;
+    try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, prepareImage(a, png, config));
 }

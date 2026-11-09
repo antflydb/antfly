@@ -52,6 +52,8 @@ pub const RenderedPageRaster = @import("pdf_values").RenderedPageRaster;
 pub const RenderQuality = @import("pdf_values").RenderQuality;
 
 pub const RenderProfile = @import("pdf_values").RenderProfile;
+pub const ImageSamplingPolicy = @import("pdf_values").ImageSamplingPolicy;
+pub const RenderPolicy = @import("pdf_values").RenderPolicy;
 
 pub const RenderResolutionPolicy = @import("pdf_values").RenderResolutionPolicy;
 
@@ -341,9 +343,7 @@ fn renderParsedPageRgbaNativeWithAllocators(
     var render_runs = try parsed.extractPageRenderRunsForRasterAlloc(page_number, @intFromFloat(preflight_width), @intFromFloat(preflight_height));
     defer render_runs.deinit(reader_alloc);
     try parsed.checkCancellation();
-    if (profile == .ocr) {
-        try reader.prepareOcrRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, parsed.cancellationProbe());
-    }
+    try reader.prepareRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, profile, parsed.cancellationProbe());
     scalePageRenderRuns(&render_runs, scale);
     // The integer raster plan is authoritative. Scaling negative/fractional
     // origins can turn an exact extent into N + epsilon; another ceil would
@@ -1457,7 +1457,7 @@ const PageRenderWorker = struct {
     fn configure(self: *PageRenderWorker, fork_template: *const reader.RenderForkTemplate, prepared: PreparedRenderPage, profile: RenderProfile, output_kind: RenderBatchOutputKind, wave_control: *RenderWaveControl, shared_budget: *RenderBatchBudget, output_allocator: ?Allocator, max_retained_output_bytes: usize, compatibility_session: ?*CompatibilityRenderSession) void {
         std.debug.assert(!self.task_configured);
         self.request = prepared.request;
-        self.profile = profile;
+        self.profile = if (prepared.request.sampling == .auto) profile else prepared.request.sampling.profile();
         self.output_kind = output_kind;
         self.fork_template = fork_template;
         self.shared_budget = shared_budget;
@@ -5757,4 +5757,22 @@ test "compatibility rendering scales page content up and down through rotations"
             try std.testing.expectEqualSlices(usize, &expected, &bounds);
         }
     }
+}
+
+test "OCR sampling page overrides survive prepared batch rendering" {
+    const a = std.testing.allocator;
+    var parsed = try reader.Reader.init(a, @embedFile("../testdata/continuous_sampling_fixture.pdf"));
+    defer parsed.deinit();
+    var batch = try renderParsedPagesBatchAlloc(a, &parsed, &.{
+        .{ .page_number = 1, .requested_dpi = 72, .sampling = .pdf },
+        .{ .page_number = 1, .requested_dpi = 72, .sampling = .auto },
+        .{ .page_number = 1, .requested_dpi = 72, .sampling = .smooth },
+    }, .{ .max_batch_pages = 3, .max_parallel_pages = 1 });
+    defer batch.deinit(a);
+    for (batch.results) |result| try std.testing.expect(result.failure == null);
+    const exact = batch.results[0].rendered.?;
+    const automatic = batch.results[1].rendered.?;
+    const smooth = batch.results[2].rendered.?;
+    try std.testing.expect(!std.mem.eql(u8, exact.png, automatic.png));
+    try std.testing.expectEqualSlices(u8, automatic.png, smooth.png);
 }
