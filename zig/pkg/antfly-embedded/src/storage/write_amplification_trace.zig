@@ -160,15 +160,18 @@ pub const Stage = enum(u8) {
     algebraic_bulk_finish,
     algebraic_hll_maintenance,
     algebraic_adaptive,
-    // `lite/docstore.zig`'s `rideAlongFlushLoop`: the idle-flush timer's own
-    // `forceDrainDurable` call, pushed around it so the harness can tell a
-    // drain the idle timer led (unavoidable without a foreground write
-    // following within `ride_along_idle_ns` of the last enqueue, bounded by
-    // how many times the timer can fire over the run) apart from any other
-    // background sync, which the single-commit write path's gates must
-    // still treat as a real amplification bug. See
-    // `lite-single-commit-write-path.md` §3.2a.
-    ride_along_idle_flush,
+    // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): docstore.zig's
+    // `rideAlongFlushLoop` idle-flush timer (barrier (a)) -- the background
+    // thread that bounds how long a ride-along write can sit undurable when
+    // no foreground commit comes along to carry it. This is the expected,
+    // amortized cost of ride-along's staleness bound, not an avoidable
+    // per-write sync; distinguishing it from a genuinely unattributed
+    // `.other` background sync is the point of this tag. The write-
+    // amplification harness additionally hard-gates how many times this
+    // can fire over one measured run (`ceil(elapsed_ns / idle_window) + 1`)
+    // rather than tolerating it unbounded -- see
+    // `write_amplification_bench_test.zig`'s `idleFlushDrains`.
+    ride_along_flush,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;
@@ -343,7 +346,8 @@ fn currentStage() Stage {
 pub fn recordSync() void {
     if (!enabled) return;
     const lane = currentLane();
-    _ = sync_calls[@backingInt(lane)][@backingInt(currentStage())].fetchAdd(1, .monotonic);
+    const stage = currentStage();
+    _ = sync_calls[@backingInt(lane)][@backingInt(stage)].fetchAdd(1, .monotonic);
 }
 
 /// Record one write/pwrite submission of `bytes` attributed to the calling

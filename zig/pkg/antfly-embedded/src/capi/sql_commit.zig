@@ -440,6 +440,18 @@ const OutcomeFixture = struct {
             const value = body.value.object.get("mutation_outcome") orelse return null;
             return if (value == .string) value.string else null;
         }
+        /// The raw 16 bytes behind a `transaction_id` hex field, for a
+        /// caller that resolves it directly through
+        /// `antfly_db_get_transaction_status` rather than through
+        /// another JSON round trip.
+        fn transactionId(self: Reply) ?[16]u8 {
+            const body = self.parsed orelse return null;
+            const value = body.value.object.get("transaction_id") orelse return null;
+            if (value != .string or value.string.len != 32) return null;
+            var out: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&out, value.string) catch return null;
+            return out;
+        }
     };
 
     fn sql(self: *OutcomeFixture, request: []const u8) !Reply {
@@ -654,6 +666,52 @@ test "capi SQL outcome COMMIT decision failing inside publication is unknown wit
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
     try std.testing.expectEqualStrings("40003", reply.state().?);
     try std.testing.expect(reply.has("transaction_id"));
+}
+
+// lite-single-commit-write-path.md §3.3c: session COMMIT on the fused
+// path (`allow_local_decision = true` in `sql_session.zig`) has no begin
+// record to resolve an ambiguous outcome against, so its
+// `transaction_id` is the retired outcome-receipt writer's bare 16-byte
+// id instead (see `DB.last_ambiguous_fused_marker`'s doc comment). This
+// reuses the exact fault from "capi SQL outcome COMMIT decision failing
+// inside publication is unknown with a receipt" above -- which that
+// test's own comment (mirrored from the autocommit case) establishes
+// lands before the slot write, so the row ends up durably absent -- and
+// additionally resolves the returned `transaction_id` through
+// `antfly_db_get_transaction_status` on a table handle for `t` (the
+// table that holds the marker; a different handle to the same table,
+// exactly like the existing receipt-text scheme's own table-handle
+// tests), checking it agrees with the row state the crash-sweep-style
+// checkers would see.
+test "capi SQL outcome COMMIT on the fused path resolves an unknown outcome's transaction_id to not applied" {
+    const api = @import("db.zig");
+    var f = try OutcomeFixture.init("outcome-commit-decision-uncertain-status");
+    defer f.deinit();
+    try SessionStatements.stage(&f);
+    const Arm = struct {
+        fault: PrimaryFault,
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fault.arm();
+        }
+    };
+    var arm: Arm = .{ .fault = .{ .fixture = &f, .err = error.InputOutput, .publication = true } };
+    test_after_prepare = .{ .ptr = &arm, .run = Arm.run };
+    var reply = try f.sql(SessionStatements.commit);
+    defer reply.deinit();
+    test_after_prepare = null;
+    PrimaryFault.disarm();
+    try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
+    const txn_id = reply.transactionId() orelse return error.TestUnexpectedResult;
+
+    var table_id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(f.id, .fromSlice("t"), &table_id));
+    defer api.antfly_db_close(table_id);
+    var status: u8 = 0xff;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_transaction_status(table_id, &txn_id, &status));
+    try std.testing.expectEqual(@as(u8, 2), status); // 2 = aborted, matching the row's durable absence.
+
+    try std.testing.expectEqual(@as(usize, 0), try f.rows());
 }
 
 test "capi SQL outcome COMMIT failure after a committed decision is committed" {

@@ -1710,6 +1710,24 @@ pub const Store = struct {
     ride_along_pending_count: usize = 0,
     ride_along_pending_bytes: usize = 0,
     ride_along_last_enqueue_ns: i96 = 0,
+    /// Count of currently-queued, not-yet-drained members with
+    /// `ride_along = false` -- i.e. every member with no backstop of its
+    /// own. A ride-along member left queued when a leader stops early
+    /// (`driveMutationCoordinator`'s `own_request`) is still guaranteed a
+    /// drain: the idle-flush timer above, the byte threshold, or the next
+    /// foreground write. A non-ride-along member (an ordinary foreground
+    /// write, or a derived/index worker's own synchronous
+    /// `submitMutation`/`submitIndexMutation` call) has none of those --
+    /// it is parked in `Ticket.wait()` relying entirely on *some* leader
+    /// draining it. `driveMutationCoordinator` must never stop early while
+    /// this is nonzero, or such a member can be stranded forever (observed
+    /// live: a derived worker blocked in `Ticket.wait()` while the thread
+    /// that would otherwise lead the queue had already stopped, since its
+    /// own ticket was covered -- see perf/lwa-commit-eff2's leader-loop
+    /// change). Guarded by `commit_mutex`, maintained alongside
+    /// `ride_along_pending_count` in `enqueueRequest`/
+    /// `drainMutationBatchLocked`.
+    non_ride_along_pending_count: usize = 0,
     /// Durability bound for ride-along work when no foreground writer
     /// arrives to drain it for free (barrier (a), `rideAlongFlushLoop`
     /// below). Overridable at open time via `OpenOptions.ride_along_idle_ns`/
@@ -3236,8 +3254,14 @@ pub const Store = struct {
             // ever being applied at a time, and whatever stages while that
             // group's `commitTransactionWithDurability` runs (including its
             // fsync) forms the next group, bounding flight to the applying
-            // group plus the one accumulating behind it.
-            if (self.become_leader) self.store.driveMutationCoordinator(false);
+            // group plus the one accumulating behind it. Passing
+            // `self.request` as `own_request` stops this leader's turn as
+            // soon as its own ticket is covered, rather than continuing to
+            // drain whatever else the queue has accumulated: a foreground
+            // write must not pay latency or commit count for unrelated
+            // backlog. Any leftover goes to the idle flush or whichever
+            // request leads the queue next (see `driveMutationCoordinator`).
+            if (self.become_leader) self.store.driveMutationCoordinator(false, self.request);
         }
 
         pub fn ticket(self: Staged) Ticket {
@@ -3284,6 +3308,8 @@ pub const Store = struct {
             self.ride_along_pending_count +|= 1;
             self.ride_along_pending_bytes +|= plan.estimated_bytes;
             self.ride_along_last_enqueue_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        } else {
+            self.non_ride_along_pending_count +|= 1;
         }
         self.commit_mutex.unlock(io);
 
@@ -3343,7 +3369,11 @@ pub const Store = struct {
         const become_leader = self.commit_head != null and !self.commit_draining;
         if (become_leader) self.commit_draining = true;
         self.commit_mutex.unlock(io);
-        if (become_leader) self.driveMutationCoordinator(true);
+        // A barrier, not a foreground write: drain to empty (`own_request =
+        // null`), not just until some one ticket is covered. Nothing must
+        // be left behind for close/sync/the reuse frontier to have called
+        // this for in the first place.
+        if (become_leader) self.driveMutationCoordinator(true, null);
     }
 
     /// WS1 hook: call before relying on `durableSequence()` to bound which
@@ -3417,8 +3447,12 @@ pub const Store = struct {
             if (!pending) continue;
             const now = std.Io.Clock.awake.now(io).nanoseconds;
             if (now -| last_ns < @as(i96, @intCast(self.ride_along_idle_ns))) continue; // not idle long enough; re-check on the next wake.
-            const idle_flush_scope = wal_trace.scope(.ride_along_idle_flush);
-            defer idle_flush_scope.end();
+            // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): tag
+            // this background thread's own forced flush so it attributes to
+            // `.ride_along_flush`, not the unattributed `.other` bucket --
+            // see the doc comment on that Stage tag.
+            const flush_scope = wal_trace.scope(.ride_along_flush);
+            defer flush_scope.end();
             self.forceDrainDurable();
         }
     }
@@ -3467,22 +3501,33 @@ pub const Store = struct {
             if (request.ride_along) {
                 self.ride_along_pending_count -|= 1;
                 self.ride_along_pending_bytes -|= request.estimated_bytes;
+            } else {
+                self.non_ride_along_pending_count -|= 1;
             }
         }
         return batch;
     }
 
-    /// Run until the pending queue is empty, applying one bounded group at a
-    /// time. Only the thread that staged the first request of a newly-formed
-    /// queue (`become_leader` in `enqueue`/`forceDrainDurable`) ever runs
-    /// this; every other staging thread only enqueues and waits on its own
-    /// ticket. `force_durable` makes every batch this call drains durable
-    /// regardless of any member's own `durable` flag (`forceDrainDurable`'s
-    /// callers: the ride-along idle-flush timer and byte threshold,
-    /// `Store.close`, `Store.sync`, and WS1's reuse-frontier hook) --
-    /// otherwise a batch of ride-along-only members, all `durable = false`,
-    /// would take the deferred-publication path and never actually fsync.
-    fn driveMutationCoordinator(self: *Store, force_durable: bool) void {
+    /// Applies one bounded group per call to a foreground leader (one that
+    /// supplies `own_request`), stopping as soon as that request's own
+    /// ticket is covered; drains until the queue is fully empty for a
+    /// barrier (`own_request = null`: `forceDrainDurable`'s callers --
+    /// close, sync, the idle-flush timer, the byte threshold, and WS1's
+    /// reuse-frontier hook). Only the thread that staged the first request
+    /// of a newly-formed queue (`become_leader` in `enqueue`/
+    /// `forceDrainDurable`) ever runs this; every other staging thread only
+    /// enqueues and waits on its own ticket. A foreground write's own
+    /// leadership turn must not pay latency or commit count for unrelated
+    /// backlog -- whatever is left queued when `own_request` is covered
+    /// (backlog already ahead of it, or ride-along work that arrived while
+    /// its group's native commit was applying) is left for the idle flush
+    /// or whichever request leads the queue next, by resetting
+    /// `commit_draining` to false before returning rather than looping to
+    /// drain it here. `force_durable` makes every batch this call drains
+    /// durable regardless of any member's own `durable` flag -- otherwise a
+    /// batch of ride-along-only members, all `durable = false`, would take
+    /// the deferred-publication path and never actually fsync.
+    fn driveMutationCoordinator(self: *Store, force_durable: bool, own_request: ?*MutationRequest) void {
         const io = self.file.runtime();
         while (true) {
             self.commit_mutex.lockUncancelable(io);
@@ -3522,12 +3567,34 @@ pub const Store = struct {
                 item.done = true;
                 current = item.next;
             }
+            // `own_request` is a member of some batch this same call
+            // already drained (this one, or an earlier iteration's), since
+            // it was queued before this call was ever entered -- so by the
+            // time its `.done` is observed true here, it is actually done,
+            // never a stale read racing its own completion. `null` (a
+            // barrier) never stops early: it keeps looping, as before,
+            // until the top-of-loop empty check above ends it.
+            //
+            // Stopping early is only safe while `non_ride_along_pending_
+            // count` is zero: a ride-along member left queued still has a
+            // backstop (the idle-flush timer, the byte threshold, or the
+            // next foreground write), but a non-ride-along one -- an
+            // ordinary write, or a derived/index worker's own synchronous
+            // `submitMutation`/`submitIndexMutation` call -- has none and
+            // is parked in `Ticket.wait()` relying entirely on some leader
+            // draining it. Walking away while one is still queued strands
+            // it forever (observed live: a derived worker deadlocked
+            // against the main thread waiting on it, both parked, nothing
+            // left to ever lead the queue again).
+            const stop_here = if (own_request) |req| req.done and self.non_ride_along_pending_count == 0 else false;
+            if (stop_here) self.commit_draining = false;
             self.commit_ready.broadcast(io);
             self.commit_mutex.unlock(io);
 
             if (result) |_| {} else |err| {
                 if (err == error.LiteStorageBudgetExceeded) self.recordMaintenanceError(err);
             }
+            if (stop_here) break;
         }
         // Start after publication, and only once -- after this leader's
         // entire queue (including anything staged while it was draining
@@ -5161,6 +5228,20 @@ pub const Txn = struct {
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
         try self.synchronizeResolverConsumers(key, value);
+        // An overwrite of an already-pending key (common in a loop or batch
+        // that touches the same key more than once in one transaction) needs
+        // no new key allocation at all: look up with the caller's borrowed
+        // key first, instead of always duping a key that appendPending would
+        // often just free again immediately because the key already exists.
+        // Only safe when there is no prefix to fold in first.
+        if (self.prefix.len == 0) {
+            if (self.pending_tree.getEntryFor(key).node) |existing| {
+                const owned_value = try self.allocator.dupe(u8, value);
+                errdefer self.allocator.free(owned_value);
+                try self.updatePendingValue(existing, owned_value);
+                return;
+            }
+        }
         const owned_key = if (self.prefix.len == 0)
             try self.allocator.dupe(u8, key)
         else
@@ -5174,12 +5255,33 @@ pub const Txn = struct {
     pub fn delete(self: *Txn, key: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
         try self.synchronizeResolverConsumers(key, null);
+        if (self.prefix.len == 0) {
+            if (self.pending_tree.getEntryFor(key).node) |existing| {
+                try self.updatePendingValue(existing, null);
+                return;
+            }
+        }
         const owned_key = if (self.prefix.len == 0)
             try self.allocator.dupe(u8, key)
         else
             try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         try self.appendPending(.{ .key = owned_key });
+    }
+
+    /// Replaces an existing pending entry's value, following the same
+    /// borrowed/free rule `appendPending` uses for the value it discards:
+    /// a value some borrowed-read API already handed out survives until
+    /// `freePending` instead of being freed out from under that borrow.
+    fn updatePendingValue(self: *Txn, node: *PendingTree.Node, owned_value: ?[]u8) !void {
+        const current = &self.pending.items[pendingNode(node).ordinal];
+        if (current.value) |old| {
+            if (current.borrowed) {
+                try self.borrowed_versions.append(self.allocator, old);
+            } else self.allocator.free(old);
+        }
+        current.value = owned_value;
+        current.borrowed = false;
     }
 
     /// WS4 phase 2: stage `mutations` (as produced by a `PersistentIndex`
@@ -5227,17 +5329,12 @@ pub const Txn = struct {
     fn appendPending(self: *Txn, mutation: PendingMutation) !void {
         var entry = self.pending_tree.getEntryFor(mutation.key);
         if (entry.node) |existing| {
-            const current = &self.pending.items[pendingNode(existing).ordinal];
-            if (current.value) |value| {
-                if (current.borrowed) {
-                    // Reserve before changing any ownership so OOM leaves the
-                    // pending value and every existing borrow intact.
-                    try self.borrowed_versions.append(self.allocator, value);
-                } else self.allocator.free(value);
-            }
+            // `put`/`delete`'s own no-prefix fast path already checks this
+            // before allocating a key, so this is only reached through the
+            // prefixed-key path (which must build `mutation.key` before it
+            // can look anything up).
             self.allocator.free(mutation.key);
-            current.value = mutation.value;
-            current.borrowed = false;
+            try self.updatePendingValue(existing, mutation.value);
             return;
         }
         const node = try self.allocator.create(PendingNode);
@@ -7464,7 +7561,7 @@ test "lite a group fsync failure sends OutcomeUnknown to every member" {
     store.commit_head = &first;
     store.commit_tail = &second;
     store.commit_draining = true;
-    store.driveMutationCoordinator(false);
+    store.driveMutationCoordinator(false, null);
     try std.testing.expectError(error.OutcomeUnknown, first.result);
     try std.testing.expectError(error.OutcomeUnknown, second.result);
 }

@@ -567,3 +567,75 @@ It passed cleanly here; that satisfies this session's gate (everything
 else green, and this one either green or failing with its own known
 signature, never a hang or a new failure mode) without this session
 needing to reproduce or touch its bug.
+
+### 7.5 Columnar maintenance scheduler's own background commits: ride-along
+
+The write-amplification bench's "relational write surface" report showed
+every relational mode still paying a non-zero `background_syncs_per_update`
+(baseline ~1.6-1.9 `durable_commits_per_write`). A bounded stack-trace
+diagnostic in `write_amplification_trace.zig`'s `recordSync()` (test-only,
+since removed) traced every occurrence to `relational_columns.zig`'s
+columnar-index maintenance scheduler -- `selectReady`, `compact`, `prune`,
+`drainCleanup`, `drainCleanupWithLimit`, `drainGarbage` and `drainRetired` --
+each opening its own standalone write transaction and forcing its own fsync
+for scheduling/GC bookkeeping over the *derived* columnar index (which byte
+range is deferred and until when, a build-slot claim/counter, the dirty-
+journal pagination cursor, retired-root GC), never the primary row data.
+
+All of it is already redoable through recovery paths the scheduler already
+has for a canceled/interrupted pass: an abandoned `building_key` gets
+reclaimed as garbage on the next turn, and GC progress is its own durable
+cursor (deleting a record/page over again, next pass, is idempotent). That
+makes every one of those sites a ride-along candidate under §3.2a. Converted
+them all to `beginWriteBatchWithOptions(.{.durability = .ride_along})`;
+`sameValue`/`deleteIfPresent`/`clearPage`/`scheduleMaintenance`/`retireBlock`/
+`bootstrapBoundary`/`Cleanup.publish` (`relational_columns.zig`) and
+`Prepared.apply` (`column_payloads.zig`) were widened to `anytype` so they
+work over both the real `Txn` and the ride-along `Batch` type.
+
+Measured `durable_commits_per_write` dropped to ~1.3-1.6 across the
+relational modes; the bench's regression gates tightened from 2.5 to 2.0
+accordingly (`write_amplification_bench_test.zig`). The residual is not a
+bug: `docstore.zig`'s `rideAlongFlushLoop` (the idle-flush timer that bounds
+how long a ride-along write can sit undurable when no foreground commit
+comes along to carry it) still fires periodically, now tagged
+`.ride_along_flush` in `write_amplification_trace.zig` instead of falling
+into the unattributed `.other` bucket. `relational foreign-key` is
+unaffected (still ~15.5-15.7, unchanged) -- it still spans two physical
+tables through the full cross-database two-phase protocol; folding its
+`.attach` bookkeeping into the child's own fused commit is the multi-table
+coordinator described as follow-up work below, not done in this pass.
+
+**Follow-up: the FK multi-table coordinator.** `capi/sql.zig`'s
+`eligibleForLocalDecision` excludes any multi-table request, and
+`mutation_commit.zig`'s `prepareLocalIntegrityDecision` refuses a `.foreign`
+generation command as defense-in-depth
+(`if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;`)
+even if something upstream routed one in. Each SQL table opens its own `*DB`
+(own `core.apply_mutex`) via `capi/tables.zig`'s `get(handle, name)`, all
+against the same `.aflite` file; `relational_integrity_contract.zig`'s
+claim/reference keys (`Address.key`) are addressed by `routing = hash(
+generation, tuple_digest)`, not by table id, so they live in a namespace
+shared by every table participating in one FK's `generation` -- the parent's
+`.attach`/`.detach` record can fold into the child's own native batch via
+`BatchExecutionOptions.extra_store_writes` exactly like a UNIQUE claim does
+today, with no separate commit against the parent's own store. What is
+missing is the lock discipline: a fused child insert/update needs the
+parent's row to stay stable while it claims/releases a reference, and a
+parent delete needs no concurrent child claim while it checks for zero
+remaining references, so both operations must hold *both* tables'
+`apply_mutex` for the duration of touching that shared state -- in one
+fixed global order (ascending `core.identity_namespace.table_id`) to rule
+out a deadlock between a child-insert-then-parent-check order on one thread
+and a parent-delete-then-child-check order on another. That requires a new
+entry point upstream of `commitCoordinatedLocal` that resolves every
+participant table via `tables.zig`'s `get`, sorts them by table id, and
+acquires their `apply_mutex`es in that order before the normal single-table
+batch logic runs -- not a change to `prepareLocalIntegrityDecision` in
+place, since by the time that runs today the caller already holds only its
+own table's lock. Not implemented this pass: a cross-table lock-ordering
+primitive is exactly the kind of thing worth its own dedicated, heavily
+stress-tested session rather than folding in under time pressure --
+the concurrency test matrix it needs (parent-delete racing child-insert
+across N threads with no orphan/lost-reject/deadlock, plus a two-table
+mutual-FK lock-order test) is substantial in its own right.

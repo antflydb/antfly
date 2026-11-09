@@ -1423,6 +1423,21 @@ pub const Owner = struct {
     /// per Store), shared by every compatible `Connection` to this path in
     /// this process.
     writer_lane: WriterLane = .{},
+    /// lite-single-commit-write-path.md §3.3c: the most recent ambiguous
+    /// outcome `commitCoordinatedLocal` (`capi/sql.zig`) retired a marker
+    /// for, across any table on this path. `DB.outcomeMarkerFallbackStatus`
+    /// uses this to resolve `antfly_db_get_transaction_status` for an id
+    /// that is not a two-phase decision -- kept here, not on the
+    /// per-generation `*DB` the ambiguous commit actually touched,
+    /// because an uncertain outcome's own reconciliation on the next call
+    /// can replace that `DB` instance before a client ever gets to query
+    /// status, which would silently lose an in-memory field living there.
+    /// Bounded to exactly one outstanding ambiguous receipt per path at a
+    /// time (overwritten by the next one, across every table): an older,
+    /// still-unresolved `transaction_id` stops resolving once a newer
+    /// ambiguous commit replaces it here, same as any bounded receipt
+    /// scheme.
+    last_ambiguous_fused_marker: ?@import("../storage/db/apply_receipts.zig").OutcomeMarker = null,
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
     // The path gate permits one foreground lease wait per owner. The global
