@@ -1156,3 +1156,48 @@ hierarchy, pending enrichment, maintenance, pagination and restart, with the
 existing deadlines and strict background-log assertion unchanged. All 1,690
 task-owned GCS versions were deleted, absence verified, and credential files
 removed. Raw qualification artifacts remain outside the PR.
+
+### Batched-read candidate qualification (2026-11-09)
+
+Native revision `8299117c73` includes the five-part read batching/locator change
+and main through `42d1a0b9e2`. All 98 ReleaseSafe server/Lite build steps and the
+141-function export check passed. The post-merge gate passed 119 cases
+(76 API / 43 local), with zero failures, skips or leaks. Server SHA-256:
+`aed141e3d0a7cefed4191b2195c0224fc8a137f3bd24bd6f3b95c1f74c478093`;
+Lite SHA-256:
+`e35df9fdd37c19ddab8aebeafd37f4a0b197d9eed640dbb6e5a32c4184031e9d`.
+
+Both original-settings GCS cases passed. Parentheses contain the preceding
+`d2cd8141f9` samples; these are individual developer-host observations.
+
+| Mode | Warm median | First after restart | Cache-cleared query |
+|---|---:|---:|---:|
+| Stored source | 9.27 ms (12.14) | 1.74 s (1.80) | 4.97 s (4.38) |
+| Parquet hydration | 15.41 ms (7.66) | 1.92 s (1.73) | 4.95 s (4.75) |
+
+Cold CPU was 396/562 ms, sampled RSS 252/208 MiB and footprint 222/270 MiB
+(stored/hydration). Both cases again verified two preparations across three leaf
+calls, nonempty retained pending pagination, and concurrent ingestion/publication.
+
+Stored-source native hydration fell from the preceding process aggregate of
+1.90 s to 0.82 s. Its retained slowest lake call was 2.74 s, including opening
+0.50 s and ranking 1.36 s; the composed request took 4.97 s across three calls.
+That leaves about 2.23 s in other leaf calls, which the single retained lake-call
+profile does not individually attribute. The composed profile recorded 29
+artifact loads (3.59 MB), four traced map loads (0.48 s) and 23 direct-locator hits.
+
+Parquet source hydration remained 2.14 s, with 33 source loads (3.89 MB), peak
+source concurrency six and no recorded file-lane submissions. The fixture
+combines the input corpus into one Parquet file with 1,000-row groups; the added
+selected-file split therefore does not exercise multiple hydration lanes here.
+Its composed profile recorded 14 artifact loads (1.93 MB versus the preceding
+0.62 MB), four traced map loads (0.52 s) and five direct-locator hits. Additional
+metadata/read amplification needs attention. Process aggregates may include
+background work, and nested/overlapping provider durations are not additive.
+
+These samples do not establish an end-to-end speedup; the sub-second and 10x
+goals remain unmet. The next targets are selected-row-group splitting inside one
+file, remaining map/opening dependencies, and per-leaf attribution of refill and
+current-source costs. The assembled HN HTTP regression passed in 177 seconds.
+All 1,673 test object versions were deleted with absence verified, and private
+credential files removed. Raw logs and fixture results remain outside the PR.
