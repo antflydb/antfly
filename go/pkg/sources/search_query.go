@@ -139,9 +139,13 @@ func BuildSearchQuery(binding Binding, request SearchRequest) ([]byte, error) {
 			delete(body, "hierarchy")
 			// Native external vectors retain their legacy omission semantics.
 			// Canonical acquisition replaces metadata without writer receipts;
-			// require a current authored receipt so an older retained vector is
+			// require the exact selected recipe receipt so an older retained vector is
 			// never exposed after a provider revision replaces its parent.
-			body["filter_query"] = map[string]any{"bool": map[string]any{"filter": []any{body["filter_query"], map[string]any{"exists": map[string]any{"path": "/metadata/embedding_spaces/" + strings.ReplaceAll(strings.ReplaceAll(semantic.Index, "~", "~0"), "/", "~1")}}}}}
+			receipt := map[string]any{"term": map[string]any{
+				"path":  "/metadata/embedding_spaces/" + strings.ReplaceAll(strings.ReplaceAll(semantic.Index, "~", "~0"), "/", "~1"),
+				"value": VectorSpaceIdentity(semantic.VectorSpace),
+			}}
+			body["filter_query"] = map[string]any{"bool": map[string]any{"filter": []any{body["filter_query"], receipt}}}
 		}
 		if semantic == nil {
 			return nil, fmt.Errorf("stream has no semantic retrieval")

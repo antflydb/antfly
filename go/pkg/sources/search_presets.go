@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"github.com/antflydb/antfly/go/pkg/sources/management"
 	"math"
+	"strings"
 )
 
 // TextProcessingPreset composes ordinary native enrichments. Models, prompts
@@ -68,14 +69,17 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 	if contentType == "text/plain" && outputField != "text" {
 		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("plain text assets use the native text indexing slot")
 	}
-	unitConfig := map[string]any{"kind": "asset", "template": "{{" + input + "}}", "content_type": contentType, "producer": producer}
-	if preset.ResourceField != "" {
-		delete(unitConfig, "template")
-		if producer["type"] == "generator" {
-			unitConfig["template"] = "{{#if " + input + "}}{{remoteMedia url=" + input + "}}{{/if}}"
-		} else {
-			unitConfig["field"] = input
-		}
+	unitConfig := map[string]any{"kind": "asset", "field": input, "content_type": contentType, "producer": producer}
+	// Native field selectors name literal root fields. Logical nested source
+	// paths use raw-text templates: ordinary Handlebars interpolation would
+	// HTML-escape both content and signed resource URLs.
+	if strings.Contains(input, ".") {
+		delete(unitConfig, "field")
+		unitConfig["template"] = "{{{" + input + "}}}"
+	}
+	if preset.ResourceField != "" && producer["type"] == "generator" {
+		delete(unitConfig, "field")
+		unitConfig["template"] = "{{#if " + input + "}}{{remoteMedia url=" + input + "}}{{/if}}"
 	}
 
 	if preset.Purpose == "summary" || preset.Purpose == "caption" {
@@ -107,7 +111,7 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 			return plan, stream, artifact, err
 		}
 		all := append(append([]any{}, enrichments...), chunkConfig)
-		vectorSource, vectorField := chunks, outputField
+		vectorSource, vectorField := chunks, "text"
 		denseConfig := map[string]any{"kind": "embedding", "source_artifact_name": vectorSource, "field": vectorField, "expected_dims": preset.VectorSpace.Dimension, "vector_space": VectorSpaceIdentity(*preset.VectorSpace)}
 		dense := NativeIndexName(preset.Name+"_dense", denseConfig)
 		denseConfig["name"] = dense
@@ -129,7 +133,10 @@ func ExternalVectorIndex(name string, space VectorSpace) (management.NativeIndex
 
 // WithExternalVector binds an authored vector to the parent's acquired revision
 // and declares its recipe. Native admission independently checks identity/shape.
-// It cannot establish that an untrusted writer used the asserted model.
+// The vector and receipt must accompany each authored row together; withdraw
+// the receipt when updating a row without authoring its vector. Native omission
+// may retain physical bytes, but cannot retain that assertion. It cannot prove
+// that an untrusted writer used the asserted model.
 func WithExternalVector(parent map[string]any, index string, space VectorSpace, vector []float32) (map[string]any, error) {
 	if !validBindingName(index) || len(vector) != space.Dimension {
 		return nil, fmt.Errorf("external vector shape mismatch")

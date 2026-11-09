@@ -5094,6 +5094,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(privacy_prefix);
             try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
+            const local_asset_prefix = try @import("artifact_local_publication.zig").key(alloc, document_prefix);
+            defer alloc.free(local_asset_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, local_asset_prefix, delete_keys, owned_delete_keys, null);
             const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
             defer alloc.free(retry_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);

@@ -32,6 +32,34 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     if not args.no_build:
+        subprocess.run(
+            [
+                "python3",
+                "tools/run_bounded_zig_build.py",
+                "--zig",
+                os.environ.get("ZIG", "zig"),
+                "--",
+                "build",
+                "antfly-inference-managed-embedder-test",
+                "-Dtest-filter=managed embedder preserves coverage policy in storage config",
+            ],
+            cwd=root / "zig",
+            check=True,
+        )
+        subprocess.run(
+            [
+                "python3",
+                "tools/run_bounded_zig_build.py",
+                "--zig",
+                os.environ.get("ZIG", "zig"),
+                "--",
+                "build",
+                "source-vector-contract-test",
+                "query-contract-test",
+            ],
+            cwd=root / "zig",
+            check=True,
+        )
         subprocess.run(["make", "-C", "zig", "build"], cwd=root, check=True)
     with tempfile.TemporaryDirectory(prefix=".source-native-ci-", dir=root) as name:
         state = Path(name)

@@ -304,6 +304,9 @@ func TestScalarTextBindingRequiresDeclaredNativeAssetType(t *testing.T) {
 	plan, stream, _, err := BuildTextProcessing(TextProcessingPreset{Name: "plain", Field: "content.text"})
 	require.NoError(t, err)
 	require.Equal(t, "$", stream.Field)
+	unit := plan.Indexes[0].Config["enrichments"].([]any)[0].(map[string]any)
+	require.Equal(t, "{{{content.text}}}", unit["template"], "nested source text must not be HTML-escaped")
+	require.NotContains(t, unit, "field")
 	raw, err := json.Marshal(map[string]any{"config": plan.Indexes[0].Config})
 	require.NoError(t, err)
 	index, err := decodeSearchIndex(raw)
@@ -341,4 +344,51 @@ func TestManagedSearchResolvesEncoderAndProjection(t *testing.T) {
 	altered := space
 	altered.QueryPreprocessing = "custom-query-prefix"
 	require.Error(t, ValidateManagedVectorSpace(altered, embedder))
+}
+
+func TestManagedEncodingOverridesParticipateInCompatibility(t *testing.T) {
+	base := map[string]any{"provider": "antfly", "model": "pinned", "model_identity": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+	original, err := NativeVectorSpace("text", base, 3, "cosine", "text")
+	require.NoError(t, err)
+	for _, key := range []string{"query_instruction", "query_input_type", "document_input_type"} {
+		changed := map[string]any{"provider": base["provider"], "model": base["model"], "model_identity": base["model_identity"], "retrieval": map[string]any{key: "custom"}}
+		space, err := NativeVectorSpace("text", changed, 3, "cosine", "text")
+		require.NoError(t, err)
+		require.NotEqual(t, VectorSpaceIdentity(original), VectorSpaceIdentity(space), key)
+		require.Error(t, ValidateManagedVectorSpace(original, changed), key)
+		require.NoError(t, ValidateManagedVectorSpace(space, changed))
+	}
+	base["api_url"] = "http://transport-only"
+	same, err := NativeVectorSpace("text", base, 3, "cosine", "text")
+	require.NoError(t, err)
+	require.Equal(t, original, same)
+	base["retrieval"] = map[string]any{"query_instruction": ""}
+	same, err = NativeVectorSpace("text", base, 3, "cosine", "text")
+	require.NoError(t, err)
+	require.Equal(t, original, same)
+}
+
+func TestStructuredProcessingUsesChunkOutputProjection(t *testing.T) {
+	embedder := map[string]any{"provider": "antfly", "model": "pinned", "model_identity": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+	space, err := NativeVectorSpace("text", embedder, 3, "cosine", "text")
+	require.NoError(t, err)
+	plan, stream, _, err := BuildTextProcessing(TextProcessingPreset{Name: "structured", Field: "content.text", ContentType: "application/json", OutputField: "body", VectorSpace: &space, Embedder: embedder})
+	require.NoError(t, err)
+	require.Equal(t, "body", stream.Field)
+	for i, decl := range plan.Indexes {
+		raw, err := json.Marshal(map[string]any{"config": decl.Config})
+		require.NoError(t, err)
+		index, err := decodeSearchIndex(raw)
+		require.NoError(t, err)
+		require.NoError(t, checkNativeStream(stream, index, i == 1))
+	}
+}
+
+func TestExternalReceiptFilterRequiresSelectedRecipe(t *testing.T) {
+	stream := testMediaStream()
+	stream.Retrieval.Semantic.External = true
+	raw, err := BuildSearchQuery(Binding{SearchVersion: 2, Streams: []SearchStream{stream}, Filter: SourceFilter(testSourceID)}, SearchRequest{Stream: stream.Name, Mode: "semantic", Vector: []float32{1, 0, 0}, VectorSpace: &stream.Retrieval.Semantic.VectorSpace})
+	require.NoError(t, err)
+	require.Contains(t, string(raw), VectorSpaceIdentity(stream.Retrieval.Semantic.VectorSpace))
+	require.Contains(t, string(raw), `"term":{"path":"/metadata/embedding_spaces/`)
 }

@@ -167,7 +167,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 	totalBytes := 0
 	for start := 0; start < len(ids); start += 100 {
 		keys := ids[start:min(start+100, len(ids))]
-		query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "limit": len(keys), "fields": []string{"version", "doc_type", "source", "provider", "document_version", "published_revision", "permissions"}, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "limit": len(keys), "fields": []string{"acquisition_id", "version", "doc_type", "source", "provider", "document_version", "published_revision", "permissions"}, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 		data, err := s.Client.Query(ctx, s.table(), query)
 		if err != nil {
 			return nil, err

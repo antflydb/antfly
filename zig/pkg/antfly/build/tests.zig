@@ -6811,7 +6811,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const source_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks" },
+        .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("source-vector-contract-test", "Verify authored source vector compatibility and text-asset chunk lifecycle")

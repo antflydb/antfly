@@ -244,7 +244,11 @@ object field or a caption for a selected representation.
 
 Managed semantic bindings resolve an immutable native `antfly` encoder pin.
 `NativeVectorSpace` derives the model revision from `embedder.model_identity` and
-uses the native retrieval-query/document role encodings. Native admission checks
+uses the native retrieval-query/document role encodings. Nonempty retrieval
+overrides and other execution settings are included in a versioned preprocessing
+identity; changing instructions or role overrides changes compatibility even when
+the asset pin stays the same. Transport location does not change compatibility.
+Native admission checks
 that pin against the loaded assets and processor. A mutable hosted model alias,
 an arbitrary preprocessing label, or an unpinned encoder is not advertised as
 resolved native compatibility. Such applications can supply externally authored
@@ -254,7 +258,9 @@ Semantic bindings declare `member_field` independently of their representation
 field. For example, a scalar text unit uses `$`, while embeddings of its chunks
 return `member_field: text`. Validation checks each embedding/chunk projection
 transition to the representation, not just the presence of an ancestor name.
-`$` is an explicit raw scalar byte projection; JSON-looking plaintext is never
+`$` selects a declared scalar value; structured members retain public internal-field
+suppression. The storage/query boundary wraps declared plaintext in the scalar `$` slot
+before serialization, so JSON-looking plaintext is never
 coerced to a number, string literal, or object by content sniffing.
 
 Both management runtimes expose `POST /sources/{id}/processing-preview` for
@@ -283,3 +289,22 @@ regression automatically. Mixed parents with no text input settle intentional
 absence from the captured primary; nonempty or unresolved upstream inputs still
 require publication proof. External-vector receipt identities are compiled into
 the cached immutable write plan and relational writes reuse their parsed row.
+
+
+Local generic assets commit a storage-owned receipt with their bytes, binding the
+producer definition, exact logical parent revision, and output digest. Consumers
+validate that receipt before preparing work and again at publication; cache reuse
+does not reuse publication authority. Imported legacy skip state without a receipt
+is repaired through ordinary producer execution. Ordered owners continue using
+native causal proofs and never accept local receipts as ordered authority.
+
+Externally authored semantic search requires an exact receipt for the selected
+vector-space identity. Receipt presence alone does not authorize vector bytes
+retained by native omission semantics.
+
+An authored row that asserts the configured receipt must include that vector in
+the same write. To update acquisition data without authoring a new vector, remove
+the receipt; omission may retain physical vector bytes, but source search hides
+them. This prevents an unchanged receipt from reauthorizing an old vector after a
+parent edit. Direct text presets use literal fields or unescaped nested-path text projection,
+preserving quotes, angle brackets, and resource URLs without HTML escaping.

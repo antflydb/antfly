@@ -67,10 +67,20 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 		require.NoError(t, err)
 		parents[item.id] = doc
 	}
+	invalid, err := WithExternalVector(parents["image"].(map[string]any), ext.Name, space, []float32{0, 1, 0})
+	require.NoError(t, err)
+	invalid["metadata"].(map[string]any)["embedding_spaces"].(map[string]any)[ext.Name] = "different-recipe"
+	require.Error(t, p.Batch(ctx, table, map[string]any{"invalid-vector": invalid}, nil), "public index translation must preserve external writer admission identity")
 	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": parents, "sync_level": "write"})
 	require.NoError(t, err)
 	valid := time.Now().Add(5 * time.Minute).Unix()
 	binding := Binding{ID: testSourceID, Table: table, SearchVersion: 2, Streams: []SearchStream{text, original}, Artifacts: []ArtifactBinding{artifact}, Filter: SourceFilter(testSourceID), Status: "searchable", ValidUntil: &valid}
+	defer func() {
+		if t.Failed() {
+			status := ObserveSearch(ctx, p, binding)
+			t.Logf("final readiness: %+v", status)
+		}
+	}()
 	require.Eventually(t, func() bool {
 		for _, s := range ObserveSearch(ctx, p, binding).Streams {
 			if s.State != "ready" {
@@ -153,6 +163,39 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(raw, &wire))
 	require.Empty(t, wire.Responses[0].Hits.Hits, "new acquisition cannot expose an older external vector")
+	media["metadata"] = map[string]any{"embedding_spaces": map[string]any{ext.Name: VectorSpaceIdentity(space)}}
+	err = p.Batch(ctx, table, map[string]any{"image": media}, nil)
+	require.Error(t, err, "a valid receipt without an accompanying vector cannot reauthorize retained bytes")
+	media["metadata"] = map[string]any{"embedding_spaces": map[string]any{ext.Name: "different-recipe"}}
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"image": media}, "sync_level": "full_index"})
+	require.NoError(t, err)
+	raw, err = p.Search(ctx, binding, request)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &wire))
+	require.Empty(t, wire.Responses[0].Hits.Hits, "a mismatched receipt cannot authorize an omitted retained vector")
+	// Declared plaintext retains its exact type even when its bytes parse as JSON.
+	plain := parents["text"].(map[string]any)
+	delete(plain, "_embeddings")
+	plain["metadata"] = map[string]any{}
+	plain["content"].(map[string]any)["text"] = `{"text":"launch"}`
+	plain["source"].(map[string]any)["revision"] = "r2"
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"text": plain}, "sync_level": "full_index"})
+	require.NoError(t, err)
+	raw, err = p.Search(ctx, binding, SearchRequest{Stream: text.Name, Mode: "full_text", Text: "launch"})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &wire))
+	require.Len(t, wire.Responses[0].Hits.Hits, 1)
+	require.Equal(t, `{"text":"launch"}`, wire.Responses[0].Hits.Hits[0].Hierarchy.Matches[0].Source["$"])
+	catalogBinding := binding
+	catalogBinding.DocumentVersion = SourceRecordVersion
+	catalogBinding.Fields = CanonicalDocumentFields()
+	record := NewCatalogRecord(catalogBinding, ProviderS3, "acquired-r2", Permissions{Public: true})
+	record.AcquisitionID = "acquisition-recipe-pin"
+	catalog := CatalogStore{Client: p, Table: table + "_catalog"}
+	require.NoError(t, catalog.Publish(ctx, record))
+	records, err := catalog.Read(ctx, []string{binding.ID})
+	require.NoError(t, err)
+	require.Equal(t, record.AcquisitionID, records[binding.ID].AcquisitionID, "HTTP catalog projection must retain acquisition identity")
 	// Management repair controls delegate to the ordinary durable native job API.
 	source := management.Source{Table: table, Artifacts: []ArtifactBinding{artifact}}
 	job, err := p.ProcessingJob(ctx, source, management.ProcessingJobRequest{Artifact: artifact.Artifact, Action: "start", Limit: 2})

@@ -48684,7 +48684,7 @@ pub const DB = struct {
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
             if (internal_keys.isInternalUserKey(key)) {
                 const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
-                return try alloc.dupe(u8, safe);
+                return if (scalarSearchAsset(self, store_key)) try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = safe }, .{}) else try alloc.dupe(u8, safe);
             }
             const safe = privacy.project(privacy_arena.allocator(), policy.?, key, raw, &txn) catch |err| {
                 if (privacy.pending(err)) return null;
@@ -48693,7 +48693,7 @@ pub const DB = struct {
             return try alloc.dupe(u8, safe);
         }
         if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
-        return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
+        return try materializeSearchStoredValue(self, alloc, store_key, raw);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -49006,6 +49006,22 @@ const assetPayloadJsonValue = read_projection.assetPayloadJsonValue;
 
 const assetContentTypeIsJson = document_collectors.assetContentTypeIsJson;
 
+// Preserve the declared scalar type at the storage/query boundary. JSON-shaped
+// plaintext must never be inferred to be a structured artifact by a serializer.
+fn scalarSearchAsset(self: *DB, key: []const u8) bool {
+    if (!internal_keys.isAssetArtifactKey(key)) return false;
+    const name = (internal_keys.artifactNameView(key) catch return false) orelse return false;
+    self.core.index_manager.catalog_mutex.lockShared();
+    defer self.core.index_manager.catalog_mutex.unlockShared();
+    const entry = self.core.index_manager.getEnrichment(.asset, name) orelse return false;
+    return entry.content_type.len == 0 or std.mem.eql(u8, entry.content_type, "text/plain");
+}
+
+fn materializeSearchStoredValue(self: *DB, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
+    if (scalarSearchAsset(self, key)) return try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = raw }, .{});
+    return try self.core.index_manager.materializeStoredValueAlloc(alloc, key, raw);
+}
+
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
     return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, raw, opts, .{
         .ctx = self,
@@ -49313,7 +49329,9 @@ fn loadStoredSearchDocumentsMany(
             };
             // Authenticate the complete document, then retain only the selected
             // output. Unselected bodies and validation DOMs expire per row.
-            loaded[item.original_index] = if (direct_fields) |fields|
+            loaded[item.original_index] = if (scalarSearchAsset(self, item.store_key))
+                try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = safe }, .{})
+            else if (direct_fields) |fields|
                 try db_query_projection.projectLookupStoredBytesWithOutput(row, alloc, id, safe, .{ .fields = fields, .include_all_fields = false }, .{
                     .ctx = self,
                     .load_chunks = loadChunkFieldValueCallback,
@@ -49326,11 +49344,10 @@ fn loadStoredSearchDocumentsMany(
                 try alloc.dupe(u8, safe);
             continue;
         }
-        loaded[item.original_index] = try schema_plans.materialize(
-            item.store_key,
-            value,
-            values_authenticated,
-        );
+        loaded[item.original_index] = if (scalarSearchAsset(self, item.store_key))
+            try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = value }, .{})
+        else
+            try schema_plans.materialize(item.store_key, value, values_authenticated);
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - materialize_start_ns;
     if (bench_profile) {
@@ -149556,6 +149573,13 @@ test "external vector compatibility declaration rejects missing and mismatched w
         .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
         .sync_level = .full_index,
     });
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+        .sync_level = .full_index,
+    }));
+    // Withdrawing the receipt permits an acquisition update to retain hidden
+    // vector bytes; source search independently requires the exact receipt.
+    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
 }
 
 test "scalar text asset chunks track parent updates and retirement" {
@@ -149603,6 +149627,11 @@ test "scalar text asset chunks track parent updates and retirement" {
     var retired = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "gold" } }, .limit = 10 });
     defer retired.deinit();
     try std.testing.expectEqual(@as(usize, 0), retired.hits.len);
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
+    defer a.free(asset_key);
+    const receipt_key = try @import("artifact_local_publication.zig").key(a, asset_key);
+    defer a.free(receipt_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, receipt_key));
 }
 
 test "scalar text asset chunks asynchronous mixed parents settle publication" {

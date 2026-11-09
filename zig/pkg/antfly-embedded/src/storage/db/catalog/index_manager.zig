@@ -19872,7 +19872,6 @@ pub const IndexManager = struct {
     /// Caller holds the catalog read/apply fence. The immutable write plan owns
     /// indexed expected identities; ordinary writes do no index/config scans.
     pub fn validateExternalVectorSpaces(self: *IndexManager, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document_json: []const u8) !void {
-        if (embeddings.len == 0) return;
         var plan = try self.acquireWritePlanSnapshot();
         defer plan.release();
         if (plan.plan().external_vector_spaces.count() == 0) return;
@@ -19882,15 +19881,20 @@ pub const IndexManager = struct {
     }
 
     pub fn validateExternalVectorSpacesParsed(self: *IndexManager, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
-        if (embeddings.len == 0) return;
         var plan = try self.acquireWritePlanSnapshot();
         defer plan.release();
         try validateExternalVectorSpacesInPlan(plan.plan(), embeddings, document);
     }
 
     fn validateExternalVectorSpacesInPlan(plan: *const WritePlanSnapshot, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+        if (plan.external_vector_spaces.count() == 0) return;
+        // A receipt is an assertion about this authored row. Omitting vectors
+        // retains native bytes, but must not retain an assertion for a new row.
+        var supplied_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer supplied_names.deinit(plan.alloc);
         for (embeddings) |embedding| {
             const expected = plan.external_vector_spaces.get(embedding.index_name) orelse continue;
+            try supplied_names.put(plan.alloc, embedding.index_name, {});
             if (document != .object) return error.InvalidEmbedding;
             const metadata = document.object.get("metadata") orelse return error.InvalidEmbedding;
             if (metadata != .object) return error.InvalidEmbedding;
@@ -19898,6 +19902,17 @@ pub const IndexManager = struct {
             if (spaces != .object) return error.InvalidEmbedding;
             const supplied = spaces.object.get(embedding.index_name) orelse return error.InvalidEmbedding;
             if (supplied != .string or !std.mem.eql(u8, supplied.string, expected)) return error.InvalidEmbedding;
+        }
+        if (document != .object) return;
+        const metadata = document.object.get("metadata") orelse return;
+        if (metadata != .object) return;
+        const spaces = metadata.object.get("embedding_spaces") orelse return;
+        if (spaces != .object) return;
+        var receipts = spaces.object.iterator();
+        while (receipts.next()) |receipt| {
+            const expected = plan.external_vector_spaces.get(receipt.key_ptr.*) orelse continue;
+            if (receipt.value_ptr.* != .string or !std.mem.eql(u8, receipt.value_ptr.string, expected)) continue;
+            if (!supplied_names.contains(receipt.key_ptr.*)) return error.InvalidEmbedding;
         }
     }
 

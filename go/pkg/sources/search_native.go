@@ -556,5 +556,18 @@ func validateProcessingSecretsDepth(value any, depth int) error {
 // Existing tables are never implicitly rewritten or migrated.
 func SourceTableConfig() map[string]any {
 	keyword := func() map[string]any { return map[string]any{"type": "string", "x-antfly-types": []string{"keyword"}} }
-	return map[string]any{"num_shards": 1, "schema": map[string]any{"default_type": "doc", "document_schemas": map[string]any{"doc": map[string]any{"schema": map[string]any{"type": "object", "additionalProperties": true, "x-antfly-dynamic-indexing": map[string]any{"mode": "infer_types"}, "properties": map[string]any{"source_id": keyword(), "doc_type": keyword(), "permissions": map[string]any{"type": "object", "additionalProperties": true, "properties": map[string]any{"public": map[string]any{"type": "boolean"}, "readers": map[string]any{"type": "array", "items": keyword()}}}}}}}}}
+	properties := map[string]any{
+		"source_id": keyword(), "doc_type": keyword(),
+		"metadata": map[string]any{"type": "object", "additionalProperties": true, "properties": map[string]any{
+			"embedding_spaces": map[string]any{"type": "object", "additionalProperties": keyword()},
+		}},
+		"permissions": map[string]any{"type": "object", "additionalProperties": true, "properties": map[string]any{
+			"public": map[string]any{"type": "boolean"}, "readers": map[string]any{"type": "array", "items": keyword()},
+		}},
+	}
+	return map[string]any{"num_shards": 1, "schema": map[string]any{
+		"default_type": "doc", "document_schemas": map[string]any{"doc": map[string]any{"schema": map[string]any{
+			"type": "object", "additionalProperties": true, "x-antfly-dynamic-indexing": map[string]any{"mode": "infer_types"}, "properties": properties,
+		}}},
+	}}
 }
