@@ -206,12 +206,20 @@ def check_manifest(api, run, request):
         return None  # Older Colony validators publish the bounded ZIP instead.
     require(len(selected) == 1, "Ambiguous validation reports")
     check = selected[0]
+    # GitHub may replace the supplied workflow URL with this check's own URL.
+    # Accept only these exact identities; external_id still binds the request,
+    # workflow run and attempt, alongside the app and commit checks below.
     require(
         check.get("name") == MANIFEST_CHECK
         and check.get("app", {}).get("slug") == "github-actions"
         and check.get("head_sha") == run["head_sha"]
+        and type(check.get("id")) is int
+        and check["id"] > 0
         and check.get("details_url")
-        == f"https://github.com/{COLONY}/actions/runs/{run['id']}"
+        in (
+            f"https://github.com/{COLONY}/actions/runs/{run['id']}",
+            f"https://github.com/{COLONY}/runs/{check['id']}",
+        )
         and check.get("status") == "completed"
         and check.get("conclusion") == "success",
         "Untrusted validation report",

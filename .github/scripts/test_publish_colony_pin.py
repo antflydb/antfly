@@ -131,6 +131,7 @@ class PublisherTests(unittest.TestCase):
 
     def report(self, api):
         return {
+            "id": 34,
             "name": p.MANIFEST_CHECK,
             "external_id": "antfly-pin:10-1:12:1",
             "app": {"slug": "github-actions"},
@@ -142,12 +143,75 @@ class PublisherTests(unittest.TestCase):
         }
 
     def test_trusted_report_does_not_require_artifact_storage(self):
+        for path in ("actions/runs/12", "runs/34"):
+            with self.subTest(path=path):
+                api = FakeAPI()
+                report = self.report(api)
+                report["details_url"] = f"https://github.com/{p.COLONY}/{path}"
+                api.checks = [report]
+                run, manifest = p.wait_for_validation(api, "10-1", timeout=1)
+                self.assertEqual(manifest, api.manifest)
+                self.assertEqual(api.artifact_reads, 0)
+                self.assertEqual(p.publish(api, run, manifest), COMMIT)
+
+    def test_report_url_must_identify_the_selected_run_or_check(self):
+        urls = [
+            f"https://github.com/{p.COLONY}/actions/runs/34",
+            f"https://github.com/{p.COLONY}/runs/12",
+            "https://github.com/other/repo/runs/34",
+            f"https://example.test/{p.COLONY}/runs/34",
+            f"http://github.com/{p.COLONY}/runs/34",
+            f"https://github.com/{p.COLONY}/runs/34?other=1",
+            f"https://github.com/{p.COLONY}/runs/34#other",
+            None,
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                api = FakeAPI()
+                api.checks = [{**self.report(api), "details_url": url}]
+                with self.assertRaisesRegex(
+                    p.PublicationError, "Untrusted validation report"
+                ):
+                    p.wait_for_validation(api, "10-1", timeout=1)
+                self.assertEqual(api.artifact_reads, 0)
+                self.assertEqual(api.writes, [])
+
+    def test_canonical_report_url_requires_a_positive_integer_check_id(self):
+        for check_id in (None, "34", True, 0, -1):
+            with self.subTest(check_id=check_id):
+                api = FakeAPI()
+                report = self.report(api)
+                report.update(
+                    id=check_id,
+                    details_url=f"https://github.com/{p.COLONY}/runs/{check_id}",
+                )
+                api.checks = [report]
+                with self.assertRaisesRegex(
+                    p.PublicationError, "Untrusted validation report"
+                ):
+                    p.wait_for_validation(api, "10-1", timeout=1)
+                self.assertEqual(api.writes, [])
+
+    def test_canonical_report_preserves_request_run_and_attempt_binding(self):
         api = FakeAPI()
-        api.checks = [self.report(api)]
-        run, manifest = p.wait_for_validation(api, "10-1", timeout=1)
+        api.run["run_attempt"] = 2
+        report = {
+            **self.report(api),
+            "external_id": "antfly-pin:10-1:12:2",
+            "details_url": f"https://github.com/{p.COLONY}/runs/34",
+        }
+        api.checks = [
+            {**report, "external_id": identity, "output": {"text": "invalid"}}
+            for identity in (
+                "antfly-pin:99-1:12:2",
+                "antfly-pin:10-1:99:2",
+                "antfly-pin:10-1:12:1",
+            )
+        ] + [report]
+        _, manifest = p.wait_for_validation(api, "10-1", timeout=1)
         self.assertEqual(manifest, api.manifest)
         self.assertEqual(api.artifact_reads, 0)
-        self.assertEqual(p.publish(api, run, manifest), COMMIT)
+        self.assertEqual(api.writes, [])
 
     def test_report_origin_binding_and_size_fail_closed(self):
         changes = [
@@ -160,14 +224,17 @@ class PublisherTests(unittest.TestCase):
             {"output": {"text": "x" * 4097}},
             {"output": {"text": json.dumps({**FakeAPI().manifest, "request": "99-1"})}},
         ]
-        for change in changes:
-            with self.subTest(change=change):
-                api = FakeAPI()
-                api.checks = [{**self.report(api), **change}]
-                with self.assertRaises(p.PublicationError):
-                    p.wait_for_validation(api, "10-1", timeout=1)
-                self.assertEqual(api.artifact_reads, 0)
-                self.assertEqual(api.writes, [])
+        for path in ("actions/runs/12", "runs/34"):
+            for change in changes:
+                with self.subTest(path=path, change=change):
+                    api = FakeAPI()
+                    report = self.report(api)
+                    report["details_url"] = f"https://github.com/{p.COLONY}/{path}"
+                    api.checks = [{**report, **change}]
+                    with self.assertRaises(p.PublicationError):
+                        p.wait_for_validation(api, "10-1", timeout=1)
+                    self.assertEqual(api.artifact_reads, 0)
+                    self.assertEqual(api.writes, [])
         api = FakeAPI()
         api.checks = [self.report(api), self.report(api)]
         with self.assertRaises(p.PublicationError):
