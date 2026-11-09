@@ -37,11 +37,22 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
     return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
 }
 
+/// PDF input consumes a URI selected from the source document. Both literal
+/// fields and rendered URI templates are supported; text chunking is not.
+/// Share this check with storage admission to avoid accepting definitions that
+/// cannot be installed after metadata publication.
+pub fn validateEmbeddingInput(kind: types.EnrichmentKind, input: @import("enrichment_types.zig").EmbeddingInput, chunk_size: u32, chunker_json: []const u8) !void {
+    if (input == .text) return;
+    if (kind != .embedding or chunk_size != 0 or chunker_json.len != 0)
+        return error.InvalidEnrichmentConfig;
+}
+
 /// Validates the context-free portion of a public enrichment definition.
 /// Dependency edges are validated by the catalog-aware caller, while this
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
     if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+    try validateEmbeddingInput(cfg.kind, cfg.embedding_input, cfg.chunk_size, cfg.chunker_json);
     if (cfg.kind == .group) {
         const source = cfg.source orelse return error.InvalidEnrichmentConfig;
         try source.validate();
