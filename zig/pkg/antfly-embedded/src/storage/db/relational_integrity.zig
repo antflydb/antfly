@@ -800,7 +800,7 @@ test "relational index system integrity compare claim fences absence and exact o
 fn testCommands(store: *@import("../docstore.zig").DocStore, manager: *transactions.TxnManager, id: transactions.TxnId, commands: []const Command, commit: bool) !void {
     var read = try CurrentView.init(store);
     defer read.deinit();
-    var effects = try prepare(std.testing.allocator, &read, commands);
+    var effects = try prepare(std.testing.allocator, &read, commands, null);
     defer effects.deinit();
     try manager.initTransaction(id, 1);
     try testPrepareEffects(store, manager, id, effects.operations);
