@@ -1702,6 +1702,22 @@ pub const Store = struct {
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
     ride_along_byte_threshold: usize = 1024 * 1024,
     ride_along_flush_started: std.atomic.Value(bool) = .init(false),
+    /// Guards only the one-time `ride_along_flush_future` spawn below --
+    /// deliberately not `self.mutex`/`lockStoreExclusive`'s broader
+    /// store-exclusive lock, which `ensureRideAlongFlushStarted` used to
+    /// `tryLock`. That lock is also what a commit mid-`syncIfRequired`
+    /// (`commit_in_sync != 0`) holds contended for the whole sync window,
+    /// so a `stageRideAlong` call landing during exactly that window used
+    /// to skip starting the flush loop with nothing guaranteed to retry:
+    /// if that was the only `stageRideAlong` call this Store ever saw (no
+    /// later call, no foreground write), the idle-flush timer -- the one
+    /// thing a lone ride-along ticket needs to ever resolve without a
+    /// foreground write riding behind it -- would never start at all, and
+    /// `Ticket.wait()` would block until `close()`'s own
+    /// `forceDrainDurable()` (not gated on this lock). A dedicated,
+    /// essentially-never-contended lock removes that gap: this init can
+    /// no longer be skipped by unrelated store activity.
+    ride_along_flush_start_mutex: std.atomic.Mutex = .unlocked,
     ride_along_flush_cancel: maintenance.CancelToken = .{},
     ride_along_flush_future: ?std.Io.Future(void) = null,
     ride_along_wake: std.Io.Event = .unset,
@@ -3307,14 +3323,23 @@ pub const Store = struct {
     fn ensureRideAlongFlushStarted(self: *Store) void {
         if (self.ride_along_flush_started.load(.acquire)) return;
         if (self.read_only) return;
-        // Non-blocking, like the maintenance kicks elsewhere (WS2): a
-        // ride-along caller must never pay for someone else's in-flight
-        // commit just to start this one-time background task. If
-        // self.mutex is contended right now, skip starting it this call --
-        // the next stageRideAlong (or this same byte threshold, checked
-        // without needing self.mutex at all) gets another chance.
-        if (!tryLockStoreExclusive(self)) return;
-        defer self.mutex.unlock();
+        // Guarded by `ride_along_flush_start_mutex`, not the store-exclusive
+        // lock (`lockStoreExclusive`/`tryLockStoreExclusive`): that lock is
+        // also held for an entire in-flight group's `commit_in_sync` sync
+        // window, so a `tryLock` here used to be able to lose to ordinary
+        // commit traffic. If this call is the ONLY `stageRideAlong` this
+        // Store ever sees -- no later call, no foreground write -- nothing
+        // else would ever retry, so a lost race here used to mean the
+        // idle-flush timer (the one thing a lone ride-along ticket needs to
+        // resolve without a foreground write riding behind it) never starts
+        // at all; `Ticket.wait()` then blocks until `close()`'s own
+        // `forceDrainDurable()`, not this barrier. `ride_along_flush_start_
+        // mutex` is contended only by this tiny critical section (never by
+        // an in-flight commit's sync window), so blocking on it here is
+        // cheap and bounded -- unlike the store-exclusive lock, it can't be
+        // held by someone else for a whole fsync.
+        platform_sync.lockYielding(&self.ride_along_flush_start_mutex);
+        defer self.ride_along_flush_start_mutex.unlock();
         if (self.ride_along_flush_started.load(.acquire)) return;
         self.ride_along_flush_future = self.file.runtime().concurrent(rideAlongFlushLoop, .{self}) catch return;
         self.ride_along_flush_started.store(true, .release);
