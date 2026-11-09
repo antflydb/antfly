@@ -677,7 +677,9 @@ prefix; neither receives R2 or registry authority. PR VOPR access still requires
 the existing default-branch admission controller. The existing Cloud Build/GAR
 builder federation must also be restricted to trusted publishers before enabling
 source-job OIDC, so staging tokens cannot switch providers to gain publish
-access. GitHub cache writes remain
+access. Apply and verify that companion IAM change before merging these
+workflows: declaring OIDC permission takes effect even while GCS uploads are
+disabled. GitHub cache writes remain
 restricted by `cache-mode: read` in approved PR runs.
 
 Receipts and ordinary intermediate artifacts expire after fourteen days. Existing
