@@ -11312,7 +11312,7 @@ const SharedPdfWindowScheduler = struct {
             defer borrowed.deinit();
             const downloaded = borrowed.entry().content;
             try document_extraction_mod.verifyChecksumDigest(config, &borrowed.entry().content_sha256);
-            break :blk try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
+            break :blk try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
         return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest), request.producer_json);
@@ -12204,7 +12204,7 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
         defer scheduler.deinit();
         var config = try document_extraction_mod.parseConfig(alloc, config_json);
         defer config.deinit(alloc);
-        const fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, url, config_json, config) orelse try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, url, config_json, config, "application/pdf") orelse try documentExtractionFingerprintAlloc(alloc, url, config_json, config.native_text, config.content_type, config.filename, "application/pdf", source);
+        const fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, url, config_json, config) orelse try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, url, config_json, config, "application/pdf") orelse try documentExtractionFingerprintAlloc(alloc, url, config_json, config, config.content_type, config.filename, "application/pdf", source);
         defer alloc.free(fingerprint);
         const state = try documentExtractionStateValueAlloc(alloc, fingerprint, &.{}, &.{}, &.{}, "", 0, true);
         defer alloc.free(state);
@@ -18245,7 +18245,7 @@ fn processDocumentExtractionAsset(
         return;
     };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
-        try document_extraction_mod.downloadedMetadataFingerprintAlloc(runtime.alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
+        try document_extraction_mod.downloadedMetadataFingerprintAlloc(runtime.alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
     else
         null;
     defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
@@ -34039,7 +34039,7 @@ fn documentExtractionFingerprintAlloc(
     alloc: Allocator,
     source_url: []const u8,
     config_json: []const u8,
-    native_text: document_extraction_mod.NativeTextConfig,
+    config: document_extraction_mod.Config,
     configured_content_type: []const u8,
     configured_filename: []const u8,
     downloaded_content_type: []const u8,
@@ -34048,10 +34048,10 @@ fn documentExtractionFingerprintAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, native_text, configured_content_type, configured_filename, downloaded_content_type, &digest);
+    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, config, configured_content_type, configured_filename, downloaded_content_type, &digest);
 }
 
-test "document extraction runtime fingerprints independent native quality and policy without OCR" {
+test "OCR sampling byte fingerprints also preserve independent native quality without OCR" {
     const alloc = std.testing.allocator;
     var native_only = try document_extraction_mod.parseConfig(alloc,
         \\{"native_text":{"policy":"page","quality":{"min_chars":1}}}
@@ -34075,12 +34075,12 @@ test "document extraction runtime fingerprints independent native quality and po
     try std.testing.expect(!std.mem.eql(u8, left, right));
     var visible_native = document_extraction_mod.NativeTextConfig{};
     visible_native.policy = .visible;
-    const visible = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", visible_native, "application/pdf", "file.pdf", "application/pdf", &digest);
+    const visible = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{ .native_text = visible_native }, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(visible);
     try std.testing.expect(!std.mem.eql(u8, prepared, visible));
     var tuned_native = document_extraction_mod.NativeTextConfig{};
     tuned_native.quality.min_chars += 1;
-    const tuned = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", tuned_native, "application/pdf", "file.pdf", "application/pdf", &digest);
+    const tuned = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{ .native_text = tuned_native }, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(tuned);
     try std.testing.expect(!std.mem.eql(u8, prepared, tuned));
     digest[0] ^= 1;
@@ -34102,13 +34102,15 @@ fn documentExtractionFingerprintFromDigestAlloc(
     alloc: Allocator,
     source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
     config_json: []const u8,
-    native_text: document_extraction_mod.NativeTextConfig,
+    config: document_extraction_mod.Config,
     configured_content_type: []const u8,
     configured_filename: []const u8,
     downloaded_content_type: []const u8,
     content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) ![]u8 {
+    const native_text = config.native_text;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    document_extraction_mod.hashRenderPolicy(&hasher, config);
     hasher.update("antfly.document-extraction.fingerprint.v4\x00");
     hasher.update(source_identity);
     for ([_][]const u8{ config_json, document_extraction_mod.native_text_extraction_identity, @tagName(native_text.policy), configured_content_type, configured_filename, downloaded_content_type }) |field| {
@@ -46388,4 +46390,92 @@ test "document preparation copy admission failure discards optional state withou
     try std.testing.expectEqualStrings("native text", units[0].text);
     try std.testing.expectEqualStrings("pending_ocr", units[0].extraction_status.?);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "OCR sampling upgrade replaces persisted duf5 units and reuses duf6 publication" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "upgrade" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/upgrade-indexes", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try index_manager_mod.IndexManager.init(a, path);
+    defer manager.deinit();
+    var runtime = EnrichmentRuntime{ .alloc = a, .io_impl = null, .store = erased, .owns_store = false, .change_journal = undefined, .replay_source = undefined, .index_manager = &manager, .write_ctx = undefined, .write_fn = undefined, .failure_ctx = undefined, .failure_fn = undefined, .notify_ctx = undefined, .notify_fn = undefined, .config = .{}, .ownership = undefined, .lease_fencing_enabled = false };
+    const source = "Freshly extracted text after upgrading the renderer.";
+    var initial = try document_extraction_mod.extractDownloadedAlloc(a, .{ .data = source, .content_type = "text/plain" }, "source.txt", .{});
+    defer initial.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), initial.units.len);
+    const unit_id = initial.units[0].unit_id;
+    const key = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "units", unit_id);
+    defer a.free(key);
+    const state_key = try assetStateKeyAlloc(a, "doc", "units");
+    defer a.free(state_key);
+    const old_marker = "duf5:0000000000000000000000000000000000000000000000000000000000000000";
+    const old_state = try std.json.Stringify.valueAlloc(a, .{ .fingerprint = "source-version", .unit_keys = &.{key}, .unit_descriptors = &.{.{ .key = key, .fingerprint = old_marker }}, .chunk_keys = &.{}, .chunk_unit_fingerprint_version = 5 }, .{});
+    defer a.free(old_state);
+    // Persist the old row/state before exercising the production reuse gate.
+    try storePutWithRetry(&runtime, key, "{\"_artifact_unit_fingerprint\":\"" ++ old_marker ++ "\",\"text\":\"stale output\"}");
+    try storePutWithRetry(&runtime, state_key, old_state);
+    var extractions: usize = 0;
+    for (0..2) |_| {
+        const state = try storeGetAllocWithRetry(&runtime, state_key);
+        defer a.free(state);
+        if (try skipRuntimeDocumentExtractionByFingerprint(&runtime, "doc", "units", "source-version", state, "{}", 1, "{}")) continue;
+        extractions += 1;
+        var extracted = try document_extraction_mod.extractDownloadedAlloc(a, .{ .data = source, .content_type = "text/plain" }, "source.txt", .{});
+        defer extracted.deinit(a);
+        const unit = extracted.units[0];
+        const fingerprint = try document_unit_fingerprint.fingerprintAlloc(a, unit);
+        defer a.free(fingerprint);
+        const payload = try documentUnitPayloadAlloc(a, "doc", "units", unit, fingerprint, "source.txt", "text/plain", .{ .range_id = "units-0" });
+        defer a.free(payload);
+        const descriptors = [_]DocumentExtractionUnitDescriptor{.{ .key = key, .fingerprint = fingerprint }};
+        const digest = try hierarchy_navigation.artifactDigestAlloc(a, &descriptors);
+        defer a.free(digest);
+        const next_state = try documentExtractionStateValueAlloc(a, "source-version", &.{key}, &descriptors, &.{}, digest, 1, true);
+        defer a.free(next_state);
+        const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(a, "doc", "units");
+        defer a.free(summary_key);
+        const summary = try hierarchy_navigation.summaryValueAlloc(a, 1, digest, 1, 1);
+        defer a.free(summary);
+        const block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(a, "doc", "units", 0);
+        defer a.free(block_key);
+        const block = try hierarchy_navigation.blockValueAlloc(a, 0, &descriptors);
+        defer a.free(block);
+        try storePutBatchWithRetry(&runtime, &.{ .{ .key = key, .value = payload }, .{ .key = state_key, .value = next_state }, .{ .key = summary_key, .value = summary }, .{ .key = block_key, .value = block } }, &.{});
+    }
+    try std.testing.expectEqual(@as(usize, 1), extractions);
+    try std.testing.expectEqual(@as(u64, 1), runtime.skip_by_hash_count);
+    const stored = try storeGetAllocWithRetry(&runtime, key);
+    defer a.free(stored);
+    var decoded = try @import("document_unit_payload.zig").decodeAlloc(a, stored, .{ .document = "doc", .producer = "units", .unit = unit_id });
+    defer decoded.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, decoded.fingerprint, "duf6:"));
+    try std.testing.expectEqualStrings(source, decoded.unit.text);
+}
+
+test "OCR sampling byte fingerprint binds resolved render recipe" {
+    const a = std.testing.allocator;
+    const identity = PreparedDocumentSourceCache.sourceIdentity("source.pdf");
+    const digest: [32]u8 = @splat(1);
+    const automatic = try documentExtractionFingerprintFromDigestAlloc(a, &identity, "{}", .{ .ocr_enabled = true }, "application/pdf", "source.pdf", "application/pdf", &digest);
+    defer a.free(automatic);
+    const variants = [_]document_extraction_mod.Config{
+        .{ .ocr_enabled = true, .ocr_render_sampling = .pdf },
+        .{ .ocr_enabled = true, .ocr_render_dpi = 300 },
+        .{ .ocr_enabled = true, .ocr_render_resolution = .model_input },
+        .{ .ocr_enabled = true, .ocr_max_rendered_pixels = 1000 },
+        .{ .ocr_enabled = true, .ocr_max_rendered_dimension = 1000 },
+    };
+    for (variants) |config| {
+        const exact = try documentExtractionFingerprintFromDigestAlloc(a, &identity, "{}", config, "application/pdf", "source.pdf", "application/pdf", &digest);
+        defer a.free(exact);
+        try std.testing.expect(!std.mem.eql(u8, automatic, exact));
+    }
 }

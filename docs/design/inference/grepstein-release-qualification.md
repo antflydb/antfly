@@ -175,6 +175,70 @@ originals. Neither recommendation establishes their internal sampling filter.
 [Tesseract](https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html) performs
 its own preprocessing and generally prefers at least 300 DPI.
 
+## Sampling regression and CPU measurements
+
+The processor contract is checked against checked-in Pillow 12.1.0 RGB fixtures
+for all supported filters (nearest, antialiased bilinear and antialiased bicubic),
+including magnification, reduction, single-pixel axes and non-default channel
+normalization. Regenerate with
+`uv run --with pillow==12.1.0 zig/lib/image/testdata/generate_resampling_references.py`,
+then format the generated Zig file. These pixel checks do not invoke a model.
+
+The separable resizer retains an 8-bit horizontal row window, rather than a
+full-height intermediate. This preserves the reference quantization boundary.
+Coefficient storage is allocated exactly; Pillow only retains one row of f64
+coefficients, while Torchvision retains the axis needed for its global precision
+selection. Geometry-based admission includes source decoding, normalized images
+retained earlier in the batch, filter tables and the row window. Both the native
+ColQwen reranker and the Qwen3.5 fallback generation route reserve this work.
+Reranker token preflight inspects image headers and uses the execution geometry;
+it no longer decodes/resizes the same image before execution.
+
+A local safe-build CPU comparison with the previous implementation preserved
+all output floats for three nonuniform RGB workloads. Each result is a mean of
+three timed iterations after warm-up; shared-machine timing is diagnostic,
+not a performance threshold or hosted-GPU measurement.
+
+| Source → model dimensions | Previous bicubic | Row-window bicubic |
+| --- | ---: | ---: |
+| 1801×1278 → 1024×728 | 22.5 ms | 19.8 ms |
+| 2400×3200 → 840×1120 | 70.0 ms | 68.9 ms |
+| 1×100000 → 28×3584 | 28.4 ms | 18.8 ms |
+
+The million-row regression (1×1000000 → 28×35840) fits a preprocessing
+allocation budget below 32 MiB. Previously the horizontal buffer alone required
+84 MB, excluding tensors and coefficients. Source decoding is admitted separately.
+
+To compare actual native PDF painting and PNG transport sizes, build
+`zig build lib-pdf-bench -Doptimize=safe -j2` from `zig/`, then run from the
+repository root:
+
+```sh
+zig/zig-out/bin/lib-pdf-bench sampling-report path/to/sample.pdf 150 3 output-prefix
+```
+
+The command emits one JSON record per sampling policy, including PDF/PNG SHA-256,
+actual geometry, renderer quality, PNG byte count and mean render-plus-encode
+time. It rejects nondeterministic output and optionally writes each PNG for
+comparison through the same pinned `/read` model. Parsing/cold-start, HTTP
+transport, reader latency and accuracy are separate measurements.
+
+Local 150-DPI measurements on the native-text fixture and the two-line scan
+produced identical PNG hashes across policies (the scan explicitly requests
+interpolation); rendering plus encoding took about 20–23 ms and 35–39 ms,
+respectively. The text fixture reports `degraded` native glyph rendering, not
+fully native fidelity. For the Grepstein photo canary, `auto` took 180 ms and
+produced 2,463,230 bytes; `pdf` took 99 ms and produced 612,874 bytes.
+The `auto` PNG hash remains
+`622c903d2c249c0924403cae961a7f2ca53f6f975887060f7c3db370b263aa72`.
+That material CPU/transport tradeoff must remain visible in rollout measurements.
+
+Persisted-state coverage verifies that a version-5 publication is re-extracted,
+replaced with an authenticated version-6 unit and reused on the next pass. Both
+metadata-based and downloaded-byte source fingerprints bind the resolved render
+recipe. Full scan/photo/text reader accuracy and deployed end-to-end throughput
+remain required before broad backfill; these local tests do not claim them.
+
 ## Large-page vLLM comparison
 
 The reader throughput target is parity with vLLM, preferably faster, while

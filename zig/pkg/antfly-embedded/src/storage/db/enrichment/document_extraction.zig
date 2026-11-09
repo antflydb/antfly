@@ -2777,13 +2777,16 @@ pub fn renderPolicy(config: Config) pdf.RenderPolicy {
     return .{ .sampling = config.ocr_render_sampling, .resolved_profile = config.ocr_render_sampling.profile(), .resolution = config.ocr_render_resolution };
 }
 
-fn hashRenderPolicy(hasher: *std.crypto.hash.sha2.Sha256, config: Config) void {
+pub fn hashRenderPolicy(hasher: *std.crypto.hash.sha2.Sha256, config: Config) void {
     if (!config.ocr_enabled) return;
     var version: [2]u8 = undefined;
     std.mem.writeInt(u16, &version, (RenderPolicy{}).version, .big);
     hashField(hasher, "ocr_render_policy_version", &version);
     hashField(hasher, "ocr_render_sampling", @tagName(config.ocr_render_sampling));
     hashField(hasher, "ocr_render_resolution", @tagName(config.ocr_render_resolution));
+    hashU64Field(hasher, "ocr_render_dpi", config.ocr_render_dpi);
+    hashU64Field(hasher, "ocr_max_rendered_pixels", config.ocr_max_rendered_pixels);
+    hashU64Field(hasher, "ocr_max_rendered_dimension", config.ocr_max_rendered_dimension);
 }
 
 fn hashNativeTextConfig(hasher: *std.crypto.hash.sha2.Sha256, native_text: NativeTextConfig) void {

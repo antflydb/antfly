@@ -48,7 +48,7 @@ pub const PreparedImage = struct {
 
 /// Version execution semantics separately from checkpoint bytes so corrected
 /// preprocessing cannot reuse embeddings produced by the earlier fixed filter.
-pub const preprocessing_recipe = "qwen2vl-declared-resample-scale-v1";
+pub const preprocessing_recipe = "qwen2vl-declared-resample-scale-v2";
 
 pub fn preprocessingRevision(artifacts: [32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});

@@ -246,7 +246,9 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         if (image_count == 0) return .{};
         const prep_config = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
         const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
-        return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
+        const images = try collectImagesInPromptOrder(allocator, messages);
+        defer allocator.free(images);
+        return .{ .token_allowance = image_count *| (max_image_tokens +| 1), .host_scratch_bytes = try qwen2vl_mm.imageWorkingBytes(images, prep_config) };
     }
     var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
     // CUDA decodes on the device. Portable decoding runs in host memory, and
