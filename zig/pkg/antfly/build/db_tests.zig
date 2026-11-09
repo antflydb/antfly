@@ -33,6 +33,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const native_query_maintenance_filters = [_][]const u8{
         "db native checkpoint warming",
+        "db native checkpoint discovery",
         "db idle dense query captures",
         "external lake native warming",
         "source vector payloads debt policy bounds background deferral",

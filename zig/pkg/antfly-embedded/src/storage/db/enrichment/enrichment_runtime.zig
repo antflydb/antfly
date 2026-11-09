@@ -10090,6 +10090,7 @@ fn runForegroundCatchUpPassOwned(
     const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
     const config_changed = scheduler.state.config_hash != 0 and scheduler.state.config_hash != config_hash;
     if (config_changed) {
+        scheduler.state.beginReplan();
         scheduler.state.scanned_sequence = runtime.applied_sequence;
         scheduler.state.clearScanDocument(runtime.alloc);
     }
@@ -10104,10 +10105,7 @@ fn runForegroundCatchUpPassOwned(
     }
     runtime.retry_scheduler = &scheduler;
     defer runtime.retry_scheduler = null;
-    const due = if (config_changed)
-        try scheduler.state.replanWithReferences(runtime.alloc, runtime.clock.nowRealtimeMs(), ScopedReplay.documentResolver(runtime), 4 * 1024 * 1024)
-    else
-        try scheduler.state.dueWithReferences(runtime.alloc, runtime.clock.nowRealtimeMs(), ScopedReplay.documentResolver(runtime), 4 * 1024 * 1024);
+    const due = try scheduler.state.dueWithReferences(runtime.alloc, runtime.clock.nowRealtimeMs(), ScopedReplay.documentResolver(runtime), 4 * 1024 * 1024);
     defer due.deinit(runtime.alloc);
     var processed_request_count: u64 = 0;
     if (due.groups.len != 0) {
@@ -10120,6 +10118,7 @@ fn runForegroundCatchUpPassOwned(
         };
         try drain_due;
         try replay_lease_guard.check();
+        scheduler.state.completeReplan(due);
         scheduler.state.retire(runtime.alloc, due.tokens);
         try scheduler.save(runtime);
     }
