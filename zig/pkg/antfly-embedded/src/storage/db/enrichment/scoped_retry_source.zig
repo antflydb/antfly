@@ -65,13 +65,12 @@ test "durable enrichment scoped retry validates metadata without reading unchang
     const Fixture = struct {
         physical: []const u8,
         mutation_key: revisions.Key,
-        revision: [8]u8 = undefined,
-        content: [49]u8 = undefined,
+        // Revision and content authority share one combined record.
+        record: [revisions.encoded_len_with_content]u8 = undefined,
         body: []const u8 = "old primary",
         reads: usize = 0,
         pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
-            if (std.mem.eql(u8, key, &self.mutation_key)) return &self.revision;
-            if (std.mem.eql(u8, key, &revisions.contentKey(self.mutation_key))) return &self.content;
+            if (std.mem.eql(u8, key, &self.mutation_key)) return &self.record;
             if (std.mem.eql(u8, key, self.physical)) {
                 self.reads += 1;
                 return self.body;
@@ -82,11 +81,14 @@ test "durable enrichment scoped retry validates metadata without reading unchang
             return alloc.dupe(u8, raw);
         }
         fn write(self: *@This(), revision: u64) void {
-            std.mem.writeInt(u64, &self.revision, revision, .little);
-            std.mem.writeInt(u64, self.content[0..8], revision, .little);
-            std.mem.writeInt(u64, self.content[8..16], self.body.len, .little);
-            self.content[16] = self.physical[self.physical.len - 1];
-            std.crypto.hash.sha2.Sha256.hash(self.body, self.content[17..49], .{});
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(self.body, &digest, .{});
+            _ = revisions.encodeCombined(&self.record, .{ .revision = revision, .content = .{ .revision = revision, .bytes = self.body.len, .kind = self.physical[self.physical.len - 1], .digest = digest } });
+        }
+        /// An old writer advancing only the compatibility revision, leaving
+        /// the embedded content proof's own revision stale.
+        fn bumpRevisionOnly(self: *@This(), revision: u64) void {
+            std.mem.writeInt(u64, self.record[0..8], revision, .little);
         }
     };
     var fixture = Fixture{ .physical = physical, .mutation_key = mutation_key };
@@ -111,14 +113,14 @@ test "durable enrichment scoped retry validates metadata without reading unchang
     // An old writer advances only the compatibility revision. Read its bytes
     // once, then reuse the resulting observation until another mutation.
     fixture.body = "old writer primary";
-    std.mem.writeInt(u64, &fixture.revision, 4, .little);
+    fixture.bumpRevisionOnly(4);
     const fallback = try observe(a, &fixture, physical, "doc", changed.stamp, false, fixture);
     try std.testing.expect(fallback.primary_read);
     try std.testing.expectEqual(@as(usize, 1), fixture.reads);
     _ = try observe(a, &fixture, physical, "doc", fallback.stamp, false, fixture);
     try std.testing.expectEqual(@as(usize, 1), fixture.reads);
     fixture.body = "further old writer change";
-    std.mem.writeInt(u64, &fixture.revision, 5, .little);
+    fixture.bumpRevisionOnly(5);
     const later = try observe(a, &fixture, physical, "doc", fallback.stamp, false, fixture);
     try std.testing.expect(!later.stamp.?.sameInput(fallback.stamp.?));
     try std.testing.expectEqual(@as(usize, 2), fixture.reads);

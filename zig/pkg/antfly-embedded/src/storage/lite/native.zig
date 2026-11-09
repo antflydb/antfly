@@ -3359,6 +3359,7 @@ const IndexEditor = struct {
         const alloc = self.nodeAllocator(node);
         const index = try self.bound(node, key, node.kind == .internal);
         if (node.kind == .leaf) {
+            if (builtin.is_test) DocumentIndexKeyLog.record("insert", node.original_page, key);
             const replacement = index < node.keys.items.len and std.mem.eql(u8, try self.resolve(node, &node.keys.items[index]), key);
             if (replacement) {
                 if (self.accounting_pages) |pages| if (node.links.items[index].page != page) try pages.retire(node.links.items[index].page, .record);
@@ -3450,6 +3451,7 @@ const IndexEditor = struct {
         if (depth > 64) return error.InvalidDocumentIndex;
         const index = try self.bound(node, key, node.kind == .internal);
         if (node.kind == .leaf) {
+            if (builtin.is_test) DocumentIndexKeyLog.record("erase", node.original_page, key);
             if (index == node.keys.items.len or !std.mem.eql(u8, try self.resolve(node, &node.keys.items[index]), key)) return .{ .removed = false };
             if (self.accounting_pages) |pages| try pages.retire(node.links.items[index].page, .record);
             _ = node.keys.orderedRemove(index);
@@ -4444,6 +4446,29 @@ pub const PageWriteMetrics = struct {
             bucket.calls.store(0, .monotonic);
             bucket.bytes.store(0, .monotonic);
         }
+    }
+};
+
+/// Diagnostic-only (perf/lwa-cpu, document-index write-count investigation):
+/// when armed, logs every key `IndexEditor.insert`/`erase` touches at the
+/// leaf level -- the leaf's original (pre-commit) on-disk page id, so
+/// multiple keys landing in the *same* leaf are visibly grouped, and the
+/// key bytes themselves -- to answer "how many distinct leaves does one
+/// commit's document-index writes actually touch, and why". Not armed by
+/// default; armed only by the dedicated attribution test in
+/// `write_amplification_cpu_bench_test.zig`.
+pub const DocumentIndexKeyLog = struct {
+    var armed: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {};
+
+    pub fn arm(on: bool) void {
+        if (!builtin.is_test) return;
+        armed.store(on, .monotonic);
+    }
+
+    fn record(comptime op: []const u8, leaf_original_page: u64, key: []const u8) void {
+        if (!builtin.is_test) return;
+        if (!armed.load(.monotonic)) return;
+        std.debug.print("DOCIDX_KEY op={s} leaf_original_page={d} key_len={d} key={s}\n", .{ op, leaf_original_page, key.len, key });
     }
 };
 
@@ -6415,10 +6440,24 @@ pub const NativeFile = struct {
 
     fn ledgerRead(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
         const file: *NativeFile = @ptrCast(@alignCast(context));
+        const expected_kind: PageKind = if (page == file.activeCheckpoint().free_map_root_page) .free_map else .allocator;
+        // A cache hit already holds a CRC-validated page; borrow its payload
+        // directly instead of duplicating the whole page just to decode and
+        // immediately discard the full-page copy. allocator_v4's ledger load
+        // calls this once per ledger page per commit, so this was the single
+        // largest allocation site in the write path.
+        const use_cache = file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0;
+        if (use_cache) {
+            const physical = physicalPage(page);
+            if (try file.page_cache.acquirePayload(file.allocator, physical, @intCast(file.header.page_size))) |view| {
+                defer file.page_cache.releaseRaw(file.allocator, view);
+                if (view.validation.?.kind != expected_kind) return error.UnexpectedNativePageKind;
+                return try a.dupe(u8, view.bytes[page_header_size..][0..view.validation.?.payload_len]);
+            }
+        }
         const raw = try file.readPageAlloc(a, page);
         defer a.free(raw);
-        const kind: PageKind = if (page == file.activeCheckpoint().free_map_root_page) .free_map else .allocator;
-        return try a.dupe(u8, try decodePagePayload(raw, kind));
+        return try a.dupe(u8, try decodePagePayload(raw, expected_kind));
     }
     fn ledgerReadOnlyAllocate(_: *anyopaque) !u64 {
         return error.ReadOnly;

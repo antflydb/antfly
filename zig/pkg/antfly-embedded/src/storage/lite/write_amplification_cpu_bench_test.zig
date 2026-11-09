@@ -92,31 +92,51 @@ fn cpuNowNs() u64 {
 // get "allocations/write" as a real count rather than an estimate.
 // ---------------------------------------------------------------------------
 
-/// Return-address histogram for the allocation-site attribution task: a
-/// small, mutex-protected map from `ret_addr` (the immediate caller of
-/// `allocator.alloc`/`create`/etc., per `std.mem.Allocator.VTable`'s own
-/// `ret_addr` parameter -- the same value `std.testing.allocator`'s stack
-/// capture would start unwinding from) to a call count. Only armed during
-/// the dedicated attribution test (see `histogram_armed`); the steady
-/// report/ceilings/profile-loop tests never pay this lock, so their
-/// numbers stay exactly what they were before this file added attribution.
+/// How many frames of the call chain above (and including) `ret_addr` are
+/// captured per allocation when armed. `ret_addr` alone collapses every
+/// caller of a shared, non-inlined generic (`dupe`, `create`, `alloc`'s own
+/// convenience wrappers) into one bucket, since it is the wrapper's own
+/// call-into-`alloc` address, identical for every one of its callers. A
+/// few more frames reach past that wrapper to the frame that actually
+/// decided to allocate -- resolved at report time (`AllocSiteHistogram.top`),
+/// not at record time, to keep the hot per-allocation path to a cheap
+/// stack-unwind with no DWARF symbol lookup.
+const stack_frames_per_site = 4;
+const StackKey = [stack_frames_per_site]usize;
+
+/// Call-chain histogram for the allocation-site attribution task: a small,
+/// mutex-protected map from a short stack-frame key (see
+/// `stack_frames_per_site`) to a call count. Only armed during the
+/// dedicated attribution test (see `histogram_armed`); the steady
+/// report/ceilings/profile-loop tests never pay this lock or the stack
+/// unwind, so their numbers stay exactly what they were before this file
+/// added attribution.
 const AllocSiteHistogram = struct {
     // A plain spin lock (tryLock/unlock only, no blocking lock()) is
     // enough: this histogram is only armed for the single-writer
     // attribution test, so contention is a non-issue, and it avoids
     // pulling in an Io-aware mutex for a CPU-only data structure.
     mutex: std.atomic.Mutex = .unlocked,
-    counts: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    counts: std.AutoHashMapUnmanaged(StackKey, u64) = .empty,
     backing: std.mem.Allocator = std.heap.page_allocator,
 
     fn lockSpin(self: *AllocSiteHistogram) void {
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
     }
 
+    /// `ret_addr` is the immediate caller of the allocator vtable (frame 0
+    /// of the captured key); `first_address = ret_addr` tells the unwinder
+    /// to discard every frame below it, so the remaining
+    /// `stack_frames_per_site - 1` slots are the real callers above it.
     fn record(self: *AllocSiteHistogram, ret_addr: usize) void {
+        var buf: [stack_frames_per_site]usize = undefined;
+        const trace = std.debug.captureCurrentStackTrace(.{ .first_address = ret_addr, .allow_unsafe_unwind = true }, &buf);
+        var key: StackKey = @splat(0);
+        const n = @min(trace.return_addresses.len, stack_frames_per_site);
+        @memcpy(key[0..n], trace.return_addresses[0..n]);
         self.lockSpin();
         defer self.mutex.unlock();
-        const entry = self.counts.getOrPut(self.backing, ret_addr) catch return;
+        const entry = self.counts.getOrPut(self.backing, key) catch return;
         if (!entry.found_existing) entry.value_ptr.* = 0;
         entry.value_ptr.* += 1;
     }
@@ -127,17 +147,17 @@ const AllocSiteHistogram = struct {
         self.counts.clearRetainingCapacity();
     }
 
-    const Entry = struct { addr: usize, count: u64 };
+    const Entry = struct { frames: StackKey, count: u64 };
 
-    /// Returns the top `n` (addr, count) pairs by count, descending, owned
-    /// by `alloc` (caller frees).
+    /// Returns the top `n` (frames, count) pairs by count, descending,
+    /// owned by `alloc` (caller frees).
     fn top(self: *AllocSiteHistogram, alloc: std.mem.Allocator, n: usize) ![]Entry {
         self.lockSpin();
         defer self.mutex.unlock();
         var list: std.ArrayListUnmanaged(Entry) = .empty;
         defer list.deinit(alloc);
         var it = self.counts.iterator();
-        while (it.next()) |kv| try list.append(alloc, .{ .addr = kv.key_ptr.*, .count = kv.value_ptr.* });
+        while (it.next()) |kv| try list.append(alloc, .{ .frames = kv.key_ptr.*, .count = kv.value_ptr.* });
         const lessThan = struct {
             fn call(_: void, a: Entry, b: Entry) bool {
                 return a.count > b.count;
@@ -599,6 +619,7 @@ fn measureConcurrent(alloc: std.mem.Allocator, comptime name: []const u8, mode: 
 // ---------------------------------------------------------------------------
 
 fn resolveAddressSymbol(io: std.Io, address: usize, buf: []u8) []const u8 {
+    if (address == 0) return "(none)";
     const debug_info = std.debug.getSelfDebugInfo() catch return "???";
     var text_arena = std.heap.ArenaAllocator.init(std.debug.getDebugInfoAllocator());
     defer text_arena.deinit();
@@ -612,6 +633,36 @@ fn resolveAddressSymbol(io: std.Io, address: usize, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "{s} ({s}:{d})", .{ name, sl.file_name, sl.line }) catch name;
     }
     return std.fmt.bufPrint(buf, "{s}", .{name}) catch "???";
+}
+
+/// Whether `address` resolves into a source file under the zig standard
+/// library (a shared, non-inlined generic like `dupe`/`create`/`alloc`'s
+/// own convenience wrappers, whose own return address collapses every one
+/// of its callers into the same bucket -- see `stack_frames_per_site`'s
+/// doc comment). Treats an unresolved address as "std" so it is skipped
+/// rather than wrongly reported as the real caller.
+fn isStdLibraryFrame(io: std.Io, address: usize) bool {
+    if (address == 0) return true;
+    const debug_info = std.debug.getSelfDebugInfo() catch return true;
+    var text_arena = std.heap.ArenaAllocator.init(std.debug.getDebugInfoAllocator());
+    defer text_arena.deinit();
+    var symbols = std.ArrayList(std.debug.Symbol).initCapacity(std.debug.getDebugInfoAllocator(), 1) catch return true;
+    defer symbols.deinit(std.debug.getDebugInfoAllocator());
+    debug_info.getSymbols(io, std.debug.getDebugInfoAllocator(), text_arena.allocator(), address, false, &symbols) catch return true;
+    if (symbols.items.len == 0) return true;
+    const sl = symbols.items[0].source_location orelse return true;
+    return std.mem.indexOf(u8, sl.file_name, "/lib/std/") != null;
+}
+
+/// The first frame in `frames` (in order, i.e. innermost first) that does
+/// not resolve into the standard library, or the last frame if every one
+/// of them does (still more informative than nothing). Returns its index.
+fn firstNonStdFrameIndex(io: std.Io, frames: []const usize) usize {
+    for (frames, 0..) |addr, i| {
+        if (addr == 0) continue;
+        if (!isStdLibraryFrame(io, addr)) return i;
+    }
+    return frames.len -| 1;
 }
 
 fn printReport(comptime label: []const u8, report: CpuReport) void {
@@ -759,15 +810,47 @@ test "lite write amplification cpu attribution" {
     std.debug.print("lite write amplification CPU attribution (updates={d}):\n", .{updates});
     printReport("primary-only", report);
 
-    const top_sites = alloc_site_histogram.top(std.heap.page_allocator, 20) catch &.{};
-    defer std.heap.page_allocator.free(top_sites);
-    std.debug.print("  top {d} allocation sites (count/write):\n", .{top_sites.len});
+    // Grouping by the raw (unresolved-at-record-time) `stack_frames_per_site`
+    // key can split one real caller across several histogram entries when
+    // the std-library wrapper frames above it vary slightly (different
+    // `alloc`/`create`/`dupe` overloads with different intermediate
+    // frames). Re-aggregate at report time by (first-non-std-frame,
+    // caller-of-that-frame) instead of the raw key, so callers that only
+    // differ in which std wrapper they went through collapse together.
+    const raw_sites = alloc_site_histogram.top(std.heap.page_allocator, 256) catch &.{};
+    defer std.heap.page_allocator.free(raw_sites);
+    const RegroupKey = struct { caller: usize, callers_caller: usize };
+    var regrouped = std.AutoHashMap(RegroupKey, u64).init(std.heap.page_allocator);
+    defer regrouped.deinit();
+    for (raw_sites) |entry| {
+        const idx = firstNonStdFrameIndex(std.testing.io, &entry.frames);
+        const caller = entry.frames[idx];
+        const callers_caller = if (idx + 1 < entry.frames.len) entry.frames[idx + 1] else 0;
+        const key: RegroupKey = .{ .caller = caller, .callers_caller = callers_caller };
+        const slot = regrouped.getOrPut(key) catch continue;
+        if (!slot.found_existing) slot.value_ptr.* = 0;
+        slot.value_ptr.* += entry.count;
+    }
+    const RegroupedEntry = struct { key: RegroupKey, count: u64 };
+    var regrouped_list: std.ArrayListUnmanaged(RegroupedEntry) = .empty;
+    defer regrouped_list.deinit(std.heap.page_allocator);
+    var regrouped_it = regrouped.iterator();
+    while (regrouped_it.next()) |kv| regrouped_list.append(std.heap.page_allocator, .{ .key = kv.key_ptr.*, .count = kv.value_ptr.* }) catch {};
+    std.mem.sort(RegroupedEntry, regrouped_list.items, {}, struct {
+        fn call(_: void, a: RegroupedEntry, b: RegroupedEntry) bool {
+            return a.count > b.count;
+        }
+    }.call);
+
+    std.debug.print("  top {d} allocation call chains (first non-std frame, count/write):\n", .{@min(20, regrouped_list.items.len)});
     var buf: [256]u8 = undefined;
-    for (top_sites, 0..) |entry, i| {
-        const symbol = resolveAddressSymbol(std.testing.io, entry.addr, &buf);
+    var buf2: [256]u8 = undefined;
+    for (regrouped_list.items[0..@min(20, regrouped_list.items.len)], 0..) |entry, i| {
+        const caller_symbol = resolveAddressSymbol(std.testing.io, entry.key.caller, &buf);
+        const callers_caller_symbol = resolveAddressSymbol(std.testing.io, entry.key.callers_caller, &buf2);
         std.debug.print(
-            "    {d}. 0x{x} count={d} per_write={d:.3}  {s}\n",
-            .{ i + 1, entry.addr, entry.count, @as(f64, @floatFromInt(entry.count)) / @as(f64, @floatFromInt(updates)), symbol },
+            "    {d}. count={d} per_write={d:.3}  {s}  <-  {s}\n",
+            .{ i + 1, entry.count, @as(f64, @floatFromInt(entry.count)) / @as(f64, @floatFromInt(updates)), caller_symbol, callers_caller_symbol },
         );
     }
 
@@ -803,6 +886,40 @@ test "lite write amplification cpu attribution" {
         "    TOTAL (PageWriteMetrics): calls/write={d:.3} bytes/write={d:.1} (harness pwrite/write={d:.3} for cross-check)\n",
         .{ @as(f64, @floatFromInt(total_calls)) / @as(f64, @floatFromInt(updates)), @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(updates)), @as(f64, @floatFromInt(report.pwrite)) / @as(f64, @floatFromInt(report.updates)) },
     );
+}
+
+// Diagnostic-only (not a gate): logs every document-index key one single
+// primary-only *update* (not a first insert -- the 128-key cycling set is
+// seeded first, matching the steady-state harness's own shape) writes,
+// and which leaf (by original on-disk page id) each lands in --
+// `native.DocumentIndexKeyLog`, armed only around the one logged update.
+// Also reports the `document_index` pwrite count/bytes for that exact
+// commit (native.PageWriteMetrics), the direct "how many pages did this
+// one commit's document-index writes actually take" answer. Invoke with
+// `--test-filter "lite write amplification cpu document index keys"`.
+test "lite write amplification cpu document index keys" {
+    const alloc = cpuAllocator();
+    var fixture = try Fixture.open(alloc, "lite-write-amp-cpu-docidx", .primary_only);
+    defer fixture.close();
+
+    var buffer: [text_bytes]u8 = undefined;
+    var key_buffer: [32]u8 = undefined;
+    for (0..default_updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
+        const text = payload(&buffer, 0, i);
+        try insertOne(alloc, fixture.handle, key, text, "write");
+    }
+
+    native.PageWriteMetrics.reset();
+    std.debug.print("lite write amplification document-index keys for one update:\n", .{});
+    native.DocumentIndexKeyLog.arm(true);
+    const key = try std.fmt.bufPrint(&key_buffer, "doc-0", .{});
+    const text = payload(&buffer, 0, default_updates);
+    try insertOne(alloc, fixture.handle, key, text, "write");
+    native.DocumentIndexKeyLog.arm(false);
+
+    const snap = native.PageWriteMetrics.get(.document_index);
+    std.debug.print("  document_index pwrite for this one update: calls={d} bytes={d}\n", .{ snap.calls, snap.bytes });
 }
 
 // Regression gate: allocations/write and syscalls/write are build-mode

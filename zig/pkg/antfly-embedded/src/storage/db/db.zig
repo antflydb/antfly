@@ -146478,9 +146478,16 @@ test "public graph metric borrowed wire content migration fences edits abort del
     const kc = try internal_keys.documentKeyAlloc(a, "c");
     defer a.free(kc);
     {
+        // Drop each cached content proof while preserving its revision, the
+        // merged-record equivalent of deleting a separate content-only key.
         var write = try db.core.store.beginWriteTxn();
         errdefer write.abort();
-        for ([_][]const u8{ ka, kb, kc }) |key| try write.delete(&revision.contentKey(revision.keyForPhysical(key).?));
+        for ([_][]const u8{ ka, kb, kc }) |key| {
+            const revision_key = revision.keyForPhysical(key).?;
+            const current_revision = try revision.load(&write, revision_key);
+            var buf: [revision.encoded_len_with_content]u8 = undefined;
+            try write.put(&revision_key, revision.encodeCombined(&buf, .{ .revision = current_revision, .content = null }));
+        }
         try write.commit();
     }
     // This fixture exercises fencing within one page. A real 2 ms clock may
@@ -146526,16 +146533,17 @@ test "public graph metric borrowed wire content migration fences edits abort del
     }
     try std.testing.expect(try db.advanceDocumentAuthorityBackfillPage());
     try std.testing.expect(!db.document_authority_backfill_active.load(.acquire));
-    // Simulate a revision-aware older writer that cannot refresh our cache.
+    // Simulate a revision-aware older writer that cannot refresh our cache:
+    // it advances the revision and drops the content proof in one write.
     var expected_revision: u64 = undefined;
     {
         var write = try db.core.store.beginWriteTxn();
         errdefer write.abort();
-        expected_revision = (try revision.load(&write, revision.keyForPhysical(kb).?)) + 1;
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, expected_revision, .little);
+        const revision_key = revision.keyForPhysical(kb).?;
+        expected_revision = (try revision.load(&write, revision_key)) + 1;
+        var buf: [revision.encoded_len_with_content]u8 = undefined;
         try write.write.?.put(kb, "{\"n\":5}");
-        try write.put(&revision.keyForPhysical(kb).?, &bytes);
+        try write.put(&revision_key, revision.encodeCombined(&buf, .{ .revision = expected_revision, .content = null }));
         try write.commit();
     }
     const hits = try a.alloc(types.SearchHit, 1);
