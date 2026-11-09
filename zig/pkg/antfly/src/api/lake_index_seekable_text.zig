@@ -2875,6 +2875,7 @@ test "external lake demanded pack read ahead reuses distant blocks and respects 
     var fs = try Fs.init(a, directory.path());
     defer fs.deinit();
     var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(42), 1, std.testing.io);
     const bytes = try a.alloc(u8, pack_bytes);
     defer a.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);

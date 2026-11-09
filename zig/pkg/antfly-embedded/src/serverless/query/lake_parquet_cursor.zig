@@ -633,7 +633,9 @@ pub const Cursor = struct {
         // A serving request with bounded byte read-ahead can amortize its
         // first header and following payload. Tiny probes force another GET
         // even when the entire projected chunk fits in the admitted buffer.
-        const probe_limit: usize = if (self.shared_reader) |reader| if (reader.context.trace != null and reader.cache.max_bytes >= 8 * 1024 * 1024) 64 * 1024 else 512 else 512;
+        const lanes = @max(@as(usize, 1), @min(4, self.columns.len));
+        const probe_budget = @max(@as(usize, 1), self.limits.max_input_bytes / lanes);
+        const probe_limit: usize = if (self.shared_reader) |reader| if (reader.context.trace != null and reader.cache.max_bytes >= 8 * 1024 * 1024) @min(64 * 1024, probe_budget) else 512 else 512;
         var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, probe_limit)));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
