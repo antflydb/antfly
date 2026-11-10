@@ -7163,6 +7163,7 @@ const UnsupportedEnrichmentRuntime = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     deadline_clock: platform_clock.Clock = platform_clock.Clock.real(),
     applied_sequence: u64 = 0,
+    status_revision: ?u64 = null,
     target_sequence: u64 = 0,
     activity_epoch: u64 = 0,
     processed_requests: u64 = 0,
@@ -7320,8 +7321,10 @@ const UnsupportedEnrichmentRuntime = struct {
                 .sync_wait_timeout_ms = config.sync_wait_timeout_ms,
             },
         };
-        runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        const observed = try enrichment_state.loadRuntimeObservation(alloc, store, scope_name);
+        runtime.applied_sequence = observed.applied;
+        runtime.status_revision = observed.revision;
+        const persisted_status = observed.status;
         restorePersistedRuntimeStatus(&runtime, persisted_status);
         try restoreScopedRetryCache(&runtime);
         return runtime;
@@ -7331,8 +7334,10 @@ const UnsupportedEnrichmentRuntime = struct {
     /// joined. Reconfiguration must not start from a checkpoint/status
     /// snapshot taken while that worker could still publish progress.
     pub fn reloadDurableState(self: *@This()) !void {
-        self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
-        const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
+        const observed = try enrichment_state.loadRuntimeObservation(self.alloc, self.store, scope_name);
+        self.applied_sequence = observed.applied;
+        self.status_revision = observed.revision;
+        const persisted_status = observed.status;
         restorePersistedRuntimeStatus(self, persisted_status);
         try restoreScopedRetryCache(self);
         self.retry_error_has_request_identity = false;
@@ -7514,7 +7519,7 @@ const UnsupportedEnrichmentRuntime = struct {
         // concurrent work: a guard timeout/cancellation or scan-time error
         // can still leave an earlier quantum's dispatched lane running in
         // the background, and it must be awaited before this call returns.
-        const scan_result = runGeneratedCatchUpQuanta(self, self.applied_sequence, pending, replay_cursor_assets, replay_cursor_dense, guard, &pipeline, &processed_request_count);
+        const scan_result = runGeneratedCatchUpQuanta(self, self.applied_sequence, .discovery, pending, replay_cursor_assets, replay_cursor_dense, guard, &pipeline, &processed_request_count);
         const drain_result = pipeline.drainAll(if (scan_result) |_| true else |_| false);
         var max_seen = scan_result catch |err| {
             drain_result catch {};
@@ -7528,8 +7533,8 @@ const UnsupportedEnrichmentRuntime = struct {
         if (max_seen > self.applied_sequence) {
             self.active_failure_fingerprint = 0;
             self.retry_error_has_request_identity = false;
-            const applied = try publishAppliedProgressWithRetry(self, max_seen, runtimeStatusSnapshot(self));
-            self.applied_sequence = applied;
+            const published = try publishAppliedProgressWithRetry(self, max_seen, runtimeStatusSnapshot(self));
+            self.applied_sequence = published.applied;
             self.processed_requests += processed_request_count;
             self.retrying = false;
             clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
@@ -7548,8 +7553,8 @@ const UnsupportedEnrichmentRuntime = struct {
     pub fn markAppliedThrough(self: *@This(), sequence: u64) !void {
         if (sequence <= self.applied_sequence) return;
         const before = runtimeStatusSnapshot(self);
-        const applied = try publishAppliedProgressWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
-        _ = finishPrecomputedApplied(self, sequence, applied, before);
+        const published = try publishAppliedProgressWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
+        _ = finishPrecomputedApplied(self, sequence, published, before);
     }
 
     pub fn appliedSequence(self: *@This()) u64 {
@@ -7705,6 +7710,7 @@ const PlatformEnrichmentRuntime = struct {
     target_sequence: u64 = 0,
     activity_epoch: u64 = 0,
     applied_sequence: u64 = 0,
+    status_revision: ?u64 = null,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
@@ -7883,8 +7889,10 @@ const PlatformEnrichmentRuntime = struct {
         // Providers transfer only on successful return. Unwind local ownership
         // allocations without releasing another worker's durable lease.
         errdefer runtime.ownership.deinitPreserveLease(alloc);
-        runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        const observed = try enrichment_state.loadRuntimeObservation(alloc, store, scope_name);
+        runtime.applied_sequence = observed.applied;
+        runtime.status_revision = observed.revision;
+        const persisted_status = observed.status;
         restoreThreadedRuntimeStatus(&runtime, persisted_status);
         try restoreScopedRetryCache(&runtime);
         return runtime;
@@ -7895,8 +7903,10 @@ const PlatformEnrichmentRuntime = struct {
     pub fn reloadDurableState(self: *EnrichmentRuntime) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentReloadDurableState", .{self});
         if (self.future != null) return error.EnrichmentRuntimeStarted;
-        self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
-        const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
+        const observed = try enrichment_state.loadRuntimeObservation(self.alloc, self.store, scope_name);
+        self.applied_sequence = observed.applied;
+        self.status_revision = observed.revision;
+        const persisted_status = observed.status;
         restoreThreadedRuntimeStatus(self, persisted_status);
         try restoreScopedRetryCache(self);
         self.last_error_name = null;
@@ -8342,9 +8352,9 @@ const PlatformEnrichmentRuntime = struct {
 
             // Publish all durable state before admitting visibility waiters. An
             // interrupted publication leaves the in-memory cut retryable too.
-            const applied = try publishAppliedProgressWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
+            const published = try publishAppliedProgressWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
             self.mutex.lockUncancelable(io);
-            const advanced = finishPrecomputedApplied(self, sequence, applied, before);
+            const advanced = finishPrecomputedApplied(self, sequence, published, before);
             if (advanced) broadcastRuntimeStateChanged(self, io);
             self.mutex.unlock(io);
             break :publication advanced;
@@ -10105,7 +10115,7 @@ fn runForegroundCatchUpPassOwned(
     var processed_request_count: u64 = 0;
     if (due.groups.len != 0) {
         var due_pipeline = LanePipeline.init(runtime);
-        const due_result = runGeneratedCatchUpQuanta(runtime, runtime.appliedSequence(), due.groups, null, null, guard, &due_pipeline, &processed_request_count);
+        const due_result = runGeneratedCatchUpQuanta(runtime, runtime.appliedSequence(), .due_tickets, due.groups, null, null, guard, &due_pipeline, &processed_request_count);
         const drain_due = due_pipeline.drainAll(if (due_result) |_| true else |_| false);
         _ = due_result catch |err| {
             drain_due catch {};
@@ -10153,7 +10163,7 @@ fn runForegroundCatchUpPassOwned(
     // a guard timeout/cancellation or scan-time error can still leave an
     // earlier quantum's dispatched lane running in the background, and it
     // must be awaited before this call returns.
-    const scan_result = runGeneratedCatchUpQuanta(runtime, replay_applied, pending, replay_cursor_assets, replay_cursor_dense, guard, &pipeline, &processed_request_count);
+    const scan_result = runGeneratedCatchUpQuanta(runtime, replay_applied, .discovery, pending, replay_cursor_assets, replay_cursor_dense, guard, &pipeline, &processed_request_count);
     const drain_result = pipeline.drainAll(if (scan_result) |_| true else |_| false);
     var max_seen = scan_result catch |err| {
         drain_result catch {};
@@ -10185,9 +10195,9 @@ fn runForegroundCatchUpPassOwned(
         const pending_status = if (completed > runtime.applied_sequence) runtimeStatusSnapshot(runtime) else null;
         runtime.mutex.unlock(io);
         if (pending_status) |status| {
-            const applied = try publishAppliedProgressWithRetry(runtime, completed, status);
+            const published = try publishAppliedProgressWithRetry(runtime, completed, status);
             runtime.mutex.lockUncancelable(io);
-            runtime.applied_sequence = @max(runtime.applied_sequence, applied);
+            runtime.applied_sequence = @max(runtime.applied_sequence, published.applied);
             runtime.mutex.unlock(io);
         }
     }
@@ -16083,6 +16093,7 @@ test "privacy independent roots preserve the bounded asset replay lane" {
 fn runGeneratedCatchUpQuanta(
     runtime: *EnrichmentRuntime,
     replay_applied: u64,
+    pass: enum { discovery, due_tickets },
     pending: []const enrichment_worker.PendingDocumentGroup,
     replay_cursor_assets: ?enrichment_state.ReplayCursor,
     replay_cursor_dense: ?enrichment_state.ReplayCursor,
@@ -16166,15 +16177,15 @@ fn runGeneratedCatchUpQuanta(
             // Cursor checkpoints are saved per-lane inside dispatch as each
             // stream durably publishes.
             preparation.deinit();
-            try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, replay_applied, group, &prepared_sources);
+            try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, replay_applied, if (pass == .discovery) group else null, &prepared_sources);
         } else if (window.itemCount() >= max_window_items) {
             try flushGeneratedReplayWindow(runtime, &window);
-            try saveReplayCursorForIdleStreams(runtime, pipeline, deferred_assets.items.len, deferred_plain_dense.items.len + deferred_chunked_dense.items.len, replay_applied, group);
+            if (pass == .discovery) try saveReplayCursorForIdleStreams(runtime, pipeline, deferred_assets.items.len, deferred_plain_dense.items.len + deferred_chunked_dense.items.len, replay_applied, group);
         }
     }
     try guard.check();
     preparation.deinit();
-    try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, replay_applied, last_processed, &prepared_sources);
+    try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, replay_applied, if (pass == .discovery) last_processed else null, &prepared_sources);
     return max_seen;
 }
 
@@ -36482,9 +36493,10 @@ fn appliedRuntimeStatus(before: enrichment_state.RuntimeStatus, sequence: u64) e
 }
 
 /// Caller owns the worker state mutex on threaded runtimes.
-fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, applied: u64, before: enrichment_state.RuntimeStatus) bool {
+fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, published: enrichment_state.ProgressPublication, before: enrichment_state.RuntimeStatus) bool {
+    const applied = published.applied;
     if (applied <= runtime.applied_sequence) return false;
-    const reset_retry = applied == sequence and before.target_sequence <= sequence and std.meta.eql(before, runtimeStatusSnapshot(runtime));
+    const reset_retry = published.status_revision != null and applied == sequence and before.target_sequence <= sequence and std.meta.eql(before, runtimeStatusSnapshot(runtime));
     runtime.applied_sequence = applied;
     runtime.target_sequence = @max(runtime.target_sequence, applied);
     if (reset_retry) {
@@ -36504,14 +36516,14 @@ fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, applied:
     return true;
 }
 
-fn publishAppliedProgressWithRetry(runtime: *EnrichmentRuntime, sequence: u64, status: enrichment_state.RuntimeStatus) !u64 {
+fn publishAppliedProgressWithRetry(runtime: *EnrichmentRuntime, sequence: u64, status: enrichment_state.RuntimeStatus) !enrichment_state.ProgressPublication {
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
     const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        return enrichment_state.publishAppliedProgress(runtime.alloc, live_store.*, scope_name, sequence, config_hash, status) catch |err| switch (err) {
+        const published = enrichment_state.publishAppliedProgressObserved(runtime.alloc, live_store.*, scope_name, sequence, config_hash, status, runtime.status_revision) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -36519,6 +36531,10 @@ fn publishAppliedProgressWithRetry(runtime: *EnrichmentRuntime, sequence: u64, s
             },
             else => return err,
         };
+        if (runtime.status_revision != null) if (published.status_revision) |revision| {
+            runtime.status_revision = revision;
+        };
+        return published;
     }
 }
 
@@ -36696,7 +36712,7 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, mode: StatusPublicati
     const projection_status = runtimeProjectionStatus(status.retrying, status.worker_failed);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveRuntimeStatusAndProjection(runtime.alloc, live_store.*, scope_name, applied, status, projection_status, config_hash) catch |err| switch (err) {
+        const next = enrichment_state.saveRuntimeStatusAndProjection(runtime.alloc, live_store.*, scope_name, applied, runtime.status_revision, status, projection_status, config_hash) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -36704,6 +36720,11 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, mode: StatusPublicati
             },
             else => return err,
         };
+        if (next) |revision| {
+            if (runtime.status_revision != null) runtime.status_revision = revision;
+        } else if (mode == .boundary_recovery) {
+            return error.EnrichmentSourceChanged;
+        }
         return;
     }
 }
@@ -37397,7 +37418,7 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
         .config_hash = 0,
     });
 
-    try std.testing.expectEqual(@as(u64, 5), try publishAppliedProgressWithRetry(&runtime, 5, runtimeStatusSnapshot(&runtime)));
+    try std.testing.expectEqual(@as(u64, 5), (try publishAppliedProgressWithRetry(&runtime, 5, runtimeStatusSnapshot(&runtime))).applied);
     const degraded_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 5), degraded_checkpoint.applied_sequence);
     try std.testing.expectEqual(enrichment_state.ProjectionStatus.degraded, degraded_checkpoint.status);

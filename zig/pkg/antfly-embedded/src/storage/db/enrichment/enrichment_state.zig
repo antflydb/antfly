@@ -182,6 +182,20 @@ pub fn saveReplayCursorAtCut(alloc: Allocator, store: anytype, scope: ?[]const u
             return;
         }
     }
+    if (scope != null) {
+        const previous = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+        if (previous) |bytes| {
+            if (replayCursorView(bytes)) |existing| {
+                if (existing.base_applied_sequence == cursor.base_applied_sequence and
+                    (existing.sequence > cursor.sequence or (existing.sequence == cursor.sequence and
+                        std.mem.order(u8, existing.doc_key, cursor.doc_key) != .lt)))
+                {
+                    txn.abort();
+                    return;
+                }
+            } else |_| {}
+        }
+    }
     try txn.put(key, raw);
     try txn.commit();
 }
@@ -218,6 +232,21 @@ fn encodeReplayCursor(alloc: Allocator, cursor: ReplayCursor) ![]u8 {
 }
 
 fn decodeReplayCursor(alloc: Allocator, raw: []const u8) !ReplayCursor {
+    const view = try replayCursorView(raw);
+    return .{
+        .base_applied_sequence = view.base_applied_sequence,
+        .sequence = view.sequence,
+        .doc_key = try alloc.dupe(u8, view.doc_key),
+    };
+}
+
+const ReplayCursorView = struct {
+    base_applied_sequence: u64,
+    sequence: u64,
+    doc_key: []const u8,
+};
+
+fn replayCursorView(raw: []const u8) error{InvalidEnrichmentState}!ReplayCursorView {
     const fixed_len = replay_cursor_magic.len + 4 + 8 + 8 + 4 + 4;
     if (raw.len < fixed_len or !std.mem.eql(u8, raw[0..replay_cursor_magic.len], replay_cursor_magic))
         return error.InvalidEnrichmentState;
@@ -234,7 +263,7 @@ fn decodeReplayCursor(alloc: Allocator, raw: []const u8) !ReplayCursor {
     return .{
         .base_applied_sequence = base_applied_sequence,
         .sequence = sequence,
-        .doc_key = try alloc.dupe(u8, raw[pos..body_len]),
+        .doc_key = raw[pos..body_len],
     };
 }
 
@@ -276,7 +305,16 @@ pub fn saveProjectionCheckpoint(store: anytype, scope: []const u8, checkpoint: P
 /// Commit a precomputed visibility cut as one publication. A failed write
 /// leaves progress, cursors and worker status together at the previous cut.
 /// Late acknowledgements cannot retire a newer cursor or regress progress.
+pub const ProgressPublication = struct {
+    applied: u64,
+    status_revision: ?u64 = null,
+};
+
 pub fn publishAppliedProgress(alloc: Allocator, store: anytype, scope: []const u8, sequence: u64, config_hash: u64, status: RuntimeStatus) !u64 {
+    return (try publishAppliedProgressObserved(alloc, store, scope, sequence, config_hash, status, null)).applied;
+}
+
+pub fn publishAppliedProgressObserved(alloc: Allocator, store: anytype, scope: []const u8, sequence: u64, config_hash: u64, status: RuntimeStatus, observed_revision: ?u64) !ProgressPublication {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
@@ -286,11 +324,14 @@ pub fn publishAppliedProgress(alloc: Allocator, store: anytype, scope: []const u
     defer alloc.free(key);
     const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
     var checkpoint = if (raw) |bytes| try decodeProjectionCheckpoint(bytes) else ProjectionCheckpoint{};
-    if (checkpoint.applied_sequence > sequence) return checkpoint.applied_sequence;
+    if (checkpoint.applied_sequence > sequence) return .{ .applied = checkpoint.applied_sequence };
     const previous = try loadRuntimeStatusTxn(alloc, &txn, scope);
     // A worker may already have parked a later request while this caller was
     // acquiring publication authority. Preserve that durable status as well.
-    const current_status = if (previous.target_sequence > sequence and previous.target_sequence >= status.target_sequence) previous else status;
+    const revision = try loadStatusRevisionTxn(alloc, &txn, scope);
+    const preserve_status = (observed_revision != null and observed_revision.? != revision) or
+        (previous.target_sequence > sequence and previous.target_sequence >= status.target_sequence);
+    const current_status = if (preserve_status) previous else status;
     const previous_applied = checkpoint.applied_sequence;
     checkpoint.applied_sequence = sequence;
     checkpoint.config_hash = config_hash;
@@ -329,10 +370,10 @@ pub fn publishAppliedProgress(alloc: Allocator, store: anytype, scope: []const u
     }
     var encoded = encodeProjectionCheckpoint(checkpoint);
     try txn.put(key, &encoded);
-    try putRuntimeStatusTxn(&txn, scope, current_status);
+    const status_revision = if (preserve_status) null else try putVersionedStatusTxn(alloc, &txn, scope, current_status, revision);
     try txn.commit();
     committed = true;
-    return sequence;
+    return .{ .applied = sequence, .status_revision = status_revision };
 }
 
 fn decodeProjectionCheckpoint(raw: []const u8) !ProjectionCheckpoint {
@@ -391,6 +432,47 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
     return loadRuntimeStatusTxn(alloc, &txn, scope);
+}
+
+pub const RuntimeObservation = struct {
+    applied: u64,
+    status: RuntimeStatus,
+    revision: u64,
+};
+
+pub fn loadRuntimeObservation(alloc: Allocator, store: anytype, scope: []const u8) !RuntimeObservation {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    return .{
+        .applied = (try loadProjectionCheckpointTxn(alloc, &txn, scope)).applied_sequence,
+        .status = try loadRuntimeStatusTxn(alloc, &txn, scope),
+        .revision = try loadStatusRevisionTxn(alloc, &txn, scope),
+    };
+}
+
+fn statusRevisionKey(alloc: Allocator, scope: []const u8) ![]u8 {
+    return std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":revision" });
+}
+
+fn loadStatusRevisionTxn(alloc: Allocator, txn: anytype, scope: []const u8) !u64 {
+    const key = try statusRevisionKey(alloc, scope);
+    defer alloc.free(key);
+    const bytes = txn.get(key) catch |err| if (err == error.NotFound) return 0 else return err;
+    if (bytes.len != 8) return error.InvalidEnrichmentState;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+fn putVersionedStatusTxn(alloc: Allocator, txn: anytype, scope: []const u8, status: RuntimeStatus, revision: u64) !u64 {
+    const next = try std.math.add(u64, revision, 1);
+    const key = try statusRevisionKey(alloc, scope);
+    defer alloc.free(key);
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, next, .little);
+    try putRuntimeStatusTxn(txn, scope, status);
+    try txn.put(key, &encoded);
+    return next;
 }
 
 fn loadRuntimeStatusTxn(alloc: Allocator, txn: anytype, scope: []const u8) !RuntimeStatus {
@@ -510,13 +592,14 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    try putRuntimeStatusTxn(&txn, scope, status);
+    const revision = try loadStatusRevisionTxn(std.heap.page_allocator, &txn, scope);
+    _ = try putVersionedStatusTxn(std.heap.page_allocator, &txn, scope, status, revision);
     try txn.commit();
 }
 
 /// Publish worker status and its projection metadata without replacing progress
 /// from a checkpoint read before write admission.
-pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: []const u8, observed_applied: u64, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64) !void {
+pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: []const u8, observed_applied: u64, observed_revision: ?u64, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64) !?u64 {
     const key = try appliedSequenceKey(alloc, scope);
     defer alloc.free(key);
     var runtime = try initRuntimeStore(alloc, store);
@@ -525,16 +608,20 @@ pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: [
     errdefer txn.abort();
     const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
     var checkpoint = if (raw) |bytes| try decodeProjectionCheckpoint(bytes) else ProjectionCheckpoint{};
-    if (checkpoint.applied_sequence > observed_applied and status.target_sequence <= checkpoint.applied_sequence) {
+    const revision = try loadStatusRevisionTxn(alloc, &txn, scope);
+    if ((observed_revision != null and observed_revision.? != revision) or
+        (checkpoint.applied_sequence > observed_applied and status.target_sequence <= checkpoint.applied_sequence))
+    {
         txn.abort();
-        return;
+        return null;
     }
     checkpoint.status = projection_status;
     checkpoint.config_hash = config_hash;
     const encoded = encodeProjectionCheckpoint(checkpoint);
     try txn.put(key, &encoded);
-    try putRuntimeStatusTxn(&txn, scope, status);
+    const next = try putVersionedStatusTxn(alloc, &txn, scope, status, revision);
     try txn.commit();
+    return next;
 }
 
 fn putRuntimeStatusTxn(txn: anytype, scope: []const u8, status: RuntimeStatus) !void {
@@ -719,7 +806,7 @@ test "enrichment status publication keeps progress advanced before write admissi
     instrumented.write_gate = null;
 
     const worker_status: RuntimeStatus = .{ .target_sequence = 8, .retrying = true };
-    try saveRuntimeStatusAndProjection(alloc, instrumented, "generated", 4, worker_status, .degraded, 12);
+    _ = try saveRuntimeStatusAndProjection(alloc, instrumented, "generated", 4, null, worker_status, .degraded, 12);
     try std.testing.expectEqual(@as(usize, 1), Admission.writes);
 
     const checkpoint = try loadProjectionCheckpoint(alloc, store, "generated");
@@ -755,7 +842,7 @@ test "enrichment status publication keeps progress advanced before write admissi
 
     // An old failure for an acknowledged cut must not be restored after
     // restart, even when it only attempts to publish status.
-    try saveRuntimeStatusAndProjection(alloc, store, "generated", 4, .{
+    _ = try saveRuntimeStatusAndProjection(alloc, store, "generated", 4, null, .{
         .target_sequence = 5,
         .worker_failed = true,
     }, .repair_required, 99);
@@ -772,6 +859,32 @@ test "enrichment status publication keeps progress advanced before write admissi
     defer current.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 9), current.sequence);
     try std.testing.expectEqualStrings("a", current.doc_key);
+
+    // Independent runtimes may load the same initial revision. A later
+    // writer cannot replace the live retry episode, even for the same cut.
+    const detached = try loadRuntimeObservation(alloc, store, "generated");
+    const live_status: RuntimeStatus = .{ .target_sequence = 10, .worker_failed = true, .next_retry_at_ms = 91 };
+    const live_revision = (try saveRuntimeStatusAndProjection(alloc, store, "generated", 6, detached.revision, live_status, .repair_required, 11)).?;
+    try std.testing.expect((try saveRuntimeStatusAndProjection(alloc, store, "generated", 6, detached.revision, .{ .target_sequence = 8 }, .clean, 11)) == null);
+    const forward = try publishAppliedProgressObserved(alloc, store, "generated", 7, 11, .{ .target_sequence = 11 }, detached.revision);
+    try std.testing.expectEqual(@as(u64, 7), forward.applied);
+    try std.testing.expectEqual(@as(?u64, null), forward.status_revision);
+    const latest = try loadRuntimeObservation(alloc, store, "generated");
+    try std.testing.expectEqual(live_revision, latest.revision);
+    try std.testing.expectEqual(live_status, latest.status);
+
+    // Same-cut checkpoints also order documents within a replay sequence.
+    for ([_]u64{ 8, 9 }) |sequence| {
+        try saveReplayCursorAtCut(alloc, store, "generated", "generated.dense", .{
+            .base_applied_sequence = 7,
+            .sequence = sequence,
+            .doc_key = @constCast("0"),
+        });
+    }
+    var retained = (try loadReplayCursorAtCut(alloc, store, "generated", "generated.dense", 7)).?;
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 9), retained.sequence);
+    try std.testing.expectEqualStrings("a", retained.doc_key);
 }
 
 test "enrichment projection checkpoint rejects malformed structured state" {

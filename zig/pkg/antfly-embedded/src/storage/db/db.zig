@@ -78131,6 +78131,7 @@ test "db enrichment status changes notify only after atomic publication" {
             defer db.close();
             const runtime = db.enrichment_runtime.?;
             try enrichment_state.saveRuntimeStatus(runtime.store, "generated", .{ .worker_failed = true, .target_sequence = 1 });
+            try runtime.reloadDurableState();
             for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
                 try enrichment_state.saveReplayCursor(runtime.store, scope, .{ .base_applied_sequence = 0, .sequence = 1, .doc_key = @constCast("pending") });
             }
