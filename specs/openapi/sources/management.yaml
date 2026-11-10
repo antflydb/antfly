@@ -148,7 +148,21 @@
               }
             }
           }
-        }
+        },
+        "description": "Replaces the source declaration. With If-Match, the write succeeds only when the current declaration revision matches; runtimes that advertise revision_preconditions compare under the same lock as the write. If-Match never creates a source.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "description": "Quoted declaration revision from a prior GET (strong tag only).",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            }
+          }
+        ]
       },
       "delete": {
         "operationId": "removeSource",
@@ -588,6 +602,10 @@
           "knowledge_audience": {
             "type": "string",
             "description": "Runtime deployment boundary, absent when knowledge is disabled."
+          },
+          "revision_preconditions": {
+            "type": "boolean",
+            "description": "PUT /sources/{source_id} honors If-Match declaration revisions."
           }
         }
       },
@@ -702,6 +720,12 @@
             "$ref": "#/components/schemas/KnowledgeStatus",
             "readOnly": true,
             "x-go-type-skip-optional-pointer": false
+          },
+          "revision": {
+            "type": "string",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Opaque declaration revision returned by GET and PUT. Covers declared fields only; run state and search status do not change it. Ignored when submitted."
           }
         },
         "additionalProperties": false

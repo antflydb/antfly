@@ -35,6 +35,7 @@ class Capabilities(TypedDict):
     processing_jobs: NotRequired[bool]
     knowledge_versions: NotRequired[list[int]]
     knowledge_audience: NotRequired[str]
+    revision_preconditions: NotRequired[bool]
 
 
 class SourceIdentity(TypedDict):
@@ -60,6 +61,7 @@ class Source(TypedDict):
     processing: NotRequired[ProcessingDeclaration]
     knowledge: NotRequired[KnowledgeDeclaration]
     knowledge_status: NotRequired[KnowledgeStatus]
+    revision: NotRequired[str]
 
 
 class Run(TypedDict):
