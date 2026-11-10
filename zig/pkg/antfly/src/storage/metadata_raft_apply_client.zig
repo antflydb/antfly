@@ -574,6 +574,10 @@ pub const RaftApplyStore = struct {
     pub fn sqlPolicyPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_status = table_id });
     }
+    pub fn validateRetainedOwnerReceipt(self: *RaftApplyStore, group: u64, receipt: @import("../metadata/retained_dataset_owner_receipt.zig").Receipt) !void {
+        try receipt.verify();
+        if (!try self.catalogProjection(bool, self.alloc, group, .{ .retained_owner_receipt_preflight = receipt })) return error.RetainedOwnerPlanChanged;
+    }
     pub fn retainedOwnerReadJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("../metadata/retained_dataset_owners.zig").Read) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group, .{ .retained_owner_read = request });

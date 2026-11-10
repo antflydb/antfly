@@ -1647,6 +1647,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.fk_generation_parent_suffix, httpx.Handler.bind(self, internalGroupFkGenerationParent));
         try server.post(table_prefix ++ routes.fk_generation_source_suffix, httpx.Handler.bind(self, internalGroupFkGenerationSource));
         try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
+        try server.post(table_prefix ++ routes.retained_owner_control_suffix, httpx.Handler.bind(self, internalGroupRetainedOwnerControl));
         try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
@@ -2884,6 +2885,29 @@ pub const AntflyApiHandler = struct {
             error.InitialChildPublicationChanged, error.GenerationAdmissionChanged, error.IntegrityCatalogChanged, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "initial FK child plan or owner changed"),
             error.Canceled, error.Cancelled => textResponse(ctx, 408, "initial FK child canceled"),
             else => textResponse(ctx, 503, "initial FK child must be retried"),
+        };
+        return ctx.json(receipt);
+    }
+
+    fn internalGroupRetainedOwnerControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        // New destructive controls never inherit legacy unauthenticated-peer
+        // migration mode. The source fence is an internal service capability.
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "retained owner request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "retained owner request too large");
+        var parsed = std.json.parseFromSlice(@import("retained_owner_control.zig").Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid retained owner request");
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid retained owner scope");
+        const port = self.api_server.cfg.retained_owner_control orelse return textResponse(ctx, 503, "retained owner unavailable");
+        const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.RetainedOwnerPlanChanged, error.InvalidRetainedOwnerPlan, error.RetainedSeriesDefinitionMismatch, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "retained owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "retained owner canceled"),
+            else => textResponse(ctx, 503, "retained owner operation must be retried"),
         };
         return ctx.json(receipt);
     }
@@ -22782,4 +22806,21 @@ test "distributed SQL API control routes authenticate cancellation and share ter
     var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status.code);
+}
+
+test "retained owner native controls require service credentials even in legacy migration mode" {
+    const a = std.testing.allocator;
+    var api = ApiHttpServer.init(a, .{ .internal_service_secret = "0123456789abcdef0123456789abcdef", .internal_service_issuer = "retained-owners", .internal_service_accept_legacy_unauthenticated = true }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    for ([_]?[]const u8{ null, "invalid" }) |credential| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/11/tables/raw/retained-owner-control");
+        defer request.deinit();
+        if (credential) |token| try request.headers.set(internal_service_auth.header_name, token);
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.internalGroupRetainedOwnerControl(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    }
 }

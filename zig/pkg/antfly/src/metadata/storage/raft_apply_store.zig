@@ -26,6 +26,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 // Accommodate their bounded envelope as well as ordinary 255-byte names.
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
+const retained_owner_receipt = @import("../retained_dataset_owner_receipt.zig");
 const retained_owner_model = @import("../retained_dataset_owners.zig");
 const retained_owner_journal = @import("../retained_dataset_owner_store.zig");
 const transaction_session_record = @import("../transaction_session_record.zig");
@@ -5899,6 +5900,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 }
 
 pub const TransitionCommand = union(enum) {
+    acknowledge_retained_owner: retained_owner_receipt.Receipt,
     register_retained_owners: retained_owner_model.Registration,
     apply_transaction_sessions: []const u8,
     advance_resolver_namespace: @import("../resolver_authority.zig").ReplayAdvance,
@@ -6201,6 +6203,7 @@ pub const TransitionCommand = union(enum) {
 
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
+        .acknowledge_retained_owner => |receipt| try receipt.verify(),
         .register_retained_owners => |request| try request.validate(),
         .apply_relation_reconciliation => |bytes| _ = try relation_control.Command.decode(bytes),
         .advance_resolver_namespace => |intent| if (intent.table_id == 0) return error.InvalidResolverCurationRequest,
@@ -15069,6 +15072,65 @@ pub const RaftApplyStore = struct {
     /// Register at most 64 owners from the frozen topology. The request cannot
     /// supply a partition or install receipt; cancellation/revision races are
     /// checked before deriving any native authority or writing any owner row.
+    /// Validate cryptographic and current physical authority at the same cut
+    /// as the owner CAS. No caller-supplied aggregate plan revision is used:
+    /// acknowledgements for distinct owners commute under this transaction.
+    pub fn validateRetainedOwnerReceipt(self: *RaftApplyStore, group: u64, receipt: retained_owner_receipt.Receipt) !void {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        try self.retainedOwnerReceiptTxn(&txn, group, receipt, false);
+    }
+    fn acknowledgeRetainedOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, receipt: retained_owner_receipt.Receipt) !void {
+        return self.retainedOwnerReceiptTxn(txn, group, receipt, true);
+    }
+    fn retainedOwnerReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, receipt: retained_owner_receipt.Receipt, persist: bool) !void {
+        try receipt.verify();
+        try self.requireStoreRootEnrollmentTxn(txn, group, receipt.identity);
+        const current = (try self.loadStoreHeaderTxn(txn, group, receipt.identity.store_id)) orelse return error.RetainedOwnerPlanChanged;
+        defer metadata_table_manager.freeStore(self.alloc, current);
+        if (!current.live or current.node_id != receipt.identity.node_id or current.reporter_incarnation != receipt.reporter_incarnation or
+            current.replica_root_incarnation != receipt.identity.root_incarnation or
+            !std.mem.eql(u8, &current.replica_root_public_key, &receipt.identity.public_key)) return error.RetainedOwnerPlanChanged;
+        var key: [192]u8 = undefined;
+        const cluster_bytes = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&key, group))) orelse return error.RetainedOwnerPlanChanged;
+        if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(cluster_bytes)).incarnation, &receipt.identity.metadata_incarnation)) return error.RetainedOwnerPlanChanged;
+        const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&key, group, receipt.group, receipt.identity.node_id))) orelse return error.RetainedOwnerPlanChanged;
+        defer raft_reconciler.freeIntentOwned(self.alloc, placement);
+        if (placement.store_id != receipt.identity.store_id or placement.record.group_id != receipt.group or
+            placement.record.local_node_id != receipt.identity.node_id or placement.record.replica_id != receipt.replica_id or
+            placement.record.metadata_version != receipt.metadata_version or placement.serving_state != .serving or
+            std.mem.indexOfScalar(u64, placement.peer_node_ids, receipt.identity.node_id) == null) return error.RetainedOwnerPlanChanged;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const plan = (try retained_owner_journal.getPlan(a, txn, group, receipt.resource, receipt.generation)) orelse return error.RetainedOwnerPlanChanged;
+        const topology = try self.loadTableTransitionFenceTxn(txn, group, plan.source_table);
+        if (topology.active() or topology.generation != plan.topology_generation or
+            !std.mem.eql(u8, &topology.membership(plan.source_table).digest, &plan.membership)) return error.RetainedOwnerPlanChanged;
+        const source: system_catalog.retained_datasets.Source = .{ .metadata_incarnation = receipt.identity.metadata_incarnation, .table_id = plan.source_table, .storage_name = "identity-only", .schema = @splat(1), .schema_version = 0 };
+        if (!std.mem.eql(u8, &source.identity(), &plan.source)) return error.RetainedOwnerPlanChanged;
+        const raw_range = (try stagingGet(txn, try rangeKeyForGroup(&key, group, receipt.group))) orelse return error.RetainedOwnerPlanChanged;
+        const range = try decodeRangeRecord(a, raw_range);
+        if (range.group_id != receipt.group or range.table_id != plan.source_table) return error.RetainedOwnerPlanChanged;
+        const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{
+            .table_id = plan.source_table,
+            .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+            .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+        });
+        var partition: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+        if (!std.mem.eql(u8, &partition, &receipt.partition)) return error.RetainedOwnerPlanChanged;
+        var previous = (try retained_owner_journal.getOwner(a, txn, group, plan.id, receipt.group)) orelse return error.RetainedOwnerPlanChanged;
+        defer previous.deinit();
+        // An exact retry is already complete. A different signed observation
+        // cannot consume an owner revision that another transition advanced.
+        if (previous.value.revision == receipt.owner_revision + 1 and previous.value.native_receipt != null and
+            std.mem.eql(u8, &previous.value.native_receipt.?, &try receipt.digest())) return;
+        const owner = try receipt.owner(a, plan, previous.value);
+        if (!persist) return;
+        _ = try retained_owner_journal.acknowledge(a, txn, group, .{ .resource = plan.resource, .generation = plan.generation, .owner_group = receipt.group }, plan.revision, receipt.owner_revision, owner);
+    }
+
     fn registerRetainedOwnersTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: retained_owner_model.Registration) !void {
         try request.validate();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -18874,7 +18936,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
-            .register_retained_owners => metadataSnapshotProjectionBit(.retained_owner_plan) | metadataSnapshotProjectionBit(.retained_owner) | metadataSnapshotProjectionBit(.retained_owner_work),
+            .acknowledge_retained_owner, .register_retained_owners => metadataSnapshotProjectionBit(.retained_owner_plan) | metadataSnapshotProjectionBit(.retained_owner) | metadataSnapshotProjectionBit(.retained_owner_work),
             .apply_transaction_sessions => metadataSnapshotProjectionBit(.transaction_sessions),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
@@ -21273,6 +21335,12 @@ pub const RaftApplyStore = struct {
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
             },
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
+            .acknowledge_retained_owner => |receipt| self.acknowledgeRetainedOwnerTxn(txn, group_id, receipt) catch |err| switch (err) {
+                // Authority may change after a legitimate observation was
+                // proposed. Reject it without halting the committed log.
+                error.RetainedOwnerPlanChanged, error.InvalidRetainedOwnerPlan, error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged => {},
+                else => return err,
+            },
             .register_retained_owners => |request| try self.registerRetainedOwnersTxn(txn, group_id, request),
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .apply_transaction_sessions => |bytes| {
@@ -28379,6 +28447,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 
 const TransitionTag = enum(u8) {
     register_retained_owners = 83,
+    acknowledge_retained_owner = 84,
     apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
     apply_transaction_sessions = 82,
@@ -28525,6 +28594,14 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_relation_reconciliation => |bytes| {
             _ = try relation_control.Command.decode(bytes);
             try out.append(alloc, @backingInt(TransitionTag.apply_relation_reconciliation));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .acknowledge_retained_owner => |receipt| {
+            try receipt.verify();
+            const bytes = try std.json.Stringify.valueAlloc(alloc, receipt, .{});
+            defer alloc.free(bytes);
+            if (bytes.len > retained_owner_receipt.max_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @backingInt(TransitionTag.acknowledge_retained_owner));
             try appendRequiredString(alloc, &out, bytes);
         },
         .register_retained_owners => |request| {
@@ -29001,6 +29078,15 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
             _ = try relation_control.Command.decode(bytes);
             break :blk .{ .apply_relation_reconciliation = bytes };
+        },
+        .acknowledge_retained_owner => blk: {
+            if (encoded.len > retained_owner_receipt.max_bytes + 16) return error.CatalogCommandTooLarge;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(retained_owner_receipt.Receipt, alloc, bytes, .{});
+            defer parsed.deinit();
+            try parsed.value.verify();
+            break :blk .{ .acknowledge_retained_owner = parsed.value };
         },
         .register_retained_owners => blk: {
             var request: retained_owner_model.Registration = .{ .resource = try readInt(encoded, &pos, u64), .generation = try readInt(encoded, &pos, u64), .plan = undefined, .revision = undefined };
@@ -45801,4 +45887,102 @@ test "system catalog retained activation journals source ownership atomically an
     try std.testing.expectEqual(standalone_revision, try store.standaloneRevision());
     try std.testing.expectEqual(renamed_meta.revision, (try store.systemCatalogMeta(a, group)).revision);
     try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requireRetainedSourceDropAllowed(group, 7));
+}
+
+test "system catalog retained owner acknowledgements verify physical authority and commute across owners" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/retained-native-ack", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const cluster = "11111111111111111111111111111111".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = cluster });
+    try store.replaceStandaloneCatalog(group, try store.standaloneRevision(), &.{.{ .table_id = 7, .name = "raw" }}, &.{
+        .{ .table_id = 7, .group_id = 11, .range_id = 11, .start_key = "", .end_key = "a" },
+        .{ .table_id = 7, .group_id = 12, .range_id = 12, .start_key = "a" },
+    }, "{}");
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = cluster, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    var reporter: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = pair.public_key.toBytes(), .role = "data", .live = true };
+    try store.applyStandaloneCommand(group, .{ .register_store = reporter });
+    const enrollment = try store_root_enrollment.Request.sign(identity, seed);
+    const enrollment_json = try std.json.Stringify.valueAlloc(a, enrollment, .{});
+    defer a.free(enrollment_json);
+    const source = try system_catalog.retained_datasets.Source.fromTable(a, metadata.TableRecord{ .table_id = 7, .name = "raw" }, cluster);
+    const Partition = struct {
+        fn forGroup(owner_group: u64) [32]u8 {
+            const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = 7, .shard_id = owner_group, .range_id = owner_group });
+            var partition: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+            return partition;
+        }
+    };
+    var plan: retained_owner_model.Plan = undefined;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        const fence = try store.loadTableTransitionFenceTxn(&txn, group, 7);
+        plan = .{ .id = @splat(0), .resource = 41, .dataset = @splat(2), .generation = 1, .definition = @splat(3), .source = source.identity(), .source_table = 7, .topology_generation = fence.generation, .membership = fence.membership(7).digest };
+        plan.id = plan.identity();
+        _ = try retained_owner_journal.create(a, &txn, group, plan);
+        for ([_]u64{ 11, 12 }) |owner_group| {
+            plan = try retained_owner_journal.register(a, &txn, group, .{ .resource = 41, .generation = 1 }, plan.revision, .{ .plan = plan.id, .group = owner_group, .partition = Partition.forGroup(owner_group), .incarnation = 1 });
+            var key: [192]u8 = undefined;
+            const encoded = try encodePlacementIntent(a, .{ .record = .{ .group_id = owner_group, .replica_id = owner_group, .local_node_id = 2, .metadata_version = 6 }, .store_id = 3, .peer_node_ids = &.{2} });
+            defer a.free(encoded);
+            try txn.put(try placementKeyForGroup(&key, group, owner_group, 2), encoded);
+        }
+        plan = try retained_owner_journal.transition(a, &txn, group, .{ .resource = 41, .generation = 1 }, plan.revision, .complete_registration);
+        try txn.commit();
+    }
+    const first = try (retained_owner_receipt.Receipt{ .resource = 41, .generation = 1, .plan = plan.id, .dataset = plan.dataset, .definition = plan.definition, .group = 11, .partition = Partition.forGroup(11), .incarnation = 1, .owner_revision = 1, .mode = .ready, .cut = .{ .sequence = 42, .complete_from_ns = 0, .admitted_ns = 100 }, .identity = identity, .reporter_incarnation = 4, .replica_id = 11, .metadata_version = 6, .native_root = 17 }).sign(seed);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.acknowledgeRetainedOwnerTxn(&txn, group, first));
+    }
+    try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment_json });
+    var second = first;
+    second.group = 12;
+    second.partition = Partition.forGroup(12);
+    second.replica_id = 12;
+    second = try second.sign(seed);
+    // Both receipts name owner revision one. Neither carries the shared plan
+    // revision, so accepting one cannot make the other spuriously stale.
+    for ([_]retained_owner_receipt.Receipt{ first, second, first }) |receipt| {
+        const encoded = try encodeTransitionCommand(a, .{ .acknowledge_retained_owner = receipt });
+        defer a.free(encoded);
+        var decoded = (try decodeTransitionCommand(a, encoded)).?;
+        defer decoded.deinit(a);
+        try std.testing.expectEqualDeep(receipt, decoded.acknowledge_retained_owner);
+        try store.applyStandaloneCommand(group, decoded);
+    }
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        const observed = (try retained_owner_journal.getPlan(a, &txn, group, 41, 1)).?;
+        try std.testing.expectEqual(@as(u32, 2), observed.ready);
+        try std.testing.expectEqual(plan.revision + 2, observed.revision);
+    }
+    var next = first;
+    next.owner_revision = 2;
+    next.mode = .installed;
+    next = try next.sign(seed);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.RetainedOwnerPlanChanged, store.acknowledgeRetainedOwnerTxn(&txn, group, next));
+    }
+    // An enrolled but superseded physical reporter is not current authority.
+    reporter.reporter_incarnation += 1;
+    try store.applyStandaloneCommand(group, .{ .register_store = reporter });
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.RetainedOwnerPlanChanged, store.acknowledgeRetainedOwnerTxn(&txn, group, first));
+    }
 }

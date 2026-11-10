@@ -106,6 +106,10 @@ pub const Progress = struct {
     complete_from_ns: i128,
     ready: bool = false,
     closed: bool = false,
+    /// Immutable logical closure clock. Maintenance may advance admitted_ns
+    /// after closure; signed closure receipts must never use that moving clock.
+    /// Legacy closed progress requires a replicated close before attestation.
+    closed_at_ns: ?i128 = null,
     /// Terminal producer cancellation; incomplete backfill never becomes coverage.
     revoked: bool = false,
     /// Stop new admissions while previously prepared transactions drain.
@@ -118,8 +122,14 @@ pub const Progress = struct {
     support_cursor: []const u8 = "",
     maintenance_pending: bool = false,
     last_tick_ns: i128 = 0,
+    maintenance_next_slot: u2 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+    }
+    pub fn closureCut(self: Progress) !struct { sequence: u64, complete_from_ns: i128, admitted_ns: i128 } {
+        if (self.revoked) return error.RetainedSeriesSourceRevoked;
+        if (!self.closed) return error.RetainedSeriesNotReady;
+        return .{ .sequence = self.source_sequence, .complete_from_ns = self.complete_from_ns, .admitted_ns = self.closed_at_ns orelse return error.RetainedSeriesNotReady };
     }
 };
 pub const Scalar = union(enum) { null, integer: i64, number: f64 };
@@ -194,6 +204,8 @@ pub const Engine = struct {
         if ((p.backfill_clean or (p.closed and !p.revoked)) and !p.ready) return error.RetainedSeriesCorrupt;
         if (p.revoked and !p.closed) return error.RetainedSeriesCorrupt;
         if (p.draining and p.closed) return error.RetainedSeriesCorrupt;
+        if (p.closed_at_ns) |closed_at| if (!p.closed or closed_at > p.admitted_ns) return error.RetainedSeriesCorrupt;
+        if (p.maintenance_next_slot > 2) return error.RetainedSeriesCorrupt;
         if (p.feed_floor > p.feed_latest or p.feed_latest - p.feed_floor > max_feed_frames or p.feed_bytes > max_feed_bytes or
             try self.spec.bucket(p.complete_from_ns) != p.complete_from_ns) return error.RetainedSeriesCorrupt;
         return p;
@@ -253,6 +265,11 @@ pub const Engine = struct {
             if (revoking) {
                 p.revoked = true;
                 try self.save(a, txn, p);
+            } else if (p.closed_at_ns == null) {
+                // Explicitly pin a legacy closed producer's existing durable
+                // clock. This replicated repair never reopens source writes.
+                p.closed_at_ns = p.admitted_ns;
+                try self.save(a, txn, p);
             }
             return;
         }
@@ -265,9 +282,19 @@ pub const Engine = struct {
         }
         p.admitted_ns = @max(p.admitted_ns, admitted_ns);
         p.closed = true;
+        if (!revoking) p.closed_at_ns = p.admitted_ns;
         p.draining = false;
         p.revoked = revoking;
         try self.save(a, txn, p);
+    }
+    pub fn recordMaintenance(self: Engine, txn: anytype, next_slot: u2) !void {
+        if (next_slot > 2) return error.InvalidRetainedSeries;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var progress = try self.load(a, txn);
+        progress.maintenance_next_slot = next_slot;
+        try self.save(a, txn, progress);
     }
     fn bucketKey(self: Engine, a: A, row: Row) ![]u8 {
         var digest: Id = undefined;

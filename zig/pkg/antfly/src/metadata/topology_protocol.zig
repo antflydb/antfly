@@ -119,7 +119,8 @@ const std = @import("std");
 /// Version 85 owns independent retained dataset resources and source/work indexes.
 /// Version 86 journals native retained owners before activation and requires
 /// verified journal progress before source release or producer collection.
-pub const current_version: u16 = 86;
+pub const current_version: u16 = 87;
+pub const retained_owner_acknowledgements_version: u16 = 87;
 pub const retained_datasets_version: u16 = 86;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;

@@ -724,7 +724,12 @@ test "retained series generation closure drains even no-op prepares and finalize
     const progress = try e.status(temp, &store);
     try std.testing.expect(try e.expirationReady(temp, &store, progress, row, 5));
     // Closed extrema no longer require source evidence, even before event time.
+    const closure = try progress.closureCut();
+    try std.testing.expectEqual(@as(i128, 5), closure.admitted_ns);
     try std.testing.expectEqual(@as(usize, 2), try e.tick(&store, 6, 1024));
+    const after_tick = try e.status(temp, &store);
+    try std.testing.expectEqual(@as(i128, 6), after_tick.admitted_ns);
+    try std.testing.expectEqualDeep(closure, try after_tick.closureCut());
     const page = try e.scan(temp, &store, 1000, 1010, 6, null, 10);
     try std.testing.expectEqual(@as(i64, 1), page.rows[0].rows);
     try std.testing.expectEqual(@as(?f64, 3), page.rows[0].metrics[3].value(.min));

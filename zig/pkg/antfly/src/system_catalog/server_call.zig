@@ -127,6 +127,7 @@ pub const Call = union(enum) {
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
     lake_source_owner_read: u64,
     /// Bounded metadata-derived registration, protected by an administrative grant.
+    retained_owner_acknowledge: @import("../metadata/retained_dataset_owner_receipt.zig").Receipt,
     retained_owner_register: @import("../metadata/retained_dataset_owners.zig").Registration,
     /// Point reads and bounded supervisor selection require a body-bound read grant.
     retained_owner_read: @import("../metadata/retained_dataset_owners.zig").Read,
@@ -134,7 +135,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .retained_owner_register, .relation_replace, .relation_schema_mutate, .native_memory_create => true,
+            .retained_owner_acknowledge, .retained_owner_register, .relation_replace, .relation_schema_mutate, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -304,6 +305,9 @@ test "retained owner controls bind grants to distinct private request bodies" {
         .{ .retained_owner_read = .{ .owner = .{ .resource = 7, .generation = 1, .plan = @splat(3), .group = 11, .revision = 1 } } },
         .{ .retained_owner_register = .{ .resource = 7, .generation = 1, .plan = @splat(3), .revision = 1 } },
     };
+    try std.testing.expect((Call{ .retained_owner_acknowledge = undefined }).requiresAdministrativeGrant());
+    try std.testing.expect((Call{ .retained_owner_acknowledge = undefined }).isMutation());
+    try std.testing.expect(!(Call{ .retained_owner_acknowledge = undefined }).requiresSettingAuthorityReadGrant());
     for (calls) |request| {
         const mutation = request == .retained_owner_register;
         try std.testing.expectEqual(mutation, request.requiresAdministrativeGrant());

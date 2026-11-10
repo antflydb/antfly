@@ -17,3 +17,5 @@
 pub const retained_dataset_types = @import("retained_dataset_types.zig");
 pub const storage_retained_series = @import("storage/retained_series.zig");
 pub const storage_retained_series_archive = @import("storage/retained_series_archive.zig");
+
+pub const metadata_incarnation = @import("metadata/incarnation.zig");

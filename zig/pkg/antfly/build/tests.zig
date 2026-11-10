@@ -541,7 +541,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const retained_public_filters = &.{ "retained source write diagnostics", "SQL retained source", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
+    const retained_public_filters = &.{ "retained owner native controls", "retained source write diagnostics", "SQL retained source", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
     const retained_public_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = retained_public_filters, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const retained_public_step = b.step("retained-series-public-test", "Verify source write constraints and retry semantics across HTTP, SQL and participant transport");
     retained_public_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, retained_public_tests, retained_public_filters).step);
@@ -3176,6 +3176,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const retained_dataset_step = b.step("retained-dataset-test", "Run durable dataset placement, replay coverage and reader-safe retention contracts");
     retained_dataset_step.dependOn(&b.addRunArtifact(retained_dataset_tests).step);
     serverless_test_step.dependOn(retained_dataset_step);
+
+    const retained_owner_receipt_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/retained_dataset_owner_receipt.zig"), .target = target, .optimize = optimize });
+    retained_owner_receipt_mod.addImport("antfly_local_sources", retained_contract_mod);
+    const retained_owner_receipt_tests = b.addTest(.{ .root_module = retained_owner_receipt_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-dataset-owner-receipt-test", "Verify signed native owner observations and stable logical closure")
+        .dependOn(&b.addRunArtifact(retained_owner_receipt_tests).step);
 
     const retained_owner_plan_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/retained_dataset_owners.zig"), .target = target, .optimize = optimize });
     retained_owner_plan_mod.addImport("antfly_local_sources", retained_contract_mod);

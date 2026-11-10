@@ -1718,6 +1718,7 @@ pub const ApiHttpServerConfig = struct {
     fk_generation_parent: ?@import("relational_fk_generation_publication.zig").Port = null,
     fk_generation_source: ?@import("relational_fk_generation_publication.zig").SourcePort = null,
     fk_initial_child: ?@import("relational_fk_generation_publication.zig").InitialChildPort = null,
+    retained_owner_control: ?@import("retained_owner_control.zig").Port = null,
     row_policy_install: ?@import("row_policy_install.zig").Port = null,
     online_merge_io: ?@import("online_merge_io.zig").Port = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -20973,6 +20974,25 @@ pub const ApiHttpServer = struct {
     /// The coordinator names only the immutable metadata publication. The
     /// current owner leader independently fetches it and commits its receipt
     /// through Raft; a stale route cannot install policy on a replacement.
+    pub fn executeRetainedOwnerControl(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("retained_owner_control.zig").Request, context: api_operation.RequestContext) !@import("retained_owner_control.zig").Response {
+        try context.ensureActive();
+        try request.validate(group_id);
+        if (self.cfg.deployment_mode == .standalone)
+            return (self.cfg.retained_owner_control orelse return error.RetainedSeriesNotReady).execute(alloc, table_name, group_id, request, context);
+        var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
+        const router = self.cfg.session_router orelse fallback.router();
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.RetainedSeriesNotReady;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => return (self.cfg.retained_owner_control orelse return error.RetainedSeriesNotReady).execute(alloc, table_name, group_id, request, context),
+            .remote => |remote| {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                return client.fetchRetainedOwnerControl(remote.base_uri, group_id, table_name, request, context);
+            },
+        }
+    }
+
     pub fn executeRowPolicyInstall(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("row_policy_install.zig").Request, context: api_operation.RequestContext) !@import("row_policy_install.zig").Response {
         try context.ensureActive();
         try @import("row_policy_install.zig").validate(request, group_id);

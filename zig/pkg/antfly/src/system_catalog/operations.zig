@@ -517,6 +517,33 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try context.ensureActive();
             break :blk bytes;
         },
+        .retained_owner_acknowledge => |proof| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try proof.verify();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.retained_owner_acknowledgements_version);
+            svc.lockCatalogMutation();
+            defer svc.unlockCatalogMutation();
+            try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            try store.validateRetainedOwnerReceipt(svc.metadata_group_id, proof);
+            const admitted = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .acknowledge_retained_owner = proof });
+            svc.waitForTransitionAppliedWithContext(admitted, context) catch return error.MetadataMutationOutcomeUnknown;
+            // A stale committed command is a semantic no-op. Return success
+            // only after seeing its exact native receipt on the owner row.
+            const bytes = store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .owner = .{
+                .resource = proof.resource,
+                .generation = proof.generation,
+                .plan = proof.plan,
+                .group = proof.group,
+                .revision = proof.owner_revision + 1,
+            } }) catch return error.MetadataMutationOutcomeUnknown;
+            errdefer alloc.free(bytes);
+            var observed = std.json.parseFromSlice(struct { owner: @import("../metadata/retained_dataset_owners.zig").Owner }, alloc, bytes, .{ .ignore_unknown_fields = true }) catch return error.MetadataMutationOutcomeUnknown;
+            defer observed.deinit();
+            if (observed.value.owner.native_receipt == null or !std.mem.eql(u8, &observed.value.owner.native_receipt.?, &try proof.digest())) return error.MetadataMutationOutcomeUnknown;
+            break :blk bytes;
+        },
         .retained_owner_register => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try request.validate();

@@ -16,6 +16,7 @@
 //! Private replicated lifecycle commands. Public batch JSON cannot supply them.
 const std = @import("std");
 const series = @import("retained_series.zig");
+pub const maintenance = @import("retained_series_maintenance.zig");
 const capture = @import("retained_series_capture.zig");
 const A = std.mem.Allocator;
 pub const Fence = @import("retained_series_revocation.zig").Fence;
@@ -111,5 +112,13 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
         .cleanup => _ = try engine.cleanupBackfill(txn, command.work_limit),
         .close => try capture.closeBinding(a, txn, spec.id, spec.generation, admitted_ns),
         .drain => try engine.beginClose(txn, admitted_ns),
+    }
+    // Persist the next fair slot with the command's effects. Recreating a
+    // host planner after each task or leader change cannot starve cleanup.
+    switch (command.action) {
+        .backfill => try engine.recordMaintenance(txn, 1),
+        .tick => try engine.recordMaintenance(txn, 2),
+        .cleanup => try engine.recordMaintenance(txn, 0),
+        else => {},
     }
 }

@@ -2789,6 +2789,25 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .retained_owner_acknowledge) {
+            if (!context.setting_admin) return error.Forbidden;
+            const proof = call.retained_owner_acknowledge;
+            try proof.verify();
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            if (self.hot_standby_catalog_server) |server|
+                try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            try store.validateRetainedOwnerReceipt(group_ids.main_metadata_group_id, proof);
+            try self.applyCdcStatusCommandLocked(.{ .acknowledge_retained_owner = proof });
+            return store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, .{ .owner = .{
+                .resource = proof.resource,
+                .generation = proof.generation,
+                .plan = proof.plan,
+                .group = proof.group,
+                .revision = proof.owner_revision + 1,
+            } });
+        }
         if (call == .retained_owner_register) {
             if (!context.setting_admin) return error.Forbidden;
             const request = call.retained_owner_register;
@@ -2909,7 +2928,7 @@ const LocalStandaloneMetadata = struct {
                 read.standalone = true;
                 return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
             },
-            .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .retained_owner_acknowledge, .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,

@@ -49,6 +49,7 @@ pub const Planner = struct {
             switch (slot % 3) {
                 0 => if (!entry.progress.ready) return .{ .index = index, .action = .backfill, .expected_cursor = entry.progress.backfill_cursor, .work_limit = self.work_limit },
                 1 => {
+                    if (!entry.progress.ready) continue;
                     const now = @max(admitted_ns, entry.progress.admitted_ns);
                     if (entry.progress.maintenance_pending or now -| entry.progress.last_tick_ns >= self.tick_interval_ns)
                         return .{ .index = index, .action = .tick, .work_limit = self.work_limit };
@@ -73,11 +74,11 @@ test "retained series maintenance rotation bounds hot-source work and respects d
     try std.testing.expectEqualStrings("page", first.expected_cursor);
     try std.testing.expectEqual(@as(usize, 0), first.index);
     const second = (try planner.next(&entries, 100)).?;
-    try std.testing.expect(second.action == .tick and second.index == 0);
+    try std.testing.expect(second.action == .tick and second.index == 1);
     const third = (try planner.next(&entries, 100)).?;
-    try std.testing.expect(third.action == .tick and third.index == 1);
+    try std.testing.expect(third.action == .cleanup and third.index == 1);
     const fourth = (try planner.next(&entries, 100)).?;
-    try std.testing.expect(fourth.action == .cleanup and fourth.index == 1);
+    try std.testing.expect(fourth.action == .backfill and fourth.index == 0);
     for (&entries) |*entry| {
         entry.progress.ready = true;
         entry.progress.backfill_clean = true;

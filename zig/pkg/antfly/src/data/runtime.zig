@@ -7047,6 +7047,7 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_parent = .{ .ptr = self, .execute_fn = fkGenerationParentControl };
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
+        api_server_cfg.retained_owner_control = .{ .ptr = self, .execute_fn = executeRetainedOwnerControl };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -12010,6 +12011,150 @@ pub const DataServer = struct {
             }).sign(root, receipt.digest());
         }
         try receipt.validate(request);
+        return receipt;
+    }
+
+    fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const series = @import("antfly_local_sources").storage_retained_series;
+        const controls = @import("antfly_local_sources").storage_retained_series_control;
+        const queries = @import("antfly_local_sources").storage_retained_series_query;
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const term = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            break :blk status.hard.current_term;
+        };
+        try self.waitDataReadSafeWithCancellation(group_id, "retained-owner-control", 5_000, context.cancellation);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var metadata_context = context;
+        metadata_context.setting_admin = true;
+        const bytes = try self.status_source.systemCatalog(a, metadata_context, .{ .retained_owner_read = request.read() });
+        if (bytes.len > 4 * 1024 * 1024) return error.CatalogCommandTooLarge;
+        const snapshot = try std.json.parseFromSliceLeaky(antfly.public_api.retained_owner_control.Snapshot, a, bytes, .{});
+        try request.admit(snapshot.plan, snapshot.owner);
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        const descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+        const lineage = descriptor.value.source orelse return error.RetainedOwnerPlanChanged;
+        if (!std.mem.eql(u8, source.name, table_name) or source.table_id != snapshot.plan.source_table) return error.RetainedOwnerPlanChanged;
+        const fence: controls.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        var revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
+        var command: ?controls.Command = null;
+        if (request.action == .revoke and !revocation.revoked) {
+            command = .{ .action = .revoke, .fence = fence };
+            // Cancellation already has durable metadata work. Stop fresh
+            // votes before waiting for old prepares, including unready or
+            // installed-but-unacknowledged producers. A missing install goes
+            // directly to the durable tombstone operation.
+            const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+            for (status.entries) |entry| {
+                if (!std.mem.eql(u8, &entry.binding.spec.id, &fence.id) or entry.binding.spec.generation != fence.generation) continue;
+                try controls.requireFence(fence, entry.binding.spec);
+                if (!entry.progress.closed and !entry.progress.draining) command = .{ .action = .drain, .fence = fence };
+                break;
+            }
+        } else if (!revocation.revoked) {
+            const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+            const entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else return error.RetainedSeriesNotReady;
+            try controls.requireFence(fence, entry.binding.spec);
+            if (request.action != .drain) try @import("../api/retained_owner_binding.zig").validate(a, descriptor.value.definition, entry.binding, source.schema_json);
+            switch (request.action) {
+                .reconcile => {
+                    var planner: controls.maintenance.Planner = .{ .next_slot = entry.progress.maintenance_next_slot };
+                    if (try planner.next(&.{.{ .spec = entry.binding.spec, .progress = entry.progress }}, platform_time.realtimeNs())) |task|
+                        command = .{ .action = switch (task.action) {
+                            .backfill => .backfill,
+                            .tick => .tick,
+                            .cleanup => .cleanup,
+                        }, .fence = fence, .expected_cursor = task.expected_cursor, .work_limit = task.work_limit };
+                },
+                .drain => if (!entry.progress.draining and !entry.progress.closed) {
+                    command = .{ .action = .drain, .fence = fence };
+                },
+                .close => if (!entry.progress.closed or entry.progress.closed_at_ns == null) {
+                    command = .{ .action = .close, .fence = fence };
+                },
+                .observe, .revoke => {},
+            }
+        }
+        if (command) |native| {
+            try context.ensureActive();
+            try self.proposeRaftBatchGroup(a, group_id, table_name, .{ .retained_series = native, .timestamp_ns = platform_time.realtimeNs() }, .{
+                .discovery = .cached,
+                .required_local_term = term,
+                .allow_remote_forward = false,
+                .admission_deadline_ns = context.deadline_ns,
+                .visibility_cancellation = context.cancellation,
+            });
+            revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
+        }
+        var mode: @import("../metadata/retained_dataset_owners.zig").Mode = .revoked;
+        var cut: @import("../metadata/retained_dataset_owner_receipt.zig").Cut = .{ .sequence = 0, .complete_from_ns = 0, .admitted_ns = 0 };
+        var native_root = try std.fmt.parseInt(u128, revocation.root_incarnation, 10);
+        if (!revocation.revoked) {
+            const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+            const entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else return error.RetainedSeriesNotReady;
+            try controls.requireFence(fence, entry.binding.spec);
+            try @import("../api/retained_owner_binding.zig").validate(a, descriptor.value.definition, entry.binding, source.schema_json);
+            const progress: series.Progress = entry.progress;
+            if (progress.revoked) return error.RetainedSeriesDefinitionMismatch;
+            mode = if (progress.closed) .closed else if (progress.ready) .ready else .installed;
+            cut = .{ .sequence = progress.source_sequence, .complete_from_ns = progress.complete_from_ns, .admitted_ns = progress.admitted_ns };
+            if (progress.closed) {
+                const closed = try progress.closureCut();
+                cut = .{ .sequence = closed.sequence, .complete_from_ns = closed.complete_from_ns, .admitted_ns = closed.admitted_ns };
+            }
+            native_root = try std.fmt.parseInt(u128, status.root_incarnation, 10);
+        } else if (request.action != .revoke and request.action != .observe) return error.RetainedSeriesSourceRevoked;
+        const registration = self.store_registration orelse return error.StoreRegistrationUnavailable;
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(a, io, self.write_source.replica_root_dir);
+        var point = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const current = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            if (current.hard.current_term != term) return error.GroupLeaderUnavailable;
+            break :blk (try raft.host.http_host.host.readReplicaCatalogRecord(a, group_id)) orelse return error.ReplicaCatalogUnavailable;
+        };
+        defer point.deinit(a);
+        const record = point.record orelse return error.ReplicaCatalogUnavailable;
+        if (record.local_node_id != registration.node_id or record.group_id != group_id) return error.RetainedOwnerPlanChanged;
+        const receipt = try (antfly.public_api.retained_owner_control.Response{
+            .resource = request.resource,
+            .generation = request.generation,
+            .plan = request.plan,
+            .dataset = snapshot.plan.dataset,
+            .definition = snapshot.plan.definition,
+            .group = group_id,
+            .partition = snapshot.owner.partition,
+            .incarnation = snapshot.owner.incarnation,
+            .owner_revision = request.revision,
+            .mode = mode,
+            .cut = cut,
+            .native_root = native_root,
+            .identity = .{ .metadata_incarnation = lineage.metadata_incarnation, .node_id = registration.node_id, .store_id = registration.store_id, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
+            .reporter_incarnation = self.reporter_incarnation,
+            .replica_id = record.replica_id,
+            .metadata_version = record.metadata_version,
+        }).sign(root.seed);
+        try context.ensureActive();
         return receipt;
     }
 
@@ -57898,4 +58043,9 @@ test "retained series lifecycle rejections round trip and never discard a commit
         try std.testing.expect(Failure.forRequest(reason, .{}) != null);
         try std.testing.expect(Failure.forRequest(reason, committed) == null);
     }
+}
+
+test "retained series native owner controller rejects malformed scope before touching its server" {
+    var server: DataServer = undefined;
+    try std.testing.expectError(error.InvalidRetainedOwnerPlan, DataServer.executeRetainedOwnerControl(&server, std.testing.allocator, "raw", 11, .{ .resource = 0, .generation = 1, .plan = @splat(1), .group = 11, .revision = 1 }, .{}));
 }

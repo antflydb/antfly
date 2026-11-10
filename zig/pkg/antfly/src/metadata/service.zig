@@ -3585,6 +3585,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => {},
     }
+    if (command == .acknowledge_retained_owner) return metadata_topology_protocol.retained_owner_acknowledgements_version;
     if (command == .register_retained_owners) return metadata_topology_protocol.retained_datasets_version;
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_system_catalog) {
