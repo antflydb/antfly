@@ -763,6 +763,12 @@ const LocalStandaloneMetadata = struct {
     lifecycle_store: ?*antfly.metadata.RaftApplyStore = null,
     data_server: ?*antfly.data.runtime.DataServer = null,
     initial_fk_round_mutex: std.atomic.Mutex = .unlocked,
+    /// An empty coherent cut can be reused until durable metadata changes.
+    /// Never suppress progress or retirement for a resident private owner.
+    empty_provisioning_cut: ?struct {
+        store: *antfly.metadata.RaftApplyStore,
+        revision: u64,
+    } = null,
     relation_reconciliation: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{},
     /// Only private owners actually primed in this process need resident
     /// retirement. Durable terminal metadata remains the authority.
@@ -4252,8 +4258,20 @@ const LocalStandaloneMetadata = struct {
         var projection = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
+            const before = try store.standaloneRevision();
+            if (self.initial_fk_primed.count() == 0) {
+                if (self.empty_provisioning_cut) |empty| {
+                    if (empty.store == store and empty.revision == before) return;
+                }
+            }
+            self.empty_provisioning_cut = null;
             var cut = try store.captureProvisioningCatalog(self.alloc, group_ids.main_metadata_group_id);
             errdefer cut.deinit(self.alloc);
+            // The revision brackets capture: a concurrent publication must
+            // force another capture even when this particular cut was empty.
+            if (cut.initial_fk_owners.len == 0 and cut.jobs_json.len == 0 and
+                self.initial_fk_primed.count() == 0 and before == try store.standaloneRevision())
+                self.empty_provisioning_cut = .{ .store = store, .revision = before };
             // Verify the private/public separation against this same local
             // catalog cut with indexed lookups. Never clone and scan every
             // public table on the 100 ms provisioning round.
@@ -13541,6 +13559,16 @@ test "standalone canceled initial self FK retires exact private owners after res
         metadata.deinit();
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
+    try metadata.provisionRestoreOwners();
+    try std.testing.expect(metadata.empty_provisioning_cut != null);
+    {
+        // Unchanged empty rounds must avoid catalog materialization entirely.
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        metadata.alloc = failing.allocator();
+        defer metadata.alloc = alloc;
+        try metadata.provisionRestoreOwners();
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -13583,6 +13611,8 @@ test "standalone canceled initial self FK retires exact private owners after res
     const began = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_begin = plan });
     alloc.free(began);
     try metadata.provisionRestoreOwners();
+    // A new private publication invalidates the empty cut and primes owners.
+    try std.testing.expect(metadata.empty_provisioning_cut == null);
     try std.testing.expectEqual(@as(usize, 2), server.kernel_owner_source.?.ownerCountForTest());
 
     const first_work_json = try metadata.lifecycle_store.?.fkInitialCreateWorkJson(alloc, group_id, 0);
