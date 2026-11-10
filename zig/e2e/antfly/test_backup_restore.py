@@ -90,6 +90,33 @@ def _wait_for_constraints_enforced(
     return False
 
 
+def test_routed_document_reads_preserve_budget_on_every_gateway(
+    three_by_three_backup_cluster,
+):
+    cluster = three_by_three_backup_cluster
+    table = "routed_read_clock"
+    expected = {"value": 42}
+    with requests.Session() as session:
+        session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+        _create_cluster_table_when_admitted(cluster, session, table, {"num_shards": 3})
+        assert wait_until(
+            lambda: cluster.fully_replicated_topology(table), timeout_s=90
+        ), cluster.debug_logs()
+        _seed_cluster_docs_when_writable(cluster, session, table, {"0:clock": expected})
+        # Include the coordinator's own route and both forwarded routes.
+        # Internal route fencing establishes a finite executor-clock deadline,
+        # even when the public caller did not supply an explicit timeout.
+        for api_url in cluster.data_api_urls:
+            actual = wait_until(
+                lambda api_url=api_url: _lookup_doc_from_url(
+                    session, api_url, table, "0:clock"
+                ),
+                timeout_s=15,
+                interval_s=0.1,
+            )
+            assert actual == expected, cluster.debug_logs()
+
+
 def _enroll_store_root_once(client, api_url, proof, *, timeout_s=30.0):
     """Resolve uncertain enrollment by exact identity; never replay the write."""
     identity = proof["identity"]
