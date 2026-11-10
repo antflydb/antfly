@@ -195,6 +195,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft proposal materializes a default batch timestamp exactly once",
         "raft proposal preserves isolated catalog admission through document revision negotiation",
         "raft proposal preserves guarded graph cleanup through document revision negotiation",
+        "raft cleanup protocol preflight rejects mixed decoders and rechecks upgraded peers",
         "online merge admission distinguishes unsupported peers and fences leader authority",
         "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
