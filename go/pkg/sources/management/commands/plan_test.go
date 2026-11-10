@@ -34,6 +34,15 @@ type manifestAPI struct {
 	removes     int
 	beforeGet   func(string, int)
 	putFailures map[string]error
+	// revisionFor models a server whose revision encoding the client cannot recompute.
+	revisionFor func(management.Source) string
+}
+
+func (f *manifestAPI) revision(s management.Source) string {
+	if f.revisionFor != nil {
+		return f.revisionFor(s)
+	}
+	return management.SourceRevision(s)
 }
 
 var _ API = (*manifestAPI)(nil)
@@ -80,7 +89,7 @@ func (f *manifestAPI) GetSource(_ context.Context, id string) (management.Source
 		return management.Source{}, management.Failure(http.StatusNotFound, "source_not_found")
 	}
 	s = f.copySource(s)
-	s.Revision = management.SourceRevision(s)
+	s.Revision = f.revision(s)
 	return s, nil
 }
 
@@ -95,7 +104,7 @@ func (f *manifestAPI) PutSourceIfMatch(_ context.Context, s management.Source, r
 	if !ok {
 		return management.Source{}, management.Failure(http.StatusNotFound, "source_not_found")
 	}
-	if management.SourceRevision(current) != revision {
+	if f.revision(current) != revision {
 		return management.Source{}, management.Failure(http.StatusPreconditionFailed, "source_revision_mismatch")
 	}
 	return f.store(s)
@@ -580,6 +589,28 @@ func TestApplyManifestOutput(t *testing.T) {
 				if lines[3] != "Applied: 1 created, 1 updated, 1 unchanged, 0 conflicts, 0 failed." {
 					t.Fatalf("human apply summary = %q", lines[3])
 				}
+			}
+		})
+	}
+}
+
+// The server's revision is authoritative: its config encoding (for example
+// JSON numbers) may differ from what the client would recompute.
+func TestApplyManifestUsesServerRevision(t *testing.T) {
+	for _, preconditions := range []bool{true, false} {
+		t.Run(fmt.Sprintf("preconditions=%t", preconditions), func(t *testing.T) {
+			api := newManifestAPI(t, manifestCurrent("docs"))
+			api.caps.RevisionPreconditions = preconditions
+			api.revisionFor = func(s management.Source) string { return "server-" + management.SourceRevision(s) }
+			entry := manifestEntry("docs")
+			entry.Name = "Updated"
+			results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifestFile(entry), PlanOptions{})
+			if err != nil {
+				t.Fatalf("apply: %v (results %#v)", err, results)
+			}
+			requireApplyOutcomes(t, results, []string{"docs"}, []string{"updated"})
+			if preconditions && api.writes[0].revision != api.revision(manifestCurrent("docs")) {
+				t.Fatalf("precondition revision = %q", api.writes[0].revision)
 			}
 		})
 	}
