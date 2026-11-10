@@ -439,6 +439,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
+    const retained_catalog_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "system catalog retained", "retained dataset resource" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("retained-dataset-catalog-test", "Verify retained resource identity, indexed dependencies and source-drop fences")
+        .dependOn(&addFilteredTestRunArtifact(b, retained_catalog_tests).step);
     const relation_namespace_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
@@ -3156,6 +3163,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     retained_dataset_step.dependOn(&b.addRunArtifact(retained_dataset_tests).step);
     serverless_test_step.dependOn(retained_dataset_step);
 
+    const retained_resource_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_dataset_resource_test_root.zig"), .target = target, .optimize = optimize });
+    const retained_resource_tests = b.addTest(.{ .root_module = retained_resource_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-dataset-resource-test", "Verify independent retained resource identity and source dependency lifecycle").dependOn(&b.addRunArtifact(retained_resource_tests).step);
     const retained_series_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_series_test_root.zig"), .target = target, .optimize = optimize });
     const retained_series_tests = b.addTest(.{ .root_module = retained_series_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const retained_series_step = b.step("retained-series-test", "Run transactional retained aggregate, TTL fence and bounded feed contracts");

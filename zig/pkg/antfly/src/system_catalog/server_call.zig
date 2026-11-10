@@ -126,6 +126,8 @@ pub const Call = union(enum) {
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
     lake_source_owner_read: u64,
+    /// Bounded private supervisor selection, protected by a body-bound read grant.
+    retained_dataset_work: struct { after_id: u64 = 0, native: bool = true },
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
@@ -141,6 +143,7 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .retained_dataset_work,
             .lake_index_lifecycle_read,
             .lake_source_owner_read,
             .lake_index_lifecycle_work,
@@ -273,4 +276,18 @@ test "privacy table record transport is a service read without mutation authorit
     const read: Call = .{ .table_record_read = "private" };
     try std.testing.expect(!read.isMutation());
     try std.testing.expect(!read.requiresAdministrativeGrant());
+}
+
+test "system catalog retained work is read only and requires a body bound supervisor grant" {
+    const a = std.testing.allocator;
+    const request: Call = .{ .retained_dataset_work = .{ .after_id = 7 } };
+    try std.testing.expect(request.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!request.isMutation());
+    const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.retained_dataset_work.after_id);
+    const Legacy = union(enum) { resolve_many: ResolveMany, mutate: Request };
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Legacy, a, bytes, .{}));
 }

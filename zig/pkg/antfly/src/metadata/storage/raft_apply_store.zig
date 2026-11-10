@@ -5816,7 +5816,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "12";
+const derived_catalog_index_version = "13";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -12752,6 +12752,17 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, stamp, .{});
     }
 
+    pub fn retainedDatasetWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64, native: bool) ![]u8 {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        return std.json.Stringify.valueAlloc(alloc, system_catalog.RetainedWork{ .revision = meta.revision, .resource = try view.nextRetainedWork(after, native) }, .{});
+    }
+
     pub fn sqlPolicyPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_table_id: u64) ![]u8 {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -12788,7 +12799,8 @@ pub const RaftApplyStore = struct {
     /// A newly routed owner has no installed policy bundle. Until owner
     /// transfer carries and acknowledges that bundle, changing the physical
     /// owner cut of a protected table is not an admissible topology operation.
-    fn policyTopologyMutationAllowedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+    fn ownerTopologyMutationAllowedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+        if (try self.retainedSourcePresentTxn(txn, group_id, table_id)) return false;
         var publication = try system_catalog_storage.loadPolicyPublication(self.alloc, txn, group_id, table_id);
         defer if (publication) |*value| value.deinit();
         const value = publication orelse return true;
@@ -12799,9 +12811,10 @@ pub const RaftApplyStore = struct {
     /// apply repeats the check against the committed metadata cut so a racing
     /// policy publication cannot create an unprotected owner.
     pub fn requirePolicyTopologyMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
+        try self.requireRetainedSourceDropAllowed(group_id, table_id);
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        if (!try self.policyTopologyMutationAllowedTxn(&txn, group_id, table_id)) return error.RowPolicyUnsupported;
+        if (!try self.ownerTopologyMutationAllowedTxn(&txn, group_id, table_id)) return error.RowPolicyUnsupported;
     }
 
     /// Build the only accepted publication-begin payload from one metadata
@@ -14054,7 +14067,7 @@ pub const RaftApplyStore = struct {
                 // A hidden child still installs structural parent controls.
                 // Reject active policy owners before reserving the child;
                 // otherwise an accepted plan cannot complete its parent cut.
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
+                if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
                     return error.RowPolicyUnsupported;
                 try self.validateFkGenerationTableTxn(txn, group_id, parent.table, parent.ranges);
                 if (plan.support_pending and parent.support_after != null and
@@ -14456,7 +14469,7 @@ pub const RaftApplyStore = struct {
             // inherit those structural controls without a bound policy
             // handoff, even if the child itself is unprotected.
             for (plan.parents) |parent| {
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
+                if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
                     return error.RowPolicyUnsupported;
             }
             try self.setFkGenerationTableLocksTxn(txn, group_id, plan, true);
@@ -14536,6 +14549,31 @@ pub const RaftApplyStore = struct {
             const value = try decodeTableIdentity(self.view.alloc, bytes);
             if (value.table_id != id) return error.InvalidCatalogRecord;
             return .{ .id = value.table_id, .name = value.name };
+        }
+        pub fn datasetOwner(self: @This(), id: system_catalog.retained_datasets.Id) !?u64 {
+            return self.view.datasetOwner(id);
+        }
+        pub fn hasRetainedSourceUsers(self: @This(), id: u64) !bool {
+            return self.view.hasRetainedSourceUsers(id);
+        }
+        pub fn retainedSource(self: @This(), id: u64) !?system_catalog.retained_datasets.Source {
+            var buf: [160]u8 = undefined;
+            const cluster_raw = self.view.txn.get(try metadataIncarnationKeyForGroup(&buf, self.view.group_id)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidMetadataIncarnation,
+                else => return err,
+            };
+            const cluster = (try decodeMetadataIncarnationRecord(cluster_raw)).incarnation;
+            const raw = self.view.txn.get(try tableKeyForGroup(&buf, self.view.group_id, id)) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            const table = try decodeTableRecord(self.view.alloc, raw);
+            if (table.table_id != id) return error.InvalidCatalogRecord;
+            const fence = try self.store.loadTableTransitionFenceTxn(self.view.txn, self.view.group_id, id);
+            if (fence.active() or fence.range_membership.count == 0 or table.read_schema_json.len != 0 or
+                try restoreStagingLocksTableTxn(self.view.txn, self.view.group_id, id) or
+                try self.store.fkGenerationTableLockedTxn(self.view.txn, self.view.group_id, id)) return error.RetainedDatasetSourceNotReady;
+            return try system_catalog.retained_datasets.Source.fromTable(self.view.alloc, table, cluster);
         }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
             var buf: [160]u8 = undefined;
@@ -15515,7 +15553,8 @@ pub const RaftApplyStore = struct {
     ) !TableRestoreAdmission {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        if (!try self.policyTopologyMutationAllowedTxn(&txn, group_id, expected_table.table_id))
+        if (try self.retainedSourcePresentTxn(&txn, group_id, expected_table.table_id)) return error.RetainedDatasetSourceInUse;
+        if (!try self.ownerTopologyMutationAllowedTxn(&txn, group_id, expected_table.table_id))
             return error.RowPolicyUnsupported;
 
         var version_key_buf: [160]u8 = undefined;
@@ -16252,6 +16291,13 @@ pub const RaftApplyStore = struct {
         const table = try decodeTableRecord(alloc, encoded_table);
         errdefer metadata_table_manager.freeTable(alloc, table);
         if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidDerivedCatalogIndex;
+        {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = try system_catalog_storage.readMeta(a, &txn, group_id) };
+            if (try view.hasRetainedSourceUsers(table_id)) return error.RetainedDatasetSourceInUse;
+        }
         if (try self.relationalDropBlockedTxn(&txn, group_id, table))
             return error.ConstraintRetirementRequired;
 
@@ -21253,7 +21299,7 @@ pub const RaftApplyStore = struct {
                 // Replicated stale/rejected commands are deterministic no-ops;
                 // standalone callers use the same guard but retain its reason.
                 self.removeTableTxn(txn, group_id, record.table_id, record.expected_transition_generation) catch |err| switch (err) {
-                    error.TableTransitionActive, error.TableGenerationChanged, error.ConstraintRetirementRequired => return,
+                    error.TableTransitionActive, error.TableGenerationChanged, error.ConstraintRetirementRequired, error.RetainedDatasetSourceInUse => return,
                     else => return err,
                 };
             },
@@ -21424,7 +21470,7 @@ pub const RaftApplyStore = struct {
                     if (metadata_table_manager.rangeRecordsEqual(existing, record)) return;
                 }
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return;
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, record.table_id)) return;
+                if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, record.table_id)) return;
                 const value = try encodeRangeRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
@@ -21461,7 +21507,7 @@ pub const RaftApplyStore = struct {
                 defer metadata_table_manager.freeRange(self.alloc, current);
                 if (!metadata_table_manager.restoreIntentMatchesRange(expected, current)) break :complete;
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, current.table_id)) break :complete;
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, current.table_id)) break :complete;
+                if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, current.table_id)) break :complete;
 
                 const table_name = try self.lookupTableNameTxn(txn, group_id, current.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
@@ -21506,7 +21552,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const key = try rangeKeyForGroup(&key_buf, group_id, record.group_id);
                 if (existing == null) return;
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, existing_table_id)) return;
+                if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, existing_table_id)) return;
                 try txn.delete(key);
                 try self.deleteTableRangeIndexTxn(txn, group_id, existing_table_id, record.group_id);
                 try self.deleteActiveRestoreRangeIndexTxn(txn, group_id, record.group_id);
@@ -21908,7 +21954,48 @@ pub const RaftApplyStore = struct {
     /// Admission and mutation share the caller's transaction. In particular,
     /// rejection must precede logical unbinding: Raft commits rejected commands
     /// as no-ops, while standalone aborts and exposes the precise policy error.
+    fn retainedSourceDropBlockedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, table: u64) !bool {
+        _ = try self.ensureDerivedCatalogIndexesTxn(txn, group);
+        return self.retainedSourcePresentTxn(txn, group, table);
+    }
+
+    /// Read-only admission shares the same indexed dependency cut as apply.
+    /// Resource/index writes are atomic, including the activating phase before
+    /// the first native owner receives its install command.
+    fn retainedSourcePresentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, table: u64) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, txn, group) };
+        return view.hasRetainedSourceUsers(table);
+    }
+
+    fn retainedSourceDefinitionAllowedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
+        // Native extraction binds exact stored fields, immutable layouts and
+        // the physical storage name. A schema/name evolution must publish a
+        // coupled dataset generation rather than retarget an existing binding.
+        if (std.mem.eql(u8, previous.name, next.name) and
+            std.mem.eql(u8, previous.schema_json, next.schema_json) and
+            std.mem.eql(u8, previous.read_schema_json, next.read_schema_json)) return true;
+        return !try self.retainedSourcePresentTxn(txn, group, previous.table_id);
+    }
+
+    pub fn requireRetainedSourceDropAllowed(self: *RaftApplyStore, group: u64, table: u64) !void {
+        try self.ensureDerivedCatalogIndexes(group);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var version_buf: [160]u8 = undefined;
+        const version = txn.get(try derivedCatalogIndexVersionKey(&version_buf, group)) catch return error.InvalidDerivedCatalogIndex;
+        if (!std.mem.eql(u8, version, derived_catalog_index_version)) return error.InvalidDerivedCatalogIndex;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, &txn, group) };
+        if (try view.hasRetainedSourceUsers(table)) return error.RetainedDatasetSourceInUse;
+    }
+
     fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
+        if (try self.retainedSourceDropBlockedTxn(txn, group_id, table_id)) return error.RetainedDatasetSourceInUse;
         if (try self.fkGenerationTableLockedTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
@@ -21991,6 +22078,7 @@ pub const RaftApplyStore = struct {
             privacy_indexes = (try @import("antfly_local_sources").privacy_catalog.reconcileIndexes(self.alloc, existing.indexes_json, admission.indexes_json)) orelse return;
             admission.indexes_json = privacy_indexes.?;
             if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return;
+            if (!try self.retainedSourceDefinitionAllowedTxn(txn, group_id, existing, admission)) return;
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return;
             if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
                 !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, admission)) return;
@@ -22642,8 +22730,8 @@ pub const RaftApplyStore = struct {
             // Check every collision before writing anything. All names and
             // fresh IDs are reserved together, including interdependent FKs.
             for (plan.targets) |target| {
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, target.table.table_id)) return;
-                if (target.replace) |old| if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, old.table.table_id)) return;
+                if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, target.table.table_id)) return;
+                if (target.replace) |old| if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, old.table.table_id)) return;
                 var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
                 if (try stagingGet(txn, try tableKeyForGroup(&key_buf, group_id, target.table.table_id)) != null or
                     try stagingGet(txn, try restore_staging.nameKey(&key_buf, group_id, target.table.name)) != null or
@@ -23211,6 +23299,7 @@ pub const RaftApplyStore = struct {
                 }
             },
             .drop => |drop| {
+                if (try self.retainedSourceDropBlockedTxn(txn, group_id, drop.table_id)) return;
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return;
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
                 if (fence.active() or fence.generation != drop.expected_transition_generation) return;
@@ -23661,6 +23750,7 @@ pub const RaftApplyStore = struct {
                 else => return,
             };
         }
+        if (!try self.retainedSourceDefinitionAllowedTxn(txn, group_id, current, replacement)) return;
         if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, current, replacement)) return;
         var admission = replacement;
         // A completed subtract-only retirement changes active policy, not
@@ -26052,6 +26142,7 @@ pub const RaftApplyStore = struct {
             // coupled schema/policy candidate is acknowledged by every owner,
             // reject the mutation at the common table writer rather than
             // accepting DDL that later makes protected reads unavailable.
+            if (!try self.retainedSourceDefinitionAllowedTxn(txn, group_id, existing, record)) return error.RetainedDatasetSourceInUse;
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, record))
                 return error.RowPolicyUnsupported;
             try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
@@ -26203,7 +26294,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.SplitTransitionRecord,
     ) !void {
-        if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
+        if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         var key_buf: [160]u8 = undefined;
         const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
         const encoded_existing = txn.get(key) catch |err| switch (err) {
@@ -26281,7 +26372,7 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, &OnlineMergeAdmission.digestEncoded(bytes), &admission.expected_record_digest)) return;
         const current = try decodeMergeTransitionRecord(self.alloc, bytes);
         defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, current);
-        if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
+        if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
         if (current.online != null or current.phase != .prepare or current.rollback_reason != null) return;
         // The catalog flag authorizes rebuilding source identities in the
         // receiver namespace. Online row preparation performs that rebuild;
@@ -26317,7 +26408,7 @@ pub const RaftApplyStore = struct {
         const bytes = (try stagingGet(txn, key)) orelse return;
         const current = try decodeMergeTransitionRecord(self.alloc, bytes);
         defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, current);
-        if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
+        if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
         const online = current.online orelse return;
         if (!online.eql(update.expected) or (current.rollback_reason != null) != update.expected_cancel) return;
         var lease_buf: [160]u8 = undefined;
@@ -26358,7 +26449,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyMergeTransitionUpsertAuthorizedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord, allow_online_change: bool) !void {
-        if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
+        if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         if (record.online) |online| try online.validateRecord(record);
         var key_buf: [160]u8 = undefined;
         const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
@@ -26439,7 +26530,7 @@ pub const RaftApplyStore = struct {
         expected_source_epoch: u64,
         record: metadata.SplitTransitionRecord,
     ) !void {
-        if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
+        if (!try self.ownerTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         const split_key = record.split_key orelse return error.InvalidSplitAdmission;
 
         var transition_key_buf: [160]u8 = undefined;
@@ -45144,4 +45235,129 @@ test "selected owner readiness durable transition index rebuilds and retires act
     defer a.free(retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadinessTransitions(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "system catalog retained dependency and maintenance indexes survive restart and fence every source DROP" {
+    const a = std.testing.allocator;
+    const retained = system_catalog.retained_datasets;
+    const group: u64 = 21;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/retained-catalog", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    var opened = true;
+    defer if (opened) store.deinit();
+    const cluster = "11111111111111111111111111111111".*;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "raw" };
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = cluster });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const source = try retained.Source.fromTable(a, table, cluster);
+    var schema: retained.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    var descriptor: retained.Descriptor = .{ .definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(3), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = source.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } }, .source = source, .catalog_location = @splat(4), .catalog_storage_identity = @splat(5) };
+    const json = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(json);
+    var resource: system_catalog.Resource = .{ .kind = .dataset, .id = 41, .parent_id = 2, .name = "stats", .source_json = json, .retained = descriptor.identity() };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try system_catalog_storage.writeResource(a, &txn, group, resource);
+        for (0..1000) |i| {
+            const name = try std.fmt.allocPrint(a, "unrelated_{d}", .{i});
+            defer a.free(name);
+            try system_catalog_storage.writeResource(a, &txn, group, .{ .kind = .database, .id = 100 + i, .name = name });
+        }
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        try system_catalog_storage.applyDelta(a, &txn, group, .{ .upserts = &.{}, .removes = &.{}, .next_id = 2000 }, meta, @splat(9));
+        try txn.commit();
+    }
+    try store.ensureDerivedCatalogIndexes(group);
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requireRetainedSourceDropAllowed(group, table.table_id));
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.captureTableDropProjection(a, group, table.name));
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requirePolicyTopologyMutationAllowed(group, table.table_id));
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.captureTableRestoreAdmission(a, group, table));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(!try store.ownerTopologyMutationAllowedTxn(&txn, group, table.table_id));
+        var changed = table;
+        changed.schema_json = "{\"version\":2}";
+        try std.testing.expect(!try store.retainedSourceDefinitionAllowedTxn(&txn, group, table, changed));
+        try store.applyTableUpsertTxn(&txn, group, changed);
+        try store.applyTableCompareAndReplaceTxn(&txn, group, table, changed);
+        changed = table;
+        changed.name = "retargeted";
+        try std.testing.expect(!try store.retainedSourceDefinitionAllowedTxn(&txn, group, table, changed));
+        try store.applyTableUpsertTxn(&txn, group, changed);
+        changed = table;
+        changed.description = "metadata-only updates remain allowed";
+        try std.testing.expect(try store.retainedSourceDefinitionAllowedTxn(&txn, group, table, changed));
+        var key: [160]u8 = undefined;
+        const unchanged = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&key, group, table.table_id)));
+        defer metadata_table_manager.freeTable(a, unchanged);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, unchanged));
+        // A reconciliation command must not publish a new owner while native
+        // activation has not yet installed any bindings.
+        try store.applyTransitionCommandTxn(&txn, group, .{ .upsert_range = .{ .table_id = table.table_id, .group_id = 71, .range_id = 71, .start_key = "" } });
+        try std.testing.expectEqual(@as(?[]const u8, null), try RaftApplyStore.stagingGet(&txn, try rangeKeyForGroup(&key, group, 71)));
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        const fence = try store.loadTableTransitionFenceTxn(&txn, group, table.table_id);
+        try std.testing.expectError(error.RetainedDatasetSourceInUse, store.removeTableTxn(&txn, group, table.table_id, fence.generation));
+        // Replicated stale commands are deterministic no-ops, including both
+        // legacy removal and the membership-fenced physical DROP command.
+        try store.applyTransitionCommandTxn(&txn, group, .{ .remove_table = .{ .table_id = table.table_id, .expected_transition_generation = fence.generation } });
+        try store.applyTableTopologyMutationTxn(&txn, group, .{ .drop = .{ .table_id = table.table_id, .expected_name = table.name, .expected_transition_generation = fence.generation, .range_contract = .{ .membership = fence.membership(table.table_id) } } });
+        var key_buf: [160]u8 = undefined;
+        _ = try txn.get(try tableKeyForGroup(&key_buf, group, table.table_id));
+    }
+    {
+        var buffer: [64 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const allocator = bounded.allocator();
+        var txn = try store.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        const view: system_catalog_storage.View = .{ .alloc = allocator, .txn = &txn, .group_id = group, .meta = try system_catalog_storage.readMeta(allocator, &txn, group) };
+        try std.testing.expect(try view.hasRetainedSourceUsers(table.table_id));
+        try std.testing.expectEqual(@as(?u64, resource.id), try view.datasetOwner(descriptor.definition.id));
+        try std.testing.expectEqual(resource.id, (try view.nextRetainedWork(0, true)).?.id);
+        try std.testing.expectEqual(resource.id, (try view.nextRetainedWork(resource.id, true)).?.id);
+    }
+    store.deinit();
+    opened = false;
+    store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    opened = true;
+    try store.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requireRetainedSourceDropAllowed(group, table.table_id));
+    // The verified detached state releases only the raw-source dependency.
+    // Independent catalog maintenance remains scheduled after the source dies.
+    descriptor.phase = .closed;
+    descriptor.source = null;
+    descriptor.closed_receipt = @splat(8);
+    descriptor.revision = 4;
+    const closed = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(closed);
+    resource.source_json = closed;
+    resource.retained = descriptor.identity();
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try system_catalog_storage.writeResource(a, &txn, group, resource);
+        try system_catalog_storage.validateNameIndex(a, &txn, group);
+        try txn.commit();
+    }
+    try store.requireRetainedSourceDropAllowed(group, table.table_id);
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = allocator, .txn = &txn, .group_id = group, .meta = try system_catalog_storage.readMeta(allocator, &txn, group) };
+        try std.testing.expectEqual(@as(?system_catalog.Resource, null), try view.nextRetainedWork(0, true));
+        try std.testing.expectEqual(resource.id, (try view.nextRetainedWork(0, false)).?.id);
+    }
 }

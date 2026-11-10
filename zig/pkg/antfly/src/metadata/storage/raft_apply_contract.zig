@@ -323,4 +323,6 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    retained_dataset_work: struct { after_id: u64, native: bool },
+    require_retained_source_drop_allowed: u64,
 };

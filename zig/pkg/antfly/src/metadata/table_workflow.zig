@@ -190,6 +190,13 @@ pub const TableWorkflow = struct {
         table_id: u64,
         held_catalog_gate: *bool,
     ) !control_loop.ReconcileSummary {
+        const ServiceType = @TypeOf(service);
+        const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+            .pointer => |pointer| pointer.child,
+            else => ServiceType,
+        };
+        if (@hasDecl(ServiceDeclType, "ensureRetainedSourceDropAllowedWithContext"))
+            try service.ensureRetainedSourceDropAllowedWithContext(request, table_id);
         try self.bootstrapDesiredFromCommitted(service);
         _ = self.loop.stateRef().tableManager().removeTableTopology(table_id);
         return try self.loop.reconcilePreparedCatalogLockedWithContextAndGate(service, request, held_catalog_gate);

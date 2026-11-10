@@ -7940,7 +7940,7 @@ pub const AntflyApiHandler = struct {
                 const resource = try system_catalog_routes.resourceNameAlloc(ctx.allocator, destination);
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
-                    .query_source => .table,
+                    .query_source, .dataset => .table,
                     .graph => .graph,
                     .database => .database,
                     .namespace => .namespace,
@@ -8999,6 +8999,10 @@ pub const AntflyApiHandler = struct {
                 error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
                     _ = ctx.status(409);
                     return ctx.text("table topology changed or is extension-owned");
+                },
+                error.RetainedDatasetSourceInUse => {
+                    _ = ctx.status(409);
+                    return ctx.text("table still supplies retained datasets");
                 },
                 error.ConstraintRetirementRequired => {
                     _ = ctx.status(409);

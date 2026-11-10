@@ -3590,6 +3590,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
         var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch return metadata_topology_protocol.current_version;
         defer parsed.deinit();
+        if (parsed.value.mutation.kind == .dataset) return metadata_topology_protocol.retained_datasets_version;
         if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
     }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
@@ -6725,6 +6726,12 @@ pub const MetadataService = struct {
         }
         try request.ensureActive();
         return error.MetadataProposalApplyTimeout;
+    }
+
+    pub fn ensureRetainedSourceDropAllowedWithContext(self: *MetadataService, request: api_operation.RequestContext, table_id: u64) !void {
+        try self.ensureLinearizableReadWithContext(request);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        try store.requireRetainedSourceDropAllowed(self.metadata_group_id, table_id);
     }
 
     pub fn captureTableDropAdmission(

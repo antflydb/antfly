@@ -89,7 +89,7 @@ pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     return switch (route.kind) {
         .database, .tablespace, .query_source, .graph => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
-        .table => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
+        .table, .dataset => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
     };
 }
 

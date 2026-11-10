@@ -23,6 +23,27 @@ const settings = @import("antfly_local_sources").system_catalog_settings;
 const policies = @import("antfly_local_sources").system_catalog_policies;
 
 pub const Meta = domain.Meta;
+const retained = domain.retained_datasets;
+fn datasetIdKey(a: std.mem.Allocator, group: u64, id: retained.Id) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:dataset_id:{s}", .{ group, std.fmt.bytesToHex(id, .lower) });
+}
+fn retainedSourcePrefix(a: std.mem.Allocator, group: u64, source: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:retained_source:{d}:", .{ group, source });
+}
+fn retainedSourceKey(a: std.mem.Allocator, group: u64, source: u64, resource: u64) ![]u8 {
+    const prefix = try retainedSourcePrefix(a, group, source);
+    defer a.free(prefix);
+    return indexedIdKey(a, prefix, resource);
+}
+fn retainedWorkPrefix(a: std.mem.Allocator, group: u64, native: bool) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:retained_{s}_work:", .{ group, if (native) "native" else "catalog" });
+}
+fn indexedIdKey(a: std.mem.Allocator, prefix: []const u8, id: u64) ![]u8 {
+    const key = try a.alloc(u8, prefix.len + 8);
+    @memcpy(key[0..prefix.len], prefix);
+    std.mem.writeInt(u64, key[prefix.len..][0..8], id, .big);
+    return key;
+}
 
 pub const OwnedState = domain.OwnedState;
 
@@ -668,6 +689,52 @@ pub const View = struct {
         }
         return out.items;
     }
+    pub fn datasetOwner(self: View, id: retained.Id) !?u64 {
+        const key = try datasetIdKey(self.alloc, self.group_id, id);
+        defer self.alloc.free(key);
+        const raw = self.txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (raw.len != 8) return error.InvalidCatalogRecord;
+        const owner = std.mem.readInt(u64, raw[0..8], .little);
+        var resource = (try getById(self.alloc, self.txn, self.group_id, .dataset, owner)) orelse return error.InvalidCatalogRecord;
+        defer resource.deinit();
+        if (resource.value.retained == null or !std.mem.eql(u8, &resource.value.retained.?.dataset, &id)) return error.InvalidCatalogRecord;
+        return owner;
+    }
+    pub fn hasRetainedSourceUsers(self: View, source: u64) !bool {
+        const prefix = try retainedSourcePrefix(self.alloc, self.group_id, source);
+        defer self.alloc.free(prefix);
+        var cursor = try self.txn.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        if (!std.mem.startsWith(u8, row.key, prefix)) return false;
+        if (row.key.len != prefix.len + 8 or row.value.len != 8) return error.InvalidCatalogRecord;
+        const id = std.mem.readInt(u64, row.value[0..8], .little);
+        if (id != std.mem.readInt(u64, row.key[prefix.len..][0..8], .big)) return error.InvalidCatalogRecord;
+        var resource = (try getById(self.alloc, self.txn, self.group_id, .dataset, id)) orelse return error.InvalidCatalogRecord;
+        defer resource.deinit();
+        if (resource.value.retained == null or resource.value.retained.?.source_table_id != source) return error.InvalidCatalogRecord;
+        return true;
+    }
+    pub fn nextRetainedWork(self: View, after: u64, native: bool) !?domain.Resource {
+        const prefix = try retainedWorkPrefix(self.alloc, self.group_id, native);
+        const seek = if (after == std.math.maxInt(u64)) prefix else try indexedIdKey(self.alloc, prefix, after + 1);
+        var cursor = try self.txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(seek);
+        if (entry == null or !std.mem.startsWith(u8, entry.?.key, prefix)) entry = try cursor.seekAtOrAfter(prefix);
+        const row = entry orelse return null;
+        if (!std.mem.startsWith(u8, row.key, prefix)) return null;
+        if (row.key.len != prefix.len + 8 or row.value.len != 8) return error.InvalidCatalogRecord;
+        const id = std.mem.readInt(u64, row.value[0..8], .little);
+        if (id != std.mem.readInt(u64, row.key[prefix.len..][0..8], .big)) return error.InvalidCatalogRecord;
+        const resource = (try self.byId(.dataset, id)) orelse return error.InvalidCatalogRecord;
+        if (resource.retained == null or (native and resource.retained.?.source_table_id == 0)) return error.InvalidCatalogRecord;
+        try domain.validateRetainedProjection(self.alloc, resource);
+        return resource;
+    }
     pub fn bindingForStorage(self: View, name: []const u8) !?domain.Resource {
         const key = try storageBindingKey(self.alloc, self.group_id, name);
         const bytes = self.txn.get(key) catch |err| switch (err) {
@@ -704,7 +771,7 @@ pub const View = struct {
     }
     pub fn read(self: View, request: domain.Read) !domain.State {
         if (request.kind == .table) return error.InvalidCatalogMutation;
-        const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else 0;
+        const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else if (request.kind == .dataset) (try self.namespaceFor(request.database, request.namespace)).id else 0;
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
         if (request.name) |name| {
             try out.append(self.alloc, (try self.lookup(request.kind, parent, name)) orelse return error.CatalogNotFound);
@@ -768,6 +835,25 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
         const child_json = try std.json.Stringify.valueAlloc(alloc, resource, .{});
         defer alloc.free(child_json);
         if (!std.mem.eql(u8, txn.get(child_key) catch return error.InvalidCatalogRecord, child_json)) return error.InvalidCatalogRecord;
+        if (resource.retained) |identity| {
+            const view: View = .{ .alloc = alloc, .txn = txn, .group_id = group_id, .meta = state.meta };
+            if ((try view.datasetOwner(identity.dataset)) != resource.id) return error.InvalidCatalogRecord;
+            if (identity.source_table_id != 0) {
+                const dependency = try retainedSourceKey(alloc, group_id, identity.source_table_id, resource.id);
+                defer alloc.free(dependency);
+                const bytes = txn.get(dependency) catch return error.InvalidCatalogRecord;
+                if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+            }
+            for ([_]bool{ false, true }) |native| {
+                if (native and identity.source_table_id == 0) continue;
+                const prefix = try retainedWorkPrefix(alloc, group_id, native);
+                defer alloc.free(prefix);
+                const key = try indexedIdKey(alloc, prefix, resource.id);
+                defer alloc.free(key);
+                const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
+                if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+            }
+        }
         if (resource.kind == .table) {
             const key = try storageBindingKey(alloc, group_id, resource.storage_name);
             defer alloc.free(key);
@@ -799,6 +885,29 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
+    if (r.retained) |identity| {
+        const key = try datasetIdKey(alloc, group_id, identity.dataset);
+        defer alloc.free(key);
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, r.id, .little);
+        if (txn.get(key)) |old| {
+            if (!std.mem.eql(u8, old, &id)) return error.InvalidCatalogRecord;
+        } else |err| if (err != error.NotFound) return err;
+        try txn.put(key, &id);
+        if (identity.source_table_id != 0) {
+            const dependency = try retainedSourceKey(alloc, group_id, identity.source_table_id, r.id);
+            defer alloc.free(dependency);
+            try txn.put(dependency, &id);
+        }
+        for ([_]bool{ false, true }) |native| {
+            if (native and identity.source_table_id == 0) continue;
+            const prefix = try retainedWorkPrefix(alloc, group_id, native);
+            defer alloc.free(prefix);
+            const work_key = try indexedIdKey(alloc, prefix, r.id);
+            defer alloc.free(work_key);
+            try txn.put(work_key, &id);
+        }
+    }
     if (r.kind == .table) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
@@ -824,6 +933,24 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         error.NotFound => {},
         else => return err,
     };
+    if (r.retained) |identity| {
+        const key = try datasetIdKey(alloc, group_id, identity.dataset);
+        defer alloc.free(key);
+        try txn.delete(key);
+        if (identity.source_table_id != 0) {
+            const dependency = try retainedSourceKey(alloc, group_id, identity.source_table_id, r.id);
+            defer alloc.free(dependency);
+            try txn.delete(dependency);
+        }
+        for ([_]bool{ false, true }) |native| {
+            if (native and identity.source_table_id == 0) continue;
+            const prefix = try retainedWorkPrefix(alloc, group_id, native);
+            defer alloc.free(prefix);
+            const work_key = try indexedIdKey(alloc, prefix, r.id);
+            defer alloc.free(work_key);
+            try txn.delete(work_key);
+        }
+    }
     if (r.kind == .table) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
@@ -843,6 +970,7 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 }
 
 pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {
+    try domain.validateRetainedProjection(alloc, resource);
     if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |old_value| {
         var old = old_value;
         defer old.deinit();

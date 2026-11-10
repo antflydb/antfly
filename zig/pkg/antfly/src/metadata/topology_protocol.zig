@@ -116,7 +116,9 @@ const std = @import("std");
 /// Version 83 decodes independent durable query-artifact store ownership and
 /// its restartable cleanup frontier, including the global composed-cursor row.
 /// Version 84 adds graph definitions and transaction sessions.
-pub const current_version: u16 = 84;
+/// Version 85 owns independent retained dataset resources and source/work indexes.
+pub const current_version: u16 = 85;
+pub const retained_datasets_version: u16 = 85;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;

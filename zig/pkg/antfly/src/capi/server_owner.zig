@@ -2178,6 +2178,14 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlPolicyPublicationStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .retained_dataset_work => |input| {
+                    const value = handle.store.retainedDatasetWorkJson(a, group_id, input.after_id, input.native) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .require_retained_source_drop_allowed => |input| {
+                    handle.store.requireRetainedSourceDropAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
                 .sql_policy_publication_work => |input| {
                     const value = handle.store.sqlPolicyPublicationWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

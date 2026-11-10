@@ -840,6 +840,13 @@ const LocalStandaloneMetadata = struct {
         committed: bool = false,
 
         fn upsertTable(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, table: antfly.metadata.TableRecord) !void {
+            if (metadata.system_catalog_state) |state| if (state.index.retained_source_users.contains(table.table_id)) {
+                if (metadata.manager.tables.get(table.table_id)) |previous| {
+                    if (!std.mem.eql(u8, previous.name, table.name) or
+                        !std.mem.eql(u8, previous.schema_json, table.schema_json) or
+                        !std.mem.eql(u8, previous.read_schema_json, table.read_schema_json)) return error.RetainedDatasetSourceInUse;
+                } else return error.RetainedDatasetSourceInUse;
+            };
             if (metadata.lifecycle_store) |store| {
                 if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
             }
@@ -853,6 +860,10 @@ const LocalStandaloneMetadata = struct {
             try self.previous_tables.put(metadata.alloc, id, owned);
         }
         fn upsertRange(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, range: antfly.metadata.RangeRecord) !void {
+            if (metadata.system_catalog_state) |state| if (state.index.retained_source_users.contains(range.table_id)) {
+                const previous = metadata.manager.ranges.get(range.group_id) orelse return error.RetainedDatasetSourceInUse;
+                if (!antfly.metadata.table_manager.rangeRecordsEqual(previous, range)) return error.RetainedDatasetSourceInUse;
+            };
             try self.captureRange(metadata, range.group_id);
             try metadata.manager.upsertRange(range);
         }
@@ -2427,6 +2438,17 @@ const LocalStandaloneMetadata = struct {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
+        pub fn datasetOwner(self: @This(), id: system_catalog.retained_datasets.Id) !?u64 {
+            return self.index.dataset_ids.get(id);
+        }
+        pub fn hasRetainedSourceUsers(self: @This(), id: u64) !bool {
+            return self.index.retained_source_users.contains(id);
+        }
+        pub fn retainedSource(self: @This(), id: u64) !?system_catalog.retained_datasets.Source {
+            const table = self.owner.manager.tables.get(id) orelse return null;
+            if (table.read_schema_json.len != 0 or table.storage_migration != null) return error.RetainedDatasetSourceNotReady;
+            return try system_catalog.retained_datasets.Source.fromTable(self.alloc, table, self.owner.metadata_incarnation orelse return error.InvalidMetadataIncarnation);
+        }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return @import("../system_catalog/graph_bindings.zig").indexIdentity(self.alloc, table.indexes_json, name);
@@ -2765,6 +2787,12 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .retained_dataset_work) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            const request = call.retained_dataset_work;
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedDatasetWorkJson(alloc, group_ids.main_metadata_group_id, request.after_id, request.native);
+        }
         if (call == .lake_source_owner_read) {
             try lockAtomicForRequest(&self.mutex, admission);
             defer self.mutex.unlock();
@@ -2855,7 +2883,7 @@ const LocalStandaloneMetadata = struct {
                 read.standalone = true;
                 return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
             },
-            .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
@@ -3721,6 +3749,7 @@ const LocalStandaloneMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         if (table.storage_migration != null) return error.VectorMigrationActive;
         const table_id = table.table_id;
+        if (self.system_catalog_state) |state| if (state.index.retained_source_users.contains(table_id)) return error.RetainedDatasetSourceInUse;
         const ranges = try self.manager.listRanges(alloc);
         defer self.manager.freeRanges(alloc, ranges);
         var dropped_group_ids = std.ArrayListUnmanaged(u64).empty;
