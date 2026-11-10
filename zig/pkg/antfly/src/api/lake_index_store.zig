@@ -30,6 +30,7 @@ pub const Store = struct {
     locator: local.metadata_lake_index_catalog.StoreLocator,
     cloud_binding: ?@import("lake_cloud_publication.zig").Binding = null,
     reopen_options: ?Reopen = null,
+    binding_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool) !Store {
         return openNative(a, config, secrets, read_only, config.deployment_mode, null);
@@ -128,14 +129,16 @@ pub const Store = struct {
         return result;
     }
     pub fn bindPublication(self: *Store, publication: local.metadata_lake_index_catalog.Publication, token: @import("antfly_cancellation").CancellationToken) !void {
+        @import("antfly_platform").sync.lockYielding(&self.binding_mutex);
+        defer self.binding_mutex.unlock();
         if (self.cloud_binding) |*held| {
-            const expected = publication.cloud_generations orelse return error.CatalogGenerationChanged;
-            if (!std.mem.eql(u8, held.reader.root.?.artifact_id, expected.root.artifact_id) or !std.mem.eql(u8, held.reader.root.?.generation, expected.root.generation)) return error.CatalogGenerationChanged;
-            return;
+            return held.bindPublication(publication, token);
         }
         self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(self.implementation.alloc, &self.implementation, publication, token);
     }
     pub fn bindGenerationMap(self: *Store, cloud: ?local.metadata_lake_index_catalog.CloudGenerations, token: @import("antfly_cancellation").CancellationToken) !void {
+        @import("antfly_platform").sync.lockYielding(&self.binding_mutex);
+        defer self.binding_mutex.unlock();
         const selected = cloud orelse return;
         if (self.cloud_binding != null) return error.CatalogGenerationChanged;
         self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.initMap(self.implementation.alloc, &self.implementation, selected, token);

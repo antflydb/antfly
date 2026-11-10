@@ -391,7 +391,13 @@ publication resolves readers across all child scopes. Leaf elapsed sums overlap;
 Publication capture records physical artifact selectors separately from synthetic
 range cache keys. Thus a page inside a navigation pack retains the pack's exact
 provider selector in the publication-bound locator set. Missing/overflow locators
-still take the authoritative map path. Payload prefetch may include one adjacent
+still take the authoritative map path. Selecting a publication promotes an
+existing map-only binding in place: it installs locators and validates its
+retention certificate while keeping the reader address stable. Identical admitted
+certificates retain their clock qualification. Store binding transitions are
+serialized; a fully admitted reader remains immutable under parallel hydration,
+and changed authority is rejected. Failed upgrades preserve prior binding state.
+Payload prefetch may include one adjacent
 64 KiB block from the same physical pack, batching a header hint and the next
 posting pull. The existing shared byte allowance, queue cap, physical adjacency,
 pack limits, and at-most-32-member envelopes bound speculation; demand continues

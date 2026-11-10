@@ -42,6 +42,7 @@ pub const Binding = struct {
     previous_reader: ?*maps.Reader,
     previous_roots: []const [32]u8,
     previous_until: u64,
+    publication_key: ?catalog.Digest = null,
     pub fn initMap(a: A, object: *Object, cloud: catalog.CloudGenerations, token: Token) !Binding {
         try cloud.root.validate();
         try token.check();
@@ -61,20 +62,54 @@ pub const Binding = struct {
         try publication.validate();
         var result = try initMap(a, object, cloud, token);
         errdefer result.deinit();
-        var until: u64 = 0;
-        if (object.cloud_retention_qualified) if (cloud.certificate) |certificate| {
-            const binding = try certificateBinding(a, publication, certificate);
+        try result.bindPublication(publication, token);
+        return result;
+    }
+    /// Promote a map-only retained/owner binding without moving its reader or
+    /// restoring state through an expired object address. Validate all new
+    /// authority before replacing certificate roots; failed upgrades preserve
+    /// the previous admitted state.
+    pub fn bindPublication(self: *Binding, publication: catalog.Publication, token: Token) !void {
+        try publication.validate();
+        try token.check();
+        const cloud = publication.cloud_generations orelse return error.CatalogGenerationChanged;
+        const root = self.reader.root orelse return error.CatalogGenerationChanged;
+        if (root.byte_len != cloud.root.byte_len or
+            !std.mem.eql(u8, root.artifact_id, cloud.root.artifact_id) or !std.mem.eql(u8, root.checksum, cloud.root.checksum) or
+            !std.mem.eql(u8, root.generation, cloud.root.generation)) return error.CatalogGenerationChanged;
+        // A fully admitted binding is immutable while hydration workers borrow
+        // its reader. Map-only admission can be promoted once, before readers
+        // are exposed; repeated source calls must never rewrite locator slices.
+        if (self.object.cloud_retention_qualified) if (cloud.certificate) |certificate| {
+            const binding = try certificateBinding(self.a, publication, certificate);
             if (!std.mem.eql(u8, &binding, &certificate.binding)) return error.InvalidCloudRetentionCertificate;
-            const provider_now = try object.client.providerTime(object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn));
+        };
+        const encoded = try std.json.Stringify.valueAlloc(self.a, .{ .root = cloud.root, .complete = cloud.complete, .opening_bundles = publication.opening_bundles, .certificate = cloud.certificate }, .{});
+        defer self.a.free(encoded);
+        const key = digestRoot(encoded);
+        if (self.publication_key) |prior| {
+            if (!std.mem.eql(u8, &prior, &key)) return error.CatalogGenerationChanged;
+            return;
+        }
+        if (self.object.cloud_reader != self.reader) return error.CatalogGenerationChanged;
+        var until: u64 = 0;
+        var roots: []const [32]u8 = &.{};
+        errdefer if (roots.len != 0) self.a.free(roots);
+        if (self.object.cloud_retention_qualified) if (cloud.certificate) |certificate| {
+            const provider_now = try self.object.client.providerTime(self.object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn));
             if (provider_now != null and provider_now.? +| 60_000 < certificate.until_ms) {
-                result.roots = try a.dupe([32]u8, certificate.roots);
+                roots = try self.a.dupe([32]u8, certificate.roots);
                 until = certificate.until_ms;
             }
         };
-        try result.reader.bindPublicationLocators(publication.opening_bundles);
-        object.cloud_certified_roots = result.roots;
-        object.cloud_certificate_until_ms = until;
-        return result;
+        try self.reader.bindPublicationLocators(publication.opening_bundles);
+        const old_roots = self.roots;
+        self.roots = roots;
+        self.publication_key = key;
+        self.reader.complete = cloud.complete;
+        self.object.cloud_certified_roots = roots;
+        self.object.cloud_certificate_until_ms = until;
+        if (old_roots.len != 0) self.a.free(old_roots);
     }
     pub fn deinit(self: *Binding) void {
         self.object.cloud_reader = self.previous_reader;
@@ -211,7 +246,7 @@ pub const UnionBinding = struct {
     }
 };
 
-test "external lake global frontier cloud certificates bind publications restart generations expiry and backend identity" {
+test "external lake global frontier cloud certificates bind publications restart generations expiry and backend identity with independent source map upgrades" {
     const a = std.testing.allocator;
     const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
     var provider = Provider.init(a);
@@ -287,6 +322,50 @@ test "external lake global frontier cloud certificates bind publications restart
     try std.testing.expect(cloud.complete);
     try std.testing.expectEqual(provider.until_ms, cloud.certificate.?.until_ms);
     object.cloud_writer = null;
+    var inventory_record = (try writer.lookup(a, inventory.artifact_id, .none)).?;
+    defer inventory_record.deinit(a);
+    const locators = [_]catalog.ProviderLocator{.{ .id = inventory.artifact_id, .bytes = inventory.byte_len, .generation = inventory_record.generation, .retention_until_ms = inventory_record.retention_until_ms }};
+    const bundles = [_]catalog.OpeningBundle{.{ .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .decoded_bytes = 5, .provider_locators = &locators }};
+    publication.opening_bundles = &bundles;
+    publication.cloud_generations.?.certificate.?.binding = try certificateBinding(a, publication, cloud.certificate.?);
+    // Resume/owner recovery starts map-only. Selecting the full publication
+    // must add direct locators and its certificate without moving the reader.
+    const Store = @import("lake_index_store.zig").Store;
+    var promoted: Store = .{ .opened = undefined, .implementation = try Object.initWithClient(a, client, "bucket", "native"), .identity = identity, .cache_identity = identity, .locator = undefined };
+    defer promoted.implementation.deinit();
+    promoted.implementation.cloud_retention_qualified = true;
+    try promoted.bindGenerationMap(publication.cloud_generations, .none);
+    defer promoted.cloud_binding.?.deinit();
+    const stable_reader = promoted.cloud_binding.?.reader;
+    const clocks = provider.clock_reads.load(.acquire);
+    try promoted.bindPublication(publication, .none);
+    try std.testing.expectEqual(stable_reader, promoted.cloud_binding.?.reader);
+    try std.testing.expectEqual(stable_reader, promoted.implementation.cloud_reader.?);
+    try std.testing.expectEqual(provider.until_ms, promoted.implementation.cloud_certificate_until_ms);
+    try std.testing.expectEqual(clocks + 1, provider.clock_reads.load(.acquire));
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    stable_reader.trace = &trace;
+    const get_count = provider.gets;
+    var selected = (try stable_reader.lookup(a, inventory.artifact_id, .none)).?;
+    defer selected.deinit(a);
+    try std.testing.expectEqualStrings(inventory_record.generation, selected.generation);
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().map_locator_hits);
+    try std.testing.expectEqual(get_count, provider.gets);
+    const roots_pointer = promoted.implementation.cloud_certified_roots.ptr;
+    const locators_pointer = stable_reader.publication_locators.ptr;
+    const borrowed_bundles = bundles;
+    var equivalent = publication;
+    equivalent.opening_bundles = &borrowed_bundles;
+    try promoted.bindPublication(equivalent, .none);
+    try std.testing.expectEqual(locators_pointer, stable_reader.publication_locators.ptr);
+    try std.testing.expectEqual(roots_pointer, promoted.implementation.cloud_certified_roots.ptr);
+    try std.testing.expectEqual(clocks + 1, provider.clock_reads.load(.acquire));
+    var invalid = publication;
+    invalid.cloud_generations.?.certificate.?.binding[0] ^= 1;
+    try std.testing.expectError(error.InvalidCloudRetentionCertificate, promoted.bindPublication(invalid, .none));
+    try std.testing.expectEqual(stable_reader, promoted.implementation.cloud_reader.?);
+    try std.testing.expectEqual(roots_pointer, promoted.implementation.cloud_certified_roots.ptr);
+    try std.testing.expectEqual(provider.until_ms, promoted.implementation.cloud_certificate_until_ms);
     // Fresh owner has neither a verification cache nor decoded map pages.
     var reopened = try Object.initWithClient(a, client, "bucket", "native");
     defer reopened.deinit();
