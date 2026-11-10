@@ -4790,6 +4790,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
                 if (internal_keys.isAssetArtifactKey(key)) {
                     try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+                    // Match generated publication records: even an unchanged
+                    // source can publish a newer healthy manifest whose repair
+                    // effect must reach every consumer before target advance.
+                    inline for (.{ .full_text, .dense_vector, .sparse_vector, .algebraic }) |hint|
+                        try appendUniqueReplayRecordHint(alloc, &target_hints, hint);
                 }
                 // A committed resolution artifact re-drives sibling resolvers over
                 // the same source (compositional event identity composes sibling

@@ -88,9 +88,12 @@ def sync_detailed(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
-    Embedding requests are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference; inspect index coverage
-    and repair issues for the eventual outcome.
+    Embedding requests and document-extraction requests on servers with an
+    enrichment runtime are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference. For extraction, inspect
+    the artifact generation, merge status and per-page failures; for embeddings,
+    inspect index coverage and repair issues. Embedded databases without an
+    enrichment runtime execute document extraction inline.
 
     Args:
         table_name (str):
@@ -132,9 +135,12 @@ def sync(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
-    Embedding requests are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference; inspect index coverage
-    and repair issues for the eventual outcome.
+    Embedding requests and document-extraction requests on servers with an
+    enrichment runtime are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference. For extraction, inspect
+    the artifact generation, merge status and per-page failures; for embeddings,
+    inspect index coverage and repair issues. Embedded databases without an
+    enrichment runtime execute document extraction inline.
 
     Args:
         table_name (str):
@@ -171,9 +177,12 @@ async def asyncio_detailed(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
-    Embedding requests are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference; inspect index coverage
-    and repair issues for the eventual outcome.
+    Embedding requests and document-extraction requests on servers with an
+    enrichment runtime are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference. For extraction, inspect
+    the artifact generation, merge status and per-page failures; for embeddings,
+    inspect index coverage and repair issues. Embedded databases without an
+    enrichment runtime execute document extraction inline.
 
     Args:
         table_name (str):
@@ -213,9 +222,12 @@ async def asyncio(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
-    Embedding requests are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference; inspect index coverage
-    and repair issues for the eventual outcome.
+    Embedding requests and document-extraction requests on servers with an
+    enrichment runtime are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference. For extraction, inspect
+    the artifact generation, merge status and per-page failures; for embeddings,
+    inspect index coverage and repair issues. Embedded databases without an
+    enrichment runtime execute document extraction inline.
 
     Args:
         table_name (str):

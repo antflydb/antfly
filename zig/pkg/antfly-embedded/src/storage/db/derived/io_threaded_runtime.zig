@@ -92,9 +92,9 @@ fn forcePersistAppliedSequence(worker: *const Worker) bool {
     return catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).force_persist_applied_sequence;
 }
 
-fn canAdvanceToTarget(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64, target_sequence: u64) !bool {
+fn canAdvanceToTarget(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64, target_sequence: u64, replayed_through_sequence: u64) !bool {
     if (runtime.can_advance_to_target_fn) |callback| {
-        return try callback(runtime.ctx, worker.kind, from_sequence, target_sequence);
+        return try callback(runtime.ctx, worker.kind, from_sequence, target_sequence, replayed_through_sequence);
     }
     return true;
 }
@@ -1204,7 +1204,7 @@ fn workerMain(worker: *Worker) void {
         }
 
         const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
-            canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
+            canAdvanceToTarget(runtime, worker, from_sequence, target_sequence, stats.targetAdvanceFromSequence(from_sequence, target_sequence)) catch |err| {
                 close_success = false;
                 runtime.recordError(io, worker, "target_advance", err);
                 return;
@@ -1851,7 +1851,7 @@ test "io threaded deferred source capture advances empty targets only through co
         .target_hints = &.{.full_text},
     });
     const Coverage = struct {
-        fn allow(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef, from: u64, target: u64) !bool {
+        fn allow(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef, from: u64, target: u64, _: u64) !bool {
             const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
             try std.testing.expectEqual(@as(u64, 0), from);
             try std.testing.expectEqual(@as(u64, 1), target);

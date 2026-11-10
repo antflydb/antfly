@@ -23,42 +23,45 @@ T = TypeVar("T", bound="TableRepairJob")
 
 @_attrs_define
 class TableRepairJob:
-    """Durable table repair job state.
+    """Durable table repair job state. In result, work counters accumulate across
+    passes, while unresolved and in_progress describe only the latest bounded
+    pass. Earlier failures remain represented by cumulative failure counters,
+    debt_remaining, and the current remaining_failures summary.
 
-    Attributes:
-        job_id (int): Server-assigned durable repair job identifier.
-        attempt_id (int): Monotonic execution attempt token for the current running pass.
-        table_name (str): Table being repaired.
-        phase (TableRepairJobPhase): Lifecycle phase of the repair job. `completed_with_failures` means every
-            pass ran but some documents still fail; `remaining_failures` says why
-            and what to do, and running repair again retries them. `failed` means
-            the job itself could not run, for example an invalid request or a
-            stale control fence.
-        repair_status (TableRepairJobRepairStatus): User-facing repair progress state. `debt_remaining` means the
-            bounded job stopped because unsupported or failed debt still requires operator action.
-        target (RepairTarget): Repair subsystem to inspect or run.
-        limit (int): Effective per-pass repair limit.
-        force (bool): Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
-        result (TableRepairRunResult): Result of one bounded table repair pass.
-        cancel_requested (bool): Whether cancellation is pending. For a named-index repair/rebuild job, cancellation
-            durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without
-            undoing controls already applied.
-        created_at_millis (int): Unix epoch milliseconds when the job was created.
-        last_updated_at_millis (int): Unix epoch milliseconds when the job state was last updated.
-        expires_at_millis (int): Unix epoch milliseconds when the job is eligible for cleanup.
-        kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
-        index (str | Unset): Index name when the job is restricted to one index.
-        control (TableRepairJobControl | Unset): Durable named-index control applied in bounded server-owned passes
-            across every table group.
-        repair_id (str | Unset): Decimal repair attempt fence, preserved across every pass. A stale fence fails the
-            control job.
-        cursor (None | str | Unset): Opaque continuation cursor for the next bounded repair pass.
-        last_error (None | str | Unset): Last stable job-level error code.
-        next_retry_at_millis (int | Unset): Unix epoch milliseconds when a deferred pass may next run; zero means
-            immediately eligible.
-        remaining_failures (list[RepairRemainingFailure] | Unset): Documents that still fail, grouped by error code with
-            the next step. Present on finished repair jobs that are not controls, read from the current repair issues.
-        remaining_failures_truncated (bool | Unset): Whether more repair issues exist than the summary scanned.
+        Attributes:
+            job_id (int): Server-assigned durable repair job identifier.
+            attempt_id (int): Monotonic execution attempt token for the current running pass.
+            table_name (str): Table being repaired.
+            phase (TableRepairJobPhase): Lifecycle phase of the repair job. `completed_with_failures` means every
+                pass ran but some documents still fail; `remaining_failures` says why
+                and what to do, and running repair again retries them. `failed` means
+                the job itself could not run, for example an invalid request or a
+                stale control fence.
+            repair_status (TableRepairJobRepairStatus): User-facing repair progress state. `debt_remaining` means the
+                bounded job stopped because unsupported or failed debt still requires operator action.
+            target (RepairTarget): Repair subsystem to inspect or run.
+            limit (int): Effective per-pass repair limit.
+            force (bool): Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
+            result (TableRepairRunResult): Result of one bounded table repair pass.
+            cancel_requested (bool): Whether cancellation is pending. For a named-index repair/rebuild job, cancellation
+                durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without
+                undoing controls already applied.
+            created_at_millis (int): Unix epoch milliseconds when the job was created.
+            last_updated_at_millis (int): Unix epoch milliseconds when the job state was last updated.
+            expires_at_millis (int): Unix epoch milliseconds when the job is eligible for cleanup.
+            kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
+            index (str | Unset): Index name when the job is restricted to one index.
+            control (TableRepairJobControl | Unset): Durable named-index control applied in bounded server-owned passes
+                across every table group.
+            repair_id (str | Unset): Decimal repair attempt fence, preserved across every pass. A stale fence fails the
+                control job.
+            cursor (None | str | Unset): Opaque continuation cursor for the next bounded repair pass.
+            last_error (None | str | Unset): Last stable job-level error code.
+            next_retry_at_millis (int | Unset): Unix epoch milliseconds when a deferred pass may next run; zero means
+                immediately eligible.
+            remaining_failures (list[RepairRemainingFailure] | Unset): Documents that still fail, grouped by error code with
+                the next step. Present on finished repair jobs that are not controls, read from the current repair issues.
+            remaining_failures_truncated (bool | Unset): Whether more repair issues exist than the summary scanned.
     """
 
     job_id: int

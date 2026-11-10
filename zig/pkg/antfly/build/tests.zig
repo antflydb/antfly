@@ -6925,6 +6925,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const repair_publication_tests = b.addTest(.{
+        .name = "artifact-repair-publication-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "successful forced document reprocess", "successful asset publication clears terminal debt", "public artifact reprocess accepts durable work", "managed index repair observes terminal replay failure", "metadata replay progress", "document extraction manifest inspection and reprocess API", "document quality policy reprocess retires", "OCR sampling byte fingerprints", "managed index repair keeps failed OCR manifests as debt", "managed index repair queues providers outside the request guard and survives reopen" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        // This focused Safe owner measured 13.9 GB peak with extraction
+        // inspection included. Reserve at least 25% headroom, not the full
+        // storage suite's budget, so unrelated compiles can still run.
+        .max_rss = 17 * 1024 * 1024 * 1024,
+    });
+    b.step("artifact-repair-publication-test", "Verify producer publication retires prior consumer repair debt").dependOn(&b.addRunArtifact(repair_publication_tests).step);
     const source_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },

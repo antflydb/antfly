@@ -286,6 +286,7 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             try appendUniqueHintAlloc(alloc, &target_hints, .full_text);
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
+            try appendUniqueHintAlloc(alloc, &target_hints, .algebraic);
         } else if (internal_keys.isResolutionArtifactKey(key)) {
             // The resolution stage journals its output; wake the graph
             // materializer for doc->entity provenance edges and the promoter so
