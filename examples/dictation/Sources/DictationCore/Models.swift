@@ -95,6 +95,12 @@ public struct Configuration: Codable, Equatable, Sendable {
   public var shortcutModifiers: UInt32 = 6144  // Control + Option (Carbon)
   public var toggle = false
   public var autoPaste = true
+  public var voiceFormatting: Bool?
+  public var smartSpacing: Bool?
+  public var pressEnterCommand: Bool?
+  public var usesVoiceFormatting: Bool { voiceFormatting ?? true }
+  public var usesSmartSpacing: Bool { smartSpacing ?? true }
+  public var usesPressEnterCommand: Bool { pressEnterCommand ?? false }
   public var retainHistory = false
   public var retainAudio = false
   public var concurrentRequests: Int?
@@ -269,6 +275,7 @@ public enum RecordingState: Equatable, Sendable {
 }
 
 public struct DictationResult: Sendable {
+  public var formatting: VoiceFormatting.Output?
   public var raw: String
   public var text: String
   public var timing: DictationTiming?
