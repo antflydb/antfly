@@ -198,6 +198,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			binding.Publication = "native"
 		}
 		if prior, ok := old[source.ID]; ok && prior.Table == source.Table && binding.SameRecordLayout(prior) {
+			binding.AcquisitionID = prior.AcquisitionID
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
 			binding.PublishedRevision = prior.PublishedRevision
@@ -237,6 +238,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 				return err
 			}
 		}
+		catalog.Sources[i].AcquisitionID = ""
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
 		catalog.Sources[i].ValidUntil = nil
@@ -259,6 +261,12 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		until := started + int64(ttl)
 		// Each successful publication gets a new fence even for an unchanged inventory.
 		revision += ":" + rand.Text()
+		if source.Knowledge != nil {
+			catalog.Sources[i].AcquisitionID, err = sourceAcquisitionIdentity(source, connection)
+			if err != nil {
+				return err
+			}
+		}
 		catalog.Sources[i].PublishedRevision = revision
 		catalog.Sources[i].Status = "searchable"
 		catalog.Sources[i].ValidUntil = &until
@@ -868,4 +876,35 @@ func decodeJSONExact(raw []byte, out any) error {
 		return fmt.Errorf("expected exactly one JSON value")
 	}
 	return nil
+}
+
+// Publication identity includes row keying as well as acquired content/access.
+// Processing-only edits are deliberately excluded; key migrations and provider
+// selection edits cannot reuse a previous publication's authority.
+func sourceAcquisitionIdentity(source Source, connection Connection) (string, error) {
+	// A management client may reorder JSON object keys without changing the
+	// selected acquisition. Preserve numbers while canonicalizing that witness.
+	if len(source.Config) > 0 {
+		var config any
+		if err := decodeJSONExact(source.Config, &config); err != nil {
+			return "", err
+		}
+		canonical, err := json.Marshal(config)
+		if err != nil {
+			return "", err
+		}
+		source.Config = canonical
+	}
+	if connection.Provider == ProviderGoogleWorkspace {
+		connection.Services = nil
+	}
+	hash, err := sourceConfigurationHash(source, connection)
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal([]string{hash, source.Identity.Namespace})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw)), nil
 }

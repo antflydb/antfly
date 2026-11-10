@@ -30,6 +30,7 @@ type Catalog struct {
 	Principals []string  `json:"principals"`
 }
 type Binding struct {
+	AcquisitionID     string                `json:"acquisition_id,omitempty"`
 	Knowledge         *KnowledgeDeclaration `json:"knowledge,omitempty"`
 	SearchVersion     int                   `json:"search_version,omitempty"`
 	Artifacts         []ArtifactBinding     `json:"artifacts,omitempty"`

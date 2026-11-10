@@ -7049,7 +7049,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const resolver_backfill_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill" },
+        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill", "resolver config persists and reader-fences candidate namespaces" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const resolver_backfill_step = b.step("antfly-resolver-backfill-test", "Run resolver catalog and durable backfill regressions");

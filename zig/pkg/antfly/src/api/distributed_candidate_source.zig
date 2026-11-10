@@ -334,7 +334,7 @@ pub const DistributedCandidateSource = struct {
             .execution_deadline_ns = self.readDeadline(),
             .inclusive_from = true,
             .exclusive_to = true,
-            .include_documents = true,
+            .include_documents = false,
             .limit = @intCast(@min(opts.limit, std.math.maxInt(u32))),
         };
         if (self.read_filter) |policy| scan_options.filter_query_json = try policy.get(policy.ptr, allocator, physical);
@@ -344,10 +344,23 @@ pub const DistributedCandidateSource = struct {
         var resp = (try self.reads.scan(allocator, physical, prefix, upper, scan_options, self.consistency)) orelse return;
         defer resp.deinit(allocator);
 
+        // Scan envelopes differ between legacy and relational tables. Only
+        // `_id` is shared and reserved. Hydrate logical documents through the
+        // existing bounded bulk reader rather than guessing from user fields.
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
         var lines = std.mem.splitScalar(u8, resp.ndjson, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            try consumeScanLine(allocator, line, ctx, consume);
+            if (opts.limit > 0 and keys.items.len >= opts.limit) return error.InvalidCandidateResponse;
+            try keys.append(a, try scanLineKey(a, line));
+        }
+        if (keys.items.len > 0) {
+            var bound = self.*;
+            bound.catalog_binding = null;
+            try getManyFn(&bound, allocator, physical, keys.items, ctx, consume);
         }
     }
 
@@ -422,6 +435,7 @@ pub const DistributedCandidateSource = struct {
             .include_stored = true,
             .fields = query.fields,
             .include_all_fields = query.fields.len == 0,
+            .filter_prefix = query.key_prefix,
         };
         var resp = (try self.reads.query(allocator, physical, try self.queryRequest(allocator, physical, req), self.consistency)) orelse return;
         defer resp.deinit(allocator);
@@ -443,32 +457,10 @@ fn prefixUpperBoundAlloc(allocator: std.mem.Allocator, prefix: []const u8) !?[]u
     return out;
 }
 
-/// Scan encoders identify documents with `_id`. Relational scans wrap the
-/// document in `row`; legacy scans project its fields into the envelope.
-/// Pass only the relational document to the matcher, never its metadata.
-fn consumeScanLine(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    ctx: *anyopaque,
-    consume: CandidateSource.Consume,
-) !void {
-    const Wire = struct {
-        _id: []const u8,
-        // Legacy document fields can also be named schema_version or row.
-        // Require the relational version envelope before unwrapping either.
-        version: ?@import("antfly-json").BorrowedValue = null,
-        schema_version: ?@import("antfly-json").BorrowedValue = null,
-        row: ?@import("antfly-json").BorrowedValue = null,
-    };
-    const parsed = std.json.parseFromSlice(Wire, allocator, line, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCandidateResponse;
-    defer parsed.deinit();
-    if (parsed.value.schema_version != null and parsed.value.version != null) {
-        const row = parsed.value.row orelse return error.InvalidCandidateResponse;
-        if (row.json.len == 0 or row.json[0] != '{') return error.InvalidCandidateResponse;
-        try consume(ctx, parsed.value._id, row.json);
-    } else {
-        try consume(ctx, parsed.value._id, line);
-    }
+/// Both scan formats reserve `_id`; every other document field is opaque.
+fn scanLineKey(a: std.mem.Allocator, line: []const u8) ![]const u8 {
+    const wire = std.json.parseFromSliceLeaky(struct { _id: []const u8 }, a, line, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCandidateResponse;
+    return wire._id;
 }
 
 /// The public query envelope is `{"responses":[{"hits":{"hits":[{"_id","_source"}]}}]}`
@@ -505,6 +497,7 @@ const FakeTableReadSource = struct {
     point_query_calls: usize = 0,
     last_query_index: []const u8 = "",
     expected_filter: ?[]const u8 = null,
+    expected_key_prefix: ?[]const u8 = null,
 
     fn source(self: *FakeTableReadSource) table_reads.TableReadSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -550,22 +543,16 @@ const FakeTableReadSource = struct {
 
         var out = std.ArrayListUnmanaged(u8).empty;
         defer out.deinit(alloc);
+        var emitted: usize = 0;
         var it = self.docs.iterator();
         while (it.next()) |e| {
             const key = e.key_ptr.*;
             if (std.mem.order(u8, key, from_key) == .lt) continue;
             if (std.mem.order(u8, key, to_key) != .lt) continue;
-            // Emit the legacy public scan envelope, including its `_id`.
-            const doc = e.value_ptr.*;
-            const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
-            defer alloc.free(escaped_key);
-            try out.appendSlice(alloc, "{\"_id\":");
-            try out.appendSlice(alloc, escaped_key);
-            if (doc.len > 2) {
-                try out.append(alloc, ',');
-                try out.appendSlice(alloc, doc[1..]);
-            } else try out.append(alloc, '}');
-            try out.append(alloc, '\n');
+            if (opts.limit > 0 and emitted >= opts.limit) break;
+            emitted += 1;
+            try testing.expect(!opts.include_documents);
+            try @import("antfly_local_sources").api_local_query_contract.appendScanLine(alloc, &out, key, null, null);
         }
         return .{ .ndjson = try out.toOwnedSlice(alloc) };
     }
@@ -598,6 +585,7 @@ const FakeTableReadSource = struct {
             try out.writer.writeAll("]}}]}");
             return .{ .json = try out.toOwnedSlice() };
         }
+        if (self.expected_key_prefix) |prefix| try testing.expectEqualStrings(prefix, req.filter_prefix);
         if (req.dense_queries.len > 0) {
             self.last_query_k = req.dense_queries[0].query.k;
             self.last_query_index = req.dense_queries[0].index_name;
@@ -667,7 +655,7 @@ test "DistributedCandidateSource scan_prefix returns only keys under the prefix"
     var fake = FakeTableReadSource{ .alloc = alloc, .table = "entities" };
     defer fake.docs.deinit(alloc);
     try fake.docs.put(alloc, "person/ada_lovelace",
-        \\{"canonical_name":"Ada Lovelace","label":"person"}
+        \\{"canonical_name":"Ada Lovelace","label":"person","version":1,"schema_version":1,"row":{"nested":true},"generation":18446744073709551615}
     );
     try fake.docs.put(alloc, "person/alan_turing",
         \\{"canonical_name":"Alan Turing","label":"person"}
@@ -685,34 +673,32 @@ test "DistributedCandidateSource scan_prefix returns only keys under the prefix"
 
     try testing.expectEqual(@as(usize, 2), ctx.keys.items.len);
     for (ctx.keys.items) |k| try testing.expect(std.mem.startsWith(u8, k, "person/"));
-    // The value carries the document fields the matcher reads.
-    for (ctx.values.items) |v| try testing.expect(std.mem.indexOf(u8, v, "canonical_name") != null);
+    // Hydration preserves application fields even when they resemble either
+    // storage envelope, including exact integers beyond float precision.
+    for (ctx.keys.items, ctx.values.items) |key, value| try testing.expectEqualStrings(fake.docs.get(key).?, value);
+    try testing.expectEqual(@as(usize, 1), fake.point_query_calls);
 }
 
-test "DistributedCandidateSource consumes real legacy and relational scan encodings" {
-    const alloc = testing.allocator;
+test "DistributedCandidateSource scans reserve only document identity" {
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const document = "{\"canonical_name\":\"Alice\",\"label\":\"person\",\"key\":\"user-field\",\"row\":{\"nested\":true},\"schema_version\":\"user-field\",\"generation\":18446744073709551615}";
+    const doc = "{\"canonical_name\":\"Alice\",\"version\":1,\"schema_version\":1,\"row\":{\"nested\":true},\"generation\":18446744073709551615}";
     var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    var collected = CollectCtx{ .alloc = alloc };
-    defer collected.deinit();
-    try contract.appendScanLine(alloc, &out, "person/alice", document, null);
-    try consumeScanLine(alloc, std.mem.trimEnd(u8, out.items, "\n"), &collected, CollectCtx.consume);
+    try contract.appendScanLine(a, &out, "person/alice", doc, null);
+    try testing.expectEqualStrings("person/alice", try scanLineKey(a, std.mem.trimEnd(u8, out.items, "\n")));
     out.clearRetainingCapacity();
-    try contract.appendRelationalScanLine(alloc, &out, .{ .id = "person/alice", .hash = 42, .document_json = document }, 1);
-    try consumeScanLine(alloc, std.mem.trimEnd(u8, out.items, "\n"), &collected, CollectCtx.consume);
-    try testing.expectEqual(@as(usize, 2), collected.keys.items.len);
-    for (collected.keys.items) |key| try testing.expectEqualStrings("person/alice", key);
-    for (collected.values.items) |value| try @import("antfly-json").testing.expectSubsetJsonText(alloc, document, value);
-    try testing.expectEqualStrings(document, collected.values.items[1]);
-    try testing.expectError(error.InvalidCandidateResponse, consumeScanLine(alloc, "{\"_id\":\"bad\",\"version\":\"1\",\"schema_version\":1,\"row\":null}", &collected, CollectCtx.consume));
+    try contract.appendRelationalScanLine(a, &out, .{ .id = "person/alice", .hash = 42, .document_json = doc }, 1);
+    try testing.expectEqualStrings("person/alice", try scanLineKey(a, std.mem.trimEnd(u8, out.items, "\n")));
+    try testing.expectError(error.InvalidCandidateResponse, scanLineKey(a, "{\"row\":{}}"));
 }
 
 test "DistributedCandidateSource nearest parses query hits into candidates" {
     const alloc = testing.allocator;
     var fake = FakeTableReadSource{ .alloc = alloc, .table = "entities" };
     defer fake.docs.deinit(alloc);
+    fake.expected_key_prefix = "person/";
     fake.query_body =
         \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[
         \\  {"_id":"person/ada_lovelace","_score":0.98,"_source":{"canonical_name":"Ada Lovelace","label":"person"}}
@@ -729,6 +715,7 @@ test "DistributedCandidateSource nearest parses query hits into candidates" {
         .index_name = "name_embedding",
         .embedding = &embedding,
         .k = 25,
+        .key_prefix = "person/",
     }, &ctx, CollectCtx.consume);
 
     try testing.expectEqual(@as(u32, 25), fake.last_query_k);

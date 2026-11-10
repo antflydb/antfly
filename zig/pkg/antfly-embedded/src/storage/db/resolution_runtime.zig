@@ -284,6 +284,7 @@ pub fn resolveExtraction(
         cfg.scorer_json,
     );
     defer resolver.deinit();
+    resolver.candidate_key_prefix = cfg.candidate_key_prefix;
     const compiled_policy = try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json);
     defer compiled_policy.release();
     resolver.aliases = compiled_policy.aliases();
@@ -520,6 +521,7 @@ fn processChangedExtractionWithConfigOptions(
         cfg.scorer_json,
     );
     defer resolver.deinit();
+    resolver.candidate_key_prefix = cfg.candidate_key_prefix;
     const compiled_policy = if (query_policy == null or !query_policy.?.replaces_configured_policy) try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json) else null;
     defer if (compiled_policy) |lease| lease.release();
     if (compiled_policy) |lease| {
@@ -535,8 +537,8 @@ fn processChangedExtractionWithConfigOptions(
     // Candidate blocking: if configured and the caller didn't supply a provider,
     // look up the rendered canonical key as a candidate so the scorer can link
     // to an existing entity instead of always minting.
-    var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
-    var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .candidate_limit = candidateLimit(cfg) };
+    var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .key_prefix = cfg.candidate_key_prefix };
+    var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .candidate_limit = candidateLimit(cfg), .key_prefix = cfg.candidate_key_prefix };
     var source_provider: SourceCandidateProvider = undefined;
     const effective_strategy = if (resolver.scorer == null) "exact_key" else cfg.candidate_search;
     const blocked_provider = provider orelse blk: {
@@ -551,6 +553,7 @@ fn processChangedExtractionWithConfigOptions(
                     .mode = mode,
                     .ann_index_name = annIndexName(cfg),
                     .candidate_limit = candidateLimit(cfg),
+                    .key_prefix = cfg.candidate_key_prefix,
                     .cache_vectors = retain_work and cfg.retain_work == .full,
                 };
                 break :blk source_provider.provider();
@@ -567,7 +570,7 @@ fn processChangedExtractionWithConfigOptions(
     // into a per-mention ANN or prefix scan.
     var alias_source: SourceCandidateProvider = undefined;
     const alias_provider = if (batch_source) |src| blk: {
-        alias_source = .{ .source = src, .resolver = &resolver, .table = cfg.table, .mode = .exact_key, .ann_index_name = "", .candidate_limit = 1 };
+        alias_source = .{ .source = src, .resolver = &resolver, .table = cfg.table, .mode = .exact_key, .ann_index_name = "", .candidate_limit = 1, .key_prefix = cfg.candidate_key_prefix };
         break :blk alias_source.provider();
     } else exact_provider.provider();
     var alias_first = AliasFirstCandidateProvider{ .exact = alias_provider, .blocked = blocked_provider };
@@ -651,7 +654,7 @@ fn processChangedExtractionWithConfigOptions(
         .work_retention = cfg.retain_work,
         .max_work_bytes = cfg.max_work_bytes,
         .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding_dims }) else null,
-        .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, effective_strategy, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
+        .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, effective_strategy, annIndexName(cfg), candidateLimit(cfg), cfg.candidate_key_prefix, vector_fields }) else null,
         .embedder = stage_embedder,
         .embedding_cache = if (batch_source) |source| if (source.vtable.embedding_cache_get != null and source.vtable.embedding_cache_put != null) .{ .ptr = source.ptr, .get = source.vtable.embedding_cache_get.?, .put = source.vtable.embedding_cache_put.? } else null else null,
         .vector_loader = if (batch_source) |source| if (source.vtable.load_vector) |load| .{ .ptr = source.ptr, .load = load } else null else null,
@@ -1219,6 +1222,7 @@ const SourceCandidateProvider = struct {
     mode: CandidateMode,
     ann_index_name: []const u8,
     candidate_limit: usize,
+    key_prefix: []const u8 = "",
     cache_vectors: bool = false,
 
     fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
@@ -1256,6 +1260,10 @@ const SourceCandidateProvider = struct {
         }
     }
 
+    fn redirectAllowed(self: *const SourceCandidateProvider, table: ?[]const u8, key: []const u8) bool {
+        return self.key_prefix.len == 0 or ((table == null or std.mem.eql(u8, table.?, self.table)) and std.mem.startsWith(u8, key, self.key_prefix));
+    }
+
     fn candidatesForBatch(ptr: *anyopaque, alloc: std.mem.Allocator, entities: []const resolver_lib.ExtractedEntity, lists: [][]const resolver_lib.Candidate) anyerror!void {
         const self: *SourceCandidateProvider = @ptrCast(@alignCast(ptr));
         var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -1274,10 +1282,10 @@ const SourceCandidateProvider = struct {
                 };
                 key.* = try std.fmt.allocPrint(a, "{x}", .{&(try resolver_lib.fingerprint(a, vector))});
                 const slot = try unique.getOrPut(a, key.*);
-                if (!slot.found_existing) try queries.append(a, .{ .index_name = self.ann_index_name, .embedding = vector, .k = self.candidate_limit, .vector_fields = vector_fields, .fields = fields, .cache_vectors = self.cache_vectors });
+                if (!slot.found_existing) try queries.append(a, .{ .index_name = self.ann_index_name, .embedding = vector, .k = self.candidate_limit, .key_prefix = self.key_prefix, .vector_fields = vector_fields, .fields = fields, .cache_vectors = self.cache_vectors });
             } else {
                 const rendered = try self.resolver.renderKeyAlloc(a, entity);
-                key.* = if (self.mode == .prefix) rendered[0..if (std.mem.indexOfScalar(u8, rendered, '/')) |i| i + 1 else rendered.len] else rendered;
+                key.* = if (self.mode == .prefix) candidatePrefix(rendered, self.key_prefix) else rendered;
                 try unique.put(a, key.*, {});
             }
         }
@@ -1328,6 +1336,7 @@ const SourceCandidateProvider = struct {
         while (documents.next()) |raw| {
             if (try jsonStringFieldAlloc(a, raw.*, "merged_into")) |key| {
                 const target_table = try jsonStringFieldAlloc(a, raw.*, "merged_into_table");
+                if (!self.redirectAllowed(target_table, key)) continue;
                 if ((target_table == null or std.mem.eql(u8, target_table.?, self.table)) and !collected.docs.contains(key)) {
                     try redirects.put(a, key, {});
                 } else if (target_table) |table| {
@@ -1359,9 +1368,11 @@ const SourceCandidateProvider = struct {
             var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
             const selected: []const []const u8 = if (self.mode == .exact_key) &.{key} else prefixes.get(key).?;
             for (selected) |candidate_key| {
+                if (!self.redirectAllowed(null, candidate_key)) continue;
                 if (collected.docs.get(candidate_key)) |raw| {
                     const resolved_key = try jsonStringFieldAlloc(a, raw, "merged_into");
                     const target_table = try jsonStringFieldAlloc(a, raw, "merged_into_table");
+                    if (resolved_key) |key_ref| if (!self.redirectAllowed(target_table, key_ref)) continue;
                     const resolved_raw = if (resolved_key) |rk|
                         if (target_table) |target|
                             if (!std.mem.eql(u8, target, self.table)) external_redirects.get(target).?.found.docs.get(rk) else collected.docs.get(rk)
@@ -1404,6 +1415,7 @@ const SourceCandidateProvider = struct {
         allocator: std.mem.Allocator,
         table: []const u8,
         source: CandidateSource,
+        source_provider: *const SourceCandidateProvider,
         out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
         limit: usize,
         seen: usize = 0,
@@ -1414,7 +1426,7 @@ const SourceCandidateProvider = struct {
             defer if (resolved_key) |rk| self.allocator.free(rk);
             const target_table = try jsonStringFieldAlloc(self.allocator, value, "merged_into_table");
             defer if (target_table) |name| self.allocator.free(name);
-            const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, target_table orelse self.table, rk) else null;
+            const resolved_raw = if (resolved_key) |rk| if (self.source_provider.redirectAllowed(target_table, rk)) try self.source.get(self.allocator, target_table orelse self.table, rk) else null else null;
             defer if (resolved_raw) |raw| self.allocator.free(raw);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
@@ -1438,16 +1450,15 @@ const SourceCandidateProvider = struct {
                 defer if (resolved_key) |rk| allocator.free(rk);
                 const target_table = try jsonStringFieldAlloc(allocator, raw, "merged_into_table");
                 defer if (target_table) |name| allocator.free(name);
-                const resolved_raw = if (resolved_key) |rk| try self.source.get(allocator, target_table orelse self.table, rk) else null;
+                const resolved_raw = if (resolved_key) |rk| if (self.redirectAllowed(target_table, rk)) try self.source.get(allocator, target_table orelse self.table, rk) else null else null;
                 defer if (resolved_raw) |rv| allocator.free(rv);
                 try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
             },
             .prefix => {
                 const key = try self.resolver.renderKeyAlloc(allocator, entity);
                 defer allocator.free(@constCast(key));
-                const slash = std.mem.indexOfScalar(u8, key, '/');
-                const prefix = if (slash) |i| key[0 .. i + 1] else key;
-                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out, .limit = self.candidate_limit };
+                const prefix = candidatePrefix(key, self.key_prefix);
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .source_provider = self, .out = out, .limit = self.candidate_limit };
                 self.source.scanPrefix(allocator, self.table, prefix, .{ .limit = self.candidate_limit }, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.ScanUnsupported => return,
                     error.CandidateLimitReached => return,
@@ -1456,12 +1467,13 @@ const SourceCandidateProvider = struct {
             },
             .ann => {
                 const emb = entity.embedding orelse return;
-                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out, .limit = self.candidate_limit };
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .source_provider = self, .out = out, .limit = self.candidate_limit };
                 self.source.nearest(allocator, self.table, .{
                     .index_name = self.ann_index_name,
                     .cache_vectors = self.cache_vectors,
                     .embedding = emb,
                     .k = self.candidate_limit,
+                    .key_prefix = self.key_prefix,
                     .vector_fields = try self.resolver.candidateVectorFields(allocator),
                 }, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.NearestUnsupported => return,
@@ -1485,6 +1497,7 @@ fn candidateLimit(cfg: *const ResolverConfig) usize {
 /// entity (by document key through the store seam). Reads whatever the worker's
 /// store can see; cross-shard entity tables need distributed reads (phase 2).
 const ExactKeyCandidateProvider = struct {
+    key_prefix: []const u8 = "",
     store: resolver_lib.ArtifactStore,
     resolver: *const resolver_lib.Resolver,
     table: []const u8,
@@ -1509,7 +1522,7 @@ const ExactKeyCandidateProvider = struct {
         const target_table = try jsonStringFieldAlloc(allocator, raw, "merged_into_table");
         defer if (target_table) |name| allocator.free(name);
         const resolved_raw = if (resolved_key) |rk|
-            if (target_table == null or std.mem.eql(u8, target_table.?, self.table)) try entityRawFromStore(allocator, self.store, rk) else null
+            if ((target_table == null or std.mem.eql(u8, target_table.?, self.table)) and (self.key_prefix.len == 0 or std.mem.startsWith(u8, rk, self.key_prefix))) try entityRawFromStore(allocator, self.store, rk) else null
         else
             null;
         defer if (resolved_raw) |rv| allocator.free(rv);
@@ -1526,6 +1539,7 @@ const PrefixCandidateProvider = struct {
     resolver: *const resolver_lib.Resolver,
     table: []const u8,
     candidate_limit: usize = default_candidate_limit,
+    key_prefix: []const u8 = "",
 
     fn provider(self: *PrefixCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1536,6 +1550,7 @@ const PrefixCandidateProvider = struct {
         allocator: std.mem.Allocator,
         table: []const u8,
         store: resolver_lib.ArtifactStore,
+        key_prefix: []const u8 = "",
         out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
         limit: usize,
         seen: usize = 0,
@@ -1552,7 +1567,7 @@ const PrefixCandidateProvider = struct {
             const target_table = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into_table");
             defer if (target_table) |name| self.allocator.free(name);
             const resolved_raw = if (resolved_key) |rk|
-                if (target_table == null or std.mem.eql(u8, target_table.?, self.table)) try entityRawFromStore(self.allocator, self.store, rk) else null
+                if ((target_table == null or std.mem.eql(u8, target_table.?, self.table)) and (self.key_prefix.len == 0 or std.mem.startsWith(u8, rk, self.key_prefix))) try entityRawFromStore(self.allocator, self.store, rk) else null
             else
                 null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
@@ -1570,15 +1585,14 @@ const PrefixCandidateProvider = struct {
         const self: *PrefixCandidateProvider = @ptrCast(@alignCast(ptr));
         const key = try self.resolver.renderKeyAlloc(allocator, entity);
         defer allocator.free(@constCast(key));
-        const slash = std.mem.indexOfScalar(u8, key, '/');
-        const prefix = if (slash) |i| key[0 .. i + 1] else key;
+        const prefix = candidatePrefix(key, self.key_prefix);
 
         const lower = try internal_keys.documentRangeLowerAlloc(allocator, prefix);
         defer allocator.free(lower);
         const upper = (try internal_keys.documentRangeUpperAlloc(allocator, prefix)) orelse return;
         defer allocator.free(upper);
 
-        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .store = self.store, .out = out, .limit = self.candidate_limit };
+        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .store = self.store, .key_prefix = self.key_prefix, .out = out, .limit = self.candidate_limit };
         self.store.scanPrefix(lower, upper, &ctx, ScanCtx.consume) catch |e| switch (e) {
             error.ScanUnsupported => return,
             error.CandidateLimitReached => return,
@@ -5795,4 +5809,38 @@ test "SourceCandidateProvider ANN batches unique vectors and bulk hydrates share
         try testing.expectEqual(@as(usize, 1), list.len);
         try testing.expectEqualStrings("person/ada", list[0].resolved_doc_ref.?.key);
     }
+}
+
+// Unscoped native recipes retain their historical label-prefix behavior.
+// Scoped recipes include the complete rendered namespace/label, not just the
+// first slash in a multi-component key. This bounds the scan before its limit.
+fn candidatePrefix(key: []const u8, scope: []const u8) []const u8 {
+    const slash = if (scope.len == 0) std.mem.indexOfScalar(u8, key, '/') else std.mem.lastIndexOfScalar(u8, key, '/');
+    return if (slash) |i| key[0 .. i + 1] else key;
+}
+
+test "SourceCandidateProvider scopes multi-component prefixes before limits and skips foreign redirects" {
+    const a = testing.allocator;
+    const Fake = struct {
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedPointRead;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            try testing.expectEqualStrings("source/ours/person/", prefix);
+            try testing.expectEqual(@as(usize, 1), opts.limit);
+            try consume(ctx, "source/ours/person/alice", "{\"canonical_name\":\"Alice\",\"label\":\"person\",\"merged_into\":\"source/foreign/alice\",\"merged_into_table\":\"foreign\"}");
+        }
+        fn getMany(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8, _: *anyopaque, _: CandidateSource.Consume) anyerror!void {
+            return error.UnexpectedPointRead;
+        }
+    };
+    var fake: u8 = 0;
+    var resolver = try resolver_lib.Resolver.initFromParts(a, "entities", "source/ours/{{ slug _entity.label }}/{{ slug _entity.text }}", .{}, true, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 1, .key_prefix = "source/ours/" };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var lists: [1][]const resolver_lib.Candidate = undefined;
+    try provider.provider().candidatesForBatch(scratch.allocator(), &.{.{ .local_id = "one", .label = "person", .text = "Alice" }}, &lists);
+    try testing.expectEqual(@as(usize, 0), lists[0].len);
 }

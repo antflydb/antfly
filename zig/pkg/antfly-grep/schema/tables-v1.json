@@ -92,6 +92,7 @@
             "minLength": 1,
             "description": "Optional physical table binding for a logical source."
           },
+          "acquisition_id": {"type": "string"},
           "source_id": {
             "type": "string",
             "minLength": 1

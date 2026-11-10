@@ -142,6 +142,7 @@
               "native"
             ]
           },
+          "acquisition_id": {"type": "string"},
           "published_revision": {
             "type": "string",
             "minLength": 1,

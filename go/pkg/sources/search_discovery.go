@@ -98,6 +98,13 @@ func (r *Runner) RefreshSearchDiscovery(ctx context.Context, sourceID string) er
 				if binding.DocumentVersion != SourceRecordVersion {
 					return nil
 				}
+				binding.AcquisitionID = ""
+				if source.Knowledge != nil {
+					binding.AcquisitionID, err = sourceAcquisitionIdentity(source, connection)
+					if err != nil {
+						return err
+					}
+				}
 				binding.Knowledge = source.Knowledge
 				binding.SearchVersion, binding.Streams, binding.Artifacts = source.SearchVersion, source.Streams, source.Artifacts
 				if len(binding.Streams) == 0 && source.Publication != "media" {

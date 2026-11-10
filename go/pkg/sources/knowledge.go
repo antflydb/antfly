@@ -125,7 +125,7 @@ func checkEntityBinding(e EntityBinding, cfg map[string]any) error {
 		}
 		key, _ := r["key_template"].(string)
 		stable := key == e.Namespace+"{{ slug _entity.text }}" || key == e.Namespace+"{{ slug _entity.label }}/{{ slug _entity.text }}"
-		if !stable || r["table"] != e.Table || r["source_artifact"] != e.SourceArtifact || r["resolution_artifact"] != e.ResolutionArtifact {
+		if !stable || r["candidate_key_prefix"] != e.Namespace || r["table"] != e.Table || r["source_artifact"] != e.SourceArtifact || r["resolution_artifact"] != e.ResolutionArtifact {
 			return fmt.Errorf("resolver identity mismatch or unstable key template")
 		}
 		// Native scoring breaks equal-score ties by durable table/key identity.
@@ -249,6 +249,7 @@ type nativeKnowledgeResolver struct {
 	Table              string `json:"table"`
 	SourceArtifact     string `json:"source_artifact"`
 	ResolutionArtifact string `json:"resolution_artifact"`
+	CandidateKeyPrefix string `json:"candidate_key_prefix"`
 }
 
 func nativeGraphResolvers(g GraphBinding, idx nativeSearchIndex) []nativeKnowledgeResolver {
@@ -274,7 +275,10 @@ func nativeGraphResolvers(g GraphBinding, idx nativeSearchIndex) []nativeKnowled
 		if a.SourceArtifact != b.SourceArtifact {
 			return a.SourceArtifact < b.SourceArtifact
 		}
-		return a.ResolutionArtifact < b.ResolutionArtifact
+		if a.ResolutionArtifact != b.ResolutionArtifact {
+			return a.ResolutionArtifact < b.ResolutionArtifact
+		}
+		return a.CandidateKeyPrefix < b.CandidateKeyPrefix
 	})
 	return values
 }
@@ -297,7 +301,7 @@ func checkNativeKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, idx nati
 	matched := map[string]bool{}
 	for _, r := range nativeGraphResolvers(g, idx) {
 		e, ok := declared[r.Name]
-		if !ok || r.Table != e.Table || r.SourceArtifact != e.SourceArtifact || r.ResolutionArtifact != e.ResolutionArtifact {
+		if !ok || r.Table != e.Table || r.SourceArtifact != e.SourceArtifact || r.ResolutionArtifact != e.ResolutionArtifact || r.CandidateKeyPrefix != e.Namespace {
 			return fmt.Errorf("undeclared active native graph resolver target")
 		}
 		matched[r.Name] = true

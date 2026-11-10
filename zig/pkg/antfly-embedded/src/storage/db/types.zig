@@ -3638,6 +3638,7 @@ pub const ResolverReplayObservation = struct {
 };
 
 pub const ResolverReplayDiagnostic = struct {
+    candidate_key_prefix: []const u8 = "",
     name: []const u8 = "",
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
@@ -5338,6 +5339,7 @@ pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiag
         alloc.free(resolver.table);
         alloc.free(resolver.source_artifact);
         alloc.free(resolver.resolution_artifact);
+        alloc.free(resolver.candidate_key_prefix);
     }
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }

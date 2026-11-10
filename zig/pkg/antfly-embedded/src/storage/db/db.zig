@@ -33121,6 +33121,7 @@ pub const DB = struct {
                 alloc.free(resolver.table);
                 alloc.free(resolver.source_artifact);
                 alloc.free(resolver.resolution_artifact);
+                alloc.free(resolver.candidate_key_prefix);
             }
             if (resolvers.len > 0) alloc.free(resolvers);
         }
@@ -33134,7 +33135,10 @@ pub const DB = struct {
             errdefer alloc.free(source_artifact);
             const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
             errdefer alloc.free(resolution_artifact);
+            const candidate_key_prefix = try alloc.dupe(u8, cfg.candidate_key_prefix);
+            errdefer alloc.free(candidate_key_prefix);
             resolvers[initialized] = .{
+                .candidate_key_prefix = candidate_key_prefix,
                 .name = name,
                 .config_generation = cfg.config_generation,
                 .effective_generation = cfg.effectiveGeneration(),

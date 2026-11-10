@@ -46,7 +46,7 @@ func TestNativeSourceKnowledgePrefixResolution(t *testing.T) {
 	require.NoError(t, p.EnsureTable(ctx, entities))
 	key := "source/" + testSourceID + "/facts/person/curated_alice"
 	_, err = p.call(ctx, "POST", tablePath(entities)+"/batch", map[string]any{
-		"inserts":    map[string]any{key: map[string]any{"canonical_name": "Alice", "label": "person"}},
+		"inserts":    map[string]any{key: map[string]any{"canonical_name": "Alice", "label": "person", "version": 1, "schema_version": 1}, "source/00000000-0000-4000-8000-000000000000/facts/person/alice": map[string]any{"canonical_name": "Alice", "label": "person"}},
 		"sync_level": "full_index",
 	})
 	require.NoError(t, err)
@@ -54,6 +54,7 @@ func TestNativeSourceKnowledgePrefixResolution(t *testing.T) {
 		Name: "facts", SourceID: testSourceID, Audience: "research", Field: "facts", EntityTable: entities,
 		Resolver: map[string]any{
 			"candidate_search": "prefix",
+			"candidate_limit":  1,
 			"scorer": map[string]any{
 				"comparisons": []any{map[string]any{"name": "name", "left": "canonical_text", "right": "canonical_name", "levels": []any{
 					map[string]any{"when": "jaro_winkler > 0.9", "weight": 8.0}, map[string]any{"else": true, "weight": -6.0},

@@ -119,6 +119,7 @@ func BuildKnowledgeProcessing(p KnowledgePreset) (ProcessingDeclaration, Knowled
 	delete(resolver, "name")
 	delete(resolver, "source_artifact")
 	delete(resolver, "resolution_artifact")
+	resolver["candidate_key_prefix"] = namespace
 	resolver["table"] = p.EntityTable
 	resolver["source_artifact_kind"] = "asset"
 	if _, ok := resolver["config_generation"]; !ok {

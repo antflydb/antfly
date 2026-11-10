@@ -235,7 +235,7 @@ func TestLocalKnowledgeQueryRejectsConcurrentPublicationRetirement(t *testing.T)
 	until := time.Now().Add(time.Minute).Unix()
 	binding := Binding{ID: testSourceID, Table: "docs", Knowledge: &k, Status: "searchable", ValidUntil: &until}
 	catalogPath := filepath.Join(s.runnerPath(), "catalog.json")
-	require.NoError(t, writeJSON(catalogPath, Catalog{Version: 2, Sources: []Binding{binding}}, 32<<20))
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/query") {
@@ -252,6 +252,10 @@ func TestLocalKnowledgeQueryRejectsConcurrentPublicationRetirement(t *testing.T)
 	s.profile.Sources[0].Table = "docs"
 	s.profile.Sources[0].Knowledge = &k
 	s.mu.Unlock()
-	_, err := (localManagement{s}).QueryKnowledge(t.Context(), testSourceID, KnowledgeRequest{Graph: "facts", Start: []string{"alice"}})
+	snapshot, err := (localManagement{s}).knowledgeSnapshot(testSourceID)
+	require.NoError(t, err)
+	binding.AcquisitionID = snapshot.acquisition
+	require.NoError(t, writeJSON(catalogPath, Catalog{Version: 2, Endpoint: server.URL, Sources: []Binding{binding}}, 32<<20))
+	_, err = (localManagement{s}).QueryKnowledge(t.Context(), testSourceID, KnowledgeRequest{Graph: "facts", Start: []string{"alice"}})
 	require.ErrorContains(t, err, "knowledge_changed_during_query")
 }
