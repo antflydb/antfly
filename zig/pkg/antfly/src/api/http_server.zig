@@ -17086,6 +17086,7 @@ pub const ApiHttpServer = struct {
         index_name: []u8,
         index_json: ?[]u8,
         generation: u64,
+        maintenance_table_id: ?u64 = null,
         failures: u8 = 0,
         retry_after_ns: u64 = 0,
 
@@ -17103,6 +17104,7 @@ pub const ApiHttpServer = struct {
         index_name: []u8,
         index_json: ?[]u8,
         generation: u64,
+        maintenance_table_id: ?u64 = null,
 
         pub fn deinit(self: *PendingIndexInstallationSnapshot) void {
             const alloc = std.heap.page_allocator;
@@ -17202,7 +17204,7 @@ pub const ApiHttpServer = struct {
         prepared: *PreparedIndexInstallation,
         enqueue_if_absent: bool,
     ) bool {
-        return self.activatePreparedIndexInstallationWithReplacement(prepared, enqueue_if_absent, true);
+        return self.activatePreparedIndexInstallationWithReplacement(prepared, enqueue_if_absent, true, 0, null);
     }
 
     fn activatePreparedIndexInstallationWithReplacement(
@@ -17210,6 +17212,8 @@ pub const ApiHttpServer = struct {
         prepared: *PreparedIndexInstallation,
         enqueue_if_absent: bool,
         replace_existing: bool,
+        retry_after_ns: u64,
+        maintenance_table_id: ?u64,
     ) bool {
         const runtime = self.cfg.backend_runtime orelse return false;
         if (!prepared.reservation_active or !prepared.owns_payload) return false;
@@ -17220,7 +17224,8 @@ pub const ApiHttpServer = struct {
         var existing: ?*PendingIndexInstallation = null;
         for (self.index_installation_queue.items) |*pending| {
             if (std.mem.eql(u8, pending.table_name, prepared.table_name) and
-                std.mem.eql(u8, pending.index_name, prepared.index_name))
+                std.mem.eql(u8, pending.index_name, prepared.index_name) and
+                pending.maintenance_table_id == maintenance_table_id)
             {
                 existing = pending;
                 break;
@@ -17241,6 +17246,8 @@ pub const ApiHttpServer = struct {
                 .index_name = prepared.index_name,
                 .index_json = prepared.index_json,
                 .generation = generation,
+                .retry_after_ns = retry_after_ns,
+                .maintenance_table_id = maintenance_table_id,
             };
         } else {
             // prepareIndexInstallationReconcile reserved this exact slot.
@@ -17249,6 +17256,8 @@ pub const ApiHttpServer = struct {
                 .index_name = prepared.index_name,
                 .index_json = prepared.index_json,
                 .generation = generation,
+                .retry_after_ns = retry_after_ns,
+                .maintenance_table_id = maintenance_table_id,
             });
         }
         prepared.reservation_active = false;
@@ -17360,7 +17369,7 @@ pub const ApiHttpServer = struct {
     pub fn requestLakePublication(self: *ApiHttpServer, table_name: []const u8) !void {
         var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
-        _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false);
+        _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false, 0, null);
     }
 
     fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
@@ -17391,7 +17400,8 @@ pub const ApiHttpServer = struct {
         // superseded on every supervisor tick.
         platform_sync.lockYielding(&self.index_installation_mutex);
         const queued = for (self.index_installation_queue.items) |pending| {
-            if (std.mem.eql(u8, pending.table_name, table.name)) break true;
+            if (std.mem.eql(u8, pending.table_name, table.name) and
+                pending.maintenance_table_id == null) break true;
         } else false;
         self.index_installation_mutex.unlock();
         if (queued) return;
@@ -17457,6 +17467,7 @@ pub const ApiHttpServer = struct {
                 .index_name = index_copy,
                 .index_json = config_copy,
                 .generation = pending.generation,
+                .maintenance_table_id = pending.maintenance_table_id,
             } };
         }
         return .{ .wait_ns = minimum_wait_ns };
@@ -17466,6 +17477,10 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         pending: *const PendingIndexInstallationSnapshot,
     ) IndexInstallationReconcileResult {
+        if (pending.maintenance_table_id) |table_id| {
+            self.scheduleLakeMaintenance(table_id);
+            return .complete;
+        }
         const alloc = std.heap.page_allocator;
         var authoritative_snapshot = (self.source.linearizableSnapshot(.{}) catch return .retry) orelse return .retry;
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
@@ -17688,18 +17703,24 @@ pub const ApiHttpServer = struct {
                 .deadline_ns = request.deadline_ns,
                 .cancellation = .{ .ptr = server, .is_cancelled_fn = canceled },
             };
-            const changed = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, server, table.*, source.binding, options, context) catch |err| {
+            const continuation_delay_ms = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, server, table.*, source.binding, options, context) catch |err| {
                 if (err != error.Canceled and err != error.DeadlineExceeded)
                     std.log.warn("native lake maintenance deferred table={s} err={s}", .{ table.name, @errorName(err) });
                 return;
             };
-            // Release admission before enqueueing the next publication pass;
-            // otherwise a fast reconciler can drop the maintenance continuation
-            // while this completed job still holds its in-flight bit.
+            // Release admission before enqueueing another pass, so a fast
+            // reconciler can claim the continuation.
             work.release();
-            // Supersede a publication pass that may still be completing;
-            // a coalesced read-side hint could be removed by its old generation.
-            if (changed and !canceled(server)) try server.notifyLakeCommit(table.name);
+            if (continuation_delay_ms) |delay_ms| {
+                if (canceled(server)) return;
+                if (delay_ms == 0) return server.notifyLakeCommit(table.name);
+                // Pending collection needs only another maintenance step.
+                // Keep the delayed wakeup separate from immediate writes.
+                var prepared = (try server.prepareIndexInstallationReconcile(table.name, "__lake_maintenance", null)) orelse return;
+                defer prepared.deinit(server);
+                const due = platform_time.monotonicNs() +| (delay_ms *| std.time.ns_per_ms);
+                _ = server.activatePreparedIndexInstallationWithReplacement(&prepared, true, true, due, table.table_id);
+            }
         }
         fn deinit(raw: *anyopaque) void {
             const work: *@This() = @ptrCast(@alignCast(raw));

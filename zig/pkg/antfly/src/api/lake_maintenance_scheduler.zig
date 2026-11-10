@@ -77,17 +77,17 @@ fn releaseClaim(a: A, client: *@import("objectstore").Client, bucket: []const u8
     result.deinit(client.allocator);
 }
 
-pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent: catalog.types.Context) !bool {
+pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent: catalog.types.Context) !?u64 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     var loaded = try configured.executeLakeCatalogAlloc(a, binding, options, parent, .load);
     defer loaded.deinit(a);
     const root = try catalog.metadata.parse(scratch, loaded.table.metadata_json);
-    const property = (try catalog.metadata.get(root, "properties")).object.get("antfly.maintenance.policy") orelse return false;
+    const property = (try catalog.metadata.get(root, "properties")).object.get("antfly.maintenance.policy") orelse return null;
     const policy = try std.json.parseFromSliceLeaky(Policy, scratch, try catalog.metadata.str(property), .{});
     try policy.validate(binding.catalog.?.type == .rest);
-    if (!policy.enabled) return false;
+    if (!policy.enabled) return null;
     var opened = try ingestion.openQueue(a, binding, options);
     defer opened.deinit();
     var client = opened.client;
@@ -107,10 +107,15 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
             2 => policy.vacuum,
             else => false,
         };
-        if (!enabled) return false;
+        if (!enabled) return null;
     }
     const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-    if (state.lease_until_ms > now or state.next_ms > now) return false;
+    if (state.lease_until_ms > now) return null;
+    if (state.next_ms > now) {
+        // An unrelated write may wake publication before the scheduled retry.
+        // Restore the delayed wakeup while the unfinished request remains.
+        return if (state.request != null and state.failures == 0) state.next_ms - now else null;
+    }
     if (state.request == null) {
         while (state.stage < 3) : (state.stage += 1) {
             const enabled = switch (state.stage) {
@@ -139,7 +144,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     // clock skew using the same grace contract as reader leases.
     beginClaim(&state, parent.io orelse return error.UnsupportedOperation, now);
     var claimed = client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = catalog.types.contextCancellation(&parent) }) catch |err| switch (err) {
-        error.PreconditionFailed, error.ConditionalCheckFailed => return false,
+        error.PreconditionFailed, error.ConditionalCheckFailed => return null,
         else => return err,
     };
     defer claimed.deinit(client.allocator);
@@ -147,7 +152,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     var finished = false;
     defer if (!finished) releaseClaim(a, &client, opened.bucket, key, claimed_revision, state, parent.io);
     var mutated = false;
-    var pending = false;
+    var continuation_delay_ms: ?u64 = null;
     if (state.request) |request| {
         var context = parent;
         const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
@@ -160,7 +165,13 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
             mutated = result.mutated;
             const completed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, result.body, .{});
             const complete = if (completed.object.get("complete")) |value| value == .bool and value.bool else true;
-            pending = !complete;
+            if (!complete) {
+                // Keep the same durable operation ID and give a bounded step
+                // time to make progress before starting another provider pass.
+                const delay_ms = @max(result.retry_delay_ms, 250);
+                state.next_ms = now +| delay_ms;
+                continuation_delay_ms = delay_ms;
+            }
             if (complete) {
                 state.request = null;
                 // A bounded vacuum that left expirable snapshots plans the next
@@ -180,7 +191,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     var completed = try client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), claimed_revision, .{ .cancellation = catalog.types.contextCancellation(&parent) });
     completed.deinit(client.allocator);
     finished = true;
-    return mutated or pending;
+    return if (mutated) 0 else continuation_delay_ms;
 }
 
 test "external lake scheduled maintenance releases interrupted claims without overwriting a replacement owner" {
