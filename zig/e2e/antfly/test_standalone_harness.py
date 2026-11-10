@@ -1105,3 +1105,57 @@ def test_scaling_readiness_rejects_process_exit_during_second_foreign_reply(
             [{"id": 101}], public_api=True, max_timeout_s=2, label="Data API"
         )
     assert replies[0] == 2
+
+
+def test_lake_readiness_allows_full_budget_after_bounded_probe_timeout(monkeypatch):
+    import test_lake_row_identity as lake
+
+    now = [0.0]
+    monkeypatch.setattr(
+        lake,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        ),
+    )
+    query = {"full_text_search": {"match": "needle", "field": "body"}}
+    queries = []
+
+    def raw(method, path, body):
+        assert (method, path) == ("POST", "/tables/docs/query")
+        queries.append(body)
+        if "timeout_ms" in body:
+            now[0] += 1
+            return SimpleNamespace(
+                ok=False,
+                status_code=504,
+                text="bounded probe expired",
+                json=lambda: {"code": "query_timeout", "retryable": True},
+            )
+        # A valid Debug query may need more than the readiness probe's second.
+        now[0] += 2
+        return SimpleNamespace(ok=True, status_code=200, text="ok")
+
+    revisions = iter(["old", "new"])
+
+    def indexes(method, path):
+        assert (method, path) == ("GET", "/tables/docs/indexes")
+        return [
+            {
+                "config": {"name": "text"},
+                "status": {
+                    "published_revision": next(revisions),
+                    "readiness": {"state": "ready", "queryable": True},
+                },
+            }
+        ]
+
+    assert (
+        lake._wait_for_native_indexes_ready(
+            raw, indexes, lambda: "", "docs", query, after="old"
+        )
+        == "new"
+    )
+    assert queries == [{**query, "timeout_ms": 1000}, query]
+    assert "timeout_ms" not in query
