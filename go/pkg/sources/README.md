@@ -871,6 +871,51 @@ endpoint independently of credentials and source policy. Hosting runtimes can
 cache verified byte digests under that namespace, immutable object version and
 length; a digest receipt never replaces live access checks or grants delivery.
 
+### Declaration revisions and preconditions
+
+Every source returned by the shared handler carries a read-only `revision` (also
+sent as an `ETag`). It is derived from declared fields only, so run state, search
+status and knowledge status never change it. Runtimes that advertise
+`revision_preconditions` accept `PUT /sources/{id}` with `If-Match: "<revision>"`
+and return `412 source_revision_mismatch` when another edit landed first; a
+conditional PUT never creates a source. Runtimes implement this by providing
+`management.PreconditionBackend` and comparing under the same lock as the write;
+the shared handler answers `501` for runtimes that do not. Use
+`Client.PutSourceIfMatch` with the revision from a prior read; the server's
+revision is authoritative (do not recompute it client-side).
+
+### Reusable CLI handlers
+
+`sources/management/commands` packages management operations as framework-neutral
+handlers that any CLI can mount against Colony or a standalone server:
+capabilities, paginated listing, status, runs (start with an idempotency key,
+bounded waiting that never cancels hosted work, history, inspection,
+capability-gated cancellation), processing and artifact readiness, archive and
+confirmation-gated purge, and versioned manifests with `PlanManifest` and
+`ApplyManifest`. Handlers take an `Env` (any `API` implementation such as
+`*management.Client`, an output writer, JSON mode, and test clock hooks) and return
+typed `*commands.Error` values whose `ExitCode()` gives stable process statuses.
+Hosting-specific behaviour (identity of manifest entries, connection references,
+default permissions, extensions) is injected through `PlanOptions`.
+
+Build the client with `NewClientWithOptions` to supply your own `http.Client`
+(timeouts; redirects stay disabled) and a per-request token source.
+
+A manifest is strict, versioned JSON (callers may convert YAML first) that reuses
+the shared declaration types:
+
+```json
+{"version": 1, "sources": [{
+  "key": "engineering-docs", "name": "Engineering docs",
+  "connection": "<connection-id>", "table": "knowledge",
+  "config": {"resource": "drive", "folder_id": "..."}
+}]}
+```
+
+Fields an entry omits are left as the server has them. Plan never writes; apply
+writes only changed sources and never deletes one that is absent from the file —
+retire sources explicitly with archive or purge.
+
 ## Native source records and searchable artifacts
 
 Source runs now publish the consumer-independent [v3 envelope](../../../zig/pkg/antfly-grep/schema/document-v3.json):
