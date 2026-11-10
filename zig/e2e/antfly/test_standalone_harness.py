@@ -1159,3 +1159,134 @@ def test_lake_readiness_allows_full_budget_after_bounded_probe_timeout(monkeypat
     )
     assert queries == [{**query, "timeout_ms": 1000}, query]
     assert "timeout_ms" not in query
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_constraint_poll_gateway_timeouts_preserve_outer_budget(monkeypatch, ready):
+    import test_backup_restore as backup
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
+    calls = []
+
+    def get(url, *, timeout):
+        calls.append(timeout)
+        clock.now += min(timeout, 0.5)
+        response = requests.Response()
+        response.status_code = 200 if ready and len(calls) > 1 else 504
+        response._content = (
+            b'{"state":"enforced"}'
+            if response.status_code == 200
+            else b'{"error":"constraint status deadline exceeded"}'
+        )
+        return response
+
+    assert (
+        backup._wait_for_constraints_enforced(
+            SimpleNamespace(get=get), "http://localhost/db/v1", "docs", timeout_s=3.0
+        )
+        is ready
+    )
+    assert len(calls) >= 2
+    assert all(0 < timeout <= 3 for timeout in calls)
+    assert clock.now <= 3
+
+
+@pytest.mark.parametrize("status", [401, 500, 504])
+def test_resolution_gateway_timeout_retry_requires_read_only_poll(status):
+    from test_resolution import _transient_poll_error
+
+    response = requests.Response()
+    response.status_code = status
+    error = requests.HTTPError(response=response)
+    assert not _transient_poll_error(error)
+    assert _transient_poll_error(error, read_only=True) is (status == 504)
+
+
+@pytest.mark.parametrize("transport_failure", [False, True])
+def test_root_enrollment_reconciles_unknown_outcome_without_replaying(
+    monkeypatch, transport_failure
+):
+    import test_backup_restore as backup
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
+    identity = {
+        "node_id": 4,
+        "store_id": 4,
+        "root_incarnation": "123",
+        "public_key": "ab" * 32,
+        "metadata_incarnation": "incarnation",
+    }
+    proof = {"identity": identity, "signature": "cd" * 64}
+    writes = []
+    reads = []
+
+    def response(status, body):
+        import json
+
+        result = requests.Response()
+        result.status_code = status
+        result._content = json.dumps(body).encode()
+        return result
+
+    def post(url, **kwargs):
+        if url.endswith("/enrollment-status"):
+            return get(url, **kwargs)
+        writes.append((url, kwargs))
+        if transport_failure:
+            raise requests.ReadTimeout("reply lost after commit")
+        return response(503, {"error": "MetadataMutationOutcomeUnknown"})
+
+    def get(url, **kwargs):
+        reads.append((url, kwargs))
+        assert kwargs["json"] == identity
+        return response(404, {}) if len(reads) == 1 else response(200, identity)
+
+    backup._enroll_store_root_once(
+        SimpleNamespace(post=post, get=get), "http://metadata/db/v1", proof, timeout_s=1
+    )
+    assert len(writes) == 1
+    assert len(reads) == 2
+    assert clock.now <= 1
+
+
+@pytest.mark.parametrize("status", [401, 409])
+def test_root_enrollment_does_not_retry_permanent_rejection(status):
+    import test_backup_restore as backup
+
+    response = requests.Response()
+    response.status_code = status
+    response._content = b"enrollment rejected"
+    response.url = "http://metadata/db/v1/store-roots/enroll"
+    response.request = requests.Request("POST", response.url).prepare()
+    writes = []
+
+    def post(*args, **kwargs):
+        writes.append(args)
+        return response
+
+    def get(*args, **kwargs):
+        pytest.fail("permanent enrollment rejection must not be polled")
+
+    with pytest.raises((requests.HTTPError, AssertionError)):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post, get=get),
+            "http://metadata/db/v1",
+            {"identity": {}},
+        )
+    assert len(writes) == 1
