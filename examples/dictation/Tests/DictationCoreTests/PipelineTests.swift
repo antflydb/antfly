@@ -311,3 +311,44 @@ private actor PreviewProbe {
   await pipeline.cancel()
   #expect(await disposed.ready)
 }
+
+private actor FormattingCleaner {
+  var inputs: [String] = []
+  let options: VoiceFormatting.Options
+  init(pressEnter: Bool = false) { options = .init(pressEnter: pressEnter) }
+  func clean(_ raw: String) -> DictationResult {
+    inputs.append(raw)
+    let rendered = VoiceFormatting.Plan(raw, options: options).render()
+    var result = DictationResult(raw: raw, text: rendered.text)
+    result.formatting = rendered
+    return result
+  }
+}
+@Test func streamingCleanupRepairsCommandsSplitAcrossFinalSegments() async throws {
+  let cleaner = FormattingCleaner()
+  let pipeline = LiveDictation(
+    incremental: true, needsCleanup: true, formatting: .init(),
+    recognize: { data, commit in
+      if commit { return [] }
+      return data.first == 1 ? [final(1, "First new", 0)] : [final(2, "paragraph second", 100)]
+    }, clean: { await cleaner.clean($0) })
+  try await pipeline.append(Data([1]))
+  while await cleaner.inputs.isEmpty { await Task.yield() }
+  try await pipeline.append(Data([2]))
+  let result = try await pipeline.finish(Data())
+  #expect(result.raw == "First new paragraph second" && result.text == "First\n\nsecond")
+  #expect(await cleaner.inputs.last == result.raw)
+}
+@Test func terminalEnterIsDecidedAfterTheCompleteUtterance() async throws {
+  let cleaner = FormattingCleaner(pressEnter: true)
+  let pipeline = LiveDictation(
+    incremental: true, needsCleanup: true, formatting: .init(pressEnter: true),
+    recognize: { _, commit in
+      commit ? [final(2, "enter", 100)] : [final(1, "Hello press", 0)]
+    }, clean: { await cleaner.clean($0) })
+  try await pipeline.append(Data([1]))
+  #expect(await cleaner.inputs.isEmpty)
+  let result = try await pipeline.finish(Data())
+  #expect(result.text == "Hello" && result.formatting?.pressEnter == true)
+  #expect(await cleaner.inputs == ["Hello press enter"])
+}
