@@ -653,7 +653,7 @@ out-of-band rebuild, missing and corrupt generations, restart).
 1. **Raft entry.** `BatchRequest.leann_record` (`storage/db/types.zig`)
    travels as the internal `_leann_record` field of the batch wire
    (`api/batch.zig`) and must stand alone in its batch. It requires
-   `batch_dense_artifact_flags_protocol_version = 28`
+   `batch_dense_artifact_flags_protocol_version = 29`
    (`common/data_raft_protocol.zig`). A durable capability barrier certifies
    every applying replica before new dense flags or graph records are
    admitted. It is exempt from the timestamp override.

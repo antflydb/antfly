@@ -2873,7 +2873,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const leann_replication_runtime_tests = b.addTest(.{
         .root_module = data_implementation_module,
-        .filters = &.{ "leann replication round", "leann dense artifact format admission" },
+        .filters = &.{ "leann replication round", "leann dense artifact format admission", "raft proposal preserves isolated catalog admission", "raft proposal preserves guarded graph cleanup", "raft cleanup protocol preflight" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("leann-replication-runtime-test", "Run LEANN leader replication routing and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, leann_replication_runtime_tests).step);
