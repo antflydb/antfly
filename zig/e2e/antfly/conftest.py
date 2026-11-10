@@ -1179,6 +1179,8 @@ def _standalone_stateful_command(
     ]
 
 
+# Real-process fixtures use production consensus/control cadence. Accelerated
+# ticks can outrun disk sync and turn visibility checks into election churn.
 def _metadata_command(
     binary: str, *, host: str, raft_port: int, admin_port: int, root: Path
 ) -> list[str]:
@@ -1197,10 +1199,6 @@ def _metadata_command(
         "false",
         "--data-dir",
         str(root),
-        "--raft-tick-ms",
-        "5",
-        "--control-tick-ms",
-        "5",
         "--replica-root-dir",
         str(root / "metadata-replicas"),
         "--replica-catalog-path",
@@ -1241,10 +1239,6 @@ def _data_command(
         "2",
         "--data-dir",
         str(root),
-        "--raft-tick-ms",
-        "5",
-        "--control-tick-ms",
-        "5",
         "--replica-root-dir",
         str(root / "data-replicas"),
         "--replica-catalog-path",
