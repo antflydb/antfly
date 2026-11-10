@@ -112,6 +112,9 @@ const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
+// Freestanding owners have no filesystem query caches. In particular, do not
+// instantiate native directory iterator buffers in their DB layout or teardown.
+const NativeQueryCollector = if (builtin.os.tag == .freestanding) opaque {} else @import("native_query_cut_gc.zig").Collector;
 const build_options = @import("build_options");
 const antfly_image = @import("antfly_image");
 const platform = @import("antfly_platform");
@@ -3112,7 +3115,7 @@ pub const DB = struct {
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
     native_query_cleanup: @import("native_query_warming.zig").Owner = .{},
     // Allocate directory iterator buffers only while this owner is sweeping.
-    native_query_collector: ?*@import("native_query_cut_gc.zig").Collector = null,
+    native_query_collector: ?*NativeQueryCollector = null,
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -6128,10 +6131,12 @@ pub const DB = struct {
         self.async_context.background_closing.store(true, .release);
         self.native_query_warming.stop(self.backend_runtime);
         self.native_query_cleanup.stop(self.backend_runtime);
-        if (self.native_query_collector) |collector| {
-            collector.deinit(self.backend_runtime.filesystemIo().?);
-            self.alloc.destroy(collector);
-            self.native_query_collector = null;
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.native_query_collector) |collector| {
+                collector.deinit(self.backend_runtime.filesystemIo().?);
+                self.alloc.destroy(collector);
+                self.native_query_collector = null;
+            }
         }
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
@@ -21340,6 +21345,7 @@ pub const DB = struct {
         };
     }
     fn collectNativeQueryCaches(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+        if (comptime builtin.os.tag == .freestanding) return true;
         const self: *DB = @ptrCast(@alignCast(raw));
         const io = self.backend_runtime.filesystemIo() orelse return true;
         if (self.native_query_collector == null) {
@@ -21349,7 +21355,7 @@ pub const DB = struct {
                 error.FileNotFound => return true,
                 else => return err,
             };
-            const collector = try self.alloc.create(@import("native_query_cut_gc.zig").Collector);
+            const collector = try self.alloc.create(NativeQueryCollector);
             collector.* = .{ .a = self.alloc };
             self.native_query_collector = collector;
         }

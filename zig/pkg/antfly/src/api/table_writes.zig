@@ -40265,6 +40265,51 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        // Source quiescence joins source-owned work; cached DB workers also
+        // borrow it through runtime hooks and must drain before its destruction.
+        fn deinitManagedSourceForTest(source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
+            source.quiesce();
+            cache.closeAllDbsLocked() catch @panic("managed fixture retained DB leases");
+            source.deinit();
+        }
+
+        fn appendDenseReplayForTest(
+            seed_alloc: std.mem.Allocator,
+            db: *db_mod.DB,
+            index_name: []const u8,
+            doc_id: []const u8,
+            value: []const u8,
+            vector: []const f32,
+        ) !u64 {
+            const stored_key = try db_mod.internal_keys.documentKeyAlloc(seed_alloc, doc_id);
+            defer seed_alloc.free(stored_key);
+            const artifact_key = try db_mod.internal_keys.embeddingArtifactKeyForDocumentAlloc(seed_alloc, doc_id, index_name);
+            defer seed_alloc.free(artifact_key);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = value },
+            }, &.{});
+
+            var dense_embeddings = try seed_alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
+            var batch = db_mod.derived_types.DerivedBatch{
+                .dense_embeddings = dense_embeddings,
+            };
+            defer db_mod.derived_types.deinitDerivedBatch(seed_alloc, &batch);
+            dense_embeddings[0] = .{
+                .index_name = try seed_alloc.dupe(u8, index_name),
+                .doc_key = try seed_alloc.dupe(u8, doc_id),
+                .artifact_key = try seed_alloc.dupe(u8, artifact_key),
+                .vector = try seed_alloc.dupe(f32, vector),
+            };
+
+            const sequence = db.core.store.reserveNextReplaySequence(1);
+            var record = try change_journal_mod.recordFromDerivedBatch(seed_alloc, batch, sequence);
+            defer change_journal_mod.deinitRecord(seed_alloc, &record);
+            const encoded = try change_journal_mod.encodeRecord(seed_alloc, record);
+            defer seed_alloc.free(encoded);
+            try db_mod.replay_stream.appendOpaque(seed_alloc, db.core.store, sequence, encoded);
+            return sequence;
+        }
+
         test "writer cache distinguishes borrowed publisher callbacks and synchronization" {
             const contract = @import("antfly_local_sources").storage_db_replication_contract;
             const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
@@ -46752,14 +46797,16 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             const batch_size = auto_bulk_ingest_min_batch_ops;
             const total_docs = batch_size;
@@ -46871,14 +46918,16 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             const batch_size = 250;
             const expected_docs = 1000;
@@ -50716,17 +50765,21 @@ fn implementationTests() type {
             };
 
             var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
             lockAtomic(&source.local_db_mutex);
             var cached = try write_cache.getOrOpenLocked(group_path, FakeCatalog.iface(), 7001, 0, "docs");
             source.local_db_mutex.unlock();
             defer cached.deinit(alloc);
-            try publishRuntimeStatusSnapshot(&source, alloc, "docs", 7001, cached.db);
+            // This fixture requires a snapshot, rather than best-effort
+            // publication racing the just-opened index workers.
+            try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, cached.db);
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
 
@@ -52568,14 +52621,15 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbModeWithMetadata(
                 alloc,
@@ -52717,14 +52771,15 @@ fn implementationTests() type {
             };
 
             var catalog = Catalog{};
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbModeWithMetadata(
                 alloc,
@@ -52981,14 +53036,15 @@ fn implementationTests() type {
                 }
             };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
             var capture: DebtCapture = .{};
             source.setLocalIndexRepairDebtHook(.{ .ptr = &capture, .on_change = DebtCapture.onDebt });
 
@@ -54341,14 +54397,16 @@ fn implementationTests() type {
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicated-sync-runtime-dirty", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var hook = Hook{};
             source.setLocalChangeHook(.{
@@ -55437,14 +55495,16 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
             defer alloc.free(path);
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
             cached.deinit(alloc);
@@ -55691,15 +55751,16 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
             defer alloc.free(path);
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
             cached.deinit(alloc);
@@ -57152,6 +57213,7 @@ fn implementationTests() type {
             defer alloc.free(path);
 
             const Catalog = struct {
+                const indexes_json = "{\"dv_v1\":{\"type\":\"embeddings\",\"dimension\":2,\"external\":true}}";
                 fn iface() table_catalog.CatalogSource {
                     return .{
                         .ptr = undefined,
@@ -57172,7 +57234,7 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .placement_role = "data",
-                            .indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+                            .indexes_json = indexes_json,
                         }})[0..]),
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                             .group_id = 7001,
@@ -57190,48 +57252,67 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             {
-                var seeded = try openManagedDbWithIndexesJsonAndCacheMode(
-                    alloc,
-                    path,
-                    "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-                    null,
-                    null,
-                    0,
-                    null,
-                    .writer_no_replay,
-                );
+                var seeded = try db_mod.DB.open(alloc, path, .{
+                    .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+                    .start_index_workers = false,
+                    .ttl_cleanup = .{ .enabled = false },
+                });
                 defer seeded.close();
+                _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &seeded, Catalog.indexes_json, .{
+                    .drain_resolver_backfill = false,
+                });
                 _ = try seeded.batch(.{
-                    .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
-                    .sync_level = .write,
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,2]}}" }},
+                    .sync_level = .full_index,
                 });
             }
 
-            var db = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
-            const before = try db.db.stats(alloc);
-            defer db_mod.types.freeDBStats(alloc, before);
-            try std.testing.expectEqual(@as(usize, 1), before.indexes.len);
-            try std.testing.expect(before.indexes[0].replay_catch_up_required);
+            {
+                // Startup catch-up must not open a foreground bulk session,
+                // which intentionally defers native posting publication.
+                var db = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .startup_catch_up, null, null);
+                defer db.deinit(alloc);
+                // Add real retained replay debt to an already published native
+                // generation, without relying on a race with startup workers.
+                _ = try appendDenseReplayForTest(alloc, db.db, "dv_v1", "doc:a", "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,2]}}", &[_]f32{ 1, 2 });
+                const before = try db.db.stats(alloc);
+                defer db_mod.types.freeDBStats(alloc, before);
+                try std.testing.expectEqual(@as(usize, 1), before.indexes.len);
+                try std.testing.expect(before.indexes[0].replay_catch_up_required);
+                // Cache the pending state explicitly so stale complete-state
+                // observations cannot accidentally satisfy the final check.
+                try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, db.db);
+                var pending = (try snapshot_cache.snapshot(alloc, "docs")).?;
+                defer pending.deinit(alloc);
+                try std.testing.expect(pending.items[0].stats.indexes[0].replay_catch_up_required);
+            }
 
+            const resident_owner = write_cache.entries.items[0];
             const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
             try std.testing.expect(!result.busy);
             try std.testing.expect(result.had_debt);
             try std.testing.expect(result.cleared_debt);
-            try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+            // Live catch-up refreshes observations on the owning writer; it
+            // must not evict that warm owner just to invalidate stale status.
+            try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+            try std.testing.expect(write_cache.entries.items[0] == resident_owner);
 
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
             try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+            try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].doc_count);
             try std.testing.expectEqual(@as(u64, statuses.items[0].stats.indexes[0].replay_target_sequence), statuses.items[0].stats.indexes[0].replay_applied_sequence);
             try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
         }
@@ -57288,44 +57369,6 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            const ReplaySeed = struct {
-                fn appendDenseReplay(
-                    seed_alloc: std.mem.Allocator,
-                    db: *db_mod.DB,
-                    doc_id: []const u8,
-                    value: []const u8,
-                    vector: []const f32,
-                ) !u64 {
-                    const stored_key = try db_mod.internal_keys.documentKeyAlloc(seed_alloc, doc_id);
-                    defer seed_alloc.free(stored_key);
-                    const artifact_key = try db_mod.internal_keys.embeddingArtifactKeyForDocumentAlloc(seed_alloc, doc_id, "dense_idx");
-                    defer seed_alloc.free(artifact_key);
-                    try db.core.store.putBatch(&.{
-                        .{ .key = stored_key, .value = value },
-                    }, &.{});
-
-                    var dense_embeddings = try seed_alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
-                    var batch = db_mod.derived_types.DerivedBatch{
-                        .dense_embeddings = dense_embeddings,
-                    };
-                    defer db_mod.derived_types.deinitDerivedBatch(seed_alloc, &batch);
-                    dense_embeddings[0] = .{
-                        .index_name = try seed_alloc.dupe(u8, "dense_idx"),
-                        .doc_key = try seed_alloc.dupe(u8, doc_id),
-                        .artifact_key = try seed_alloc.dupe(u8, artifact_key),
-                        .vector = try seed_alloc.dupe(f32, vector),
-                    };
-
-                    const sequence = db.core.store.reserveNextReplaySequence(1);
-                    var record = try change_journal_mod.recordFromDerivedBatch(seed_alloc, batch, sequence);
-                    defer change_journal_mod.deinitRecord(seed_alloc, &record);
-                    const encoded = try change_journal_mod.encodeRecord(seed_alloc, record);
-                    defer seed_alloc.free(encoded);
-                    try db_mod.replay_stream.appendOpaque(seed_alloc, db.core.store, sequence, encoded);
-                    return sequence;
-                }
-            };
-
             {
                 var seeded = try db_mod.DB.open(alloc, path, .{
                     .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
@@ -57362,14 +57405,15 @@ fn implementationTests() type {
                 }
             };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
             try std.testing.expect(cached.db.core.index_manager.denseIndex("dense_idx") != null);
@@ -57388,7 +57432,7 @@ fn implementationTests() type {
                 @as(u64, 3),
                 cached.db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
             );
-            _ = try ReplaySeed.appendDenseReplay(alloc, cached.db, "doc:a", "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}", &[_]f32{ 1, 0 });
+            _ = try appendDenseReplayForTest(alloc, cached.db, "dense_idx", "doc:a", "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}", &[_]f32{ 1, 0 });
             try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .isolated));
             var queued = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, .{
                 .target = .index,
@@ -60000,13 +60044,15 @@ fn implementationTests() type {
                 }
             }
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
+            // Writer callbacks borrow snapshot_cache; drain them before its teardown.
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
 
