@@ -164,22 +164,47 @@ const KernelState = Io.File.Lock;
 
 /// Bound on how long an idle `Entry` keeps its kernel lock parked before
 /// the next release attempts the cross-process fairness probe below.
-/// Mirrors the fairness quantum already used for the writer-path lease
-/// handoff (`QueuedMutex.contended_quantum_ns`,
-/// `capi/lite_connection.zig`) and `WriterLane.foreign_fairness_quantum_ns`
-/// -- the same trade-off (bounded same-process reuse instead of paying a
-/// kernel call on every turn), applied to this inode-level lock.
-pub const fairness_quantum_ns: i128 = 20 * std.time.ns_per_ms;
+///
+/// Deliberately *not* the same 20ms quantum `QueuedMutex.contended_quantum_ns`
+/// / `WriterLane.foreign_fairness_quantum_ns` (`capi/lite_connection.zig`)
+/// use, despite sharing the same trade-off in spirit (bounded same-process
+/// reuse instead of paying a kernel call on every turn): both of those gate
+/// their probe on elapsed time *and* an explicit "is anyone else waiting"
+/// signal from a lease file other processes register intent in
+/// (`othersWaiting`/`othersWaitingAcrossProcesses`), so 20ms only matters
+/// once that signal already says someone is waiting. A raw `flock()` has no
+/// equivalent cheap introspection -- the unlock-then-tryLock probe below
+/// *is* the only way this entry can find out, so gating purely on elapsed
+/// wall-clock time (as this does) means the quantum alone controls how
+/// often the probe pays for one unlock/relock pair, not how often someone
+/// is actually waiting. A 20ms quantum measured this way fires on
+/// essentially every write whose own latency (one `fsync`, Debug-build
+/// instrumentation overhead, contention) exceeds 20ms wall-clock -- which
+/// is the common case, not the exception -- making the "parked" warm-fd
+/// optimization pay a real kernel call nearly every turn, the opposite of
+/// its purpose. Measured directly: the single-writer primary-only
+/// benchmark attributed ~0.9 of its ~4.9 flock()/write here before this
+/// comment was written to explain why 20ms was wrong for this call site.
+/// A full second is still imperceptible next to any plausible genuine
+/// cross-process wait, while comfortably exceeding any realistic
+/// single-commit wall-clock latency.
+pub const fairness_quantum_ns: i128 = 1 * std.time.ns_per_s;
 
 /// How long a fail-fast `.shared` acquirer (`acquire(..., .shared, false)`)
-/// retries before giving up. Two quanta: one covers this process's own
-/// warm-parking dance (`maybeReleaseAssumeLocked`) possibly being mid-probe;
-/// the other covers a genuinely different process's own active hold
-/// clearing. Exclusive acquisitions are never retried here -- every
-/// existing epoch-reuse-lock call site already treats an immediate
-/// `error.WouldBlock` as "skip reuse this commit," which stays correct and
-/// cheap; only a fail-fast *read* benefits from tolerating a transient hold.
-pub const shared_fail_fast_retry_ns: i128 = 2 * fairness_quantum_ns;
+/// retries before giving up. Deliberately independent of
+/// `fairness_quantum_ns` (not derived from it, unlike an earlier version of
+/// this constant): this needs to stay short to honor "fail-fast" for a
+/// caller that explicitly asked not to block, while `fairness_quantum_ns`
+/// needs to stay long to keep the warm-parked kernel lock from being
+/// probed away on nearly every write (see that constant's own comment).
+/// Coupling them meant either one dragged the other to the wrong value.
+/// Covers a genuinely different process's own active hold clearing within
+/// a brief, bounded grace period; exclusive acquisitions are never retried
+/// here -- every existing epoch-reuse-lock call site already treats an
+/// immediate `error.WouldBlock` as "skip reuse this commit," which stays
+/// correct and cheap; only a fail-fast *read* benefits from tolerating a
+/// transient hold.
+pub const shared_fail_fast_retry_ns: i128 = 40 * std.time.ns_per_ms;
 
 pub const Entry = struct {
     inode: Io.File.INode,

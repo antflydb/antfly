@@ -169,6 +169,12 @@ const AllocSiteHistogram = struct {
     }
 };
 var alloc_site_histogram: AllocSiteHistogram = .{};
+/// Same mechanism, armed alongside `alloc_site_histogram`, for `flock()`
+/// calls specifically: the registry's whole point is to amortize these to
+/// zero per warm write, so when the steady-state report still shows a
+/// nonzero `flock_per_write`, this is what names the call site instead of
+/// leaving a bare count to track down by inspection.
+var flock_site_histogram: AllocSiteHistogram = .{};
 var histogram_armed = std.atomic.Value(bool).init(false);
 
 const CountingAllocator = struct {
@@ -329,13 +335,19 @@ const CountingShim = struct {
     }
     fn fileLock(userdata: ?*anyopaque, file: std.Io.File, lock: std.Io.File.Lock) std.Io.File.LockError!void {
         _ = userdata;
+        const ret_addr = @returnAddress();
         try std.testing.io.vtable.fileLock(std.testing.io.userdata, file, lock);
         _ = syscalls.flock.fetchAdd(1, .monotonic);
+        if (histogram_armed.load(.monotonic)) flock_site_histogram.record(ret_addr);
     }
     fn fileTryLock(userdata: ?*anyopaque, file: std.Io.File, lock: std.Io.File.Lock) std.Io.File.LockError!bool {
         _ = userdata;
+        const ret_addr = @returnAddress();
         const ok = try std.testing.io.vtable.fileTryLock(std.testing.io.userdata, file, lock);
-        if (ok) _ = syscalls.flock.fetchAdd(1, .monotonic);
+        if (ok) {
+            _ = syscalls.flock.fetchAdd(1, .monotonic);
+            if (histogram_armed.load(.monotonic)) flock_site_histogram.record(ret_addr);
+        }
         return ok;
     }
 };
@@ -802,6 +814,8 @@ test "lite write amplification cpu attribution" {
     const updates: usize = 2000;
 
     alloc_site_histogram.reset();
+    flock_site_histogram.reset();
+    syscalls.reset();
     native.PageWriteMetrics.reset();
     native.PageDecodeMetrics.resetCrc();
     histogram_armed.store(true, .monotonic);
@@ -857,6 +871,47 @@ test "lite write amplification cpu attribution" {
         std.debug.print(
             "    {d}. count={d} per_write={d:.3}  {s}  <-  {s}\n",
             .{ i + 1, entry.count, @as(f64, @floatFromInt(entry.count)) / @as(f64, @floatFromInt(updates)), caller_symbol, callers_caller_symbol },
+        );
+    }
+
+    // Same regroup-and-resolve treatment as the allocation histogram above,
+    // applied to `flock()` calls: names which call site (registry kernel
+    // transition in inode_lock.zig, WriterLane/path gate in
+    // capi/lite_connection.zig, a reader fence, or something else) is still
+    // issuing a real `flock()` syscall on a warm, steady-state write path
+    // the registry is supposed to amortize to zero.
+    std.debug.print("  flock()/write: {d:.3}\n", .{@as(f64, @floatFromInt(syscalls.flock.load(.monotonic))) / @as(f64, @floatFromInt(updates))});
+    const raw_flock_sites = flock_site_histogram.top(std.heap.page_allocator, 256) catch &.{};
+    defer std.heap.page_allocator.free(raw_flock_sites);
+    var flock_regrouped = std.AutoHashMap(RegroupKey, u64).init(std.heap.page_allocator);
+    defer flock_regrouped.deinit();
+    for (raw_flock_sites) |entry| {
+        const idx = firstNonStdFrameIndex(std.testing.io, &entry.frames);
+        const caller = entry.frames[idx];
+        const callers_caller = if (idx + 1 < entry.frames.len) entry.frames[idx + 1] else 0;
+        const key: RegroupKey = .{ .caller = caller, .callers_caller = callers_caller };
+        const slot = flock_regrouped.getOrPut(key) catch continue;
+        if (!slot.found_existing) slot.value_ptr.* = 0;
+        slot.value_ptr.* += entry.count;
+    }
+    var flock_regrouped_list: std.ArrayListUnmanaged(RegroupedEntry) = .empty;
+    defer flock_regrouped_list.deinit(std.heap.page_allocator);
+    var flock_regrouped_it = flock_regrouped.iterator();
+    while (flock_regrouped_it.next()) |kv| flock_regrouped_list.append(std.heap.page_allocator, .{ .key = kv.key_ptr.*, .count = kv.value_ptr.* }) catch {};
+    std.mem.sort(RegroupedEntry, flock_regrouped_list.items, {}, struct {
+        fn call(_: void, a: RegroupedEntry, b: RegroupedEntry) bool {
+            return a.count > b.count;
+        }
+    }.call);
+    std.debug.print("  flock call sites (first non-std frame, count/write):\n", .{});
+    var flock_buf: [256]u8 = undefined;
+    var flock_buf2: [256]u8 = undefined;
+    for (flock_regrouped_list.items) |entry| {
+        const caller_symbol = resolveAddressSymbol(std.testing.io, entry.key.caller, &flock_buf);
+        const callers_caller_symbol = resolveAddressSymbol(std.testing.io, entry.key.callers_caller, &flock_buf2);
+        std.debug.print(
+            "    count={d} per_write={d:.3}  {s}  <-  {s}\n",
+            .{ entry.count, @as(f64, @floatFromInt(entry.count)) / @as(f64, @floatFromInt(updates)), caller_symbol, callers_caller_symbol },
         );
     }
 
