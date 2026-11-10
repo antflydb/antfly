@@ -20,7 +20,6 @@ import json
 import os
 import subprocess
 import time
-from pathlib import Path
 
 import pytest
 from conftest import DEFAULT_ANTFLY_BIN, resolve_binary_path
