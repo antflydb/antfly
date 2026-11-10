@@ -105,6 +105,7 @@ pub const Descriptor = struct {
         if (self.source) |source| {
             const summary = self.definition.summary orelse return error.InvalidRetainedDatasetResource;
             try source.validate();
+            if (summary.projection) |projection| if (!std.mem.eql(u8, &projection.source_schema, &source.schema)) return error.InvalidRetainedDatasetResource;
             if (!std.mem.eql(u8, &summary.source, &source.identity()) or self.phase == .closed or self.closed_receipt != null) return error.InvalidRetainedDatasetResource;
         } else if (self.definition.kind == .summary and ((self.phase != .closed and self.phase != .retiring) or self.closed_receipt == null)) return error.InvalidRetainedDatasetResource;
         if (self.phase == .closed and self.closed_receipt == null) return error.InvalidRetainedDatasetResource;
@@ -220,4 +221,27 @@ test "retained dataset resource metadata round trips identities and releases adm
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "retained dataset compiled projections bind source schema without changing legacy definition bytes" {
+    const a = std.testing.allocator;
+    const legacy = fixture();
+    const bytes = try std.json.Stringify.valueAlloc(a, legacy.definition.summary.?, .{});
+    defer a.free(bytes);
+    var old = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer old.deinit();
+    try std.testing.expect(!old.value.object.contains("projection"));
+    var compiled = legacy;
+    compiled.definition.summary.?.projection = .{ .source_schema = legacy.source.?.schema, .timestamp = .{ .column = "ts" }, .measures = &.{null} };
+    try compiled.validateCreation();
+    const old_id = try legacy.definition.fingerprint(a);
+    const new_id = try compiled.definition.fingerprint(a);
+    try std.testing.expect(!std.mem.eql(u8, &old_id, &new_id));
+    const encoded = try std.json.Stringify.valueAlloc(a, compiled, .{});
+    defer a.free(encoded);
+    var decoded = try parse(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(compiled, decoded.value);
+    compiled.definition.summary.?.projection.?.source_schema = @splat(19);
+    try std.testing.expectError(error.InvalidRetainedDatasetResource, compiled.validate());
 }

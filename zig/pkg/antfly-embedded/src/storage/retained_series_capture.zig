@@ -56,6 +56,7 @@ pub const Binding = struct {
     dimension_types: []const DimensionType = &.{},
     /// Null names denote count(*); other inputs are numeric nullable fields.
     fields: []const ?[]const u8,
+    compiled: ?@import("../retained_dataset_projection.zig").Projection = null,
 
     pub fn validate(self: Binding) !void {
         try self.spec.validate();
@@ -65,6 +66,11 @@ pub const Binding = struct {
                 if ((field != null) != self.spec.countsNonNull(i)) return error.InvalidRetainedSeries;
                 if (field) |name| if (name.len == 0 or name.len > 256) return error.InvalidRetainedSeries;
             } else if (field == null or field.?.len == 0 or field.?.len > 256) return error.InvalidRetainedSeries;
+        }
+        if (self.compiled) |projection| {
+            try projection.validate();
+            if (projection.dimensions.len != self.dimensions.len or projection.measures.len != self.fields.len) return error.InvalidRetainedSeries;
+            for (projection.measures, self.fields) |reference, field| if ((reference == null) != (field == null)) return error.InvalidRetainedSeries;
         }
         for (self.dimensions, 0..) |name, i| {
             if (name.len == 0 or name.len > 256) return error.InvalidRetainedSeries;
@@ -123,6 +129,12 @@ pub fn requireNamespace(a: A, txn: anytype, namespace: [24]u8) !void {
 pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_from_ns: i128) !void {
     try binding.validate();
     if (binding.closed) return error.InvalidRetainedSeries;
+    if (binding.compiled) |projection| {
+        const current = (try optional(txn, keys.public_schema_json_key)) orelse "";
+        var digest: series.Id = undefined;
+        std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &projection.source_schema)) return error.RetainedSeriesDefinitionMismatch;
+    }
     try @import("retained_series_revocation.zig").requireInstall(txn, .{ .id = binding.spec.id, .generation = binding.spec.generation, .definition = binding.spec.definition, .partition = binding.spec.source_partition, .incarnation = binding.spec.source_incarnation });
     const previous = try load(a, txn);
     if (previous.len == max_bindings) return error.RetainedSeriesBatchTooLarge;
@@ -329,11 +341,15 @@ fn releasePreparedKeys(a: A, txn: anytype, transaction: [16]u8) !void {
     try txn.delete(try preparedCountKey(a, transaction));
 }
 
-const topology_keys = [_][]const u8{
+const ownership_keys = [_][]const u8{
     @import("db/range_state.zig").range_key,
     @import("db/range_state.zig").split_bootstrap_marker_key,
     @import("db/merge_state.zig").key,
     @import("db/merge_state.zig").legacy_key,
+};
+const topology_keys = ownership_keys ++ [_][]const u8{
+    keys.public_schema_json_key,
+    schema.schema_key,
 };
 fn valueDigest(raw: ?[]const u8) ?series.Id {
     const bytes = raw orelse return null;
@@ -413,7 +429,12 @@ pub const Capture = struct {
             var changed = self.topology_before.iterator();
             while (changed.next()) |entry| {
                 const after = valueDigest(try optional(txn, topology_keys[entry.key_ptr.*]));
-                if (!std.meta.eql(entry.value_ptr.*, after)) return error.RetainedSeriesTopologyUnsupported;
+                if (!std.meta.eql(entry.value_ptr.*, after)) {
+                    if (entry.key_ptr.* < ownership_keys.len) return error.RetainedSeriesTopologyUnsupported;
+                    // Closed generations read aggregate state independently;
+                    // active extraction must retain the exact admitted layout.
+                    if (try isCapturing(a, txn)) return error.RetainedSeriesDefinitionMismatch;
+                }
             }
         }
         if (self.before.count() == 0) {
@@ -515,11 +536,22 @@ const Decoder = struct {
         var self = Decoder{ .a = a };
         for (bindings) |binding| {
             if (binding.closed) continue;
+            if (binding.compiled) |projection| {
+                try self.wantExact(projection.timestamp.column, true);
+                for (projection.dimensions) |reference| try self.wantExact(reference.column, true);
+                for (binding.spec.laws, projection.measures) |law, reference| if (reference) |field| try self.wantExact(field.column, law != .count or field.path.len != 0);
+                continue;
+            }
             try self.want(binding.timestamp, true);
             for (binding.dimensions) |field| try self.want(field, true);
             for (binding.spec.laws, binding.fields) |law, field| if (field) |name| try self.want(name, law != .count);
         }
         return self;
+    }
+    fn wantExact(self: *Decoder, column: []const u8, value_needed: bool) !void {
+        const entry = try self.wanted.getOrPut(self.a, column);
+        if (!entry.found_existing) entry.value_ptr.* = false;
+        entry.value_ptr.* = entry.value_ptr.* or value_needed;
     }
     fn want(self: *Decoder, path: []const u8, value_needed: bool) !void {
         const whole = try self.wanted.getOrPut(self.a, path);
@@ -573,17 +605,18 @@ fn normalizeImage(a: A, binding: Binding, image: Image) !series.Row {
 }
 fn normalizeValueWithPresence(a: A, binding: Binding, value: std.json.Value, presence: std.StringHashMapUnmanaged(bool)) !series.Row {
     if (value != .object) return error.InvalidRetainedSeriesRow;
-    const timestamp = lookup(value, binding.timestamp);
+    const timestamp = if (binding.compiled) |projection| projection.timestamp.get(value, presence).value else lookup(value, binding.timestamp);
     const ns = datetime.rangeNanoseconds(timestamp) orelse return error.InvalidRetainedSeriesRow;
     const dimensions = try a.alloc(std.json.Value, binding.dimensions.len);
-    for (binding.dimensions, binding.dimension_types, dimensions) |field, declared, *out| out.* = try normalizeDimension(a, declared, lookup(value, field));
+    for (binding.dimensions, binding.dimension_types, dimensions, 0..) |field, declared, *out, index| out.* = try normalizeDimension(a, declared, if (binding.compiled) |projection| projection.dimensions[index].get(value, presence).value else lookup(value, field));
     const inputs = try a.alloc(?f64, binding.fields.len);
-    for (binding.spec.laws, binding.fields, inputs) |law, field, *input| {
+    for (binding.spec.laws, binding.fields, inputs, 0..) |law, field, *input, index| {
         input.* = if (field) |name| projected: {
-            const cell = lookup(value, name);
+            const projected = if (binding.compiled) |projection| projection.measures[index].?.get(value, presence) else null;
+            const cell = if (projected) |result| result.value else lookup(value, name);
             if (law == .count) {
                 // SQL JSONB literal null is a present, non-SQL-null column.
-                const nonnull = presence.get(name) orelse (cell != .null);
+                const nonnull = if (projected) |result| result.nonnull else presence.get(name) orelse (cell != .null);
                 break :projected if (nonnull) @as(f64, 1) else null;
             }
             break :projected switch (cell) {
@@ -736,6 +769,19 @@ test "retained series native source commit coalesces corrections and preserves T
     }
     try std.testing.expect(try store.retainedSeriesActive());
     {
+        var blocked = try store.beginWriteTxn();
+        defer blocked.abort();
+        try blocked.put(keys.public_schema_json_key, "{\"version\":2}");
+        try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, blocked.commit());
+        try std.testing.expectError(error.RetainedSeriesTransactionPoisoned, blocked.commit());
+    }
+    {
+        var blocked = try store.beginWriteTxn();
+        defer blocked.abort();
+        try blocked.put(schema.schema_key, "different physical layout");
+        try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, blocked.commit());
+    }
+    {
         var noop = try store.beginWriteTxn();
         errdefer noop.abort();
         // An absent -> absent lifecycle update is harmless replay.
@@ -833,9 +879,14 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     try db.batch(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = first }} });
     var partition: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&@import("db/online_source_contract.zig").namespaceBytes(namespace), &partition, .{});
-    const binding = Binding{ .spec = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .source_partition = partition, .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 100, .laws = &.{ .count, .sum } }, .timestamp = "ts", .fields = &.{ null, "v" } };
+    var source_schema: series.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &source_schema, .{});
+    const binding = Binding{ .spec = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .source_partition = partition, .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 100, .laws = &.{ .count, .sum } }, .timestamp = "ts", .fields = &.{ null, "v" }, .compiled = .{ .source_schema = source_schema, .timestamp = .{ .column = "ts" }, .measures = &.{ null, .{ .column = "v" } } } };
     const control = @import("retained_series_control.zig");
     const fence = control.Fence{ .id = binding.spec.id, .generation = 1, .definition = binding.spec.definition, .partition = partition, .incarnation = 1 };
+    var stale_binding = binding;
+    stale_binding.compiled.?.source_schema = @splat(9);
+    try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, db.batch(.{ .timestamp_ns = 2, .retained_series = .{ .action = .install, .fence = fence, .binding = stale_binding } }));
     try db.batch(.{ .timestamp_ns = 2, .retained_series = .{ .action = .install, .fence = fence, .binding = binding } });
     try db.batch(.{ .timestamp_ns = 3, .retained_series = .{ .action = .backfill, .fence = fence, .work_limit = 1024 } });
     try db.batch(.{ .timestamp_ns = 4, .writes = &.{.{ .key = "a", .value = second }} });
@@ -1223,6 +1274,18 @@ test "retained series packed JSON literal null remains distinct from SQL null wh
     try std.testing.expectEqual(@as(?f64, null), sql.values[1]);
     try std.testing.expectEqual(@as(?f64, 1), nested.values[0]);
     try std.testing.expectEqual(@as(?f64, null), nested.values[1]);
+    var compiled = binding;
+    compiled.compiled = .{ .source_schema = @splat(4), .timestamp = .{ .column = "ts" }, .measures = &.{ .{ .column = "doc", .result = .json }, .{ .column = "doc", .path = &.{.{ .key = "x" }}, .result = .json } } };
+    var frozen = try Decoder.init(alloc, &.{compiled});
+    const typed_literal = try normalizeImage(alloc, compiled, try frozen.read(&txn, json_null));
+    const typed_sql = try normalizeImage(alloc, compiled, try frozen.read(&txn, sql_null));
+    const typed_nested = try normalizeImage(alloc, compiled, try frozen.read(&txn, nested_null));
+    try std.testing.expectEqual(@as(?f64, 1), typed_literal.values[0]);
+    try std.testing.expectEqual(@as(?f64, null), typed_literal.values[1]);
+    try std.testing.expectEqual(@as(?f64, null), typed_sql.values[0]);
+    try std.testing.expectEqual(@as(?f64, null), typed_sql.values[1]);
+    try std.testing.expectEqual(@as(?f64, 1), typed_nested.values[0]);
+    try std.testing.expectEqual(@as(?f64, 1), typed_nested.values[1]);
 }
 
 test "retained series native prepare plans vote atomically and resolution markers release commit and abort evidence" {
@@ -1337,4 +1400,36 @@ test "retained series native prepare plans vote atomically and resolution marker
         _ = try engine.requireClosedSpan(temp, &txn, .{ .start_ns = "120", .end_ns = "130" }, null);
         try txn.commit();
     }
+}
+
+test "retained series compiled fields use frozen roots and SQL JSON count provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var binding: Binding = .{
+        .spec = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .source_partition = @splat(3), .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 100, .laws = &.{ .count, .sum }, .count_nonnull = &.{ true, false } },
+        .timestamp = "meta.at",
+        .dimensions = &.{"payload.region"},
+        .dimension_types = &.{.string},
+        .fields = &.{ "payload.x", "payload.y" },
+        .compiled = .{ .source_schema = @splat(4), .timestamp = .{ .column = "meta", .path = &.{.{ .key = "at" }} }, .dimensions = &.{.{ .column = "payload", .path = &.{.{ .key = "region" }} }}, .measures = &.{ .{ .column = "payload", .path = &.{.{ .key = "x" }}, .result = .json }, .{ .column = "payload", .path = &.{.{ .key = "y" }} } } },
+    };
+    try binding.validate();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"meta.at\":\"invalid\",\"meta\":{\"at\":\"1970-01-01T00:00:00.000000001Z\"},\"payload.region\":\"wrong\",\"payload.x\":99,\"payload.y\":88,\"payload\":{\"x\":null,\"y\":4,\"region\":\"us\"}}", .{});
+    const row = try normalizeValue(a, binding, value);
+    try std.testing.expectEqual(@as(i128, 1), row.timestamp_ns);
+    try std.testing.expectEqualStrings("[\"us\"]", row.dimensions);
+    try std.testing.expectEqual(@as(?f64, 1), row.values[0]);
+    try std.testing.expectEqual(@as(?f64, 4), row.values[1]);
+    const decoder = try Decoder.init(a, &.{binding});
+    try std.testing.expect(decoder.wanted.contains("meta"));
+    try std.testing.expect(decoder.wanted.contains("payload"));
+    try std.testing.expect(!decoder.wanted.contains("meta.at"));
+    try std.testing.expect(!decoder.wanted.contains("payload.x"));
+    const scalar = [_]?@import("../retained_dataset_projection.zig").Reference{
+        .{ .column = "payload", .path = &.{.{ .key = "x" }} },
+        .{ .column = "payload", .path = &.{.{ .key = "y" }} },
+    };
+    binding.compiled.?.measures = &scalar;
+    try std.testing.expectEqual(@as(?f64, null), (try normalizeValue(a, binding, value)).values[0]);
 }

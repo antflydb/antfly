@@ -33,8 +33,10 @@ pub const Summary = struct {
     origin_ns: []const u8 = "0",
     mutable_for_ns: u64,
     measures: []const Measure,
+    projection: ?@import("retained_dataset_projection.zig").Projection = null,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.projection == null) return writeFieldsOmitting(self, .{ "interval_ns", "mutable_for_ns" }, .{"projection"}, writer);
         try writeFields(self, .{ "interval_ns", "mutable_for_ns" }, writer);
     }
     pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
@@ -94,6 +96,11 @@ pub const Definition = struct {
             for (s.dimensions, 0..) |name, i| {
                 if (name.len == 0) return error.InvalidDatasetDefinition;
                 for (s.dimensions[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidDatasetDefinition;
+            }
+            if (s.projection) |projection| {
+                projection.validate() catch return error.InvalidDatasetDefinition;
+                if (projection.dimensions.len != s.dimensions.len or projection.measures.len != s.measures.len) return error.InvalidDatasetDefinition;
+                for (projection.measures, s.measures) |reference, measure| if ((reference == null) != (measure.field == null)) return error.InvalidDatasetDefinition;
             }
             for (s.measures, 0..) |m, i| {
                 if (m.name.len == 0 or (m.law != .count and (m.field == null or m.field.?.len == 0))) return error.InvalidDatasetDefinition;
@@ -301,6 +308,7 @@ const SummaryWire = struct {
     origin_ns: []const u8 = "0",
     mutable_for_ns: DecimalU64,
     measures: []const Measure,
+    projection: ?@import("retained_dataset_projection.zig").Projection = null,
 };
 const DefinitionWire = struct {
     format: u8 = 1,
@@ -324,8 +332,17 @@ fn fromWire(comptime T: type, value: anytype) T {
     return result;
 }
 pub fn writeFields(value: anytype, comptime names: anytype, writer: anytype) !void {
+    return writeFieldsOmitting(value, names, .{}, writer);
+}
+
+pub fn writeFieldsOmitting(value: anytype, comptime names: anytype, comptime omitted: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
+        const skip = comptime blk: {
+            for (omitted) |name| if (std.mem.eql(u8, name, field)) break :blk true;
+            break :blk false;
+        };
+        if (comptime skip) continue;
         try writer.objectField(field);
         const decimal = comptime blk: {
             for (names) |name| {
