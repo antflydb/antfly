@@ -295,6 +295,8 @@ pub const CatalogProjectionRequest = union(enum) {
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,
+    owner_readiness: @import("../api.zig").OwnerReadinessRequest,
+    owner_readiness_transitions: @import("../api.zig").OwnerReadinessRequest,
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,

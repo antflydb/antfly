@@ -111,7 +111,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
-    _privacy_policy_version: ?[]const u8 = null,
+    _privacy_policy_version: ?std.json.Value = null,
     _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -233,18 +233,18 @@ pub fn parseTextStatsRequest(
 ) !ParsedTextStatsRequest {
     var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, body, .{});
     defer parsed.deinit();
-    const privacy_policy_version = try parseTextStatsPrivacyVersion(parsed.value._privacy_policy_version);
+    const version = if (parsed.value._privacy_policy_version) |value| try query_contract.parsePrivacyPolicyVersion(value) else null;
     if (parsed.value.query_request) |query_value| {
         if (parsed.value._resolved_doc_filter != null) return error.InvalidQueryRequest;
         const encoded_query = try std.json.Stringify.valueAlloc(alloc, query_value, .{});
         defer alloc.free(encoded_query);
-        var query = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query);
-        errdefer query.deinit(alloc);
-        if (privacy_policy_version) |version| {
-            if (query.req.privacy_policy_version) |inner| if (!std.mem.eql(u8, &inner, &version)) return error.InvalidQueryRequest;
-            query.req.privacy_policy_version = version;
+        var owned = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query);
+        errdefer owned.deinit(alloc);
+        if (version) |expected| {
+            if (owned.req.privacy_policy_version) |nested| if (!std.mem.eql(u8, &expected, &nested)) return error.InvalidQueryRequest;
+            owned.req.privacy_policy_version = expected;
         }
-        return .{ .query_request = query };
+        return .{ .query_request = owned };
     }
     if (parsed.value.fields) |fields_value| {
         var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
@@ -278,7 +278,7 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .explicit_fields = .{
-            .privacy_policy_version = privacy_policy_version,
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
@@ -318,21 +318,13 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .background_fields = .{
-            .privacy_policy_version = privacy_policy_version,
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
         } };
     }
     return error.InvalidQueryRequest;
-}
-
-fn parseTextStatsPrivacyVersion(value: ?[]const u8) !?[64]u8 {
-    const text = value orelse return null;
-    if (std.mem.eql(u8, text, "none")) return @as([64]u8, @splat(0));
-    if (text.len != 64) return error.InvalidQueryRequest;
-    for (text) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
-    return text[0..64].*;
 }
 
 test "local query contract text stats wire preserves privacy controls and rejects unknown metadata" {

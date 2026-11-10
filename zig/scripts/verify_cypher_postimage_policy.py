@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from cypher_qualification_retry import retry_allowed
+from cypher_qualification_retry import await_durable_graph_commit, retry_allowed
 
 
 def main():
@@ -80,24 +80,15 @@ def main():
 
     def write(statement):
         result = query(statement, accepted=(200, 202))
-        receipt = result["commit"]
-        if receipt["status"] != "committed":
-            # An admitted write is never replayed. Resolve its durable receipt
-            # before issuing another statement against the changed rows.
-            deadline = time.monotonic() + 90
-            while True:
-                status = call(
-                    f"/transactions/{receipt['transaction_id']}/status",
-                    method="GET",
-                    accepted=(200, 409, 503),
-                )
-                disposition = status.get("disposition")
-                assert disposition != "aborted", status
-                if disposition == "committed" and status.get("durable"):
-                    break
-                assert time.monotonic() < deadline, status
-                time.sleep(0.2)
-            receipt["status"] = "committed"
+        await_durable_graph_commit(
+            result,
+            lambda transaction: call(
+                f"/transactions/{transaction}/status",
+                method="GET",
+                accepted=(200, 409, 503),
+            ),
+        )
+        result["commit"]["status"] = "committed"
         return result
 
     null = {"type": "null", "value": None}
