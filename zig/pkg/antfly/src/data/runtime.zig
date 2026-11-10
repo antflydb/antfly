@@ -12692,7 +12692,9 @@ pub const DataServer = struct {
         // Isolated control commands assign no document versions. Preserve their
         // request scheme, including invalid explicit adjuncts for validation,
         // rather than injecting a row-version marker during negotiation.
-        if (batchMutatesDocuments(req))
+        // Guarded cleanup removes internal queue keys and graph edges, not
+        // ordinary documents; its effect-bearing deletes do not assign versions.
+        if (!req.graph_endpoint_cleanup and batchMutatesDocuments(req))
             proposal.document_version_scheme = if (active_protocol_version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version) .revision_v1 else .legacy;
         return proposal;
     }
@@ -42384,6 +42386,35 @@ fn consumerTests() type {
                 const document = DataServer.raftBatchRequestForActiveProtocol(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} }, active, 999);
                 try std.testing.expectEqual(@as(u64, 999), document.timestamp_ns);
                 try std.testing.expectEqual(if (active >= revisions) antfly.db.types.DocumentVersionScheme.revision_v1 else .legacy, document.document_version_scheme);
+            }
+        }
+
+        test "raft proposal preserves guarded graph cleanup through document revision negotiation" {
+            const alloc = std.testing.allocator;
+            const keys = @import("antfly_local_sources").storage_internal_keys;
+            const job = try keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+            defer alloc.free(job);
+            const request = (antfly.db.types.GraphEndpointCleanupStatus{
+                .pending = true,
+                .guards = &.{.{ .endpoint = "hub", .generation = 0 }},
+                .deletes = &.{job},
+                .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .owner = "owner" }},
+            }).request();
+            const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+            for ([_]u16{ revisions - 1, revisions }) |active| {
+                const proposal = DataServer.raftBatchRequestForActiveProtocol(request, active, 999);
+                try std.testing.expectEqual(.admit_current, proposal.document_version_scheme);
+                try antfly.db.types.validateGraphEndpointCleanupCommand(proposal);
+                const encoded = try data_raft_batch.encode(alloc, "docs", proposal);
+                defer alloc.free(encoded);
+                var decoded = try data_raft_batch.decode(alloc, encoded);
+                defer decoded.deinit(alloc);
+                try antfly.db.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
+                try std.testing.expectEqualStrings(job, decoded.batch.req.deletes[0]);
+                try std.testing.expectEqualDeep(request.graph_deletes, decoded.batch.req.graph_deletes);
+                var invalid = proposal;
+                invalid.writes = &.{.{ .key = "ordinary", .value = "{}" }};
+                try std.testing.expectError(error.InvalidBatchRequest, antfly.db.types.validateGraphEndpointCleanupCommand(invalid));
             }
         }
 

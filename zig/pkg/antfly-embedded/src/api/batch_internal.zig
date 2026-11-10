@@ -224,9 +224,28 @@ test "signed write admission is internal-only and survives the replicated batch 
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
+    @memset(encoded, 0xa5);
     try std.testing.expectEqualStrings(req.row_policy_principal_proof, parsed.req.row_policy_principal_proof);
     try std.testing.expectEqualStrings(req.row_policy_database, parsed.req.row_policy_database);
     try std.testing.expectEqual(req.row_policy_admitted_at_seconds, parsed.req.row_policy_admitted_at_seconds);
+    const forwarded = try encodeBatchRequest(alloc, parsed.req);
+    defer alloc.free(forwarded);
+    var next = try parseInternalBatchRequest(alloc, forwarded);
+    defer next.deinit(alloc);
+    try std.testing.expectEqualStrings(req.row_policy_principal_proof, next.req.row_policy_principal_proof);
+    try std.testing.expectEqualStrings(req.row_policy_database, next.req.row_policy_database);
+}
+
+test "signed write admission ownership survives every parser allocation failure" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var owned = try parseInternalBatchRequest(alloc, "{\"inserts\":{\"row\":{}},\"_row_policy_principal_proof\":\"proof\",\"_row_policy_database\":\"main\",\"_row_policy_admitted_at_seconds\":123}");
+            defer owned.deinit(alloc);
+            try std.testing.expectEqualStrings("proof", owned.req.row_policy_principal_proof);
+            try std.testing.expectEqualStrings("main", owned.req.row_policy_database);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "index maintenance internal batch codec owns binary proof and rejects public bypass" {
@@ -504,6 +523,8 @@ pub const OwnedBatchRequest = struct {
     relational_generation_gc: ?std.json.Parsed(@import("../storage/db/relational_integrity_generation_retirement.zig").GcCommand) = null,
     row_policy_publication: ?std.json.Parsed(@import("../system_catalog/policies.zig").InstallRequest) = null,
     row_policy_install_bundle: ?[]u8 = null,
+    // Only signed requests allocate this compact proof/database backing.
+    row_policy_admission_bytes: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
@@ -540,6 +561,7 @@ pub const OwnedBatchRequest = struct {
         if (self.relational_generation_gc) |*page| page.deinit();
         if (self.row_policy_publication) |*publication| publication.deinit();
         if (self.row_policy_install_bundle) |bundle| alloc.free(bundle);
+        if (self.row_policy_admission_bytes) |bytes| alloc.free(bytes);
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
@@ -1084,13 +1106,18 @@ fn parseBatchRequestWithOptions(
         break :sync_level db_mod.types.SyncLevel.propose;
     };
 
+    const graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| blk: {
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :blk value.bool;
+    } else false;
+
     const document_version_scheme: db_mod.types.DocumentVersionScheme = scheme: {
         // Isolated control commands never assign ordinary document versions.
         // Preserve their neutral request default across forwarding and native
         // owner calls: choosing legacy here adds an adjunct that their strict
         // single-purpose validators correctly reject. Ordinary unmarked row
         // replay retains its historical legacy interpretation.
-        const isolated_control = activate_range_tracking or relational_topology != null or relational_generation_gc != null or
+        const isolated_control = graph_endpoint_cleanup or activate_range_tracking or relational_topology != null or relational_generation_gc != null or
             row_policy_publication != null or artifact_catalog != null or group_source != null or
             resolver_review != null or artifact_publication != null or artifact_publication_transport != null or
             leann_record_index != null or merge_proof_adoption != null;
@@ -1612,6 +1639,10 @@ fn parseBatchRequestWithOptions(
             return error.InvalidBatchRequest;
     };
 
+    // The JSON arena is released on return. Keep just the signed admission
+    // strings, not the entire parsed request, alive with the owned batch.
+    const admission_bytes: ?[]u8 = if (row_policy_proof.len == 0) null else try std.mem.concat(alloc, u8, &.{ row_policy_proof, row_policy_database });
+    errdefer if (admission_bytes) |bytes| alloc.free(bytes);
     const result_value: OwnedBatchRequest = .{
         .writes = writes,
         .deletes = deletes,
@@ -1630,6 +1661,7 @@ fn parseBatchRequestWithOptions(
         .relational_generation_gc = relational_generation_gc,
         .row_policy_publication = row_policy_publication,
         .row_policy_install_bundle = row_policy_install_bundle,
+        .row_policy_admission_bytes = admission_bytes,
         .restore_staging = restore_staging,
         .online_source = online_source,
         .group_source = group_source,
@@ -1653,8 +1685,8 @@ fn parseBatchRequestWithOptions(
         .merge_page = merge_page,
         .merge_page_effects = page_effects,
         .req = .{
-            .row_policy_principal_proof = row_policy_proof,
-            .row_policy_database = row_policy_database,
+            .row_policy_principal_proof = if (admission_bytes) |bytes| bytes[0..row_policy_proof.len] else "",
+            .row_policy_database = if (admission_bytes) |bytes| bytes[row_policy_proof.len..] else "",
             .row_policy_admitted_at_seconds = row_policy_admitted_at_seconds,
             .normalized_graph_rows = normalized_graph_rows,
             .integrity = integrity,
@@ -1687,7 +1719,7 @@ fn parseBatchRequestWithOptions(
             .deletes = deletes,
             .transforms = transforms,
             .graph_endpoint_cleanup_planned = if (root.get("_graph_endpoint_cleanup_planned")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
-            .graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
+            .graph_endpoint_cleanup = graph_endpoint_cleanup,
             .graph_writes = graph_writes,
             .graph_deletes = graph_deletes,
             .graph_endpoint_cleanup_guards = if (graph_endpoint_cleanup_guards) |guards| guards.value else &.{},
@@ -3443,6 +3475,13 @@ test "internal batch graph endpoint cleanup command isolates planned effects" {
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expect(parsed.req.graph_endpoint_cleanup_planned);
+    try std.testing.expectEqual(.admit_current, parsed.req.document_version_scheme);
+    try db_mod.types.validateGraphEndpointCleanupCommand(parsed.req);
+    const forwarded = try encodeBatchRequest(alloc, parsed.req);
+    defer alloc.free(forwarded);
+    var forwarded_parsed = try parseInternalBatchRequest(alloc, forwarded);
+    defer forwarded_parsed.deinit(alloc);
+    try db_mod.types.validateGraphEndpointCleanupCommand(forwarded_parsed.req);
     try std.testing.expectEqualStrings("hub", parsed.req.graph_endpoint_cleanup_guards[0].endpoint);
     try std.testing.expectEqual(@as(u64, 0), parsed.req.graph_endpoint_cleanup_guards[0].generation);
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job} }));
