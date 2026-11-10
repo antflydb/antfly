@@ -582,6 +582,15 @@ pub const RaftApplyStore = struct {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group, .{ .retained_owner_read = request });
     }
+    pub fn retainedSourceCandidateJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, target: @import("antfly_local_sources").system_catalog_domain.Target) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_source_candidate = target });
+    }
+    pub fn retainedDatasetReadCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, target: @import("antfly_local_sources").system_catalog_domain.Target) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_read_cut = target });
+    }
+    pub fn retainedDatasetPendingJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_pending = after });
+    }
     pub fn retainedDatasetWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64, native: bool) ![]u8 {
         return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_work = .{ .after_id = after, .native = native } });
     }

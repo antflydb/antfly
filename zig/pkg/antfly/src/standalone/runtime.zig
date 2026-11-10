@@ -2789,6 +2789,43 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .retained_dataset_read_cut) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedDatasetReadCutJson(alloc, group_ids.main_metadata_group_id, call.retained_dataset_read_cut);
+        }
+        if (call == .retained_dataset_pending) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedDatasetPendingJson(alloc, group_ids.main_metadata_group_id, call.retained_dataset_pending);
+        }
+        if (call == .retained_dataset_activate) {
+            if (!context.setting_admin) return error.Forbidden;
+            const request = call.retained_dataset_activate;
+            try request.validate();
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            if (self.hot_standby_catalog_server) |server|
+                try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            const model = @import("../metadata/retained_dataset_owners.zig");
+            const query: model.Read = .{ .plan = .{ .resource = request.resource, .generation = request.generation } };
+            const before_bytes = try store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, query);
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(?model.Plan, alloc, before_bytes, .{});
+            defer before.deinit();
+            const plan = before.value orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &plan.id, &request.plan) or plan.revision != request.revision) return error.RetainedOwnerPlanChanged;
+            _ = try plan.activate();
+            try self.applyJobCommandLocked(.{ .activate_retained_dataset = request });
+            const bytes = try store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, query);
+            errdefer alloc.free(bytes);
+            var observed = try std.json.parseFromSlice(?model.Plan, alloc, bytes, .{});
+            defer observed.deinit();
+            const after = observed.value orelse return error.MetadataMutationOutcomeUnknown;
+            if (!std.mem.eql(u8, &after.id, &request.plan) or after.phase != .active) return error.MetadataMutationOutcomeUnknown;
+            return bytes;
+        }
         if (call == .retained_owner_acknowledge) {
             if (!context.setting_admin) return error.Forbidden;
             const proof = call.retained_owner_acknowledge;
@@ -2928,7 +2965,8 @@ const LocalStandaloneMetadata = struct {
                 read.standalone = true;
                 return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
             },
-            .retained_owner_acknowledge, .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .retained_owner_archive, .retained_dataset_release, .retained_source_candidate => return error.UnsupportedOperation,
+            .retained_dataset_pending, .retained_dataset_read_cut, .retained_dataset_activate, .retained_owner_acknowledge, .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,

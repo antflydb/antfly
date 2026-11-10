@@ -43,6 +43,7 @@ pub const ResourceType = enum {
     inference,
     @"*",
     graph,
+    dataset,
 
     pub fn fromSlice(raw: []const u8) !ResourceType {
         if (std.mem.eql(u8, raw, "database")) return .database;
@@ -50,6 +51,7 @@ pub const ResourceType = enum {
         if (std.mem.eql(u8, raw, "tablespace")) return .tablespace;
         if (std.mem.eql(u8, raw, "table")) return .table;
         if (std.mem.eql(u8, raw, "graph")) return .graph;
+        if (std.mem.eql(u8, raw, "dataset")) return .dataset;
         if (std.mem.eql(u8, raw, "user")) return .user;
         if (std.mem.eql(u8, raw, "inference")) return .inference;
         if (std.mem.eql(u8, raw, "*")) return .@"*";
@@ -63,6 +65,7 @@ pub const ResourceType = enum {
             .tablespace => "tablespace",
             .table => "table",
             .graph => "graph",
+            .dataset => "dataset",
             .user => "user",
             .inference => "inference",
             .@"*" => "*",
@@ -963,7 +966,7 @@ pub const UserManager = struct {
         for (checks) |check| {
             const allowed = for (permissions) |permission| {
                 const kind = permission.resource_type == .@"*" or permission.resource_type == check.resource_type;
-                const resource = if (check.resource_type == .table) catalog_names.tableResourceMatches(permission.resource, check.resource) else std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, check.resource);
+                const resource = if ((check.resource_type == .table or check.resource_type == .dataset)) catalog_names.tableResourceMatches(permission.resource, check.resource) else std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, check.resource);
                 if (kind and resource and permission.type.allows(check.permission_type)) break true;
             } else false;
             if (!allowed) return false;
@@ -990,7 +993,7 @@ pub const UserManager = struct {
         for (permissions) |permission| {
             const resource_type_matches = permission.resource_type == .@"*" or
                 permission.resource_type == resource_type;
-            const resource_matches = if (resource_type == .table)
+            const resource_matches = if (resource_type == .table or resource_type == .dataset)
                 catalog_names.tableResourceMatches(permission.resource, resource)
             else
                 std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);

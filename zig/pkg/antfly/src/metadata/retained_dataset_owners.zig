@@ -21,6 +21,15 @@ const std = @import("std");
 const types = @import("antfly_local_sources").retained_dataset_types;
 pub const Id = types.Id;
 pub const max_owners = 4096;
+pub const Activation = struct {
+    resource: u64,
+    generation: u64,
+    plan: Id,
+    revision: u64,
+    pub fn validate(self: Activation) !void {
+        try (Registration{ .resource = self.resource, .generation = self.generation, .plan = self.plan, .revision = self.revision, .limit = 1 }).validate();
+    }
+};
 pub const Registration = struct {
     resource: u64,
     generation: u64,
@@ -36,21 +45,41 @@ pub const Registration = struct {
 };
 /// Private reads use distinct tags so older peers reject unknown authority.
 pub const Cursor = struct { resource: u64 = 0, generation: u64 = 0, owner_group: u64 = 0 };
+pub const WorkKey = struct { cursor: Cursor, plan: Id };
 pub const Read = union(enum) {
     work: Cursor,
+    work_key: Cursor,
+    selection: WorkKey,
     plan: struct { resource: u64, generation: u64 },
     owner: struct { resource: u64, generation: u64, plan: Id, group: u64, revision: u64 },
 
     pub fn validate(self: Read) !void {
         switch (self) {
-            .work => |c| {
+            .work, .work_key => |c| {
                 if ((c.resource == 0 or c.generation == 0 or c.owner_group == 0) and
                     (c.resource != 0 or c.generation != 0 or c.owner_group != 0)) return error.InvalidRetainedOwnerPlan;
+            },
+            .selection => |q| {
+                try (Read{ .work_key = q.cursor }).validate();
+                if (q.cursor.resource == 0 or types.zero(q.plan)) return error.InvalidRetainedOwnerPlan;
             },
             .plan => |q| if (q.resource == 0 or q.generation == 0 or q.generation > types.max_public_counter) return error.InvalidRetainedOwnerPlan,
             .owner => |q| if (q.resource == 0 or q.generation == 0 or q.generation > types.max_public_counter or
                 types.zero(q.plan) or q.group == 0 or q.revision == 0 or q.revision > types.max_public_counter) return error.InvalidRetainedOwnerPlan,
         }
+    }
+};
+pub const ArchiveScope = @FieldType(Read, "owner");
+/// Only a metadata leader which verified the sealed independent catalog may
+/// propose this command. Clients send ArchiveScope, never an archive digest.
+pub const ArchiveAcknowledgement = struct {
+    scope: ArchiveScope,
+    closure: Id,
+    receipt: Id,
+
+    pub fn validate(self: ArchiveAcknowledgement) !void {
+        try (Read{ .owner = self.scope }).validate();
+        if (types.zero(self.closure) or types.zero(self.receipt)) return error.InvalidRetainedOwnerPlan;
     }
 };
 pub const Phase = enum { activating, active, closing, closed, retiring, retired };
@@ -245,6 +274,14 @@ pub const Plan = struct {
         next.phase = .retiring;
         try next.validate();
         return next;
+    }
+    pub fn canReleaseSource(self: Plan) bool {
+        if (self.source_release_receipt != null or self.revoked != self.registered) return false;
+        return switch (self.phase) {
+            .closing => self.registration_complete and self.independent == self.registered,
+            .retiring => true,
+            else => false,
+        };
     }
     /// A digest is structural here. The caller must independently verify the
     /// exact native revocations and authoritative catalog publication first.

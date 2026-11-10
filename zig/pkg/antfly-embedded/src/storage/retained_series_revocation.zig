@@ -73,17 +73,36 @@ pub fn requireInstall(txn: anytype, fence: Fence) !void {
     try fence.validate();
     if (try read(txn, fence.id, fence.generation) != null) return error.RetainedSeriesSourceRevoked;
 }
+fn headKey(buffer: []u8, id: Id, partition: Id) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:retained_series_revoked_head_v1:{s}:{s}", .{ std.fmt.bytesToHex(id, .lower), std.fmt.bytesToHex(partition, .lower) });
+}
+pub fn latestRevoked(txn: anytype, id: Id, partition: Id) !u64 {
+    var buffer: [192]u8 = undefined;
+    const bytes = txn.get(try headKey(&buffer, id, partition)) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (bytes.len != 8) return error.RetainedSeriesCorrupt;
+    return std.mem.readInt(u64, bytes[0..8], .big);
+}
+
 /// Call only in the same transaction as stopping the installed producer and
 /// draining its prepared intents. Missing producers are deliberately accepted.
 pub fn stage(txn: anytype, fence: Fence) !void {
     try fence.validate();
     if (try read(txn, fence.id, fence.generation)) |previous| {
         if (!std.meta.eql(previous, fence)) return error.RetainedSeriesDefinitionMismatch;
-        return;
+    } else {
+        var buffer: [192]u8 = undefined;
+        const bytes = encode(fence);
+        try txn.put(try key(&buffer, fence.id, fence.generation), &bytes);
     }
-    var buffer: [192]u8 = undefined;
-    const bytes = encode(fence);
-    try txn.put(try key(&buffer, fence.id, fence.generation), &bytes);
+    if (try latestRevoked(txn, fence.id, fence.partition) < fence.generation) {
+        var buffer: [192]u8 = undefined;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, fence.generation, .big);
+        try txn.put(try headKey(&buffer, fence.id, fence.partition), &bytes);
+    }
 }
 
 test "retained revocation survives missing installs and rejects stale retries without blocking successors" {

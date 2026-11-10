@@ -40,7 +40,8 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 30;
+/// Version 32 reclaims revoked retained state in bounded batches.
+pub const batch_protocol_version: u16 = 32;
 /// Version 28 preserves neutral document-version semantics when decoding
 /// guarded graph cleanup. Earlier v27 peers reject these commands, so the
 /// corrected leader must activate this version across every applying replica.
@@ -50,7 +51,9 @@ pub const batch_graph_cleanup_neutral_protocol_version: u16 = 28;
 /// source dependency release.
 /// Version 30 persists an immutable closure clock separately from the moving
 /// retention clock, and a fair maintenance cursor which survives leader changes.
-pub const batch_retained_series_protocol_version: u16 = 30;
+/// Version 31 fences owner-derived installs against the actual source schema,
+/// including legacy extraction programs without a compiled projection.
+pub const batch_retained_series_protocol_version: u16 = 32;
 /// Explicit document revision semantics and source-preserving retained tails.
 /// Missing command tags retain the pre-v27 timestamp semantics on replay.
 pub const batch_document_revisions_protocol_version: u16 = 27;

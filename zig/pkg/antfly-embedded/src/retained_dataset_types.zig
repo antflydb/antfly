@@ -22,6 +22,10 @@ pub const Kind = enum { records, summary };
 pub const Access = enum { local, queryable, restore_required };
 pub const Law = enum { count, sum, avg, min, max };
 pub const Measure = struct { name: []const u8, law: Law, field: ?[]const u8 = null };
+/// Initial history is explicit. Automatic producers start from source rows
+/// still physically retained at activation; they cannot reconstruct old TTL
+/// deletions. Certified history remains a separate, proof-bearing contract.
+pub const InitialHistory = enum { certified, retained_source_rows };
 pub const Summary = struct {
     source: Id,
     timestamp: []const u8,
@@ -34,9 +38,12 @@ pub const Summary = struct {
     mutable_for_ns: u64,
     measures: []const Measure,
     projection: ?@import("retained_dataset_projection.zig").Projection = null,
+    initial_history: InitialHistory = .certified,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.projection == null and self.initial_history == .certified) return writeFieldsOmitting(self, .{ "interval_ns", "mutable_for_ns" }, .{ "projection", "initial_history" }, writer);
         if (self.projection == null) return writeFieldsOmitting(self, .{ "interval_ns", "mutable_for_ns" }, .{"projection"}, writer);
+        if (self.initial_history == .certified) return writeFieldsOmitting(self, .{ "interval_ns", "mutable_for_ns" }, .{"initial_history"}, writer);
         try writeFields(self, .{ "interval_ns", "mutable_for_ns" }, writer);
     }
     pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
@@ -81,9 +88,11 @@ pub const Definition = struct {
     }
 
     pub fn validate(self: Definition) !void {
-        if (self.format != 1 or zero(self.id) or zero(self.schema) or zero(self.authorization) or self.generation == 0 or self.generation > max_public_counter or
+        if ((self.format != 1 and self.format != 2) or zero(self.id) or zero(self.schema) or zero(self.authorization) or self.generation == 0 or self.generation > max_public_counter or
             self.retention_ns == 0 or self.local_residence_ns > self.retention_ns or
             (self.kind == .summary) != (self.summary != null)) return error.InvalidDatasetDefinition;
+        if (self.format == 2 and (self.summary == null or self.summary.?.initial_history != .retained_source_rows)) return error.InvalidDatasetDefinition;
+        if (self.format == 1 and self.summary != null and self.summary.?.initial_history != .certified) return error.InvalidDatasetDefinition;
         if (self.schema_json.len == 0 or self.schema_json.len > 16384) return error.InvalidDatasetDefinition;
         var digest: Id = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.schema_json, &digest, .{});
@@ -309,6 +318,7 @@ const SummaryWire = struct {
     mutable_for_ns: DecimalU64,
     measures: []const Measure,
     projection: ?@import("retained_dataset_projection.zig").Projection = null,
+    initial_history: InitialHistory = .certified,
 };
 const DefinitionWire = struct {
     format: u8 = 1,

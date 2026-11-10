@@ -842,6 +842,31 @@ pub const Engine = struct {
         const p = try self.key(a, "bucket:");
         const biased = @as(u128, @bitCast(start_ns)) ^ (@as(u128, 1) << 127);
         const lower = try std.fmt.allocPrint(a, "{s}{x:0>32}:", .{ p, biased });
+        return self.scanKeyRange(a, txn, p, lower, start_ns, end_ns, after, limit, cut);
+    }
+
+    /// A closed owner exports through the last physical bucket, including
+    /// future observations. A committed archive frontier may split a bucket.
+    pub fn scanArchive(self: Engine, a: A, txn: anytype, request: @import("retained_series_read_contract.zig").ArchiveStart, after: ?[]const u8, limit: usize) !Page {
+        if (limit == 0 or limit > max_changes) return error.RetainedSeriesBatchTooLarge;
+        const state = try self.load(a, txn);
+        const closed = try state.closureCut();
+        if (request.sequence != closed.sequence or request.complete_from_ns != closed.complete_from_ns or request.closed_at_ns != closed.admitted_ns) return error.RetainedSeriesDefinitionMismatch;
+        const types = @import("../retained_dataset_types.zig");
+        for (request.first_key) |digit| {
+            if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return error.RetainedSeriesResolutionMismatch;
+        }
+        const start_ns = try types.rowKeyTimestamp(request.first_key);
+        if (try self.spec.bucket(start_ns) != start_ns) return error.RetainedSeriesResolutionMismatch;
+        if (start_ns < closed.complete_from_ns) return error.RetainedSeriesCoverageMissing;
+        if (try self.spec.expired(start_ns, state.admitted_ns)) return error.RetainedSeriesHistoryExpired;
+        const cut = try self.snapshotCursor(txn);
+        const bucket_prefix = try self.key(a, "bucket:");
+        const lower = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ bucket_prefix, request.first_key[0..32], request.first_key[32..] });
+        return self.scanKeyRange(a, txn, bucket_prefix, lower, start_ns, null, after, limit, cut);
+    }
+
+    fn scanKeyRange(self: Engine, a: A, txn: anytype, p: []const u8, lower: []const u8, start_ns: i128, end_ns: ?i128, after: ?[]const u8, limit: usize, cut: Cursor) !Page {
         var seek = lower;
         if (after) |previous| {
             if (!std.mem.startsWith(u8, previous, p) or previous.len != p.len + 32 + 1 + 64 or std.mem.order(u8, previous, lower) == .lt) return error.RetainedSeriesResetRequired;
@@ -856,7 +881,9 @@ pub const Engine = struct {
         while (entry) |e| {
             if (!std.mem.startsWith(u8, e.key, p)) break;
             const b = try self.decodeBucket(a, e.key, e.value);
-            if (b.start_ns >= end_ns) break;
+            if (end_ns) |end| {
+                if (b.start_ns >= end) break;
+            }
             if (b.start_ns < start_ns) return error.RetainedSeriesCorrupt;
             if (count == limit) return .{ .rows = rows[0..count], .after = last, .cursor = cut };
             rows[count] = b;
@@ -898,6 +925,40 @@ pub const Engine = struct {
         }
         return n;
     }
+    /// Remove a bounded page only after a replicated revocation has drained
+    /// old prepares. Keep both headers until the final page so every retry
+    /// can still validate the exact generation and terminal state.
+    pub fn purgeRevoked(self: Engine, a: A, txn: anytype, limit: usize) !bool {
+        if (limit == 0 or limit > max_changes) return error.RetainedSeriesBatchTooLarge;
+        if (!(try self.load(a, txn)).revoked) return error.RetainedSeriesNotReady;
+        const generation_prefix = try self.key(a, "");
+        const definition = try self.key(a, "definition");
+        const progress = try self.key(a, "progress");
+        const keys = try a.alloc([]const u8, limit);
+        var count: usize = 0;
+        var more = false;
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(generation_prefix);
+            while (row) |entry| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, generation_prefix)) break;
+                if (std.mem.eql(u8, entry.key, definition) or std.mem.eql(u8, entry.key, progress)) continue;
+                if (count == limit) {
+                    more = true;
+                    break;
+                }
+                keys[count] = try a.dupe(u8, entry.key);
+                count += 1;
+            }
+        }
+        for (keys[0..count]) |item_key| try txn.delete(item_key);
+        if (more) return false;
+        try txn.delete(definition);
+        try txn.delete(progress);
+        return true;
+    }
+
     /// Read this and snapshot rows in ONE immutable read transaction for the
     /// snapshot/replay handoff. The transport authenticates/binds the token.
     pub fn snapshotCursor(self: Engine, txn: anytype) !Cursor {

@@ -127,6 +127,12 @@ pub const Call = union(enum) {
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
     lake_source_owner_read: u64,
     /// Bounded metadata-derived registration, protected by an administrative grant.
+    retained_dataset_pending: u64,
+    retained_source_candidate: domain.Target,
+    retained_dataset_read_cut: domain.Target,
+    retained_dataset_release: @import("../metadata/retained_dataset_owners.zig").Activation,
+    retained_dataset_activate: @import("../metadata/retained_dataset_owners.zig").Activation,
+    retained_owner_archive: @import("../metadata/retained_dataset_owners.zig").ArchiveScope,
     retained_owner_acknowledge: @import("../metadata/retained_dataset_owner_receipt.zig").Receipt,
     retained_owner_register: @import("../metadata/retained_dataset_owners.zig").Registration,
     /// Point reads and bounded supervisor selection require a body-bound read grant.
@@ -135,7 +141,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .retained_owner_acknowledge, .retained_owner_register, .relation_replace, .relation_schema_mutate, .native_memory_create => true,
+            .retained_dataset_activate, .retained_dataset_release, .retained_owner_archive, .retained_owner_acknowledge, .retained_owner_register, .relation_replace, .relation_schema_mutate, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -147,6 +153,9 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .retained_dataset_pending,
+            .retained_dataset_read_cut,
+            .retained_source_candidate,
             .retained_owner_read,
             .retained_dataset_work,
             .lake_index_lifecycle_read,

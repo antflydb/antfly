@@ -1170,6 +1170,12 @@ pub const Request = struct {
     create_table_json: ?[]const u8 = null,
     /// Trusted ingress allocates identity before sealing durable destinations.
     physical_name: ?[]const u8 = null,
+    expected_catalog_revision: ?u64 = null,
+
+    pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.expected_catalog_revision == null) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name });
+        try writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .expected_catalog_revision = self.expected_catalog_revision });
+    }
 };
 
 /// Relation names share a namespace with tables, indexes and constraint indexes.

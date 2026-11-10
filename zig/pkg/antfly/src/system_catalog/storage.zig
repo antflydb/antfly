@@ -38,6 +38,19 @@ fn retainedSourceKey(a: std.mem.Allocator, group: u64, source: u64, resource: u6
 fn retainedWorkPrefix(a: std.mem.Allocator, group: u64, native: bool) ![]u8 {
     return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:retained_{s}_work:", .{ group, if (native) "native" else "catalog" });
 }
+fn retainedPendingPrefix(a: std.mem.Allocator, group: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:retained_pending_work:", .{group});
+}
+fn retainedPending(a: std.mem.Allocator, resource: domain.Resource) !bool {
+    const identity = resource.retained orelse return false;
+    if (identity.source_table_id == 0) return false;
+    var descriptor = try retained.parse(a, resource.source_json);
+    defer descriptor.deinit();
+    return switch (descriptor.value.phase) {
+        .activating, .closing, .retiring => true,
+        else => false,
+    };
+}
 fn indexedIdKey(a: std.mem.Allocator, prefix: []const u8, id: u64) ![]u8 {
     const key = try a.alloc(u8, prefix.len + 8);
     @memcpy(key[0..prefix.len], prefix);
@@ -735,6 +748,22 @@ pub const View = struct {
         try domain.validateRetainedProjection(self.alloc, resource);
         return resource;
     }
+    pub fn nextRetainedPending(self: View, after: u64) !?domain.Resource {
+        const prefix = try retainedPendingPrefix(self.alloc, self.group_id);
+        const seek = if (after == std.math.maxInt(u64)) prefix else try indexedIdKey(self.alloc, prefix, after + 1);
+        var cursor = try self.txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(seek);
+        if (row == null or !std.mem.startsWith(u8, row.?.key, prefix)) row = try cursor.seekAtOrAfter(prefix);
+        const entry = row orelse return null;
+        if (!std.mem.startsWith(u8, entry.key, prefix)) return null;
+        if (entry.key.len != prefix.len + 8 or entry.value.len != 8) return error.InvalidCatalogRecord;
+        const id = std.mem.readInt(u64, entry.value[0..8], .little);
+        if (id == 0 or id != std.mem.readInt(u64, entry.key[prefix.len..][0..8], .big)) return error.InvalidCatalogRecord;
+        const resource = (try self.byId(.dataset, id)) orelse return error.InvalidCatalogRecord;
+        if (!try retainedPending(self.alloc, resource)) return error.InvalidCatalogRecord;
+        return resource;
+    }
     pub fn bindingForStorage(self: View, name: []const u8) !?domain.Resource {
         const key = try storageBindingKey(self.alloc, self.group_id, name);
         const bytes = self.txn.get(key) catch |err| switch (err) {
@@ -854,6 +883,14 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
                 if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
             }
         }
+        if (try retainedPending(alloc, resource)) {
+            const prefix = try retainedPendingPrefix(alloc, group_id);
+            defer alloc.free(prefix);
+            const key = try indexedIdKey(alloc, prefix, resource.id);
+            defer alloc.free(key);
+            const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
+            if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+        }
         if (resource.kind == .table) {
             const key = try storageBindingKey(alloc, group_id, resource.storage_name);
             defer alloc.free(key);
@@ -907,6 +944,13 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
             defer alloc.free(work_key);
             try txn.put(work_key, &id);
         }
+        if (try retainedPending(alloc, r)) {
+            const pending_prefix = try retainedPendingPrefix(alloc, group_id);
+            defer alloc.free(pending_prefix);
+            const pending_key = try indexedIdKey(alloc, pending_prefix, r.id);
+            defer alloc.free(pending_key);
+            try txn.put(pending_key, &id);
+        }
     }
     if (r.kind == .table) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
@@ -950,6 +994,11 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
             defer alloc.free(work_key);
             try txn.delete(work_key);
         }
+        const pending_prefix = try retainedPendingPrefix(alloc, group_id);
+        defer alloc.free(pending_prefix);
+        const pending_key = try indexedIdKey(alloc, pending_prefix, r.id);
+        defer alloc.free(pending_key);
+        try txn.delete(pending_key);
     }
     if (r.kind == .table) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);

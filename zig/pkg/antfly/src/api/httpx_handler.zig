@@ -1648,6 +1648,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.fk_generation_source_suffix, httpx.Handler.bind(self, internalGroupFkGenerationSource));
         try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
         try server.post(table_prefix ++ routes.retained_owner_control_suffix, httpx.Handler.bind(self, internalGroupRetainedOwnerControl));
+        try server.post(table_prefix ++ routes.retained_owner_read_suffix, httpx.Handler.bind(self, internalGroupRetainedOwnerRead));
         try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
@@ -2887,6 +2888,143 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 503, "initial FK child must be retried"),
         };
         return ctx.json(receipt);
+    }
+
+    pub fn createRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        return self.retainedDatasetControl(ctx, .create);
+    }
+    pub fn getRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        return self.retainedDatasetControl(ctx, .get);
+    }
+    pub fn closeRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        return self.retainedDatasetControl(ctx, .close);
+    }
+
+    fn retainedDatasetControl(self: *AntflyApiHandler, ctx: *httpx.Context, action: enum { create, get, close }) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*admitted| admitted.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const route = (try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path))) orelse return textResponse(ctx, 400, "invalid dataset target");
+        defer route.deinit(ctx.allocator);
+        if (route.kind != .dataset) return textResponse(ctx, 400, "invalid dataset target");
+        const name = route.name orelse return textResponse(ctx, 400, "dataset name required");
+        const logical = try system_catalog_routes.resourceNameAlloc(ctx.allocator, route);
+        defer ctx.allocator.free(logical);
+        if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, if (action == .get) .read else .admin)) return textResponse(ctx, 403, "forbidden");
+        if (action != .get and self.api_server.cfg.deployment_mode == .standalone) return textResponse(ctx, 503, "retained dataset maintenance unavailable");
+        const a = ctx.allocator;
+        const local = @import("antfly_local_sources");
+        const retained = local.system_catalog_retained_datasets;
+        var context = operationContext(ctx, identity);
+        const source = self.api_server.source;
+        if (action == .create) {
+            const admin = @import("retained_dataset_admin.zig");
+            const body = (try ctx.body()) orelse return textResponse(ctx, 400, "summary definition required");
+            if (body.len > 32768) return textResponse(ctx, 413, "summary definition too large");
+            const request = std.json.parseFromSliceLeaky(admin.Create, a, body, .{}) catch return textResponse(ctx, 400, "invalid summary definition");
+            request.source.validate() catch return textResponse(ctx, 400, "invalid source table");
+            const table = try request.source.resourceNameAlloc(a);
+            defer a.free(table);
+            if (!try http_server_mod.tablePermissionCurrentlyAllowed(identity, table, .admin)) return textResponse(ctx, 403, "source table administration required");
+            context.setting_admin = true;
+            const bytes = source.systemCatalog(a, context, .{ .retained_source_candidate = request.source }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+            defer a.free(bytes);
+            const candidate = try std.json.parseFromSliceLeaky(admin.Source, a, bytes, .{ .allocate = .alloc_always });
+            const cfg = self.api_server.cfg;
+            const config = cfg.node_config orelse return textResponse(ctx, 503, "shared archive storage required");
+            var storage = @import("lake_index_store.zig").Store.open(a, config, cfg.secret_store, true) catch return textResponse(ctx, 503, "shared archive storage unavailable");
+            defer storage.deinit();
+            if (storage.locator.protocol == .filesystem) return textResponse(ctx, 503, "shared archive storage required");
+            const io = self.api_server.sharedApiIo() orelse return textResponse(ctx, 503, "dataset service unavailable");
+            const definition = admin.descriptor(a, io, request, candidate, storage.identity) catch |err| return textResponse(ctx, 400, @errorName(err));
+            const json = try std.json.Stringify.valueAlloc(a, definition, .{});
+            if (!try http_server_mod.tablePermissionCurrentlyAllowed(identity, table, .admin)) return textResponse(ctx, 403, "source table administration required");
+            const mutation: system_catalog.Mutation = .{ .action = .create, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json };
+            const applied = source.systemCatalog(a, context, .{ .mutate = .{ .mutation = mutation, .expected_catalog_revision = candidate.catalog_revision } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+            defer a.free(applied);
+            return retainedDatasetInfo(ctx, 201, name, definition);
+        }
+        const bytes = source.systemCatalog(a, context, .{ .read = .{ .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+        defer a.free(bytes);
+        const state = try std.json.parseFromSliceLeaky(system_catalog.State, a, bytes, .{ .allocate = .alloc_always });
+        const resource = for (state.resources) |item| {
+            if (item.kind == .dataset and std.mem.eql(u8, item.name, name)) break item;
+        } else return textResponse(ctx, 404, "dataset not found");
+        var descriptor = try retained.parse(a, resource.source_json);
+        defer descriptor.deinit();
+        if (action == .get) return retainedDatasetInfo(ctx, 200, name, descriptor.value);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset revision required");
+        if (body.len > 4096) return textResponse(ctx, 413, "close request too large");
+        const request = std.json.parseFromSliceLeaky(struct { expected_revision: u64 }, a, body, .{}) catch return textResponse(ctx, 400, "invalid dataset revision");
+        if (descriptor.value.revision != request.expected_revision or descriptor.value.phase != .active) return textResponse(ctx, 409, "dataset phase or revision changed");
+        var next = descriptor.value;
+        next.phase = .closing;
+        next.revision += 1;
+        const json = try std.json.Stringify.valueAlloc(a, next, .{});
+        const applied = source.systemCatalog(a, context, .{ .mutate = .{ .mutation = .{ .action = .set_definition, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json, .expected_dataset_revision = request.expected_revision } } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+        defer a.free(applied);
+        return retainedDatasetInfo(ctx, 202, name, next);
+    }
+
+    fn retainedDatasetInfo(ctx: *httpx.Context, code: u16, name: []const u8, descriptor: @import("antfly_local_sources").system_catalog_retained_datasets.Descriptor) !httpx.Response {
+        const summary = descriptor.definition.summary orelse return textResponse(ctx, 409, "dataset is not a summary");
+        const id = std.fmt.bytesToHex(descriptor.definition.id, .lower);
+        const retention = try std.fmt.allocPrint(ctx.allocator, "{d}", .{descriptor.definition.retention_ns});
+        const interval = try std.fmt.allocPrint(ctx.allocator, "{d}", .{summary.interval_ns});
+        return ctx.status(code).json(.{ .id = &id, .name = name, .revision = descriptor.revision, .phase = descriptor.phase, .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .retention_ns = retention, .interval_ns = interval, .origin_ns = summary.origin_ns });
+    }
+
+    pub fn queryRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*admitted| admitted.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const route = (try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path))) orelse return textResponse(ctx, 400, "invalid dataset target");
+        defer route.deinit(ctx.allocator);
+        if (route.kind != .dataset) return textResponse(ctx, 400, "invalid dataset target");
+        const name = route.name orelse return textResponse(ctx, 400, "dataset name required");
+        const logical = try system_catalog_routes.resourceNameAlloc(ctx.allocator, route);
+        defer ctx.allocator.free(logical);
+        if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset range required");
+        if (body.len > 4096) return textResponse(ctx, 413, "dataset request too large");
+        const request = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid dataset range");
+        const result = @import("retained_dataset_read.zig").queryJson(self.api_server, ctx.allocator, .{ .database = route.database, .namespace = route.namespace, .table = name }, request, operationContext(ctx, identity)) catch |err| return switch (err) {
+            error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
+            error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
+            error.RetainedSeriesResolutionMismatch, error.InvalidDatasetCoverage => textResponse(ctx, 400, @errorName(err)),
+            error.RetainedSeriesCoverageMissing, error.RetainedOwnerPlanChanged => textResponse(ctx, 409, @errorName(err)),
+            error.CatalogNotFound, error.NamespaceNotFound, error.DatabaseNotFound => textResponse(ctx, 404, @errorName(err)),
+            else => textResponse(ctx, 503, "dataset range unavailable"),
+        };
+        defer ctx.allocator.free(result);
+        if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(result);
+        return ctx.response.build();
+    }
+
+    fn internalGroupRetainedOwnerRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "retained owner read required");
+        if (body.len > 4096) return textResponse(ctx, 413, "retained owner read too large");
+        const query = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").NativeQuery, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid retained owner read");
+        const port = self.api_server.cfg.retained_owner_read orelse return textResponse(ctx, 503, "retained owner unavailable");
+        const bytes = port.readRows(ctx.allocator, params.table_name, params.group_id, query, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
+            error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
+            error.RetainedSeriesCoverageMissing, error.RetainedOwnerPlanChanged, error.RetainedSeriesSourceRevoked, error.RetainedSeriesResolutionMismatch => textResponse(ctx, 409, @errorName(err)),
+            error.InvalidRetainedOwnerPlan, error.InvalidDatasetCoverage => textResponse(ctx, 400, @errorName(err)),
+            else => textResponse(ctx, 503, "retained owner unavailable"),
+        };
+        defer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(bytes);
+        return ctx.response.build();
     }
 
     fn internalGroupRetainedOwnerControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -7964,7 +8102,8 @@ pub const AntflyApiHandler = struct {
                 const resource = try system_catalog_routes.resourceNameAlloc(ctx.allocator, destination);
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
-                    .query_source, .dataset => .table,
+                    .query_source => .table,
+                    .dataset => .dataset,
                     .graph => .graph,
                     .database => .database,
                     .namespace => .namespace,

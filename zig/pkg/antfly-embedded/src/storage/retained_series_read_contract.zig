@@ -14,11 +14,19 @@
 // limitations under the License.
 
 //! Private native retained-read admission; no physical storage dependencies.
+pub const ArchiveStart = struct {
+    sequence: u64,
+    complete_from_ns: i128,
+    closed_at_ns: i128,
+    first_key: @import("../retained_dataset_types.zig").RowKey,
+};
+
 pub const Query = struct {
     fence: @import("retained_series_control.zig").Fence,
     start_ns: i128,
     end_ns: i128,
     admitted_ns: i128,
+    archive: ?ArchiveStart = null,
 };
 pub const Request = union(enum) {
     status,

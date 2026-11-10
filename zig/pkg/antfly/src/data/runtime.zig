@@ -5569,6 +5569,13 @@ pub const DataServer = struct {
     /// thread to continue during blocking restore and catalog durability I/O.
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
+    retained_maintenance_running: std.atomic.Value(bool) = .init(false),
+    retained_maintenance_next_ns: std.atomic.Value(u64) = .init(0),
+    retained_resource_next_ns: u64 = 0,
+    retained_owner_next_ns: u64 = 0,
+    retained_resource_cursor: u64 = 0,
+    retained_owner_cursor: @import("../metadata/retained_dataset_owners.zig").Cursor = .{},
+    retained_plan_turn: bool = false,
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     leann_replication_running: std.atomic.Value(bool) = .init(false),
@@ -6693,6 +6700,174 @@ pub const DataServer = struct {
         return std.json.parseFromSliceLeaky(bool, a, raw, .{});
     }
 
+    // Dispatch only: metadata and native proposals must never block the Raft
+    // driver which advances them. Each job visits bounded indexed work and
+    // only the current source-group leader performs reconciliation.
+    fn runRetainedMaintenanceRound(self: *DataServer) !void {
+        if (self.data_raft == null or !self.store_root_registration_active.load(.acquire)) return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        const now = self.backgroundMonotonicNs();
+        if (now < self.retained_maintenance_next_ns.load(.acquire)) return;
+        if (self.retained_maintenance_running.swap(true, .acq_rel)) return;
+        errdefer self.retained_maintenance_running.store(false, .release);
+        self.retained_maintenance_next_ns.store(now +| std.time.ns_per_s, .release);
+        try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = self, .run = runRetainedMaintenanceJob, .deinit = deinitRetainedMaintenanceJob });
+    }
+    fn deinitRetainedMaintenanceJob(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.retained_maintenance_running.store(false, .release);
+    }
+    fn retainedMaintenanceLeader(self: *DataServer, group: u64) bool {
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return false;
+        return raft.host.http_host.host.isLocalLeader(group);
+    }
+    fn runRetainedMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const model = @import("../metadata/retained_dataset_owners.zig");
+        const control = antfly.public_api.retained_owner_control;
+        var budget = resource_manager_mod.BudgetedAllocator.init(&self.provisioned_storage.resource_manager, .shard_transition_working_set, self.alloc, 1);
+        defer budget.deinit();
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        // Schedule the two indexed lanes independently. Idle resources must
+        // not delay active backfill; alternating eligible lanes preserves
+        // fairness when both have work.
+        const now = self.backgroundMonotonicNs();
+        const resource_due = now >= self.retained_resource_next_ns;
+        const owner_due = now >= self.retained_owner_next_ns;
+        defer self.retained_maintenance_next_ns.store(@min(self.retained_resource_next_ns, self.retained_owner_next_ns), .release);
+        if (!resource_due and !owner_due) return;
+        self.retained_plan_turn = resource_due and (!owner_due or !self.retained_plan_turn);
+        if (self.retained_plan_turn) {
+            self.retained_resource_next_ns = now +| std.time.ns_per_s;
+            const Pending = struct { resource: @import("antfly_local_sources").system_catalog_domain.Resource, coordinator_group: u64 };
+            const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_pending = self.retained_resource_cursor });
+            const pending = (try std.json.parseFromSliceLeaky(?Pending, a, bytes, .{})) orelse {
+                self.retained_resource_next_ns = now +| 10 * std.time.ns_per_s;
+                return;
+            };
+            self.retained_resource_cursor = pending.resource.id;
+            if (!self.retainedMaintenanceLeader(pending.coordinator_group)) return;
+            const descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, pending.resource.source_json);
+            const raw = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .plan = .{ .resource = pending.resource.id, .generation = descriptor.value.definition.generation } } });
+            const plan = (try std.json.parseFromSliceLeaky(?model.Plan, a, raw, .{})) orelse return;
+            try context.ensureActive();
+            if (!self.retainedMaintenanceLeader(pending.coordinator_group)) return error.GroupLeaderUnavailable;
+            if (plan.canReleaseSource()) {
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_release = .{ .resource = plan.resource, .generation = plan.generation, .plan = plan.id, .revision = plan.revision } });
+                return;
+            }
+            if (plan.phase != .activating) return;
+            if (!plan.registration_complete) {
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_owner_register = .{ .resource = plan.resource, .generation = plan.generation, .plan = plan.id, .revision = plan.revision } });
+                self.retained_resource_next_ns = now +| 100 * std.time.ns_per_ms;
+            } else if (plan.ready == plan.registered) {
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_activate = .{ .resource = plan.resource, .generation = plan.generation, .plan = plan.id, .revision = plan.revision } });
+            }
+            return;
+        }
+        // Cheap keys avoid transferring schemas or opening owners for groups
+        // led elsewhere. The subsequent same-cut snapshot uses latest owner
+        // revision; the native actor independently validates it again.
+        self.retained_owner_next_ns = now +| std.time.ns_per_s;
+        var first: ?model.Cursor = null;
+        for (0..8) |_| {
+            try context.ensureActive();
+            const raw = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .work_key = self.retained_owner_cursor } });
+            const key = (try std.json.parseFromSliceLeaky(?model.WorkKey, a, raw, .{})) orelse {
+                self.retained_owner_next_ns = now +| 10 * std.time.ns_per_s;
+                return;
+            };
+            if (first) |seen| {
+                if (std.meta.eql(seen, key.cursor)) return;
+            } else first = key.cursor;
+            self.retained_owner_cursor = key.cursor;
+            if (!self.retainedMaintenanceLeader(key.cursor.owner_group)) continue;
+            const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .selection = key } });
+            const snapshot = try std.json.parseFromSliceLeaky(control.Snapshot, a, bytes, .{});
+            if (snapshot.plan.phase == .closing and snapshot.owner.mode == .closed and snapshot.owner.independent_receipt == null) {
+                if (self.api_server_cfg.node_config) |config| {
+                    if (config.storage.artifacts.connection != null) {
+                        if ((try self.exportRetainedOwnerPage(a, snapshot, context)) != null) {
+                            if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+                            _ = try self.status_source.systemCatalog(a, context, .{ .retained_owner_archive = .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision } });
+                        }
+                        return;
+                    }
+                }
+                continue;
+            }
+            const action: @FieldType(control.Request, "action") = switch (snapshot.plan.phase) {
+                .activating, .active => .reconcile,
+                .closing => if (snapshot.owner.mode == .closed) (if (snapshot.owner.independent_receipt != null) .revoke else continue) else .close,
+                .retiring => .revoke,
+                .closed, .retired => continue,
+            };
+            const table = snapshot.source_table orelse continue;
+            const proof = executeRetainedOwnerControl(self, a, table.name, snapshot.owner.group, .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision, .action = action }, context) catch |err| switch (err) {
+                error.RetainedSeriesNotReady => return,
+                else => return err,
+            };
+            // Maintenance ticks do not rewrite the metadata owner journal.
+            // Only a logical state transition needs a verified acknowledgement.
+            if (proof.mode != snapshot.owner.mode)
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_owner_acknowledge = proof });
+            if (snapshot.plan.phase == .activating and proof.mode == .installed)
+                self.retained_owner_next_ns = now +| 100 * std.time.ns_per_ms;
+            return;
+        }
+    }
+
+    fn exportRetainedOwnerPage(self: *DataServer, a: std.mem.Allocator, snapshot: antfly.public_api.retained_owner_control.Snapshot, context: antfly.public_api.operation.RequestContext) !?@import("../metadata/retained_dataset_owners.zig").Id {
+        const local = @import("antfly_local_sources");
+        const exported = @import("../serverless/datasets/closure_export.zig");
+        const manifest = @import("../serverless/datasets/closure_manifest.zig");
+        try context.ensureActive();
+        if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+        const closed = snapshot.owner.cut orelse return error.RetainedOwnerPlanChanged;
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        var descriptor = try local.system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+        defer descriptor.deinit();
+        const definition = descriptor.value.definition;
+        const spec = try @import("../api/retained_owner_binding.zig").specification(a, definition, snapshot.owner.partition, snapshot.owner.incarnation);
+        const cut: manifest.Cut = .{ .closure = closed.closure, .sequence = closed.sequence, .complete_from_ns = try std.fmt.parseInt(i128, closed.complete_from_ns, 10), .admitted_ns = try std.fmt.parseInt(i128, closed.admitted_ns, 10) };
+        const config = self.api_server_cfg.node_config orelse return error.InvalidDatasetBinding;
+        var archive = try @import("../serverless/datasets/configured_archive.zig").Opened.init(a, config, self.api_server_cfg.secret_store, descriptor.value, false);
+        defer archive.deinit();
+        const io = (try self.ensureBackendRuntime()).apiIo() orelse return error.BackendRuntimeUnavailable;
+        const store = archive.store(io, &context);
+        const location = archive.location();
+        store.create(definition) catch |err| switch (err) {
+            error.DatasetAlreadyExists => {},
+            else => return err,
+        };
+        const progress = (try store.getClosedExport(spec, cut)) orelse try manifest.Manifest.init(spec, cut);
+        if (progress.sealed) return try progress.receipt();
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const fence: local.storage_retained_series_control.Fence = .{ .id = spec.id, .generation = spec.generation, .definition = spec.definition, .partition = spec.source_partition, .incarnation = spec.source_incarnation };
+        const bytes = read: {
+            var reader = try owners.openRetainedRead(a, snapshot.owner.group, source.name, .{ .fence = fence, .start_ns = 0, .end_ns = 0, .admitted_ns = cut.admitted_ns, .archive = .{ .sequence = cut.sequence, .complete_from_ns = cut.complete_from_ns, .closed_at_ns = cut.admitted_ns, .first_key = progress.next } }, context);
+            defer reader.deinit();
+            break :read try reader.nextJson(a, 256, context);
+        };
+        const response = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, bytes, .{});
+        if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+        try context.ensureActive();
+        if (try exported.encode(a, definition, spec, cut, progress.next, response.page.rows, response.page.after != null, location)) |page| {
+            defer exported.deinit(a, page);
+            try exported.publish(store, spec, cut, page, location);
+            return null;
+        }
+        return try (try store.sealClosedExport(spec, cut, progress.next)).receipt();
+    }
+
     const GraphCleanupJob = struct {
         server: *DataServer,
         table: []const u8,
@@ -7048,6 +7223,7 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
         api_server_cfg.retained_owner_control = .{ .ptr = self, .execute_fn = executeRetainedOwnerControl };
+        api_server_cfg.retained_owner_read = .{ .ptr = self, .read_fn = queryRetainedOwnerRows };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -9614,6 +9790,9 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runRetainedMaintenanceRound() catch |err| {
+            std.log.warn("retained dataset dispatch deferred err={s}", .{@errorName(err)});
+        };
         self.runGroupSourceRound() catch |err| {
             std.log.warn("group source dispatch deferred err={s}", .{@errorName(err)});
         };
@@ -12014,6 +12193,42 @@ pub const DataServer = struct {
         return receipt;
     }
 
+    fn queryRetainedOwnerRows(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeQuery, input: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        var context = try input.platformDeadline();
+        try context.ensureActive();
+        context.setting_admin = true;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const local = @import("antfly_local_sources");
+        const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .owner = request.scope } });
+        if (bytes.len > 4 * 1024 * 1024) return error.CatalogCommandTooLarge;
+        const snapshot = try std.json.parseFromSliceLeaky(antfly.public_api.retained_owner_control.Snapshot, a, bytes, .{});
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        if ((snapshot.plan.phase != .active and snapshot.plan.phase != .closing) or (snapshot.owner.mode != .ready and snapshot.owner.mode != .closed) or
+            snapshot.owner.independent_receipt != null or !std.mem.eql(u8, source.name, table_name)) return error.RetainedOwnerPlanChanged;
+        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = platform_time.realtimeNs() }, context);
+        defer reader.deinit();
+        var rows: std.ArrayList(local.storage_retained_series.Bucket) = .empty;
+        var encoded_bytes: usize = 0;
+        while (true) {
+            const raw = try reader.nextJson(a, @min(128, request.limit), context);
+            if (raw.len > 6 * 1024 * 1024 - encoded_bytes) return error.DatasetPageBudgetExceeded;
+            encoded_bytes += raw.len;
+            const page = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, raw, .{});
+            if (page.page.rows.len > request.limit - rows.items.len) return error.DatasetPageBudgetExceeded;
+            try rows.appendSlice(a, page.page.rows);
+            if (page.page.after == null) break;
+            if (rows.items.len == request.limit) return error.DatasetPageBudgetExceeded;
+        }
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items }, .{});
+    }
+
     fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const series = @import("antfly_local_sources").storage_retained_series;
@@ -12063,31 +12278,42 @@ pub const DataServer = struct {
                 if (!entry.progress.closed and !entry.progress.draining) command = .{ .action = .drain, .fence = fence };
                 break;
             }
+        } else if (request.action == .revoke and !revocation.reclaimed) {
+            command = .{ .action = .purge, .fence = fence, .work_limit = 512 };
         } else if (!revocation.revoked) {
             const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
-            const entry = for (status.entries) |entry| {
+            const found: ?queries.Entry = for (status.entries) |entry| {
                 if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else null;
+            if (found) |entry| {
+                try controls.requireFence(fence, entry.binding.spec);
+                if (request.action != .drain) try @import("../api/retained_owner_binding.zig").validate(a, descriptor.value.definition, entry.binding, source.schema_json);
+                switch (request.action) {
+                    .reconcile => {
+                        var planner: controls.maintenance.Planner = .{ .next_slot = entry.progress.maintenance_next_slot };
+                        if (try planner.next(&.{.{ .spec = entry.binding.spec, .progress = entry.progress }}, platform_time.realtimeNs())) |task|
+                            command = .{ .action = switch (task.action) {
+                                .backfill => .backfill,
+                                .tick => .tick,
+                                .cleanup => .cleanup,
+                            }, .fence = fence, .expected_cursor = task.expected_cursor, .work_limit = task.work_limit };
+                    },
+                    .drain => if (!entry.progress.draining and !entry.progress.closed) {
+                        command = .{ .action = .drain, .fence = fence };
+                    },
+                    .close => if (!entry.progress.closed or entry.progress.closed_at_ns == null) {
+                        command = .{ .action = if (!entry.progress.draining and !entry.progress.closed) .drain else .close, .fence = fence };
+                    },
+                    .observe, .revoke => {},
+                }
+            } else if (request.action == .reconcile and snapshot.owner.mode == .registered) {
+                const summary = descriptor.value.definition.summary orelse return error.InvalidDatasetDefinition;
+                // Automatic capture cannot manufacture certified pre-existing
+                // event history. The initial provenance must be explicit.
+                if (summary.initial_history != .retained_source_rows) return error.RetainedSeriesCoverageMissing;
+                const binding = try @import("../api/retained_owner_binding.zig").compile(a, descriptor.value.definition, source.schema_json, snapshot.owner.partition, snapshot.owner.incarnation);
+                command = .{ .action = .install, .fence = fence, .binding = binding, .complete_from_ns = try @import("../api/retained_owner_binding.zig").minimumBucketStart(binding.spec), .expected_source_schema = lineage.schema };
             } else return error.RetainedSeriesNotReady;
-            try controls.requireFence(fence, entry.binding.spec);
-            if (request.action != .drain) try @import("../api/retained_owner_binding.zig").validate(a, descriptor.value.definition, entry.binding, source.schema_json);
-            switch (request.action) {
-                .reconcile => {
-                    var planner: controls.maintenance.Planner = .{ .next_slot = entry.progress.maintenance_next_slot };
-                    if (try planner.next(&.{.{ .spec = entry.binding.spec, .progress = entry.progress }}, platform_time.realtimeNs())) |task|
-                        command = .{ .action = switch (task.action) {
-                            .backfill => .backfill,
-                            .tick => .tick,
-                            .cleanup => .cleanup,
-                        }, .fence = fence, .expected_cursor = task.expected_cursor, .work_limit = task.work_limit };
-                },
-                .drain => if (!entry.progress.draining and !entry.progress.closed) {
-                    command = .{ .action = .drain, .fence = fence };
-                },
-                .close => if (!entry.progress.closed or entry.progress.closed_at_ns == null) {
-                    command = .{ .action = .close, .fence = fence };
-                },
-                .observe, .revoke => {},
-            }
         }
         if (command) |native| {
             try context.ensureActive();
@@ -12100,6 +12326,7 @@ pub const DataServer = struct {
             });
             revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
         }
+        if (revocation.revoked and !revocation.reclaimed) return error.RetainedSeriesNotReady;
         var mode: @import("../metadata/retained_dataset_owners.zig").Mode = .revoked;
         var cut: @import("../metadata/retained_dataset_owner_receipt.zig").Cut = .{ .sequence = 0, .complete_from_ns = 0, .admitted_ns = 0 };
         var native_root = try std.fmt.parseInt(u128, revocation.root_incarnation, 10);
@@ -58048,4 +58275,12 @@ test "retained series lifecycle rejections round trip and never discard a commit
 test "retained series native owner controller rejects malformed scope before touching its server" {
     var server: DataServer = undefined;
     try std.testing.expectError(error.InvalidRetainedOwnerPlan, DataServer.executeRetainedOwnerControl(&server, std.testing.allocator, "raw", 11, .{ .resource = 0, .generation = 1, .plan = @splat(1), .group = 11, .revision = 1 }, .{}));
+}
+
+test "retained series maintenance stops before authority IO on shutdown" {
+    var server: DataServer = undefined;
+    server.background_jobs_shutdown = .init(true);
+    try std.testing.expectError(error.Canceled, DataServer.runRetainedMaintenanceJob(&server));
+    server.data_raft = null;
+    try server.runRetainedMaintenanceRound();
 }

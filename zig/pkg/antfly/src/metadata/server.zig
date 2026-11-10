@@ -157,6 +157,7 @@ pub const MetadataServer = struct {
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
         var service_cfg = cfg.service;
+        service_cfg.retained_archive_config = cfg.api_server_cfg.node_config;
         service_cfg.internal_service_secret = cfg.api_server_cfg.internal_service_secret;
         service_cfg.internal_service_issuer = cfg.api_server_cfg.internal_service_issuer;
         const setting_authority = cfg.api_server_cfg.effectiveSettingAuthority();

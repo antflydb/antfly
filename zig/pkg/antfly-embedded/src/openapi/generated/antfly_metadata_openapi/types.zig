@@ -12792,6 +12792,46 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
+pub const RetainedDatasetInfo = struct {
+    /// Stable dataset identifier in hexadecimal.
+    id: []const u8,
+    name: []const u8,
+    revision: u64,
+    phase: []const u8,
+    initial_history: []const u8,
+    dimensions: []const []const u8,
+    measures: []const RetainedDatasetMeasure,
+    retention_ns: []const u8,
+    interval_ns: []const u8,
+    origin_ns: []const u8,
+};
+
+pub const RetainedDatasetMeasure = struct {
+    name: []const u8,
+    law: []const u8,
+    field: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("law");
+        try jw.write(self.law);
+        switch (self.field) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("field");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("field");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     context_management: ?AgentContextManagement = null,

@@ -9119,6 +9119,307 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get retained summary status
+      tags:
+        - query_operations
+      operationId: getRetainedDataset
+      responses:
+        '200':
+          description: Retained summary definition and lifecycle phase.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetInfo'
+        '403':
+          description: Dataset read permission is required.
+        '404':
+          description: Dataset not found.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Create a retained summary
+      description: Starts a background backfill of source rows that still exist. Previously expired source
+        rows are outside initial history. Requires administration permission on the dataset and source
+        table.
+      tags:
+        - query_operations
+      operationId: createRetainedDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - source
+                - timestamp
+                - interval_ns
+                - mutable_for_ns
+                - retention_ns
+                - measures
+              properties:
+                source:
+                  type: object
+                  required:
+                    - table
+                  properties:
+                    database:
+                      type: string
+                      default: default
+                    namespace:
+                      type: string
+                      default: public
+                    table:
+                      type: string
+                timestamp:
+                  type: string
+                dimensions:
+                  type: array
+                  items:
+                    type: string
+                interval_ns:
+                  type: string
+                  description: Positive bucket width in nanoseconds as a decimal string.
+                origin_ns:
+                  type: string
+                  default: '0'
+                  description: Signed UTC nanoseconds as a decimal string.
+                mutable_for_ns:
+                  type: string
+                retention_ns:
+                  type: string
+                measures:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/RetainedDatasetMeasure'
+      responses:
+        '201':
+          description: Summary accepted and awaiting activation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetInfo'
+        '400':
+          description: Invalid or unsupported summary definition.
+        '403':
+          description: Dataset and source table administration permission required.
+        '409':
+          description: The catalog changed or the dataset already exists.
+        '503':
+          description: Shared archive storage or metadata authority is unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/close:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Close and archive a retained summary
+      description: Begins asynchronous closure. The source dependency is released after all source owners
+        finish verified archive handoff.
+      tags:
+        - query_operations
+      operationId: closeRetainedDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - expected_revision
+              properties:
+                expected_revision:
+                  type: integer
+                  format: uint64
+                  minimum: 1
+                  maximum: 9007199254740991
+      responses:
+        '202':
+          description: Summary is closing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetInfo'
+        '403':
+          description: Dataset administration permission required.
+        '404':
+          description: Dataset not found.
+        '409':
+          description: The summary phase or revision changed.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Query retained summary buckets
+      description: Reads a bounded, half-open range aligned to the summary's bucket width and origin.
+        Requires read permission on the qualified dataset.
+      tags:
+        - query_operations
+      operationId: queryRetainedDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - start_ns
+                - end_ns
+              properties:
+                start_ns:
+                  type: string
+                  description: Inclusive UTC nanoseconds as a signed decimal string.
+                end_ns:
+                  type: string
+                  description: Exclusive UTC nanoseconds as a signed decimal string.
+                max_rows:
+                  type: integer
+                  minimum: 1
+                  maximum: 4096
+                  default: 4096
+      responses:
+        '200':
+          description: Summary buckets with dimensions and measures in the listed order. Count values
+            are exact decimal strings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - initial_history
+                  - dimensions
+                  - measures
+                  - rows
+                properties:
+                  initial_history:
+                    type: string
+                    enum:
+                      - certified
+                      - retained_source_rows
+                  dimensions:
+                    type: array
+                    items:
+                      type: string
+                  measures:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - name
+                        - law
+                      properties:
+                        name:
+                          type: string
+                        law:
+                          type: string
+                          enum:
+                            - count
+                            - sum
+                            - avg
+                            - min
+                            - max
+                        field:
+                          type: string
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - bucket_start_ns
+                        - dimensions
+                        - values
+                      properties:
+                        bucket_start_ns:
+                          type: string
+                        dimensions:
+                          type: array
+                          items: {}
+                        values:
+                          type: array
+                          items: {}
+        '400':
+          description: Invalid range or bucket alignment.
+        '403':
+          description: Dataset read permission is required.
+        '404':
+          description: Dataset not found.
+        '409':
+          description: Dataset coverage or owner authority changed.
+        '410':
+          description: Requested history has expired.
+        '413':
+          description: Request or result exceeds the range budget.
+        '503':
+          description: Dataset authority is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
     parameters:
       - name: databaseName
@@ -24439,6 +24740,76 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    RetainedDatasetMeasure:
+      type: object
+      required:
+        - name
+        - law
+      properties:
+        name:
+          type: string
+        law:
+          type: string
+          enum:
+            - count
+            - sum
+            - avg
+            - min
+            - max
+        field:
+          type: string
+          nullable: true
+    RetainedDatasetInfo:
+      type: object
+      required:
+        - id
+        - name
+        - revision
+        - phase
+        - initial_history
+        - dimensions
+        - measures
+        - retention_ns
+        - interval_ns
+        - origin_ns
+      properties:
+        id:
+          type: string
+          description: Stable dataset identifier in hexadecimal.
+        name:
+          type: string
+        revision:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 9007199254740991
+        phase:
+          type: string
+          enum:
+            - activating
+            - active
+            - closing
+            - closed
+            - retiring
+        initial_history:
+          type: string
+          enum:
+            - certified
+            - retained_source_rows
+        dimensions:
+          type: array
+          items:
+            type: string
+        measures:
+          type: array
+          items:
+            $ref: '#/components/schemas/RetainedDatasetMeasure'
+        retention_ns:
+          type: string
+        interval_ns:
+          type: string
+        origin_ns:
+          type: string
     PrivacyProducer:
       type: object
       additionalProperties: false
@@ -39079,6 +39450,7 @@ components:
         - namespace
         - tablespace
         - graph
+        - dataset
         - user
         - inference
         - '*'

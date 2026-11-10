@@ -21,17 +21,24 @@ const capture = @import("retained_series_capture.zig");
 const A = std.mem.Allocator;
 pub const Fence = @import("retained_series_revocation.zig").Fence;
 pub const Command = struct {
-    action: enum { install, backfill, tick, cleanup, close, revoke, drain },
+    action: enum { install, backfill, tick, cleanup, close, revoke, drain, purge },
     fence: Fence,
     binding: ?capture.Binding = null,
     complete_from_ns: i128 = 0,
+    expected_source_schema: ?series.Id = null,
     expected_cursor: []const u8 = "",
     work_limit: u16 = 128,
 
+    pub fn jsonStringify(self: Command, writer: anytype) !void {
+        const t = @import("../retained_dataset_types.zig");
+        if (self.expected_source_schema == null) return t.writeFieldsOmitting(self, .{}, .{"expected_source_schema"}, writer);
+        try t.writeFields(self, .{}, writer);
+    }
     pub fn validate(self: Command) !void {
         if (self.fence.generation == 0 or self.fence.incarnation == 0 or self.work_limit == 0 or self.work_limit > series.max_changes or self.expected_cursor.len > 16384 or
             std.mem.allEqual(u8, &self.fence.id, 0) or std.mem.allEqual(u8, &self.fence.definition, 0) or std.mem.allEqual(u8, &self.fence.partition, 0)) return error.InvalidRetainedSeries;
         if ((self.action == .install) != (self.binding != null)) return error.InvalidRetainedSeries;
+        if (self.expected_source_schema) |digest| if (self.action != .install or std.mem.allEqual(u8, &digest, 0)) return error.InvalidRetainedSeries;
         if (self.binding) |binding| {
             try binding.validate();
             try requireFence(self.fence, binding.spec);
@@ -92,6 +99,15 @@ pub fn validateRequest(req: anytype) !void {
 pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitted_ns: i128) !void {
     try command.validate();
     if (command.action == .install) {
+        if (command.expected_source_schema) |expected| {
+            const current = txn.get(@import("internal_keys.zig").public_schema_json_key) catch |err| switch (err) {
+                error.NotFound => "",
+                else => return err,
+            };
+            var actual: series.Id = undefined;
+            std.crypto.hash.sha2.Sha256.hash(current, &actual, .{});
+            if (!std.mem.eql(u8, &expected, &actual)) return error.RetainedSeriesDefinitionMismatch;
+        }
         try capture.install(a, txn, command.binding.?, .{ .sequence = source_sequence, .admitted_ns = admitted_ns }, command.complete_from_ns);
         return;
     }
@@ -99,6 +115,7 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
         try capture.revokeBinding(a, txn, command.fence, admitted_ns);
         return;
     }
+    if (command.action == .purge) return capture.purgeRevokedBinding(a, txn, command.fence, command.work_limit);
     const bindings = try capture.load(a, txn);
     const spec = for (bindings) |binding| {
         if (std.mem.eql(u8, &binding.spec.id, &command.fence.id) and binding.spec.generation == command.fence.generation) break binding.spec;
@@ -106,7 +123,7 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
     try requireFence(command.fence, spec);
     const engine = series.Engine{ .alloc = a, .spec = spec };
     switch (command.action) {
-        .install, .revoke => unreachable,
+        .install, .revoke, .purge => unreachable,
         .backfill => _ = try capture.backfillPage(a, txn, spec.id, spec.generation, command.expected_cursor, command.work_limit),
         .tick => _ = try engine.tick(txn, admitted_ns, command.work_limit),
         .cleanup => _ = try engine.cleanupBackfill(txn, command.work_limit),

@@ -2488,6 +2488,7 @@ pub const MetadataServiceConfig = struct {
     // Embedded services may cohost data; dedicated metadata runtimes opt out.
     local_data_owner: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    retained_archive_config: ?*const @import("antfly_local_sources").common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -3585,6 +3586,8 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => {},
     }
+    if (command == .activate_retained_dataset) return metadata_topology_protocol.retained_datasets_version;
+    if (command == .acknowledge_retained_archive or command == .release_retained_source) return metadata_topology_protocol.retained_archive_acknowledgements_version;
     if (command == .acknowledge_retained_owner) return metadata_topology_protocol.retained_owner_acknowledgements_version;
     if (command == .register_retained_owners) return metadata_topology_protocol.retained_datasets_version;
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
@@ -8810,6 +8813,7 @@ pub const MetadataHttpService = struct {
     // state.
     cdc_snapshot_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
     cdc_streaming_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
+    retained_archive_config: ?*const @import("antfly_local_sources").common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -8875,6 +8879,7 @@ pub const MetadataHttpService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
+            .retained_archive_config = cfg.retained_archive_config,
             .secret_store = cfg.secret_store,
             .internal_service_secret = cfg.internal_service_secret,
             .internal_service_issuer = cfg.internal_service_issuer,

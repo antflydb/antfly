@@ -20,7 +20,7 @@ const std = @import("std");
 const model = @import("retained_dataset_owners.zig");
 const A = std.mem.Allocator;
 pub const Cursor = model.Cursor;
-pub const WorkKey = struct { cursor: Cursor, plan: model.Id };
+pub const WorkKey = model.WorkKey;
 pub const root_limit = 16 * 1024;
 pub const owner_limit = 4096;
 const roots = "\x00\x00__metadata__:retained_owner_plan_v1:";
@@ -79,6 +79,32 @@ pub fn getOwner(a: A, txn: anytype, metadata_group: u64, plan: model.Id, owner_g
     if (!std.mem.eql(u8, &parsed.value.plan, &plan) or parsed.value.group != owner_group) return error.InvalidRetainedOwnerPlan;
     return parsed;
 }
+/// Read the exact frozen membership in key order at the caller's metadata
+/// snapshot. The caller owns the result and must supply an arena allocator.
+pub fn readOwners(a: A, txn: anytype, metadata_group: u64, plan: model.Plan) ![]const model.Owner {
+    try plan.validate();
+    var buffer: [192]u8 = undefined;
+    const first = try ownerKey(&buffer, metadata_group, plan.id, 0);
+    const owner_prefix = first[0 .. first.len - 16];
+    const result = try a.alloc(model.Owner, plan.registered);
+    var count: usize = 0;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(owner_prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, owner_prefix)) break;
+        if (count == result.len or item.value.len > owner_limit or item.key.len != first.len) return error.InvalidRetainedOwnerPlan;
+        const group = std.fmt.parseInt(u64, item.key[owner_prefix.len..], 16) catch return error.InvalidRetainedOwnerPlan;
+        const owner = try std.json.parseFromSliceLeaky(model.Owner, a, item.value, .{ .allocate = .alloc_always });
+        try owner.validate();
+        if (!std.mem.eql(u8, &owner.plan, &plan.id) or owner.group != group) return error.InvalidRetainedOwnerPlan;
+        result[count] = owner;
+        count += 1;
+    }
+    if (count != result.len) return error.InvalidRetainedOwnerPlan;
+    return result;
+}
+
 fn savePlan(a: A, txn: anytype, metadata_group: u64, plan: model.Plan) !void {
     try plan.validate();
     const bytes = try std.json.Stringify.valueAlloc(a, plan, .{});

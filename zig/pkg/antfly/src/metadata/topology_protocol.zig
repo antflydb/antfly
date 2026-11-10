@@ -119,9 +119,13 @@ const std = @import("std");
 /// Version 85 owns independent retained dataset resources and source/work indexes.
 /// Version 86 journals native retained owners before activation and requires
 /// verified journal progress before source release or producer collection.
-pub const current_version: u16 = 87;
+/// Version 87 verifies signed observations against current store enrollment.
+/// Version 88 distinguishes snapshot-origin summaries from certified history.
+/// Version 89 verifies archive authority and atomically releases sources.
+pub const current_version: u16 = 89;
+pub const retained_archive_acknowledgements_version: u16 = 89;
 pub const retained_owner_acknowledgements_version: u16 = 87;
-pub const retained_datasets_version: u16 = 86;
+pub const retained_datasets_version: u16 = 88;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;

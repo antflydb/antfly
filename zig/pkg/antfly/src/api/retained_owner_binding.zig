@@ -49,6 +49,58 @@ fn dimensionType(properties: []const public_schema.DocumentProperty, reference: 
     };
 }
 
+pub fn specification(a: A, definition: t.Definition, partition: t.Id, incarnation: u64) !local.storage_retained_series.Spec {
+    try definition.validate();
+    const summary = definition.summary orelse return error.InvalidDatasetDefinition;
+    const laws = try a.alloc(t.Law, summary.measures.len);
+    const flags = try a.alloc(bool, summary.measures.len);
+    var nonnull_count = false;
+    for (summary.measures, laws, flags) |measure, *law, *flag| {
+        law.* = measure.law;
+        flag.* = measure.law == .count and measure.field != null;
+        nonnull_count = nonnull_count or flag.*;
+    }
+    const spec: local.storage_retained_series.Spec = .{ .id = definition.id, .generation = definition.generation, .definition = try definition.fingerprint(a), .source_partition = partition, .source_incarnation = incarnation, .interval_ns = summary.interval_ns, .origin_ns = try std.fmt.parseInt(i128, summary.origin_ns, 10), .mutable_for_ns = summary.mutable_for_ns, .retention_ns = definition.retention_ns, .laws = laws, .count_nonnull = if (nonnull_count) flags else &.{} };
+    try spec.validate();
+    return spec;
+}
+
+/// First representable aligned bucket in the existing checked i128 bin domain.
+/// Widen intermediate calculations so extreme origins do not overflow while
+/// choosing a boundary. This is a data-domain bound, not a historical claim.
+pub fn minimumBucketStart(spec: local.storage_retained_series.Spec) !i128 {
+    try spec.validate();
+    const minimum: i256 = std.math.minInt(i128);
+    const origin: i256 = spec.origin_ns;
+    const interval: i256 = spec.interval_ns;
+    const offset_floor = @max(minimum, minimum - origin);
+    const offset = -@divFloor(-offset_floor, interval) * interval;
+    const start = std.math.cast(i128, origin + offset) orelse return error.RetainedSeriesTimeOverflow;
+    if (try spec.bucket(start) != start) return error.RetainedSeriesTimeOverflow;
+    return start;
+}
+
+pub fn compile(a: A, definition: t.Definition, source_json: []const u8, partition: t.Id, incarnation: u64) !capture.Binding {
+    const spec = try specification(a, definition, partition, incarnation);
+    const summary = definition.summary.?;
+    const inputs = try a.alloc(?[]const u8, summary.measures.len);
+    for (summary.measures, inputs) |measure, *field| field.* = measure.field;
+    const dimension_types = try a.alloc(capture.DimensionType, summary.dimensions.len);
+    if (summary.dimensions.len != 0) {
+        var schema = try public_schema.parseValidatedTableSchema(a, source_json);
+        defer schema.deinit(a);
+        if (schema.document_schemas.len == 0) return error.RetainedSeriesDefinitionMismatch;
+        for (summary.dimensions, dimension_types, 0..) |name, *kind, i| {
+            const reference: Reference = if (summary.projection) |projection| projection.dimensions[i] else .{ .column = name };
+            kind.* = try dimensionType(schema.document_schemas[0].properties, reference);
+            for (schema.document_schemas[1..]) |document| if (try dimensionType(document.properties, reference) != kind.*) return error.RetainedSeriesDefinitionMismatch;
+        }
+    }
+    const binding: capture.Binding = .{ .spec = spec, .timestamp = summary.timestamp, .dimensions = summary.dimensions, .dimension_types = dimension_types, .fields = inputs, .compiled = summary.projection };
+    try validate(a, definition, binding, source_json);
+    return binding;
+}
+
 pub fn validate(a: A, definition: t.Definition, binding: capture.Binding, source_json: []const u8) !void {
     try definition.validate();
     try binding.validate();
@@ -111,4 +163,35 @@ test "retained owner native controls reject mismatched extraction programs despi
     wrong = binding;
     wrong.spec.definition = try filtered.fingerprint(a);
     try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, validate(a, filtered, wrong, "{}"));
+}
+
+test "retained owner native controls compile snapshot history without changing legacy definition fingerprints" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var schema: t.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const old: t.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(2), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = @splat(3), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } };
+    const old_json = try std.json.Stringify.valueAlloc(temp, old, .{});
+    try std.testing.expect(std.mem.indexOf(u8, old_json, "initial_history") == null);
+    var snapshot = old;
+    snapshot.format = 2;
+    snapshot.summary.?.initial_history = .retained_source_rows;
+    const json = try std.json.Stringify.valueAlloc(temp, snapshot, .{});
+    var parsed = try std.json.parseFromSlice(t.Definition, a, json, .{});
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try std.testing.expectEqual(t.InitialHistory.retained_source_rows, parsed.value.summary.?.initial_history);
+    try std.testing.expect(!std.mem.eql(u8, &try old.fingerprint(temp), &try snapshot.fingerprint(temp)));
+    const binding = try compile(temp, snapshot, "{}", @splat(4), 1);
+    try std.testing.expectEqual(@as(usize, 0), binding.spec.count_nonnull.len);
+    for ([_]i128{ 0, -1, std.math.minInt(i128), std.math.maxInt(i128) }) |origin| {
+        var spec = binding.spec;
+        spec.origin_ns = origin;
+        const first = try minimumBucketStart(spec);
+        try std.testing.expectEqual(first, try spec.bucket(first));
+    }
+    snapshot.format = 1;
+    try std.testing.expectError(error.InvalidDatasetDefinition, snapshot.validate());
 }

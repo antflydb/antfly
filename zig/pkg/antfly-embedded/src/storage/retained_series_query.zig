@@ -23,7 +23,7 @@ const contract = @import("retained_series_read_contract.zig");
 const A = std.mem.Allocator;
 pub const Entry = struct { binding: capture.Binding, progress: series.Progress };
 pub const Status = struct { root_incarnation: []const u8, entries: []const Entry };
-pub const Revocation = struct { root_incarnation: []const u8, fence: control.Fence, revoked: bool };
+pub const Revocation = struct { root_incarnation: []const u8, fence: control.Fence, revoked: bool, reclaimed: bool = false };
 pub const Replay = struct { root_incarnation: []const u8, cursor: series.Cursor, frames: []const series.Frame };
 pub const max_response_bytes = 6 * 1024 * 1024;
 
@@ -34,7 +34,16 @@ pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract
     const root = try std.fmt.allocPrint(temp, "{d}", .{root_incarnation});
     const bindings: []const capture.Binding = if (request == .revocation) &.{} else try capture.load(temp, txn);
     const response = switch (request) {
-        .revocation => |fence| try std.json.Stringify.valueAlloc(a, Revocation{ .root_incarnation = root, .fence = fence, .revoked = try @import("retained_series_revocation.zig").isRevoked(txn, fence) }, .{}),
+        .revocation => |fence| result: {
+            const revoked = try @import("retained_series_revocation.zig").isRevoked(txn, fence);
+            const reclaimed = if (revoked) for (try capture.load(temp, txn)) |binding| {
+                if (std.mem.eql(u8, &binding.spec.id, &fence.id) and binding.spec.generation == fence.generation) {
+                    try control.requireFence(fence, binding.spec);
+                    break false;
+                }
+            } else true else false;
+            break :result try std.json.Stringify.valueAlloc(a, Revocation{ .root_incarnation = root, .fence = fence, .revoked = revoked, .reclaimed = reclaimed }, .{});
+        },
         .status => result: {
             const entries = try temp.alloc(Entry, bindings.len);
             for (bindings, entries) |binding, *entry| entry.* = .{ .binding = binding, .progress = try (series.Engine{ .alloc = a, .spec = binding.spec }).status(temp, txn) };

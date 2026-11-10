@@ -2182,6 +2182,18 @@ pub fn metadataApplyStoreProjection(
                     handle.store.validateRetainedOwnerReceipt(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
                 },
+                .retained_source_candidate => |input| {
+                    const value = handle.store.retainedSourceCandidateJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_dataset_read_cut => |input| {
+                    const value = handle.store.retainedDatasetReadCutJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_dataset_pending => |input| {
+                    const value = handle.store.retainedDatasetPendingJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .retained_owner_read => |input| {
                     const value = handle.store.retainedOwnerReadJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

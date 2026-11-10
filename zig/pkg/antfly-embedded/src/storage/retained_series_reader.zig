@@ -50,11 +50,14 @@ pub const Session = struct {
             if (std.mem.eql(u8, &binding.spec.id, &query.fence.id) and binding.spec.generation == query.fence.generation) break binding.spec;
         } else return error.RetainedSeriesDefinitionMismatch;
         try control.requireFence(query.fence, spec);
-        if (query.start_ns >= query.end_ns or try spec.bucket(query.start_ns) != query.start_ns or try spec.bucket(query.end_ns) != query.end_ns) return error.RetainedSeriesResolutionMismatch;
         const engine = series.Engine{ .alloc = a, .spec = spec };
         const cursor = try engine.snapshotCursor(&txn);
         // Validate coverage, readiness and logical expiry even for empty reads.
-        _ = try engine.scan(temp, &txn, query.start_ns, query.end_ns, query.admitted_ns, null, 1);
+        if (query.archive) |archive| {
+            _ = try engine.scanArchive(temp, &txn, archive, null, 1);
+        } else {
+            _ = try engine.scan(temp, &txn, query.start_ns, query.end_ns, query.admitted_ns, null, 1);
+        }
         const self = try a.create(Session);
         self.* = .{ .alloc = a, .definition_arena = arena, .page_arena = std.heap.ArenaAllocator.init(a), .txn = txn, .spec = spec, .query = query, .root_incarnation = root_incarnation, .expires_at_ns = @import("antfly_platform").time.monotonicNs() +| (60 * std.time.ns_per_s), .cursor = cursor };
         return self;
@@ -68,7 +71,10 @@ pub const Session = struct {
         _ = self.page_arena.reset(.retain_capacity);
         if (self.done) return .{ .rows = &.{}, .after = null, .cursor = self.cursor };
         const engine = series.Engine{ .alloc = self.alloc, .spec = self.spec };
-        const page = try engine.scan(self.page_arena.allocator(), &self.txn, self.query.start_ns, self.query.end_ns, self.query.admitted_ns, self.after, limit);
+        const page = if (self.query.archive) |archive|
+            try engine.scanArchive(self.page_arena.allocator(), &self.txn, archive, self.after, limit)
+        else
+            try engine.scan(self.page_arena.allocator(), &self.txn, self.query.start_ns, self.query.end_ns, self.query.admitted_ns, self.after, limit);
         if (!std.meta.eql(page.cursor, self.cursor)) return error.RetainedSeriesResetRequired;
         const after = if (page.after) |value| try self.alloc.dupe(u8, value) else null;
         if (self.after) |value| self.alloc.free(value);

@@ -168,6 +168,7 @@ from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
+from .close_retained_dataset_body import CloseRetainedDatasetBody
 from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
 from .cloudflare_embedder_config import CloudflareEmbedderConfig
 from .cloudflare_embedder_config_provider import CloudflareEmbedderConfigProvider
@@ -240,6 +241,8 @@ from .create_index_common import CreateIndexCommon
 from .create_query_source_body import CreateQuerySourceBody
 from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
+from .create_retained_dataset_body import CreateRetainedDatasetBody
+from .create_retained_dataset_body_source import CreateRetainedDatasetBodySource
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_table_storage_migration_body import CreateTableStorageMigrationBody
@@ -2226,6 +2229,12 @@ from .query_result_base_analyses import QueryResultBaseAnalyses
 from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 from .query_result_base_source_ranking import QueryResultBaseSourceRanking
+from .query_retained_dataset_body import QueryRetainedDatasetBody
+from .query_retained_dataset_response_200 import QueryRetainedDatasetResponse200
+from .query_retained_dataset_response_200_initial_history import QueryRetainedDatasetResponse200InitialHistory
+from .query_retained_dataset_response_200_measures_item import QueryRetainedDatasetResponse200MeasuresItem
+from .query_retained_dataset_response_200_measures_item_law import QueryRetainedDatasetResponse200MeasuresItemLaw
+from .query_retained_dataset_response_200_rows_item import QueryRetainedDatasetResponse200RowsItem
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
@@ -2394,6 +2403,11 @@ from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
 from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
 from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
+from .retained_dataset_info import RetainedDatasetInfo
+from .retained_dataset_info_initial_history import RetainedDatasetInfoInitialHistory
+from .retained_dataset_info_phase import RetainedDatasetInfoPhase
+from .retained_dataset_measure import RetainedDatasetMeasure
+from .retained_dataset_measure_law import RetainedDatasetMeasureLaw
 from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -2863,6 +2877,7 @@ __all__ = (
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
+    "CloseRetainedDatasetBody",
     "CloseSQLConnectionResponse200",
     "CloudflareEmbedderConfig",
     "CloudflareEmbedderConfigProvider",
@@ -2957,6 +2972,8 @@ __all__ = (
     "CreateQuerySourceBody",
     "CreateRelationalIndexRequest",
     "CreateRelationalIndexRequestType",
+    "CreateRetainedDatasetBody",
+    "CreateRetainedDatasetBodySource",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateTablespaceRequest",
@@ -4697,6 +4714,12 @@ __all__ = (
     "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
     "QueryResultBaseSourceRanking",
+    "QueryRetainedDatasetBody",
+    "QueryRetainedDatasetResponse200",
+    "QueryRetainedDatasetResponse200InitialHistory",
+    "QueryRetainedDatasetResponse200MeasuresItem",
+    "QueryRetainedDatasetResponse200MeasuresItemLaw",
+    "QueryRetainedDatasetResponse200RowsItem",
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
@@ -4865,6 +4888,11 @@ __all__ = (
     "RestoreRequest",
     "ResultExtractDocumentJobResponse200",
     "ResultReadDocumentJobResponse200",
+    "RetainedDatasetInfo",
+    "RetainedDatasetInfoInitialHistory",
+    "RetainedDatasetInfoPhase",
+    "RetainedDatasetMeasure",
+    "RetainedDatasetMeasureLaw",
     "RetrievalAgentRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",

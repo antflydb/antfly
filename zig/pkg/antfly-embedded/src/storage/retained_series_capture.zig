@@ -138,7 +138,7 @@ pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_
     try @import("retained_series_revocation.zig").requireInstall(txn, .{ .id = binding.spec.id, .generation = binding.spec.generation, .definition = binding.spec.definition, .partition = binding.spec.source_partition, .incarnation = binding.spec.source_incarnation });
     const previous = try load(a, txn);
     if (previous.len == max_bindings) return error.RetainedSeriesBatchTooLarge;
-    var latest: u64 = 0;
+    var latest = try @import("retained_series_revocation.zig").latestRevoked(txn, binding.spec.id, binding.spec.source_partition);
     for (previous) |old| if (std.mem.eql(u8, &old.spec.id, &binding.spec.id)) {
         if (!old.closed or old.spec.generation >= binding.spec.generation) return error.RetainedSeriesAlreadyExists;
         latest = @max(latest, old.spec.generation);
@@ -181,6 +181,27 @@ pub fn revokeBinding(a: A, txn: anytype, fence: @import("retained_series_revocat
         if (active) try txn.put(active_key, "1") else try txn.delete(active_key);
     }
     try @import("retained_series_revocation.zig").stage(txn, fence);
+}
+
+pub fn purgeRevokedBinding(a: A, txn: anytype, fence: @import("retained_series_revocation.zig").Fence, limit: usize) !void {
+    const revocations = @import("retained_series_revocation.zig");
+    if (!try revocations.isRevoked(txn, fence)) return error.RetainedSeriesNotReady;
+    const bindings = try load(a, txn);
+    const index = for (bindings, 0..) |binding, i| {
+        if (std.mem.eql(u8, &binding.spec.id, &fence.id) and binding.spec.generation == fence.generation) break i;
+    } else return;
+    const binding = bindings[index];
+    if (!binding.closed or !std.mem.eql(u8, &binding.spec.definition, &fence.definition) or
+        !std.mem.eql(u8, &binding.spec.source_partition, &fence.partition) or binding.spec.source_incarnation != fence.incarnation) return error.RetainedSeriesDefinitionMismatch;
+    if (!try (series.Engine{ .alloc = a, .spec = binding.spec }).purgeRevoked(a, txn, limit)) return;
+    try revocations.stage(txn, fence);
+    const remaining = try std.mem.concat(a, Binding, &.{ bindings[0..index], bindings[index + 1 ..] });
+    if (remaining.len == 0) {
+        try txn.delete(registry_key);
+        try txn.delete(active_key);
+    } else {
+        try txn.put(registry_key, try std.json.Stringify.valueAlloc(a, remaining, .{}));
+    }
 }
 
 pub fn closeBinding(a: A, txn: anytype, id: series.Id, generation: u64, admitted_ns: i128) !void {
@@ -1024,6 +1045,31 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     defer old_reader.close();
     const old_page = try old_reader.next(10);
     try std.testing.expectEqual(@as(?f64, 3), old_page.rows[0].metrics[1].value(.sum));
+    {
+        const archive_cut = try (try (series.Engine{ .alloc = a, .spec = binding.spec }).status(alloc, &old_reader.txn)).closureCut();
+        var query: @import("retained_series_read_contract.zig").Query = .{
+            .fence = fence,
+            .start_ns = 0,
+            .end_ns = 0,
+            .admitted_ns = archive_cut.admitted_ns,
+            .archive = .{ .sequence = archive_cut.sequence, .complete_from_ns = archive_cut.complete_from_ns, .closed_at_ns = archive_cut.admitted_ns, .first_key = @import("retained_series_archive.zig").key(old_page.rows[0]) },
+        };
+        const export_read = try db.openRetainedSeriesRead(a, query);
+        defer export_read.close();
+        try std.testing.expectEqual(@as(usize, 1), (try export_read.next(1)).rows.len);
+        query.archive.?.first_key = @import("../retained_dataset_types.zig").rowKey(10, @splat(0));
+        const future_read = try db.openRetainedSeriesRead(a, query);
+        defer future_read.close();
+        const future = try future_read.next(10);
+        try std.testing.expect(future.rows.len != 0 and future.after == null);
+        const last = future.rows[future.rows.len - 1].start_ns;
+        query.archive.?.first_key = @import("../retained_dataset_types.zig").rowKey(last + binding.spec.interval_ns, @splat(0));
+        const tail_read = try db.openRetainedSeriesRead(a, query);
+        defer tail_read.close();
+        try std.testing.expectEqual(@as(usize, 0), (try tail_read.next(1)).rows.len);
+        query.archive.?.sequence += 1;
+        try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, db.openRetainedSeriesRead(a, query));
+    }
     const new_reader = try db.openRetainedSeriesRead(a, .{ .fence = next_fence, .start_ns = 270, .end_ns = 280, .admitted_ns = 268 });
     defer new_reader.close();
     const new_page = try new_reader.next(10);
@@ -1033,6 +1079,20 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     try db.batch(.{ .timestamp_ns = 269, .retained_series = .{ .action = .revoke, .fence = next_fence } });
     try db.batch(.{ .timestamp_ns = 270, .retained_series = .{ .action = .revoke, .fence = next_fence } });
     try std.testing.expect(!try db.core.store.retainedSeriesActive());
+    const query = @import("retained_series_query.zig");
+    for (0..64) |_| {
+        const raw = try db.queryRetainedSeriesJson(a, .{ .revocation = next_fence });
+        defer a.free(raw);
+        var revocation_status = try std.json.parseFromSlice(query.Revocation, a, raw, .{});
+        defer revocation_status.deinit();
+        try std.testing.expect(revocation_status.value.revoked);
+        if (revocation_status.value.reclaimed) break;
+        try db.batch(.{ .timestamp_ns = 270, .retained_series = .{ .action = .purge, .fence = next_fence, .work_limit = 1 } });
+    } else return error.TestExpectedReclaimedOwner;
+    // Existing admitted readers hold their own immutable cut and survive
+    // physical reclamation. The sibling producer remains installed.
+    try std.testing.expectEqual(@as(?f64, 5), new_page.rows[0].metrics[1].value(.sum));
+    try std.testing.expect(try db.core.store.retainedSeriesPresent());
     try std.testing.expectError(error.RetainedSeriesSourceRevoked, db.batch(.{ .timestamp_ns = 271, .retained_series = .{ .action = .install, .fence = next_fence, .binding = next, .complete_from_ns = 260 } }));
     var cancelled = next;
     cancelled.spec.generation = 3;

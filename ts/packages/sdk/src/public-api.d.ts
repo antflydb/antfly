@@ -3010,6 +3010,79 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        /** Get retained summary status */
+        get: operations["getRetainedDataset"];
+        put?: never;
+        /**
+         * Create a retained summary
+         * @description Starts a background backfill of source rows that still exist. Previously expired source rows are outside initial history. Requires administration permission on the dataset and source table.
+         */
+        post: operations["createRetainedDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Close and archive a retained summary
+         * @description Begins asynchronous closure. The source dependency is released after all source owners finish verified archive handoff.
+         */
+        post: operations["closeRetainedDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query retained summary buckets
+         * @description Reads a bounded, half-open range aligned to the summary's bucket width and origin. Requires read permission on the qualified dataset.
+         */
+        post: operations["queryRetainedDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query": {
         parameters: {
             query?: never;
@@ -7290,6 +7363,28 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        RetainedDatasetMeasure: {
+            name: string;
+            /** @enum {string} */
+            law: "count" | "sum" | "avg" | "min" | "max";
+            field?: string | null;
+        };
+        RetainedDatasetInfo: {
+            /** @description Stable dataset identifier in hexadecimal. */
+            id: string;
+            name: string;
+            /** Format: uint64 */
+            revision: number;
+            /** @enum {string} */
+            phase: "activating" | "active" | "closing" | "closed" | "retiring";
+            /** @enum {string} */
+            initial_history: "certified" | "retained_source_rows";
+            dimensions: string[];
+            measures: components["schemas"]["RetainedDatasetMeasure"][];
+            retention_ns: string;
+            interval_ns: string;
+            origin_ns: string;
+        };
         PrivacyProducer: {
             /** @enum {string} */
             type: "extractor" | "generator";
@@ -15829,7 +15924,7 @@ export interface components {
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "user" | "inference" | "*";
+        ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "dataset" | "user" | "inference" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -38512,6 +38607,271 @@ export interface operations {
             404: components["responses"]["NotFound"];
             /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retained summary definition and lifecycle phase. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetInfo"];
+                };
+            };
+            /** @description Dataset read permission is required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    source: {
+                        /** @default default */
+                        database?: string;
+                        /** @default public */
+                        namespace?: string;
+                        table: string;
+                    };
+                    timestamp: string;
+                    dimensions?: string[];
+                    /** @description Positive bucket width in nanoseconds as a decimal string. */
+                    interval_ns: string;
+                    /**
+                     * @description Signed UTC nanoseconds as a decimal string.
+                     * @default 0
+                     */
+                    origin_ns?: string;
+                    mutable_for_ns: string;
+                    retention_ns: string;
+                    measures: components["schemas"]["RetainedDatasetMeasure"][];
+                };
+            };
+        };
+        responses: {
+            /** @description Summary accepted and awaiting activation. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetInfo"];
+                };
+            };
+            /** @description Invalid or unsupported summary definition. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset and source table administration permission required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The catalog changed or the dataset already exists. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Shared archive storage or metadata authority is unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    closeRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Format: uint64 */
+                    expected_revision: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Summary is closing. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetInfo"];
+                };
+            };
+            /** @description Dataset administration permission required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The summary phase or revision changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Inclusive UTC nanoseconds as a signed decimal string. */
+                    start_ns: string;
+                    /** @description Exclusive UTC nanoseconds as a signed decimal string. */
+                    end_ns: string;
+                    /** @default 4096 */
+                    max_rows?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Summary buckets with dimensions and measures in the listed order. Count values are exact decimal strings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        initial_history: "certified" | "retained_source_rows";
+                        dimensions: string[];
+                        measures: {
+                            name: string;
+                            /** @enum {string} */
+                            law: "count" | "sum" | "avg" | "min" | "max";
+                            field?: string;
+                        }[];
+                        rows: {
+                            bucket_start_ns: string;
+                            dimensions: unknown[];
+                            values: unknown[];
+                        }[];
+                    };
+                };
+            };
+            /** @description Invalid range or bucket alignment. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission is required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset coverage or owner authority changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Requested history has expired. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request or result exceeds the range budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset authority is temporarily unavailable. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -860,6 +860,39 @@ pub const ApiHttpClient = struct {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
     }
 
+    pub fn fetchRetainedOwnerRows(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, request: @import("retained_dataset_read.zig").NativeQuery, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, encoded_name, routes.Routes.retained_owner_read_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Forbidden,
+            410 => return error.RetainedSeriesHistoryExpired,
+            413 => return error.DatasetPageBudgetExceeded,
+            409 => {
+                if (std.mem.eql(u8, response.body, "RetainedSeriesCoverageMissing")) return error.RetainedSeriesCoverageMissing;
+                if (std.mem.eql(u8, response.body, "RetainedSeriesResolutionMismatch")) return error.RetainedSeriesResolutionMismatch;
+                return error.RetainedOwnerPlanChanged;
+            },
+            else => return error.RetainedSeriesNotReady,
+        }
+        if (response.body.len > 6 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
+        try context.ensureActive();
+        return self.alloc.dupe(u8, response.body);
+    }
+
     pub fn fetchRetainedOwnerControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("retained_owner_control.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) !@import("retained_owner_control.zig").Response {
         const context = try input.platformDeadline();
         try context.ensureActive();
