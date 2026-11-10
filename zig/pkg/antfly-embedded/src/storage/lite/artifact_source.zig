@@ -660,6 +660,19 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
 pub const MarkerSweep = struct {
     iterator: ?std.Io.Dir.Iterator = null,
     publication_guard: ?std.Io.File = null,
+    /// When a fresh sweep (`iterator == null`) last ran, or `0` if it never
+    /// has. `run` is driven by `Store.maintainOnceWithCancel`'s maintenance
+    /// loop, which wakes and calls it again on essentially every write
+    /// (measured: ~4/write in the write-amplification CPU harness's
+    /// attribution test, almost entirely this lock/unlock pair) even though
+    /// nothing has changed in the directory since the last pass -- crash-
+    /// leftover markers are inherently rare, so reaping them promptly on
+    /// every single tick buys nothing a bounded delay would not also give.
+    /// `sweep_min_interval_ns` throttles *starting a new* pass; a pass
+    /// already mid-walk (`iterator != null`, more than 64 entries) is never
+    /// throttled, since abandoning that would restart the scan from the
+    /// beginning next time instead of making bounded progress through it.
+    last_run_ns: i128 = 0,
 
     fn resetIterator(self: *MarkerSweep, runtime: std.Io) void {
         if (self.iterator) |it| it.reader.dir.close(runtime);
@@ -671,8 +684,20 @@ pub const MarkerSweep = struct {
         self.publication_guard = null;
     }
 
+    /// How often a fresh sweep may start; see `last_run_ns`'s doc comment.
+    /// A second is still far more prompt than crash-leftover markers need
+    /// to be reaped (they only accumulate from a crash mid-rename, not
+    /// normal operation), while turning ~4 flock()/write from a tight
+    /// write loop's own maintenance wake-ups into effectively zero.
+    const sweep_min_interval_ns: i128 = 1 * std.time.ns_per_s;
+
     pub fn run(self: *MarkerSweep, file: *native.NativeFile) !void {
         const runtime = file.runtime();
+        if (self.iterator == null) {
+            const now = std.Io.Clock.awake.now(runtime).nanoseconds;
+            if (self.last_run_ns != 0 and now - self.last_run_ns < sweep_min_interval_ns) return;
+            self.last_run_ns = now;
+        }
         if (self.publication_guard == null) self.publication_guard = try openPublicationGuard(file.allocator, runtime, file.path);
         const guard = self.publication_guard.?;
         // A new marker is visible before createFile has acquired its lock.
