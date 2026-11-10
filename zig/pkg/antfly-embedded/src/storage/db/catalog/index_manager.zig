@@ -30038,23 +30038,62 @@ pub const IndexManager = struct {
         var persistent_session: LeannRecoverySession = .{};
         defer persistent_session.deinit();
         if (!entry.leann_transient and elided_artifacts.items.len > 0) {
+            // Resolve pending writes once; only owners with work get batches.
+            var owners: std.StringHashMapUnmanaged(*DenseIndex) = .empty;
+            defer owners.deinit(self.alloc);
+            var full_media_names: std.StringHashMapUnmanaged(void) = .empty;
+            defer full_media_names.deinit(self.alloc);
             for (self.dense_indexes.items) |*owner| {
+                if (!owner.leann_media_int8) {
+                    if (owner.embedding_name) |name| try full_media_names.put(self.alloc, name, {});
+                    for (owner.embedding_names) |name| try full_media_names.put(self.alloc, name, {});
+                }
                 if (!owner.leann_transient or owner.dims != entry.dims) continue;
                 const name = owner.embedding_name orelse continue;
+                const result = try owners.getOrPut(self.alloc, name);
+                if (!result.found_existing) result.value_ptr.* = owner;
+            }
+            var sources: std.StringHashMapUnmanaged(*DenseIndex) = .empty;
+            defer sources.deinit(self.alloc);
+            for (entry.embedding_names) |name| {
+                if (owners.get(name)) |owner| try sources.put(self.alloc, name, owner);
+            }
+            const fallback_owner = if (entry.embedding_name) |name| owners.get(name) else null;
+            var groups: std.AutoArrayHashMapUnmanaged(*DenseIndex, std.ArrayListUnmanaged(usize)) = .empty;
+            defer {
+                for (groups.values()) |*slots| slots.deinit(self.alloc);
+                groups.deinit(self.alloc);
+            }
+            for (writes, 0..) |write, i| {
+                if (!keep_write[i] or !std.mem.eql(u8, write.index_name, entry.config.name) or write.vector.len != 0 or write.artifact_key == null or preloaded_artifact_vectors[i] != null or elided_digests[i] == null) continue;
+                var resolved: ?*DenseIndex = null;
+                if (try internal_keys.artifactNameView(write.artifact_key.?)) |name| {
+                    resolved = sources.get(name);
+                } else {
+                    if (try internal_keys.artifactNameAlloc(self.alloc, write.artifact_key.?)) |name| {
+                        defer self.alloc.free(name);
+                        resolved = sources.get(name);
+                    }
+                }
+                const owner = resolved orelse fallback_owner orelse return error.VectorElided;
+                const group = try groups.getOrPut(self.alloc, owner);
+                if (!group.found_existing) group.value_ptr.* = .empty;
+                try group.value_ptr.append(self.alloc, i);
+            }
+            for (groups.keys(), groups.values()) |owner, slots| {
+                const name = owner.embedding_name.?;
+                const full_media = full_media_names.contains(name);
                 var cursor: usize = 0;
-                while (cursor < writes.len) {
+                while (cursor < slots.items.len) {
                     recovery_keys.clearRetainingCapacity();
                     recovery_hashes.clearRetainingCapacity();
                     recovery_digests.clearRetainingCapacity();
                     recovery_slots.clearRetainingCapacity();
-                    while (cursor < writes.len and recovery_slots.items.len < 128) : (cursor += 1) {
-                        const i = cursor;
+                    const end = @min(cursor + 128, slots.items.len);
+                    for (slots.items[cursor..end]) |i| {
                         const write = writes[i];
-                        if (!keep_write[i] or !std.mem.eql(u8, write.index_name, entry.config.name) or write.vector.len != 0 or write.artifact_key == null or preloaded_artifact_vectors[i] != null or elided_digests[i] == null or recovered[i] != null) continue;
-                        const source = self.elidedArtifactOwner(entry, write.artifact_key.?, write.doc_key) orelse return error.VectorElided;
-                        if (!std.mem.eql(u8, source.embedding_name, name)) continue;
                         if (try leannInt8StubVectorAlloc(self.alloc, store, write.doc_key, name)) |vector| {
-                            if (self.embeddingHasFullMediaConsumer("", name) or vector.len != entry.dims) {
+                            if (full_media or vector.len != entry.dims) {
                                 self.alloc.free(vector);
                                 return error.ArtifactRepairRequired;
                             }
@@ -30069,6 +30108,7 @@ pub const IndexManager = struct {
                         try recovery_digests.append(self.alloc, identity.digest);
                         try recovery_slots.append(self.alloc, i);
                     }
+                    cursor = end;
                     if (recovery_slots.items.len == 0) continue;
                     const vectors = try self.alloc.alloc(f32, recovery_slots.items.len * @as(usize, entry.dims));
                     defer self.alloc.free(vectors);
@@ -53353,7 +53393,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
     const dims = 8;
     const n = 400;
     const config_json =
-        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"transient","search_ef":0,"bound_scale":1,"batch_size":0}}
+        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","semantic_producer":"{}","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"transient","search_ef":0,"bound_scale":1,"batch_size":0}}
     ;
 
     var prng = std.Random.DefaultPrng.init(23);
@@ -53560,17 +53600,62 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         // Rebuilding a group must invoke its provider once for the group.
         manager.dense_reembedder = embedder.reembedder();
         try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_copy", .kind = .dense_vector, .config_json = config_json }});
-        var writes: [16]mapper.DenseEmbeddingWrite = undefined;
-        for (&writes, 0..) |*write, i| write.* = .{ .index_name = @constCast("leann_copy"), .doc_key = keys[i * 4], .vector = &.{}, .artifact_key = produced[i * 4] };
+        var writes: [192]mapper.DenseEmbeddingWrite = undefined;
+        for (&writes, 0..) |*write, i| write.* = .{ .index_name = @constCast("leann_copy"), .doc_key = keys[(i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1)], .vector = &.{}, .artifact_key = produced[(i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1)] };
         const before_calls = embedder.calls;
         try manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes);
         try std.testing.expectEqual(before_calls + 1, embedder.calls);
         const persistent_config = "{\"field\":\"body\",\"dims\":8,\"metric\":\"l2_squared\",\"embedding_name\":\"leann_idx\",\"external\":true}";
         try manager.addAllNoBackfill(&store, &.{.{ .name = "persistent_copy", .kind = .dense_vector, .config_json = persistent_config }});
         for (&writes) |*write| write.index_name = @constCast("persistent_copy");
+        // Failure in the second inference batch must leave both the graph
+        // and all source stubs untouched, including the completed first batch.
+        embedder.wrong_key = 254;
+        try std.testing.expectError(error.ReembedRevisionMismatch, manager.applyDenseEmbeddingWritesByName(&store, "persistent_copy", &writes));
+        embedder.wrong_key = null;
+        try std.testing.expectEqual(@as(u64, 0), manager.denseIndex("persistent_copy").?.index.stats().active_count);
+        const first_raw = try store.get(alloc, writes[0].artifact_key.?);
+        defer alloc.free(first_raw);
+        try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(first_raw) != null);
         const persistent_calls = embedder.calls;
         try manager.applyDenseEmbeddingWritesByName(&store, "persistent_copy", &writes);
-        try std.testing.expectEqual(persistent_calls + 1, embedder.calls);
+        try std.testing.expectEqual(persistent_calls + 2, embedder.calls);
+
+        // Interleave two producers and include unrelated same-dimension
+        // owners. Only producers represented in the request may run inference.
+        const other_config = try std.mem.replaceOwned(u8, alloc, config_json, "leann_idx", "other_owner");
+        defer alloc.free(other_config);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "other_owner", .kind = .dense_vector, .config_json = other_config }});
+        const other_artifacts = try seedProducedEmbeddings(alloc, &store, "other_owner", keys[0..writes.len], vectors[0..writes.len]);
+        defer freeProducedEmbeddings(alloc, other_artifacts);
+        // Seed the second producer's stubs directly so this exercises
+        // recovery independently of the graph's elision scheduling.
+        for (other_artifacts, 0..) |artifact_key, i| {
+            const raw = try store.get(alloc, artifact_key);
+            defer alloc.free(raw);
+            const header = try enrichment_artifact_codec.decodeHeader(raw);
+            const stub = try enrichment_artifact_codec.encodeElidedDenseEmbeddingAlloc(alloc, header, dims, leann_store_mod.vectorDigest(&vectors[i]));
+            defer alloc.free(stub);
+            try store.put(artifact_key, stub);
+        }
+        const unrelated_config = try std.mem.replaceOwned(u8, alloc, config_json, "leann_idx", "unrelated_owner");
+        defer alloc.free(unrelated_config);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "unrelated_owner", .kind = .dense_vector, .config_json = unrelated_config }});
+        const mixed_config =
+            \\{"field":"body","dims":8,"metric":"l2_squared","sources":[{"artifact":"leann_idx"},{"artifact":"other_owner"}]}
+        ;
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "mixed_copy", .kind = .dense_vector, .config_json = mixed_config }});
+        var mixed: [256]mapper.DenseEmbeddingWrite = undefined;
+        for (0..64) |i| {
+            const original = 256 + (i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1);
+            mixed[i * 2] = .{ .index_name = @constCast("mixed_copy"), .doc_key = keys[original], .vector = &.{}, .artifact_key = produced[original] };
+            mixed[i * 2 + 1] = .{ .index_name = @constCast("mixed_copy"), .doc_key = keys[i], .vector = &.{}, .artifact_key = other_artifacts[i] };
+        }
+        for (128..256) |i| mixed[i] = .{ .index_name = @constCast("mixed_copy"), .doc_key = keys[i - 64], .vector = &.{}, .artifact_key = other_artifacts[i - 64] };
+        const mixed_calls = embedder.calls;
+        try manager.applyDenseEmbeddingWritesByName(&store, "mixed_copy", &mixed);
+        try std.testing.expectEqual(mixed_calls + 3, embedder.calls);
+        try std.testing.expectEqual(@as(u64, mixed.len), manager.denseIndex("mixed_copy").?.index.stats().active_count);
     }
 }
 

@@ -2690,6 +2690,17 @@ pub fn parseEmbeddingArtifactKeyView(key: []const u8) !?struct { doc_key: []cons
 /// chunk/asset source name. Callers that accept arbitrary binary components
 /// must fall back to the allocating decoder when this returns null.
 pub fn artifactNameView(key: []const u8) !?[]const u8 {
+    const encoded = (try artifactNameEncodedView(key)) orelse return null;
+    return try decodeBodyView(encoded);
+}
+
+/// Decode only the terminal stream name, including escaped binary names.
+pub fn artifactNameAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    const encoded = (try artifactNameEncodedView(key)) orelse return null;
+    return try decodeBodyAlloc(alloc, encoded);
+}
+
+fn artifactNameEncodedView(key: []const u8) !?[]const u8 {
     if (!isInternalUserKey(key)) return null;
     const doc_term = findComponentTerminator(key, 1) orelse return null;
     var pos = doc_term + 2;
@@ -2697,14 +2708,14 @@ pub fn artifactNameView(key: []const u8) !?[]const u8 {
     pos += 1;
 
     const type_term = findComponentTerminator(key, pos) orelse return null;
-    const artifact_type = (try decodeBodyView(key[pos..type_term])) orelse return null;
+    const is_graph = componentEquals(key, pos, "graph") or componentEquals(key, pos, "resolution");
     pos = type_term + 2;
     const name_term = findComponentTerminator(key, pos) orelse return null;
-    const base_name = (try decodeBodyView(key[pos..name_term])) orelse return null;
+    const base_name = key[pos..name_term];
     pos = name_term + 2;
     if (pos == key.len) return base_name;
 
-    if (std.mem.eql(u8, artifact_type, "graph") or std.mem.eql(u8, artifact_type, "resolution")) return base_name;
+    if (is_graph) return base_name;
     if (pos < key.len and key[pos] == document_unit_record_kind) {
         pos += 1;
         const unit_term = findComponentTerminator(key, pos) orelse return null;
@@ -2719,7 +2730,7 @@ pub fn artifactNameView(key: []const u8) !?[]const u8 {
     pos += 1;
     const derived_term = findComponentTerminator(key, pos) orelse return null;
     if (derived_term + 2 != key.len) return null;
-    return (try decodeBodyView(key[pos..derived_term])) orelse null;
+    return key[pos..derived_term];
 }
 
 pub fn parseGraphEdgeArtifactKeyAlloc(
@@ -3260,6 +3271,12 @@ test "artifact name view resolves direct and derived streams without allocation"
     const derived = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "chunk_vectors");
     defer alloc.free(derived);
     try std.testing.expectEqualStrings("chunk_vectors", (try artifactNameView(derived)).?);
+    const binary = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "vectors\x00binary");
+    defer alloc.free(binary);
+    try std.testing.expectEqual(null, try artifactNameView(binary));
+    const decoded = (try artifactNameAlloc(alloc, binary)).?;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("vectors\x00binary", decoded);
 }
 
 test "graph edge artifact key round trip" {
