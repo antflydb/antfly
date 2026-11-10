@@ -134310,8 +134310,9 @@ test "db native snapshot pins a local leann graph file" {
     defer cleanupTempDir(restore_path);
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/leann", .{std.mem.span(path)});
     defer alloc.free(snapshot_root);
-    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{});
-    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+    var generation = (try native_backup.validateAndMaterializeWithCancellation(alloc, io_impl.io(), snapshot_root, std.mem.span(restore_path), .none)) orelse return error.TestUnexpectedResult;
+    defer generation.deinit();
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = .query_readonly, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
     defer restored.close();
     const entry = restored.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
     const query = [_]f32{ 3, 4.23, 1, 4 };
