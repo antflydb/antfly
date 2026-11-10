@@ -3111,7 +3111,8 @@ pub const DB = struct {
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
     native_query_cleanup: @import("native_query_warming.zig").Owner = .{},
-    native_query_collector: @import("native_query_cut_gc.zig").Collector = .{ .a = std.heap.page_allocator },
+    // Allocate directory iterator buffers only while this owner is sweeping.
+    native_query_collector: ?*@import("native_query_cut_gc.zig").Collector = null,
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -6123,7 +6124,11 @@ pub const DB = struct {
         self.async_context.background_closing.store(true, .release);
         self.native_query_warming.stop(self.backend_runtime);
         self.native_query_cleanup.stop(self.backend_runtime);
-        if (self.backend_runtime.filesystemIo()) |io| self.native_query_collector.deinit(io);
+        if (self.native_query_collector) |collector| {
+            collector.deinit(self.backend_runtime.filesystemIo().?);
+            self.alloc.destroy(collector);
+            self.native_query_collector = null;
+        }
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.clearGraphReplacementManager();
@@ -21332,8 +21337,25 @@ pub const DB = struct {
     fn collectNativeQueryCaches(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
         const self: *DB = @ptrCast(@alignCast(raw));
         const io = self.backend_runtime.filesystemIo() orelse return true;
-        self.native_query_collector.a = self.alloc;
-        return self.native_query_collector.step(io, self.core.path, @import("native_query_cut.zig").nowMs(), 64, cancellation);
+        if (self.native_query_collector == null) {
+            const path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins", .{self.core.path});
+            defer self.alloc.free(path);
+            std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return true,
+                else => return err,
+            };
+            const collector = try self.alloc.create(@import("native_query_cut_gc.zig").Collector);
+            collector.* = .{ .a = self.alloc };
+            self.native_query_collector = collector;
+        }
+        const collector = self.native_query_collector.?;
+        const complete = try collector.step(io, self.core.path, @import("native_query_cut.zig").nowMs(), 64, cancellation);
+        if (complete) {
+            collector.deinit(io);
+            self.alloc.destroy(collector);
+            self.native_query_collector = null;
+        }
+        return complete;
     }
     /// One local speculative slot, independently budgeted and never uploaded.
     /// A foreground capture promotes its immutable files into its own binding.
