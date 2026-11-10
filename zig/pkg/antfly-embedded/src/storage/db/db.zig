@@ -5564,14 +5564,18 @@ pub const DB = struct {
 
     pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (comptime storage_engine.enabled) return storage_engine.call("createDetachedEnrichmentRuntime", .{ self, enrichment_cfg });
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !self.core.index_manager.hasGroupSources()) return null;
+        // Native assets/chunks and their graph consumers still need replay
+        // when no external inference provider is installed. Reconfiguration
+        // must not discard that owner after a repair created it.
+        const has_native_work = self.core.index_manager.hasGeneratedEnrichmentTargets();
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !has_native_work) return null;
         // Producer ownership moves through reconfiguration, but execution and
         // security capabilities belong to the resident DB. Hydrate every
         // replacement at this single construction boundary so live index DDL
         // cannot silently fall back to default remote-content policy or an
         // unrelated executor when it supplies only a new producer set.
         var runtime_cfg = enrichment_cfg.*;
-        if (self.core.index_manager.hasGroupSources()) runtime_cfg.enable_without_producers = true;
+        if (has_native_work) runtime_cfg.enable_without_producers = true;
         runtime_cfg.root_incarnation = self.root_incarnation;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
@@ -30191,8 +30195,17 @@ pub const DB = struct {
         // here makes it finalize HBC once per producer window while competing
         // with artifact production, even though that generation will be
         // discarded. Install the worker at the shadow activation fence above.
+        // Legacy artifact-backed graphs materialize their durable source
+        // contributions in this worker. Deferring it would let a shadow publish
+        // an empty generation past the resolver event that should create them.
+        // Ordered publication owns those effects separately and can still defer
+        // the disposable projection worker until shadow activation.
+        const needs_legacy_graph_materialization = cfg.kind == .graph and
+            self.core.index_manager.graphArtifactSources(cfg.name).len != 0 and
+            !try orderedCoverageActive(self.core.store);
         const defer_worker_to_managed_repair = installed.managed_admission_pending and
             self.local_execution.optional_runtime_workers_enabled and
+            !needs_legacy_graph_materialization and
             try types.indexPublicationPolicy(self.alloc, cfg) == .atomic;
         if (self.start_index_workers and !defer_worker_to_managed_repair) {
             try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
@@ -150477,4 +150490,21 @@ test "source semantic media input canonical relations publish without mention ed
     defer graph_mod.GraphIndex.freeEdges(a, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("entity/bob", edges[0].target);
+}
+
+test "source semantic media input native asset replay survives provider-free reconfiguration" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("native-asset-runtime-owner");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime == null);
+    try db.addEnrichment(.{ .name = "facts", .kind = .asset, .field = "facts", .content_type = "application/json" });
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime != null);
+    try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime != null);
+    try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
 }

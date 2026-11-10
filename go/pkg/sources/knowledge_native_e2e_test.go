@@ -76,6 +76,10 @@ func TestNativeSourceKnowledge(t *testing.T) {
 	defer func() {
 		if t.Failed() {
 			t.Logf("final status: %+v; response=%s", ObserveKnowledge(ctx, p, b, "research"), raw)
+			unqualified := request
+			unqualified.Entity = ""
+			diagnostic, diagnosticErr := p.QueryKnowledge(ctx, b, unqualified, "research")
+			t.Logf("unqualified diagnostic: error=%v response=%s", diagnosticErr, diagnostic)
 		}
 	}()
 	require.Eventually(t, func() bool {
@@ -149,6 +153,7 @@ func TestNativeSourceKnowledge(t *testing.T) {
 	require.NoError(t, err)
 	resolvedBinding := Binding{ID: testSourceID, Table: table, Knowledge: &resolvedKnowledge, Status: "searchable", ValidUntil: &until}
 	resolvedRequest := KnowledgeRequest{Graph: "resolved", Entity: "resolved", Start: []string{resolvedKnowledge.Entities[0].Namespace + "person/alice"}, ValidAt: "2022-01-01T00:00:00Z", KnownAt: "2022-01-01T00:00:00Z"}
+	b, request = resolvedBinding, resolvedRequest // Failure diagnostics follow the active branch.
 	require.Eventually(t, func() bool {
 		var err error
 		raw, err = p.QueryKnowledge(ctx, resolvedBinding, resolvedRequest, "research")
