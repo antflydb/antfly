@@ -14,6 +14,11 @@
 // limitations under the License.
 
 pub const hbc = @import("antfly_local_sources").storage_hbc_adapter;
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+pub const platform_time = @import("antfly_platform").time;
+pub const vectorindex = @import("antfly_vectorindex");
+pub const proto = @import("antfly_vector").proto;
+pub const quantizer = @import("antfly_vector").quantizer;
 pub const vector = @import("antfly_vector").vector;
 
 /// Server fixtures retain this compilation root's source and type identity.

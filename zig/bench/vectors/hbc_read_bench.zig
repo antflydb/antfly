@@ -27,7 +27,9 @@ const Config = struct {
     samples: usize = 3,
     vectors: usize = 10_000,
     dims: usize = 128,
+    metric: vec.DistanceMetric = .cosine,
     queries: usize = 200,
+    search_width: u32 = 0,
     recall_queries: usize = 20,
     k: usize = 10,
     batch_size: usize = 1_000,
@@ -421,6 +423,7 @@ pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
+    try out.print("bulk_build_algo={s} metric={s}\n", .{ @tagName(cfg.bulk_build_algo), @tagName(cfg.metric) });
     try out.print(
         "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} rerank_policy={s} rerank_factor={d} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any} segment_store_reads={any} segment_wal_shadow_batches={d} segment_wal_mutation_batches={d} prebuild_mutation_batches={d} mutation_rebuild_quantized={any} segment_wal_sync_each_batch={any}\n",
         .{
@@ -807,11 +810,34 @@ fn benchShadowSegmentCheckpoint(writer: anytype, stdout_writer: anytype, scenari
 
 fn printBuildResult(
     writer: anytype,
-    scenario: *const Scenario,
+    scenario: *Scenario,
     elapsed_ns: u64,
     before_storage: StorageCounters,
     after_storage: StorageCounters,
 ) !void {
+    // Read packed headers directly so shape reporting does not warm the node cache.
+    var txn = try scenario.index.beginRuntimeReadTxn();
+    defer txn.abort();
+    var leaves: usize = 0;
+    var members: usize = 0;
+    var min_members: usize = std.math.maxInt(usize);
+    var max_members: usize = 0;
+    var node_id: u64 = 1;
+    while (node_id <= scenario.index.metadata.node_count) : (node_id += 1) {
+        var key: [12]u8 = undefined;
+        const value = scenario.index.getNamespaced(&txn, .nodes, antfly.vectorindex.encodeNodeKey(&key, node_id, .packed_node)) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const decoded_node = try antfly.vectorindex.hbc.decodePackedNodeValue(value);
+        if (!decoded_node.header.is_leaf) continue;
+        const count = decoded_node.ids_bytes.len / @sizeOf(u64);
+        leaves += 1;
+        members += count;
+        min_members = @min(min_members, count);
+        max_members = @max(max_members, count);
+    }
+    try writer.print("{{\"workload\":\"build_shape\",\"algorithm\":\"{s}\",\"metric\":\"{s}\",\"leaves\":{d},\"members\":{d},\"min_leaf_members\":{d},\"max_leaf_members\":{d},\"mean_leaf_members\":{d:.2}}}\n", .{ @tagName(scenario.cfg.bulk_build_algo), @tagName(scenario.cfg.metric), leaves, members, if (leaves == 0) 0 else min_members, max_members, @as(f64, @floatFromInt(members)) / @as(f64, @floatFromInt(@max(leaves, 1))) });
     const storage_delta = StorageCounters.delta(after_storage, before_storage);
     const profile = scenario.index.getWriteProfile();
     try writer.print(
@@ -923,7 +949,7 @@ fn benchQueries(
         const truth = try recall_common.calculateTruth(
             scenario.allocator,
             @min(scenario.cfg.k, scenario.cfg.vectors),
-            .cosine,
+            scenario.cfg.metric,
             query,
             .{ .dims = scenario.cfg.dims, .count = scenario.cfg.vectors, .data = @constCast(dataset) },
         );
@@ -1046,11 +1072,11 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
     return .{
         .storage_backend = .lsm,
         .dims = @intCast(cfg.dims),
-        .metric = .cosine,
+        .metric = cfg.metric,
         .split_algo = cfg.split_algo,
         .branching_factor = cfg.branching_factor,
         .leaf_size = cfg.leaf_size,
-        .search_width = cfg.branching_factor,
+        .search_width = if (cfg.search_width == 0) cfg.branching_factor else cfg.search_width,
         .epsilon = 7,
         .use_quantization = cfg.use_quantization,
         .rerank_policy = cfg.rerank_policy,
@@ -1077,7 +1103,7 @@ fn makeDataset(allocator: Allocator, cfg: Config) ![]f32 {
         for (0..cfg.dims) |dim| {
             data[row * cfg.dims + dim] = base + random.float(f32) * 0.01;
         }
-        _ = vec.normalize(data[row * cfg.dims ..][0..cfg.dims]);
+        if (cfg.metric == .cosine) _ = vec.normalize(data[row * cfg.dims ..][0..cfg.dims]);
     }
     return data;
 }
@@ -1091,7 +1117,7 @@ fn makeQueries(allocator: Allocator, cfg: Config, dataset: []const f32) ![]f32 {
         for (0..cfg.dims) |dim| {
             queries[i * cfg.dims + dim] = dataset[source * cfg.dims + dim] + random.float(f32) * 0.0001;
         }
-        _ = vec.normalize(queries[i * cfg.dims ..][0..cfg.dims]);
+        if (cfg.metric == .cosine) _ = vec.normalize(queries[i * cfg.dims ..][0..cfg.dims]);
     }
     return queries;
 }
@@ -1145,6 +1171,8 @@ fn parseArgs(args: *std.process.Args.Iterator) !Config {
             cfg.vectors = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--dims")) {
             cfg.dims = try parseNextUsize(args, arg);
+        } else if (std.mem.eql(u8, arg, "--search-width")) {
+            cfg.search_width = @intCast(try parseNextUsize(args, arg));
         } else if (std.mem.eql(u8, arg, "--queries")) {
             cfg.queries = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--recall-queries")) {
@@ -1171,6 +1199,10 @@ fn parseArgs(args: *std.process.Args.Iterator) !Config {
             cfg.bulk_build_algo = .recursive;
         } else if (std.mem.eql(u8, arg, "--bulk-build-doc-key-seeded")) {
             cfg.bulk_build_algo = .doc_key_seeded;
+        } else if (std.mem.eql(u8, arg, "--metric")) {
+            cfg.metric = std.meta.stringToEnum(vec.DistanceMetric, args.next() orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--bulk-build-emeans")) {
+            cfg.bulk_build_algo = .emeans;
         } else if (std.mem.eql(u8, arg, "--bulk-build-kmeans")) {
             cfg.bulk_build_algo = .kmeans;
         } else if (std.mem.eql(u8, arg, "--kmeans-backend")) {

@@ -714,6 +714,11 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     hbc_isolate_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
     hbc_isolate_root_mod.addImport("antfly_platform", platform_mod);
     hbc_isolate_root_mod.addImport("antfly_hash", hash_mod);
+    antfly_imports.configureRuntimeContracts(hbc_isolate_root_mod);
+    antfly_imports.storage_boundary.configureSources(hbc_isolate_root_mod, false, false);
+    @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(hbc_isolate_root_mod);
+    hbc_isolate_root_mod.addImport("antfly-json", antfly_imports.json);
+    hbc_isolate_root_mod.addImport("structlog", structlog_mod);
     hbc_isolate_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
 
     const hbc_isolate = b.addExecutable(.{
@@ -723,6 +728,16 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const hbc_isolate_step = b.step("hbc-isolate", "Build and install hbc_isolate");
     hbc_isolate_step.dependOn(&b.addInstallArtifact(hbc_isolate, .{}).step);
+
+    // HBC-only comparisons do not need the server's inference library.
+    const hbc_read_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/hbc_read_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hbc_read_mod.addImport("antfly-zig", hbc_isolate_root_mod);
+    const hbc_read = b.addExecutable(.{ .name = "hbc_read_bench", .root_module = hbc_read_mod });
+    b.step("hbc-read-bench", "Build standalone HBC build/recall benchmark").dependOn(&b.addInstallArtifact(hbc_read, .{}).step);
 
     const build_quality_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench_build_quality.zig"),

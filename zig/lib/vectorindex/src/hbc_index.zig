@@ -6691,6 +6691,28 @@ test "kmeans bulk builders pack bounded leaves" {
     try std.testing.expect(mock.max_internal_children <= 2);
     try std.testing.expectEqual(@as(usize, inputs.len), built.member_count);
 
+    var experimental = MockIndex{
+        .alloc = std.testing.allocator,
+        .config = .{ .dims = 2, .leaf_size = 2, .branching_factor = 2, .metric = .l2_squared, .kmeans_backend = .cpu, .use_quantization = false },
+        .rng = go_rand.GoPcg.init(42, 1024),
+    };
+    defer experimental.deinit();
+    var e_built = try buildBulkClusteredFromInputs(&experimental, {}, &inputs, true);
+    defer e_built.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, inputs.len), e_built.member_count);
+    try std.testing.expect(experimental.max_leaf_members <= 2);
+    try std.testing.expect(experimental.max_internal_children <= 2);
+    var seen: [6]bool = @splat(false);
+    var nodes = experimental.nodes.valueIterator();
+    while (nodes.next()) |node| {
+        if (!node.is_leaf) continue;
+        for (node.members) |id| {
+            try std.testing.expect(!seen[id - 1]);
+            seen[id - 1] = true;
+        }
+    }
+    for (seen) |present| try std.testing.expect(present);
+
     var hierarchical = MockIndex{
         .alloc = std.testing.allocator,
         .config = mock.config,
@@ -10509,6 +10531,10 @@ pub fn bulkBuildPreparedInputsTxnOptions(
 ) !void {
     if (inputs.len == 0) return;
     try self.bindTxnLike(txn);
+    if ((options.algo orelse self.config.bulk_build_algo) == .emeans) {
+        if (self.config.metric != .l2_squared) return error.EmeansRequiresL2;
+        if (self.config.kmeans_backend == .metal) return error.EmeansRequiresCpu;
+    }
     try self.prepareEmptyPreparedBulkBuild(txn, inputs);
 
     const sorted_indexes = try self.alloc.alloc(usize, inputs.len);
@@ -10553,6 +10579,7 @@ pub fn bulkBuildPreparedInputsTxnOptions(
         .hilbert_seeded => try self.buildBulkHilbertSeeded(txn, inputs),
         .doc_key_seeded => try self.buildBulkDocKeySeeded(txn, inputs),
         .kmeans => try self.buildBulkKmeansFromInputs(txn, inputs),
+        .emeans => try buildBulkClusteredFromInputs(self, txn, inputs, true),
     };
     defer built.deinit(self.alloc);
     self.write_profile.bulk_build_tree_ns += elapsed_fn(build_start);
@@ -10829,6 +10856,17 @@ pub fn buildBulkKmeansFromInputs(
     txn: anytype,
     inputs: []const bulk_build.PreparedBulkBuildInput,
 ) !BuiltBulkNode {
+    return buildBulkClusteredFromInputs(self, txn, inputs, false);
+}
+
+fn buildBulkClusteredFromInputs(
+    self: anytype,
+    txn: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    emeans: bool,
+) !BuiltBulkNode {
+    if (emeans and self.config.metric != .l2_squared) return error.EmeansRequiresL2;
+    if (emeans and self.config.kmeans_backend == .metal) return error.EmeansRequiresCpu;
     if (inputs.len == 0) return error.TooFewVectors;
     if (inputs.len <= self.config.leaf_size) {
         return try buildBulkLeaf(self, txn, self.nextNodeId(), inputs, 0, 0);
@@ -10874,6 +10912,8 @@ pub fn buildBulkKmeansFromInputs(
     defer self.alloc.free(entries);
 
     const stats = try kmeans.run(.{
+        .emeans = emeans,
+        .allocator = self.alloc,
         .dims = dims,
         .metric = self.config.metric,
         .max_iter = self.config.kmeans_max_iter,

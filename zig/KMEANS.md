@@ -76,3 +76,73 @@ The target rebuild shape is:
 
 - Phase 5 (benchmarks and rollout) is not finished: recall/latency/rebuild-memory comparisons across `.hilbert_seeded`, `.doc_key_seeded`, `.recursive`, and `.kmeans` have not been published, and there is no recorded decision to gate or flip the default `bulk_build_algo` to `.kmeans`.
 - Weighted parent-level Metal centroid updates are not implemented; those levels always fall back to CPU update strategies (see Phase 4/Current Status above).
+
+## Experimental e-means leaf builder
+
+`BulkBuildAlgo.emeans` is a library/benchmark-only experiment for squared L2.
+It does not change the default builder or add a public API configuration value.
+Leaf clustering uses five shuffled CPU passes with the batch-size and step-size
+laws from [Bessa et al., e-means (2026)](https://arxiv.org/abs/2611.09501), EMA
+counts/means, cosine step decay, mass-weighted donor splitting every five
+batches (disabled at dimension <= 2), and final-epoch closing means. Unlike the
+reference's returned training labels, HBC obtains exact nearest-final-centroid
+labels with one additional assignment pass before packing. Leaves remain
+bounded by `leaf_size`; weighted parent levels still use the existing Lloyd
+builder and its configured backend. Forced Metal leaf execution and non-L2
+metrics return explicit errors. `kmeans_max_iter` still controls parents;
+e-means leaf training uses a fixed five epochs.
+
+The additional e-means scratch is one `usize` permutation per vector, one FP32
+mass and one `usize` closing count per centroid, and one FP32 closing sum per
+centroid coordinate: `N*sizeof(usize) + K*(sizeof(f32)+sizeof(usize)+D*sizeof(f32))`.
+This is in addition to the existing Lloyd/bulk-builder buffers. No `N x K`
+distance matrix is allocated. This CPU prototype does not use the paper's
+CUDA kernels, so its performance must be measured independently.
+
+Build and compare from `zig/`:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build hbc-read-bench -Doptimize=ReleaseFast
+python3 tools/bench_emeans.py --vectors 10000 --dims 128 --samples 3
+```
+
+The script compares Hilbert, Lloyd and e-means on identical seeded synthetic
+vectors using squared L2, CPU assignment, and memory storage. It saves raw
+benchmark output and median build time, warm query time, recall@10, and leaf
+occupancy. On macOS it also records peak process RSS via `/usr/bin/time -l`;
+that includes the fixture, index, storage, and queries, and is not isolated
+clustering workspace. The read benchmark reopens the index before its warm
+query measurements. Use different `--seed`, `--vectors`, and `--dims` values
+for additional comparisons, and vary `--search-width` (default 16 in the
+script) to measure recall/latency tradeoffs. L2 fixture vectors and queries
+retain their original magnitudes; cosine fixtures are normalized. These synthetic results alone are insufficient to
+choose a production default; embedding fixtures and matched-recall latency
+curves are still required.
+
+Individual benchmark commands accept `--bulk-build-emeans --metric l2_squared`.
+Both `hbc-read` and `hbc-write` default to cosine unless `--metric` is supplied.
+
+### Initial local measurements (2026-11-09)
+
+See [`emeans_baseline.json`](bench/vectors/emeans_baseline.json) for the complete
+summary. ReleaseFast, CPU, memory storage, 10,000 vectors x 128 dimensions,
+16 synthetic clusters, seed 42, median of three samples, 100 queries, leaf size
+128, branching factor 128, search width 16:
+
+| Builder | Build ms | Warm query µs | Recall@10 | Leaves | Leaf members min/max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hilbert | 225.8 | 192.3 | 0.243 | 79 | 126 / 127 |
+| Lloyd | 328.2 | 392.0 | 0.929 | 114 | 30 / 128 |
+| e-means | 132.6 | 388.4 | 0.920 | 115 | 16 / 128 |
+
+E-means built about 2.5x faster than Lloyd on this fixture, with recall lower
+by 0.9 percentage points. At search width 32, recall remained 0.920 versus
+0.929, and query times were 452.4 versus 428.2 µs. This does not demonstrate a
+query-speed improvement or equal quality. Peak whole-process RSS across both
+comparisons ranged from about 80 to 101 MiB; these measurements do not isolate
+the small additional clustering buffers. Every build retained all 10,000
+members and bounded leaves by 128, and reopened-index queries completed.
+
+Other builds/services were active during measurement. Samples reuse one fixed
+seeded dataset; real embedding datasets, additional seeds, and matched-recall
+comparisons remain necessary before considering any default change.

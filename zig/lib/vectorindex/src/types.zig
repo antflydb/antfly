@@ -154,6 +154,8 @@ pub const BulkBuildAlgo = enum {
     hilbert_seeded,
     doc_key_seeded,
     kmeans,
+    /// Experimental CPU L2 leaf clustering; parent levels still use Lloyd.
+    emeans,
 };
 
 pub const Node = struct {
