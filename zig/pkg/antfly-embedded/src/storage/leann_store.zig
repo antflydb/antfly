@@ -699,9 +699,10 @@ pub const LeannStore = struct {
         defer recovery.deinit();
         var ctx = SourceCtx{ .recovery = &recovery, .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
+        const direct_candidates = filter.has_allowed and useDirectCandidates(req, filter.allowed.count(), live, self.opts.search_ef);
         var candidate_ids = std.ArrayListUnmanaged(u32).empty;
         defer candidate_ids.deinit(alloc);
-        if (filter.has_allowed) {
+        if (direct_candidates) {
             var ids = filter.allowed.keyIterator();
             while (ids.next()) |id| if (self.node_of.get(id.*)) |node| try candidate_ids.append(alloc, node);
         }
@@ -713,7 +714,7 @@ pub const LeannStore = struct {
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (filter.nodeActive() or search_types.requiresExhaustiveCoverage(req)) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
-                .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
+                .candidate_ids = if (direct_candidates) candidate_ids.items else null,
                 .exhaustive = search_types.requiresExhaustiveCoverage(req),
                 .distance_over = req.distance_over,
                 .distance_under = req.distance_under,
@@ -1166,6 +1167,29 @@ pub const ReembedCache = struct {
         alloc.destroy(victim);
     }
 };
+
+/// A small allowlist is cheaper to score directly. Keep large allowlists
+/// as graph predicates, with the same visit budget as other bounded filters.
+pub fn useDirectCandidates(req: search_types.SearchRequest, allowed: usize, live: usize, search_ef: u32) bool {
+    if (search_types.requiresExhaustiveCoverage(req)) return true;
+    const effort = @max(req.k, if (search_ef == 0) @as(usize, 512) else search_ef);
+    // A moderately sized list may still be very sparse on a large graph.
+    // Cap direct work at the minimum budget used by filtered graph search.
+    return allowed <= @min(65536, @max(1024, effort *| 4, live / 16));
+}
+
+test "LEANN allowlist routing bounds direct scoring on large indexes" {
+    const req: search_types.SearchRequest = .{ .query = &.{0}, .k = 10 };
+    try std.testing.expect(useDirectCandidates(req, 32, 10_000, 0));
+    try std.testing.expect(useDirectCandidates(req, 2048, 10_000, 0));
+    try std.testing.expect(!useDirectCandidates(req, 2049, 10_000, 0));
+    try std.testing.expect(!useDirectCandidates(req, 100_000, 1_000_000, 4096));
+    try std.testing.expect(useDirectCandidates(req, 10_000, 1_000_000, 0));
+    try std.testing.expect(!useDirectCandidates(req, 100_000, 10_000_000, 0));
+    var exhaustive = req;
+    exhaustive.search_effort = 1;
+    try std.testing.expect(useDirectCandidates(exhaustive, 100_000, 1_000_000, 4096));
+}
 
 /// Per-query gate for re-embedding: the request's cancellation aborts the
 /// search; once the time budget is spent, the store reports incomplete

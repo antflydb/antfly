@@ -734,9 +734,10 @@ pub const ReplicatedState = struct {
         if (filtered and !search_types.requiresExhaustiveCoverage(req)) want = @intCast(@max(req.k * 4, req.k + 64));
         const live: u32 = @intCast(@max(self.replica.liveCount(), 1));
         var key_filter = KeyRequestFilter{ .state = self, .filter = &filter };
+        const direct_candidates = filter.has_allowed and @import("leann_store.zig").useDirectCandidates(req, filter.allowed.count(), live, self.opts.search_ef);
         var candidate_ids = std.ArrayListUnmanaged(u32).empty;
         defer candidate_ids.deinit(alloc);
-        if (filter.has_allowed) {
+        if (direct_candidates) {
             var ids = filter.allowed.keyIterator();
             while (ids.next()) |id| if (self.key_of.get(id.*)) |key| {
                 if (self.replica.node_of.get(key)) |node| try candidate_ids.append(alloc, node);
@@ -751,7 +752,7 @@ pub const ReplicatedState = struct {
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (key_filtered) .{ .ctx = &key_filter, .allows_fn = KeyRequestFilter.allows } else null,
-                .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
+                .candidate_ids = if (direct_candidates) candidate_ids.items else null,
                 .filter_visit_limit = if (!search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
                 .filter_truncated = &filter_truncated,
                 .budget_exhausted = &budget_exhausted,

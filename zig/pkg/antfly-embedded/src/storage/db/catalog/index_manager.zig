@@ -29973,10 +29973,10 @@ pub const IndexManager = struct {
         )) {
             if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
         }
-        const elided_digests = try self.alloc.alloc(?u64, writes.len);
-        defer self.alloc.free(elided_digests);
-        @memset(elided_digests, null);
-        for (elided_artifacts.items) |elided| elided_digests[elided.write_index] = elided.vector_digest;
+        const stubs = try self.alloc.alloc(?*const ElidedDenseArtifact, if (elided_artifacts.items.len == 0) 0 else writes.len);
+        defer self.alloc.free(stubs);
+        @memset(stubs, null);
+        for (elided_artifacts.items) |*elided| stubs[elided.write_index] = elided;
         for (preloaded_artifact_vectors) |maybe_vector| {
             if (maybe_vector) |vector| preloaded_vector_bytes += @as(u64, @intCast(vector.len * @sizeOf(f32)));
         }
@@ -30012,11 +30012,11 @@ pub const IndexManager = struct {
         defer self.alloc.free(recovered);
         @memset(recovered, null);
         if (entry.leann_transient and elided_artifacts.items.len > 0) if (entry.index.leann) |leann_store| {
-            for (writes, 0..) |write, i| {
-                if (!keep_write[i] or !std.mem.eql(u8, write.index_name, entry.config.name) or write.vector.len != 0 or write.artifact_key == null or preloaded_artifact_vectors[i] != null or elided_digests[i] == null) continue;
+            for (elided_artifacts.items) |stub| {
+                const i = stub.write_index;
+                const write = writes[i];
                 if (prefetched_mappings[i]) |mapping| if (leann_store.holdsElided(mapping.vector_id)) continue;
-                const name = entry.embedding_name orelse return error.ReembedProvenanceUnavailable;
-                if (try leannInt8StubVectorAlloc(self.alloc, store, write.doc_key, name)) |vector| {
+                if (try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(self.alloc, stub.raw)) |vector| {
                     if (!entry.leann_media_int8 or vector.len != entry.dims) {
                         self.alloc.free(vector);
                         return error.ArtifactRepairRequired;
@@ -30026,10 +30026,9 @@ pub const IndexManager = struct {
                     recovered[i] = vector;
                     continue;
                 }
-                const identity = (try leannStubIdentity(self.alloc, store, write.doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
                 try recovery_keys.append(self.alloc, write.doc_key);
-                try recovery_hashes.append(self.alloc, identity.source_hash);
-                try recovery_digests.append(self.alloc, identity.digest);
+                try recovery_hashes.append(self.alloc, stub.source_hash);
+                try recovery_digests.append(self.alloc, stub.vector_digest);
                 try recovery_slots.append(self.alloc, i);
             }
         };
@@ -30041,13 +30040,7 @@ pub const IndexManager = struct {
             // Resolve pending writes once; only owners with work get batches.
             var owners: std.StringHashMapUnmanaged(*DenseIndex) = .empty;
             defer owners.deinit(self.alloc);
-            var full_media_names: std.StringHashMapUnmanaged(void) = .empty;
-            defer full_media_names.deinit(self.alloc);
             for (self.dense_indexes.items) |*owner| {
-                if (!owner.leann_media_int8) {
-                    if (owner.embedding_name) |name| try full_media_names.put(self.alloc, name, {});
-                    for (owner.embedding_names) |name| try full_media_names.put(self.alloc, name, {});
-                }
                 if (!owner.leann_transient or owner.dims != entry.dims) continue;
                 const name = owner.embedding_name orelse continue;
                 const result = try owners.getOrPut(self.alloc, name);
@@ -30064,8 +30057,9 @@ pub const IndexManager = struct {
                 for (groups.values()) |*slots| slots.deinit(self.alloc);
                 groups.deinit(self.alloc);
             }
-            for (writes, 0..) |write, i| {
-                if (!keep_write[i] or !std.mem.eql(u8, write.index_name, entry.config.name) or write.vector.len != 0 or write.artifact_key == null or preloaded_artifact_vectors[i] != null or elided_digests[i] == null) continue;
+            for (elided_artifacts.items) |stub| {
+                const i = stub.write_index;
+                const write = writes[i];
                 var resolved: ?*DenseIndex = null;
                 if (try internal_keys.artifactNameView(write.artifact_key.?)) |name| {
                     resolved = sources.get(name);
@@ -30081,8 +30075,6 @@ pub const IndexManager = struct {
                 try group.value_ptr.append(self.alloc, i);
             }
             for (groups.keys(), groups.values()) |owner, slots| {
-                const name = owner.embedding_name.?;
-                const full_media = full_media_names.contains(name);
                 var cursor: usize = 0;
                 while (cursor < slots.items.len) {
                     recovery_keys.clearRetainingCapacity();
@@ -30092,20 +30084,10 @@ pub const IndexManager = struct {
                     const end = @min(cursor + 128, slots.items.len);
                     for (slots.items[cursor..end]) |i| {
                         const write = writes[i];
-                        if (try leannInt8StubVectorAlloc(self.alloc, store, write.doc_key, name)) |vector| {
-                            if (full_media or vector.len != entry.dims) {
-                                self.alloc.free(vector);
-                                return error.ArtifactRepairRequired;
-                            }
-                            errdefer self.alloc.free(vector);
-                            try reembedded_vectors.append(self.alloc, vector);
-                            recovered[i] = vector;
-                            continue;
-                        }
-                        const identity = (try leannStubIdentity(self.alloc, store, write.doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
+                        const stub = stubs[i].?;
                         try recovery_keys.append(self.alloc, write.doc_key);
-                        try recovery_hashes.append(self.alloc, identity.source_hash);
-                        try recovery_digests.append(self.alloc, identity.digest);
+                        try recovery_hashes.append(self.alloc, stub.source_hash);
+                        try recovery_digests.append(self.alloc, stub.vector_digest);
                         try recovery_slots.append(self.alloc, i);
                     }
                     cursor = end;
@@ -30205,7 +30187,8 @@ pub const IndexManager = struct {
                         // Replaying a transient LEANN write whose vector is
                         // already a stub: keep the existing vector id bound
                         // when the graph holds it, otherwise re-embed.
-                        const digest = elided_digests[write_index] orelse continue;
+                        if (stubs.len == 0) continue;
+                        const stub = stubs[write_index] orelse continue;
                         if (!entry.leann_transient) {
                             // A persistent index added after a transient
                             // LEANN index elided this shared embedding: the
@@ -30216,17 +30199,10 @@ pub const IndexManager = struct {
                         }
                         const leann_store = entry.index.leann orelse continue;
                         if (prefetched_mappings[write_index]) |mapping| if (leann_store.holdsElided(mapping.vector_id)) {
-                            try leann_store.noteElided(mapping.vector_id, member_key, digest);
+                            try leann_store.noteElided(mapping.vector_id, member_key, stub.vector_digest);
                             continue;
                         };
-                        if (recovered[write_index]) |vector| break :blk vector;
-                        const reembedded = self.reembedOneDenseDocument(self.alloc, entry, write.doc_key) catch |err| switch (err) {
-                            error.NotFound => continue,
-                            else => return err,
-                        };
-                        errdefer self.alloc.free(reembedded);
-                        try reembedded_vectors.append(self.alloc, reembedded);
-                        break :blk reembedded;
+                        break :blk recovered[write_index] orelse return error.ReembedProvenanceUnavailable;
                     };
                     const vector_fingerprint = denseVectorFingerprint(vector);
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
@@ -30337,7 +30313,13 @@ pub const IndexManager = struct {
 
     /// A stored embedding read as an elided stub (transient LEANN): the
     /// graph already holds the vector with `vector_digest`.
-    const ElidedDenseArtifact = struct { write_index: usize, vector_digest: u64 };
+    const ElidedDenseArtifact = struct {
+        write_index: usize,
+        vector_digest: u64,
+        source_hash: ?u64,
+        // Borrowed from the same read transaction as preloaded full vectors.
+        raw: []const u8,
+    };
 
     fn validateLeannArtifactPrecision(self: *IndexManager, index_name: []const u8, raw: []const u8) !void {
         const header = try enrichment_artifact_codec.decodeHeader(raw);
@@ -30446,7 +30428,13 @@ pub const IndexManager = struct {
                         try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                         continue;
                     }
-                    try list.append(self.alloc, .{ .write_index = item.write_index, .vector_digest = stub.vector_digest });
+                    const header = try enrichment_artifact_codec.decodeHeader(raw);
+                    try list.append(self.alloc, .{
+                        .write_index = item.write_index,
+                        .vector_digest = stub.vector_digest,
+                        .source_hash = if (header.flags.has_source_hash) header.source_hash else null,
+                        .raw = raw,
+                    });
                     continue;
                 };
                 if (isRecoverableEmbeddingArtifactError(err)) {
@@ -30570,7 +30558,13 @@ pub const IndexManager = struct {
                         try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                         continue;
                     }
-                    try list.append(self.alloc, .{ .write_index = item.write_index, .vector_digest = stub.vector_digest });
+                    const header = try enrichment_artifact_codec.decodeHeader(raw);
+                    try list.append(self.alloc, .{
+                        .write_index = item.write_index,
+                        .vector_digest = stub.vector_digest,
+                        .source_hash = if (header.flags.has_source_hash) header.source_hash else null,
+                        .raw = raw,
+                    });
                     continue;
                 };
                 if (isRecoverableEmbeddingArtifactError(err)) {

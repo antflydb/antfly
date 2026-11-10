@@ -134514,18 +134514,22 @@ test "db native snapshot exports self-contained generation" {
 }
 
 test "db native snapshot pins a local leann graph file" {
-    try testLeannNativeSnapshot(false, false);
+    try testLeannNativeSnapshot(false, false, false);
 }
 
 test "db native snapshot restores an upgraded native leann wrapper" {
-    try testLeannNativeSnapshot(true, false);
+    try testLeannNativeSnapshot(true, false, false);
 }
 
 test "db native snapshot restores leann through explicit native storage" {
-    try testLeannNativeSnapshot(false, true);
+    try testLeannNativeSnapshot(false, true, false);
 }
 
-fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool) !void {
+test "db native snapshot restores and re-embeds transient leann stubs" {
+    try testLeannNativeSnapshot(false, false, true);
+}
+
+fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transient: bool) !void {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -134533,19 +134537,24 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool) !void {
     defer cleanupTempDir(path);
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
-        .backend = .manual,
+        .backend = if (transient) .io_threaded else .manual,
         .filesystem_io = std.testing.io,
     });
     defer runtime.deinit();
     var native = try lsm_backend_mod.NativeStorage.init(alloc, .threaded);
     defer native.deinit();
-    var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .index_backends = .{ .dense_lsm_storage = if (explicit_storage) native.storage() else null }, .ttl_cleanup = .{ .enabled = false } });
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const enrichment: ?enrichment_runtime_mod.Config = if (transient) .{ .owner_id = "leann-snapshot", .dense_embedder = deterministic.interface() } else null;
+    var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .enrichment = enrichment, .index_backends = .{ .dense_lsm_storage = if (explicit_storage) native.storage() else null }, .ttl_cleanup = .{ .enabled = false } });
     var db_open = true;
     defer if (db_open) db.close();
     try db.addIndex(.{
         .name = "leann_idx",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":4,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"leann_idx\",\"algorithm\":\"leann\",\"leann\":{\"max_degree\":8}}",
+        .config_json = if (transient)
+            \\{"field":"embedding","dims":4,"metric":"l2_squared","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":8,"vector_storage":"transient"}}
+        else
+            "{\"field\":\"embedding\",\"dims\":4,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"leann_idx\",\"algorithm\":\"leann\",\"leann\":{\"max_degree\":8}}",
     });
     // Past the default graph build threshold, so the graph file exists.
     const n = 300;
@@ -134555,7 +134564,10 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool) !void {
     for (0..n) |i| {
         keys[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
         const c: f32 = @floatFromInt(i % 4);
-        values[i] = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"leann_idx\":[{d},{d},{d},{d}]}}}}", .{ c, c + 0.01 * @as(f32, @floatFromInt(i)), 1.0, @as(f32, @floatFromInt(i % 7)) });
+        values[i] = if (transient)
+            try std.fmt.allocPrint(alloc, "{{\"body\":\"passage number {d}\"}}", .{i})
+        else
+            try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"leann_idx\":[{d},{d},{d},{d}]}}}}", .{ c, c + 0.01 * @as(f32, @floatFromInt(i)), 1.0, @as(f32, @floatFromInt(i % 7)) });
         writes[i] = .{ .key = keys[i], .value = values[i] };
     }
     defer for (keys, values) |k, v| {
@@ -134588,6 +134600,15 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool) !void {
         try std.testing.expect(!reopened.index.experimentalPostingWalAuthoritative());
     }
 
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, keys[123], "leann_idx");
+    defer alloc.free(artifact_key);
+    if (transient) {
+        try db.syncIndexes(true);
+        try db.runUntilIdle();
+        const raw = try db.core.store.get(alloc, artifact_key);
+        defer alloc.free(raw);
+        try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+    }
     // A table with a LEANN index used to fail native snapshots outright.
     _ = try db.snapshotNative("leann");
     defer {
@@ -134617,12 +134638,21 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool) !void {
     defer alloc.free(snapshot_root);
     var generation = (try native_backup.validateAndMaterializeWithCancellation(alloc, io_impl.io(), snapshot_root, std.mem.span(restore_path), .none)) orelse return error.TestUnexpectedResult;
     defer generation.deinit();
-    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = .query_readonly, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = if (transient) .writer else .query_readonly, .enrichment = enrichment, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
     defer restored.close();
     const entry = restored.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
     try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
-    const query = [_]f32{ 3, 4.23, 1, 4 };
-    var results = try entry.index.searchWithRequest(.{ .query = &query, .k = 1 });
+    const query = if (transient)
+        try deterministic.interface().embedDense(alloc, "leann_idx", "passage number 123", 4)
+    else
+        try alloc.dupe(f32, &.{ 3, 4.23, 1, 4 });
+    defer alloc.free(query);
+    if (transient) {
+        const raw = try restored.core.store.get(alloc, artifact_key);
+        defer alloc.free(raw);
+        try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+    }
+    var results = try entry.index.searchWithRequest(.{ .query = query, .k = 1, .search_effort = if (transient) 1 else null });
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
     const doc = (try restored.core.index_manager.lookupDenseDocKey(restored.core.store, "leann_idx", results.items.items[0].vector_id)) orelse return error.TestUnexpectedResult;
