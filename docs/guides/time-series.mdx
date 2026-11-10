@@ -181,6 +181,13 @@ identifiers. Dotted field names resolve to nested JSON paths in timestamps,
 dimensions, grouping, and measurements. To address a literal dotted SQL column,
 pass explicit segments, for example
 `seriesSQL(options, { fieldPaths: { "sensor.time": ["sensor.time"] } })`.
+The SQL bucket column is named `bucket` by default. If a grouping field or
+measurement already uses that name, the helper appends underscores until it is
+unique. Set `bucketAlias` in the second argument for an explicit output name.
+Explicit aliases must be nonempty and distinct from group and measurement names;
+measurement aliases cannot overlap grouping fields. Group columns always retain
+their logical `groupBy` names, including when `fieldPaths` maps them to differently
+named source columns.
 Nested measurements are cast to floating-point values before aggregation.
 SQL expressions outside the materialization planner's proven shapes
 retain normal scan execution.
