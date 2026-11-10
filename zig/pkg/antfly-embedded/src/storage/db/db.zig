@@ -149474,6 +149474,16 @@ test "db templated dense routes preserve backfill and reembedding semantics" {
         try std.testing.expectEqual(@as(usize, 0), probe.batch_calls);
         try std.testing.expectEqual(@as(usize, if (equivalent) 0 else 1), probe.parts_calls);
 
+        // Legacy/unbound stubs must not send media URLs to inference either.
+        remote[0].source_template = "{{media url=\"https://example.invalid/file.png\"}}";
+        remote[0].expected_source_hash = null;
+        remote[0].expected_vector_digest = null;
+        found[0] = false;
+        try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, &remote, dims, &out, &found);
+        try std.testing.expect(!found[0]);
+        try std.testing.expectEqual(@as(usize, 0), probe.batch_calls);
+        try std.testing.expectEqual(@as(usize, if (equivalent) 0 else 1), probe.parts_calls);
+
         // A plain source field stays on the batched text path.
         found[0] = false;
         const field = [_]enrichment_types.GeneratedEnrichmentRequest{.{

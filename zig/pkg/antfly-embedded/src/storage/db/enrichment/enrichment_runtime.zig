@@ -1869,6 +1869,7 @@ pub fn reembedDenseDocuments(
         switch (prepared) {
             .empty => continue,
             .parts => |parts| {
+                if (!partsAreText(parts)) continue;
                 if (request.expected_source_hash) |expected| {
                     const actual = (try densePartsSourceHash(alloc, request, parts, generation.revision)) orelse return error.ReembedProvenanceUnavailable;
                     if (actual != expected) continue;
