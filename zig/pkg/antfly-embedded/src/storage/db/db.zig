@@ -33500,9 +33500,9 @@ pub const DB = struct {
     fn markEnrichmentAppliedIfNoPendingThrough(self: *DB, sequence: u64) !void {
         if (sequence == 0) return;
         const runtime = self.enrichment_runtime orelse return;
-        const runtime_stats = runtime.stats();
-        if (runtime_stats.applied_sequence >= sequence) return;
-        if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
+        const applied = runtime.appliedSequence();
+        if (applied >= sequence) return;
+        if (try self.noPendingEnrichmentReplayThrough(applied, sequence)) {
             try runtime.markAppliedThrough(sequence);
         }
     }
@@ -54826,9 +54826,9 @@ fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !
 fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
     if (sync_level != .enrichments or sequence == 0) return;
     const runtime = ctx.enrichment_runtime orelse return;
-    const runtime_stats = runtime.stats();
-    if (runtime_stats.applied_sequence >= sequence) return;
-    if (try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence)) {
+    const applied = runtime.appliedSequence();
+    if (applied >= sequence) return;
+    if (try noPendingEnrichmentReplayThroughContext(ctx, applied, sequence)) {
         try runtime.markAppliedThrough(sequence);
     }
 }

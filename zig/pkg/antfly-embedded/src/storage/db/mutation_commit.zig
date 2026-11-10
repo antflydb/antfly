@@ -3854,11 +3854,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const runtime_stats = runtime.stats();
-            if (runtime_stats.applied_sequence >= sequence) return;
+            const applied = runtime.appliedSequence();
+            if (applied >= sequence) return;
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
-            if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
+            if (try self.noPendingEnrichmentReplayThrough(applied, sequence)) {
                 try runtime.markAppliedThrough(sequence);
             }
         }
