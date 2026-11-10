@@ -30008,7 +30008,7 @@ pub const IndexManager = struct {
         defer recovery_digests.deinit(self.alloc);
         var recovery_slots: std.ArrayListUnmanaged(usize) = .empty;
         defer recovery_slots.deinit(self.alloc);
-        const recovered = try self.alloc.alloc(?[]const f32, if (entry.leann_transient and elided_artifacts.items.len > 0) writes.len else 0);
+        const recovered = try self.alloc.alloc(?[]const f32, if (elided_artifacts.items.len > 0) writes.len else 0);
         defer self.alloc.free(recovered);
         @memset(recovered, null);
         if (entry.leann_transient and elided_artifacts.items.len > 0) if (entry.index.leann) |leann_store| {
@@ -30033,6 +30033,63 @@ pub const IndexManager = struct {
                 try recovery_slots.append(self.alloc, i);
             }
         };
+        // Persistent consumers may read several embedding producers. Recover
+        // each owner separately and cap temporary inference buffers per batch.
+        var persistent_session: LeannRecoverySession = .{};
+        defer persistent_session.deinit();
+        if (!entry.leann_transient and elided_artifacts.items.len > 0) {
+            for (self.dense_indexes.items) |*owner| {
+                if (!owner.leann_transient or owner.dims != entry.dims) continue;
+                const name = owner.embedding_name orelse continue;
+                var cursor: usize = 0;
+                while (cursor < writes.len) {
+                    recovery_keys.clearRetainingCapacity();
+                    recovery_hashes.clearRetainingCapacity();
+                    recovery_digests.clearRetainingCapacity();
+                    recovery_slots.clearRetainingCapacity();
+                    while (cursor < writes.len and recovery_slots.items.len < 128) : (cursor += 1) {
+                        const i = cursor;
+                        const write = writes[i];
+                        if (!keep_write[i] or !std.mem.eql(u8, write.index_name, entry.config.name) or write.vector.len != 0 or write.artifact_key == null or preloaded_artifact_vectors[i] != null or elided_digests[i] == null or recovered[i] != null) continue;
+                        const source = self.elidedArtifactOwner(entry, write.artifact_key.?, write.doc_key) orelse return error.VectorElided;
+                        if (!std.mem.eql(u8, source.embedding_name, name)) continue;
+                        if (try leannInt8StubVectorAlloc(self.alloc, store, write.doc_key, name)) |vector| {
+                            if (self.embeddingHasFullMediaConsumer("", name) or vector.len != entry.dims) {
+                                self.alloc.free(vector);
+                                return error.ArtifactRepairRequired;
+                            }
+                            errdefer self.alloc.free(vector);
+                            try reembedded_vectors.append(self.alloc, vector);
+                            recovered[i] = vector;
+                            continue;
+                        }
+                        const identity = (try leannStubIdentity(self.alloc, store, write.doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
+                        try recovery_keys.append(self.alloc, write.doc_key);
+                        try recovery_hashes.append(self.alloc, identity.source_hash);
+                        try recovery_digests.append(self.alloc, identity.digest);
+                        try recovery_slots.append(self.alloc, i);
+                    }
+                    if (recovery_slots.items.len == 0) continue;
+                    const vectors = try self.alloc.alloc(f32, recovery_slots.items.len * @as(usize, entry.dims));
+                    defer self.alloc.free(vectors);
+                    const found = try self.alloc.alloc(bool, recovery_slots.items.len);
+                    defer self.alloc.free(found);
+                    @memset(found, false);
+                    try self.reembedDenseDocumentsSession(self.alloc, owner, recovery_keys.items, recovery_hashes.items, recovery_digests.items, vectors, found, recovery_session orelse &persistent_session);
+                    for (recovery_slots.items, 0..) |slot, i| {
+                        if (!found[i]) return error.ReembedProvenanceUnavailable;
+                        const vector = try self.alloc.dupe(f32, vectors[i * entry.dims ..][0..entry.dims]);
+                        errdefer self.alloc.free(vector);
+                        try reembedded_vectors.append(self.alloc, vector);
+                        recovered[slot] = vector;
+                    }
+                }
+            }
+            recovery_keys.clearRetainingCapacity();
+            recovery_hashes.clearRetainingCapacity();
+            recovery_digests.clearRetainingCapacity();
+            recovery_slots.clearRetainingCapacity();
+        }
         const recovery_vectors = try self.alloc.alloc(f32, recovery_keys.items.len * @as(usize, entry.dims));
         defer self.alloc.free(recovery_vectors);
         if (recovery_keys.items.len > 0) {
@@ -30113,17 +30170,8 @@ pub const IndexManager = struct {
                             // A persistent index added after a transient
                             // LEANN index elided this shared embedding: the
                             // owner re-embeds it.
-                            const owner = self.elidedArtifactOwner(entry, write.artifact_key.?, write.doc_key) orelse return error.VectorElided;
-                            const reembedded = self.reembedElidedDocumentSession(self.alloc, owner.embedding_name, owner.doc_key, entry.dims, recovery_session) catch |err| switch (err) {
-                                error.NotFound => return error.VectorElided,
-                                else => return err,
-                            };
-                            errdefer self.alloc.free(reembedded);
-                            // Store the vector again: this index reads it
-                            // from storage in every scoring path, and elision
-                            // now skips embeddings it consumes.
+                            const reembedded = recovered[write_index] orelse return error.VectorElided;
                             try restoreElidedArtifactTxn(self.alloc, store_txn, write.artifact_key.?, reembedded);
-                            try reembedded_vectors.append(self.alloc, reembedded);
                             break :blk reembedded;
                         }
                         const leann_store = entry.index.leann orelse continue;
@@ -53517,6 +53565,12 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         const before_calls = embedder.calls;
         try manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes);
         try std.testing.expectEqual(before_calls + 1, embedder.calls);
+        const persistent_config = "{\"field\":\"body\",\"dims\":8,\"metric\":\"l2_squared\",\"embedding_name\":\"leann_idx\",\"external\":true}";
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "persistent_copy", .kind = .dense_vector, .config_json = persistent_config }});
+        for (&writes) |*write| write.index_name = @constCast("persistent_copy");
+        const persistent_calls = embedder.calls;
+        try manager.applyDenseEmbeddingWritesByName(&store, "persistent_copy", &writes);
+        try std.testing.expectEqual(persistent_calls + 1, embedder.calls);
     }
 }
 
