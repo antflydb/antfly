@@ -66,6 +66,8 @@ pub fn build(a: A, io: std.Io, table: local.common_topology_records.TableRecord,
     var callbacks: Callbacks = .{ .allocator = a, .context = context, .cancellation = cancellation, .clock = clock, .lease = lease };
     var request: c.Request = .{ .allocator = a, .allocator_headroom = .{ .context = &callbacks, .query = Callbacks.headroom }, .table = table, .source = source_options, .store = store, .io = c.native.IoBorrow.init(&io), .cancellation = cancellation, .control = .{ .ptr = &callbacks, .check = Callbacks.check, .now = Callbacks.now, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, .embedding_options = embedding_options, .policy = policy, .build_limits = build_limits };
     // Reconstruct provider runtimes from the checked IoBorrow in the owner.
+    const transport_io = source_options.io;
+    request.transport_io = if (transport_io) |*value| c.native.IoBorrow.init(value) else null;
     request.source.io = null;
     // Clients/caches embed the creator's executor and cannot cross error domains.
     // Only the checked AntflyProvider and secret-store capabilities are borrowed.

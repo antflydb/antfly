@@ -377,7 +377,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     var manifest_ahead: ManifestAhead = .{};
     defer manifest_ahead.deinit(server.embedding_provider_runtime.io);
     if (prepared.native_cut) |cut| {
-        var cut_store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
@@ -388,7 +388,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     }
     if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
-        var cut_store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
@@ -414,12 +414,13 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer if (!transferred) lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
-    var options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = server.embedding_provider_runtime.io, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    const transport = try server.lakeProviderTransport();
+    var options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     options.retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null;
     options.authoritative_metadata = prepared.native_cut != null;
     options.native_reader_protected = if (prepared.native_owner) |owner| owner.enabled else false;
     if (prepared.native_cut) |cut| if (cut.manifest) |ref| {
-        var manifest_store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+        var manifest_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer manifest_store.deinit();
         manifest_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = manifest_store.cache_identity, .context = context };
@@ -431,7 +432,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     // at its final heap address before selecting/binding any publication.
     // Owned queries reference already durable state. Enforce their no-upload
     // contract through a read-only artifact store, including fresh requests.
-    prepared.store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+    prepared.store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
     const store = &prepared.store;
     defer if (!transferred) store.deinit();
     if (retained == null) try server.retainLakeQueryStore(a, store, table.table_id, request);
@@ -589,7 +590,7 @@ const ManifestAhead = struct {
         try token.check();
         var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer arena.deinit();
-        var store = try Store.openNativeWithIo(arena.allocator(), self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, self.server.embedding_provider_runtime.io);
+        var store = try Store.openNativeWithTransport(arena.allocator(), self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.server.lakeProviderTransport());
         defer store.deinit();
         if (!std.mem.eql(u8, &store.cache_identity, &self.scope)) return error.ExternalLakeIndexCredentialsChanged;
         var context = self.context;
@@ -687,7 +688,7 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
     const retained_api = @import("lake_retained_cut.zig");
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     if (native_owner.current) |cut| if (now < cut.refresh_after_ms and cut.canIssue(now, retained_api.configuredTtl(server.cfg.node_config)) and std.mem.eql(u8, &cut.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) {
-        var store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+        var store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer store.deinit();
         var artifacts = store.artifactStore();
         var resident = retained_api.ownedResident(&artifacts, store.identity, table, cut, &server.lake_read_cache.decoded);
@@ -6951,4 +6952,19 @@ test "external lake independent source scopes share preparation capacity and mem
     try std.testing.expectError(error.OutOfMemory, second.budget.allocator().alloc(u8, 16));
     try std.testing.expect(root.budget.exhausted);
     try std.testing.expectEqual(@as(usize, 24), root.budget.live);
+}
+
+test "external lake provider clients use one isolated server-owned transport" {
+    const a = std.testing.allocator;
+    var unused: u8 = 0;
+    var server = server_api.ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &unused, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const first = try server.lakeProviderTransport();
+    const second = try server.lakeProviderTransport();
+    try std.testing.expect(first.io.?.userdata == second.io.?.userdata);
+    try std.testing.expect(first.io.?.userdata != server.embedding_provider_runtime.io.userdata);
+    try std.testing.expect(first.requests == second.requests);
+    try std.testing.expectEqual(@as(u32, 4), first.requests.?.capacity);
+    server.index_installation_closing.store(true, .release);
+    try std.testing.expectError(error.Canceled, server.lakeProviderTransport());
 }

@@ -32,7 +32,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     defer parsed.deinit();
     const request = parsed.value;
     if (request.action == .enrichment_status) {
-        var store = try @import("lake_index_store.zig").Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer store.deinit();
         return .{ .body = try @import("lake_recent_vectors.zig").status(a, &store, table, context), .mutated = false };
     }
@@ -82,7 +82,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     const wal: @import("../serverless/lake_wal.zig").Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try ingestion.prefix(scratch, opened.prefix, binding, options), .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     var result = try wal.prune(scratch, wal_cut, request.max_deleted, request.dry_run);
     if (!request.dry_run and result.complete) {
-        var artifacts = try @import("lake_index_store.zig").Store.openNativeWithIo(scratch, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+        var artifacts = try @import("lake_index_store.zig").Store.openNativeWithTransport(scratch, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer artifacts.deinit();
         const identity = @import("lake_wal_image.zig").digest(.{ .storage = artifacts.identity, .table = table.table_id, .generation = table.object_storage_generation, .prefix = wal.prefix });
         var shared = try wal.open(scratch, false);

@@ -762,7 +762,7 @@ fn isRetryableLakeBuildFailure(reason: []const u8) bool {
     // reacquires its fence and resumes verified checkpoints after backoff.
     // In particular, an ambiguous TLS write must not be blindly replayed.
     if (@import("httpx").isRetryableTransportErrorName(reason)) return true;
-    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" }) |name| {
+    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable", "ConcurrencyUnavailable", "ResourceTemporarilyUnavailable", "SystemResources", "ProcessFdQuotaExceeded", "SystemFdQuotaExceeded" }) |name| {
         if (std.mem.eql(u8, reason, name)) return true;
     }
     return false;
@@ -11351,7 +11351,7 @@ test "external lake native interrupted publication is pending while integrity an
     defer config.deinit();
     var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
     const desired = lake.desiredFingerprint(table);
-    const pending_errors = [_][]const u8{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionTimedOut", "ConnectionTimeout", "BrokenPipe", "ConnectionClosed", "ConnectionRefused", "Closed", "NotConnected", "EndOfStream", "UnexpectedEof", "ReadFailed", "WriteFailed", "RecvFailed", "SendFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" };
+    const pending_errors = [_][]const u8{ "ConcurrencyUnavailable", "ResourceTemporarilyUnavailable", "SystemResources", "ProcessFdQuotaExceeded", "SystemFdQuotaExceeded", "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionTimedOut", "ConnectionTimeout", "BrokenPipe", "ConnectionClosed", "ConnectionRefused", "Closed", "NotConnected", "EndOfStream", "UnexpectedEof", "ReadFailed", "WriteFailed", "RecvFailed", "SendFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" };
     const terminal_errors = [_][]const u8{ "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded", "TlsBadRecordMac", "TlsAlert", "AccessDenied", "Unauthorized", "PreconditionFailed" };
     for (pending_errors ++ terminal_errors, 0..) |reason, i| {
         const catalog_json = try lake.encode(a, .{ .generation = 1, .failure = .{ .generation = 1, .desired = desired, .reason = reason, .retry_at_ms = 1000 } });

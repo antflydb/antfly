@@ -664,3 +664,21 @@ keep the cut reference/request context alive through every exit path; failed or
 unadmitted speculation retains required-reader fallback. Publication leases and
 normal manifest validation remain mandatory. This removes a sequential remote
 read without query-time uploads or carrying clients into cached metadata.
+
+Provider transport and query execution use separate executors. API workers may
+block on Parquet, warming or native-build work; lending their bounded executor to
+HTTP watchdogs and connect tasks creates a nested-admission dependency. The API
+owner instead lazily owns one 32-worker transport executor. All its GCS and S3
+clients share four whole-request grants, leaving room for each HTTP/1 request's
+six-task envelope and completion. Waiting callers consume no transport workers;
+queue waits preserve the original deadline, cancellation and client shutdown.
+This transport owns no shared credentials or mutable query state. Clients and
+background work drain before its executor and admission counter are destroyed.
+
+Native build contract v4 carries separate checked I/O borrows for execution and
+transport, plus the layout-checked, value-only shared admission counter. The
+receiving owner reconstructs each I/O view; no raw creator executor or provider
+client crosses the boundary. Temporary local admission/resource exhaustion stays
+pending in index readiness while the fenced coordinator backs off and resumes
+verified progress. Integrity, authorization and hard work-limit failures retain
+their terminal classification.

@@ -90,8 +90,34 @@ fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool 
     return self_delimited and parser.headers.isKeepAlive(parser.version);
 }
 
+/// Shared admission for HTTP/1 clients using a dedicated bounded transport
+/// executor. Reserve the complete request task graph before submitting any
+/// watchdog or network work. Queueing does not occupy that executor's workers.
+/// The owner must drain every client before destroying this value or its I/O.
+pub const RequestLimit = extern struct {
+    capacity: u32,
+    active: u32 = 0,
+
+    fn acquire(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken) !void {
+        while (true) {
+            try io.checkCancel();
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            try ensureRequestDeadline(io, deadline_ms);
+            const count = @atomicLoad(u32, &self.active, .acquire);
+            if (count < self.capacity and @cmpxchgWeak(u32, &self.active, count, count + 1, .acq_rel, .acquire) == null) return;
+            if (self.capacity == 0) return error.ConcurrencyUnavailable;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    fn release(self: *RequestLimit) void {
+        const previous = @atomicRmw(u32, &self.active, .Sub, 1, .acq_rel);
+        std.debug.assert(previous != 0);
+    }
+};
+
 /// HTTP client configuration.
 pub const ClientConfig = struct {
+    request_limit: ?*RequestLimit = null,
     attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
@@ -1152,9 +1178,12 @@ pub const Client = struct {
         const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
+        var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
+        if (self.config.request_limit) |limit| try limit.acquire(self.io, deadline_ms, queued_cancellation.token());
+        defer if (self.config.request_limit) |limit| limit.release();
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0, deadline_ms);
 
-        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
+        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
         var coordinated = reqOpts;
         coordinated.cancellation = cancellation.token();
         return self.requestInternal(method, url, coordinated, 0, deadline_ms);
@@ -1174,9 +1203,12 @@ pub const Client = struct {
         const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
+        var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
+        if (self.config.request_limit) |limit| try limit.acquire(self.io, deadline_ms, queued_cancellation.token());
+        defer if (self.config.request_limit) |limit| limit.release();
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0, deadline_ms);
 
-        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
+        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
         var coordinated = reqOpts;
         coordinated.cancellation = cancellation.token();
         return self.requestToWriterInternal(method, url, coordinated, writer, progress_cb, progress_ctx, 0, deadline_ms);
@@ -7086,4 +7118,109 @@ test "admitted transport H2 pre-send expiry retains the cached connection and tr
         try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
         try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
     }
+}
+
+test "request task admission shares whole-request capacity and releases before transport failure" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var limit: RequestLimit = .{ .capacity = 1 };
+    try limit.acquire(io, null, null);
+    var held = true;
+    defer if (held) limit.release();
+    var configured_cancel = std.atomic.Value(bool).init(false);
+    var client = Client.initWithConfig(a, io, .{ .request_cancellation = .fromAtomic(&configured_cancel), .request_limit = &limit, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    const deadline = std.math.cast(i64, @divFloor(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms)).? - 1;
+    try std.testing.expectError(error.Timeout, limit.acquire(io, deadline, null));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, limit.acquire(io, null, .fromAtomic(&canceled)));
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    try std.testing.expectError(error.Timeout, client.get("http://127.0.0.1:1/", .{ .timeout_ms = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
+    configured_cancel.store(true, .release);
+    try std.testing.expectError(error.Cancelled, client.get("http://127.0.0.1:1/", .{}));
+    configured_cancel.store(false, .release);
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(a);
+    try std.testing.expectError(error.Timeout, client.getToWriter("http://127.0.0.1:1/", .{ .timeout_ms = 1 }, arrayListWriter(&bytes, a), null, null));
+    try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    limit.release();
+    held = false;
+    // With a grant, an invalid URL fails before sending. Both buffered and
+    // streamed calls must return their shared slot on this path.
+    _ = client.get("invalid://", .{}) catch {};
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+    _ = client.getToWriter("invalid://", .{}, arrayListWriter(&bytes, a), null, null) catch {};
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission cancels queued clients on shutdown and recovers shared capacity" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var limit: RequestLimit = .{ .capacity = 1 };
+    try limit.acquire(io, null, null);
+    var client = Client.initWithConfig(a, io, .{ .request_limit = &limit });
+    defer client.deinit();
+    const Task = struct {
+        fn run(c: *Client) !void {
+            var response = try c.get("http://127.0.0.1:1/", .{});
+            response.deinit();
+        }
+    };
+    var pending = try io.concurrent(Task.run, .{&client});
+    defer _ = pending.cancel(io) catch {};
+    while (client.activeRequestCount() == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    client.beginShutdown();
+    try std.testing.expectError(error.Cancelled, pending.await(io));
+    client.drainShutdown();
+    try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    limit.release();
+    try limit.acquire(io, null, null);
+    limit.release();
+}
+
+test "request task admission keeps transport independent of a fully occupied caller executor" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const TestServer = @import("../testing.zig").TestServer;
+    var server = try TestServer.start(a, io, &.{.{ .path = "/ready", .respond = .{ .body = "ready" } }});
+    defer server.deinit();
+    var callers = Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+    defer callers.deinit();
+    var transport = Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(32) });
+    defer transport.deinit();
+    var limit: RequestLimit = .{ .capacity = 4 };
+    var entered = std.atomic.Value(u32).init(0);
+    const url = try std.fmt.allocPrint(a, "{s}/ready", .{server.baseUrl()});
+    defer a.free(url);
+    const Task = struct {
+        fn serve(ts: *TestServer) !void {
+            for (0..4) |_| try ts.handleOne();
+        }
+        fn fetch(caller_io: Io, transport_io: Io, budget: *RequestLimit, count: *std.atomic.Value(u32), endpoint: []const u8) anyerror!void {
+            _ = count.fetchAdd(1, .acq_rel);
+            while (count.load(.acquire) != 4) try caller_io.sleep(.fromMilliseconds(1), .awake);
+            var client = Client.initWithConfig(std.testing.allocator, transport_io, .{ .request_limit = budget, .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            var response = try client.get(endpoint, .{ .timeout_ms = 5000 });
+            defer response.deinit();
+            try std.testing.expectEqualStrings("ready", response.body.?);
+        }
+    };
+    var serving = try io.concurrent(Task.serve, .{&server});
+    defer _ = serving.cancel(io) catch {};
+    var requests: [4]?Io.Future(anyerror!void) = @splat(null);
+    defer for (&requests) |*pending| {
+        if (pending.*) |*future| _ = future.cancel(callers.io()) catch {};
+    };
+    for (&requests) |*pending| pending.* = try callers.io().concurrent(Task.fetch, .{ callers.io(), transport.io(), &limit, &entered, url });
+    for (&requests) |*pending| {
+        const result = pending.*.?.await(callers.io());
+        pending.* = null;
+        try result;
+    }
+    try serving.await(io);
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
 }

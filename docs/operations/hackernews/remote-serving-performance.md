@@ -1413,3 +1413,12 @@ selectors independently of the warming cap. Bootstrap locators retain priority;
 tiny seeds avoid a duplicate producer pass. Sub-second GCS and the disappearance
 of remaining generation-map reads still require candidate validation. No public
 readiness timeout, fixture concurrency or correctness assertion is relaxed.
+
+Candidate 97ffc2e013 builds all 98 optimized server/Lite steps, but qualification
+stops during local fixture publication with `ConcurrencyUnavailable`, before any
+search sample or GCS run. An unchanged local reproduction fails the same way.
+Parallel Parquet callers and nested provider HTTP tasks exhaust the shared
+16-worker API lane. The replacement separates transport execution and adds
+shared whole-request admission, deadline/cancellation/shutdown regressions, and
+retryable readiness classification. Fresh candidate qualification is required;
+the failed setup supplies no new latency evidence.

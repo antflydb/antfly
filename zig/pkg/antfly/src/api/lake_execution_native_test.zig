@@ -142,7 +142,7 @@ test "external lake execution operation owns clients checkpoints cancellation an
     var cause: ?anyerror = null;
     const native_client = @import("lake_execution_native_client.zig");
     if (@hasDecl(@import("lake_execution_options"), "external_test_provider")) {
-        const get = @extern(*const fn () callconv(.c) *const c.Endpoint, .{ .name = "antfly_lake_execute_v3" });
+        const get = @extern(*const fn () callconv(.c) *const c.Endpoint, .{ .name = "antfly_lake_execute_v4" });
         const endpoint = get();
         if (endpoint.version == c.endpoint_version and endpoint.layout_count == c.layouts.len) for (endpoint.layout.*, c.layouts, 0..) |actual, expected, index| if (!actual.matches(expected)) {
             std.debug.print("lake execution incompatible layout {d}: actual={any} expected={any}\n", .{ index, actual, expected });

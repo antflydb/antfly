@@ -323,7 +323,7 @@ pub fn warmNavigationWithin(a: A, server: *@import("http_server.zig").ApiHttpSer
     defer state.deinit();
     const publication = state.value.published orelse return;
     if ((publication.reader_protocol < local.metadata_lake_index_catalog.minimum_reader_protocol or publication.reader_protocol > local.metadata_lake_index_catalog.native_reader_protocol)) return;
-    var store = try @import("lake_index_store.zig").Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
+    var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
     defer store.deinit();
     if (!std.mem.eql(u8, &publication.signature.store, &store.identity)) return error.ExternalLakeIndexStoreChanged;
     var hash = std.crypto.hash.Blake3.init(.{});

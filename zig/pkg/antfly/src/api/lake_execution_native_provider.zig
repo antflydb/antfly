@@ -71,16 +71,16 @@ const Callbacks = struct {
         return .fromError(err);
     }
 };
-fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Failure) ![]u8 {
+fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, transport_io: ?std.Io, cause: *c.Failure) ![]u8 {
     const a = request.allocator;
     const context: Context = .{ .io = io, .checkpoint = .{ .ptr = callbacks, .check = Callbacks.check } };
     try context.ensureActive();
     try request.cancellation.check();
     const store_started = probeNow();
     var store = if (request.store.config) |config|
-        try Store.openRetainedNativeWithIo(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir, io)
+        try Store.openRetainedNativeWithTransport(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests })
     else
-        try Store.openNativeWithIo(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir, io);
+        try Store.openNativeWithTransport(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests });
     defer store.deinit();
     probeStage("store_open_ns", store_started);
     if (store.locator.protocol != request.store.locator.protocol or store.locator.tls != request.store.locator.tls or
@@ -90,7 +90,7 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     store.implementation.cloud_vacuum = request.store.cloud_vacuum;
     var source_options = request.source;
     source_options.read_only = true;
-    source_options.io = io;
+    source_options.io = transport_io;
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, request.table.schema_json)) orelse return error.InvalidExternalTableBinding;
     defer binding.deinit(a);
     // Each writer family revisits source metadata and ranges. Keep reuse in
@@ -128,6 +128,7 @@ pub fn execute(request: c.Request) c.Response {
     var callbacks: Callbacks = .{ .host = request.control };
     var backing = c.memory.BorrowedAllocator.init(request.allocator, request.allocator_headroom) catch |err| return .{ .failure = .fromError(err) };
     var receiver = request.io.receive() catch |err| return .{ .failure = .fromError(err) };
+    var transport_receiver = if (request.transport_io) |borrow| borrow.receive() catch |err| return .{ .failure = .fromError(err) } else null;
     var cause: c.Failure = .{};
     // Headroom/admission inspects allocator identity. Keep the quota in this
     // owner instead of asking physical writers to interpret a foreign quota.
@@ -136,7 +137,7 @@ pub fn execute(request: c.Request) c.Response {
     defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeQuota")) @import("root").lakeExecutionProbeQuota(working.quota.peak_bytes);
     var local_request = request;
     local_request.allocator = working.allocator();
-    const bytes = attempt(local_request, &callbacks, receiver.io(), &cause) catch |err| {
+    const bytes = attempt(local_request, &callbacks, receiver.io(), if (transport_receiver) |*value| value.io() else null, &cause) catch |err| {
         const failure = callbacks.failure(err);
         // A control callback may allocate from this owner's quota. Its error
         // token remains opaque, so classify that actual OOM by name as well.
@@ -162,5 +163,5 @@ fn get() callconv(.c) *const c.Endpoint {
     return &endpoint;
 }
 pub fn exportOperations() void {
-    @export(&get, .{ .name = "antfly_lake_execute_v3", .visibility = .hidden });
+    @export(&get, .{ .name = "antfly_lake_execute_v4", .visibility = .hidden });
 }

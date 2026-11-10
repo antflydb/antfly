@@ -20,6 +20,10 @@ const google_auth = @import("antfly_google").auth;
 const remote_uri = @import("remote_uri.zig");
 
 const Allocator = std.mem.Allocator;
+pub const Transport = struct {
+    io: ?std.Io = null,
+    requests: ?*@import("httpx").RequestLimit = null,
+};
 const AwsCredentialContext = @import("aws_credential_context.zig").AwsCredentialContext;
 
 pub const S3Options = struct {
@@ -140,6 +144,7 @@ pub const OpenedObjectStore = struct {
         ensure_bucket: bool = true,
         /// Borrowed runtime; it must outlive the opened provider client.
         io: ?std.Io = null,
+        requests: ?*@import("httpx").RequestLimit = null,
     };
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
@@ -255,6 +260,7 @@ pub const OpenedObjectStore = struct {
         errdefer cfg.deinit(alloc);
         if (options.io) |io| cfg.io = io;
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
+        if (gcs.owned_httpx) |transport| transport.client.config.request_limit = options.requests;
 
         var owned_client = gcs.client();
         if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
@@ -374,6 +380,7 @@ pub const OpenedObjectStore = struct {
         if (open_options.io) |io| cfg.io = io;
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
         cfg_owned = false;
+        if (s3.owned_httpx) |transport| transport.client.config.request_limit = open_options.requests;
         var owned_client = s3.client();
         errdefer owned_client.deinit();
         if (open_options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
@@ -462,16 +469,19 @@ test "storage.hot_standby cleanup object store does not create a missing bucket 
 
 test "external lake provider clients borrow the live runtime without private transport executors" {
     const a = std.testing.allocator;
+    var requests: @import("httpx").RequestLimit = .{ .capacity = 4 };
     {
-        var opened = try OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(a, "test-bucket", "prefix", "test-token", .{ .ensure_bucket = false, .io = std.testing.io });
+        var opened = try OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(a, "test-bucket", "prefix", "test-token", .{ .ensure_bucket = false, .io = std.testing.io, .requests = &requests });
         defer opened.deinit();
         try std.testing.expect(opened.gcs_client.?.cfg.io != null);
+        try std.testing.expect(opened.gcs_client.?.owned_httpx.?.client.config.request_limit == &requests);
         try std.testing.expect(opened.gcs_client.?.owned_httpx.?.io_impl == null);
     }
     {
-        var opened = try OpenedObjectStore.initS3UriWithS3AndOpenOptions(a, "test-bucket", "prefix", .{ .access_key_id = "test-key", .secret_access_key = "test-secret", .endpoint = "localhost", .use_ssl = false }, .{ .ensure_bucket = false, .io = std.testing.io });
+        var opened = try OpenedObjectStore.initS3UriWithS3AndOpenOptions(a, "test-bucket", "prefix", .{ .access_key_id = "test-key", .secret_access_key = "test-secret", .endpoint = "localhost", .use_ssl = false }, .{ .ensure_bucket = false, .io = std.testing.io, .requests = &requests });
         defer opened.deinit();
         try std.testing.expect(opened.s3_client.?.cfg.io != null);
+        try std.testing.expect(opened.s3_client.?.owned_httpx.?.client.config.request_limit == &requests);
         try std.testing.expect(opened.s3_client.?.owned_httpx.?.io_impl == null);
     }
     // Both provider clients are gone; the borrowed runtime remains usable.

@@ -1902,7 +1902,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     if (pinned) |shared| {
         try shared.read_context.ensureActive();
     } else {
-        store = Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io) catch |err| {
+        store = Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport()) catch |err| {
             try context.ensureActive();
             if (policy == .automatic and err != error.OutOfMemory) return null;
             return err;

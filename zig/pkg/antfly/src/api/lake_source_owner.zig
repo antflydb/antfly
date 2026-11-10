@@ -68,7 +68,8 @@ pub fn options(backing: A, server: *server_api.ApiHttpServer, table: Table, requ
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     const a = arena.allocator();
-    var result: configured.BindingObjectStoreOpenOptions = .{ .io = server.embedding_provider_runtime.io, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation, .native_owner_resolver = .{ .ptr = server, .resolve = resolve } };
+    const transport = try server.lakeProviderTransport();
+    var result: configured.BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation, .native_owner_resolver = .{ .ptr = server, .resolve = resolve } };
     if (try lookup(a, server, table, request)) |owner| result.native_owner = .{ .token = owner.owner, .ptr = server, .table_id = table.table_id, .object_generation = table.object_storage_generation, .acknowledge = acknowledge };
     return result;
 }

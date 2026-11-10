@@ -18,6 +18,11 @@
 //! transport their named errors without importing those implementations here.
 const std = @import("std");
 const values = [_]anyerror{
+    error.ConcurrencyUnavailable,
+    error.ResourceTemporarilyUnavailable,
+    error.SystemResources,
+    error.ProcessFdQuotaExceeded,
+    error.SystemFdQuotaExceeded,
     error.AggregateOrderedIndexUnavailable,
     error.AmbiguousLakeRebuildBuilder,
     error.ArtifactBucketNotFound,

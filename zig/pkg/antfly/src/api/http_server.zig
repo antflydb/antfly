@@ -4184,6 +4184,8 @@ pub const ApiHttpServer = struct {
     // inherit the single-threaded provider fallback. Allocate at a stable
     // address on first use; drain the cache before releasing this lane.
     lake_cache_io: ?*std.Io.Threaded = null,
+    lake_transport_mutex: std.atomic.Mutex = .unlocked,
+    lake_transport: ?*LakeProviderTransport = null,
     lake_cache_start_mutex: std.Io.Mutex = .init,
     lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
@@ -5069,6 +5071,11 @@ pub const ApiHttpServer = struct {
             io_impl.deinit();
             self.owner_alloc.destroy(io_impl);
         }
+        if (self.lake_transport) |transport| {
+            std.debug.assert(@atomicLoad(u32, &transport.requests.active, .acquire) == 0);
+            transport.io.deinit();
+            self.owner_alloc.destroy(transport);
+        }
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
@@ -5320,8 +5327,27 @@ pub const ApiHttpServer = struct {
         );
     }
 
-    /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
-    /// must not retain it beyond the server lifetime.
+    // Provider watchdogs and connect tasks must not depend on the executor
+    // occupied by synchronous query/build callers.
+    const LakeProviderTransport = struct {
+        io: std.Io.Threaded,
+        // HTTP/1 reserves up to six nested request/connect/socket tasks. Four
+        // admitted requests leave eight workers of completion headroom.
+        requests: @import("httpx").RequestLimit = .{ .capacity = 4 },
+    };
+    pub fn lakeProviderTransport(self: *ApiHttpServer) !@import("antfly_local_sources").serverless_object_store_support.Transport {
+        platform_sync.lockYielding(&self.lake_transport_mutex);
+        defer self.lake_transport_mutex.unlock();
+        if (self.index_installation_closing.load(.acquire)) return error.Canceled;
+        if (self.lake_transport == null) {
+            const transport = try self.owner_alloc.create(LakeProviderTransport);
+            transport.* = .{ .io = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(32) }) };
+            self.lake_transport = transport;
+        }
+        return .{ .io = self.lake_transport.?.io.io(), .requests = &self.lake_transport.?.requests };
+    }
+
+    /// Shared API executor. Borrowers must not outlive this server.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
         return configuredApiIo(self.cfg);
     }
@@ -10146,7 +10172,7 @@ pub const ApiHttpServer = struct {
         // Internal owners already select the retained DB before schema routing.
         // Only a request-scoped resolver owns capability descriptor memory.
         if (resolver != null) if (query_req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, @import("native_retained_cut.zig").prefix)) {
-            var store = try @import("lake_index_store.zig").Store.openNativeWithIo(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io);
+            var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, try self.lakeProviderTransport());
             defer store.deinit();
             var artifacts = store.artifactStore();
             const cut = @import("native_retained_cut.zig").load(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none) catch |err| {
@@ -16099,7 +16125,7 @@ pub const ApiHttpServer = struct {
                 if (external == null and table.storage.engine != .object and !self.cfg.native_retained_cuts) {
                     query_req.req.response_live_read = true;
                 } else if (external == null and table.storage.engine != .object) {
-                    var store = try @import("lake_index_store.zig").Store.openNativeWithIo(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io);
+                    var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, try self.lakeProviderTransport());
                     defer store.deinit();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
                     defer self.source.freeAdminSnapshot(&capture);
@@ -17578,7 +17604,7 @@ pub const ApiHttpServer = struct {
             .deadline_ns = platform_time.monotonicNs() +| 24 * 60 * 60 * std.time.ns_per_s,
             .cancellation = local.storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn),
         };
-        var store = try @import("lake_index_store.zig").Store.openNativeWithIo(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, try self.lakeProviderTransport());
         defer store.deinit();
         try self.retainLakeQueryStore(a, &store, table.table_id, .{ .deadline_ns = context.deadline_ns, .cancellation = cancel });
         // Retained cuts and recent-vector jobs belong to the bounded durable
@@ -23266,7 +23292,7 @@ pub const ApiHttpServer = struct {
         try context.ensureActive();
         var bound = table.*;
         if (std.mem.allEqual(u8, &bound.object_storage_identity, 0)) {
-            var store = @import("lake_index_store.zig").Store.openNativeWithIo(self.alloc, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io) catch |err| switch (err) {
+            var store = @import("lake_index_store.zig").Store.openNativeWithTransport(self.alloc, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, try self.lakeProviderTransport()) catch |err| switch (err) {
                 error.NativeArtifactStorageRequired, error.NativeArtifactStorageUnauthorized => return try contextual_operations.textAlloc(self.alloc, 503, "object table storage is not configured or authorized"),
                 else => return err,
             };
