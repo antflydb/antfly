@@ -274,6 +274,21 @@ fn execOutcome(alloc: Allocator, id: ?*anyopaque, statement: []const u8) !h.capi
     return api.antfly_db_sql_json(id, .fromSlice(request), &output);
 }
 
+/// `null` when the query itself did not succeed (e.g. a crash point early
+/// enough that `CREATE TABLE parents`/the seed `INSERT` never durably
+/// happened at all -- not a self-heal question, nothing to check yet).
+/// Otherwise whether the one parent row this scenario ever creates is
+/// present.
+fn tryParentRowExists(alloc: Allocator, id: ?*anyopaque) !?bool {
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    const code = api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT id FROM parents WHERE id = 0\"}"), &output);
+    if (code != .ok) return null;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, output.ptr.?[0..output.len], .{});
+    defer parsed.deinit();
+    return parsed.value.object.get("rows").?.array.items.len != 0;
+}
+
 /// `parent_id`'s value for the child row named `id_value` in table
 /// `children`, or `null` if no such row exists.
 fn selectChildParentId(alloc: Allocator, id: ?*anyopaque, id_value: []const u8) !?i64 {
@@ -363,7 +378,7 @@ fn checkViaSqlForeignKeyChild(allocator: Allocator, path: []const u8, outcome: ?
             std.debug.print("crash-consistency capi FK: parent DELETE succeeded despite a surviving child reference\n", .{});
             return error.CrashConsistencyAcknowledgedWriteLost;
         }
-    } else {
+    } else if ((try tryParentRowExists(allocator, handle.id)) orelse false) {
         // lite-single-commit-write-path.md §7.6: the inverse of the check
         // above, and the whole point of the self-healing fix. No child
         // row is durably present, so if the crash landed in the window
@@ -373,7 +388,11 @@ fn checkViaSqlForeignKeyChild(allocator: Allocator, path: []const u8, outcome: ?
         // may still be sitting there with no child behind it. RESTRICT's
         // own existence check (`relational_integrity.zig`'s
         // `requireEmpty` + `ChildExistenceCheck`) must recognize it as
-        // stale and let the parent go, not block it forever.
+        // stale and let the parent go, not block it forever. Guarded by
+        // `tryParentRowExists`: at a crash point early enough that the
+        // parent's own seed INSERT never durably happened, "DELETE FROM
+        // parents" failing (or the table not existing at all) is not a
+        // self-heal question -- there is nothing to check yet.
         const code = try execOutcome(allocator, handle.id, "DELETE FROM parents WHERE id = 0");
         if (code != .ok) {
             std.debug.print("crash-consistency capi FK: parent DELETE blocked ({s}) with no child row durably present -- a dangling reference was not self-healed\n", .{@tagName(code)});
