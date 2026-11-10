@@ -1373,3 +1373,27 @@ def test_numeric_histogram_extremes_return_error_and_preserve_server(
         assert response.status_code == 400, response.text
     payload = api.query_table(name, {"limit": 1})
     assert payload.get("responses", [payload])[0].get("status", 200) == 200, payload
+
+
+def test_sdk_sql_output_aliases_are_unique_and_preserve_results(stateful_api):
+    api = stateful_api
+    fixture = json.loads(
+        (
+            Path(__file__).parent / "fixtures/time-series-sdk-sql-aliases.json"
+        ).read_text()
+    )
+    name = f"series_sql_alias_{time.time_ns()}"
+    finish_create_table(
+        api, name, api._request("POST", f"/tables/{name}", fixture["table"])
+    )
+    api.batch_write(name, inserts=fixture["readings"], sync_level="full_index")
+    for case in fixture["cases"]:
+        request = dict(case["sql"])
+        request["statement"] = request["statement"].replace('"fixture"', f'"{name}"')
+        response = api._request("POST", "/sql", request)
+        assert response.status_code == 200, (case["name"], response.text)
+        result = response.json()
+        names = [column["name"] for column in result["columns"]]
+        assert names == case["columns"], (case["name"], result)
+        assert len(set(names)) == len(names), (case["name"], result)
+        assert result["rows"] == case["rows"], (case["name"], result)
