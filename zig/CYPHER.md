@@ -6097,3 +6097,21 @@ The nine SQL diagnostic tests, generated error identities, control-source catalo
 and 2,560-file Apache boundary checks pass. The authenticated eight-owner
 standalone and replicated metadata/data campaigns pass again on this merged
 binary (53 and 215 seconds respectively).
+
+### Reporter-bounded readiness and cold routing contention
+
+Owner identity readiness resolves reporting store IDs from the selected-group
+report index before fetching store headers and active report roots. It caches
+each store once within the same read transaction, reads only active selected
+report slots, and omits stores referenced solely by obsolete report generations.
+Missing store headers on obsolete index entries remain ignorable; malformed
+active selected records remain errors. The control-plane report projection
+deliberately retains the full candidate store inventory for replica placement.
+
+Regression coverage preserves control-plane inventory, duplicate-group
+deduplication, active report-root selection after baseline activation and
+snapshot restore, missing-store and obsolete-generation filtering, and no
+per-read allocation growth with 512 poisoned unrelated store headers. The cold
+authoritative routing snapshot path uses the shared request budget while
+acquiring read-endpoint affinity, with held-mutex cancellation and deadline
+tests that admit no transport request.

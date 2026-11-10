@@ -27758,7 +27758,7 @@ const RemoteMetadataSource = struct {
         for (0..self.base_uris.len) |attempt| {
             try routing_budget.checkpoint();
             ensureBudgetActive(outer_budget) catch |err| return normalizeCatalogRoutingSnapshotError(err);
-            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const index = self.metadataReadApiIndexForAttemptWithBudget(attempt, outer_budget) catch |err| return normalizeCatalogRoutingSnapshotError(err);
             const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| blk: {
                 const now_ns = self.awakeNs();
                 break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt), .io = self.io, .cancellation = &signal };
@@ -47088,6 +47088,34 @@ fn consumerTests() type {
                 try std.testing.expectError(error.Canceled, RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, budget, true));
                 try std.testing.expectEqual(@as(usize, 6), token.calls);
             }
+        }
+
+        test "remote graph cold snapshot affinity wait honors cancellation and deadline" {
+            const Cancel = struct {
+                calls: usize = 0,
+                fn check(raw: *const anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.calls += 1;
+                    return self.calls >= 6;
+                }
+            };
+            const Stub = struct {
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    return error.TestUnexpectedResult;
+                }
+            };
+            var token: Cancel = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(std.testing.allocator, &.{"http://metadata.test"}, &.{.{ .ptr = &token, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            // Enter the cold authoritative snapshot path directly: this bypasses
+            // the generation/cache locks covered by the acquisition regression.
+            try std.testing.expect(source.cache_mutex.tryLock());
+            defer source.cache_mutex.unlock();
+            const budget: antfly.public_api.table_catalog.RoutingBudget = .{ .cancellation = .{ .ptr = &token, .is_cancelled_fn = Cancel.check } };
+            try std.testing.expectError(error.Canceled, source.remoteRoutingSnapshotWithBudget(budget, true));
+            try std.testing.expectEqual(@as(usize, 6), token.calls);
+            const deadline = source.catalogSource().budget(source.awakeNs() + 5 * std.time.ns_per_ms);
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteRoutingSnapshotWithBudget(deadline, true));
         }
 
         test "remote graph readiness forwards cancellation and stops endpoint retries" {

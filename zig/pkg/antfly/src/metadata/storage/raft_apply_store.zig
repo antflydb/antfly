@@ -12099,19 +12099,27 @@ pub const RaftApplyStore = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const rows = try docstore.DocStore.scanPrefixTxn(a, txn, try listingStorePrefix(a, group_id));
-        const headers = try a.alloc(metadata.StoreRecord, rows.len);
-        const addresses = try a.alloc(ReportAddress, rows.len);
-        const reports = try a.alloc(std.ArrayListUnmanaged(metadata.GroupStatusReport), rows.len);
-        @memset(reports, .empty);
-        const runtimes = try a.alloc(std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport), rows.len);
-        @memset(runtimes, .empty);
-        var positions: std.AutoHashMapUnmanaged(u64, usize) = .empty;
-        for (rows, headers, addresses, 0..) |row, *header, *address, i| {
-            try budget.checkpointIndex(i);
-            header.* = try decodeStoredHeader(a, row.value);
-            address.* = try ReportAddress.active(a, txn, group_id, header.store_id);
-            try positions.put(a, header.store_id, i);
+        const Store = struct {
+            header: metadata.StoreRecord,
+            address: ReportAddress,
+            reports: std.ArrayListUnmanaged(metadata.GroupStatusReport) = .empty,
+            runtimes: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty,
+            selected: bool = false,
+        };
+        var stores: std.ArrayListUnmanaged(Store) = .empty;
+        // Null caches missing store IDs referenced by obsolete index entries.
+        var positions: std.AutoHashMapUnmanaged(u64, ?usize) = .empty;
+        if (!include_identity) {
+            // Placement/control planning needs the entire candidate inventory,
+            // including stores which do not report any selected group yet.
+            const rows = try docstore.DocStore.scanPrefixTxn(a, txn, try listingStorePrefix(a, group_id));
+            try stores.ensureTotalCapacityPrecise(a, rows.len);
+            for (rows, 0..) |row, i| {
+                try budget.checkpointIndex(i);
+                const header = try decodeStoredHeader(a, row.value);
+                try positions.put(a, header.store_id, stores.items.len);
+                try stores.append(a, .{ .header = header, .address = try ReportAddress.active(a, txn, group_id, header.store_id) });
+            }
         }
         const Address = struct { store_index: usize, page: u64 };
         var pages: std.AutoHashMapUnmanaged(Address, [4][]const u8) = .empty;
@@ -12129,41 +12137,64 @@ pub const RaftApplyStore = struct {
                 try budget.checkpoint();
                 if (kv.value.len != 16) return error.InvalidCatalogRecord;
                 const store_id = std.mem.readInt(u64, kv.value[0..8], .little);
-                const i = positions.get(store_id) orelse continue;
-                if (!std.mem.eql(u8, kv.key, try listingReportKey(a, group_id, addresses[i], id))) continue;
+                const position = try positions.getOrPut(a, store_id);
+                if (!position.found_existing) {
+                    position.value_ptr.* = null;
+                    if (!include_identity) continue;
+                    var key: [160]u8 = undefined;
+                    const encoded = txn.get(try storeKeyForGroup(&key, group_id, store_id)) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    const header = try decodeStoredHeader(a, encoded);
+                    if (header.store_id != store_id) return error.InvalidCatalogRecord;
+                    position.value_ptr.* = stores.items.len;
+                    try stores.append(a, .{ .header = header, .address = try ReportAddress.active(a, txn, group_id, store_id) });
+                }
+                const i = position.value_ptr.* orelse continue;
+                const store = &stores.items[i];
+                if (!std.mem.eql(u8, kv.key, try listingReportKey(a, group_id, store.address, id))) continue;
+                store.selected = true;
                 const slot = std.mem.readInt(u64, kv.value[8..16], .little);
                 const page = try pages.getOrPut(a, .{ .store_index = i, .page = slot / report_page_slots });
                 if (!page.found_existing) {
                     for (if (include_identity) @as(usize, 0) else 2..4) |component| {
                         try budget.checkpoint();
-                        page.value_ptr[component] = try txn.get(try reportComponentKey(a, group_id, addresses[i], slot / report_page_slots, component));
+                        page.value_ptr[component] = try txn.get(try reportComponentKey(a, group_id, store.address, slot / report_page_slots, component));
                     }
                 }
                 var decoded = try decodeReportComponent(a, try reportPageEntry(page.value_ptr[2], slot), false);
                 try applyReportClocks(&decoded, try reportPageEntry(page.value_ptr[3], slot));
                 for (decoded.group_statuses) |report| if (report.group_id != id) return error.InvalidCatalogRecord;
-                try reports[i].appendSlice(a, decoded.group_statuses);
+                try store.reports.appendSlice(a, decoded.group_statuses);
                 if (include_identity) {
                     var runtime = try decodeReportComponent(a, try reportPageEntry(page.value_ptr[0], slot), true);
                     try applyReportClocks(&runtime, try reportPageEntry(page.value_ptr[1], slot));
                     for (runtime.runtime_statuses) |report| if (report.group_id != id) return error.InvalidCatalogRecord;
-                    try runtimes[i].appendSlice(a, runtime.runtime_statuses);
+                    try store.runtimes.appendSlice(a, runtime.runtime_statuses);
                 }
             }
         }
-        const out = try alloc.alloc(metadata.StoreRecord, headers.len);
+        var count: usize = 0;
+        for (stores.items) |store| if (!include_identity or store.selected) {
+            count += 1;
+        };
+        const out = try alloc.alloc(metadata.StoreRecord, count);
         var filled: usize = 0;
         errdefer {
             for (out[0..filled]) |record| metadata_table_manager.freeStore(alloc, record);
             alloc.free(out);
         }
-        for (headers, reports, runtimes, out) |header, facts, runtime, *record| {
-            var value = header;
-            value.group_statuses = facts.items;
-            value.runtime_statuses = runtime.items;
-            record.* = try metadata_table_manager.cloneStore(alloc, value);
+        for (stores.items) |store| {
+            if (include_identity and !store.selected) continue;
+            try budget.checkpointIndex(filled);
+            var value = store.header;
+            value.group_statuses = store.reports.items;
+            value.runtime_statuses = store.runtimes.items;
+            out[filled] = try metadata_table_manager.cloneStore(alloc, value);
             filled += 1;
         }
+        try budget.checkpoint();
         return out;
     }
 
@@ -41054,6 +41085,13 @@ test "system catalog baseline resumes after snapshot and activates atomically be
         try std.testing.expectEqual(@as(u64, 100), control[0].group_statuses[0].group_id);
         try std.testing.expectEqual(@as(usize, 0), control[0].runtime_statuses.len);
     }
+    {
+        const narrowed = try store.readSelectedStores(a, 21, &.{ 9, 100, 100 }, true, .{});
+        defer store.freeStores(a, narrowed);
+        try std.testing.expectEqual(@as(usize, 1), narrowed.len);
+        try std.testing.expectEqual(@as(usize, 1), narrowed[0].group_statuses.len);
+        try std.testing.expectEqual(@as(u64, 100), narrowed[0].group_statuses[0].group_id);
+    }
     // A sparse replacement after root activation reads and writes that root.
     var replacement = [_]metadata.GroupStatusReport{.{ .group_id = 100, .raft_term = 999 }};
     const update = try encodeTestReportUpdate(&store, a, .{ .sequence = plan.request.cursor.sequence + 1, .base = plan.request.cursor, .report = .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .group_statuses = &replacement } });
@@ -44956,6 +44994,62 @@ test "selected owner readiness reads indexed namespaces and ignores unrelated un
             try txn.put(try placementKeyForGroup(&key, 21, id, 30), placement);
         }
         try txn.commit();
+    }
+    // The control plane still sees stores without reports so it can place
+    // replicas there. The identity/readiness path must not materialize them.
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 40, .node_id = 50, .live = true, .health_class = "healthy" } });
+        try txn.commit();
+        const control = try store.readControlStores(a, 21, &.{1});
+        defer store.freeStores(a, control);
+        try std.testing.expectEqual(@as(usize, 2), control.len);
+        const narrowed = try store.readSelectedStores(a, 21, &.{ 1, 1, 2 }, true, .{});
+        defer store.freeStores(a, narrowed);
+        try std.testing.expectEqual(@as(usize, 1), narrowed.len);
+        try std.testing.expectEqual(@as(u64, 20), narrowed[0].store_id);
+        try std.testing.expectEqual(@as(usize, 2), narrowed[0].group_statuses.len);
+        try std.testing.expectEqual(@as(usize, 2), narrowed[0].runtime_statuses.len);
+    }
+    const baseline_bytes = measured: {
+        var counter = std.testing.FailingAllocator.init(a, .{});
+        const narrowed = try store.readSelectedStores(counter.allocator(), 21, &.{2}, true, .{});
+        store.freeStores(counter.allocator(), narrowed);
+        try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+        break :measured counter.allocated_bytes;
+    };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        // Poison unrelated headers. A cluster-wide inventory scan now
+        // fails this regression before it can inspect selected reports.
+        for (100..612) |id| {
+            var key: [160]u8 = undefined;
+            try txn.put(try storeKeyForGroup(&key, 21, id), "unrelated invalid header");
+        }
+        // Dangling and old-generation index rows must not fetch missing pages
+        // or retain a store twice. Neither row describes an active report.
+        for ([_]RaftApplyStore.ReportAddress{
+            .{ .store_id = 999 },
+            .{ .store_id = 20, .generation = .{ .incarnation = 123, .sequence = 456 } },
+        }) |address| {
+            const key = try RaftApplyStore.listingReportKey(a, 21, address, 1);
+            defer a.free(key);
+            var value: [16]u8 = @splat(0);
+            std.mem.writeInt(u64, value[0..8], address.store_id, .little);
+            try txn.put(key, &value);
+        }
+        try txn.commit();
+    }
+    {
+        var counter = std.testing.FailingAllocator.init(a, .{});
+        const narrowed = try store.readSelectedStores(counter.allocator(), 21, &.{2}, true, .{});
+        store.freeStores(counter.allocator(), narrowed);
+        try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+        // Warming storage buffers may reduce allocation, but unrelated
+        // inventory must never increase the selected read's allocation.
+        try std.testing.expect(counter.allocated_bytes <= baseline_bytes);
     }
     var request: @import("../api.zig").OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 1, .range_id = 1 }, .{ .group_id = 2, .shard_id = 2, .range_id = 2 } } };
     try std.testing.expectEqual(.ready, (try store.ownerReadiness(a, 21, request, .{})).status);
