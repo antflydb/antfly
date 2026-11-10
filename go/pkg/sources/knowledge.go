@@ -282,6 +282,38 @@ func nativeGraphResolvers(g GraphBinding, idx nativeSearchIndex) []nativeKnowled
 	})
 	return values
 }
+func nativeEntityMatches(e EntityBinding, r nativeKnowledgeResolver) bool {
+	return r.Name == e.Resolver && r.Table == e.Table && r.SourceArtifact == e.SourceArtifact && r.ResolutionArtifact == e.ResolutionArtifact && r.CandidateKeyPrefix == e.Namespace
+}
+
+// Entity-only discovery has no graph-query admission step to perform this
+// check later. Its advertised readiness must prove the active namespace too.
+func checkNativeEntityBinding(e EntityBinding, idx nativeSearchIndex) error {
+	if err := checkEntityBinding(e, idx.Config); err != nil {
+		return err
+	}
+	if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
+		return nil
+	}
+	if idx.Status.ResolverReplay == nil {
+		return fmt.Errorf("native entity resolver observation unavailable")
+	}
+	matched := false
+	for _, r := range idx.Status.ResolverReplay.Resolvers {
+		if r.Name != e.Resolver {
+			continue
+		}
+		if !nativeEntityMatches(e, r) {
+			return fmt.Errorf("active native entity resolver identity mismatch")
+		}
+		matched = true
+	}
+	if !matched {
+		return fmt.Errorf("active native entity resolver missing")
+	}
+	return nil
+}
+
 func checkNativeKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, idx nativeSearchIndex) error {
 	if err := checkKnowledgeGraph(k, g, idx.Config); err != nil {
 		return err
@@ -301,7 +333,7 @@ func checkNativeKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, idx nati
 	matched := map[string]bool{}
 	for _, r := range nativeGraphResolvers(g, idx) {
 		e, ok := declared[r.Name]
-		if !ok || r.Table != e.Table || r.SourceArtifact != e.SourceArtifact || r.ResolutionArtifact != e.ResolutionArtifact || r.CandidateKeyPrefix != e.Namespace {
+		if !ok || !nativeEntityMatches(e, r) {
 			return fmt.Errorf("undeclared active native graph resolver target")
 		}
 		matched[r.Name] = true
@@ -423,7 +455,7 @@ func ValidateInstalledKnowledge(ctx context.Context, client SearchIndexClient, b
 		if !ok {
 			return fmt.Errorf("entity %s observation unavailable: %v", e.Name, failures[e.Index])
 		}
-		if err := checkEntityBinding(e, idx.Config); err != nil {
+		if err := checkNativeEntityBinding(e, idx); err != nil {
 			return fmt.Errorf("entity %s: %w", e.Name, err)
 		}
 	}
@@ -500,7 +532,7 @@ func knowledgeStatusFromIndexes(b Binding, audience string, cache map[string]nat
 		return s
 	}
 	for _, e := range b.Knowledge.Entities {
-		out.Entities = append(out.Entities, state(e.Name, e.Index, func(c map[string]any) error { return checkEntityBinding(e, c) }))
+		out.Entities = append(out.Entities, state(e.Name, e.Index, func(c map[string]any) error { return checkNativeEntityBinding(e, cache[e.Index]) }))
 	}
 	for _, g := range b.Knowledge.Graphs {
 		out.Graphs = append(out.Graphs, state(g.Name, g.Index, func(c map[string]any) error { return checkNativeKnowledgeGraph(b.Knowledge, g, cache[g.Index]) }))

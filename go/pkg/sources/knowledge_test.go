@@ -147,6 +147,7 @@ type knowledgeClient struct {
 	response      string
 	generation    uint64
 	extraResolver map[string]any
+	activePrefix  *string
 	onQuery       func()
 }
 
@@ -155,6 +156,18 @@ func (c *knowledgeClient) InspectSearchIndex(context.Context, string, string) ([
 	resolvers, _ := c.config["resolvers"].([]any)
 	if c.extraResolver != nil {
 		resolvers = append(append([]any{}, resolvers...), c.extraResolver)
+	}
+	if c.activePrefix != nil {
+		observed := make([]any, 0, len(resolvers))
+		for _, value := range resolvers {
+			copy := map[string]any{}
+			for key, field := range value.(map[string]any) {
+				copy[key] = field
+			}
+			copy["candidate_key_prefix"] = *c.activePrefix
+			observed = append(observed, copy)
+		}
+		resolvers = observed
 	}
 	return json.Marshal(map[string]any{"config": c.config, "status": map[string]any{"resolver_replay": map[string]any{"resolvers": resolvers}, "readiness": map[string]any{"complete": c.complete, "queryable": c.complete, "incarnation": "knowledge-incarnation", "target_revision": c.generation, "published_revision": c.generation}}})
 }
@@ -258,4 +271,17 @@ func TestLocalKnowledgeQueryRejectsConcurrentPublicationRetirement(t *testing.T)
 	require.NoError(t, writeJSON(catalogPath, Catalog{Version: 2, Endpoint: server.URL, Sources: []Binding{binding}}, 32<<20))
 	_, err = (localManagement{s}).QueryKnowledge(t.Context(), testSourceID, KnowledgeRequest{Graph: "facts", Start: []string{"alice"}})
 	require.ErrorContains(t, err, "knowledge_changed_during_query")
+}
+
+func TestEntityOnlyDiscoveryRequiresActiveNativeScope(t *testing.T) {
+	plan, k := knowledgeFixture(t)
+	k.Graphs = nil
+	client := &knowledgeClient{config: plan.Indexes[0].Config, complete: true}
+	binding := Binding{Table: "docs", Knowledge: &k}
+	require.NoError(t, ValidateInstalledKnowledge(t.Context(), client, binding, "research"))
+	require.EqualValues(t, "ready", ObserveKnowledge(t.Context(), client, binding, "research").Entities[0].State)
+	unscoped := ""
+	client.activePrefix = &unscoped
+	require.Error(t, ValidateInstalledKnowledge(t.Context(), client, binding, "research"))
+	require.EqualValues(t, "unsupported", ObserveKnowledge(t.Context(), client, binding, "research").Entities[0].State)
 }
