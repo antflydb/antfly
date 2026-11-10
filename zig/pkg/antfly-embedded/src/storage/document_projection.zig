@@ -28,8 +28,8 @@ pub fn keyForRevision(key: anytype) Key {
     @memcpy(result[prefix.len..], key[key.len - 32 ..]);
     return result;
 }
-pub const FieldValue = struct { name: []const u8, value: []const u8 };
-pub const Source = union(enum) { bytes: []const u8, fields: []const FieldValue };
+pub const FieldValue = @import("read_document_values.zig").FieldValue;
+pub const Source = @import("read_document_values.zig").Source;
 pub const no_parent: u16 = 511;
 pub const maximum_fields = 512;
 pub const maximum_object_depth = 128;

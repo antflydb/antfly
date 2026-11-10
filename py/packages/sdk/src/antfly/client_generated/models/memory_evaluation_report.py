@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.memory_evaluation_counts import MemoryEvaluationCounts
 
@@ -22,6 +24,7 @@ class MemoryEvaluationReport:
         f1 (float | None):
         coverage (float | None):
         accuracy (float | None):
+        mean_tokens (float | None | Unset):
     """
 
     counts: MemoryEvaluationCounts
@@ -30,6 +33,7 @@ class MemoryEvaluationReport:
     f1: float | None
     coverage: float | None
     accuracy: float | None
+    mean_tokens: float | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         counts = self.counts.to_dict()
@@ -49,6 +53,12 @@ class MemoryEvaluationReport:
         accuracy: float | None
         accuracy = self.accuracy
 
+        mean_tokens: float | None | Unset
+        if isinstance(self.mean_tokens, Unset):
+            mean_tokens = UNSET
+        else:
+            mean_tokens = self.mean_tokens
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -61,6 +71,8 @@ class MemoryEvaluationReport:
                 "accuracy": accuracy,
             }
         )
+        if mean_tokens is not UNSET:
+            field_dict["mean_tokens"] = mean_tokens
 
         return field_dict
 
@@ -106,6 +118,15 @@ class MemoryEvaluationReport:
 
         accuracy = _parse_accuracy(d.pop("accuracy"))
 
+        def _parse_mean_tokens(data: object) -> float | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(float | None | Unset, data)
+
+        mean_tokens = _parse_mean_tokens(d.pop("mean_tokens", UNSET))
+
         memory_evaluation_report = cls(
             counts=counts,
             precision=precision,
@@ -113,6 +134,7 @@ class MemoryEvaluationReport:
             f1=f1,
             coverage=coverage,
             accuracy=accuracy,
+            mean_tokens=mean_tokens,
         )
 
         return memory_evaluation_report

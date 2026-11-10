@@ -55,5 +55,6 @@ jobs:
       - name: Publish the validated gitlink using the existing Colony writer
         env:
           COLONY_DISPATCH_TOKEN: ${{ secrets.COLONY_DISPATCH_TOKEN }}
+          ANTFLY_READ_TOKEN: ${{ github.token }}
           SYNC_REQUEST: ${{ needs.trigger.outputs.sync_request }}
         run: python3 .github/scripts/publish_colony_pin.py

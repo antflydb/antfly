@@ -35,6 +35,7 @@ import requests
         {"max_explored_edges": 1},
     ],
 )
+@pytest.mark.e2e_resource("antfly_process")
 def test_graph_operator_ceilings_cover_sql_and_staged_graphs(monkeypatch, ceiling):
     binary = os.environ.get("ANTFLY_BIN", str(conftest.DEFAULT_ANTFLY_BIN))
     if not Path(binary).exists():
@@ -161,6 +162,7 @@ def test_graph_operator_ceilings_cover_sql_and_staged_graphs(monkeypatch, ceilin
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_completed_graph_statements_release_cuts_and_reject_bound_redeclarations():
     binary = os.environ.get("ANTFLY_BIN", str(conftest.DEFAULT_ANTFLY_BIN))
     if not Path(binary).exists():

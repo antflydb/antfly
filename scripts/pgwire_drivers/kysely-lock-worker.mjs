@@ -22,6 +22,9 @@ import {
 	createAntflyPostgres,
 } from "../../ts/packages/sdk/dist/kysely.js";
 
+// Exercise parent-side failure reporting without creating a database claim.
+if (process.argv[2] === "exit-before-report") process.exit(17);
+
 const url = new URL(process.env.ANTFLY_PGWIRE_URL);
 const client = new AntflyClient({
 	baseUrl: process.env.ANTFLY_HTTP_URL,

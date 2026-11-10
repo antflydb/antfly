@@ -328,7 +328,17 @@ components:
         config: {type: object, additionalProperties: true}
         permissions: {$ref: '#/components/schemas/Permissions'}
         permission_ttl_seconds: {type: integer}
-        publication: {type: string, enum: [text, media], default: text}
+        publication: {type: string, enum: [native, text, media], default: native}
+        search_version: {type: integer, minimum: 1, maximum: 2}
+        streams:
+          type: array
+          maxItems: 64
+          items: {$ref: './management.yaml#/components/schemas/SearchStream'}
+        artifacts:
+          type: array
+          maxItems: 64
+          items: {$ref: './management.yaml#/components/schemas/ArtifactBinding'}
+        processing: {$ref: './management.yaml#/components/schemas/ProcessingDeclaration'}
         identity: {$ref: '#/components/schemas/SourceIdentity'}
     Profile:
       type: object

@@ -30,22 +30,44 @@ def graph_db(require_native, tmp_path, request):
     storage = request.param
     path = tmp_path / ("graph.aflite" if storage == af.Storage.LITE else "graph")
     opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
-    with closing(opener(path, af.OpenOptions(storage=storage))) as db:
-        db.sql("CREATE TABLE docs (id TEXT,score BIGINT)")
-        with db.open_table("docs") as table:
-            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
-        db.graph_catalog_json(
-            {
-                "action": "put",
-                "name": "g",
-                "definition": {
-                    "labels": [{"name": name, "table": "docs"} for name in ("D", "Other")],
-                    "relationships": [
-                        {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
-                    ],
-                },
-            }
-        )
+    # These qualify physical work/memory bounds and SQL postimages. Keep the
+    # real file format and reopen behavior without fsync on every fixture write;
+    # crash durability has separate SDK and recovery coverage.
+    with closing(opener(path, af.OpenOptions(storage=storage, no_sync=True))) as db:
+        _seed_graph(db)
+        yield db
+
+
+def _seed_graph(db):
+    db.sql("CREATE TABLE docs (id TEXT,score BIGINT)")
+    with db.open_table("docs") as table:
+        table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "g",
+            "definition": {
+                "labels": [{"name": name, "table": "docs"} for name in ("D", "Other")],
+                "relationships": [
+                    {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                ],
+            },
+        }
+    )
+
+
+@pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
+def scalar_graph_db(require_native, tmp_path_factory, request):
+    """Constant-domain proofs share an immutable graph on each real engine."""
+    storage = request.param
+    root = tmp_path_factory.mktemp("scalar-graph")
+    path = root / ("graph.aflite" if storage == af.Storage.LITE else "graph")
+    opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+    with closing(opener(path, af.OpenOptions(storage=storage, no_sync=True))) as db:
+        _seed_graph(db)
+    # Enforce isolation at the engine boundary. Each query still gets its own
+    # planner, limits and execution state; fixture mutation is rejected.
+    with closing(af.open_with_options(path, af.OpenOptions(storage=storage, mode=af.OpenMode.READONLY))) as db:
         yield db
 
 
@@ -55,6 +77,27 @@ def populate(db, count):
             "INSERT INTO docs (_id,id,score) VALUES "
             + ",".join(f"('n{i}','n{i}',{i})" for i in range(start, min(start + 500, count)))
         )
+
+
+@pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
+def ranked_graph_db(require_native, tmp_path_factory, request):
+    """Query-only planner consumers share the same complete indexed corpus."""
+    storage = request.param
+    root = tmp_path_factory.mktemp("ranked-graph")
+    path = root / ("graph.aflite" if storage == af.Storage.LITE else "graph")
+    opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+    with closing(opener(path, af.OpenOptions(storage=storage, no_sync=True))) as db:
+        _seed_graph(db)
+        # Keep the population above the unordered-source limit, including
+        # native paging and large-offset coverage. Mutation cases build their
+        # own writable databases; query limits and state remain per request.
+        populate(db, 13000)
+        db.sql("CREATE INDEX ranked ON docs(score DESC)")
+        db.run_until_idle()
+        # Retain the owner: indexed Lite reads currently need the serving
+        # owner's statement leases. These consumers issue queries only; every
+        # mutation/rebuild regression continues using the private graph_db.
+        yield db
 
 
 def test_point_reads_and_writes_do_not_capture_the_graph(graph_db):
@@ -3187,7 +3230,10 @@ def test_independent_segment_statistics_keep_marginals_compressed(graph_db):
 
 def test_sql_graph_statistics_use_consumer_certificates(graph_db):
     db = graph_db
-    layers = 512
+    # 257 vertices still cross a native page, and the path multiplicity is
+    # larger than u128. Extra layers multiply setup and moment propagation
+    # without adding a new certificate/overflow boundary.
+    layers = 128
     documents = {"start": {"id": "start", "score": 0}}
     documents.update({f"v{i}_{j}": {"id": f"v{i}_{j}", "score": i + 1} for i in range(layers) for j in range(2)})
     pairs = [("start", f"v{i}_{j}") for i in range(2) for j in range(2)]
@@ -3215,6 +3261,7 @@ def test_sql_graph_statistics_use_consumer_certificates(graph_db):
     for _ in range(2, layers + 1):
         sums.append(2 * (sums[-1] + counts[-1]) + 2 * (sums[-2] + counts[-2]))
         counts.append(2 * counts[-1] + 2 * counts[-2])
+    assert sum(counts[1:]) > 1 << 128
     average = sum(sums[1:]) / sum(counts[1:])
     relation = "GRAPH_TABLE(g MATCH p=(s IS D)-[rs IS R*]->(b IS D) WHERE s.id='start' COLUMNS(length(p) AS hops)) q"
     for query in (
@@ -4007,7 +4054,10 @@ def test_richer_statistics_preserve_support_holes_filters_and_errors(graph_db):
 
 def test_statistic_cohorts_and_grouped_supports_stay_compressed(graph_db):
     db = graph_db
-    layers = 512
+    # 257 vertices still cross a native page, and the path multiplicity is
+    # larger than u128. Extra layers multiply setup and moment propagation
+    # without adding a new certificate/overflow boundary.
+    layers = 128
     documents = {"start": {"id": "start", "score": 0}}
     documents.update({f"v{i}_{j}": {"id": f"v{i}_{j}", "score": i + 1} for i in range(layers) for j in range(2)})
     pairs = [("start", f"v{i}_{j}") for i in range(2) for j in range(2)]
@@ -4032,6 +4082,7 @@ def test_statistic_cohorts_and_grouped_supports_stay_compressed(graph_db):
             )
     db.sql("CREATE INDEX docs_id ON docs(id)")
     counts, first, second, third = layered_length_moments(layers)
+    assert counts > 1 << 128
     base = "MATCH p=(s:D {id:'start'})-[:R*1..]->(b:D) "
     limits = {"explored_edges": 5000, "intermediate_states": 200000}
     mixed = db.cypher_json(
@@ -5914,14 +5965,14 @@ def test_mapped_axes_and_distinct_sums_share_immutable_domains(graph_db):
         )
 
 
-def test_range_sum_certificates_preserve_order_and_bag_multiplicity(graph_db):
+def test_range_sum_certificates_preserve_order_and_bag_multiplicity(scalar_graph_db):
     for source, expected in (
         ("range(1,1000000000)", 500000000500000000),
         ("reverse(range(-1000000000,1000000000))", 0),
         ("range(1,1000000)+reverse(range(1,1000000))+range(1,1000000)", 1500001500000),
         ("range(3,1)", 0),
     ):
-        result = graph_db.cypher_json(
+        result = scalar_graph_db.cypher_json(
             "g",
             {
                 "query": f"UNWIND {source} AS x RETURN sum(x)",
@@ -5934,12 +5985,12 @@ def test_range_sum_certificates_preserve_order_and_bag_multiplicity(graph_db):
         "range(9223372036854775807,9223372036854775807)+range(1,1)+range(-1,-1)",
     ):
         with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
-            graph_db.cypher_json("g", {"query": f"UNWIND {source} AS x RETURN sum(x)"})
+            scalar_graph_db.cypher_json("g", {"query": f"UNWIND {source} AS x RETURN sum(x)"})
 
 
 @pytest.mark.parametrize("payload", ["x" * 1000000, "é🙂" * 55000], ids=["ascii", "unicode"])
-def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, payload):
-    result = graph_db.cypher_json(
+def test_dynamic_substrings_share_validation_and_unicode_offsets(scalar_graph_db, payload):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(100000,100099) AS i RETURN substring($s,i,1)",
@@ -5981,7 +6032,7 @@ def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, paylo
         "ordered_by_value",
     ],
 )
-def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
+def test_ordered_aggregate_domains_share_exact_reducer_states(scalar_graph_db, case):
     parameters = {"xs": list(range(1000)), "lists": [list(range(500)), list(range(250, 750))]}
     tails = {
         "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
@@ -6033,7 +6084,7 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
         parameters["xs"] = [i / 10 for i in range(1000)]
     tail, expected = tails[case]
     order = "" if case == "ordered_no_final" else " ORDER BY a" if case == "ordered_by_value" else " ORDER BY i"
-    result = graph_db.cypher_json(
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(1,30) AS i " + tail + order,
@@ -6055,20 +6106,20 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
     ] == [[i, *expected] for i in range(1, 31)]
 
 
-def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(graph_db):
+def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(scalar_graph_db):
     query = (
         "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x "
         "RETURN i,avg(x),sum(x),avg(DISTINCT x),sum(DISTINCT x) ORDER BY i"
     )
     parameters = {"lists": [[1.0, 2.0], [2, 3], [1, 4]]}
-    actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
+    actual = scalar_graph_db.cypher_json("g", {"query": query, "parameters": parameters})
     # COALESCE keeps the reference COLLECT unbounded and excludes memoization.
     # Its NULL inputs retain no cells, so reference memory stays bounded.
     control = query.replace(" ORDER BY i", ",sum(0)+size(coalesce(collect(null),[])) AS forced ORDER BY i")
-    expected = graph_db.cypher_json("g", {"query": control, "parameters": parameters})
+    expected = scalar_graph_db.cypher_json("g", {"query": control, "parameters": parameters})
     assert actual["rows"] == [row[:-1] for row in expected["rows"]]
     with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {"query": "UNWIND [1,2] AS i UNWIND [1] AS x WITH i,1/0 AS bad,x AS y UNWIND [] AS z RETURN i,avg(y)"},
         )
@@ -6082,12 +6133,12 @@ def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(graph_db
         "WITH DISTINCT i,x WITH DISTINCT i,x RETURN i,count(*),collect(DISTINCT x)[0..2],collect(DISTINCT x)[-2..]",
     ],
 )
-def test_partition_membership_and_bounded_collection_continuations_match_reference(graph_db, tail):
+def test_partition_membership_and_bounded_collection_continuations_match_reference(scalar_graph_db, tail):
     query = "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x " + tail
     control = query + ",size(coalesce(collect(null),[])) AS reference"
     parameters = {"lists": [[None, 1, 2, 1.0], [2, 3, 4], [], [4, 5]]}
-    actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
-    expected = graph_db.cypher_json("g", {"query": control, "parameters": parameters})
+    actual = scalar_graph_db.cypher_json("g", {"query": query, "parameters": parameters})
+    expected = scalar_graph_db.cypher_json("g", {"query": control, "parameters": parameters})
     assert actual["rows"] == [row[:-1] for row in expected["rows"]]
 
 
@@ -6095,12 +6146,12 @@ def test_partition_membership_and_bounded_collection_continuations_match_referen
     "xs",
     [[], [None], [1, 2, 1, None, 3], [1.0, 2, 2.0, -0.0], [1e16, 1, -1e16], [1, "bad", {"x": 1}]],
 )
-def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
+def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(scalar_graph_db, xs):
     parameters = {"xs": xs, "lists": [xs, [], [None, 2], xs]}
 
     def outcome(query):
         try:
-            return ("ok", graph_db.cypher_json("g", {"query": query, "parameters": parameters})["rows"])
+            return ("ok", scalar_graph_db.cypher_json("g", {"query": query, "parameters": parameters})["rows"])
         except af.AntflyError as error:
             return ("error", str(error))
 
@@ -6159,8 +6210,8 @@ def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
     assert outcome(wildcard) == outcome(wildcard.replace("WITH *", "WITH i,x"))
 
 
-def test_count_group_windows_reuse_complete_successful_domains(graph_db):
-    result = graph_db.cypher_json(
+def test_count_group_windows_reuse_complete_successful_domains(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y WHERE y>100 RETURN i,count(y) ORDER BY i LIMIT 5",
@@ -6173,12 +6224,12 @@ def test_count_group_windows_reuse_complete_successful_domains(graph_db):
     # must still evaluate the original COUNT argument before discarding rows.
     for limit in (0, 1):
         with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-            graph_db.cypher_json(
+            scalar_graph_db.cypher_json(
                 "g", {"query": f"UNWIND [3,1,2] AS i UNWIND [1,0] AS x RETURN i,count(1/x) ORDER BY i LIMIT {limit}"}
             )
 
         with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-            graph_db.cypher_json(
+            scalar_graph_db.cypher_json(
                 "g",
                 {
                     "query": f"UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad RETURN i,count(x) ORDER BY i LIMIT {limit}"
@@ -6186,8 +6237,8 @@ def test_count_group_windows_reuse_complete_successful_domains(graph_db):
             )
 
 
-def test_ordered_count_windows_reuse_validated_domains(graph_db):
-    result = graph_db.cypher_json(
+def test_ordered_count_windows_reuse_validated_domains(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,count(x) ORDER BY i LIMIT 5",
@@ -6198,7 +6249,7 @@ def test_ordered_count_windows_reuse_validated_domains(graph_db):
     assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 1000] for i in range(1, 6)]
     for limit in (0, 1):
         with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-            graph_db.cypher_json(
+            scalar_graph_db.cypher_json(
                 "g",
                 {
                     "query": f"UNWIND [3,1,2] AS i UNWIND [1,0] AS x WITH i,x ORDER BY x RETURN i,count(1/x) ORDER BY i LIMIT {limit}"
@@ -6207,8 +6258,8 @@ def test_ordered_count_windows_reuse_validated_domains(graph_db):
 
 
 @pytest.mark.parametrize("child", ["RETURN x+1 AS y", "CALL {RETURN x AS z} RETURN z+1 AS y", "RETURN count(x) AS y"])
-def test_singleton_call_keeps_count_group_window_bounded(graph_db, child):
-    result = graph_db.cypher_json(
+def test_singleton_call_keeps_count_group_window_bounded(scalar_graph_db, child):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND range(1,10000) AS i UNWIND [0,1] AS x CALL {{{child}}} RETURN i,count(y) ORDER BY i LIMIT 5",
@@ -6220,9 +6271,9 @@ def test_singleton_call_keeps_count_group_window_bounded(graph_db, child):
 
 
 @pytest.mark.parametrize("limit", [0, 1])
-def test_count_window_does_not_hide_uncertified_symbolic_cardinality(graph_db, limit):
+def test_count_window_does_not_hide_uncertified_symbolic_cardinality(scalar_graph_db, limit):
     with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x "
@@ -6278,8 +6329,8 @@ def test_constant_call_keys_match_execution_without_scalar_normalization(graph_d
             assert run(queries[0], values) == run(queries[1], values)
 
 
-def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(graph_db):
-    result = graph_db.cypher_json(
+def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND [3,1,2,1] AS i UNWIND range(1,1000000000000000) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
@@ -6291,7 +6342,7 @@ def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(g
     assert result["plan"][0]["output_rows"] == 4
     assert result["plan"][1]["output_rows"] == 4000000000000000
     with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x "
@@ -6318,19 +6369,21 @@ def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(g
     ],
 )
 @pytest.mark.parametrize("distinct", ["", "DISTINCT "])
-def test_call_count_window_keeps_middle_error_before_return_argument_error(graph_db, source, limit, body, distinct):
+def test_call_count_window_keeps_middle_error_before_return_argument_error(
+    scalar_graph_db, source, limit, body, distinct
+):
     with pytest.raises(af.AntflyError, match="CypherTypeMismatch"):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {"query": source + f" CALL {{{body}}} RETURN i,count({distinct}1/x) ORDER BY i LIMIT {limit}"},
         )
 
 
 @pytest.mark.parametrize("source", ["UNWIND $groups AS i", "WITH $groups AS gs UNWIND gs AS i"])
-def test_parameter_primitive_keys_share_call_domains(graph_db, source):
+def test_parameter_primitive_keys_share_call_domains(scalar_graph_db, source):
     parameters = {"groups": list(range(1, 31)), "xs": list(range(1000))}
     outputs = [
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": f"{source} UNWIND $xs AS x CALL {{{body}}} RETURN i,avg(y) ORDER BY i",
@@ -6357,8 +6410,8 @@ def test_parameter_primitive_keys_share_call_domains(graph_db, source):
         ("RETURN 7 AS y LIMIT 0", "count(*)", [0]),
     ],
 )
-def test_independent_singleton_calls_preserve_symbolic_axis_domains(graph_db, body, projection, expected):
-    result = graph_db.cypher_json(
+def test_independent_singleton_calls_preserve_symbolic_axis_domains(scalar_graph_db, body, projection, expected):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} RETURN {projection}",
@@ -6373,19 +6426,19 @@ def test_independent_singleton_calls_preserve_symbolic_axis_domains(graph_db, bo
     "body",
     ["RETURN 7 AS x", "CALL {RETURN 7 AS x} RETURN 7 AS y"],
 )
-def test_independent_call_axis_compression_retains_output_binding_conflicts(graph_db, body):
+def test_independent_call_axis_compression_retains_output_binding_conflicts(scalar_graph_db, body):
     with pytest.raises(af.AntflyError, match="CypherVariableConflict"):
-        graph_db.cypher_json("g", {"query": f"UNWIND [7,8] AS x CALL {{{body}}} RETURN count(*)"})
+        scalar_graph_db.cypher_json("g", {"query": f"UNWIND [7,8] AS x CALL {{{body}}} RETURN count(*)"})
 
 
 @pytest.mark.parametrize(
     "source,expression",
     [("range(1,30)", "toInteger(i)"), ("$groups", "i+1"), ("range(1,30)", "size(range(1,i))")],
 )
-def test_derived_primitive_keys_share_call_domains(graph_db, source, expression):
+def test_derived_primitive_keys_share_call_domains(scalar_graph_db, source, expression):
     prefix = f"UNWIND {source} AS i WITH i,{expression} AS j UNWIND $xs AS x "
     outputs = [
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": prefix + f"CALL {{{body}}} RETURN i,avg(y) ORDER BY i",
@@ -6409,8 +6462,8 @@ def test_derived_primitive_keys_share_call_domains(graph_db, source, expression)
         ("CALL {UNWIND [7,8] AS z RETURN z} RETURN z AS y", [2000000, 7, 8]),
     ],
 )
-def test_independent_expanding_calls_preserve_compressed_bags(graph_db, body, expected):
-    result = graph_db.cypher_json(
+def test_independent_expanding_calls_preserve_compressed_bags(scalar_graph_db, body, expected):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} RETURN count(*),min(y),max(y)",
@@ -6422,9 +6475,9 @@ def test_independent_expanding_calls_preserve_compressed_bags(graph_db, body, ex
     assert result["plan"][1]["output_rows"] == expected[0]
 
 
-def test_expanding_call_count_window_retains_bounded_memory(graph_db):
+def test_expanding_call_count_window_retains_bounded_memory(scalar_graph_db):
     results = [
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": "UNWIND range(1,10000) AS i UNWIND [0,1] AS x "
@@ -6445,8 +6498,8 @@ def test_expanding_call_count_window_retains_bounded_memory(graph_db):
     [("RETURN 7 AS y", 3), ("UNWIND [7,8] AS y RETURN y", 6), ("RETURN 7 AS y LIMIT 0", 0)],
 )
 @pytest.mark.parametrize("projection", ["count(*)", "count(*),min(x)"])
-def test_call_plan_counts_emitted_child_multiplicity(graph_db, body, expected, projection):
-    result = graph_db.cypher_json("g", {"query": f"UNWIND range(1,3) AS x CALL {{{body}}} RETURN {projection}"})
+def test_call_plan_counts_emitted_child_multiplicity(scalar_graph_db, body, expected, projection):
+    result = scalar_graph_db.cypher_json("g", {"query": f"UNWIND range(1,3) AS x CALL {{{body}}} RETURN {projection}"})
     assert int(result["rows"][0][0]["value"]) == expected
     assert result["plan"][1]["output_rows"] == expected
     assert result["plan"][2]["input_rows"] == expected
@@ -6459,9 +6512,9 @@ def test_call_plan_counts_emitted_child_multiplicity(graph_db, body, expected, p
         "CALL {UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN 7 AS y}",
     ],
 )
-def test_expanding_call_window_retains_overflow_from_rejected_groups(graph_db, middle):
+def test_expanding_call_window_retains_overflow_from_rejected_groups(scalar_graph_db, middle):
     with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": f"UNWIND [1,2] AS i {middle} RETURN i,count(y) ORDER BY i LIMIT 1",
@@ -6481,10 +6534,10 @@ def test_expanding_call_window_retains_overflow_from_rejected_groups(graph_db, m
         "head(CASE WHEN i>10 THEN [i] ELSE [0] END)",
     ],
 )
-def test_branch_and_element_keys_share_call_domains(graph_db, expression):
+def test_branch_and_element_keys_share_call_domains(scalar_graph_db, expression):
     prefix = f"UNWIND $groups AS i WITH i,{expression} AS j UNWIND $xs AS x "
     results = [
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": prefix + f"CALL {{{body}}} RETURN i,avg(y) ORDER BY i",
@@ -6510,8 +6563,8 @@ def test_branch_and_element_keys_share_call_domains(graph_db, expression):
         ("UNWIND range(1,1000) AS z RETURN 7 AS y", 1000),
     ],
 )
-def test_observed_range_axes_compose_call_cardinality_and_set_support(graph_db, body, copies):
-    result = graph_db.cypher_json(
+def test_observed_range_axes_compose_call_cardinality_and_set_support(scalar_graph_db, body, copies):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} "
@@ -6537,8 +6590,8 @@ def test_observed_range_axes_compose_call_cardinality_and_set_support(graph_db, 
         ("UNWIND range(9000,1,-1) AS i CALL {UNWIND [0,1,0] AS x RETURN x}", "{v:x}"),
     ],
 )
-def test_distinct_group_windows_bound_membership_through_eviction(graph_db, prefix, argument):
-    result = graph_db.cypher_json(
+def test_distinct_group_windows_bound_membership_through_eviction(scalar_graph_db, prefix, argument):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"{prefix} RETURN i,count(DISTINCT {argument}) ORDER BY i LIMIT 5",
@@ -6553,9 +6606,9 @@ def test_distinct_group_windows_bound_membership_through_eviction(graph_db, pref
     "source",
     ["[9223372036854775807,-9223372036854775807]", "[-9223372036854775807,9223372036854775807]"],
 )
-def test_observed_call_sums_retain_repeated_element_prefix_overflow(graph_db, source):
+def test_observed_call_sums_retain_repeated_element_prefix_overflow(scalar_graph_db, source):
     with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {
                 "query": f"UNWIND {source} AS x CALL {{UNWIND [7,8] AS y RETURN y}} RETURN sum(x)",
@@ -6564,8 +6617,8 @@ def test_observed_call_sums_retain_repeated_element_prefix_overflow(graph_db, so
         )
 
 
-def test_distinct_windows_reuse_wide_immutable_argument_analysis(graph_db):
-    result = graph_db.cypher_json(
+def test_distinct_windows_reuse_wide_immutable_argument_analysis(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(10000,1,-1) AS i UNWIND [0,1,0] AS x "
@@ -6577,8 +6630,8 @@ def test_distinct_windows_reuse_wide_immutable_argument_analysis(graph_db):
     assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 1] for i in range(1, 6)]
 
 
-def test_observed_parameter_lists_keep_bag_counts_and_shared_distinct_support(graph_db):
-    result = graph_db.cypher_json(
+def test_observed_parameter_lists_keep_bag_counts_and_shared_distinct_support(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND $xs AS x CALL {UNWIND [7,7,8] AS y RETURN y} "
@@ -6600,8 +6653,8 @@ def test_observed_parameter_lists_keep_bag_counts_and_shared_distinct_support(gr
         "reverse(range(1,500000)+range(500001,1000000))",
     ],
 )
-def test_affine_observers_compress_expanding_calls_without_enumerating_ranges(graph_db, source):
-    result = graph_db.cypher_json(
+def test_affine_observers_compress_expanding_calls_without_enumerating_ranges(scalar_graph_db, source):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {source} AS x CALL {{UNWIND [7,8] AS y RETURN y}} "
@@ -6619,15 +6672,15 @@ def test_affine_observers_compress_expanding_calls_without_enumerating_ranges(gr
     "aggregate", ["min(x)", "max(x)", "min(x),max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)"]
 )
 @pytest.mark.parametrize("source", ["range(1,40000)", "range(10000,1,-1)"])
-def test_numeric_and_extrema_windows_bound_group_state_through_eviction(graph_db, aggregate, source):
-    result = graph_db.cypher_json(
+def test_numeric_and_extrema_windows_bound_group_state_through_eviction(scalar_graph_db, aggregate, source):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {source} AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} ORDER BY i LIMIT 5",
             "limits": {"memory_bytes": 2 << 20},
         },
     )
-    expected = graph_db.cypher_json(
+    expected = scalar_graph_db.cypher_json(
         "g",
         {"query": f"UNWIND range(1,5) AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} ORDER BY i"},
     )
@@ -6635,8 +6688,8 @@ def test_numeric_and_extrema_windows_bound_group_state_through_eviction(graph_db
     assert result["stats"]["memory_bytes"] < 200000
 
 
-def test_unsafe_window_packet_bound_preserves_symbolic_fallback(graph_db):
-    result = graph_db.cypher_json(
+def test_unsafe_window_packet_bound_preserves_symbolic_fallback(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND [1,2] AS i UNWIND range(1,1000000) AS x RETURN i,sum(x+9000000000000) ORDER BY i LIMIT 1",
@@ -6648,8 +6701,8 @@ def test_unsafe_window_packet_bound_preserves_symbolic_fallback(graph_db):
 
 @pytest.mark.parametrize("source", ["range(1,1000000)", "reverse(range(1,500000)+range(500001,1000000))", "$xs"])
 @pytest.mark.parametrize("child", ["", "CALL {UNWIND [7,8] AS y RETURN y} "])
-def test_bounded_numeric_windows_preserve_compressed_inner_domains(graph_db, source, child):
-    result = graph_db.cypher_json(
+def test_bounded_numeric_windows_preserve_compressed_inner_domains(scalar_graph_db, source, child):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND [1,2] AS i UNWIND {source} AS x {child}RETURN i,min(x),max(x),sum(x) ORDER BY i LIMIT 1",
@@ -6674,9 +6727,9 @@ def test_bounded_numeric_windows_preserve_compressed_inner_domains(graph_db, sou
         "({v:{k:[i]}}).v.k[0]",
     ],
 )
-def test_structured_scalar_results_remove_only_dead_primitive_keys(graph_db, expression):
+def test_structured_scalar_results_remove_only_dead_primitive_keys(scalar_graph_db, expression):
     prefix = f"UNWIND range(1,30) AS i WITH i,{expression} AS j UNWIND $xs AS x "
-    result = graph_db.cypher_json(
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": prefix + "CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
@@ -6684,7 +6737,7 @@ def test_structured_scalar_results_remove_only_dead_primitive_keys(graph_db, exp
             "limits": {"intermediate_states": 100000},
         },
     )
-    expected = graph_db.cypher_json(
+    expected = scalar_graph_db.cypher_json(
         "g",
         {
             "query": prefix + "CALL {WITH avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
@@ -6703,32 +6756,34 @@ def test_structured_scalar_results_remove_only_dead_primitive_keys(graph_db, exp
         ("avg(x)", "[1,'bad']", "CypherTypeMismatch"),
     ],
 )
-def test_rejected_numeric_windows_preserve_argument_and_prefix_failures(graph_db, limit, aggregate, source, error):
+def test_rejected_numeric_windows_preserve_argument_and_prefix_failures(
+    scalar_graph_db, limit, aggregate, source, error
+):
     with pytest.raises(af.AntflyError, match=error):
-        graph_db.cypher_json(
+        scalar_graph_db.cypher_json(
             "g",
             {"query": f"UNWIND [1,2] AS i UNWIND {source} AS x RETURN i,{aggregate} ORDER BY i LIMIT {limit}"},
         )
 
 
 @pytest.mark.parametrize("aggregate", ["min(x)", "max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)"])
-def test_ordered_numeric_windows_reuse_certified_domains(graph_db, aggregate):
+def test_ordered_numeric_windows_reuse_certified_domains(scalar_graph_db, aggregate):
     def query(groups):
         return (
             f"UNWIND range(1,{groups}) AS i UNWIND [0,1,0] AS x WITH i,x ORDER BY x DESC "
             f"RETURN i,{aggregate} ORDER BY i LIMIT 5"
         )
 
-    actual = graph_db.cypher_json("g", {"query": query(10000), "limits": {"memory_bytes": 2 << 20}})
-    expected = graph_db.cypher_json("g", {"query": query(5)})
+    actual = scalar_graph_db.cypher_json("g", {"query": query(10000), "limits": {"memory_bytes": 2 << 20}})
+    expected = scalar_graph_db.cypher_json("g", {"query": query(5)})
     assert actual["rows"] == expected["rows"]
     assert actual["stats"]["memory_bytes"] < 200000
 
 
 @pytest.mark.parametrize("source", ["range(1,1000000)", "reverse(range(1,500000)+range(500001,1000000))"])
 @pytest.mark.parametrize("argument", ["x", "x+1", "0*x+7"])
-def test_sum_distinct_ranges_keep_exact_symbolic_support(graph_db, source, argument):
-    actual = graph_db.cypher_json(
+def test_sum_distinct_ranges_keep_exact_symbolic_support(scalar_graph_db, source, argument):
+    actual = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {source} AS x RETURN count(DISTINCT {argument}),sum(DISTINCT {argument})",
@@ -6743,8 +6798,8 @@ def test_sum_distinct_ranges_keep_exact_symbolic_support(graph_db, source, argum
 @pytest.mark.parametrize("groups", ["[1,2]", "[1,2,1,2]"])
 @pytest.mark.parametrize("child", ["", "CALL {UNWIND [7,8] AS y RETURN y} "])
 @pytest.mark.parametrize("window", ["", " LIMIT 1"])
-def test_grouped_distinct_ranges_reuse_typed_packets(graph_db, groups, child, window):
-    actual = graph_db.cypher_json(
+def test_grouped_distinct_ranges_reuse_typed_packets(scalar_graph_db, groups, child, window):
+    actual = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {groups} AS g UNWIND range(1,1000000) AS x {child}"
@@ -6763,8 +6818,8 @@ def test_grouped_distinct_ranges_reuse_typed_packets(graph_db, groups, child, wi
     "source", ["range(1,1000000)", "reverse(range(1,1000000))", "range(1,500000)+range(500001,1000000)"]
 )
 @pytest.mark.parametrize("argument", ["x", "2*x", "0*x+7"])
-def test_arithmetic_average_uses_exact_recurrence_certificates(graph_db, source, argument):
-    result = graph_db.cypher_json(
+def test_arithmetic_average_uses_exact_recurrence_certificates(scalar_graph_db, source, argument):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {source} AS x RETURN count(x),sum(x),avg({argument})",
@@ -6777,11 +6832,11 @@ def test_arithmetic_average_uses_exact_recurrence_certificates(graph_db, source,
 
 
 @pytest.mark.parametrize("capture", ["[i]+[]", "{v:i}", "[[i]]", "reverse([i])", "[z IN [i] | [z]]"])
-def test_safe_unused_container_capture_reuses_child_reduction(graph_db, capture):
+def test_safe_unused_container_capture_reuses_child_reduction(scalar_graph_db, capture):
     prefix = f"UNWIND range(1,100) AS i WITH i,{capture} AS j UNWIND $xs AS x "
     suffix = "RETURN i,avg(y) ORDER BY i"
     params = {"xs": list(range(1000))}
-    actual = graph_db.cypher_json(
+    actual = scalar_graph_db.cypher_json(
         "g",
         {
             "query": prefix + "CALL {WITH j,avg(x) AS y RETURN y} " + suffix,
@@ -6789,7 +6844,7 @@ def test_safe_unused_container_capture_reuses_child_reduction(graph_db, capture)
             "limits": {"intermediate_states": 100000, "memory_bytes": 2 << 20},
         },
     )
-    expected = graph_db.cypher_json(
+    expected = scalar_graph_db.cypher_json(
         "g", {"query": prefix + "CALL {WITH avg(x) AS y RETURN y} " + suffix, "parameters": params}
     )
     assert actual["rows"] == expected["rows"]
@@ -6798,8 +6853,8 @@ def test_safe_unused_container_capture_reuses_child_reduction(graph_db, capture)
 
 @pytest.mark.parametrize("aggregate", ["count(x)", "min(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)"])
 @pytest.mark.parametrize("direction", ["ASC", "DESC"])
-def test_monotone_group_windows_do_not_allocate_evicted_reducers(graph_db, aggregate, direction):
-    actual = graph_db.cypher_json(
+def test_monotone_group_windows_do_not_allocate_evicted_reducers(scalar_graph_db, aggregate, direction):
+    actual = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND range(40000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} "
@@ -6808,7 +6863,7 @@ def test_monotone_group_windows_do_not_allocate_evicted_reducers(graph_db, aggre
         },
     )
     groups = list(range(1, 8)) if direction == "ASC" else list(range(40000, 39993, -1))
-    expected = graph_db.cypher_json(
+    expected = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND $groups AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} "
@@ -6823,8 +6878,8 @@ def test_monotone_group_windows_do_not_allocate_evicted_reducers(graph_db, aggre
 
 
 @pytest.mark.parametrize("aggregate", ["avg(0*x)", "count(*)"])
-def test_monotone_window_packet_bounds_retry_large_symbolic_domains(graph_db, aggregate):
-    result = graph_db.cypher_json(
+def test_monotone_window_packet_bounds_retry_large_symbolic_domains(scalar_graph_db, aggregate):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(4,1,-1) AS i UNWIND range(1,1000000000000000) AS x "
@@ -6841,8 +6896,8 @@ def test_monotone_window_packet_bounds_retry_large_symbolic_domains(graph_db, ag
 
 
 @pytest.mark.parametrize("source", ["UNWIND [] AS i", "UNWIND range(1,0) AS i", "WITH 1 AS i WHERE false"])
-def test_unreachable_container_proofs_do_not_scan_parameters(graph_db, source):
-    result = graph_db.cypher_json(
+def test_unreachable_container_proofs_do_not_scan_parameters(scalar_graph_db, source):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": source
@@ -6855,8 +6910,8 @@ def test_unreachable_container_proofs_do_not_scan_parameters(graph_db, source):
     assert result["stats"]["intermediate_states"] < 100
 
 
-def test_reached_container_proof_shares_immutable_parameter_metadata(graph_db):
-    result = graph_db.cypher_json(
+def test_reached_container_proof_shares_immutable_parameter_metadata(scalar_graph_db):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND [1] AS i WITH i,$payload AS j UNWIND [1,2] AS x "
@@ -6870,9 +6925,11 @@ def test_reached_container_proof_shares_immutable_parameter_metadata(graph_db):
 
 @pytest.mark.parametrize("expression,scale,offset", [("i+1", 1, 1), ("-i", -1, 0), ("3-2*i", -2, 3), ("(i+7)-7", 1, 0)])
 @pytest.mark.parametrize("direction", ["ASC", "DESC"])
-def test_injective_affine_group_keys_keep_monotone_windows_bounded(graph_db, expression, scale, offset, direction):
+def test_injective_affine_group_keys_keep_monotone_windows_bounded(
+    scalar_graph_db, expression, scale, offset, direction
+):
     suffix = f"UNWIND [0,1,0] AS x RETURN {expression} AS g,avg(x),sum(x) ORDER BY g {direction} SKIP 2 LIMIT 5"
-    actual = graph_db.cypher_json(
+    actual = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(40000,1,-1) AS i " + suffix,
@@ -6881,7 +6938,9 @@ def test_injective_affine_group_keys_keep_monotone_windows_bounded(graph_db, exp
     )
     ascending_source = (scale > 0) == (direction == "ASC")
     groups = list(range(1, 8)) if ascending_source else list(range(40000, 39993, -1))
-    expected = graph_db.cypher_json("g", {"query": "UNWIND $groups AS i " + suffix, "parameters": {"groups": groups}})
+    expected = scalar_graph_db.cypher_json(
+        "g", {"query": "UNWIND $groups AS i " + suffix, "parameters": {"groups": groups}}
+    )
     assert actual["rows"] == expected["rows"]
     assert actual["plan"][0]["output_rows"] == 40000
     assert actual["plan"][1]["output_rows"] == 120000
@@ -6899,8 +6958,8 @@ def test_injective_affine_group_keys_keep_monotone_windows_bounded(graph_db, exp
 )
 @pytest.mark.parametrize("groups", ["[1,2]", "[1,2,1]"])
 @pytest.mark.parametrize("child", ["", "CALL {UNWIND [7,8] AS y RETURN y} "])
-def test_distinct_average_ranges_share_ordered_integer_support(graph_db, source, groups, child):
-    result = graph_db.cypher_json(
+def test_distinct_average_ranges_share_ordered_integer_support(scalar_graph_db, source, groups, child):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {groups} AS g UNWIND {source} AS x {child}"
@@ -6925,8 +6984,8 @@ def test_distinct_average_ranges_share_ordered_integer_support(graph_db, source,
         ("WITH 7 AS z WHERE false RETURN z AS y", False),
     ],
 )
-def test_singleton_children_preserve_arithmetic_average_certificates(graph_db, body, nonempty):
-    result = graph_db.cypher_json(
+def test_singleton_children_preserve_arithmetic_average_certificates(scalar_graph_db, body, nonempty):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} RETURN count(x),avg(x)",
@@ -6958,14 +7017,14 @@ def test_singleton_children_preserve_arithmetic_average_certificates(graph_db, b
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])
-def test_checked_range_pipeline_keeps_million_value_reductions_bounded(graph_db, tail, control, reverse):
+def test_checked_range_pipeline_keeps_million_value_reductions_bounded(scalar_graph_db, tail, control, reverse):
     source = "reverse(range(1,1000000))" if reverse else "range(1,1000000)"
-    actual = graph_db.cypher_json(
+    actual = scalar_graph_db.cypher_json(
         "g",
         {"query": f"UNWIND {source} AS x {tail}", "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}},
     )
     if control is not None:
-        expected = graph_db.cypher_json("g", {"query": f"UNWIND {source} AS x {control}"})
+        expected = scalar_graph_db.cypher_json("g", {"query": f"UNWIND {source} AS x {control}"})
         assert actual["rows"] == expected["rows"]
     else:
         expected_values = (
@@ -6983,8 +7042,8 @@ def test_checked_range_pipeline_keeps_million_value_reductions_bounded(graph_db,
 
 @pytest.mark.parametrize("key", ["i-i", "0*i", "(i+7)-(i+7)"])
 @pytest.mark.parametrize("source", ["range(1,1000000)", "reverse(range(1,1000000))"])
-def test_checked_invariant_affine_keys_keep_grouping_and_axis_multiplicity(graph_db, key, source):
-    result = graph_db.cypher_json(
+def test_checked_invariant_affine_keys_keep_grouping_and_axis_multiplicity(scalar_graph_db, key, source):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": f"UNWIND {source} AS i UNWIND [0,1,0] AS x RETURN {key} AS g,count(*)",
@@ -6995,14 +7054,16 @@ def test_checked_invariant_affine_keys_keep_grouping_and_axis_multiplicity(graph
     assert result["plan"][0]["output_rows"] == 1000000
     assert result["plan"][1]["output_rows"] == 3000000
     assert result["stats"]["intermediate_states"] < 200
-    empty = graph_db.cypher_json("g", {"query": f"UNWIND [] AS i UNWIND [0,1,0] AS x RETURN {key} AS g,count(*)"})
+    empty = scalar_graph_db.cypher_json(
+        "g", {"query": f"UNWIND [] AS i UNWIND [0,1,0] AS x RETURN {key} AS g,count(*)"}
+    )
     assert empty["rows"] == []
 
 
 @pytest.mark.parametrize("key,order,first", [("i+1", "g", 3), ("-i", "h DESC", 3), ("7", "h,g", 3), ("7", "h", 999998)])
 @pytest.mark.parametrize("child", ["", "CALL {RETURN 7 AS y} ", "CALL {CALL {RETURN 7 AS z} RETURN z AS y} "])
-def test_tuple_keys_and_singleton_calls_compose_monotone_windows(graph_db, key, order, first, child):
-    result = graph_db.cypher_json(
+def test_tuple_keys_and_singleton_calls_compose_monotone_windows(scalar_graph_db, key, order, first, child):
+    result = scalar_graph_db.cypher_json(
         "g",
         {
             "query": "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x "
@@ -7088,16 +7149,16 @@ def test_tuple_keys_and_singleton_calls_compose_monotone_windows(graph_db, key, 
     ],
 )
 def test_ordered_lineage_composes_million_value_domains_and_consumers(
-    graph_db, source, tail, control_source, control_tail, reverse
+    scalar_graph_db, source, tail, control_source, control_tail, reverse
 ):
     if reverse:
         source = f"reverse({source})"
         control_source = f"reverse({control_source})"
-    result = graph_db.cypher_json(
+    result = scalar_graph_db.cypher_json(
         "g",
         {"query": f"UNWIND {source} AS x {tail}", "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}},
     )
-    expected = graph_db.cypher_json("g", {"query": f"UNWIND {control_source} AS x {control_tail}"})
+    expected = scalar_graph_db.cypher_json("g", {"query": f"UNWIND {control_source} AS x {control_tail}"})
     assert result["rows"] == expected["rows"]
     assert result["plan"][0]["output_rows"] == 1000000
     assert result["stats"]["intermediate_states"] < 1500
@@ -7436,15 +7497,12 @@ def test_qualified_element_ids_seek_only_their_table_and_keep_exact_residuals(gr
     assert graph_db.sql("SELECT score FROM docs WHERE _id IN ('n0','n1') ORDER BY _id")["rows"] == [["42"], ["42"]]
 
 
-def test_indexed_node_order_reads_only_the_requested_window(graph_db):
-    populate(graph_db, 13000)
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+def test_indexed_node_order_reads_only_the_requested_window(ranked_graph_db):
     for order, page, expected, reads in (
         ("n.score DESC", "LIMIT 5", list(range(12999, 12994, -1)), 5),
         ("s DESC", "SKIP 2 LIMIT 3", list(range(12997, 12994, -1)), 5),
     ):
-        result = graph_db.cypher_json(
+        result = ranked_graph_db.cypher_json(
             "g",
             {
                 "query": f"MATCH (n:D) RETURN n.score AS s ORDER BY {order} {page}",
@@ -7453,7 +7511,7 @@ def test_indexed_node_order_reads_only_the_requested_window(graph_db):
         )
         assert [int(row[0]["value"]) for row in result["rows"]] == expected
         assert result["stats"]["scanned_anchors"] == reads
-    residual = graph_db.cypher_json(
+    residual = ranked_graph_db.cypher_json(
         "g",
         {
             "query": "MATCH (n:D) WHERE n.score<12997 RETURN n.score ORDER BY n.score DESC LIMIT 2",
@@ -7462,7 +7520,7 @@ def test_indexed_node_order_reads_only_the_requested_window(graph_db):
     )
     assert [row[0]["value"] for row in residual["rows"]] == ["12996", "12995"]
     assert residual["stats"]["scanned_anchors"] == 2
-    shadowed = graph_db.cypher_json(
+    shadowed = ranked_graph_db.cypher_json(
         "g",
         {"query": "MATCH (n:D) RETURN n.score AS s,null AS n ORDER BY n.score DESC LIMIT 1"},
     )
@@ -7470,7 +7528,7 @@ def test_indexed_node_order_reads_only_the_requested_window(graph_db):
     assert shadowed["stats"]["scanned_anchors"] == 13000
     # Eager projection failures beyond the requested prefix must remain visible.
     with pytest.raises(af.AntflyError):
-        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN 1/n.score ORDER BY n.score DESC LIMIT 1"})
+        ranked_graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN 1/n.score ORDER BY n.score DESC LIMIT 1"})
 
 
 def test_indexed_node_order_preserves_nulls_ties_in_both_directions(graph_db):
@@ -7679,17 +7737,14 @@ def test_composite_ordered_seeks_merge_disjoint_in_domains(graph_db):
         assert actual["rows"] == control["rows"]
 
 
-def test_order_lineage_survives_total_cypher_with_stages(graph_db):
-    populate(graph_db, 13000)
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+def test_order_lineage_survives_total_cypher_with_stages(ranked_graph_db):
     for query in (
         "MATCH (n:D) WITH n RETURN n.score ORDER BY n.score DESC LIMIT 5",
         "MATCH (n:D) WITH n AS m WITH m.score AS s RETURN s AS v ORDER BY v DESC LIMIT 5",
         "MATCH (n:D) WITH * WHERE n.score>=0 RETURN n.score ORDER BY n.score DESC LIMIT 5",
         "MATCH (n:D) WITH n.score AS n RETURN n ORDER BY n DESC LIMIT 5",
     ):
-        result = graph_db.cypher_json(
+        result = ranked_graph_db.cypher_json(
             "g",
             {
                 "query": query,
@@ -7698,7 +7753,7 @@ def test_order_lineage_survives_total_cypher_with_stages(graph_db):
         )
         assert [int(row[0]["value"]) for row in result["rows"]] == list(range(12999, 12994, -1))
         assert result["stats"]["scanned_anchors"] == 5
-    rejected_prefix = graph_db.cypher_json(
+    rejected_prefix = ranked_graph_db.cypher_json(
         "g",
         {
             "query": "MATCH (n:D) WITH n WHERE n.score<12950 OR n.score<12949 RETURN n.score ORDER BY n.score DESC LIMIT 5",
@@ -7708,10 +7763,10 @@ def test_order_lineage_survives_total_cypher_with_stages(graph_db):
     assert [int(row[0]["value"]) for row in rejected_prefix["rows"]] == list(range(12949, 12944, -1))
     assert rejected_prefix["stats"]["scanned_anchors"] == 55
     with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-        graph_db.cypher_json(
+        ranked_graph_db.cypher_json(
             "g", {"query": "MATCH (n:D) WITH n,1/n.score AS inv RETURN n.score ORDER BY n.score DESC LIMIT 5"}
         )
-    staged = graph_db.cypher_json(
+    staged = ranked_graph_db.cypher_json(
         "g",
         {"query": "MATCH (n:D) WITH n.score AS s ORDER BY s LIMIT 2 RETURN s ORDER BY s DESC LIMIT 1"},
     )
@@ -7919,13 +7974,10 @@ def test_ordered_distinct_streams_entities_and_adjacent_scalar_keys(graph_db):
     assert actual["rows"] == control["rows"]
 
 
-def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
-    populate(graph_db, 13000)
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(ranked_graph_db):
     for order in ("1,n.score DESC", "$constant,n.score DESC,n.score", "n.id,n.score DESC"):
         predicate = "WHERE n.id='n12999'" if order.startswith("n.id") else ""
-        result = graph_db.cypher_json(
+        result = ranked_graph_db.cypher_json(
             "g",
             {
                 "query": f"MATCH (n:D) {predicate} RETURN n.score ORDER BY {order} LIMIT 1",
@@ -7935,7 +7987,7 @@ def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
         )
         assert result["rows"] == [[{"type": "integer", "value": "12999"}]]
     for direction in ("ASC", "DESC"):
-        fixed = graph_db.cypher_json(
+        fixed = ranked_graph_db.cypher_json(
             "g",
             {
                 "query": f"MATCH (n:D) WHERE n.score=12999 RETURN n.score ORDER BY n.score {direction} LIMIT 1",
@@ -7943,13 +7995,13 @@ def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
             },
         )
         assert fixed["rows"] == [[{"type": "integer", "value": "12999"}]]
-    primary = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id LIMIT 5"})
-    tied = graph_db.cypher_json(
+    primary = ranked_graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id LIMIT 5"})
+    tied = ranked_graph_db.cypher_json(
         "g", {"query": "MATCH (n:D) RETURN n.id ORDER BY 1 LIMIT 5", "limits": {"scanned_anchors": 5}}
     )
     assert tied["rows"] == primary["rows"]
     with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
-        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.score ORDER BY 1/0,n.score DESC LIMIT 1"})
+        ranked_graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.score ORDER BY 1/0,n.score DESC LIMIT 1"})
 
 
 def test_partial_order_distinct_retains_only_the_distinct_window(graph_db):
@@ -8055,12 +8107,9 @@ def test_composite_index_prefixes_refine_boundary_ties_once(graph_db):
     assert actual["stats"]["scanned_anchors"] == 13000
 
 
-def test_certified_ordered_offsets_retire_skipped_rows(graph_db):
-    populate(graph_db, 13000)
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+def test_certified_ordered_offsets_retire_skipped_rows(ranked_graph_db):
     for stage, projection in (("", "n.score"), ("WITH DISTINCT n", "n.score"), ("WITH n AS m", "m.score")):
-        actual = graph_db.cypher_json(
+        actual = ranked_graph_db.cypher_json(
             "g",
             {
                 "query": f"MATCH (n:D) {stage} RETURN {projection} ORDER BY {projection} DESC SKIP 12000 LIMIT 5",
@@ -8070,7 +8119,7 @@ def test_certified_ordered_offsets_retire_skipped_rows(graph_db):
         assert [int(row[0]["value"]) for row in actual["rows"]] == list(range(999, 994, -1))
         assert actual["stats"]["scanned_anchors"] == 12005
         assert actual["stats"]["memory_bytes"] < 2 << 20
-    empty = graph_db.cypher_json(
+    empty = ranked_graph_db.cypher_json(
         "g",
         {
             "query": "MATCH (n:D) RETURN n.score ORDER BY n.score DESC SKIP 14000 LIMIT 5",
@@ -8690,6 +8739,12 @@ def test_grouped_domain_seeks_preserve_null_keys_and_non_distinct_counts(graph_d
                 assert result["stats"]["scanned_anchors"] < 256
 
 
+# These fixed-domain observers must beat a 256-anchor work ceiling and cross
+# native pages. Keep 64 times that ceiling; the separate 64,000-distinct-key
+# and 50,000-offset cases retain the large retained-memory scaling coverage.
+OBSERVER_DOMAIN_ROWS = 16384
+
+
 def scope_domains(db, count):
     with db.open_table("docs") as table:
         table.batch(
@@ -8705,7 +8760,7 @@ def scope_domains(db, count):
 
 
 def test_group_observers_survive_output_filters_wrappers_and_later_order(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     groups = [[f"g{i}", "3"] for i in range(8)]
     for query, expected in (
         ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score)+0 AS c ORDER BY n.id", groups),
@@ -8816,7 +8871,10 @@ def test_total_group_wrappers_preserve_bounded_high_cardinality_windows(graph_db
 def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
     with graph_db.open_table("docs") as table:
         table.batch(
-            [af.WriteIntent(key=f"u{i:06}", value={"id": f"u{i:06}", "score": i % 3}) for i in range(64000)],
+            [
+                af.WriteIntent(key=f"u{i:06}", value={"id": f"u{i:06}", "score": i % 3})
+                for i in range(OBSERVER_DOMAIN_ROWS)
+            ],
             timestamp=1,
         )
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
@@ -8840,7 +8898,7 @@ def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
 
 
 def test_sql_group_and_filter_observers_scale_with_index_domains(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     membership = graph_db.cypher_json(
         "g",
         {
@@ -8921,7 +8979,7 @@ def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db)
 
 
 def test_sql_filtered_observers_and_constant_admission_have_bounded_work(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
     reducers = "count(DISTINCT score),min(score),max(score)"
     filtered = "count(DISTINCT score) FILTER(WHERE score>=1),min(score) FILTER(WHERE score>=1),max(score) FILTER(WHERE score>=1)"
@@ -9071,7 +9129,7 @@ def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_contr
 
 
 def test_duplicate_membership_inputs_preserve_indexed_domains(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     # The two scalar domains are identical across the old 256-input threshold.
     for length in (2, 256, 258, 1000):
         values = [1, 2] * (length // 2)

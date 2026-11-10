@@ -26,8 +26,8 @@ Usage:
 
 Options:
   --zig-dir DIR          Directory containing build.zig. Default: zig
-  --out-dir DIR          Directory for logs. Default: /tmp/antfly-zig-build-memory
-  --prefix DIR           Zig install prefix. Default: /tmp/antfly-zig-build-memory-prefix
+  --out-dir DIR          Directory for logs. Default: .benchmark-results/compile-costs
+  --prefix DIR           Zig install prefix. Default: zig/zig-out
   --target TARGET        Zig target. Default: aarch64-linux-musl
   --optimize MODE        Zig optimize mode. Default: fast
   --strip true|false     Omit debug information. Default: false
@@ -53,8 +53,8 @@ EOF
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 zig_dir="${repo_root}/zig"
-out_dir="/tmp/antfly-zig-build-memory"
-prefix="/tmp/antfly-zig-build-memory-prefix"
+out_dir="${repo_root}/.benchmark-results/compile-costs"
+prefix="${zig_dir}/zig-out"
 target="aarch64-linux-musl"
 optimize="fast"
 strip="false"
@@ -162,6 +162,12 @@ case "${strip}" in
         ;;
 esac
 
+# A blocked sampler must not produce a successful report with a zero peak.
+if ! ps -p "$$" -o rss= >/dev/null 2>&1; then
+    echo "compiler memory profiling requires permission to inspect processes with ps" >&2
+    exit 2
+fi
+
 mkdir -p "${out_dir}" "${prefix}"
 
 if [ -z "${label}" ]; then
@@ -181,6 +187,31 @@ memory_report="${out_dir}/${label}.memory.json"
 response_dir="${out_dir}/${label}.response-files"
 rm -f "${memory_report}"
 
+# Cgroup peaks can include earlier/shared workloads. Retain both snapshots and
+# scope metadata; never present their difference as an isolated compiler peak.
+record_linux_memory() {
+    [ -r /proc/self/cgroup ] || return 0
+    {
+        echo 'scope=observed-cgroup-not-necessarily-exclusive'
+        echo 'peak_may_include_prior_workloads=true'
+        cat /proc/self/cgroup
+        cat /proc/meminfo
+        local relative_path
+        relative_path="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+        local group_dir="/sys/fs/cgroup${relative_path}"
+        # A namespaced cgroup mount may already expose the process group as /.
+        if [ ! -r "${group_dir}/memory.current" ]; then group_dir=/sys/fs/cgroup; fi
+        echo "observed_group_dir=${group_dir}"
+        local metric
+        for metric in memory.current memory.peak memory.max memory.swap.current memory.swap.peak memory.swap.max memory.events cpu.max cpuset.cpus.effective; do
+            if [ -r "${group_dir}/${metric}" ]; then
+                echo "${metric}:"
+                cat "${group_dir}/${metric}"
+            fi
+        done
+    } > "${out_dir}/${label}.linux-memory-$1.txt"
+}
+
 rss_kb_for_pid() {
     ps -o rss= -p "$1" 2>/dev/null | awk '{print $1}'
 }
@@ -190,7 +221,7 @@ find_zig_compile_pids() {
     ps -Ao pid=,ppid=,comm=,args= | awk -v root_pid="${root_pid}" '
         {
             parents[$1]=$2
-            if ($0 ~ /zig build-(exe|lib|obj)/) candidates[$1]=1
+            if ($0 ~ /zig (build-(exe|lib|obj)|test(-obj)?)( |$)/) candidates[$1]=1
         }
         END {
             for (pid in candidates) {
@@ -215,6 +246,8 @@ rss_mb_from_kb() {
 
 printf 'timestamp\telapsed_s\tpid\trss_kb\trss_mb\tcommand\tsample_id\n' > "${timeline}"
 printf 'elapsed_s\tpid\tcpu_time\tcpu_percent\tsample_id\n' > "${cpu_timeline}"
+
+record_linux_memory before
 
 start_epoch="$(date +%s)"
 sample_taken="0"
@@ -286,6 +319,8 @@ wait "${build_pid}"
 build_status="$?"
 set -e
 
+record_linux_memory after
+
 end_epoch="$(date +%s)"
 elapsed_total="$((end_epoch - start_epoch))"
 max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
@@ -293,8 +328,11 @@ max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
 # Large compilations use @response files. Retain them before another packaging
 # invocation replaces its cache, and resolve unit attribution while readable.
 memory_report_status=0
-python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
-    --output "${memory_report}" --capture-response-dir "${response_dir}" || memory_report_status=$?
+(
+    cd "${zig_dir}"
+    python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
+        --output "${memory_report}" --capture-response-dir "${response_dir}"
+) || memory_report_status=$?
 
 {
     echo "label=${label}"
@@ -336,4 +374,7 @@ python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
 printf '%s\n' "${max_cmd}" > "${max_command_file}"
 
 cat "${summary}"
-exit "${build_status}"
+if [ "${build_status}" -ne 0 ]; then
+    exit "${build_status}"
+fi
+exit "${memory_report_status}"

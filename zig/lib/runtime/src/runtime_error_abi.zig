@@ -1099,6 +1099,10 @@ pub const Detail = enum(c_int) {
     invalid_cypher_parameters,
     missing_cypher_parameter,
     sql_write_capacity_unavailable,
+    invalid_external_source_inventory,
+    invalid_external_source_snapshot,
+    external_source_snapshot_too_large,
+    storage_owner_admission_pending,
 };
 
 pub const Status = extern struct {
@@ -1408,6 +1412,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
         error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
+        error.InvalidExternalSourceInventory => status(.invalid_argument, .invalid_external_source_inventory),
+        error.InvalidExternalSourceSnapshot => status(.invalid_argument, .invalid_external_source_snapshot),
+        error.ExternalSourceSnapshotTooLarge => status(.invalid_argument, .external_source_snapshot_too_large),
         error.ExternalLakeFieldIdentityChanged => status(.conflict, .external_lake_field_identity_changed),
         error.ExternalLakeObjectChanged => status(.conflict, .external_lake_object_changed),
         error.EmptyExternalSourceSnapshot => status(.invalid_argument, .empty_external_source_snapshot),
@@ -1522,6 +1529,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
         error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
         error.StorageBusy => status(.retryable, .storage_busy),
+        error.StorageOwnerAdmissionPending => status(.retryable, .storage_owner_admission_pending),
         error.MergeTransitionNotReady => status(.retryable, .merge_transition_not_ready),
         error.MergeReceiverProjectionNotReady => status(.retryable, .merge_receiver_projection_not_ready),
         error.MergeSourceProjectionNotReady => status(.retryable, .merge_source_projection_not_ready),
@@ -1702,7 +1710,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidArgument => status(.invalid_argument, .invalid_argument),
         error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
         error.InvalidRequest => status(.invalid_argument, .invalid_request),
-        error.InvalidQueryRequest => status(.invalid_argument, .invalid_query_request),
+        // Aggregations may run in either an owner or a coordinator. Transport
+        // their public query classes using existing details, including when
+        // they cross a callback before the HTTP boundary can normalize them.
+        error.InvalidQueryRequest, error.InvalidAggregation => status(.invalid_argument, .invalid_query_request),
         error.InvalidFilterQueryRequest => status(.invalid_argument, .invalid_filter_query_request),
         error.InvalidExclusionQueryRequest => status(.invalid_argument, .invalid_exclusion_query_request),
         error.InvalidBatchRequest => status(.invalid_argument, .invalid_batch_request),
@@ -1799,7 +1810,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
-        error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => status(.unsupported, .unsupported_query_request),
         error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
@@ -2429,6 +2440,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
         .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
+        .invalid_external_source_inventory => "InvalidExternalSourceInventory",
+        .invalid_external_source_snapshot => "InvalidExternalSourceSnapshot",
+        .external_source_snapshot_too_large => "ExternalSourceSnapshotTooLarge",
         .external_lake_field_identity_changed => "ExternalLakeFieldIdentityChanged",
         .external_lake_object_changed => "ExternalLakeObjectChanged",
         .empty_external_source_snapshot => "EmptyExternalSourceSnapshot",
@@ -2570,6 +2584,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .merge_source_projection_not_ready => "MergeSourceProjectionNotReady",
         .merge_source_projection_advanced => "MergeSourceProjectionAdvanced",
         .storage_busy => "StorageBusy",
+        .storage_owner_admission_pending => "StorageOwnerAdmissionPending",
         .invalid_online_source_command => "InvalidOnlineSourceCommand",
         .online_source_corrupt => "OnlineSourceCorrupt",
         .online_source_pin_missing => "OnlineSourcePinMissing",
@@ -3408,6 +3423,9 @@ test "external lake and spill errors retain exact identity across runtime archiv
         error.ExternalLakeSnapshotMismatch,
         error.ExternalLakeSchemaMismatch,
         error.ExternalLakeSchemaUnavailable,
+        error.InvalidExternalSourceInventory,
+        error.InvalidExternalSourceSnapshot,
+        error.ExternalSourceSnapshotTooLarge,
         error.ExternalLakeFieldIdentityChanged,
         error.ExternalLakeObjectChanged,
         error.EmptyExternalSourceSnapshot,
@@ -3727,6 +3745,15 @@ test "privacy failures retain identity and retry classes across runtime callback
     try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
 }
 
+test "manifest client failures append stable details without changing released ordinals" {
+    try std.testing.expectEqual(@backingInt(Detail.sql_write_capacity_unavailable) + 1, @backingInt(Detail.invalid_external_source_inventory));
+    for ([_]anyerror{ error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot, error.ExternalSourceSnapshotTooLarge }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
 test "latest main error detail prefix remains append only across graph integration" {
     @setEvalBranchQuota(30000);
     var hash: u64 = 14695981039346656037;
@@ -3742,4 +3769,22 @@ test "latest main error detail prefix remains append only across graph integrati
     }
     try std.testing.expectEqual(@as(usize, 891), count);
     try std.testing.expectEqual(@as(u64, 16819601552131841023), hash);
+}
+
+test "time series aggregation callback failures use existing query identities" {
+    const invalid = statusFromError(error.InvalidAggregation);
+    try std.testing.expectEqualDeep(statusFromError(error.InvalidQueryRequest), invalid);
+    try std.testing.expectEqual(error.InvalidQueryRequest, errorFromStatus(invalid));
+    try std.testing.expect(errorHasStableDetail(error.InvalidAggregation));
+    const unsupported = statusFromError(error.UnsupportedAggregation);
+    try std.testing.expectEqualDeep(statusFromError(error.UnsupportedQueryRequest), unsupported);
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, errorFromStatus(unsupported));
+    try std.testing.expect(errorHasStableDetail(error.UnsupportedAggregation));
+}
+
+test "storage owner lease admission retains retryability across runtime callbacks" {
+    const wire = statusFromError(error.StorageOwnerAdmissionPending);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
+    try std.testing.expect(errorHasStableDetail(error.StorageOwnerAdmissionPending));
+    try std.testing.expectEqual(error.StorageOwnerAdmissionPending, errorFromStatus(wire));
 }

@@ -505,6 +505,11 @@ fn validateArtifactIndexReferences(
 
         if (std.mem.eql(u8, index_type, "embeddings")) {
             const external = if (object.get("external")) |value| value == .bool and value.bool else false;
+            if (object.get("external_vector_space")) |space| {
+                if (!external or space != .string or space.string.len == 0 or space.string.len > 4096)
+                    return error.InvalidEnrichmentConfig;
+                if (object.get("sparse")) |sparse| if (sparse == .bool and sparse.bool) return error.InvalidEnrichmentConfig;
+            }
             if (!external) {
                 try validateEmbeddingArtifactReferences(alloc, object, configs);
             }
@@ -665,7 +670,7 @@ fn validateEmbeddingArtifactShape(
     dims: u32,
 ) !void {
     if (sparse) {
-        if (cfg.expected_dims != 0) return error.InvalidEnrichmentConfig;
+        if (cfg.expected_dims != 0 or cfg.embedding_input != .text) return error.InvalidEnrichmentConfig;
     } else if (dims > 0 and cfg.expected_dims > 0 and cfg.expected_dims != dims) {
         return error.InvalidEnrichmentConfig;
     }
@@ -8574,10 +8579,16 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
                 \\{"enrichments":[{"name":"echo","kind":"asset","source_artifact_name":"missing"}]}
             ));
-            // Consuming assets read produced bytes; a field cannot also be set.
-            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+            // A field selects structured produced bytes; retain both parts of
+            // that lineage rather than mistaking it for a primary-row field.
+            const selected =
                 \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","field":"summary","source_artifact_name":"summary_text"}]}
-            ));
+            ;
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, selected);
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator, selected);
+            defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+            try std.testing.expectEqualStrings("summary", configs[1].field);
+            try std.testing.expectEqualStrings("summary_text", configs[1].source_artifact_name);
             // Media-locator producers dereference the source as a URL and
             // stay closed to artifact consumption.
             try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,

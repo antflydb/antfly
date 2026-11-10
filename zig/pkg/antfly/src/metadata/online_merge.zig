@@ -232,7 +232,7 @@ pub fn decide(current: State, observation: Observation, cancel: bool) !Decision 
                 if (value.phase != .retaining) return error.OnlineMergeReceiptMismatch;
                 if (value.snapshot_phase != .prepared) return advance(current, .publish);
             }
-            return .{ .execute = .{ .source_command = .{ .admit = .{ .scope = current.scope, .artifact_catalog = current.artifact_catalog } } } };
+            return .{ .execute = .{ .source_command = .{ .admit = .{ .scope = current.scope, .artifact_catalog = current.artifact_catalog, .ttl_sources = if (progress) |value| value.ttl_sources else true } } } };
         },
         .publish => {
             const value = progress orelse return error.OnlineMergeReceiptMismatch;
@@ -989,5 +989,17 @@ test "metadata transition driver online cancellation racing metadata CAS refresh
         try std.testing.expectEqual(if (phase == .final_tail) Phase.cancel_receiver else Phase.release, resumed.phase);
         try std.testing.expectEqual(@as(usize, 2), race.attempts);
         try std.testing.expectEqual(@as(usize, 1), race.committed);
+    }
+}
+
+test "time series source admission retries preserve an already admitted retained language" {
+    const state = testState();
+    try std.testing.expect((try decide(state, .{ .scope = state.scope }, false)).execute.source_command.admit.ttl_sources);
+    var observation = try testObservation(state);
+    observation.source_progress.?.snapshot_phase = .prepared;
+    for ([_]bool{ false, true }) |sources| {
+        observation.source_progress.?.ttl_sources = sources;
+        const request = (try decide(state, observation, false)).execute.source_command.admit;
+        try std.testing.expectEqual(sources, request.ttl_sources);
     }
 }

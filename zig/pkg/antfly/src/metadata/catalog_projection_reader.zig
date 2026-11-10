@@ -107,6 +107,11 @@ pub const CatalogProjectionReader = struct {
         planning: *@import("../api/join_planning.zig").Generation,
 
         fn create(alloc: std.mem.Allocator, value: Snapshot, metadata_group_id: u64, deadline_ns: ?u64) !*SharedSnapshot {
+            return createWithBudget(alloc, value, metadata_group_id, .{ .deadline_ns = deadline_ns });
+        }
+
+        fn createWithBudget(alloc: std.mem.Allocator, value: Snapshot, metadata_group_id: u64, budget: @import("../api/table_catalog.zig").RoutingBudget) !*SharedSnapshot {
+            try budget.checkpoint();
             const shared = try alloc.create(SharedSnapshot);
             errdefer alloc.destroy(shared);
             const routing = try @import("../api/table_catalog.zig").RoutingGeneration.create(alloc, .{
@@ -116,13 +121,13 @@ pub const CatalogProjectionReader = struct {
                 .change_token = .{ .metadata_group_id = metadata_group_id, .metadata_incarnation = value.metadata_incarnation, .revision = value.catalog_revision },
                 .tables = value.tables,
                 .ranges = value.ranges,
-            }, .{ .deadline_ns = deadline_ns });
+            }, budget);
             errdefer routing.release();
             const planning = try @import("../api/join_planning.zig").Generation.create(alloc, .{
                 .tables = value.tables,
                 .ranges = value.ranges,
                 .merged_group_statuses = @as([]const @import("reconciler.zig").MergedGroupStatus, &.{}),
-            }, .{ .clock = .{ .deadline_ns = deadline_ns } });
+            }, .{ .clock = budget, .cancellation = budget.cancellation });
             shared.* = .{ .alloc = alloc, .value = value, .routing = routing, .planning = planning };
             return shared;
         }
@@ -281,20 +286,26 @@ pub const CatalogProjectionReader = struct {
     /// Retain a coherent projection while doing all allocation-heavy cloning
     /// outside the publication mutex. Cache misses are single-flight: one
     /// caller captures and indexes while peers wait on a deadline-aware event.
-    fn snapshotLease(
-        self: *CatalogProjectionReader,
-        alloc: std.mem.Allocator,
-        metadata_group_id: u64,
-        source: Source,
-        deadline_ns: ?u64,
-    ) !SnapshotLease {
-        try ensureBeforeDeadline(deadline_ns);
+    fn snapshotLease(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, deadline_ns: ?u64) !SnapshotLease {
+        return self.snapshotLeaseWithBudget(alloc, metadata_group_id, source, .{ .deadline_ns = deadline_ns });
+    }
+
+    fn lockWithRoutingBudget(self: *CatalogProjectionReader, budget: @import("../api/table_catalog.zig").RoutingBudget) !void {
+        while (true) {
+            try budget.checkpoint();
+            if (self.mutex.tryLock()) return;
+            try budget.sleepNs(std.time.ns_per_ms);
+        }
+    }
+
+    fn snapshotLeaseWithBudget(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, budget: @import("../api/table_catalog.zig").RoutingBudget) !SnapshotLease {
+        try budget.checkpoint();
         try source.ensureListenerRegistered();
-        try ensureBeforeDeadline(deadline_ns);
+        try budget.checkpoint();
 
         while (true) {
             const current_epoch = source.catalogEpoch();
-            if (!self.lockUntil(deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+            try self.lockWithRoutingBudget(budget);
             if (self.cache.reusable and self.cache.catalog_epoch == current_epoch) {
                 if (self.cache.snapshot) |snapshot| {
                     snapshot.retain();
@@ -307,7 +318,7 @@ pub const CatalogProjectionReader = struct {
                 flight.retain();
                 _ = self.coalesced_waits.fetchAdd(1, .monotonic);
                 self.unlock();
-                waitForBuildFlight(flight, deadline_ns) catch |err| {
+                waitForBuildFlightWithBudget(flight, budget) catch |err| {
                     if (err == error.CatalogRoutingSnapshotTimeout) _ = self.deadline_timeouts.fetchAdd(1, .monotonic);
                     flight.release();
                     return err;
@@ -318,8 +329,8 @@ pub const CatalogProjectionReader = struct {
                     // A coalesced builder may have had a shorter deadline than
                     // this waiter. Retry under the waiter's own budget instead
                     // of leaking another request's timeout semantics.
-                    error.CatalogRoutingSnapshotTimeout => {
-                        try ensureBeforeDeadline(deadline_ns);
+                    error.CatalogRoutingSnapshotTimeout, error.Canceled => {
+                        try budget.checkpoint();
                         continue;
                     },
                     else => return err,
@@ -335,7 +346,7 @@ pub const CatalogProjectionReader = struct {
             self.build_flight = flight;
             _ = self.refresh_builds.fetchAdd(1, .monotonic);
             self.unlock();
-            return try self.buildSnapshotLease(alloc, metadata_group_id, source, deadline_ns, flight);
+            return try self.buildSnapshotLease(alloc, metadata_group_id, source, budget, flight);
         }
     }
 
@@ -344,9 +355,10 @@ pub const CatalogProjectionReader = struct {
         alloc: std.mem.Allocator,
         metadata_group_id: u64,
         source: Source,
-        deadline_ns: ?u64,
+        budget: @import("../api/table_catalog.zig").RoutingBudget,
         flight: *BuildFlight,
     ) !SnapshotLease {
+        const deadline_ns = budget.deadline_ns;
         const before = source.catalogEpoch();
         var fresh = capture(alloc, metadata_group_id, source, deadline_ns) catch |err| {
             if (err == error.CatalogRoutingSnapshotTimeout) _ = self.deadline_timeouts.fetchAdd(1, .monotonic);
@@ -355,21 +367,29 @@ pub const CatalogProjectionReader = struct {
         };
         errdefer fresh.deinit(alloc);
         const after = source.catalogEpoch();
-        ensureBeforeDeadline(deadline_ns) catch |err| {
+        budget.checkpoint() catch |err| {
             if (err == error.CatalogRoutingSnapshotTimeout) _ = self.deadline_timeouts.fetchAdd(1, .monotonic);
             self.finishBuildFlight(flight, err);
             return err;
         };
-        const shared = SharedSnapshot.create(alloc, fresh, metadata_group_id, deadline_ns) catch |err| {
+        const shared = SharedSnapshot.createWithBudget(alloc, fresh, metadata_group_id, budget) catch |err| {
             self.finishBuildFlight(flight, err);
             return err;
         };
         fresh = .{};
 
+        // Semantic checkpoints may perform I/O. Evaluate them before taking
+        // the publication mutex; cleanup must still finish this shared flight.
+        var completion_failure: ?anyerror = null;
+        budget.checkpoint() catch |err| {
+            completion_failure = err;
+        };
         self.lock();
         var old: ?*SharedSnapshot = null;
-        var failure: ?anyerror = null;
-        if (deadlineExpired(deadline_ns)) {
+        var failure: ?anyerror = completion_failure;
+        if (failure != null) {
+            if (failure.? == error.CatalogRoutingSnapshotTimeout) _ = self.deadline_timeouts.fetchAdd(1, .monotonic);
+        } else if (deadlineExpired(deadline_ns)) {
             failure = error.CatalogRoutingSnapshotTimeout;
             _ = self.deadline_timeouts.fetchAdd(1, .monotonic);
         } else if (self.cache.snapshot) |cached| {
@@ -419,6 +439,16 @@ pub const CatalogProjectionReader = struct {
         var lease = try self.snapshotLease(alloc, metadata_group_id, source, deadline_ns);
         defer lease.deinit();
         try ensureBeforeDeadline(deadline_ns);
+        lease.shared.routing.retain();
+        return lease.shared.routing;
+    }
+
+    pub fn acquireRoutingGenerationWithBudget(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, input: @import("../api/table_catalog.zig").RoutingBudget) !*@import("../api/table_catalog.zig").RoutingGeneration {
+        var budget: @import("../api/table_catalog.zig").RoutingBudget = .{ .cancellation = input.cancellation };
+        budget.deadline_ns = budget.deadlineFrom(input);
+        var lease = try self.snapshotLeaseWithBudget(alloc, metadata_group_id, source, budget);
+        defer lease.deinit();
+        try budget.checkpoint();
         lease.shared.routing.retain();
         return lease.shared.routing;
     }
@@ -698,24 +728,21 @@ fn deadlineExpired(deadline_ns: ?u64) bool {
     return if (deadline_ns) |deadline| platform_time.monotonicNs() >= deadline else false;
 }
 
-fn waitForBuildFlight(flight: *CatalogProjectionReader.BuildFlight, deadline_ns: ?u64) !void {
-    const deadline = deadline_ns orelse {
+fn waitForBuildFlightWithBudget(flight: *CatalogProjectionReader.BuildFlight, budget: @import("../api/table_catalog.zig").RoutingBudget) !void {
+    const cancellable = budget.cancellation.ptr != null and (budget.cancellation.is_cancelled_fn != null or budget.cancellation.check_fn != null);
+    if (!cancellable and budget.deadline_ns == null) {
         flight.ready.waitUncancelable(std.Options.debug_io);
         return;
-    };
+    }
     while (!flight.ready.isSet()) {
-        const now = platform_time.monotonicNs();
-        if (now >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        flight.ready.waitTimeout(std.Options.debug_io, .{
-            .duration = .{
-                .raw = std.Io.Duration.fromNanoseconds(@intCast(deadline - now)),
-                .clock = .awake,
-            },
-        }) catch |err| switch (err) {
+        try budget.checkpoint();
+        const remaining = if (budget.deadline_ns) |deadline| deadline -| budget.nowNs() else std.math.maxInt(u64);
+        flight.ready.waitTimeout(std.Options.debug_io, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(@intCast(if (cancellable) @min(remaining, 10 * std.time.ns_per_ms) else remaining)), .clock = .awake } }) catch |err| switch (err) {
             error.Timeout => continue,
-            error.Canceled => return error.CatalogRoutingSnapshotTimeout,
+            error.Canceled => return error.Canceled,
         };
     }
+    try budget.checkpoint();
 }
 
 fn cloneTables(
@@ -1487,4 +1514,64 @@ test "privacy compact bindings exclude retained job bytes and refresh at semanti
     try std.testing.expectEqual(@as(u64, 2), replaced.catalog_revision);
     try std.testing.expectEqual(@as(usize, 2), fixture.captures);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, reader.privacyPolicyBinding(a, 9, source, "docs", 1));
+}
+
+test "catalog projection routing generation cancellation preserves shared flights and recovers builders" {
+    const a = std.testing.allocator;
+    const Cancel = struct {
+        calls: usize = 0,
+        limit: usize = 4,
+        canceled: bool = false,
+        fn check(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return self.canceled or self.calls >= self.limit;
+        }
+    };
+    const Fake = struct {
+        token: *Cancel,
+        cancel_capture: bool = false,
+        captures: usize = 0,
+        fn listen(_: *anyopaque) !void {}
+        fn epoch(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn captureProjection(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: ?u64) !metadata_storage.CatalogProjectionSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captures += 1;
+            if (self.cancel_capture) self.token.canceled = true;
+            return .{ .metadata_incarnation = null, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
+        }
+        fn source(self: *@This()) CatalogProjectionReader.Source {
+            return .{ .ptr = self, .vtable = &.{ .ensure_listener_registered = listen, .catalog_epoch = epoch, .capture_projection = captureProjection } };
+        }
+    };
+    var token: Cancel = .{};
+    var fake: Fake = .{ .token = &token };
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(a);
+    const budget: @import("../api/table_catalog.zig").RoutingBudget = .{ .cancellation = .{ .ptr = &token, .is_cancelled_fn = Cancel.check } };
+    const flight = try a.create(CatalogProjectionReader.BuildFlight);
+    flight.* = .{ .alloc = a };
+    reader.build_flight = flight;
+    try std.testing.expectError(error.Canceled, reader.acquireRoutingGenerationWithBudget(a, 91, fake.source(), budget));
+    try std.testing.expectEqual(@as(usize, 1), flight.refs.load(.acquire));
+    try std.testing.expect(flight.failure == null and !flight.ready.isSet());
+    reader.build_flight = null;
+    flight.release();
+    token = .{ .limit = 3 };
+    try std.testing.expect(reader.mutex.tryLock());
+    const held_result = reader.acquireRoutingGenerationWithBudget(a, 91, fake.source(), budget);
+    reader.unlock();
+    try std.testing.expectError(error.Canceled, held_result);
+    try std.testing.expectEqual(@as(usize, 0), fake.captures);
+    token = .{ .limit = std.math.maxInt(usize) };
+    fake.cancel_capture = true;
+    try std.testing.expectError(error.Canceled, reader.acquireRoutingGenerationWithBudget(a, 91, fake.source(), budget));
+    try std.testing.expect(reader.build_flight == null);
+    token.canceled = false;
+    fake.cancel_capture = false;
+    const generation = try reader.acquireRoutingGenerationWithBudget(a, 91, fake.source(), budget);
+    generation.release();
+    try std.testing.expectEqual(@as(usize, 2), fake.captures);
 }

@@ -108,6 +108,7 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
         .embeddings => std.mem.eql(u8, field, "publication_policy") or
             std.mem.eql(u8, field, "coverage_policy") or
             std.mem.eql(u8, field, "external") or
+            std.mem.eql(u8, field, "external_vector_space") or
             std.mem.eql(u8, field, "sparse") or
             std.mem.eql(u8, field, "dimension") or
             std.mem.eql(u8, field, "field") or
@@ -359,7 +360,7 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
         .algebraic_aggregates => false,
-        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure"),
+        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure") or std.mem.eql(u8, field, "time") or std.mem.eql(u8, field, "bucket"),
         .relational_keys, .relational_predicates, .relational_expression_args => false,
         .relational_key => std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "expression") or std.mem.eql(u8, field, "result_type") or std.mem.eql(u8, field, "direction") or std.mem.eql(u8, field, "nulls") or std.mem.eql(u8, field, "collation"),
         .relational_expression => std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "value") or std.mem.eql(u8, field, "args") or std.mem.eql(u8, field, "collation"),
@@ -598,6 +599,8 @@ fn providerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 }
 
 fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "embedding_input")) return value == .string and
+        (std.mem.eql(u8, value.string, "text") or std.mem.eql(u8, value.string, "pdf_page_images"));
     if (std.mem.eql(u8, field, "source")) return groupedSourceMatches(value);
     if (std.mem.eql(u8, field, "prior_context")) return priorContextMatches(value);
     if (std.mem.eql(u8, field, "expected_dims") or
@@ -887,6 +890,7 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "source_artifact_name") or
         std.mem.eql(u8, field, "source") or
         std.mem.eql(u8, field, "prior_context") or
+        std.mem.eql(u8, field, "embedding_input") or
         std.mem.eql(u8, field, "expected_dims") or
         std.mem.eql(u8, field, "vector_space") or
         std.mem.eql(u8, field, "chunk_size") or

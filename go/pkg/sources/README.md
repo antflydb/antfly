@@ -976,3 +976,11 @@ local, S3 and GCS relative keys are reconstructed from the pinned item IDs and
 matching source configuration before publication. Namespace adoption therefore
 preserves row IDs on resume without listing the provider again. Inconsistent
 checkpoint identities fail before content publication.
+
+## Versioned search streams and processing
+
+See [Source search streams and native processing](../../../docs/design/source-search-streams.md)
+for search_version=2, semantic-only media, complete query compatibility, external
+vector admission, generic artifact discovery, standalone processing/search commands,
+Colony integration and the model-free local fixture. Legacy TextStream declarations
+remain supported; processing configuration does not change acquisition identity.

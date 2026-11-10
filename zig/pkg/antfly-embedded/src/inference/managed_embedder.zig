@@ -3026,6 +3026,9 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    if (cfg.external_vector_space) |space| {
+        if (!external or sparse or space.len == 0 or space.len > 4096) return error.InvalidCreateTableRequest;
+    }
     const publication_policy = cfg.publication_policy orelse .progressive;
     if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
     if (external and cfg.publication_policy != null) return error.InvalidCreateTableRequest;
@@ -3240,6 +3243,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try out.append(alloc, '}');
     } else {
         try out.appendSlice(alloc, ",\"external\":true");
+        if (cfg.external_vector_space) |space| {
+            try out.appendSlice(alloc, ",\"external_vector_space\":");
+            try appendJsonString(alloc, &out, space);
+        }
     }
 
     if (embedder_json) |embedder| {
@@ -8902,6 +8909,20 @@ test "managed embedder preserves coverage policy in storage config" {
     ,
         config_json,
     );
+    var external_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3,\"external_vector_space\":\"recipe-v1\"}", .{});
+    defer external_config.deinit();
+    const physical = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "authored", external_config.value, .{});
+    defer std.testing.allocator.free(physical);
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator, "{\"external\":true,\"external_vector_space\":\"recipe-v1\"}", physical);
+    for ([_][]const u8{
+        "{\"external\":false,\"dimension\":3,\"external_vector_space\":\"recipe-v1\"}",
+        "{\"external\":true,\"sparse\":true,\"external_vector_space\":\"recipe-v1\"}",
+        "{\"external\":true,\"dimension\":3,\"external_vector_space\":\"\"}",
+    }) |raw| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "invalid", invalid.value, .{}));
+    }
 }
 
 test "managed embedder rejects unsupported execution namespaces" {

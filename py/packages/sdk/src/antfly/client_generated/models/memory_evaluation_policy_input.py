@@ -5,9 +5,11 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.memory_evaluation_policy_input_retrieval import MemoryEvaluationPolicyInputRetrieval
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.memory_brief_request import MemoryBriefRequest
     from ..models.memory_entity_candidate_request import MemoryEntityCandidateRequest
     from ..models.memory_recall_request import MemoryRecallRequest
     from ..models.memory_supersession_candidate_request import MemorySupersessionCandidateRequest
@@ -20,6 +22,8 @@ T = TypeVar("T", bound="MemoryEvaluationPolicyInput")
 class MemoryEvaluationPolicyInput:
     """
     Attributes:
+        retrieval (MemoryEvaluationPolicyInputRetrieval | Unset):  Default: MemoryEvaluationPolicyInputRetrieval.RECALL.
+        brief (MemoryBriefRequest | Unset):
         seed (str | Unset):
         target (str | Unset):
         entity_candidates (MemoryEntityCandidateRequest | Unset):
@@ -27,6 +31,8 @@ class MemoryEvaluationPolicyInput:
         recall (MemoryRecallRequest | Unset):
     """
 
+    retrieval: MemoryEvaluationPolicyInputRetrieval | Unset = MemoryEvaluationPolicyInputRetrieval.RECALL
+    brief: MemoryBriefRequest | Unset = UNSET
     seed: str | Unset = UNSET
     target: str | Unset = UNSET
     entity_candidates: MemoryEntityCandidateRequest | Unset = UNSET
@@ -34,6 +40,14 @@ class MemoryEvaluationPolicyInput:
     recall: MemoryRecallRequest | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        retrieval: str | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.value
+
+        brief: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.brief, Unset):
+            brief = self.brief.to_dict()
+
         seed = self.seed
 
         target = self.target
@@ -53,6 +67,10 @@ class MemoryEvaluationPolicyInput:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
+        if brief is not UNSET:
+            field_dict["brief"] = brief
         if seed is not UNSET:
             field_dict["seed"] = seed
         if target is not UNSET:
@@ -68,11 +86,26 @@ class MemoryEvaluationPolicyInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.memory_brief_request import MemoryBriefRequest
         from ..models.memory_entity_candidate_request import MemoryEntityCandidateRequest
         from ..models.memory_recall_request import MemoryRecallRequest
         from ..models.memory_supersession_candidate_request import MemorySupersessionCandidateRequest
 
         d = dict(src_dict)
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: MemoryEvaluationPolicyInputRetrieval | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = MemoryEvaluationPolicyInputRetrieval(_retrieval)
+
+        _brief = d.pop("brief", UNSET)
+        brief: MemoryBriefRequest | Unset
+        if isinstance(_brief, Unset):
+            brief = UNSET
+        else:
+            brief = MemoryBriefRequest.from_dict(_brief)
+
         seed = d.pop("seed", UNSET)
 
         target = d.pop("target", UNSET)
@@ -99,6 +132,8 @@ class MemoryEvaluationPolicyInput:
             recall = MemoryRecallRequest.from_dict(_recall)
 
         memory_evaluation_policy_input = cls(
+            retrieval=retrieval,
+            brief=brief,
             seed=seed,
             target=target,
             entity_candidates=entity_candidates,

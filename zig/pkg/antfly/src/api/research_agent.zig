@@ -36,6 +36,7 @@ const retrieval_agent = @import("retrieval_agent.zig");
 const metadata = @import("antfly_metadata_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
 const generating = @import("antfly_generating");
+const agent_context = @import("agent_context.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const QueryRunner = retrieval_agent.QueryRunner;
@@ -233,6 +234,12 @@ const Registry = struct {
         return if (std.mem.eql(u8, item.id, id)) item else null;
     }
 };
+
+fn addResearchSourceIds(a: std.mem.Allocator, ids: *agent_context.SourceIds, evidence: Evidence) !void {
+    try ids.add(a, evidence.id);
+    if (evidence.doc_id) |id| try ids.add(a, id);
+    if (evidence.url) |url| try ids.add(a, url);
+}
 
 fn appendUnique(arena: std.mem.Allocator, list: []const []const u8, value: []const u8) ![]const []const u8 {
     for (list) |item| if (std.mem.eql(u8, item, value)) return list;
@@ -457,6 +464,7 @@ const Run = struct {
     arena: std.mem.Allocator,
     query_runner: QueryRunner,
     generator: GenerationRunner,
+    context_events: std.ArrayListUnmanaged(metadata.AgentContextEvent) = .empty,
     request: Request,
     raw: std.json.ObjectMap,
     budget: Budget,
@@ -546,15 +554,62 @@ const Run = struct {
         return cfg.instructions;
     }
 
+    const BudgetedRunner = struct {
+        run: *Run,
+        reserve_main_call: bool = false,
+        pub fn executeChain(self: *@This(), a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            try check(self.run);
+            if (self.run.llm_calls + @as(i64, if (self.reserve_main_call) 1 else 0) >= self.run.budget.max_llm_calls) return error.ResearchLlmBudgetExhausted;
+            self.run.llm_calls += 1;
+            const result = try self.run.generator.executeChain(a, chain, messages);
+            errdefer {
+                var owned = result;
+                owned.deinit();
+            }
+            try check(self.run);
+            return result;
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *Run = @ptrCast(@alignCast(raw));
+            try self.generator.check();
+            if (self.deadlineExceeded()) return error.ResearchDeadlineExceeded;
+        }
+    };
+
     fn callModel(self: *Run, chain: []const generating.ChainLink, system: []const u8, user: []const u8) ![]const u8 {
-        if (self.llm_calls >= self.budget.max_llm_calls) return error.ResearchLlmBudgetExhausted;
-        if (self.deadlineExceeded()) return error.ResearchDeadlineExceeded;
-        self.llm_calls += 1;
-        const messages = [_]generating.ChatMessage{
+        const source = [_]generating.ChatMessage{
             .{ .role = .system, .content = .{ .text = system } },
             .{ .role = .user, .content = .{ .text = user } },
         };
-        var result = try self.generator.executeChain(self.arena, chain, &messages);
+        var messages: []const generating.ChatMessage = &source;
+        var runner = BudgetedRunner{ .run = self, .reserve_main_call = true };
+        if (self.request.context_management) |config| {
+            var constraints = std.ArrayListUnmanaged(u8).empty;
+            try constraints.print(self.arena, "Research question: {s}\nBrief: {s}\n", .{ self.request.query, self.brief });
+            for (self.success_criteria) |criterion| try constraints.print(self.arena, "Success criterion: {s}\n", .{criterion});
+            if (self.clarificationAnswer()) |answer| try constraints.print(self.arena, "User clarification: {s}\n", .{try std.json.Stringify.valueAlloc(self.arena, answer, .{})});
+            // Verification must inspect the exact report rather than a summary
+            // of the claims it is asked to check.
+            if (self.phase == .verify) if (self.report) |report| try constraints.print(self.arena, "Report to verify: {s}\n", .{report.markdown});
+            const evidence = try agent_context.completedEvidence(self.arena, source[0], source[1], constraints.items);
+            var ids = agent_context.SourceIds{};
+            switch (self.phase) {
+                .write => for (self.registry.items.items) |item| try addResearchSourceIds(self.arena, &ids, item),
+                .verify => for (self.citations) |citation| {
+                    if (self.registry.get(citation.evidence_id)) |item| try addResearchSourceIds(self.arena, &ids, item);
+                },
+                .reflect => for (self.findings.items) |finding| {
+                    for (finding.evidence_ids orelse &.{}) |id| if (self.registry.get(id)) |item| try addResearchSourceIds(self.arena, &ids, item);
+                },
+                else => {},
+            }
+            const prepared = try agent_context.prepareWithSources(self.arena, &runner, config, chain, evidence, .{}, .{ .ptr = self, .check_fn = BudgetedRunner.check }, &.{.{ .tool_call_id = "antfly_context_evidence", .source_ids = ids.items.items }});
+            try self.context_events.append(self.arena, prepared.event);
+            try self.live.value("context_management", prepared.event);
+            messages = prepared.messages;
+        }
+        runner.reserve_main_call = false;
+        var result = try runner.executeChain(self.arena, chain, messages);
         defer result.deinit();
         return try self.arena.dupe(u8, result.content);
     }
@@ -773,6 +828,7 @@ const Run = struct {
             const agentic = navigation == .object and if (navigation.object.get("selection")) |selection| selection == .string and std.mem.eql(u8, selection.string, "agentic") else false;
             if (!pipeline or !agentic) try retrieval.put(self.arena, "navigation", navigation);
         };
+        if (self.raw.get("context_management")) |config| try body.put(self.arena, "context_management", config);
         var generation = std.json.ObjectMap.empty;
         const instructions = if (self.request.steps) |steps| if (steps.research) |r| r.instructions else null else null;
         try generation.put(self.arena, "system_prompt", .{ .string = if (instructions) |extra| try std.fmt.allocPrint(self.arena, "{s}\nAdditional instructions: {s}", .{ researcher_prompt, extra }) else researcher_prompt });
@@ -939,6 +995,7 @@ const Run = struct {
                 if (!dup) try evidence_ids.append(self.arena, id);
             }
         }
+        if (parsed.context_management) |events| try self.context_events.appendSlice(self.arena, events);
         const text = parsed.generation orelse "";
         var summary: []const u8 = boundedUtf8(std.mem.trim(u8, text, " \t\r\n"), 6000);
         var claims = std.ArrayListUnmanaged(Claim).empty;
@@ -1327,11 +1384,15 @@ fn isRequestError(err: anyerror) bool {
 
 /// The run's deadline or the client's cancellation stopped the work; the
 /// same work can succeed when resumed.
-fn interruption(err: anyerror) bool {
+fn deadlineFailure(err: anyerror) bool {
     return switch (err) {
-        error.DeadlineExceeded, error.Timeout, error.Canceled, error.Cancelled, error.ResearchDeadlineExceeded => true,
+        error.DeadlineExceeded, error.Timeout, error.ResearchDeadlineExceeded, error.RequestDeadlineExceeded => true,
         else => false,
     };
+}
+
+fn interruption(err: anyerror) bool {
+    return deadlineFailure(err) or err == error.Canceled or err == error.Cancelled;
 }
 
 /// Failures of the model call itself, as opposed to the request or data.
@@ -1461,8 +1522,14 @@ fn runResearchers(
 
         fn run(job: *@This()) void {
             const job_arena = job.arena_impl.allocator();
+            const Peek = struct { max_internal_iterations: ?i64 = null };
+            const peek = std.json.parseFromSliceLeaky(Peek, job_arena, job.body, .{ .ignore_unknown_fields = true }) catch {
+                job.result = error.InvalidResearchAgentRequest;
+                return;
+            };
+            const model_calls = @max(1, peek.max_internal_iterations orelse 1);
             job.result = if (retrieval_agent.executeWithOptions(job_arena, job.query_runner, job.generator, job.body, null, .{
-                .budget = .{ .max_tool_calls = job.tool_calls },
+                .budget = .{ .max_tool_calls = job.tool_calls, .max_model_calls = model_calls },
                 .hit_tables = &job.tables,
             })) |encoded| encoded.body else |err| err;
         }
@@ -1665,16 +1732,18 @@ pub fn run(
             .verify => run_state.runVerify(),
             .done => unreachable,
         };
-        phase_result catch |err| switch (err) {
-            error.ResearchLlmBudgetExhausted => {
-                run_state.incomplete = .{ .reason = "max_llm_calls", .message = "the model-call budget was exhausted" };
-                break;
-            },
-            error.ResearchDeadlineExceeded, error.Timeout, error.DeadlineExceeded => {
+        phase_result catch |err| {
+            if (deadlineFailure(err)) {
                 run_state.incomplete = .{ .reason = "deadline", .message = "the wall-clock budget elapsed; resume with research_state" };
                 break;
-            },
-            else => return err,
+            }
+            switch (err) {
+                error.ResearchLlmBudgetExhausted => {
+                    run_state.incomplete = .{ .reason = "max_llm_calls", .message = "the model-call budget was exhausted" };
+                    break;
+                },
+                else => return err,
+            }
         };
         phases += 1;
         if (run_state.questions != null) {
@@ -1699,6 +1768,7 @@ pub fn run(
         .incomplete_details = run_state.incomplete,
         .phase = run_state.phase,
         .usage = state.usage,
+        .context_management = if (run_state.context_events.items.len > 0) run_state.context_events.items else null,
         .plan = state.plan,
         .findings = state.findings,
         .evidence = state.evidence,
@@ -1733,7 +1803,9 @@ pub fn execute(
     const result = run(arena, query_runner, generator, parsed, effective_sink, options) catch |err| {
         if (!stream) return err;
         if (effective_sink) |active| {
-            try active.emitValue(arena, "error", .{ .@"error" = @errorName(err) });
+            if (agent_context.failure(err)) |detail| {
+                try active.emitValue(arena, "error", detail.payload(err));
+            } else try active.emitValue(arena, "error", .{ .@"error" = @errorName(err) });
         }
         return .{ .content_type = "text/event-stream", .body = if (sink != null) try alloc.dupe(u8, "") else try alloc.dupe(u8, buffered.body.items) };
     };
@@ -2379,4 +2451,131 @@ test "research signs its checkpoints and rejects modified or unsigned ones" {
     // Durable jobs hold their state server-side and skip verification.
     const trusted = try execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, try Resume.state(arena, state_json)), null, .{ .state_key = key, .trusted_state = true });
     std.testing.allocator.free(trusted.body);
+}
+
+test "research agent context compacts resumed evidence with independent summarizer and retains citations" {
+    var original = TestFake{};
+    const first = try runJson(&original, null, test_request, .{});
+    defer first.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var raw = try std.json.parseFromSliceLeaky(std.json.Value, a, test_request, .{});
+    var state = first.value.research_state;
+    state.phase = .write;
+    try raw.object.put(a, "research_state", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, state, .{}), .{}));
+    const knowledge = try a.alloc(u8, 8000);
+    @memset(knowledge, 'x');
+    try raw.object.put(a, "agent_knowledge", .{ .string = knowledge });
+    try raw.object.put(a, "context_management", try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"context_window_tokens":16000,"target_input_tokens":6000,"reserved_output_tokens":4000,"summarizer_context_window_tokens":32768,"summarizer":{"provider":"gemini","model":"summary"}}
+    , .{}));
+    const Fake = struct {
+        main: TestFake = .{},
+        summaries: usize = 0,
+        fn generate(raw_ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw_ptr));
+            if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                self.summaries += 1;
+                try std.testing.expectEqual(generating.Provider.gemini, chain[0].generator.provider);
+                try std.testing.expect(chain[0].generator.response_format_json == null);
+                return .{ .allocator = alloc, .content = try alloc.dupe(u8,
+                    \\{"conversation":"Research hybrid search and reranking. [E1] doc:rrf RRF fuses lists. [E2] doc:rerank rerankers reorder.","tool_evidence":[{"tool_call_id":"antfly_context_evidence","tool_name":"assembled_evidence","facts":"[E1] doc:rrf RRF fuses lists; [E2] doc:rerank rerankers reorder.","source_ids":["E1","doc:rrf","E2","doc:rerank"]}],"unresolved_tool_calls":[]}
+                ) };
+            }
+            var joined: std.ArrayListUnmanaged(u8) = .empty;
+            defer joined.deinit(alloc);
+            for (messages[1..]) |message| if (message.content) |content| try joined.appendSlice(alloc, content.text);
+            const flattened = [_]generating.ChatMessage{ messages[0], .{ .role = .user, .content = .{ .text = joined.items } } };
+            return TestFake.generate(&self.main, alloc, chain, &flattened);
+        }
+    };
+    var fake = Fake{};
+    const r = fake.main.runners(null);
+    const encoded = try execute(std.testing.allocator, r[0], .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, try std.json.Stringify.valueAlloc(a, raw, .{}), null, .{});
+    defer std.testing.allocator.free(encoded.body);
+    const result = try std.json.parseFromSlice(Result, std.testing.allocator, encoded.body, .{});
+    defer result.deinit();
+    try std.testing.expect(fake.summaries > 0);
+    try std.testing.expectEqual(AgentStatus.completed, result.value.status);
+    try std.testing.expectEqual(@as(usize, 2), result.value.evidence.?.len);
+    try std.testing.expect(result.value.citations.?.len > 0);
+    const event = result.value.context_management.?[0];
+    try std.testing.expectEqualStrings("gemini", event.summary_provider.?);
+    try std.testing.expect(event.diagnostics.effective_input_tokens.? <= 6000);
+}
+
+test "research deadline aliases during preparation and generation return signed resumable state" {
+    var original = TestFake{};
+    const key: [32]u8 = @splat(0x37);
+    const initial = try runJson(&original, null, test_request, .{ .state_key = key });
+    defer initial.deinit();
+    for ([_]anyerror{ error.RequestDeadlineExceeded, error.ResearchDeadlineExceeded, error.Timeout, error.DeadlineExceeded }) |deadline_error| for ([_]bool{ false, true }) |during_summary| for ([_]bool{ false, true }) |stream| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var raw = try std.json.parseFromSliceLeaky(std.json.Value, a, test_request, .{});
+        try raw.object.put(a, "stream", .{ .bool = stream });
+        var state = initial.value.research_state;
+        state.phase = .write;
+        state.signature = try signState(a, key, state);
+        try raw.object.put(a, "research_state", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, state, .{}), .{}));
+        if (during_summary) {
+            const knowledge = try a.alloc(u8, 8000);
+            @memset(knowledge, 'x');
+            try raw.object.put(a, "agent_knowledge", .{ .string = knowledge });
+            try raw.object.put(a, "context_management", try std.json.parseFromSliceLeaky(std.json.Value, a,
+                \\{"context_window_tokens":16000,"target_input_tokens":6000,"reserved_output_tokens":4000,"summarizer_context_window_tokens":32768,"summarizer":{"provider":"gemini","model":"summary"}}
+            , .{}));
+        }
+        const Interrupt = struct {
+            main: TestFake = .{},
+            err: anyerror,
+            armed: bool = false,
+            summaries: usize = 0,
+            fn check(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.armed) return self.err;
+            }
+            fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.armed = true;
+                if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                    self.summaries += 1;
+                    return .{ .allocator = alloc, .content = try alloc.dupe(u8, "{}") };
+                }
+                return TestFake.generate(&self.main, alloc, chain, messages);
+            }
+        };
+        var interrupt = Interrupt{ .err = deadline_error };
+        const body = try std.json.Stringify.valueAlloc(a, raw, .{});
+        const encoded = try execute(std.testing.allocator, original.runners(null)[0], .{ .ptr = &interrupt, .vtable = &.{ .execute_chain = Interrupt.generate, .check = Interrupt.check } }, body, null, .{ .state_key = key });
+        defer std.testing.allocator.free(encoded.body);
+        const result_json = if (stream) blk: {
+            try std.testing.expect(std.mem.indexOf(u8, encoded.body, "event: error\n") == null);
+            const marker = "event: done\ndata: ";
+            const start = (std.mem.indexOf(u8, encoded.body, marker) orelse return error.TestExpectedEqual) + marker.len;
+            const end = std.mem.indexOfPos(u8, encoded.body, start, "\n\n") orelse return error.TestExpectedEqual;
+            break :blk encoded.body[start..end];
+        } else encoded.body;
+        const stopped = try std.json.parseFromSlice(Result, a, result_json, .{});
+        try std.testing.expectEqual(AgentStatus.incomplete, stopped.value.status);
+        try std.testing.expectEqualStrings("deadline", stopped.value.incomplete_details.?.reason);
+        try std.testing.expectEqual(Phase.write, stopped.value.research_state.phase);
+        try std.testing.expectEqual(@as(usize, if (during_summary) 1 else 0), interrupt.summaries);
+        try std.testing.expectEqualDeep(state.evidence, stopped.value.research_state.evidence);
+        try verifyState(a, key, stopped.value.research_state);
+        try std.testing.expectEqual(state.usage.?.llm_calls.? + 1, stopped.value.usage.?.llm_calls.?);
+        try std.testing.expect(stopped.value.context_management == null);
+        // Resume through the public signed-state path after the deadline is reset.
+        try raw.object.put(a, "research_state", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, stopped.value.research_state, .{}), .{}));
+        _ = raw.object.swapRemove("context_management");
+        _ = raw.object.swapRemove("agent_knowledge");
+        try raw.object.put(a, "stream", .{ .bool = false });
+        var resumed = TestFake{};
+        const completed = try runJson(&resumed, null, try std.json.Stringify.valueAlloc(a, raw, .{}), .{ .state_key = key });
+        defer completed.deinit();
+        try std.testing.expectEqual(AgentStatus.completed, completed.value.status);
+        try std.testing.expectEqual(@as(usize, 0), resumed.queries.load(.monotonic));
+    };
 }

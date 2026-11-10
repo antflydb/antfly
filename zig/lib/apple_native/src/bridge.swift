@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Foundation
+import CoreFoundation
 import FoundationModels
 import Speech
 import AVFoundation
@@ -55,8 +56,28 @@ private func modelStatus() -> Int32 {
     }
 }
 
+// Validate even direct ABI callers before querying model readiness. Keep the
+// generation API's signed 32-bit range, independently of the host Int width.
+private func generationTokenBudget(_ request: [String: Any]) throws -> Int? {
+    guard let raw = request["max_tokens"] else { return nil }
+    guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+          let budget = raw as? Int, budget > 0, budget <= Int(Int32.max)
+    else { throw BridgeError.status(1) }
+    return budget
+}
+
+private func generationByteLimit(_ budget: Int?, _ responseLimit: Int) throws -> Int {
+    guard responseLimit >= 0 else { throw BridgeError.status(1) }
+    let (bytes, overflow) = (budget ?? 1024).multipliedReportingOverflow(by: 8)
+    return overflow ? responseLimit : min(responseLimit, bytes)
+}
+
 @available(macOS 26.0, *)
 private func generate(_ request: [String: Any], _ invocation: Invocation) async throws {
+    let tokenBudget = try generationTokenBudget(request)
+    let requireCompletion = request["require_completion"] as? Bool ?? false
+    let outputLimit = requireCompletion
+        ? try generationByteLimit(tokenBudget, invocation.limit) : invocation.limit
     let status = modelStatus()
     guard status == 0 else { throw BridgeError.status(status) }
     guard let messages = request["messages"] as? [[String: String]],
@@ -84,12 +105,9 @@ private func generate(_ request: [String: Any], _ invocation: Invocation) async 
     }
     guard history.count % 2 == 0 else { throw BridgeError.status(1) }
     let session = LanguageModelSession(model: .default, transcript: Transcript(entries: entries))
-    let requireCompletion = request["require_completion"] as? Bool ?? false
-    let tokenBudget = request["max_tokens"] as? Int
     // Apple silently truncates at maximumResponseTokens. Strict text consumers
     // must instead let the model stop naturally, rejecting an over-budget result.
     // Streaming bounds retained bytes even on macOS 26, which has no usage API.
-    let outputLimit = requireCompletion ? min(invocation.limit, (tokenBudget ?? 1024) * 8) : invocation.limit
     let options = GenerationOptions(temperature: request["temperature"] as? Double,
                                     maximumResponseTokens: requireCompletion ? nil : tokenBudget)
     let stream = session.streamResponse(to: prompt, options: options)

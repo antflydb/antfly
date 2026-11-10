@@ -1,0 +1,50 @@
+name: Restore verified release files from R2
+description: Fetch one sealed release scope without duplicating Actions payloads
+inputs:
+  tag:
+    required: true
+    description: Authenticated release tag
+  commit:
+    required: true
+    description: Authenticated source commit
+  ledger-sha256:
+    required: true
+    description: Authenticated ledger digest
+  scope:
+    required: true
+    description: runtime, cli, or all
+  path:
+    required: true
+    description: Empty destination directory
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/load-toolchain-policy
+      id: toolchain
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ steps.toolchain.outputs.python_build }}
+    - shell: bash
+      env:
+        RELEASE_TAG: ${{ inputs.tag }}
+        RELEASE_COMMIT: ${{ inputs.commit }}
+        LEDGER_SHA256: ${{ inputs.ledger-sha256 }}
+        RELEASE_SCOPE: ${{ inputs.scope }}
+        DESTINATION: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        python -m pip install --require-hashes -r scripts/release/requirements.lock
+        args=()
+        case "$RELEASE_SCOPE" in
+          all) ;;
+          runtime|cli) args=(--scope "$RELEASE_SCOPE") ;;
+          *) echo 'invalid release scope' >&2; exit 2 ;;
+        esac
+        python scripts/release/download_objectstorage.py \
+          --endpoint "$AWS_ENDPOINT_URL" --bucket antfly-releases \
+          --prefix "antfly/$RELEASE_TAG" --tag "$RELEASE_TAG" \
+          --commit "$RELEASE_COMMIT" --ledger-sha256 "$LEDGER_SHA256" \
+          --out-dir "$DESTINATION" "${args[@]}"
+        if [ "$RELEASE_SCOPE" != all ]; then
+          rm "$DESTINATION/artifacts.json"
+        fi

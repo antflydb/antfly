@@ -5,6 +5,10 @@ from .administer_sql_settings_response_200 import AdministerSqlSettingsResponse2
 from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
 from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
 from .advance_table_storage_migration_response_200 import AdvanceTableStorageMigrationResponse200
+from .agent_context_diagnostics import AgentContextDiagnostics
+from .agent_context_event import AgentContextEvent
+from .agent_context_management import AgentContextManagement
+from .agent_context_management_mode import AgentContextManagementMode
 from .agent_decision import AgentDecision
 from .agent_question import AgentQuestion
 from .agent_question_kind import AgentQuestionKind
@@ -18,6 +22,7 @@ from .aggregation_bucket_sub_aggregations import AggregationBucketSubAggregation
 from .aggregation_date_range import AggregationDateRange
 from .aggregation_range import AggregationRange
 from .aggregation_request import AggregationRequest
+from .aggregation_request_date_bounds import AggregationRequestDateBounds
 from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
@@ -250,6 +255,7 @@ from .created_embeddings_index import CreatedEmbeddingsIndex
 from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
+from .created_enrichment_config_embedding_input import CreatedEnrichmentConfigEmbeddingInput
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
@@ -374,6 +380,7 @@ from .document_extraction_reader_config_provider import DocumentExtractionReader
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
 from .document_extraction_render_config import DocumentExtractionRenderConfig
 from .document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from .document_extraction_render_config_sampling import DocumentExtractionRenderConfigSampling
 from .document_extraction_route import DocumentExtractionRoute
 from .document_extraction_route_extractor import DocumentExtractionRouteExtractor
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
@@ -436,6 +443,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -1325,6 +1333,7 @@ from .media_content_part_type import MediaContentPartType
 from .media_output_config import MediaOutputConfig
 from .media_output_coverage_counts import MediaOutputCoverageCounts
 from .media_output_coverage_values import MediaOutputCoverageValues
+from .memory_access import MemoryAccess
 from .memory_assertion import MemoryAssertion
 from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
 from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
@@ -1340,17 +1349,25 @@ from .memory_assertion_support_sets_item_evidence_item_span_type_0 import (
     MemoryAssertionSupportSetsItemEvidenceItemSpanType0,
 )
 from .memory_assertion_visibility import MemoryAssertionVisibility
+from .memory_brief import MemoryBrief
+from .memory_brief_item import MemoryBriefItem
+from .memory_brief_item_kind import MemoryBriefItemKind
+from .memory_brief_item_stability import MemoryBriefItemStability
+from .memory_brief_request import MemoryBriefRequest
 from .memory_change_page import MemoryChangePage
 from .memory_change_request import MemoryChangeRequest
 from .memory_change_request_start import MemoryChangeRequestStart
 from .memory_claim_pin import MemoryClaimPin
 from .memory_claim_view import MemoryClaimView
 from .memory_configure_request import MemoryConfigureRequest
+from .memory_consolidation import MemoryConsolidation
+from .memory_consolidation_request import MemoryConsolidationRequest
 from .memory_correction import MemoryCorrection
 from .memory_correction_evidence_item import MemoryCorrectionEvidenceItem
 from .memory_correction_evidence_item_span_type_0 import MemoryCorrectionEvidenceItemSpanType0
 from .memory_correction_lifecycle import MemoryCorrectionLifecycle
 from .memory_correction_stability import MemoryCorrectionStability
+from .memory_count import MemoryCount
 from .memory_create_space_request import MemoryCreateSpaceRequest
 from .memory_embedding_batch import MemoryEmbeddingBatch
 from .memory_embedding_batch_items_item import MemoryEmbeddingBatchItemsItem
@@ -1511,6 +1528,7 @@ from .memory_evaluation_judge_output import MemoryEvaluationJudgeOutput
 from .memory_evaluation_judge_output_label import MemoryEvaluationJudgeOutputLabel
 from .memory_evaluation_judge_task import MemoryEvaluationJudgeTask
 from .memory_evaluation_policy_input import MemoryEvaluationPolicyInput
+from .memory_evaluation_policy_input_retrieval import MemoryEvaluationPolicyInputRetrieval
 from .memory_evaluation_prediction import MemoryEvaluationPrediction
 from .memory_evaluation_prediction_label import MemoryEvaluationPredictionLabel
 from .memory_evaluation_report import MemoryEvaluationReport
@@ -1555,6 +1573,9 @@ from .memory_explanation_nodes_item_links_item_target_type_0_kind import (
 )
 from .memory_explanation_nodes_item_resource import MemoryExplanationNodesItemResource
 from .memory_explanation_nodes_item_resource_kind import MemoryExplanationNodesItemResourceKind
+from .memory_finding import MemoryFinding
+from .memory_finding_kind import MemoryFindingKind
+from .memory_finding_suggested_action import MemoryFindingSuggestedAction
 from .memory_forget_request import MemoryForgetRequest
 from .memory_inspection import MemoryInspection
 from .memory_inspection_capabilities import MemoryInspectionCapabilities
@@ -1679,6 +1700,7 @@ from .memory_observation_request_origin_type_0_trace_type_0_kind import (
 from .memory_operation import MemoryOperation
 from .memory_operation_phase import MemoryOperationPhase
 from .memory_outcome import MemoryOutcome
+from .memory_pin import MemoryPin
 from .memory_recall_request import MemoryRecallRequest
 from .memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
 from .memory_recall_request_graph_type_0 import MemoryRecallRequestGraphType0
@@ -1923,6 +1945,7 @@ from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource 
 from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource_kind import (
     MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind,
 )
+from .memory_resolved_entity import MemoryResolvedEntity
 from .memory_result import MemoryResult
 from .memory_space_change import MemorySpaceChange
 from .memory_space_change_kind import MemorySpaceChangeKind
@@ -1942,6 +1965,10 @@ from .memory_space_config_predicates_item_cardinality import MemorySpaceConfigPr
 from .memory_space_config_processing import MemorySpaceConfigProcessing
 from .memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
 from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
+from .memory_space_stats import MemorySpaceStats
+from .memory_statistics import MemoryStatistics
+from .memory_stored_evidence import MemoryStoredEvidence
+from .memory_subject_count import MemorySubjectCount
 from .memory_supersession_candidate import MemorySupersessionCandidate
 from .memory_supersession_candidate_page import MemorySupersessionCandidatePage
 from .memory_supersession_candidate_page_retrieval import MemorySupersessionCandidatePageRetrieval
@@ -1961,6 +1988,8 @@ from .memory_supersession_verdict_evidence_item import MemorySupersessionVerdict
 from .memory_supersession_verdict_evidence_item_span_type_0 import MemorySupersessionVerdictEvidenceItemSpanType0
 from .memory_supersession_verdict_model_type_0 import MemorySupersessionVerdictModelType0
 from .memory_supersession_verdict_verdict import MemorySupersessionVerdictVerdict
+from .memory_usage import MemoryUsage
+from .memory_utility import MemoryUtility
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
@@ -2521,6 +2550,8 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_index_sort_item import TableSchemaIndexSortItem
+from .table_schema_index_sort_item_order import TableSchemaIndexSortItemOrder
 from .table_schema_patch import TableSchemaPatch
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
@@ -2669,6 +2700,10 @@ __all__ = (
     "AdvanceTableStorageMigrationBody",
     "AdvanceTableStorageMigrationBodyAction",
     "AdvanceTableStorageMigrationResponse200",
+    "AgentContextDiagnostics",
+    "AgentContextEvent",
+    "AgentContextManagement",
+    "AgentContextManagementMode",
     "AgentDecision",
     "AgentQuestion",
     "AgentQuestionKind",
@@ -2682,6 +2717,7 @@ __all__ = (
     "AggregationDateRange",
     "AggregationRange",
     "AggregationRequest",
+    "AggregationRequestDateBounds",
     "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
@@ -2895,6 +2931,7 @@ __all__ = (
     "CreatedEmbeddingsIndexConfig",
     "CreatedEmbeddingsIndexType",
     "CreatedEnrichmentConfig",
+    "CreatedEnrichmentConfigEmbeddingInput",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexConfig",
     "CreatedFullTextIndexType",
@@ -3036,6 +3073,7 @@ __all__ = (
     "DocumentExtractionReaderConfigRecognitionLevel",
     "DocumentExtractionRenderConfig",
     "DocumentExtractionRenderConfigResolution",
+    "DocumentExtractionRenderConfigSampling",
     "DocumentExtractionRoute",
     "DocumentExtractionRouteExtractor",
     "DocumentExtractionRouteExtractorType",
@@ -3098,6 +3136,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigEmbeddingInput",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
@@ -3981,6 +4020,7 @@ __all__ = (
     "MediaOutputConfig",
     "MediaOutputCoverageCounts",
     "MediaOutputCoverageValues",
+    "MemoryAccess",
     "MemoryAssertion",
     "MemoryAssertionEmbeddingModelType0",
     "MemoryAssertionEvidenceItem",
@@ -3994,17 +4034,25 @@ __all__ = (
     "MemoryAssertionSupportSetsItemEvidenceItem",
     "MemoryAssertionSupportSetsItemEvidenceItemSpanType0",
     "MemoryAssertionVisibility",
+    "MemoryBrief",
+    "MemoryBriefItem",
+    "MemoryBriefItemKind",
+    "MemoryBriefItemStability",
+    "MemoryBriefRequest",
     "MemoryChangePage",
     "MemoryChangeRequest",
     "MemoryChangeRequestStart",
     "MemoryClaimPin",
     "MemoryClaimView",
     "MemoryConfigureRequest",
+    "MemoryConsolidation",
+    "MemoryConsolidationRequest",
     "MemoryCorrection",
     "MemoryCorrectionEvidenceItem",
     "MemoryCorrectionEvidenceItemSpanType0",
     "MemoryCorrectionLifecycle",
     "MemoryCorrectionStability",
+    "MemoryCount",
     "MemoryCreateSpaceRequest",
     "MemoryEmbeddingBatch",
     "MemoryEmbeddingBatchItemsItem",
@@ -4123,6 +4171,7 @@ __all__ = (
     "MemoryEvaluationJudgeOutputLabel",
     "MemoryEvaluationJudgeTask",
     "MemoryEvaluationPolicyInput",
+    "MemoryEvaluationPolicyInputRetrieval",
     "MemoryEvaluationPrediction",
     "MemoryEvaluationPredictionLabel",
     "MemoryEvaluationReport",
@@ -4165,6 +4214,9 @@ __all__ = (
     "MemoryExplanationNodesItemLinksItemTargetType0Kind",
     "MemoryExplanationNodesItemResource",
     "MemoryExplanationNodesItemResourceKind",
+    "MemoryFinding",
+    "MemoryFindingKind",
+    "MemoryFindingSuggestedAction",
     "MemoryForgetRequest",
     "MemoryInspection",
     "MemoryInspectionCapabilities",
@@ -4241,6 +4293,7 @@ __all__ = (
     "MemoryOperation",
     "MemoryOperationPhase",
     "MemoryOutcome",
+    "MemoryPin",
     "MemoryRecallRequest",
     "MemoryRecallRequestEmbeddingModelType0",
     "MemoryRecallRequestGraphType0",
@@ -4369,6 +4422,7 @@ __all__ = (
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItemSpanType0",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResource",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind",
+    "MemoryResolvedEntity",
     "MemoryResult",
     "MemorySpaceChange",
     "MemorySpaceChangeKind",
@@ -4388,6 +4442,10 @@ __all__ = (
     "MemorySpaceConfigProcessing",
     "MemorySpaceConfigSemanticDiscovery",
     "MemorySpaceConfigSourceRulesItem",
+    "MemorySpaceStats",
+    "MemoryStatistics",
+    "MemoryStoredEvidence",
+    "MemorySubjectCount",
     "MemorySupersessionCandidate",
     "MemorySupersessionCandidatePage",
     "MemorySupersessionCandidatePageRetrieval",
@@ -4407,6 +4465,8 @@ __all__ = (
     "MemorySupersessionVerdictEvidenceItemSpanType0",
     "MemorySupersessionVerdictModelType0",
     "MemorySupersessionVerdictVerdict",
+    "MemoryUsage",
+    "MemoryUtility",
     "MergeConfig",
     "MergeConfigWeights",
     "MergeProfile",
@@ -4961,6 +5021,8 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaIndexSortItem",
+    "TableSchemaIndexSortItemOrder",
     "TableSchemaPatch",
     "TableShards",
     "TablespaceCatalogRecord",

@@ -24,8 +24,29 @@ from urllib.request import Request, urlopen
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from managed_api import authorization_headers, open_request, validate_backend
+from managed_api import (
+    authorization_headers,
+    correlation_evidence,
+    open_request,
+    validate_backend,
+)
 from serve import Gateway, RateLimit
+
+
+def test_correlation_retains_only_bounded_request_ids():
+    assert correlation_evidence(None) == {}
+    assert correlation_evidence(
+        {
+            "X-Request-ID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "CF-Ray": "0123456789abcdef-SJC",
+            "Set-Cookie": "server-only",
+            "X-Antfly-Upstream-Request-ID": "Bearer server-only",
+            "X-Antfly-Upstream-CF-Ray": "a" * 10000,
+        }
+    ) == {
+        "request_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "cf_ray": "0123456789abcdef-SJC",
+    }
 
 
 def test_backend_and_secret_validation_does_not_reveal_values():

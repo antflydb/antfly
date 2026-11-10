@@ -124,3 +124,22 @@ func microphoneConversionPreservesOneSecondOfStereoSpeech(rate: Double) throws {
   #expect(!FileManager.default.fileExists(atPath: candidate.path))
   #expect(try Data(contentsOf: retained) == Data([2]))
 }
+
+@Test @MainActor func microphoneTapCreatedOnMainActorAcceptsBackgroundAudio() async throws {
+  let sink = SpeechAudioBuffer()
+  let format = AVAudioFormat(
+    commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
+  let converter = try CaptureConverter(input: format, sink: sink)
+  let tap = converter.makeTap()
+  await Task.detached {
+    let format = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
+    let block = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4800)!
+    block.frameLength = 4800
+    block.floatChannelData![0].initialize(repeating: 0.25, count: 4800)
+    tap(block, AVAudioTime(sampleTime: 0, atRate: 48000))
+    converter.finish()
+  }.value
+  let samples = try sink.all()
+  #expect((1500...1700).contains(samples.count / MemoryLayout<Float>.size))
+}

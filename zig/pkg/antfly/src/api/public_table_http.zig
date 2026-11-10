@@ -18,7 +18,7 @@ const ant_json = @import("antfly-json");
 const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
 const graph_query_mod = @import("antfly_local_sources").graph_query;
@@ -875,6 +875,26 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
     };
 }
 
+/// Preserve malformed versus unsupported aggregation failures at every public
+/// query boundary, including errors discovered while reading source values.
+pub fn normalizePublicAggregationError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
+        else => err,
+    };
+}
+
+test "time series public aggregation failures retain client and operational classes" {
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidAggregation));
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidQueryRequest));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedAggregation));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedQueryRequest));
+    for ([_]anyerror{ error.OutOfMemory, error.Timeout, error.Canceled, error.QueryCandidateBudgetExceeded }) |failure| {
+        try std.testing.expectEqual(failure, normalizePublicAggregationError(failure));
+    }
+}
+
 /// Preserve operation outcomes across query adapters before dependency-error
 /// classification can mistake cancellation for an upstream provider failure.
 pub fn queryCancellationError(err: anyerror) ?error{ Timeout, DeadlineExceeded, Canceled } {
@@ -1657,13 +1677,14 @@ pub fn handleTableBatch(
 ) !OwnedResponse {
     resetLastBatchFailureName();
     last_ambiguous_batch_txn_id = null;
-    var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
+    var public_request = @import("antfly_local_sources").api_batch.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
             error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
             else => return err,
         }
     };
+    var batch_req = batch_api.takePublic(&public_request);
     defer batch_req.deinit(alloc);
 
     return executeOwnedTableBatch(alloc, table_name, batch_req, api);

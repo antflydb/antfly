@@ -5838,3 +5838,280 @@ their immutable inputs expire. The 30-layer shared-DAG comparisons use 360–363
 work units, including equal outer lists that share the large subtree. Independent
 equal containers still consume actual traversal work and stop at their work or
 cancellation boundary; full DAG output still requires expanded admission.
+
+### Certified point cohorts and identity-hash admission
+
+Read-only text Cypher and SQL `GRAPH_TABLE` bind a conservative physical
+key-domain proof before opening their distributed statement. Isolated node
+patterns with literal or parameter `antfly.documentKey` equality / `IN` anchors
+can select only the owners of those keys. Ordinary total property predicates may
+accompany the anchor. Conjunctions retain the union of possible anchor candidates
+because streaming and materialized execution can select different conjuncts;
+disjunctions require bounded domains on every branch. Multiple relations,
+scopes, labels and UNION arms union their observations by physical table. Any
+unbounded observation dominates that table's point domains.
+
+Proof construction uses invocation-owned parameters, a bounded analysis budget,
+and request cancellation checkpoints. Prepared SQL statements never cache bound
+keys. Unknown expressions, traversals, procedures, writes, staged changes to
+tables the graph query reads (including READ COMMITTED), empty domains and
+keysets exceeding 4,096 entries retain full-table cohorts and indexes. Empty
+overlays and staged writes to unreferenced tables preserve point pruning,
+including tables exposed through other labels of the same graph. Overlay
+projection uses the query's read dependencies so it never projects an unrelated
+table against an owner cohort that does not contain that table.
+These fallbacks preserve the runtime's error, empty-input and write semantics.
+
+Every statement attempt acquires one authoritative routing generation before
+selecting any table's key owners. It retains that generation through routing,
+range copying and initial owner capture, without replacing shared provider
+state. The coordinator resolves the certified keys against that generation
+**before** read-index admission and owner capture. Live catalog validation still
+checks topology; a changed topology discards the attempt and acquires a fresh
+generation. Routing budgets retain request cancellation through both indexed
+and compatibility key loops. The indexed routing
+session deduplicates owners; the legacy resolver still requires matching catalog
+and topology generations. Owner plans retain full immutable ranges for each
+selected owner and discard their selection keyset after routing. Whole-graph
+catalog and privilege validation, policy publication checks, table identity,
+privacy versions, topology validation and retained-cut fences remain mandatory.
+SQL also retains its logical schema/policy catalog-revision fence: concurrent
+catalog DDL can return SQLSTATE `40001` even when graph routing is unchanged.
+The retained generation exposes borrowed table and group range views. Keyspace
+coverage is checked once when building its immutable indexes. Extracting the
+selected owners' full ranges then requires no catalog-sized allocation or scan;
+only the selected range bounds are copied into owner plans. The generation stays
+retained until initial capture completes.
+
+Private coordinator descriptors use kernel ABI 91 / runtime ABI 88.
+Native callback ABI 12 independently fences the graph table descriptor stride
+behind `Statement.tables`; older callbacks are rejected before payload access.
+The public JSON contract and shard query protocol are unchanged. Privacy-policy
+capture translates native monotonic deadlines into the catalog's clock domain
+for both compact and compatibility callbacks before opening retained owners.
+Remote text-statistics envelopes also preserve their expected privacy version
+through query, explicit-term and background-term decoding. Conflicting nested
+versions and malformed versions are rejected. Each storage statistics path
+checks the expected policy while holding its read lock, before collecting terms;
+the private envelope never silently drops the coordinator's policy fence.
+Ordered data-Raft application also treats writer contention during receipt
+recovery and lifecycle publication as resumable. It retains completed-entry
+checkpoints, leaves the blocked entry pending and retries its exact term/index
+when ownership becomes available. Replay qualification verifies that a prior
+increment executes only once across changed Ready windows. Mutation
+qualification resolves ambiguous admitted writes through durable receipts and
+never replays them to obtain an immediate response.
+
+Identity-based grouping hashes charge node and relationship table/key bytes,
+and path hashes charge every visited node and edge. Wide byte hashing admits
+work and checks cancellation in at most 4 KiB chunks while preserving the
+existing hash format. This closes the gap where a megabyte of path identity
+bytes could consume a single work charge. Focused regressions cover a valid
+2,048-node chain, identity byte ceilings, cancellation during path traversal,
+and digest compatibility across chunk boundaries.
+
+Parameter-domain proofs build one invocation-owned, first-binding name index.
+Index construction and lookups charge the bounded analysis budget and check
+cancellation. Repeated references cost lookups rather than repeated scans of all
+supplied bindings; exhausted indexing declines pruning. Alias scopes also use
+budgeted name indexes, avoiding repeated alias scans. The expression walker
+visits semantic children without charging source spans and physical annotations
+as though they could introduce graph reads. Regression coverage includes 10,000
+bindings with 4,096 repeated references, bounded indexing refusal, cancellation,
+production generation acquisition before admission, and eager staged-overlay
+capture requirements.
+
+Point domains are unordered identity sets. Key hashing, unions and final
+materialization charge the proof budget and check cancellation; finalization
+exhaustion discards every bound. There is no routing-only key sort. Multiple
+label aliases of one physical table insert an observation's keys only once,
+while distinct-table fanout remains budgeted. Regressions cover 4,096 wide keys,
+64 aliases, physical-table fanout and cancellation during key insertion. Borrowed
+range tests require zero lookup allocations with 1, 1,000 and 10,000 catalog
+tables and verify gaps, overlaps, invalid ranges and expired routing budgets.
+
+SQL graph relations share an invocation-owned typed parameter cache keyed by
+SQL slot and inferred type. Equivalent parsed graph syntax (ignoring diagnostic
+positions, preserving parameter slots and graph identity/revision) reuses its
+physical-domain proof. Analysis, syntax comparison, physical-key unions and
+materialization consume one statement budget; exhaustion conservatively retains
+full cohorts and cancellation remains an error. Reused domain sets are unioned
+only once per physical table. No bound value or proof survives the invocation.
+Staged writes disable key and index pruning only for their physical table;
+unrelated graph inputs retain pruning. Serializable range tracking continues to
+require the full cohort.
+
+Multi-owner graph capture checks selected owners through a compact metadata
+readiness capability, including the private HTTP transport. Requests pin table,
+group and document-identity namespaces from the routing generation. Metadata
+crosses its read barrier, reads selected report pages and placement prefixes,
+and verifies namespace/rebuild/conflict state without an administrative snapshot.
+Active merge transitions are indexed by owner once per transition publication;
+only selected transitions are observed for identity reassignment. Foreign
+catalog adapters retain a budgeted selected-owner compatibility check. Readiness
+never replaces the live topology, read-index or retained-capture fences.
+
+Readiness replies carry a required disposition: `ready`, `topology_changed`,
+or `identity_unavailable`. Missing owners and changed routing namespaces trigger
+a fresh generation and a new whole-cohort capture attempt before any rows are
+exposed. Actual identity-health failures remain fail-closed. Exhausted topology
+retries and unavailable identity state return temporary graph-read availability
+errors, including through the private HTTP/native projection boundaries. SQL
+`GRAPH_TABLE` reports the same readiness failures as retryable SQLSTATE `53300`
+with HTTP 503; pgwire uses the shared diagnostic classification.
+
+SQL computes its physically prunable table set before domain analysis. Staged
+and ordinary SQL scans already require full key cohorts, so staged-only graph
+relations perform no domain proof or proof-cache comparison. Mixed graph
+relations analyze only eligible physical nodes while still walking nested reads
+and validating residual predicates. Excluded table domains cannot consume key
+hashing/materialization work needed by unrelated bounded inputs. Regression
+coverage includes 4,096 wide keys in separate and mixed staged graph relations,
+concurrent topology replacement during readiness, and wire disposition decoding.
+
+Warm distributed graph captures validate a retained routing generation using a
+constant-size linearizable authority/revision token. Equal tokens license reuse
+without downloading or copying any catalog tables/ranges. Changed tokens refresh
+through the existing authoritative snapshot path; refreshes are coalesced and
+unsupported or incomplete token replies cannot license cache reuse. Endpoint
+iteration is pinned across failover, independently of concurrent affinity updates.
+
+Selected-owner merge readiness uses a durable covering index of active transition
+IDs and selected-owner roles. Accepted ordinary/online admission, update, terminal
+publication, and removal maintain membership in the same metadata transaction.
+Derived catalog index version 12 reconstructs it from primary records on migration
+and snapshot restore. Foreground readiness refuses an unavailable index rather
+than rebuilding catalog history or treating missing membership as ready; ordinary
+apply/startup/control index maintenance performs reconstruction. Queries only seek
+selected owner prefixes, deduplicate shared donor/receiver transitions, and inspect
+their live observations. Split publications never invalidate or rescan merge history.
+
+Readiness HTTP requests borrow the caller's cancellation signal through outer and
+per-endpoint budgets, including requests without an explicit deadline. Transport
+`Cancelled` is normalized to `Canceled` and cannot become a retryable availability
+failure; cancellation before dispatch or during a peer call stops further attempts.
+Regression gates cover warm/revision-changed/mixed-peer routing, affinity changes
+during failover, durable-index migration and retirement with unrelated terminal
+history, allocation-free misses, and preflight/in-flight cancellation.
+Readiness observation-lock waits honor the same cancellation/deadline budget, so
+an active transition's control work cannot turn cancellation into an unbounded
+mutex wait. Relational authored-vector receipt validation runs during preparation,
+while transient JSON is still alive, against the immutable write plan whose
+generation commit fences. Lazy intent projection hydrates only the metadata field
+when external vector receipts require it; commit consumes owned rows/effects and
+never revives a released JSON root. Native regressions verify both receipt
+rejection/withdrawal and the existing large relational sparse-predicate fixture.
+Internal routing-budget exhaustion retains temporary graph/SQL availability
+semantics (HTTP 503 and SQLSTATE 53300); it is never classified as malformed query
+syntax. Explicit execution deadlines and cancellation keep their own outcomes.
+
+The latest-main merge retains the equivalent upstream prepared-row receipt fix.
+Kernel ABI 90 combines main's aggregation-budget and checked-borrow changes with
+the certified graph descriptor domains; callback ABI 11 remains the graph stride
+fence. Authenticated three-metadata/three-data qualification passed all 77 Cypher
+checks: three warm reads each used one 115-byte routing token and no routing
+snapshot; a catalog revision change fetched a new snapshot before warm reuse.
+
+Compiled readiness projections validate their nested control header against the
+shared query ABI, independently of the enclosing storage projection ABI. A real
+owner regression exercises both readiness operations with valid query controls
+and rejects substituted storage-version controls before executing owner reads.
+
+Legacy wire decoding preserves its document-version scheme on private controls.
+All exclusive control validators treat that scheme as transport metadata, so
+range tracking, graph cleanup, publications, catalog/proof controls, grouped
+sources and resolver review survive wire round trips without admitting mixed
+user mutations. The focused control-wire gate covers admission, legacy and
+revision-v1 envelopes, public rejection and mixed-effect rejection.
+Sole-control root counts exclude only the revision envelope's explicit scheme
+and mandatory zero timestamp; controls that disallow authored timestamps still
+reject nonzero timestamps.
+
+Final validation is pinned to origin/main `62186c31b3` (merge `4550e4d3bb`).
+The Debug build and graph, control-wire, native-capture, remote-routing, HTTP
+transport and compiled-owner gates passed. Focused service tests import their
+service explicitly so selected-owner and held-mutex cancellation assertions
+execute under their narrow filter. The authenticated six-node campaign passed
+77 checks; each of three warm reads used one 115-byte routing token without a
+snapshot. A revision change fetched the 11,140-byte ten-table/ten-range snapshot
+once, then subsequent reads returned to token-only validation.
+
+
+### Selected-role readiness and cancellable routing acquisition
+
+Merge catalog permission is no longer interpreted as active identity reassignment.
+Derived catalog index version 12 retains the selected donor/receiver role for
+nonterminal transitions. Selecting both participants deduplicates the transition
+while preserving both roles; selecting only one participant checks only that
+owner's observed runtime reassignment. Queued transitions and online row copying
+remain readable while their original owner namespaces are healthy. Actual
+reassignment, namespace conflicts, and rebuild-required states still fail closed.
+Migration reconstructs the covering index from primary transitions; foreground
+readiness never scans terminal history or reconstructs a missing index.
+
+Routing-generation callbacks carry the complete invocation clock, deadline, and
+cancellation budget. Remote acquisition normalizes the deadline once into its
+HTTP clock, forwards cancellation through token and full/legacy snapshot reads,
+and checks cancellation during cache/refresh lock contention. Canceled requests
+stop endpoint failover and return the canonical cancellation outcome. Metadata
+projection waiters can cancel independently of the shared builder; another
+waiter's shorter deadline or cancellation does not poison a healthy acquisition.
+Standalone generation publication also checks the budget while acquiring its
+metadata lock. Native callback ABI 12 rejects older catalog callback signatures
+before interpreting their arguments. Kernel ABI 91 separately fences the changed selected-role projection response;
+query/failure ABI 88 remains unchanged.
+
+The latest main's privacy-aware text-statistics wrappers retain the original DB
+method signatures. Both wire decoders share strict privacy-version validation.
+Isolated private controls preserve the neutral document-version default through
+forwarding, including graph endpoint cleanup; explicit revision envelopes remain
+independent of control effects and mixed user writes remain rejected.
+
+
+Qualification after merging `origin/main` at `6736eb3842`: the Debug server and
+focused routing, readiness/projection, control-wire, cohort, callback, native-cut,
+and compiled storage-owner gates completed 223/223 build steps. The consumer
+suites passed five remote routing/cancellation/copy tests, six cohort tests,
+eight native capture tests, the compiled readiness ABI regression, and all
+23 control-wire implementation tests plus their two discovery roots, without
+leaks. The direct callback epoch regression rejects ABI 10 and 11, and the six
+Python retry/receipt tests pass. The authenticated eight-owner standalone test
+passed in 28 seconds; the three-metadata/three-data replicated-owner campaign
+passed in 207 seconds, covering graph reads/writes/search, SQL `GRAPH_TABLE`,
+catalog revisions, expression/normalization qualification and durable receipts.
+All qualification used Debug. The merged main's TypeScript formatter hook could
+not run without its pinned dependency installation; only merge commits
+bypassed that hook. Implementation commits use the normal staged checks.
+
+
+A subsequent main update at `8802fa94a3` was merged and requalified. Both raw
+writer contention and the new `StorageOwnerAdmissionPending` outcome retain
+exactly-once Raft retries; the combined regression checks all four admission
+failures without replaying its increment. Initial graph captures retry temporary
+owner admission under their existing attempt/deadline/cancellation bounds.
+Exhaustion reports HTTP 503 and SQLSTATE `53300`, including through pgwire.
+The focused `cypher-runtime-admission-test` also executes cleanup routing after
+the full-budget callback change. The final Debug server and focused gates pass
+238/238 build steps and 26/26 standard-runner tests; all consumer suites pass.
+The nine SQL diagnostic tests, generated error identities, control-source catalog,
+and 2,560-file Apache boundary checks pass. The authenticated eight-owner
+standalone and replicated metadata/data campaigns pass again on this merged
+binary (53 and 215 seconds respectively).
+
+### Reporter-bounded readiness and cold routing contention
+
+Owner identity readiness resolves reporting store IDs from the selected-group
+report index before fetching store headers and active report roots. It caches
+each store once within the same read transaction, reads only active selected
+report slots, and omits stores referenced solely by obsolete report generations.
+Missing store headers on obsolete index entries remain ignorable; malformed
+active selected records remain errors. The control-plane report projection
+deliberately retains the full candidate store inventory for replica placement.
+
+Regression coverage preserves control-plane inventory, duplicate-group
+deduplication, active report-root selection after baseline activation and
+snapshot restore, missing-store and obsolete-generation filtering, and no
+per-read allocation growth with 512 poisoned unrelated store headers. The cold
+authoritative routing snapshot path uses the shared request budget while
+acquiring read-endpoint affinity, with held-mutex cancellation and deadline
+tests that admit no transport request.

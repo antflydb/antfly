@@ -23,11 +23,7 @@ const file_header_len = 14;
 const dib_bitmap_info_header_len = 40;
 const compression_rgb = 0;
 
-pub const DecodedImage = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-};
+pub const DecodedImage = @import("image_values").DecodedRgba;
 
 pub const Info = struct {
     width: u32,
@@ -133,7 +129,7 @@ fn decodeRgbaChecked(alloc: Allocator, bmp_bytes: []const u8, limits: ?DecodeLim
 
     var y: usize = 0;
     while (y < height) : (y += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const src_y = if (top_down) y else @as(usize, height) - 1 - y;
         const src_row = bmp_bytes[pixel_start + src_y * src_row_stride ..][0..src_row_stride];
         const dst_row = rgba[y * @as(usize, width) * 4 ..][0 .. @as(usize, width) * 4];

@@ -1031,6 +1031,22 @@ pub const WriterLaneReleaseHook = struct {
     release: *const fn (ptr: *anyopaque) void,
 };
 
+/// One synchronous prepared attempt's irreversible disposition. It is separate
+/// from the caller's cumulative progress marker: optimistic preparation may
+/// retry, while a committed attempt must propagate every later error unchanged.
+pub const PreparedCommitDisposition = struct {
+    pub const State = enum(u8) { preparing, primary_committed };
+    state: State = .preparing,
+
+    pub fn markPrimaryCommitted(self: *@This()) void {
+        self.state = .primary_committed;
+    }
+
+    pub fn permitsPreparationRetry(self: @This(), err: anyerror) bool {
+        return self.state == .preparing and (err == error.PreparedGenerationChanged or err == error.PreparedReadSetChanged);
+    }
+};
+
 pub const BatchExecutionOptions = struct {
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1042,6 +1058,8 @@ pub const BatchExecutionOptions = struct {
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
+    restore_ttl_sources: ?*const std.StringHashMapUnmanaged(i128) = null,
+    restore_document_version_floor: u64 = 0,
     preserve_logical_values: bool = false,
     restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
@@ -1062,6 +1080,9 @@ pub const BatchExecutionOptions = struct {
     /// `db.zig`'s `DB.batchWithCommittedSequence` and `lite/docstore.zig`'s
     /// `Store.Ticket.waitSequence`.
     committed_sequence_out: ?*u64 = null,
+    /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
+    /// retained by asynchronous publication or shared across retries.
+    prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -1102,6 +1123,15 @@ pub const BatchExecutionOptions = struct {
     /// section as the commit, so two concurrent `.local_decision` writers
     /// racing the same UNIQUE value can never both win.
     integrity_authority: enum { none, local_decision } = .none,
+    /// lite-single-commit-write-path.md §7.6: only meaningful alongside
+    /// `.local_decision`. Lets `prepareLocalIntegrityDecision`'s own
+    /// RESTRICT check (`relational_integrity.requireEmpty`) tell a
+    /// genuinely live Reference apart from a dangling one left by the
+    /// fused FK multi-table coordinator's own non-atomic ride-along
+    /// `.attach` write, self-healing it (queuing its deletion in this
+    /// same commit) instead of refusing the parent change forever. `null`
+    /// preserves exact today's-behavior: any live Reference blocks.
+    relational_child_existence_check: ?@import("relational_integrity.zig").ChildExistenceCheck = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,

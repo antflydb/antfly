@@ -72,6 +72,101 @@ The native catalog owns existence, logical naming, schema, indexes, and table
 incarnation. In distributed mode it retains metadata consensus. Removing data
 Raft does not remove metadata authority or coordinated publication.
 
+### Native owner serving cuts
+
+The candidate adds opt-in native owner admission for sources whose complete
+write path Antfly controls. `lake_indexes.serving_cuts.enabled` starts durable
+activation after all writers are upgraded. Reader sharing alone retains strict
+remote checks; an activated owned source instead serves its native admitted
+publication/WAL record. This candidate still requires end-to-end qualification
+before release or deployment.
+
+Eligible sources are managed Iceberg behind an enforced writer gateway and
+sealed immutable Parquet manifests. An immutable-file prefix is insufficient:
+its membership can still change. Shared external catalogs retain fresh catalog
+coordination or an explicit bounded-staleness contract.
+
+Activation conditionally claims the managed catalog and WAL heads with the
+same durable owner nonce. Unhooked writers fail, including older binaries whose
+strict parsers reject the ownership field. Claiming stages ownership; admitting
+a complete first cut atomically enables native reads. Strict coordinated reads
+remain available while initial capture is incomplete. Turning the configuration
+off does not remove an established fence. Sealed manifests have immutable
+membership, and capture retains their exact parsed head even without a published
+file-navigation index.
+
+The native owner persists source identity, incarnation, ownership epoch,
+acknowledged WAL watermark and the current reusable serving-cut reference.
+A compact projection is written in the same native transaction as lifecycle
+state, so fresh queries do not transfer retained publication history. Native
+snapshots include both projections; older checkpoints reconstruct the compact
+view on the metadata owner. Absence is materialized too, keeping unowned sources
+on a small point read. During rolling upgrades, an older peer rejecting this
+private tag selects the existing authoritative lifecycle read. Permission and
+identity failures never select that fallback. Every accepted write advances or invalidates that
+record before acknowledgment.
+Catalog changes invalidate it before returning success. If remote commitment
+succeeds but native acknowledgment fails, the API reports `state: unknown`
+without a read receipt. Exact retries repeat native acknowledgment without
+appending the WAL again; resolving a committed catalog request also repairs
+native invalidation before reporting success. Admission of a rebuilt
+cut compares the epoch captured before observing catalog/WAL state, and cannot
+regress the acknowledged watermark. An unavailable replacement cut returns a
+retryable rebuilding response rather than serving an older acknowledged state.
+The checks belong inside the native metadata transaction, including table
+incarnation checks. Distributed mutation and warming obey leader ownership.
+
+Activation must fence all writers, including standalone, SQL, CDC and older
+processes. Conditional WAL/catalog ownership prevents an unfenced writer from
+successfully appending after activation; a separate advisory lease is not enough.
+Only the gateway holds vendor write credentials. Ownership transitions must
+preserve valid old cursors or drain them explicitly. Unconfigured sources keep
+their existing remote checks; failure to establish a fence cannot silently
+enable this mode.
+
+Publication and write acceptance construct reusable immutable state references
+containing the published generation and bounded pending row images. Queries
+issue authenticated cursor references to that state and a WAL position, without
+uploading another retained image or cursor envelope. The implementation uses
+HMAC-authenticated `lake3:` and `source3:` capabilities, while retaining legacy
+`lake2:`/`source2:` reads. A compact framed payload avoids JSON-escape expansion
+within the existing token bound; existing JSON-envelope capabilities remain
+readable through their original expiry. Signing keys stay in private native
+metadata. Cursor validation still
+checks current permissions, incarnation, recipe, ownership and expiry. Reader
+leases protect published generations through every issued cursor's expiry;
+state images and their row groups must live at least as long. Admission extends
+the publication reader through twice the cursor TTL plus a refresh margin,
+atomically with accepting the image reference. Existing generation and metadata
+bounds can impose explicit backpressure at high publication rates. Refresh happens
+before the remaining retention horizon becomes too short for a new cursor.
+Increasing the configured cursor lifetime forces refresh when the existing
+horizon cannot cover it; unavailable cuts also trigger keyed reconciliation.
+Required recovery coalesces by table incarnation within four process-wide lanes.
+Each waiting caller keeps its own deadline/cancellation; recovery also observes
+shutdown and a 60-second maximum deadline. Readiness does not swallow a required
+recovery failure for an active owner or advertise a cut whose retention cannot
+cover the configured cursor lifetime. Optional warming cannot establish readiness.
+Raw captured WAL heads cannot substitute for retained row images when their
+underlying roots can be collected independently.
+
+The owner warms the admitted cut's bounded working set: navigation, dictionaries,
+postings, row locators and replacement-key indexes. Existing process accounting,
+eviction and cancellation apply; warming yields to foreground work and stops
+when the admitted generation changes. Four bounded continuation plans retain
+completed navigation waves and their working-set quota across timeout, with
+eviction-aware rewarming after a cooldown. Plans own immutable references, never request credentials or reader
+leases. Compressed opening bundles replace redundant individual metadata fetches.
+Retained state, row groups and sealed heads also use the authenticated durable
+byte cache, with exact provider generation and credential scope in their keys.
+Cache hits still require current native authority or a valid retained capability.
+Query execution merges pinned readers
+directly, fetches remote blocks on misses and hydrates winning hits. These
+optimizations must preserve unfiltered replacement probes and exact pagination.
+External-writer freshness, vector overlays and unsupported cursor shapes keep
+their established paths until separately qualified. Warm fixture latency targets
+do not qualify full-archive performance or scale-to-zero startup.
+
 External lake sidecars retain one metadata authority: a builder first commits a
 pending attempt through definition CAS, renews its fence, uploads immutable
 artifacts, and publishes through the exact admitted CAS. Upload completion is

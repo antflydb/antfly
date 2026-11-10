@@ -22,6 +22,15 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_artifact_catalog_proposal;
+    _ = @import("antfly_local_sources").storage_db_authority_invalidation;
+    _ = @import("antfly_local_sources").storage_db_mutation_commit_disposition_test;
+    _ = @import("antfly_local_sources").storage_db_mutation_plan;
+    _ = @import("antfly_local_sources").storage_db_query_cypher_projection;
+    _ = @import("antfly_local_sources").storage_db_transform_read_plan;
+    _ = @import("antfly_local_sources").storage_embedded_graph_catalog;
+    _ = @import("antfly_local_sources").storage_read_session_contract;
+    _ = @import("antfly_local_sources").storage_read_session_values;
     _ = @import("antfly_local_sources").storage_db_field_projection_source;
     _ = @import("antfly_local_sources").storage_source_value_identity;
     _ = @import("antfly_local_sources").storage_engine;
@@ -405,7 +414,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_conformance_test;
     _ = @import("antfly_local_sources").storage_lite_connection;
     _ = @import("antfly_local_sources").storage_lite_crash_consistency_test;
-    _ = @import("antfly_local_sources").storage_lite_crash_consistency_capi_test;
     _ = @import("antfly_local_sources").storage_lite_crash_sim_io;
     _ = @import("antfly_local_sources").storage_lite_docstore;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
@@ -583,6 +591,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_source_proof_batch;
     _ = @import("antfly_local_sources").storage_projection_seal;
     _ = @import("antfly_local_sources").storage_retained_frame;
+    _ = @import("antfly_local_sources").storage_verified_retained_frame;
     _ = @import("antfly_local_sources").storage_db_native_query_cut;
     _ = @import("antfly_local_sources").storage_db_native_query_cut_contract;
     _ = @import("antfly_local_sources").storage_db_native_query_remote_storage;

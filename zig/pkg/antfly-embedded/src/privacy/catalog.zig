@@ -890,7 +890,7 @@ fn userNode(a: A, node: std.json.Value) !void {
     }
     if (node.object.get("producer")) |producer| try userProducer(producer);
     if (node.object.get("producer_json")) |producer| {
-        if (producer == .string) {
+        if (producer == .string and producer.string.len != 0) {
             var parsed = try std.json.parseFromSlice(std.json.Value, a, producer.string, .{});
             defer parsed.deinit();
             try userProducer(parsed.value);
@@ -908,6 +908,10 @@ test "privacy public declarations cannot impersonate a managed producer or opaqu
     try std.testing.expectError(error.PrivacyManagedGraph, validateUserConfiguration(a, "{\"indexes\":{\"_privacy\":{}}}"));
     try std.testing.expectError(error.PrivacyManagedGraph, validateUserConfiguration(a, "{\"enrichments\":[{\"name\":\"_privacy_document\"}]}"));
     try std.testing.expectError(error.PrivacyManagedGraph, validateUserConfiguration(a, "{\"producer\":{\"type\":\"extractor\",\"config\":{\"_antfly_privacy\":{}}}}"));
+    // An empty declaration permits ordinary inherited/default producer
+    // selection; nonempty serialized producers retain the managed-state fence.
+    try validateUserConfiguration(a, "{\"enrichments\":[{\"name\":\"vectors\",\"producer_json\":\"\"}]}");
+    try std.testing.expectError(error.PrivacyManagedGraph, validateUserConfiguration(a, "{\"producer_json\":\"{\\\"config\\\":{\\\"_antfly_privacy\\\":{}}}\"}"));
     try validateUserConfiguration(a, "{\"schema\":{\"document_schemas\":{\"doc\":{\"schema\":{\"properties\":{\"_privacy\":{\"type\":\"string\"}}}}}}}");
 }
 

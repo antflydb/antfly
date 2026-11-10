@@ -60,7 +60,7 @@ def test_upstream_agreement_summary_round_trip_preserves_abstention():
     from antfly.client_generated.models import DecisionCascadeStageTrace
 
     for state in ("agreed", "disagreed", "unverified"):
-        summary = {
+        summary: dict[str, object] = {
             "agreement_status": state,
             "decider": "remote",
             "definition_sha256": "b" * 64,

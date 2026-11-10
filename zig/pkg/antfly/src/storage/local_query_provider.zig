@@ -16,30 +16,52 @@
 //! Physical local-query provider. The storage archive owns and closes the DB;
 //! this component borrows that opaque handle for one complete query and returns
 //! one encoded response. Index internals never cross the ABI. The provider is
-//! co-generated with the owning storage kernel in release builds so physical
-//! storage and local query share one optimized compilation graph.
+//! co-located with the storage kernel. Private DB layout checks belong to its
+//! capability issuer; the independently compiled dispatcher sees no DB type.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("local_query_abi");
 const error_identity = @import("kernel_error_identity");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const query_api = @import("antfly_local_sources").api_query;
 const local_query = @import("antfly_source_root").antfly_sources.local_query;
-const distributed_graph = @import("../api/distributed_graph.zig");
+const distributed_graph = @import("antfly_local_sources").api_local_graph;
 const aggregation_plan = @import("../api/aggregation_plan.zig");
 const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 
-pub fn execute(
-    request: *const abi.LocalQueryRequest,
-    out_response: *abi.QueryOwnedResponse,
+/// Issue a synchronous execution capability only after validating the caller's
+/// existing native DB borrow in the physical owner. The donor remains owned
+/// and admitted by its caller; no stack-backed adapter or allocator is retained.
+pub fn issue(
+    borrow: *const abi.CheckedDbBorrow,
+    out_execution: *abi.QueryExecution,
     out_failure: *abi.FailureIdentity,
 ) callconv(.c) abi.Status {
+    out_execution.* = .{};
+    out_failure.* = .{};
+    const db = borrow.resolve(db_mod.DB) catch |err| return fail(err, .validate_request, out_failure);
+    out_execution.* = .{ .context = db, .execute_fn = executeIssued };
+    return .ok;
+}
+
+pub fn issueForDb(db: *db_mod.DB) abi.QueryExecution {
+    return .{ .context = db, .execute_fn = executeIssued };
+}
+
+fn executeIssued(context: ?*anyopaque, request: *const abi.LocalQueryRequest, out_response: *abi.QueryOwnedResponse, out_failure: *abi.FailureIdentity) callconv(.c) abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const pointer = context orelse return fail(error.InvalidArgument, .validate_request, out_failure);
+    if (@intFromPtr(pointer) % @alignOf(db_mod.DB) != 0) return fail(error.InvalidArgument, .validate_request, out_failure);
+    const db: *db_mod.DB = @ptrCast(@alignCast(pointer));
+    return executeForDb(db, request, out_response, out_failure);
+}
+
+fn executeForDb(live_db: *db_mod.DB, request: *const abi.LocalQueryRequest, out_response: *abi.QueryOwnedResponse, out_failure: *abi.FailureIdentity) abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .validate_request, out_failure);
-    const live_db: *db_mod.DB = @ptrCast(@alignCast(request.db orelse
-        return fail(error.InvalidArgument, .validate_request, out_failure)));
     const table_name = request.table_name.slice();
     if (table_name.len == 0 or request.request_json.len == 0)
         return fail(error.InvalidArgument, .validate_request, out_failure);
@@ -247,22 +269,20 @@ fn applyAggregations(
     result: db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
 ) !void {
-    var full: ?db_mod.types.SearchResult = null;
-    defer if (full) |*value| value.deinit();
-    var aggregation_req = req;
-    const selected = if (aggregation_plan.aggregationCanUseCurrentResult(req, result)) result else blk: {
-        aggregation_req = try aggregation_plan.aggregationFullResultRequest(req, result, "local-owner");
-        full = try aggregation_plan.collectAggregationFullResult(alloc, req, aggregation_req, LeaseSearcher{ .lease = lease }, "local-owner");
-        break :blk full.?;
-    };
+    const aggregation_req = req;
     const requests = try query_api.parseAggregationRequestsJson(alloc, aggregation_req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
+    const algebraic_name = if (db_mod.aggregations.containsDateHistogram(requests)) blk: {
+        const entry = db_mod.aggregations.resolveTemporalAlgebraicIndex(db.core.index_manager, aggregation_req.index_name) orelse break :blk aggregation_req.index_name;
+        break :blk @as(?[]const u8, entry.config.name);
+    } else aggregation_req.index_name;
     var ctx: db_mod.aggregations.Context = .{
+        .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
         .index_manager = db.core.index_manager,
         .doc_store = db.core.store,
         .full_text_index_name = if (aggregation_req.full_text_queries.len == 1) aggregation_req.full_text_queries[0].index_name else aggregation_req.index_name,
-        .algebraic_index_name = aggregation_req.index_name,
-        .algebraic_available = try local_query.algebraicIndexFreshEnoughForName(alloc, aggregation_req.index_name, db),
+        .algebraic_index_name = algebraic_name,
+        .algebraic_available = try local_query.algebraicIndexFreshEnoughForName(alloc, algebraic_name, db),
         .identity_read_generation = aggregation_req.identity_read_generation,
     };
     const constraints = if (aggregation_plan.canConsiderAlgebraicAggregations(aggregation_req))
@@ -274,6 +294,37 @@ fn applyAggregations(
         ctx.algebraic_scope = .root;
         ctx.algebraic_constraints = items;
     };
+    var schema_view = db.core.acquireSchemaView();
+    defer if (schema_view) |*view| view.release();
+    const time = @import("antfly_platform").time;
+    const visibility_proven = if (schema_view) |view|
+        local_query_contract.temporalRangeVisibleThroughDeadline(req, ctx.algebraic_constraints, view.tableSchema().ttl_field, view.visibilityTtlDurationNs(), time.realtimeNs(), time.monotonicNs())
+    else
+        true;
+    _ = try db.currentIdentityReadGenerationForRequest(aggregation_req.identity_read_generation);
+    ctx.temporal_materializations_exact = visibility_proven;
+    if (try db_mod.aggregations.tryTemporalMaterializedAggregations(alloc, requests, ctx)) |accelerated| {
+        errdefer db_mod.aggregations.deinitResults(alloc, accelerated);
+        for (accelerated) |*aggregation| try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
+        meta.aggregation_results = accelerated;
+        meta.aggregation_execution = "materialized_temporal";
+        return;
+    }
+    // A declined temporal attempt must not immediately rescan the same index
+    // during the exact stored-row fallback.
+    ctx.temporal_materializations_exact = false;
+    if (db_mod.aggregations.containsDateHistogram(requests)) {
+        ctx.algebraic_available = false;
+        ctx.algebraic_scope = .disabled;
+    }
+    var full: ?db_mod.types.SearchResult = null;
+    defer if (full) |*value| value.deinit();
+    const selected = if (aggregation_plan.aggregationCanUseCurrentResult(req, result)) result else blk: {
+        const full_req = try aggregation_plan.aggregationFullResultRequest(req, result, "local-owner");
+        full = try aggregation_plan.collectAggregationFullResult(alloc, req, full_req, LeaseSearcher{ .lease = lease }, "local-owner");
+        break :blk full.?;
+    };
+    if (db_mod.aggregations.containsDateHistogram(requests)) meta.aggregation_execution = "scan";
     const results = try db_mod.aggregations.computeSearchAggregations(alloc, requests, selected, ctx);
     errdefer db_mod.aggregations.deinitResults(alloc, results);
     for (results) |*aggregation| try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
@@ -364,11 +415,19 @@ fn executeAlgebraicPartials(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = local_query.executeStorageKernelAlgebraicPartials(
-        std.heap.c_allocator,
-        db,
-        request.request_json.slice(),
-    ) catch |err| return fail(err, .algebraic_partials, out_failure);
+    var envelope = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, request.request_json.slice(), .{}) catch |err| return fail(err, .algebraic_partials, out_failure);
+    defer envelope.deinit();
+    const response = if (envelope.value == .object and envelope.value.object.contains("temporal_query"))
+        local_query.executeTemporalQuery(std.heap.c_allocator, db, request.request_json.slice(), .{
+            .cancellation = requestCancellationToken(request),
+            .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
+        }) catch |err| return fail(err, .algebraic_partials, out_failure)
+    else
+        local_query.executeStorageKernelAlgebraicPartials(
+            std.heap.c_allocator,
+            db,
+            request.request_json.slice(),
+        ) catch |err| return fail(err, .algebraic_partials, out_failure);
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
 }
@@ -419,8 +478,16 @@ fn fail(
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
     std.log.debug("local query rejected operation={s} err={s}", .{ @tagName(operation), @errorName(err) });
+    // Query-level identities must be established before the generic runtime
+    // callback ABI. Dedicated aggregation failures are not callback details;
+    // query consumers already transport these canonical query classes.
+    const query_error = switch (err) {
+        error.InvalidAggregation => error.InvalidQueryRequest,
+        error.UnsupportedAggregation => error.UnsupportedQueryRequest,
+        else => err,
+    };
     out_failure.* = error_identity.failureFromError(
-        err,
+        query_error,
         .local_query,
         abi.abi_version,
         @backingInt(operation),

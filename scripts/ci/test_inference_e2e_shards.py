@@ -105,6 +105,14 @@ class ShardTests(unittest.TestCase):
             "ANTFLY_INFERENCE_MODELS_DIR=$home_cache_root/inference-models-full-v1",
             workflow,
         )
+        composition = workflow.split(
+            "- name: Validate standalone inference resource composition", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn(
+            'export ANTFLY_INFERENCE_STANDALONE_MODELS_DIR="$ANTFLY_INFERENCE_MODELS_DIR"',
+            composition,
+        )
+        self.assertNotIn("~/.antfly/inference/models", composition)
         regression = (root / "zig/e2e/inference/test_models.py").read_text()
         self.assertIn(
             '@pytest.mark.parametrize("base_url", ["eviction"], indirect=True)',

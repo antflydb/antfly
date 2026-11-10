@@ -243,3 +243,27 @@ test "enrichment allocation helper preserves effective PDF decode limits" {
     ));
     try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
 }
+
+test "enrichment compute boundary preserves OCR sampling overrides" {
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "lib/pdf/testdata/continuous_sampling_fixture.pdf", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    var failure: abi.FailureIdentity = .{};
+    const automatic = try client.renderPdfPagePngAdaptiveControlledAllocWithFailure(a, a, bytes, 1, 72, 64, 8, 1024 * 1024, 16 * 1024 * 1024, 0, .auto, &failure);
+    defer a.free(automatic.png);
+    const exact = try client.renderPdfPagePngAdaptiveControlledAllocWithFailure(a, a, bytes, 1, 72, 64, 8, 1024 * 1024, 16 * 1024 * 1024, 0, .pdf, &failure);
+    defer a.free(exact.png);
+    const smooth = try client.renderPdfPagePngAdaptiveControlledAllocWithFailure(a, a, bytes, 1, 72, 64, 8, 1024 * 1024, 16 * 1024 * 1024, 0, .smooth, &failure);
+    defer a.free(smooth.png);
+    try std.testing.expectEqual(@as(u32, 4), automatic.width);
+    try std.testing.expect(!std.mem.eql(u8, automatic.png, exact.png));
+    try std.testing.expectEqualSlices(u8, automatic.png, smooth.png);
+
+    var backing = a;
+    const allocator = abi.Allocator.fromStd(&backing);
+    var png: abi.OwnedBytes = .{};
+    var page: abi.EnrichmentRenderedPdfPage = .{};
+    const status = abi.antfly_enrichment_render_pdf_page_png(&.{ .allocator = &allocator, .pdf_bytes = .fromSlice(bytes), .sampling = 99 }, &png, &page, &failure);
+    try std.testing.expectEqual(abi.Status.invalid_argument, status);
+    try std.testing.expect(png.ptr == null);
+}

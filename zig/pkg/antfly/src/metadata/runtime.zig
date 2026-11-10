@@ -768,9 +768,6 @@ pub const Server = struct {
             .local_node_id = local_node_id,
             .bootstrap_mode = .empty,
         };
-        if (self.server.svc.raft.host.status(metadata_group_id) == .absent) {
-            _ = try self.server.svc.ensureMetadataReplica(local_record);
-        }
         var route_endpoints = try self.alloc.alloc([1]antfly.raft.PeerEndpoint, cluster_peers.len);
         defer self.alloc.free(route_endpoints);
         for (cluster_peers, 0..) |peer, index| {
@@ -779,11 +776,6 @@ pub const Server = struct {
                 .address = peer.raft_url,
                 .metadata = "",
             };
-            _ = try self.server.svc.raft.host.http_host.upsertResolvedPeerEndpoints(
-                metadata_group_id,
-                peer.node_id,
-                route_endpoints[index][0..],
-            );
         }
         var updates = std.ArrayListUnmanaged(antfly.raft.MetadataUpdate).empty;
         defer updates.deinit(self.alloc);
@@ -807,24 +799,18 @@ pub const Server = struct {
             });
         }
 
-        try self.server.svc.raft.submitBatch(updates.items);
-        _ = try self.server.svc.syncPending();
+        try self.server.svc.bootstrapMetadataGroup(local_record, updates.items);
     }
 
     pub fn bootstrapLocal(self: *Server, metadata_group_id: u64, local_node_id: u64) !void {
-        if (self.server.svc.raft.host.status(metadata_group_id) == .absent) {
-            _ = try self.server.svc.ensureMetadataReplica(.{
-                .group_id = metadata_group_id,
-                .replica_id = 1,
-                .local_node_id = local_node_id,
-                .bootstrap_mode = .empty,
-            });
-        }
+        try self.server.svc.ensureInitialMetadataReplica(.{
+            .group_id = metadata_group_id,
+            .replica_id = 1,
+            .local_node_id = local_node_id,
+            .bootstrap_mode = .empty,
+        });
         try self.server.campaignMetadataGroup();
-        const observe_local_replica_root = self.server.svc.observe_local_replica_root;
-        self.server.svc.observe_local_replica_root = false;
-        defer self.server.svc.observe_local_replica_root = observe_local_replica_root;
-        try self.server.runRound();
+        try self.server.svc.runBootstrapRound();
         self.refreshMetadataRaftStorageDiagnostics();
         _ = try self.server.svc.ensureMetadataReplica(.{
             .group_id = metadata_group_id,
@@ -2863,6 +2849,61 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 }
 
+test "metadata ownership cluster bootstrap stays coherent with concurrent progress" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const cfg = paths.config();
+    var server = try Server.init(alloc, cfg);
+    defer server.deinit();
+    try server.start();
+    const Progress = struct {
+        svc: *antfly.metadata_service.MetadataHttpService,
+        started: std.Io.Event = .unset,
+        stopped: std.atomic.Value(bool) = .init(false),
+        rounds: usize = 0,
+        failure: ?anyerror = null,
+        thread: ?std.Thread = null,
+        fn run(self: *@This()) void {
+            defer self.started.set(std.testing.io);
+            while (!self.stopped.load(.acquire)) {
+                self.svc.runRaftRoundOnly() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                self.rounds += 1;
+                self.started.set(std.testing.io);
+            }
+        }
+        fn stop(self: *@This()) void {
+            self.stopped.store(true, .release);
+            if (self.thread) |thread| thread.join();
+            self.thread = null;
+        }
+    };
+    var progress: Progress = .{ .svc = server.metadataHttpService() };
+    progress.thread = try std.Thread.spawn(.{}, Progress.run, .{&progress});
+    defer progress.stop();
+    try progress.started.wait(std.testing.io);
+    const uri = try server.baseUri(alloc);
+    defer alloc.free(uri);
+    const peers = [_]MetadataClusterPeer{.{ .node_id = cfg.local_node_id, .raft_url = uri }};
+    // The listener's restore supervisor and this progress owner can drain the
+    // queue throughout bootstrap. Every clone, route and initial owner must
+    // remain protected by the same service authority.
+    try server.bootstrapCluster(cfg.metadata_group_id, cfg.local_node_id, &.{});
+    for (0..32) |_| try server.bootstrapCluster(cfg.metadata_group_id, cfg.local_node_id, &peers);
+    progress.stop();
+    if (progress.failure) |err| return err;
+    try std.testing.expect(progress.rounds > 0);
+    const status = try server.metadataHttpService().status();
+    try std.testing.expectEqual(cfg.local_node_id, status.metadata_raft_local_node_id);
+    try std.testing.expect(!std.mem.eql(u8, status.metadata_raft_role, "absent"));
+    try std.testing.expectEqual(@as(usize, 1), server.metadataHttpService().raft.host.http_host.transport_stack.transport_host.served_groups.count());
+}
+
 test "metadata ownership rejects direct data replica admission" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2880,6 +2921,7 @@ test "metadata ownership rejects direct data replica admission" {
         .local_node_id = 3,
         .bootstrap_mode = .empty,
     };
+    try std.testing.expectError(error.InvalidMetadataGroupId, server.metadataHttpService().bootstrapMetadataGroup(foreign, &.{}));
     std.debug.print("OWNERSHIP_RED direct_admission expects ReplicaAdmissionRejected\n", .{});
     try std.testing.expectError(error.ReplicaAdmissionRejected, host.ensureReplica(foreign));
     try std.testing.expectEqual(.absent, host.status(foreign.group_id));

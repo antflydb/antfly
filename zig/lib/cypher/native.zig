@@ -309,7 +309,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                             if (entry.db == db and std.mem.eql(u8, entry.name, label.table)) break entry;
                         } else return error.CypherSnapshotRequired;
                         const fence = table.capture_fence orelse return error.CypherSnapshotRequired;
-                        if (fence.source != db) return error.CypherSnapshotRequired;
+                        if (fence.owner != @as(*const anyopaque, db)) return error.CypherSnapshotRequired;
                     } else return error.CypherSnapshotRequired;
                 }
             }
@@ -907,18 +907,18 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     else => return err,
                 };
                 defer session.deinit();
-                session.reader.now_ns = self.ttl_now_ns;
+                try session.setReadTime(self.ttl_now_ns);
                 try session.checkpoint();
-                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .exact_keys = true, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
-                var page = try session.reader.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .exact_keys = true, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.schemaVersion(), .after = if (cursor) |position| position.after else null }, .{}) };
+                var page = try session.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
                 defer page.deinit();
                 var nodes: std.ArrayList(*const v.Node) = .empty;
                 var cursors: std.ArrayList(?[]const u8) = .empty;
                 for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) {
                     try nodes.append(a, node_value);
-                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
+                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.schemaVersion(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
                 };
-                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
+                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.schemaVersion(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
                 if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = next;
                 try checkpoint(ptr);
                 return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .stable_ties = !coarse, .exact_keys = true, .next = next };
@@ -1102,7 +1102,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         error.RelationalIndexNotReady, error.IndexNotFound => continue,
                         else => return err,
                     };
-                    shared_session.?.reader.now_ns = self.ttl_now_ns;
+                    try shared_session.?.setReadTime(self.ttl_now_ns);
                     break;
                 };
             };
@@ -1129,10 +1129,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const value = conditions.items[alternative_condition.?].value orelse return error.CypherInvalidBackendPage;
                     try session.seekPrefix(&.{value}, if (branch == cursor.branch) cursor.after else null);
                 };
-                if (session.reader.index == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
-                session.reader.now_ns = self.ttl_now_ns;
+                if (session.indexName() == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
+                try session.setReadTime(self.ttl_now_ns);
                 try session.checkpoint();
-                var page = try session.reader.nextPage(seek_a, null, .{ .rows = limit - count, .records = limit - examined, .output_bytes = 16 << 20 });
+                var page = try session.nextPage(seek_a, null, .{ .rows = limit - count, .records = limit - examined, .output_bytes = 16 << 20 });
                 defer page.deinit();
                 examined += page.records_examined;
                 count += page.rows.len;
@@ -1147,7 +1147,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 }
                 if (page.more or examined >= limit or count >= limit) {
                     if (index_only) return null;
-                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = if (page.more) branch else branch + 1, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name, .after = if (page.more) page.next_cursor else null }, .{});
+                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = if (page.more) branch else branch + 1, .schema_version = session.schemaVersion(), .index = session.indexName().?, .after = if (page.more) page.next_cursor else null }, .{});
                     try checkpoint(ptr);
                     return .{ .items = try nodes.toOwnedSlice(a), .examined = examined, .next = next };
                 }
@@ -1398,7 +1398,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     };
                     if (base) |session| {
                         defer session.deinit();
-                        if (session.reader.index) |index| try plans.append(temporary, .{ .index = try temporary.dupe(u8, index.name) });
+                        if (session.indexName()) |name| try plans.append(temporary, .{ .index = try temporary.dupe(u8, name) });
                     }
                 }
             }
@@ -1455,7 +1455,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     return err;
                 };
                 defer sample.deinit();
-                sample.reader.now_ns = self.ttl_now_ns;
+                try sample.setReadTime(self.ttl_now_ns);
                 const branches = branchCount(plan.*, domains.items, false);
                 const samples = @min(branches, 3);
                 var visits: usize = 0;
@@ -1475,7 +1475,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         };
                     }
                     try sample.checkpoint();
-                    var page = try sample.reader.nextPage(sample_arena.allocator(), null, .{ .rows = 8, .records = 8, .output_bytes = 1 << 20 });
+                    var page = try sample.nextPage(sample_arena.allocator(), null, .{ .rows = 8, .records = 8, .output_bytes = 1 << 20 });
                     defer page.deinit();
                     try sample.checkpoint();
                     visits += page.records_examined;
@@ -1505,8 +1505,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     return err;
                 };
                 defer session.deinit();
-                if (session.reader.index == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
-                session.reader.now_ns = self.ttl_now_ns;
+                if (session.indexName() == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+                try session.setReadTime(self.ttl_now_ns);
                 const domain: ?Domain = if (plan.domain) |d| domains.items[d] else null;
                 if (!cursor.planned) if (domain) |d| {
                     for (0..branchCount(plan.*, domains.items, true)) |ordinal| {
@@ -1551,7 +1551,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     if (index_only or probe) return null;
                     try session.checkpoint();
                     try checkpoint(ptr);
-                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
+                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.indexName().?, .schema_version = session.schemaVersion(), .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
                     return .{ .items = &.{}, .examined = 0, .next = next, .seek_window = .{ .filter = if (domain) |d| d.filter else null, .prefix_filters = try a.dupe(usize, prefix_filters) } };
                 }
                 if (comptime !index_only and @hasDecl(DB, "RelationalReadSession") and @hasDecl(DB.RelationalReadSession, "visitCypherRows")) if (visitor) |sink| {
@@ -1593,7 +1593,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     }
                     var page_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
                     defer page_arena.deinit();
-                    var page = try session.reader.nextPage(page_arena.allocator(), null, .{ .rows = limit - count, .records = limit - examined, .output_bytes = if (probe) 1 << 20 else 16 << 20 });
+                    var page = try session.nextPage(page_arena.allocator(), null, .{ .rows = limit - count, .records = limit - examined, .output_bytes = if (probe) 1 << 20 else 16 << 20 });
                     defer page.deinit();
                     examined += page.records_examined;
                     count += page.rows.len;
@@ -1612,7 +1612,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     if (page.more or examined >= limit or count >= limit or branch + 1 == end) {
                         if (index_only) return null;
                         const next_branch = if (page.more) branch else branch + 1;
-                        const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .branch = next_branch, .after = if (page.more) page.next_cursor else null, .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
+                        const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.indexName().?, .schema_version = session.schemaVersion(), .branch = next_branch, .after = if (page.more) page.next_cursor else null, .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
                         return .{ .items = nodes.items, .examined = examined, .next = next, .seek_window = if (domain) |d| if (d.certified) b.SeekWindow{ .filter = d.filter, .offset = next_branch, .prefix_filters = try a.dupe(usize, prefix_filters) } else null else b.SeekWindow{ .filter = null } };
                     }
                     branch += 1;

@@ -1,5 +1,14 @@
-import { encodeGraphParameter } from "./graph-wire.js";
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+import { encodeGraphParameter } from "./graph-wire.js";
+import {
+  SeriesImportError,
+  type SeriesQueryOptions,
+  type SeriesRange,
+  seriesBatch,
+  seriesQuery,
+  seriesRead,
+  seriesResults,
+} from "./time-series.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -16,8 +25,17 @@ import {
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import {
   createMemoryClient,
+  type MemoryCallOptions,
+  type MemoryEpisodeQuery,
+  type MemoryHistoryQuery,
+  type MemoryListQuery,
+  type MemoryPageQuery,
   type MemoryPaths,
+  type MemoryRememberInput,
   type MemorySchemas,
+  type MemoryScopeOptions,
+  memoryMutationHeaders,
+  memoryScopeHeaders,
   type OrdinaryPaths,
 } from "./memory.js";
 import type { components, paths } from "./public-api.js";
@@ -592,6 +610,40 @@ function parseJSON<T>(text: string): T {
   return JSON.parse(text) as T;
 }
 
+/** Join ordinary work, but let cancellation release a caller waiting on user
+ * code. Both handlers stay attached so a late rejection is always observed. */
+function waitForSeriesStep<T>(
+  step: () => T | PromiseLike<T>,
+  signal: AbortSignal | undefined,
+  aborted: () => void
+): Promise<T> {
+  if (!signal) return Promise.resolve().then(step);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      complete();
+    };
+    const onAbort = () =>
+      finish(() => {
+        aborted();
+        reject(signal.reason);
+      });
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) return onAbort();
+    try {
+      Promise.resolve(step()).then(
+        (value) => finish(() => resolve(value)),
+        (cause) => finish(() => reject(cause))
+      );
+    } catch (cause) {
+      finish(() => reject(cause));
+    }
+  });
+}
+
 /** Resolves after `ms`, or rejects immediately/on abort when `signal` fires. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {
@@ -710,61 +762,292 @@ export class AntflyClient {
     return headers;
   }
 
-  /** Native temporal memory. All calls share the client's authenticated transport. */
+  /**
+   * Native temporal memory. All calls share the client's authenticated transport.
+   * Every helper takes optional scope options (`database`, `namespace`, `branch`);
+   * mutations also take `idempotencyKey` (a random UUID when omitted). Passing a
+   * string where options are accepted is the legacy positional idempotency key.
+   */
   readonly memory = {
-    create: (body: MemorySchemas["MemoryCreateSpaceRequest"], key: string) =>
+    /** Create a space from a `{ space, config }` body (POST). */
+    create: (
+      body: MemorySchemas["MemoryCreateSpaceRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces", {
         body,
-        params: { header: { "Idempotency-Key": key } },
+        params: { header: memoryMutationHeaders(options) },
       }),
-    inspect: (space: string) =>
-      this.memoryApi.GET("/memory/v1/spaces/{space}", { params: { path: { space } } }),
-    observe: (space: string, body: MemorySchemas["MemoryObservationRequest"], key: string) =>
+    /** Create `space` at its own path (PUT) with an optional config. */
+    put: (
+      space: string,
+      config: MemorySchemas["MemorySpaceConfig"] = {},
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.PUT("/memory/v1/spaces/{space}", {
+        body: config,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    inspect: (space: string, options?: MemoryScopeOptions & { cursor?: string; limit?: number }) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}", {
+        params: {
+          path: { space },
+          query: { cursor: options?.cursor, limit: options?.limit },
+          header: memoryScopeHeaders(options),
+        },
+      }),
+    /** Replace the space configuration at `expected_revision`. */
+    configure: (
+      space: string,
+      body: MemorySchemas["MemoryConfigureRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.PATCH("/memory/v1/spaces/{space}", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    observe: (
+      space: string,
+      body: MemorySchemas["MemoryObservationRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/observations", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    assertions: (space: string, body: MemorySchemas["MemoryAssertionRequest"], key: string) =>
+    /**
+     * Observe one text evidence item (id defaults to a random UUID). Assertions
+     * without `evidence` cite it. The result carries the `evidenceId` used.
+     */
+    remember: async (
+      space: string,
+      input: MemoryRememberInput,
+      options?: string | MemoryCallOptions
+    ) => {
+      const { text, id, sourceId, evidence, assertions, ...observation } = input;
+      const headers = memoryMutationHeaders(options);
+      const evidenceId =
+        id ??
+        (typeof options === "string" || options?.idempotencyKey !== undefined
+          ? Array.from(
+              new Uint8Array(
+                await globalThis.crypto.subtle.digest(
+                  "SHA-256",
+                  new TextEncoder().encode(`antfly-memory-remember:${headers["Idempotency-Key"]}`)
+                )
+              ),
+              (byte) => byte.toString(16).padStart(2, "0")
+            ).join("")
+          : globalThis.crypto.randomUUID());
+      const result = await this.memory.observe(
+        space,
+        {
+          ...observation,
+          ...(id === undefined ? { scoped_evidence_ids: true } : {}),
+          evidence: [
+            {
+              ...evidence,
+              id: evidenceId,
+              text,
+              ...(sourceId === undefined ? {} : { source_id: sourceId }),
+            },
+          ],
+          ...(assertions
+            ? {
+                assertions: assertions.map((assertion) => ({
+                  ...assertion,
+                  evidence: assertion.evidence ?? [{ id: evidenceId }],
+                })),
+              }
+            : {}),
+        },
+        {
+          ...(typeof options === "string" ? {} : options),
+          idempotencyKey: headers["Idempotency-Key"],
+        }
+      );
+      return { ...result, evidenceId: result.data?.evidence_ids?.[0] ?? evidenceId };
+    },
+    assertions: (
+      space: string,
+      body: MemorySchemas["MemoryAssertionRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/assertions", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    recall: (space: string, body: MemorySchemas["MemoryRecallRequest"]) =>
+    recall: (
+      space: string,
+      body: MemorySchemas["MemoryRecallRequest"],
+      options?: MemoryScopeOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/recall", {
         body,
-        params: { path: { space } },
+        params: { path: { space }, header: memoryScopeHeaders(options) },
       }),
-    explain: (space: string, id: string, body: MemorySchemas["MemoryExplainRequest"] = {}) =>
+    /** Small session-start context: pinned and high-utility memories within a token budget. */
+    brief: (
+      space: string,
+      body: MemorySchemas["MemoryBriefRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/brief", {
+        body,
+        params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    /** Read-only review of duplicates, conflicts and stale memories; changes nothing. */
+    consolidate: (
+      space: string,
+      body: MemorySchemas["MemoryConsolidationRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/consolidation", {
+        body,
+        params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    /** Record memory IDs actually consumed; reuse idempotencyKey on retries. */
+    access: (space: string, memoryIds: string[], options?: string | MemoryCallOptions) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/accesses", {
+        body: { memory_ids: memoryIds },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    usage: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}/usage", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    /** Create review proposals, leaving acceptance to the curator verdict flow. */
+    prepareConsolidation: (
+      space: string,
+      body: MemorySchemas["MemoryConsolidationRequest"] = {},
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/consolidation-proposals", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    /** Prioritize a memory in the brief within its item and byte limits. */
+    pin: (space: string, id: string, options?: MemoryCallOptions & { reason?: string }) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/pins", {
+        body: { id, pinned: true, ...(options?.reason ? { reason: options.reason } : {}) },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    unpin: (space: string, id: string, options?: MemoryCallOptions & { reason?: string }) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/pins", {
+        body: { id, pinned: false, ...(options?.reason ? { reason: options.reason } : {}) },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    /** Record whether a task that used `used_memory_ids` succeeded; feeds recall utility. */
+    outcome: (
+      space: string,
+      body: MemorySchemas["MemoryOutcome"],
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/outcomes", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    list: (space: string, query?: MemoryListQuery, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories", {
+        params: { path: { space }, query, header: memoryScopeHeaders(options) },
+      }),
+    explain: (
+      space: string,
+      id: string,
+      body: MemorySchemas["MemoryExplainRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/memories/{id}/explain", {
         body,
-        params: { path: { space, id } },
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
       }),
-    explainResource: (space: string, body: MemorySchemas["MemoryExplainRequest"]) =>
+    explainResource: (
+      space: string,
+      body: MemorySchemas["MemoryExplainRequest"],
+      options?: MemoryScopeOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/explain", {
         body,
-        params: { path: { space } },
+        params: { path: { space }, header: memoryScopeHeaders(options) },
       }),
-    get: (space: string, id: string) =>
+    get: (space: string, id: string, options?: MemoryScopeOptions) =>
       this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}", {
-        params: { path: { space, id } },
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
       }),
-    correct: (space: string, body: MemorySchemas["MemoryCorrection"], key: string) =>
+    history: (
+      space: string,
+      id: string,
+      query?: MemoryHistoryQuery,
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}/history", {
+        params: { path: { space, id }, query, header: memoryScopeHeaders(options) },
+      }),
+    evidence: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/evidence/{id}", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    entities: (space: string, query?: MemoryPageQuery, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/entities", {
+        params: { path: { space }, query, header: memoryScopeHeaders(options) },
+      }),
+    entity: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/entities/{id}", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    episodes: (space: string, query?: MemoryEpisodeQuery, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/episodes", {
+        params: { path: { space }, query, header: memoryScopeHeaders(options) },
+      }),
+    episode: (
+      space: string,
+      id: string,
+      query?: MemoryEpisodeQuery,
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/episodes/{id}", {
+        params: { path: { space, id }, query, header: memoryScopeHeaders(options) },
+      }),
+    /** Poll the change feed from `cursor` (or `start`). */
+    changes: (
+      space: string,
+      body: MemorySchemas["MemoryChangeRequest"] = {},
+      options?: MemoryScopeOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/changes", {
+        body,
+        params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    correct: (
+      space: string,
+      body: MemorySchemas["MemoryCorrection"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/corrections", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    forget: (space: string, body: MemorySchemas["MemoryForgetRequest"], key: string) =>
+    forget: (
+      space: string,
+      body: MemorySchemas["MemoryForgetRequest"],
+      options?: string | MemoryCallOptions
+    ) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/forget", {
         body,
-        params: { path: { space }, header: { "Idempotency-Key": key } },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    operation: (space: string, id: string) =>
+    /** Run space maintenance as a durable operation. */
+    maintain: (space: string, options?: string | MemoryCallOptions) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/maintenance", {
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    operation: (space: string, id: string, options?: MemoryScopeOptions) =>
       this.memoryApi.GET("/memory/v1/spaces/{space}/operations/{id}", {
-        params: { path: { space, id } },
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
       }),
-    advance: (space: string, id: string, key: string) =>
+    advance: (space: string, id: string, options?: string | MemoryCallOptions) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/operations/{id}", {
-        params: { path: { space, id }, header: { "Idempotency-Key": key } },
+        params: { path: { space, id }, header: memoryMutationHeaders(options) },
       }),
   };
 
@@ -1438,6 +1721,193 @@ export class AntflyClient {
     return data?.responses?.[0];
   }
 
+  /** Import bounded sequential batches. An error stops the import; committed
+   * earlier batches remain committed. No automatic ambiguous-write retry occurs.
+   */
+  async writeSeries(
+    table: string,
+    timestamp: string,
+    readings:
+      | AsyncIterable<{ id: string; document: Record<string, unknown> }>
+      | Iterable<{ id: string; document: Record<string, unknown> }>,
+    options?: WriteOptions & {
+      batchSize?: number;
+      syncLevel?: BatchRequest["sync_level"];
+      onBatch?: (outcome: BatchResult, submitted: number) => void | Promise<void>;
+    }
+  ) {
+    const batchSize = options?.batchSize ?? 500;
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1000)
+      throw new RangeError("batchSize must be 1–1000");
+    let batch: { id: string; document: Record<string, unknown> }[] = [];
+    let submitted = 0;
+    let committedPendingBatches = 0;
+    let repairRequiredBatches = 0;
+    let lastOutcome: BatchResult | undefined;
+    const state: { phase: "source" | "validation" | "submission" | "callback" | "aborted" } = {
+      phase: "source",
+    };
+    let pendingIds: string[] = [];
+    type Reading = { id: string; document: Record<string, unknown> };
+    let iterator: AsyncIterator<Reading> | Iterator<Reading> | undefined;
+    let sourceDone = false;
+    const aborted = () => {
+      state.phase = "aborted";
+    };
+    const checkAbort = () => {
+      if (options?.signal?.aborted) {
+        state.phase = "aborted";
+        options.signal.throwIfAborted();
+      }
+    };
+    const flush = async () => {
+      if (!batch.length) return;
+      checkAbort();
+      state.phase = "validation";
+      const request = { ...seriesBatch(batch, timestamp), sync_level: options?.syncLevel };
+      state.phase = "submission";
+      pendingIds = Object.keys(request.inserts ?? {});
+      const outcome = await this.tables.batchWithOptions(table, request, options);
+      submitted += batch.length;
+      lastOutcome = outcome;
+      if (outcome.status === "committed_pending") committedPendingBatches++;
+      if (outcome.status === "committed_repair_required") repairRequiredBatches++;
+      batch = [];
+      pendingIds = [];
+      state.phase = "callback";
+      if (options?.onBatch)
+        await waitForSeriesStep(
+          () => options.onBatch!(outcome, submitted),
+          options.signal,
+          aborted
+        );
+      state.phase = "source";
+    };
+    try {
+      checkAbort();
+      const asyncIterator = (readings as AsyncIterable<Reading>)[Symbol.asyncIterator];
+      const synchronous = asyncIterator == null;
+      iterator = synchronous
+        ? (readings as Iterable<Reading>)[Symbol.iterator]()
+        : asyncIterator.call(readings);
+      while (true) {
+        checkAbort();
+        const next = await waitForSeriesStep(() => iterator!.next(), options?.signal, aborted);
+        if (next.done) {
+          sourceDone = true;
+          break;
+        }
+        // Match for-await's AsyncFromSyncIterator value unwrapping.
+        const reading = synchronous
+          ? await waitForSeriesStep(() => next.value, options?.signal, aborted)
+          : next.value;
+        batch.push(reading);
+        checkAbort();
+        if (batch.length === batchSize) await flush();
+      }
+      await flush();
+    } catch (cause) {
+      const failure = new SeriesImportError(submitted, pendingIds, cause, {
+        phase: state.phase,
+        bufferedIds:
+          state.phase === "submission"
+            ? []
+            : batch.flatMap((reading) => {
+                try {
+                  const id = reading?.id;
+                  return typeof id === "string" ? [id] : [];
+                } catch {
+                  return [];
+                }
+              }),
+        mayHaveCommitted: state.phase === "submission",
+        committedPendingBatches,
+        repairRequiredBatches,
+        lastOutcome,
+      });
+      if (iterator && !sourceDone) {
+        try {
+          // Invoke return even when next is still pending. An uncooperative
+          // source may never finish closing; abort must still release the caller.
+          const closing = Promise.resolve(iterator.return?.());
+          if (options?.signal?.aborted) void closing.catch(() => {});
+          else
+            await waitForSeriesStep(
+              () => closing,
+              options?.signal,
+              () => {}
+            );
+        } catch {
+          // Iterator cleanup must not replace the original import failure.
+        }
+      }
+      throw failure;
+    }
+    return { submitted, committedPendingBatches, repairRequiredBatches, lastOutcome };
+  }
+
+  /** Latest N for an explicit bounded selection of series, with four requests
+   * in flight at most. Each result retains its independent snapshot cursor.
+   */
+  async latestSeries(
+    request: Omit<SeriesRange, "dimensions"> & {
+      table: string;
+      series: Record<string, string>[];
+      limit?: number;
+    },
+    options?: QueryExecutionOptions
+  ) {
+    if (request.series.length > 100) throw new RangeError("Select at most 100 series");
+    // Validate the complete selection before starting any network work.
+    const requests = request.series.map((dimensions) => seriesRead({ ...request, dimensions }));
+    const results: QueryResult[] = new Array(requests.length);
+    const stop = new AbortController();
+    const signal = options?.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal;
+    signal.throwIfAborted();
+    let next = 0;
+    let failed = false;
+    let failure: unknown;
+    // Each worker absorbs its error so Promise.all joins every in-flight call.
+    // The first failure closes admission and cancels siblings, preserving its cause.
+    await Promise.all(
+      Array.from({ length: Math.min(4, requests.length) }, async () => {
+        while (!failed && next < requests.length) {
+          try {
+            signal.throwIfAborted();
+            const index = next++;
+            results[index] = this.requireSeriesResult(
+              await this.query(requests[index]!, { ...options, signal })
+            );
+          } catch (cause) {
+            if (!failed) {
+              failed = true;
+              failure = cause;
+              stop.abort(cause);
+            }
+          }
+        }
+      })
+    );
+    if (failed) throw failure;
+    signal.throwIfAborted();
+    return results;
+  }
+
+  /** Query bucketed series using the ordinary JSON query and aggregation API. */
+  async series(request: SeriesQueryOptions, options?: QueryExecutionOptions) {
+    const result = this.requireSeriesResult(await this.query(seriesQuery(request), options));
+    return { series: seriesResults(result, request.fill), result };
+  }
+
+  private requireSeriesResult(result: QueryResult | undefined): QueryResult {
+    if (!result) throw new Error("Time-series query returned no result");
+    if (result.error || (result.status !== undefined && result.status >= 400))
+      throw new AntflyResponseError(
+        `Time-series query failed (${result.status ?? "unknown"}): ${result.error ?? "unsuccessful query result"}`
+      );
+    return result;
+  }
+
   /**
    * Execute multiple queries in a single request
    */
@@ -1539,6 +2009,9 @@ export class AntflyClient {
               break;
             case "generation":
               callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "context_management":
+              callbacks.onContextManagement?.(JSON.parse(frame.data));
               break;
             case "step_started":
               callbacks.onStepStarted?.(JSON.parse(frame.data));
@@ -1740,6 +2213,9 @@ export class AntflyClient {
           switch (frame.event) {
             case "generation":
               callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "context_management":
+              callbacks.onContextManagement?.(JSON.parse(frame.data));
               break;
             case "step_started":
               callbacks.onStepStarted?.(JSON.parse(frame.data));

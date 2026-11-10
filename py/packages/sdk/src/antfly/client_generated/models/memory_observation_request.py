@@ -23,6 +23,7 @@ class MemoryObservationRequest:
     """
     Attributes:
         evidence (list[MemoryEvidence]):
+        scoped_evidence_ids (bool | Unset):  Default: False.
         origin (MemoryObservationRequestOriginType0 | None | Unset):
         context_evidence_ids (list[str] | Unset):
         assertions (list[MemoryAssertion] | Unset):
@@ -31,6 +32,7 @@ class MemoryObservationRequest:
     """
 
     evidence: list[MemoryEvidence]
+    scoped_evidence_ids: bool | Unset = False
     origin: MemoryObservationRequestOriginType0 | None | Unset = UNSET
     context_evidence_ids: list[str] | Unset = UNSET
     assertions: list[MemoryAssertion] | Unset = UNSET
@@ -44,6 +46,8 @@ class MemoryObservationRequest:
         for evidence_item_data in self.evidence:
             evidence_item = evidence_item_data.to_dict()
             evidence.append(evidence_item)
+
+        scoped_evidence_ids = self.scoped_evidence_ids
 
         origin: dict[str, Any] | None | Unset
         if isinstance(self.origin, Unset):
@@ -85,6 +89,8 @@ class MemoryObservationRequest:
                 "evidence": evidence,
             }
         )
+        if scoped_evidence_ids is not UNSET:
+            field_dict["scoped_evidence_ids"] = scoped_evidence_ids
         if origin is not UNSET:
             field_dict["origin"] = origin
         if context_evidence_ids is not UNSET:
@@ -113,6 +119,8 @@ class MemoryObservationRequest:
             evidence_item = MemoryEvidence.from_dict(evidence_item_data)
 
             evidence.append(evidence_item)
+
+        scoped_evidence_ids = d.pop("scoped_evidence_ids", UNSET)
 
         def _parse_origin(data: object) -> MemoryObservationRequestOriginType0 | None | Unset:
             if data is None:
@@ -162,6 +170,7 @@ class MemoryObservationRequest:
 
         memory_observation_request = cls(
             evidence=evidence,
+            scoped_evidence_ids=scoped_evidence_ids,
             origin=origin,
             context_evidence_ids=context_evidence_ids,
             assertions=assertions,

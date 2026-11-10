@@ -221,14 +221,14 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\
     \\  agents retrieval [--table <table>] [--web-search-connection <name>] (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
     \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
-    \\                            --max-context-tokens <n> --streaming|--no-streaming
+    \\                            --context-management <json> --max-context-tokens <n> --streaming|--no-streaming
     \\                            --classify --reasoning --generate --followup --confidence
     \\                            --max-internal-iterations <0..20> (default: 8 for intent; 0 for explicit queries)
     \\  agents research --query <text> --generator <json> (--table <table>|--web-search-connection <name>) [options]
     \\  agents research options: --full-text-search <query> --semantic-search <text> --indexes <names> --fields <names> --limit <n>
     \\                           --fetch-allowed-hosts <hosts> --agent-knowledge <text> --outline <headings> --instructions <text>
     \\                           --max-rounds <1..5> --max-sub-questions <1..8> --max-parallel <1..4> --researcher-iterations <1..20>
-    \\                           --max-llm-calls <n> --deadline-ms <ms> --verify --streaming|--no-streaming
+    \\                           --context-management <json> --max-llm-calls <n> --deadline-ms <ms> --verify --streaming|--no-streaming
     \\                           --job (durable job, advanced phase by phase) | --resume-job <id>
     \\  agents query-builder --intent <text> --generator <json> [--table <table>]
     \\                       [--fields <names>] [--mode <mode>] [--max-internal-iterations <0..20>]

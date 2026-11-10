@@ -102,6 +102,7 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	return
 }
 func (c *Client) PutSource(ctx context.Context, source Source) (out Source, err error) {
+	source.SearchStatus = nil // GET observations are never submitted as desired state.
 	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out)
 	return
 }
@@ -127,5 +128,14 @@ func (c *Client) StartRun(ctx context.Context, id, key string, input RunInput) (
 }
 func (c *Client) CancelRun(ctx context.Context, source, id string) (out Run, err error) {
 	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(source)+"/runs/"+url.PathEscape(id)+"/cancel", "", struct{}{}, &out)
+	return
+}
+
+func (c *Client) PreviewProcessing(ctx context.Context, id string, input ProcessingPreset) (out ProcessingPreview, err error) {
+	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(id)+"/processing-preview", "", input, &out)
+	return
+}
+func (c *Client) ProcessingJob(ctx context.Context, id string, input ProcessingJobRequest) (out map[string]any, err error) {
+	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(id)+"/processing-jobs", "", input, &out)
 	return
 }

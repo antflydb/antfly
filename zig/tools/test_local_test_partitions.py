@@ -39,6 +39,8 @@ class LocalTestPartitions(unittest.TestCase):
         shutil.copytree(ZIG / "lib/decisions", self.root / "lib/decisions")
         for relative in (
             "pkg/inference/build/decision_modules.zig",
+            "pkg/inference/build/module_rewrite.zig",
+            "build_support/module_rewrite.zig",
             "build_support/antfly/test_partitions.zig",
             "build_support/antfly/source_paths.zig",
             "build_support/embedded/source_owner.zig",

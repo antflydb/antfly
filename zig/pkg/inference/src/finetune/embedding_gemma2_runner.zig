@@ -159,6 +159,10 @@ pub fn run(backing: std.mem.Allocator, io: std.Io, c: job.Config, options: Optio
         try event(io, .{ .event = "admission", .estimate = estimate, .job_fingerprint = &fingerprint, .total_steps = total_steps });
         return .{ .optimizer_steps = 0, .total_steps = total_steps, .paused = false, .tracked_peak_device_bytes = 0, .tracked_peak_host_bytes = budget.peak + external_host_reserve };
     }
+    // Admission-only dry runs remain available in CPU builds. Keep the CUDA
+    // execution graph below a compile-time fence: guarding only the CLI caller
+    // still emits it through the shared runner used for those dry runs.
+    if (comptime !@import("build_options").enable_cuda) return error.CudaTrainingBuildRequired;
     try event(io, .{ .event = "identity", .job_fingerprint = &fingerprint, .base_weight_sha256 = job.base_weight_sha256, .prepared_manifest_sha256 = &dataset_digest, .total_steps = total_steps, .precision = "bf16", .attention = job.attention_implementation, .compute_profile = job.compute_profile, .padding_policy = job.padding_policy, .rank = c.lora.rank, .alpha = c.lora.alpha, .seed = c.seed, .logical_batch_size = c.logical_batch_size, .microbatch_size = c.microbatch_size, .query_max_tokens = c.query_max_tokens, .document_max_tokens = c.document_max_tokens, .max_negatives = c.max_negatives });
     if (std.Io.Dir.cwd().access(io, c.output_dir, .{})) |_| return error.TrainingOutputAlreadyExists else |err| switch (err) {
         error.FileNotFound => {},

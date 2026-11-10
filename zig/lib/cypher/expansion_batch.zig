@@ -26,7 +26,10 @@ pub fn pageBytes(page: b.Page(*const v.Relationship)) !usize {
     try size.writer.writeAll("[");
     for (page.items) |item| try std.json.Stringify.value(wire.Value{ .value = .{ .relationship = item }, .include_native = true }, .{}, &size.writer);
     try std.json.Stringify.value(page.next, .{}, &size.writer);
-    return size.fullCount() + 256;
+    // Only the bounded batch admission decision needs this size. Saturate
+    // before narrowing so a large encoded page declines batching on wasm32.
+    if (size.fullCount() > max_bytes - 256) return max_bytes + 1;
+    return @as(usize, @intCast(size.fullCount())) + 256;
 }
 pub fn clone(a: std.mem.Allocator, page: b.Page(*const v.Relationship)) !b.Page(*const v.Relationship) {
     const items = try a.alloc(*const v.Relationship, page.items.len);

@@ -539,7 +539,9 @@ fn removeUnsafeStaticPaths(
     defer path_safety.deinit(alloc);
 
     for (fields.items, 0..) |field, i| {
-        if (schema.ttl_duration_ns > 0 and std.mem.eql(u8, field.path, schema.ttl_field)) {
+        // TTL values are not safe grouping/measurement axes, but their exact
+        // time projection is usable under the temporal planner's visibility fence.
+        if (schema.ttl_duration_ns > 0 and std.mem.eql(u8, field.path, schema.ttl_field) and field.role != .time) {
             remove[i] = true;
             continue;
         }
@@ -1038,6 +1040,18 @@ test "capability construction is failure atomic" {
 }
 
 fn scalarType(property: anytype) ?[]const u8 {
+    // An exact datetime mapping guarantees typed instants even when the JSON
+    // validation type is string. Use the same declaration as native filters and
+    // sorting rather than requiring a redundant JSON Schema format annotation.
+    if (property.antfly_field) |mapping| {
+        if (mapping.field_type) |kind| {
+            if (std.mem.eql(u8, kind, "date") or std.mem.eql(u8, kind, "datetime") or std.mem.eql(u8, kind, "timestamp")) return "datetime";
+        }
+    }
+    if (property.antfly_types.len == 1) {
+        const kind = property.antfly_types[0];
+        if (std.mem.eql(u8, kind, "date") or std.mem.eql(u8, kind, "datetime") or std.mem.eql(u8, kind, "timestamp")) return "datetime";
+    }
     const field_type = property.field_type orelse {
         if (property.const_value != null or property.enum_values.len > 0) return "string";
         return null;
@@ -1197,20 +1211,22 @@ test "schema capability evaluates date formatted strings per algebraic role" {
     try expectCapability(dated_plan, "first", "published_at", "published_at", "datetime", .time);
 }
 
-test "schema capability suppresses ttl and schema ignored fields" {
+test "time series schema capability retains ttl time but suppresses unsafe roles" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
         \\{"version":9,"default_type":"dated","ttl_duration_ns":1000,"ttl_field":"expires_at","document_schemas":{"dated":{"schema":{"type":"object","properties":{"expires_at":{"type":"datetime"},"visible":{"type":"keyword"},"_private":{"type":"keyword"},"meta":{"type":"object","properties":{"public":{"type":"keyword"},"_private":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}},"plain":{"schema":{"type":"object","properties":{"expires_at":{"type":"datetime"},"visible":{"type":"keyword"}},"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
 
-    // TTL parsing intentionally accepts canonical integer timestamps even for
-    // datetime declarations, while datetime fact projection accepts strings.
+    // TTL accepts canonical integer timestamps even for datetime declarations;
+    // time projection preserves these alongside RFC3339 timestamp strings.
     try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = "{\"_type\":\"plain\",\"expires_at\":1700000000000000000,\"visible\":\"yes\"}" }});
 
     var plan = try compilePlanAlloc(alloc, parsed);
     defer plan.deinit(alloc);
-    try expectNoCapabilityPath(plan, "expires_at");
+    try expectNoCapabilityRolePath(plan, "expires_at", .group);
+    try expectNoCapabilityRolePath(plan, "expires_at", .measure);
+    try expectCapability(plan, "dated", "expires_at", "expires_at", "datetime", .time);
     try expectNoCapabilityPath(plan, "_private");
     try expectNoCapabilityPath(plan, "meta._private");
     try expectCapability(plan, "dated", "visible", "visible", "string", .group);
@@ -2698,4 +2714,15 @@ fn expectNoCapabilityRolePath(plan: Plan, path: []const u8, role: FieldRole) !vo
     for (plan.fields) |field| {
         if (field.role == role and std.mem.eql(u8, field.path, path)) return error.UnexpectedCapability;
     }
+}
+
+test "time series capability derives timestamp from an exact date mapping" {
+    const a = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(a,
+        \\{"default_type":"reading","document_schemas":{"reading":{"schema":{"type":"object","properties":{"ts":{"type":"string","x-antfly-field":{"type":"date","sortable":true}},"value":{"type":"number"}}}}}}
+    );
+    defer parsed.deinit(a);
+    var plan = try compilePlanAlloc(a, parsed);
+    defer plan.deinit(a);
+    try expectCapability(plan, "reading", "ts", "ts", "datetime", .time);
 }

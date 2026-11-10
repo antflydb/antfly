@@ -39,6 +39,17 @@ pub fn main(init: std.process.Init) !void {
         return BenchError.InvalidArguments;
     };
 
+    if (std.mem.eql(u8, subcommand, "sampling-report")) {
+        const path = args.next() orelse return BenchError.InvalidArguments;
+        const dpi = std.math.cast(u16, try parseIterations(args.next(), 150)) orelse return BenchError.InvalidArguments;
+        const iterations = try parseIterations(args.next(), 3);
+        if (dpi == 0 or iterations == 0) return BenchError.InvalidArguments;
+        const output_prefix = args.next();
+        if (args.next() != null) return BenchError.InvalidArguments;
+        try samplingReport(alloc, path, dpi, iterations, output_prefix);
+        return;
+    }
+
     if (std.mem.eql(u8, subcommand, "render-window") or std.mem.eql(u8, subcommand, "render-compare")) {
         const path = args.next() orelse return BenchError.InvalidArguments;
         const dimension = try parseIterations(args.next(), 0);
@@ -112,13 +123,52 @@ fn printUsage(argv0: []const u8) void {
         \\usage:
         \\  {s} suite <pdf-path> [iterations]
         \\  {s} extract-text <pdf-path> [iterations]
+        \\  {s} sampling-report <pdf-path> [dpi=150] [iterations=3] [output-prefix]
         \\  {s} render-first-page <pdf-path> [iterations]
         \\  {s} render-pages <pdf-path> [dpi]
         \\  {s} render-window <pdf-path> [model-image-dimension (0=requested DPI)] [scratch-bytes (0=estimate)]
         \\  {s} dump-text <pdf-path> <output-path> [source|page|visible]
         \\  {s} dump-analysis <pdf-path> <output-json-path> [source|page|visible]
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
+}
+
+/// Deterministic CPU render/encode comparison; reader accuracy and HTTP/GPU
+/// latency are deliberately measured separately using the exported PNGs.
+fn samplingReport(alloc: std.mem.Allocator, path: []const u8, dpi: u16, iterations: usize, output_prefix: ?[]const u8) !void {
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_pdf_input_bytes));
+    defer alloc.free(bytes);
+    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+    defer parsed.deinit();
+    var source_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &source_hash, .{});
+    for ([_]pdf.ImageSamplingPolicy{ .auto, .pdf, .smooth }) |sampling| {
+        var warm = try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, dpi, 40_000_000, 4096, sampling.profile());
+        defer warm.deinit(alloc);
+        var expected: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(warm.png, &expected, .{});
+        var elapsed: u64 = 0;
+        for (0..iterations) |_| {
+            const started = monotonicNowNs();
+            var page = try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, dpi, 40_000_000, 4096, sampling.profile());
+            elapsed += monotonicNowNs() - started;
+            defer page.deinit(alloc);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(page.png, &digest, .{});
+            if (!std.mem.eql(u8, &expected, &digest)) return error.NonDeterministicRender;
+        }
+        if (output_prefix) |prefix| {
+            const filename = try std.fmt.allocPrint(alloc, "{s}-{s}.png", .{ prefix, @tagName(sampling) });
+            defer alloc.free(filename);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = filename, .data = warm.png });
+        }
+        const report = try std.json.Stringify.valueAlloc(alloc, .{ .source = path, .source_sha256 = std.fmt.bytesToHex(source_hash, .lower), .page = 1, .sampling = sampling, .quality = warm.quality, .dpi = dpi, .effective_dpi = warm.effective_dpi, .width = warm.width, .height = warm.height, .png_bytes = warm.png.len, .png_sha256 = std.fmt.bytesToHex(expected, .lower), .iterations = iterations, .mean_render_encode_ms = @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(iterations)) / std.time.ns_per_ms }, .{});
+        defer alloc.free(report);
+        std.debug.print("{s}\n", .{report});
+    }
 }
 
 /// Exercise one prepared, directly retained raster using the same estimated

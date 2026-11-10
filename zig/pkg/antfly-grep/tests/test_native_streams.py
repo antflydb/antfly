@@ -322,6 +322,33 @@ class NativeStreams(unittest.TestCase):
         ]
         self.assertIn("content.resource.type", json.dumps(queries))
 
+    def test_search_v2_preserves_exact_streams_and_rejects_semantic_only_selection(
+        self,
+    ):
+        config = json.loads(self.config.read_text())
+        table = config["tables"][0]
+        table["search_version"] = 2
+        for stream in table["streams"]:
+            stream["retrieval"] = {
+                "exact": {"default": stream.pop("default", False)},
+                "full_text": {"index": stream.pop("index")},
+            }
+        table["streams"].append(
+            {
+                "name": "original",
+                "resource_field": "content.resource",
+                "retrieval": {"semantic": {"index": "images"}},
+            }
+        )
+        self.config.write_text(json.dumps(config))
+        exact = self.run_grep("Tuesday")
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        semantic = self.run_grep("Tuesday", "--artifact", "original")
+        self.assertEqual(semantic.returncode, 2, semantic.stderr)
+        self.assertIn(
+            "RepresentationDoesNotSupportExactSearch", semantic.stderr + semantic.stdout
+        )
+
     def test_generated_selection_and_authorization_narrowing(self):
         result = self.run_grep("Tuesday", "--artifact", "summary")
         self.assertEqual(result.returncode, 0, result.stderr)

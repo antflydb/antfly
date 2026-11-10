@@ -56,39 +56,10 @@ pub const GeoShapeRelation = enum {
     contains,
 };
 
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-};
-
-pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
-    if (std.mem.eql(u8, text, "propose")) return .propose;
-    if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
-    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "full_index")) return .full_index;
-    return null;
-}
-
-pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
-    return switch (value) {
-        .string => |text| parsePublicSyncLevelText(text),
-        else => null,
-    };
-}
-
-pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
-    return switch (level) {
-        .propose => "propose",
-        .write => "write",
-        .full_text => "full_text",
-        .enrichments => "enrichments",
-        .full_index => "full_index",
-    };
-}
+pub const SyncLevel = @import("mutation_values.zig").SyncLevel;
+pub const parsePublicSyncLevelText = @import("mutation_values.zig").parsePublicSyncLevelText;
+pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicSyncLevelJson;
+pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;
 
 test "public sync level text accepts full_index and rejects removed aknn alias" {
     try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
@@ -96,75 +67,12 @@ test "public sync level text accepts full_index and rejects removed aknn alias" 
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
 }
 
-pub const BatchWrite = struct {
-    key: []const u8,
-    value: []const u8,
-    /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
-    /// Validated against the pinned relational schema before preparation.
-    json_null_fields: []const []const u8 = &.{},
-};
-
-pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
-    if (fields.len == 0) return &.{};
-    const copy = try alloc.alloc([]const u8, fields.len);
-    errdefer alloc.free(copy);
-    var initialized: usize = 0;
-    errdefer for (copy[0..initialized]) |name| alloc.free(name);
-    for (fields, copy) |name, *out| {
-        out.* = try alloc.dupe(u8, name);
-        initialized += 1;
-    }
-    return copy;
-}
-
-pub const TransformOpType = enum {
-    set,
-    set_on_insert,
-    unset,
-    inc,
-    push,
-    pull,
-    add_to_set,
-    pop,
-    mul,
-    min,
-    max,
-    current_date,
-    rename,
-};
-
-/// Canonical public wire spelling for document transform operations. Keep the
-/// representation beside the value contract so routing/serialization code
-/// does not need to import the physical transform executor.
-pub fn transformOpText(op: TransformOpType) []const u8 {
-    return switch (op) {
-        .set => "$set",
-        .set_on_insert => "$setOnInsert",
-        .unset => "$unset",
-        .inc => "$inc",
-        .push => "$push",
-        .pull => "$pull",
-        .add_to_set => "$addToSet",
-        .pop => "$pop",
-        .mul => "$mul",
-        .min => "$min",
-        .max => "$max",
-        .current_date => "$currentDate",
-        .rename => "$rename",
-    };
-}
-
-pub const TransformOp = struct {
-    op: TransformOpType,
-    path: []const u8,
-    value_json: ?[]const u8 = null,
-};
-
-pub const DocumentTransform = struct {
-    key: []const u8,
-    operations: []const TransformOp = &.{},
-    upsert: bool = false,
-};
+pub const BatchWrite = @import("mutation_values.zig").BatchWrite;
+pub const cloneJsonNullFields = @import("mutation_values.zig").cloneJsonNullFields;
+pub const TransformOpType = @import("mutation_values.zig").TransformOpType;
+pub const transformOpText = @import("mutation_values.zig").transformOpText;
+pub const TransformOp = @import("mutation_values.zig").TransformOp;
+pub const DocumentTransform = @import("mutation_values.zig").DocumentTransform;
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
@@ -338,6 +246,11 @@ pub const TransactionMutation = union(enum) {
     },
 };
 
+/// The ordered command owns version semantics, including during WAL/Raft
+/// replay. `admit_current` is local ingress only; absent private wire fields
+/// decode as legacy. The admission timestamp is separate from the revision.
+pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
+
 pub const BatchRequest = struct {
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
@@ -410,6 +323,9 @@ pub const BatchRequest = struct {
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
+    /// `admit_current` is local admission only. Persisted commands explicitly
+    /// select revision_v1; an absent wire field always decodes as legacy.
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
@@ -481,6 +397,12 @@ pub const BatchRequest = struct {
         try jw.endObject();
     }
 };
+
+/// Promote a borrowed public view without copying or granting private authority.
+/// The caller retains every buffer through the synchronous mutation call.
+pub fn fromPublicMutation(req: @import("mutation_values.zig").PublicBatchRequest) BatchRequest {
+    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level };
+}
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
     if (req.merge_artifacts.len == 0) return;
@@ -1811,11 +1733,8 @@ pub const GraphTraversalResult = traversal_mod.TraversalResult;
 pub const GraphPathWeightMode = paths_mod.PathWeightMode;
 pub const GraphPath = paths_mod.Path;
 
-pub const TransactionWrite = struct {
-    key: []const u8,
-    value: []const u8,
-    json_null_fields: []const []const u8 = &.{},
-};
+/// Transactions and batches share one authored write value and planner.
+pub const TransactionWrite = BatchWrite;
 
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
@@ -1834,6 +1753,7 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -5598,6 +5518,7 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
     if (command.record.len == 0 or command.record.len > leann_record_max_bytes) return error.InvalidBatchRequest;
     const defaults = BatchRequest{};
     inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "leann_record") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             const value = @field(req, field_name);
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
@@ -5627,6 +5548,7 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
     if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
     const defaults = BatchRequest{};
     inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field_name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             if (comptime std.mem.eql(u8, field_name, "deletes") or std.mem.eql(u8, field_name, "graph_deletes") or std.mem.eql(u8, field_name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field_name, "merge_artifacts")) {
                 if (!req.graph_endpoint_cleanup_planned and @field(req, field_name).len != 0) return error.InvalidBatchRequest;

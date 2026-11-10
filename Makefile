@@ -31,7 +31,7 @@ help: ## Show this help.
 # Build and Generation
 # ====================================================================================
 
-.PHONY: build generate graph-identifier-generate graph-identifier-check provider-matrix-generate provider-matrix-check gc
+.PHONY: build generate apple-bridge-generate apple-bridge-check graph-identifier-generate graph-identifier-check provider-matrix-generate provider-matrix-check gc
 
 # Uses the committed antfarm build in zig/pkg/antfly/antfarm; `make generate`
 # refreshes it, and repository-check verifies it.
@@ -39,7 +39,7 @@ build: ## Build the Zig antfly binary and copy it to ./antfly.
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 
-generate: graph-identifier-generate provider-matrix-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
+generate: graph-identifier-generate provider-matrix-generate apple-bridge-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
 	$(SCRIPTS_PY) scripts/generate_sources_clients.py
 	$(SCRIPTS_PY) scripts/generate_memory_openapi.py --zig $(ZIG)
 	$(SCRIPTS_PY) scripts/join_public_openapi.py openapi.yaml
@@ -57,6 +57,17 @@ generate: graph-identifier-generate provider-matrix-generate ## Regenerate opena
 	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter antfarm... build
 	rm -rf zig/pkg/antfly/antfarm/*
 	cp -r ts/apps/antfarm/dist/* zig/pkg/antfly/antfarm/
+
+apple-bridge-check:
+	$(SCRIPTS_PY) scripts/packaging/apple_bridge.py verify --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
+
+apple-bridge-generate: ## Refresh the committed ARM64 Apple bridge on Apple Silicon Macs.
+	@if [ "$$(uname -s)" = Darwin ] && [ "$$(uname -m)" = arm64 ]; then \
+		$(SCRIPTS_PY) scripts/packaging/apple_bridge.py build --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64; \
+	else \
+		echo "Using committed ARM64 Apple bridge (rebuild requires an Apple Silicon Mac)."; \
+	fi
+	$(SCRIPTS_PY) scripts/packaging/apple_bridge.py verify --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
 
 graph-identifier-generate:
 	$(SCRIPTS_PY) scripts/generate_graph_identifier_policy.py
@@ -95,7 +106,7 @@ zig-checksums-check:
 	python3 -m unittest discover -s scripts/ci -p test_check_zig_checksum_usage.py
 	python3 scripts/ci/check_zig_checksum_usage.py
 
-zig-generated-check: graph-identifier-check provider-matrix-check
+zig-generated-check: graph-identifier-check provider-matrix-check apple-bridge-check
 	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py scripts/test_graph_query_error_contract.py
 	$(ZIG_MAKE) generated-check
 

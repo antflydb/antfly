@@ -120,7 +120,14 @@ def _model_artifacts(configuration, url, working_directory):
             or instance["state"] != "loaded"
         ):
             raise q.EvidenceUnavailable(f"unresolved loaded model identity: {model}")
-        directory = root / relative
+        candidates = [root / relative]
+        candidates.extend(root / (task + "s") / relative for task in instance["tasks"])
+        existing = {path.resolve(strict=True) for path in candidates if path.is_dir()}
+        if len(existing) != 1:
+            raise q.EvidenceUnavailable(
+                f"missing or ambiguous model artifact directory: {model}"
+            )
+        directory = existing.pop()
         models.append(
             {
                 "model": model,

@@ -1348,4 +1348,6 @@ def test_multinode_autograph_deleted_target_does_not_fail_surviving_graph(
     )
     graph = _graph_result(result, "mentions")
     assert graph is not None
-    assert not any(node.get("table") == "entities" for node in graph.get("nodes", []))
+    # Both outgoing mentions target the deleted table. Canonical table
+    # qualifiers must not make this absence assertion silently vacuous.
+    assert graph.get("nodes", []) == [], graph

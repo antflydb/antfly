@@ -302,8 +302,7 @@ pub fn capture(
         error.NotFound => return error.EnrichmentSourceChanged,
         else => return err,
     };
-    if (timestamp_raw.len != 8) return error.EnrichmentSourceChanged;
-    const timestamp = std.mem.readInt(u64, timestamp_raw[0..8], .little);
+    const timestamp = @import("../ttl.zig").writeVersion(timestamp_raw) orelse return error.EnrichmentSourceChanged;
     if (timestamp == 0) return error.EnrichmentSourceChanged;
     const producer_name = try alloc.dupe(u8, request.index_name);
     errdefer alloc.free(producer_name);
@@ -334,7 +333,7 @@ test "ordered artifact inventory producer template binds every inference field" 
     try std.testing.expect(!sameDefinition(template, request));
 }
 
-test "privacy base vector source updates replace accepted absence without crediting stale input" {
+test "privacy base vector source updates replace accepted absence without crediting stale input including time series" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const adapter = @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter;
     const alloc = std.testing.allocator;
@@ -344,7 +343,7 @@ test "privacy base vector source updates replace accepted absence without credit
     defer alloc.free(path);
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
-    try db.setSchemaJson(alloc, "{}");
+    try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = std.math.maxInt(u64) });
     try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"vectors\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"vectors\"}}" });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
@@ -353,7 +352,7 @@ test "privacy base vector source updates replace accepted absence without credit
     var activate: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activate.publication_digest = activate.digest();
     try adapter.applyOrdered(&db, .{ .artifact_publication = activate }, .{ .term = 1, .index = 2 });
-    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":null}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+    try adapter.applyOrdered(&db, .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "doc", .value = "{\"body\":null,\"observed_at\":\"1969-12-31T23:59:59Z\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
     var pin = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
     var request = for (pin.plan().generated_templates) |template| {
@@ -377,7 +376,7 @@ test "privacy base vector source updates replace accepted absence without credit
         defer read.abort();
         try std.testing.expect(try before.accepted(&read));
     }
-    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = 5 });
+    try adapter.applyOrdered(&db, .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\",\"observed_at\":\"1969-12-31T23:59:59Z\"}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = 5 });
     var current = blk: {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();

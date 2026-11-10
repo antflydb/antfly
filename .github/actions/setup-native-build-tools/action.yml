@@ -1,0 +1,8 @@
+name: Prepare native build tools
+description: Prepare Linux archive extraction and native C consumer verification.
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/install.sh"

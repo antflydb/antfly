@@ -470,6 +470,26 @@ pub const MetadataHttpClient = struct {
         return try self.fetchRoutingSnapshotAt(base_uri, .POST, path, body, budget);
     }
 
+    pub fn fetchRoutingToken(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.CatalogRoutingChangeToken) {
+        return self.fetchCatalogReadAt(metadata_api.CatalogRoutingChangeToken, base_uri, .POST, routes.Routes.internal_routing_token, "{}", budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
+    }
+
+    pub fn fetchOwnerReadiness(self: *MetadataHttpClient, base_uri: []const u8, request: metadata_api.OwnerReadinessRequest, budget: ?RequestBudget) !std.json.Parsed(metadata_api.OwnerReadiness) {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        return self.fetchCatalogReadAt(metadata_api.OwnerReadiness, base_uri, .POST, routes.Routes.internal_owner_readiness, body, budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
+            // Legacy/malformed readiness replies are a peer capability or
+            // availability failure, never an invalid public graph query.
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
+    }
+
     pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
         defer self.alloc.free(body);
@@ -500,7 +520,7 @@ pub const MetadataHttpClient = struct {
             .method = method,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
-            .max_response_bytes = if (Result == metadata_api.PrivacyPolicyBinding) 4096 else null,
+            .max_response_bytes = if (Result == metadata_api.CatalogRoutingChangeToken or Result == metadata_api.PrivacyPolicyBinding or Result == metadata_api.OwnerReadiness) 4096 else null,
         };
         if (method == .POST) {
             request.body = body orelse "{}";
@@ -1165,7 +1185,12 @@ pub const MetadataHttpClient = struct {
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+            // Older peers reject an unknown private Call tag before dispatch.
+            // Only this exact response permits the authoritative legacy read;
+            // permission, identity and ordinary validation failures stay errors.
+            400 => if (input == .lake_source_owner_read and std.mem.eql(u8, response.body, "invalid catalog request"))
+                error.UnsupportedOperation
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
@@ -4856,4 +4881,34 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     const response = try client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted);
     defer a.free(response);
     try std.testing.expect(submitted);
+}
+
+test "metadata.lake index owner projection read negotiates older peers without weakening grants" {
+    const a = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        status: u16 = 400,
+        body: []const u8 = "invalid catalog request",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.indexOf(u8, request.body, "lake_source_owner_read") != null) {
+                try authority.verify("owner-read-secret", "owner-read-issuer", .read, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            }
+            return .{ .status = self.status, .headers = try alloc.alloc(http_common.Header, 0), .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    client.setting_authority_secret = "owner-read-secret";
+    client.setting_authority_issuer = "owner-read-issuer";
+    const owner: @import("../system_catalog/server_call.zig").Call = .{ .lake_source_owner_read = 4 };
+    try std.testing.expectError(error.UnsupportedOperation, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.body = "InvalidCatalogName";
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    executor.status = 403;
+    try std.testing.expectError(error.Forbidden, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    executor.status = 503;
+    executor.body = "NotLeader";
+    try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
 }

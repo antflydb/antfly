@@ -720,6 +720,20 @@ components:
           format: uint32
           readOnly: true
           description: Backend-managed schema generation used for migrations. Omit it from create and update requests.
+        index_sort:
+          type: array
+          maxItems: 32
+          description: Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead.
+          items:
+            type: object
+            additionalProperties: false
+            required: [field]
+            properties:
+              field: {type: string, minLength: 1}
+              order:
+                type: string
+                enum: [asc, desc]
+                default: asc
         storage_mode:
           $ref: "#/components/schemas/TableStorageMode"
         base_source:

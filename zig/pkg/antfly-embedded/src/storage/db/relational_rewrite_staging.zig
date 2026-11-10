@@ -44,14 +44,14 @@ pub fn requireSnapshotSource(alloc: Allocator, scope: staging.Scope, source: *DB
     if (!std.mem.eql(u8, raw, &expected)) return error.RestoreStagingScopeChanged;
 }
 
-fn page(arena: *std.heap.ArenaAllocator, raw: []const u8, next: staging.Progress, writes: []const types.BatchWrite, deletes: []const []const u8, timestamps: []const staging.Timestamp, source_effects: u32) !staging.PreparedPage {
+fn page(arena: *std.heap.ArenaAllocator, raw: []const u8, next: staging.Progress, writes: []const types.BatchWrite, deletes: []const []const u8, timestamps: []const staging.Timestamp, source_effects: u32, document_version_floor: ?u64) !staging.PreparedPage {
     // The caller owns the arena until this succeeds.
     const encoded = try next.encode(arena.allocator());
     return .{ .arena = arena.*, .phase = next.phase, .batch = .{
         .writes = writes,
         .deletes = deletes,
         .sync_level = .write,
-        .restore_staging = .{ .rewrite_page = .{ .expected = staging.digest(raw), .next = encoded, .scope = next.scope.digest(), .timestamps = timestamps, .source_effects = source_effects } },
+        .restore_staging = .{ .rewrite_page = .{ .expected = staging.digest(raw), .next = encoded, .scope = next.scope.digest(), .timestamps = timestamps, .source_effects = source_effects, .document_timestamps = if (document_version_floor) |floor| .{ .version_floor = floor } else null } },
     } };
 }
 
@@ -112,6 +112,8 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         };
     }
     const active_frame = frame orelse &local_frame.?;
+    const document_timestamps = programs.document_validator != null and active_frame.hasTtlSources();
+    var version_floor: u64 = 0;
     if (active_frame.sequence() != try std.math.add(u64, previous.sequence, 1)) return error.RetainedEffectsCorrupt;
     var reader = try active_frame.cursorAt(previous.frame_offset, previous.frame_remaining);
     if (previous.frame_offset != 0) {
@@ -152,11 +154,12 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         }
         output_bytes += size;
         source_effects += 1;
+        if (document_timestamps) version_floor = @max(version_floor, effect.timestamp);
         const output_key = try owned.dupe(u8, key);
         if (transformed) |value| {
-            if (effect.timestamp == 0 or value.timestamp != effect.timestamp) return error.RetainedEffectsCorrupt;
+            if ((!document_timestamps and effect.timestamp == 0) or value.timestamp != effect.timestamp) return error.RetainedEffectsCorrupt;
             try writes.append(owned, .{ .key = output_key, .value = try owned.dupe(u8, value.json), .json_null_fields = try @import("types.zig").cloneJsonNullFields(owned, value.json_null_fields) });
-            try timestamps.append(owned, .{ .key = output_key, .timestamp = value.timestamp });
+            try timestamps.append(owned, .{ .key = output_key, .timestamp = value.timestamp, .ttl_source_ns = if (effect.ttl_source) |bytes| std.mem.readInt(i128, &bytes, .little) else null });
         } else try deletes.append(owned, output_key);
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&next.logical_digest);
@@ -179,7 +182,7 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         next.rewrite.?.frame_offset = @intCast(reader.pos);
         next.rewrite.?.frame_remaining = reader.remaining;
     }
-    return page(&arena, raw, next, writes.items, deletes.items, timestamps.items, source_effects);
+    return page(&arena, raw, next, writes.items, deletes.items, timestamps.items, source_effects, if (document_timestamps) version_floor else null);
 }
 
 /// Called only with the coordinator's authenticated, drained final source cut.
@@ -203,7 +206,7 @@ pub fn prepareFinish(target: *DB, alloc: Allocator, scope: staging.Scope, cut: c
     if (!progress.snapshot_complete or progress.frame_offset != 0 or progress.sequence != cut.sequence) return error.RestoreStagingInProgress;
     next.rewrite.?.final_cut = cut;
     next.phase = .imported;
-    return page(&arena, raw, next, &.{}, &.{}, &.{}, 0);
+    return page(&arena, raw, next, &.{}, &.{}, &.{}, 0, null);
 }
 
 /// Local-owner bridge for the final source proof. Distributed callers must

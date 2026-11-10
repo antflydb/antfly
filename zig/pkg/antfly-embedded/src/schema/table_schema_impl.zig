@@ -879,7 +879,7 @@ pub fn documentTtlTimestampNs(
     alloc: std.mem.Allocator,
     schema: TableSchema,
     value_json: []const u8,
-) !?u64 {
+) !?i128 {
     if (schema.ttl_duration_ns == 0) return null;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
@@ -1233,6 +1233,10 @@ fn validateDocumentValueInternal(
         const is_ttl_field = schema.ttl_duration_ns > 0 and std.mem.eql(u8, field_name, schema.ttl_field);
         if (is_ttl_field) {
             try validateTtlFieldValue(entry.value_ptr.*);
+            // Relational TTL's coordinated observation protocol uses an unsigned
+            // row version as its timestamp; document metadata has a signed source.
+            if (schema.storage_mode == .relational and entry.value_ptr.* != .null)
+                _ = std.math.cast(u64, try parseTtlTimestampNs(entry.value_ptr.*)) orelse return error.InvalidBatchRequest;
         }
 
         if (document_schema) |resolved_document_schema| {
@@ -2855,7 +2859,8 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
             const valid_type = if (schema.storage_mode == .relational)
                 std.mem.eql(u8, field_type, "datetime")
             else
-                std.mem.eql(u8, field_type, "datetime") or std.mem.eql(u8, field_type, "numeric");
+                std.mem.eql(u8, field_type, "datetime") or std.mem.eql(u8, field_type, "numeric") or
+                    (std.mem.eql(u8, field_type, "string") and property.format != null and std.mem.eql(u8, property.format.?, "date-time"));
             if (!valid_type) {
                 return error.InvalidSchemaUpdateRequest;
             }
@@ -4712,7 +4717,7 @@ fn dynamicTemplateMatches(
 
 fn inferDynamicTemplateMatchType(value: std.json.Value) ?[]const u8 {
     return switch (value) {
-        .string => |text| if (parseRfc3339ToNs(text) != null or isValidDate(text)) "date" else "string",
+        .string => |text| if (storage_schema.parseRfc3339ToSignedNs(text) != null or isValidDate(text)) "date" else "string",
         .integer, .float, .number_string => "number",
         .bool => "boolean",
         .object => "object",
@@ -6481,23 +6486,8 @@ fn validateRegexPattern(pattern: []const u8) !void {
     _ = try regexMatch(pattern, "");
 }
 
-fn parseTtlTimestampNs(value: std.json.Value) !u64 {
-    return switch (value) {
-        .integer => |integer| blk: {
-            if (integer < 0) return error.InvalidBatchRequest;
-            break :blk std.math.cast(u64, integer) orelse return error.InvalidBatchRequest;
-        },
-        .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidBatchRequest,
-        .string => |text| try parseTtlStringTimestampNs(text),
-        else => error.InvalidBatchRequest,
-    };
-}
-
-fn parseTtlStringTimestampNs(text: []const u8) !u64 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidBatchRequest;
-    if (std.fmt.parseInt(u64, trimmed, 10)) |timestamp| return timestamp else |_| {}
-    return storage_schema.parseRfc3339ToNs(trimmed) orelse error.InvalidBatchRequest;
+fn parseTtlTimestampNs(value: std.json.Value) !i128 {
+    return @import("../storage/ttl.zig").parseSourceTimestamp(value) catch return error.InvalidBatchRequest;
 }
 
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
@@ -6510,7 +6500,7 @@ fn validateStringFormat(format: []const u8, string_value: []const u8) !void {
         return;
     }
     if (std.mem.eql(u8, format, "date-time")) {
-        if (parseRfc3339ToNs(string_value) == null) return error.InvalidBatchRequest;
+        if (storage_schema.parseRfc3339ToSignedNs(string_value) == null) return error.InvalidBatchRequest;
         return;
     }
     if (std.mem.eql(u8, format, "date")) {
@@ -7475,7 +7465,7 @@ test "validate ttl field values and schema bindings" {
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"2024-01-02T03:04:05Z\"}" }});
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\" 15 \"}" }});
     try std.testing.expectEqual(
-        @as(?u64, 1_700_000_000_000_000_000),
+        @as(?i128, 1_700_000_000_000_000_000),
         try documentTtlTimestampNs(std.testing.allocator, parsed, "{\"expires_at\":1700000000000000000}"),
     );
     try std.testing.expectError(
@@ -7486,10 +7476,7 @@ test "validate ttl field values and schema bindings" {
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"not-a-time\"}" }}),
     );
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":-1}" }}),
-    );
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":-1}" }});
 
     var numeric_ttl = try parseSchema(
         std.testing.allocator,
@@ -7820,4 +7807,22 @@ test "validate generic json schema rejects integer mismatch" {
             \\{"count":2.5}
         ),
     );
+}
+
+test "time series retention accepts standard date-time strings and rejects untyped strings" {
+    const a = std.testing.allocator;
+    var schema = try parseSchema(a,
+        \\{"ttl":{"field":"observed_at","duration":"7d"},"default_type":"reading","document_schemas":{"reading":{"schema":{"type":"object","properties":{"observed_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}}}}}}}
+    );
+    defer schema.deinit(a);
+    try validateWritesAgainstSchema(a, schema, &.{.{ .value = "{\"observed_at\":\"2026-11-06T12:00:00Z\"}" }});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(a,
+        \\{"ttl":{"field":"observed_at","duration":"7d"},"document_schemas":{"reading":{"schema":{"type":"object","properties":{"observed_at":{"type":"string"}}}}}}
+    ));
+}
+
+test "time series date-time validation accepts signed instants" {
+    try validateStringFormat("date-time", "1969-12-31T23:51:00Z");
+    try validateStringFormat("date-time", "1970-01-01T00:00:00+01:00");
+    try std.testing.expectError(error.InvalidBatchRequest, validateStringFormat("date-time", "1969-02-30T00:00:00Z"));
 }

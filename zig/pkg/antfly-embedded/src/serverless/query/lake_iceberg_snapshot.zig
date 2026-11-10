@@ -39,8 +39,9 @@ pub const SnapshotReadRequest = struct {
     requested_snapshot_id: ?[]const u8 = null,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache = null,
     limits: ReadLimits = .{},
-    /// Opt in only for immutable manifest locations under a freshly authorized
-    /// credential scope. Fresh metadata/list selection remains mandatory.
+    /// Opt in only for immutable manifest/list locations under an authorized
+    /// credential scope. Current metadata must still be selected authoritatively
+    /// (or supplied by an admitted retained cut); this cache never selects it.
     manifests: ?*@import("lake_decoded_cache.zig").Cache = null,
     inventory_chunks: ?*@import("lake_decoded_cache.zig").Cache = null,
     catalogs: ?*@import("lake_inventory_catalog.zig").Cache = null,
@@ -259,10 +260,9 @@ pub fn readSnapshotInventoryAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
-    defer alloc.free(manifest_list_bytes);
-    var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
-    defer manifest_list.deinit(alloc);
+    var manifest_list_pin = try readSnapshotManifestListAlloc(alloc, request, current_snapshot.manifest_list_uri, metadata_bytes);
+    defer manifest_list_pin.close(alloc);
+    const manifest_list = manifest_list_pin.value;
 
     const decoded_manifests = try alloc.alloc(iceberg_inventory.DecodedManifest, manifest_list.entries.len);
     defer alloc.free(decoded_manifests);
@@ -376,12 +376,9 @@ pub fn deletePlanFromMetadataAlloc(a: Allocator, request: SnapshotReadRequest, b
     }
     var plan = try iceberg_metadata.parseMetadataPlanAlloc(a, request.metadata_uri, bytes, request.requested_snapshot_id);
     defer plan.deinit(a);
-    var client = request.client;
-    client.allocator = a;
-    const list_bytes = try readFullObjectAlloc(a, &client, request.cache, plan.currentSnapshot().manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
-    defer a.free(list_bytes);
-    var list = try iceberg_avro.parseManifestListAlloc(a, list_bytes);
-    defer list.deinit(a);
+    var list_pin = try readSnapshotManifestListAlloc(a, request, plan.currentSnapshot().manifest_list_uri, bytes);
+    defer list_pin.close(a);
+    const list = list_pin.value;
     var files: std.ArrayList(IcebergDeleteFile) = .empty;
     errdefer {
         deinitDeleteFileItems(a, files.items);
@@ -474,8 +471,6 @@ pub fn planSnapshotInventoryAndDeletePlanFromMetadataAlloc(
 ) !SnapshotWithDeletePlan {
     try request.validate();
     if (metadata_bytes.len == 0 or metadata_bytes.len > request.limits.metadata_object_bytes) return error.IcebergMetadataObjectTooLarge;
-    var client = request.client;
-    client.allocator = alloc;
     if (try emptyInventoryAlloc(alloc, request, metadata_bytes)) |inventory| return .{ .inventory = inventory, .delete_plan = .{ .files = &.{} } };
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
@@ -486,10 +481,9 @@ pub fn planSnapshotInventoryAndDeletePlanFromMetadataAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
-    defer alloc.free(manifest_list_bytes);
-    var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
-    defer manifest_list.deinit(alloc);
+    var manifest_list_pin = try readSnapshotManifestListAlloc(alloc, request, current_snapshot.manifest_list_uri, metadata_bytes);
+    defer manifest_list_pin.close(alloc);
+    const manifest_list = manifest_list_pin.value;
 
     if (request.inventory_chunks != null) return planSharedChunks(alloc, request, metadata_plan, manifest_list);
 
@@ -558,10 +552,9 @@ pub fn readSnapshotDeletePlanAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
-    defer alloc.free(manifest_list_bytes);
-    var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
-    defer manifest_list.deinit(alloc);
+    var manifest_list_pin = try readSnapshotManifestListAlloc(alloc, request, current_snapshot.manifest_list_uri, metadata_bytes);
+    defer manifest_list_pin.close(alloc);
+    const manifest_list = manifest_list_pin.value;
 
     var delete_files = std.ArrayListUnmanaged(IcebergDeleteFile).empty;
     defer delete_files.deinit(alloc);
@@ -1670,6 +1663,75 @@ fn hasManifestSummary(manifest_entry: iceberg_avro.ManifestListEntry) bool {
         manifest_entry.added_rows_count != 0 or
         manifest_entry.existing_rows_count != 0 or
         manifest_entry.deleted_rows_count != 0;
+}
+
+// Immutable manifest lists belong to an admitted metadata image. Cache their
+// authenticated parsed lists before HEAD/range setup, scoped by credentials and the
+// complete metadata image. Mutable sources continue to revalidate remotely.
+const CachedManifestList = struct {
+    allocator: Allocator,
+    byte_len: usize,
+    value: iceberg_avro.ManifestList,
+    fn destroy(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const a = self.allocator;
+        self.value.deinit(a);
+        a.destroy(self);
+    }
+};
+const ManifestListLoader = struct {
+    request: SnapshotReadRequest,
+    uri: []const u8,
+    fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const a = item.budget.allocator();
+        const value = try a.create(CachedManifestList);
+        errdefer a.destroy(value);
+        var client = self.request.client;
+        client.allocator = a;
+        const bytes = try readFullObjectAlloc(a, &client, self.request.cache, self.uri, .iceberg_metadata, null, self.request.limits.manifest_list_object_bytes);
+        defer a.free(bytes);
+        value.* = .{ .allocator = a, .byte_len = bytes.len, .value = try iceberg_avro.parseManifestListAlloc(a, bytes) };
+        item.payload = .{ .extension = value };
+        item.extension_deinit = CachedManifestList.destroy;
+    }
+};
+const ManifestListPin = struct {
+    value: iceberg_avro.ManifestList,
+    lease: ?decoded_cache.Lease = null,
+    fn close(self: *@This(), a: Allocator) void {
+        if (self.lease) |lease| lease.release() else self.value.deinit(a);
+        self.* = undefined;
+    }
+};
+fn readSnapshotManifestListAlloc(a: Allocator, request: SnapshotReadRequest, uri: []const u8, metadata: []const u8) !ManifestListPin {
+    try request.context.ensureActive();
+    const cache = request.manifests orelse {
+        var client = request.client;
+        client.allocator = a;
+        const bytes = try readFullObjectAlloc(a, &client, request.cache, uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
+        defer a.free(bytes);
+        return .{ .value = try iceberg_avro.parseManifestListAlloc(a, bytes) };
+    };
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("immutable-iceberg-manifest-list-v1");
+    hash.update(&request.manifest_scope);
+    @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata, request.metadata_uri);
+    var loader: ManifestListLoader = .{ .request = request, .uri = uri };
+    const lease = cache.acquire(hash.finalResult(), 64 * 1024 * 1024, request.context, .{ .ptr = &loader, .load = ManifestListLoader.load }) catch |err| switch (err) {
+        error.OutOfMemory, error.SqlMemoryLimitExceeded => {
+            var fallback = request;
+            fallback.manifests = null;
+            return readSnapshotManifestListAlloc(a, fallback, uri, metadata);
+        },
+        else => return err,
+    };
+    errdefer lease.release();
+    const value: *const CachedManifestList = @ptrCast(@alignCast(lease.item.payload.extension));
+    if (value.byte_len > request.limits.manifest_list_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    // Keep the parsed immutable list pinned through the caller's traversal;
+    // warm queries neither revalidate remotely nor decode/copy the whole list.
+    return .{ .value = value.value, .lease = lease };
 }
 
 pub fn readFullObjectAlloc(
@@ -3265,4 +3327,43 @@ test "external lake metadata navigation reuses immutable manifests across fresh 
     var six = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, shared_request, next);
     defer six.deinit(a);
     try std.testing.expectEqualStrings(four.inventory.files[0].file_id, five.inventory.files[0].file_id);
+}
+
+test "external lake immutable manifest lists reuse admitted bytes without remote HEAD and fence metadata credentials limits cancellation" {
+    const a = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var fixture = try buildManifestListFixture(a, 42);
+    defer fixture.deinit(a);
+    var put = try client.putObject("bucket", "list.avro", fixture.items, .{});
+    put.deinit(a);
+    var cache: decoded_cache.Cache = .{ .a = a };
+    defer cache.deinit();
+    const uri = "s3://bucket/list.avro";
+    const metadata = "admitted immutable snapshot metadata";
+    const request: SnapshotReadRequest = .{ .client = client, .source_id = "events", .metadata_uri = "s3://bucket/metadata.json", .manifests = &cache, .manifest_scope = @splat(1), .context = .{ .io = std.testing.io } };
+    var first = try readSnapshotManifestListAlloc(a, request, uri, metadata);
+    defer first.close(a);
+    // A cache hit must not issue even HEAD. Remote absence makes accidental
+    // revalidation fail deterministically rather than relying on timing.
+    try client.deleteObject("bucket", "list.avro", .{});
+    var second = try readSnapshotManifestListAlloc(a, request, uri, metadata);
+    defer second.close(a);
+    try std.testing.expectEqualStrings(first.value.entries[0].manifest_path, second.value.entries[0].manifest_path);
+    try std.testing.expect(first.lease.?.item == second.lease.?.item);
+    try std.testing.expectError(error.FileNotFound, readSnapshotManifestListAlloc(a, request, uri, "different admitted image"));
+    var changed = request;
+    changed.manifest_scope = @splat(2);
+    try std.testing.expectError(error.FileNotFound, readSnapshotManifestListAlloc(a, changed, uri, metadata));
+    changed = request;
+    changed.manifests = null;
+    try std.testing.expectError(error.FileNotFound, readSnapshotManifestListAlloc(a, changed, uri, metadata));
+    changed = request;
+    changed.limits.manifest_list_object_bytes = 1;
+    try std.testing.expectError(error.IcebergMetadataObjectTooLarge, readSnapshotManifestListAlloc(a, changed, uri, metadata));
+    changed = request;
+    changed.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, readSnapshotManifestListAlloc(a, changed, uri, metadata));
 }

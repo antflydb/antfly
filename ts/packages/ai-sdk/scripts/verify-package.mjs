@@ -85,7 +85,7 @@ for (const [extension, statement] of [
 ]) {
   writeFileSync(
     resolve(consumer, `exports.${extension}`),
-    `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient','InferenceTransportError']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
+    `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient','InferenceTransportError']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createMemorySession','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
   );
   const runtimeCheck = `
 async function verifyEmbeddingBatching() {
@@ -115,11 +115,15 @@ verifyEmbeddingBatching().catch(error => { console.error(error); process.exitCod
 
 const contract = `import type { ProviderV4 } from '@ai-sdk/provider';
 import { AntflyClient, InferenceClient } from '@antfly/sdk';
-import { createAntfly, createMemoryTools, createSearchTool, createGraphTool, createSqlTool, createChatHistory } from '@antfly/ai-sdk';
+import { createAntfly, createMemoryTools, createMemorySession, createSearchTool, createGraphTool, createSqlTool, createChatHistory } from '@antfly/ai-sdk';
 const provider: ProviderV4 = createAntfly({ baseUrl: 'http://localhost:8080' });
 void provider.imageModel;
 const client = new AntflyClient({ baseUrl: 'http://localhost:8080' });
 void createMemoryTools({ client, space: 'test' });
+const memory = createMemorySession({ client, space: 'test', runId: 'host-run', profile: 'agent' });
+void memory.loadBrief;
+void memory.recordAccess;
+void memory.recordOutcome;
 void createSearchTool({ client, table: 'test' });
 void createGraphTool({ client, table: 'test' });
 void createSqlTool({ client });

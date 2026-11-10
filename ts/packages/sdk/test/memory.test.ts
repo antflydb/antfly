@@ -127,3 +127,206 @@ it("decodes native discovery and proposal fixtures through the typed memory tran
   expect(details?.reason).toBeNull();
   expect(details?.stale_configuration).toBe(false);
 });
+
+function captureMemoryRequests(response = "{}") {
+  const sent: Request[] = [];
+  vi.stubGlobal("fetch", async (request: Request) => {
+    sent.push(request.clone());
+    return new Response(response, { headers: { "Content-Type": "application/json" } });
+  });
+  return sent;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+it("generates idempotency keys for mutations and omits them for reads", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const outcome = { id: "o1", task_id: "t1", success: true, used_memory_ids: ["m1"] };
+  await client.memory.outcome("team", outcome);
+  await client.memory.outcome("team", outcome);
+  await client.memory.pin("team", "m1");
+  await client.memory.maintain("team");
+  await client.memory.brief("team");
+  await client.memory.consolidate("team");
+  await client.memory.recall("team", { query: "deploys" });
+  const keys = sent.map((request) => request.headers.get("Idempotency-Key"));
+  for (const key of keys.slice(0, 4)) expect(key).toMatch(UUID);
+  expect(new Set(keys.slice(0, 4)).size).toBe(4);
+  expect(keys.slice(4)).toEqual([null, null, null]);
+});
+
+it("passes explicit and legacy positional idempotency keys through", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const observation = { evidence: [{ id: "e1", text: "hello" }] };
+  await client.memory.observe("team", observation, "legacy-key");
+  await client.memory.observe("team", observation, { idempotencyKey: "explicit-key" });
+  await client.memory.create({ space: "team" }, "create-key");
+  await client.memory.advance("team", "op1", "advance-key");
+  expect(sent.map((request) => request.headers.get("Idempotency-Key"))).toEqual([
+    "legacy-key",
+    "explicit-key",
+    "create-key",
+    "advance-key",
+  ]);
+});
+
+it("sends scope headers only when provided", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  await client.memory.brief("team", {}, { database: "projects", namespace: "eng", branch: "exp" });
+  await client.memory.pin("team", "m1", { database: "projects", idempotencyKey: "k" });
+  await client.memory.inspect("team");
+  const [brief, pin, inspect] = sent;
+  if (!brief || !pin || !inspect) throw new Error("Missing requests");
+  expect(brief.headers.get("X-Antfly-Database")).toBe("projects");
+  expect(brief.headers.get("X-Antfly-Namespace")).toBe("eng");
+  expect(brief.headers.get("X-Antfly-Memory-Branch")).toBe("exp");
+  expect(pin.headers.get("X-Antfly-Database")).toBe("projects");
+  expect(pin.headers.get("X-Antfly-Namespace")).toBeNull();
+  expect(pin.headers.get("Idempotency-Key")).toBe("k");
+  for (const name of ["X-Antfly-Database", "X-Antfly-Namespace", "X-Antfly-Memory-Branch"]) {
+    expect(inspect.headers.get(name)).toBeNull();
+  }
+});
+
+it("routes helpers to their native memory endpoints", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  await client.memory.put("team", { version: 1 });
+  await client.memory.configure("team", { expected_revision: 3, config: {} });
+  await client.memory.brief("team", { token_budget: 500, task: "deploy" });
+  await client.memory.consolidate("team", { limit: 10 });
+  await client.memory.pin("team", "m1", { reason: "core" });
+  await client.memory.unpin("team", "m1");
+  await client.memory.outcome("team", {
+    id: "o1",
+    task_id: "t1",
+    success: false,
+    used_memory_ids: [],
+  });
+  await client.memory.list("team", { subject: "svc", limit: 5 });
+  await client.memory.history("team", "m1", { limit: 2 });
+  await client.memory.entities("team", { limit: 3 });
+  await client.memory.entity("team", "ent");
+  await client.memory.evidence("team", "e1");
+  await client.memory.episodes("team");
+  await client.memory.episode("team", "ep1");
+  await client.memory.changes("team", { start: "latest" });
+  await client.memory.maintain("team");
+  const routes = sent.map((request) => {
+    const url = new URL(request.url);
+    return `${request.method} ${url.pathname}${url.search}`;
+  });
+  expect(routes).toEqual([
+    "PUT /memory/v1/spaces/team",
+    "PATCH /memory/v1/spaces/team",
+    "POST /memory/v1/spaces/team/brief",
+    "POST /memory/v1/spaces/team/consolidation",
+    "POST /memory/v1/spaces/team/pins",
+    "POST /memory/v1/spaces/team/pins",
+    "POST /memory/v1/spaces/team/outcomes",
+    "GET /memory/v1/spaces/team/memories?subject=svc&limit=5",
+    "GET /memory/v1/spaces/team/memories/m1/history?limit=2",
+    "GET /memory/v1/spaces/team/entities?limit=3",
+    "GET /memory/v1/spaces/team/entities/ent",
+    "GET /memory/v1/spaces/team/evidence/e1",
+    "GET /memory/v1/spaces/team/episodes",
+    "GET /memory/v1/spaces/team/episodes/ep1",
+    "POST /memory/v1/spaces/team/changes",
+    "POST /memory/v1/spaces/team/maintenance",
+  ]);
+  const bodies = await Promise.all(sent.map((request) => request.text()));
+  expect(JSON.parse(bodies[2] ?? "")).toEqual({ token_budget: 500, task: "deploy" });
+  expect(JSON.parse(bodies[4] ?? "")).toEqual({ id: "m1", pinned: true, reason: "core" });
+  expect(JSON.parse(bodies[5] ?? "")).toEqual({ id: "m1", pinned: false });
+});
+
+it("remembers text as one evidence item cited by evidence-less assertions", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const assertion = {
+    id: "a1",
+    subject: "deploys",
+    predicate: "happen_on",
+    value: "tuesday",
+    statement: "Deploys happen on Tuesday.",
+  };
+  const generated = await client.memory.remember("team", {
+    text: "We deploy on Tuesdays.",
+    sourceId: "slack",
+    evidence: { author: "alice" },
+    assertions: [assertion],
+  });
+  await client.memory.remember("team", { text: "Second", id: "e2" }, { idempotencyKey: "k2" });
+  const [first, second] = sent;
+  if (!first || !second) throw new Error("Missing requests");
+  expect(new URL(first.url).pathname).toBe("/memory/v1/spaces/team/observations");
+  expect(first.headers.get("Idempotency-Key")).toMatch(UUID);
+  expect(generated.evidenceId).toMatch(UUID);
+  expect(JSON.parse(await first.text())).toEqual({
+    scoped_evidence_ids: true,
+    evidence: [
+      {
+        author: "alice",
+        id: generated.evidenceId,
+        text: "We deploy on Tuesdays.",
+        source_id: "slack",
+      },
+    ],
+    assertions: [{ ...assertion, evidence: [{ id: generated.evidenceId }] }],
+  });
+  expect(second.headers.get("Idempotency-Key")).toBe("k2");
+  expect(JSON.parse(await second.text())).toEqual({ evidence: [{ id: "e2", text: "Second" }] });
+});
+
+it("replays remember with the same evidence when an explicit operation key is reused", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const first = await client.memory.remember(
+    "team",
+    { text: "same text" },
+    { idempotencyKey: "retry" }
+  );
+  const retry = await client.memory.remember("team", { text: "same text" }, "retry");
+  expect(first.evidenceId).toBe(retry.evidenceId);
+  expect(await sent[0]?.text()).toBe(await sent[1]?.text());
+  expect(sent[0]?.headers.get("Idempotency-Key")).toBe("retry");
+  expect(sent[1]?.headers.get("Idempotency-Key")).toBe("retry");
+});
+
+it("scopes access, usage, inspection pages and reviewed consolidation proposals", async () => {
+  const sent: Request[] = [];
+  vi.stubGlobal("fetch", async (request: Request) => {
+    sent.push(request.clone());
+    return new Response("{}", { headers: { "Content-Type": "application/json" } });
+  });
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const scope = { database: "db", namespace: "ns", branch: "feature" };
+  await client.memory.access("team", ["a"], { ...scope, idempotencyKey: "retrieval" });
+  await client.memory.usage("team", "a", scope);
+  await client.memory.inspect("team", { ...scope, cursor: "next", limit: 7 });
+  await client.memory.prepareConsolidation(
+    "team",
+    { cursor: "review" },
+    { ...scope, idempotencyKey: "prepare" }
+  );
+  expect(sent.map((r) => new URL(r.url).pathname)).toEqual([
+    "/memory/v1/spaces/team/accesses",
+    "/memory/v1/spaces/team/memories/a/usage",
+    "/memory/v1/spaces/team",
+    "/memory/v1/spaces/team/consolidation-proposals",
+  ]);
+  for (const request of sent) {
+    expect(request.headers.get("X-Antfly-Database")).toBe("db");
+    expect(request.headers.get("X-Antfly-Memory-Branch")).toBe("feature");
+  }
+  expect(sent[0]?.headers.get("Idempotency-Key")).toBe("retrieval");
+  expect(sent[1]?.headers.has("Idempotency-Key")).toBe(false);
+  const inspection = sent[2];
+  const preparation = sent[3];
+  if (!inspection || !preparation) throw new Error("Missing memory requests");
+  expect(new URL(inspection.url).searchParams.get("cursor")).toBe("next");
+  expect(JSON.parse(await preparation.text())).toEqual({ cursor: "review" });
+});

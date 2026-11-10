@@ -65,9 +65,10 @@ pub const Pix2StructPatches = struct {
     }
 };
 
-/// Conservative source-decode peak before model resizing. RGBA decoder
-/// storage, RGB conversion and codec intermediates overlap. Frontends share
-/// this estimate; model tensors and fixed control margins are accounted apart.
+/// Initial source-decode forecast before model resizing, not an allocation
+/// ceiling. Codec scratch depends on format, bit depth and scanline geometry.
+/// Executors must admit actual allocation growth beyond this forecast; model
+/// tensors and retained-batch storage are accounted separately.
 pub fn sourceDecodeWorkingBytes(width: u32, height: u32) !usize {
     try DecodeLimits.inference_default.validate(width, height);
     const pixels = try std.math.mul(usize, width, height);

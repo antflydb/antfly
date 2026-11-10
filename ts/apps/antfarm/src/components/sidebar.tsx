@@ -306,6 +306,17 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   </SidebarMenuItem>
                   <SidebarMenuItem>
                     <SidebarMenuButton
+                      isActive={isTableSection("time-series")}
+                      tooltip="Time series"
+                      disabled={!selectedTable}
+                      onClick={() => navigateTableSection("time-series")}
+                    >
+                      <Search className="size-4" />
+                      <span>Time series</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
                       isActive={isTableSection("graph")}
                       tooltip={graphIndexes.length > 0 ? "Graph" : "Create a graph index first"}
                       disabled={!selectedTable || (!isLoadingIndexes && graphIndexes.length === 0)}

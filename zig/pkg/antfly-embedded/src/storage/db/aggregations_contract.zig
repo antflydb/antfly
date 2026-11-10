@@ -59,10 +59,14 @@ pub const SearchAggregationRequest = struct {
     // else exact).
     cardinality_mode: CardinalityMode = .auto,
     fields: []const []const u8 = &.{},
+    exclude_null: bool = false,
     size: i64 = 0,
     interval: f64 = 0,
     calendar_interval: []const u8 = "",
     fixed_interval: []const u8 = "",
+    bucket_origin: []const u8 = "",
+    date_bounds_start: []const u8 = "",
+    date_bounds_end: []const u8 = "",
     min_doc_count: i64 = 0,
     significance_algorithm: []const u8 = "",
     background_query: ?BackgroundQuery = null,
@@ -165,6 +169,7 @@ pub fn cloneSearchAggregationResultLabelsDeep(alloc: Allocator, result: *SearchA
 /// Control-side aggregation context. Physical consumers extend this contract
 /// with live index-manager and document-store handles in `aggregations.zig`.
 pub const Context = struct {
+    control: @import("../../search/execution_control.zig").ExecutionControl = .{},
     text_analysis: ?*const introducer_mod.TextAnalysisConfig = null,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
     distributed_background_text_stats: []const DistributedBackgroundTextStats = &.{},
@@ -196,16 +201,18 @@ pub fn isPipelineAggregation(agg_type: []const u8) bool {
 }
 
 pub fn algebraicBucketName(request: SearchAggregationRequest) ?[]const u8 {
-    const interval = if (request.calendar_interval.len > 0)
-        request.calendar_interval
-    else if (request.fixed_interval.len > 0)
-        request.fixed_interval
-    else
-        return null;
-    if (std.mem.eql(u8, interval, "hour") or std.mem.eql(u8, interval, "1h") or std.mem.eql(u8, interval, "60m")) return "hour";
-    if (std.mem.eql(u8, interval, "day") or std.mem.eql(u8, interval, "1d") or std.mem.eql(u8, interval, "24h")) return "day";
-    if (std.mem.eql(u8, interval, "month") or std.mem.eql(u8, interval, "1M")) return "month";
-    return null;
+    if (request.bucket_origin.len > 0 or (request.calendar_interval.len > 0 and request.fixed_interval.len > 0)) return null;
+    const cylinder = @import("algebraic/cylinder.zig");
+    if (request.fixed_interval.len > 0) return cylinder.canonicalBucketName(request.fixed_interval);
+    const interval = request.calendar_interval;
+    if (std.mem.eql(u8, interval, "1m")) return "minute";
+    if (std.mem.eql(u8, interval, "1h") or std.mem.eql(u8, interval, "60m")) return "hour";
+    if (std.mem.eql(u8, interval, "1d") or std.mem.eql(u8, interval, "24h")) return "day";
+    if (std.mem.eql(u8, interval, "1w")) return "week";
+    if (std.mem.eql(u8, interval, "1M")) return "month";
+    if (std.mem.eql(u8, interval, "1q")) return "quarter";
+    if (std.mem.eql(u8, interval, "1y")) return "year";
+    return cylinder.canonicalBucketName(interval);
 }
 
 pub fn significantTermsCandidateLimit(size: usize) !usize {
@@ -230,4 +237,54 @@ test "aggregation contract owns recursive result labels" {
 
 test "aggregation contract preserves candidate budget identity" {
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, significantTermsCandidateLimit(max_significant_terms_candidates + 1));
+}
+
+/// Shared output work limit, independent of how many source documents exist.
+pub const HistogramOutputBudget = struct {
+    remaining_cells: usize = 100_000,
+    pub fn charge(self: *@This(), buckets: usize, metrics: usize) !void {
+        const width = std.math.add(usize, metrics, 1) catch return error.QueryCandidateBudgetExceeded;
+        const cells = std.math.mul(usize, buckets, width) catch return error.QueryCandidateBudgetExceeded;
+        if (cells > self.remaining_cells) return error.QueryCandidateBudgetExceeded;
+        self.remaining_cells -= cells;
+    }
+};
+
+pub fn validateTemporalRequests(requests: []const SearchAggregationRequest) anyerror!void {
+    for (requests) |request| {
+        if (std.mem.eql(u8, request.type, "date_histogram")) {
+            _ = try @import("../../search/aggregation.zig").parseDateInterval(request.calendar_interval, request.fixed_interval, request.bucket_origin);
+            if (request.date_bounds_start.len != 0 or request.date_bounds_end.len != 0) {
+                const dt = @import("../../datetime.zig");
+                const first = dt.parseRfc3339ToSignedNs(request.date_bounds_start) orelse return error.InvalidAggregation;
+                const last = dt.parseRfc3339ToSignedNs(request.date_bounds_end) orelse return error.InvalidAggregation;
+                if (first >= last or request.min_doc_count != 0) return error.InvalidAggregation;
+                // Only scalar primary metrics have a defined empty-bucket state.
+                // In particular, bucket children would multiply synthetic rows.
+                for (request.aggregations) |child| {
+                    const scalar = std.mem.eql(u8, child.type, "count") or std.mem.eql(u8, child.type, "sum") or
+                        std.mem.eql(u8, child.type, "avg") or std.mem.eql(u8, child.type, "min") or
+                        std.mem.eql(u8, child.type, "max") or std.mem.eql(u8, child.type, "stats") or
+                        std.mem.eql(u8, child.type, "sumsquares");
+                    if (!scalar or child.aggregations.len != 0) return error.InvalidAggregation;
+                }
+            }
+        }
+        try validateTemporalRequests(request.aggregations);
+    }
+}
+
+/// Temporal acceleration is attempted as one proven operation. Its stored-row
+/// fallback must not enter an older planner without the same visibility proof.
+pub fn containsDateHistogram(requests: []const SearchAggregationRequest) bool {
+    for (requests) |request| {
+        if (std.mem.eql(u8, request.type, "date_histogram") or containsDateHistogram(request.aggregations)) return true;
+    }
+    return false;
+}
+
+/// Legacy algebraic paths do not prove the explicit null exclusion policy.
+pub fn containsNullExclusion(requests: []const SearchAggregationRequest) bool {
+    for (requests) |request| if (request.exclude_null or containsNullExclusion(request.aggregations)) return true;
+    return false;
 }

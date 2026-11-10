@@ -587,6 +587,32 @@ pub fn Adapter(comptime native: type) type {
         /// routed to a single physical table, and a `.foreign` generation
         /// command is refused deeper in by `prepareLocalIntegrityDecision`
         /// as a defense-in-depth check, never relied on to route correctly.
+        /// lite-single-commit-write-path.md §7.6: resolves a `Reference`'s
+        /// `child_table`/`child_key` to a durable existence check, so
+        /// `prepareLocalIntegrityDecision`'s own RESTRICT check can tell a
+        /// dangling Reference (the fused coordinator's ride-along `.attach`
+        /// landed without its leader's child row -- a non-atomicity window,
+        /// not a correctness bug on its own) apart from a genuinely live
+        /// one. Constructed fresh per call; `handle`/`alloc` are borrowed
+        /// for exactly that call's duration.
+        const ChildExistenceChecker = struct {
+            handle: *@import("handles.zig").Handle,
+            alloc: std.mem.Allocator,
+
+            fn exists(ptr: *anyopaque, child_table: []const u8, child_key: []const u8) anyerror!bool {
+                const self: *ChildExistenceChecker = @ptrCast(@alignCast(ptr));
+                const child_db = @import("tables.zig").get(self.handle, child_table) catch |err| switch (err) {
+                    // The child table itself is gone (dropped): nothing it
+                    // could still reference survives either.
+                    error.UndefinedTable => return false,
+                    else => return err,
+                };
+                var found = (try child_db.lookup(self.alloc, child_key, .{})) orelse return false;
+                found.deinit(self.alloc);
+                return true;
+            }
+        };
+
         fn commitCoordinatedLocal(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const outcomes = dependencies.sql_errors;
             const coordinator = @import("sql_commit.zig");
@@ -636,8 +662,14 @@ pub fn Adapter(comptime native: type) type {
             const named = if (!std.mem.eql(u8, self.table_name, "default")) self.table_name else null;
             const marker = if (writer) |w| w.next(named) else null;
 
+            var child_checker: ChildExistenceChecker = undefined;
+            const child_exists: ?dependencies.storage_db_relational_integrity.ChildExistenceCheck = if (self.handle) |handle| blk: {
+                child_checker = .{ .handle = handle, .alloc = alloc };
+                break :blk .{ .ptr = &child_checker, .exists = ChildExistenceChecker.exists };
+            } else null;
+
             var primary_committed = false;
-            self.db.batchLocalCoordinated(req, &primary_committed, marker) catch |err| {
+            self.db.batchLocalCoordinated(req, &primary_committed, marker, child_exists) catch |err| {
                 // `primary_committed` is authoritative here (and reset by
                 // `batchInternalPreparedOwned` itself if the group-commit
                 // ticket wait ultimately fails): there is no separate
@@ -838,7 +870,12 @@ pub fn Adapter(comptime native: type) type {
                         continue;
                     }
                     const schema_version = table.relational_schema_version orelse table.schema_version;
-                    const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands) catch |err| {
+                    // A follower in this coordinator only ever carries
+                    // `.attach`/`.detach`-shaped bookkeeping (the leader is
+                    // always the table with the real row write), never a
+                    // `.release`/RESTRICT command, so the self-healing
+                    // child-existence check (§7.6) has nothing to do here.
+                    const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands, null) catch |err| {
                         if (err == error.VersionConflict) return error.SqlWriteConflict;
                         return outcomes.notApplied(err);
                     };
@@ -1457,14 +1494,13 @@ pub fn Adapter(comptime native: type) type {
             projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
-                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
+                var page = try self.session.nextViewPage(alloc, limit);
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
                 const layout = try self.projection.pageLayout(owned);
-                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
-                const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
-                return .{ .rows = rows, .after = after, .owned_arena = page.arena };
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, row.sqlRow());
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -1483,7 +1519,7 @@ pub fn Adapter(comptime native: type) type {
                 errdefer page.deinit();
                 const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
                 for (page.rows, rows) |row, *out| out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
-                return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
