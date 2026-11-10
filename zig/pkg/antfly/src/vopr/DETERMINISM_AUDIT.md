@@ -264,3 +264,102 @@ its ordinary ~10-15 minutes instead of hitting the 50-minute timeout, back
 to the same `23/25, same two ReplaySelectedTransitionDiverged properties`
 state the entropy-fix section above already described and left open.
 `raft-vopr-test` and `lsm-vopr-test` stay green.
+
+## Replay-content divergence: `graph_ttl_now_ns` leaking real time into a wire payload
+
+With the hang above fixed, `full-cluster.clean` and
+`full-cluster.resource-pressure` both diverged on exact replay with
+`ReplaySelectedTransitionDiverged` at `vopr-io.packet_deliver`: same packet
+length, different payload digest. A temporary packet-content logging hook
+in `vopr_io_net.zig`'s `executeReady` (id/actor/resource/len/digest/160-byte
+prefix per delivered packet, gated behind a compile-time flag, never
+committed enabled) isolated the diverging packet on its own, uninterleaved
+test run (a throwaway `b.addTest` filtered to exactly one test, since the
+shared test binary's output from unrelated tests otherwise interleaves with
+the target test's own stdout and defeats any ordering-sensitive diff).
+
+The harness's own replay check already reports the first diverging choice
+directly (`choice=23686`, `expected`/`actual` payload hashes, same
+`parameter=1050` length) — no manual two-pass diffing needed. The packet:
+a `POST /internal/v1/groups/<g>/tables/docs/query` whose first 160 bytes
+(method, headers, and the start of the
+`x-antfly-prepared-query-routing` header value) were byte-identical between
+record and replay; the difference was further into that header's JSON body.
+`prepared_query_routing.Envelope.graph_ttl_now_ns` is a wall-clock deadline
+anchor the coordinator stamps onto a request and ships to the remote group
+in that header. Four call sites read it from `platform_time.realtimeNs()`
+— the host's real OS clock — directly, unconditionally, with no VOPR
+awareness at all:
+
+- `table_reads.zig`'s `graphTimedSearchRequest` and `graphScopedSearchRequest`
+  (the coordinator-side stamping before a query is dispatched)
+- `distributed_graph.zig`'s `executeCrossRange` and
+  `executeCrossRangeWithMatchAnchorsLifecycle` (the same stamp on the
+  cross-range graph-coordinator path, reached when the first two leave
+  `graph_ttl_now_ns` at 0)
+
+Record and replay each call `platform_time.realtimeNs()` at a different
+real wall-clock instant, so the stamped value — and therefore the request
+body's bytes — differ between the two passes even though every VOPR-
+controlled input (PRNG draws, scheduling order, the simulated clock) replays
+identically. This is exactly the "real time leaking into replay" class
+described earlier in this document, just reached through the query/graph
+request-construction path instead of repair pacing.
+
+Fix: route each call through the attached simulation `Io`'s `.real` clock
+instead of the host's. `table_reads.zig` already carries a `?FanoutIo` on
+both `ProvisionedTableReadSource` and `HostedProvisionedTableReadSource`
+(`self.io_impl`, used by the existing `monotonicNs()` helper for the
+`.awake` clock); `graphTimedSearchRequest`/`graphScopedSearchRequest` now
+take that `?FanoutIo` and a new `graphDeadlineRealtimeNs` helper reads
+`std.Io.Clock.now(.real, resolved.io())` when one is attached, falling back
+to `platform_time.realtimeNs()` only when it isn't (outside VOPR, and in the
+three unit tests that call these helpers directly with `null`).
+`distributed_graph.zig`'s `Worker` already exposes `worker.fanoutIo() ?std.Io`
+for the same purpose elsewhere in that file, so its `graphDeadlineRealtimeNs`
+helper reads `std.Io.Clock.now(.real, io)` off that instead, with the same
+real-clock fallback; this also fixed two further leaks on the incoming-edge
+probe path (`appendIncomingProbeBatches`, `probeIncomingEdgesForKeysWithOptions`)
+that stamp `IncomingProbeOptions.ttl_now_ns` the same way. All four sites
+converge on `VoprIo`'s own `realtime_ns` field under simulation — the same
+clock `BackendRuntime.clock()` already uses for the `GraphIndex`-level
+`platform.Clock` (`db.zig`'s `self.backend_runtime.clock()`), so there is no
+baseline mismatch between the coordinator's stamped deadline and the
+receiving side's own clock. Production behavior is unchanged: outside VOPR
+there is no attached `Io`/`Worker` fanout `Io`, so every converted site falls
+straight back to `platform_time.realtimeNs()`, the same call it made before.
+
+Not converted (left as direct `platform_time.realtimeNs()`/
+`std.posix.clock_gettime(.REALTIME)` calls): the dozens of other real-time
+reads elsewhere in the tree (serverless lease timestamps, lake snapshot pin
+bookkeeping, standalone-runtime auth proof timestamps, etc.) that are not on
+the request/response path this divergence investigation traced a byte to.
+Converting those was out of scope for this fix; each would need its own
+confirmed leak (a VOPR scenario that actually exercises it and diverges) before
+being worth the same treatment, per this document's running principle of
+fixing a proven leak at its root rather than sweeping every real-time call
+in the codebase.
+
+Regression: `table_reads.zig`'s existing unit test for these two helpers
+(`"single-group graph requests carry the complete-snapshot execution
+scope"`) now exercises the `io_impl`-threading signature with `null`
+(unchanged behavior outside a simulation); a VOPR-specific regression is
+the full-cluster suite itself — see below.
+
+Verified (isolated, single-test diagnostic binary, `full-cluster.clean`
+only, to avoid interleaving another test's stdout with the packet log):
+the `ReplaySelectedTransitionDiverged` at `vopr-io.packet_deliver` for
+`full-cluster.clean` is gone; its exact replay now matches the recorded run
+bit-for-bit. That same run surfaced a *different*, previously-unreached
+failure for `full-cluster.metadata-partition` (`history-completes`, a
+liveness-class failure, not a replay-content divergence) — unreached before
+because this test's mode loop runs `full-cluster.clean` first and `try`s
+every mode in sequence, so no later mode in this test function had ever
+been exercised past the point where `clean` itself used to fail. This is
+new, previously-invisible territory, not a regression from this fix (the
+`graph_ttl_now_ns` value feeds a header on a cross-group query path that
+`metadata-partition`'s early-stage traffic barely touches — its own failure
+dump shows every `production-*` feature still at 0), and is out of scope for
+this document's determinism focus: it is a liveness bug, not a nondeterminism
+one. Left for separate investigation; full `full-cluster-vopr-test` 25/25
+twice is not yet reached pending that.

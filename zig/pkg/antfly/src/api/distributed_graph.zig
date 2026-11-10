@@ -1789,6 +1789,21 @@ fn validateMatchingSourceSnapshots(
         return error.TopologyChanged;
 }
 
+/// `graph_ttl_now_ns` is a wall-clock deadline anchor that a coordinator
+/// stamps onto a request and ships over the wire (see
+/// prepared_query_routing.zig's Envelope). Reading it from
+/// `platform_time.realtimeNs()` directly would leak the host's real clock
+/// into a value that ends up in replayed network payloads: VOPR's exact
+/// replay re-runs the same requests against a simulated clock, so the
+/// stamped value must come from the worker's fanout `Io` (whose `.real`
+/// clock VOPR controls and replays bit-for-bit) when one is attached, and
+/// only fall back to the real clock outside a simulation. See
+/// DETERMINISM_AUDIT.md.
+fn graphDeadlineRealtimeNs(worker: Worker) u64 {
+    const io = worker.fanoutIo() orelse return platform_time.realtimeNs();
+    return @intCast(std.Io.Clock.now(.real, io).nanoseconds);
+}
+
 pub fn executeCrossRange(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -1807,7 +1822,7 @@ pub fn executeCrossRange(
         .group_count = base_result.shard_identity_read_generations.len,
     });
     var timed_req = req;
-    if (timed_req.graph_ttl_now_ns == 0) timed_req.graph_ttl_now_ns = platform_time.realtimeNs();
+    if (timed_req.graph_ttl_now_ns == 0) timed_req.graph_ttl_now_ns = graphDeadlineRealtimeNs(worker);
     var attempts: u32 = 0;
     while (true) : (attempts += 1) {
         return executeCrossRangeWithMatchAnchorsLifecycle(
@@ -1865,7 +1880,7 @@ fn executeCrossRangeWithMatchAnchorsLifecycle(
     emit_source_snapshot: bool,
 ) ![]db_mod.types.GraphSearchResult {
     var timed_req = req;
-    if (timed_req.graph_ttl_now_ns == 0) timed_req.graph_ttl_now_ns = platform_time.realtimeNs();
+    if (timed_req.graph_ttl_now_ns == 0) timed_req.graph_ttl_now_ns = graphDeadlineRealtimeNs(worker);
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try requireStampedCrossRangeRequest(req, base_result);
     try rejectUnstampedResultRefs(req, base_result);
@@ -7245,7 +7260,7 @@ fn appendIncomingProbeBatches(
     if (frontier_ids.len != keys.len) return error.InvalidQueryResult;
     var local_budget = graph_pattern_mod.WorkBudget.initWithLimits(.{});
     const pinned_options = IncomingProbeOptions{
-        .ttl_now_ns = if (options.ttl_now_ns == 0) platform_time.realtimeNs() else options.ttl_now_ns,
+        .ttl_now_ns = if (options.ttl_now_ns == 0) graphDeadlineRealtimeNs(worker) else options.ttl_now_ns,
         .work_budget = options.work_budget orelse &local_budget,
     };
     // Keep the exact source-owned reverse-adjacency fallback bounded. This is
@@ -8844,7 +8859,7 @@ pub fn probeIncomingEdgesForKeysWithOptions(
 ) ![]bool {
     var local_budget = graph_pattern_mod.WorkBudget.initWithLimits(.{});
     const pinned_options = IncomingProbeOptions{
-        .ttl_now_ns = if (options.ttl_now_ns == 0) platform_time.realtimeNs() else options.ttl_now_ns,
+        .ttl_now_ns = if (options.ttl_now_ns == 0) graphDeadlineRealtimeNs(worker) else options.ttl_now_ns,
         .work_budget = options.work_budget orelse &local_budget,
     };
     const result = try alloc.alloc(bool, keys.len);
