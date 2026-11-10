@@ -25,6 +25,8 @@ pub const AddTestsOptions = struct {
     pdf_standard_fonts_mod: *std.Build.Module,
     font_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
+    filters: []const []const u8 = &.{},
+    test_runner: ?std.Build.Step.Compile.TestRunner = null,
 };
 pub const AddTestsResult = struct {
     run_lib_pdf_tests: *std.Build.Step.Run,
@@ -55,6 +57,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     const lib_pdf_tests = b.addTest(.{
         .root_module = pdf_test_mod,
+        .filters = options.filters,
+        .test_runner = options.test_runner,
     });
     lib_pdf_tests.root_module.link_libc = true;
     const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);

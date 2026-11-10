@@ -18,7 +18,6 @@ Official releases are Apple Silicon ZIPs containing a signed, notarized app and
 its pinned Antfly runtime.
 
 [Download v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip).
-The download becomes available when the signed beta release completes.
 
 After downloading:
 
@@ -35,6 +34,115 @@ updates. App updates include the bundled engine and preserve settings, models,
 history, and Keychain credentials. The public Dictation download channels require
 the first signed app release; publishing an Antfly engine release alone does not
 publish the app. See [release activation and installation](UPDATES.md).
+
+## Voice formatting and insertion
+
+Voice formatting runs locally and does not require a cleanup generator. In
+Settings → Voice formatting, spoken breaks and insertion spacing default on:
+
+| Say | Inserted text |
+| --- | --- |
+| new line, next line, line break, skip a line | One line break |
+| new paragraph, start a new paragraph | A blank line between paragraphs |
+
+Commands can be spoken alone. Straight, curly, nested, escaped, and unclosed
+quoted phrases are preserved as literal text; apostrophes inside words are not
+quotation delimiters. For fully literal dictation, choose Verbatim and turn
+spoken formatting off. This is
+a deterministic English command vocabulary, so unquoted occurrences are treated
+as commands. It does not reproduce every Wispr Flow editing or formatting feature.
+
+Commands and quotations are parsed from recognition before cleanup. If cleanup
+is enabled, their contents are replaced by request-specific protected markers,
+without issuing a request per command. Markers must survive exactly once and in order; otherwise
+cleanup fails with the original transcript available for recovery. No generated
+text is interpreted as a new command. Internal and edge breaks are restored from
+the protected plan, rather than inferred from the model's output.
+
+Recognition/cleanup supplies punctuation; insertion adds boundary spaces when
+Accessibility exposes the surrounding text. Existing spaces, newlines, punctuation,
+selected-text replacements, and CJK boundaries are preserved. It reads small
+Accessibility ranges, with a bounded fallback for small text fields.
+Surrounding text is never stored; unsupported fields keep the transcript unchanged.
+
+**Allow a trailing ‘press enter’ voice command** is off by default. Enabling it
+allows a terminal **press enter** in recognized speech to send Return after the
+text is pasted. This can send a message or submit a prompt. Mid-sentence and quoted
+occurrences stay literal; generated text cannot trigger it. A command-only
+“press enter” does not send a key without a nonempty insertion. The app verifies
+the original app and text field, observes the expected text and cursor after the
+paste, and rechecks focus, clipboard ownership, and cancellation before sending
+Return. Accessibility queries run on a serial worker with short per-object IPC
+timeouts. Confirmation has an eight-second monotonic deadline, including time
+spent reading the target. The clipboard lease remains owned until confirmation
+finishes, so a slow paste cannot consume the user's restored clipboard. New
+copies or overlapping insertions invalidate an older pending Enter action. If
+verification is unavailable or times out, Enter is not sent and the transcript
+remains available to copy. Copy,
+history, and original-transcript recovery never replay key actions.
+
+Stable-segment cleanup remains incremental. If a command or quoted span crosses
+a cleanup-batch boundary, the complete utterance is cleaned once more with a
+single protected plan before insertion. Enabling the trailing Enter command keeps
+recognition streaming but defers cleanup until release, because its terminal
+position cannot be established earlier. The processing note explains this choice.
+Recorded-audio cleanup likewise runs after recognition so commands can be
+protected first. These paths use the configured inference concurrency limit.
+
+Named transcribers retain their text-cleanup `/dictate` path. Raw runtime models
+use the portable `/generate` contract for cleanup, which preserves compatibility
+with runtimes that reject `/dictate` requests containing `transcript_text`.
+External raw runtimes must permit generation for the selected cleanup model.
+Protected requests keep the selected Clean/Rewrite style. Full-size user rewrite
+instructions are preserved; when internal marker rules would exceed `/dictate`'s
+instruction limit, cleanup uses the portable generation contract instead.
+Clean-mode cleanup windows are limited to 3,072 encoded UTF-8 bytes and request
+up to 4,096 output tokens on both backends. Each request budgets one token per
+input byte plus 1,024 tokens for cleanup changes and response framing. The byte
+bound includes marker expansion and supports byte-fallback tokenizers.
+
+Long transcripts use at most 2,048 bytes of new input plus a recent editable
+output tail of up to 1,024 bytes. A correction at the next window's start can
+retract words in that tail instead of leaving both the original and corrected
+word. Text older than that tail is committed; corrections referring further back
+need Whole utterance processing. Live recognition reuses the same context and
+revises the previous input window as new finals arrive, rather than independently
+appending cleaned segments or regenerating the entire prefix. An unchanged final
+flush does not invoke the model again. The context is discarded after a failure
+or cancellation so retries cannot reuse incomplete state.
+
+Unicode word boundaries handle Chinese, Japanese, Thai, punctuation, and spaces.
+Oversized words and URLs fall back to grapheme boundaries. Protected markers are
+always atomic, and splitting/reassembly preserves every input character.
+
+Portable cleanup also requires a fresh completion token at the end of each
+response, independently of `finish_reason`. This detects silently capped output
+from older Apple runtimes bundled with existing downloads. Missing, wrong,
+duplicated, empty, or nonterminal frames fail with raw transcript recovery and
+cannot become eligible for Enter. The token is removed before any preview or
+insertion. Updated Antfly Apple providers additionally verify natural completion
+on generic `/generate` calls and reject incomplete output at the provider boundary.
+
+Rewrite and explicit Whole utterance processing preserve one generation context.
+If their encoded input exceeds this capacity, the app reports the limit before
+calling a model and preserves the raw transcript. Choose Clean with Automatic
+processing, shorten the recording, or insert the original transcript. Model
+context limits still apply; responses are bounded, and truncated or incomplete
+output cannot become insertable text. Formatting markers own
+surrounding line-break whitespace; quoted literal contents remain unchanged.
+
+Enter confirmation prerequisites are checked before Paste is posted. Failed or
+canceled insertion attempts retain the clipboard payload for the normal 750 ms
+delivery grace period; successful confirmation can restore it immediately.
+Clipboard intent is reserved before preservation or preparation begins. A newer
+operation immediately invalidates older key actions without losing the original
+clipboard snapshot. Provider waits are cancellable and time out after five
+seconds. A nonresponding lazy clipboard provider is not allowed to spawn more
+provider reads or block shutdown; at most one provider read remains in flight,
+and completed snapshots are released rather than cached indefinitely.
+
+These features implement the common spacing/break/Enter workflow in Wispr Flow;
+they do not add recognition vocabulary bias or dictionary replacement rules.
 
 ## Build and run
 

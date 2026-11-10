@@ -1102,6 +1102,7 @@ pub const Detail = enum(c_int) {
     invalid_external_source_inventory,
     invalid_external_source_snapshot,
     external_source_snapshot_too_large,
+    storage_owner_admission_pending,
 };
 
 pub const Status = extern struct {
@@ -1528,6 +1529,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
         error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
         error.StorageBusy => status(.retryable, .storage_busy),
+        error.StorageOwnerAdmissionPending => status(.retryable, .storage_owner_admission_pending),
         error.MergeTransitionNotReady => status(.retryable, .merge_transition_not_ready),
         error.MergeReceiverProjectionNotReady => status(.retryable, .merge_receiver_projection_not_ready),
         error.MergeSourceProjectionNotReady => status(.retryable, .merge_source_projection_not_ready),
@@ -2582,6 +2584,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .merge_source_projection_not_ready => "MergeSourceProjectionNotReady",
         .merge_source_projection_advanced => "MergeSourceProjectionAdvanced",
         .storage_busy => "StorageBusy",
+        .storage_owner_admission_pending => "StorageOwnerAdmissionPending",
         .invalid_online_source_command => "InvalidOnlineSourceCommand",
         .online_source_corrupt => "OnlineSourceCorrupt",
         .online_source_pin_missing => "OnlineSourcePinMissing",
@@ -3777,4 +3780,11 @@ test "time series aggregation callback failures use existing query identities" {
     try std.testing.expectEqualDeep(statusFromError(error.UnsupportedQueryRequest), unsupported);
     try std.testing.expectEqual(error.UnsupportedQueryRequest, errorFromStatus(unsupported));
     try std.testing.expect(errorHasStableDetail(error.UnsupportedAggregation));
+}
+
+test "storage owner lease admission retains retryability across runtime callbacks" {
+    const wire = statusFromError(error.StorageOwnerAdmissionPending);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
+    try std.testing.expect(errorHasStableDetail(error.StorageOwnerAdmissionPending));
+    try std.testing.expectEqual(error.StorageOwnerAdmissionPending, errorFromStatus(wire));
 }
