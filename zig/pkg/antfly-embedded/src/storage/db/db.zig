@@ -92427,6 +92427,51 @@ test "db extractEnrichments rejects unsupported legacy summaries field" {
     }));
 }
 
+test "leann synchronous chunk provenance keeps model metadata vectors recoverable" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("leann-provenance");
+    defer path_tmp.cleanup();
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .enrichment = .{ .owner_id = "provenance", .dense_embedder = deterministic.interface() },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const Sink = struct {
+        fn append(_: Allocator, _: *usize, _: []const u8, _: ?[]const u8, _: []const u8, _: []const f32, _: []const []const u8) !void {}
+    };
+    const sources = [_]ChunkEmbeddingSource{
+        .{ .key = @constCast("plain"), .text = "plain text" },
+        .{ .key = @constCast("model"), .text = "model text", .has_metadata = true },
+    };
+    var indexes = std.ArrayListUnmanaged(usize).empty;
+    defer indexes.deinit(alloc);
+    try indexes.appendSlice(alloc, &.{ 0, 1 });
+    var texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer texts.deinit(alloc);
+    try texts.appendSlice(alloc, &.{ sources[0].text, sources[1].text });
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        freePrimaryVectorRebuildWrites(alloc, &writes);
+        writes.deinit(alloc);
+    }
+    var sink: usize = 0;
+    try flushGeneratedDenseChunkBatch(alloc, db.enrichment_runtime.?, deterministic.interface(), "model", .{
+        .kind = .dense_embedding,
+        .input_kind = .inline_chunks,
+        .index_name = "idx",
+        .doc_key = "parent",
+        .source_field = "body",
+        .expected_dims = 3,
+    }, &writes, &sink, &sources, &indexes, &texts, &.{}, Sink.append);
+    try std.testing.expectEqual(@as(usize, 2), writes.items.len);
+    try std.testing.expect((try enrichment_artifact_codec.decodeHeader(writes.items[0].value)).flags.text_input);
+    try std.testing.expect(!(try enrichment_artifact_codec.decodeHeader(writes.items[1].value)).flags.text_input);
+    const retained = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, writes.items[1].value);
+    defer alloc.free(retained);
+    try std.testing.expectEqual(@as(usize, 3), retained.len);
+}
+
 test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     const alloc = std.testing.allocator;
 

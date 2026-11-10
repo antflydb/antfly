@@ -6108,6 +6108,7 @@ test "enrichment worker chunk cache keys preserve embedded separators" {
 test "transient leann re-embeds one chunk from its re-chunked parent like the producer" {
     const alloc = std.testing.allocator;
     const Probe = struct {
+        revision: u8 = 1,
         batch_calls: usize = 0,
         texts: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -6130,8 +6131,13 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
             return out;
         }
 
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
+        }
+
         fn interface(self: *@This()) embedder_mod.DenseEmbedder {
-            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_fn = embedDenseBatch, .deinit_fn = null };
+            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_fn = embedDenseBatch, .capabilities_fn = caps, .deinit_fn = null };
         }
     };
     var probe = Probe{};
@@ -6234,6 +6240,17 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     try reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]);
     try std.testing.expect(found[0]);
     requests[0].expected_vector_digest = requests[0].expected_vector_digest.? ^ 2;
+    @memset(&found, false);
+    try reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]);
+    try std.testing.expect(!found[0]);
+
+    // A revision-bound producer identity authenticates a fresh embedding
+    // without requiring bit-identical floating point results from inference.
+    requests[0].expected_source_hash = retainedTextEmbeddingHashAtRevision(document_request, wanted.text, @as([32]u8, @splat(1)));
+    @memset(&found, false);
+    try reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]);
+    try std.testing.expect(found[0]);
+    probe.revision = 2;
     @memset(&found, false);
     try reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]);
     try std.testing.expect(!found[0]);
@@ -29232,8 +29249,14 @@ fn flushChunkedDenseItems(
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     }
-    const generation = try dense_embedder.captureTextGeneration(runtime.alloc, embedding_artifact_name);
-    try dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
+    const generation_check: anyerror!void = check: {
+        const generation = dense_embedder.captureTextGeneration(runtime.alloc, embedding_artifact_name) catch |err| break :check err;
+        break :check dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
+    };
+    generation_check catch |err| {
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
     noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
 
@@ -31082,6 +31105,8 @@ fn processChunkedDenseWindow(
                     if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes)) {
                         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
                     }
+                    if (window.itemCount() >= max_window_items)
+                        try dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
                     continue;
                 }
@@ -31196,6 +31221,7 @@ fn processChunkedDenseWindow(
                 }
             }
             if (!request_complete) continue;
+            try dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
             if (stale_deletes.artifact_delete_keys.len > 0) {
                 // A provider retry must leave the previous published chunks
                 // intact. Finish this request's replacement embeddings before

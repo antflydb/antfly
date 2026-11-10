@@ -3555,7 +3555,7 @@ test "leann: retained vector validation avoids inference and rejects stale ident
     try testing.expectEqual(first.results.len, second.results.len);
     for (first.results, second.results) |a, b| {
         try testing.expectEqual(a.id, b.id);
-        try testing.expectApproxEqAbs(a.distance, b.distance, 0.00001);
+        try testing.expectApproxEqRel(a.distance, b.distance, 0.000001);
     }
 }
 

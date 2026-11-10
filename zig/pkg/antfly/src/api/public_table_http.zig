@@ -210,6 +210,7 @@ pub const TableApi = struct {
         UnsupportedVersion,
         Corrupted,
         IncompletePublishedSnapshot,
+        ReembedBudgetExceeded,
         InternalFailure,
     };
 

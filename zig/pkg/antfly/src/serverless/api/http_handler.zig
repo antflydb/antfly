@@ -6221,6 +6221,7 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.GraphTraversalQueryBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,

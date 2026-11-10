@@ -142,7 +142,7 @@ search walks using code estimates and scores allowed candidates exactly.
 Cancellation is checked during traversal and the fallback scan. The
 re-embedding budget counts time spent regenerating vectors, including
 re-chunking and source preparation, rather than graph or stored-vector reads.
-If it is exhausted before scoring finishes, the search returns an
+If it is exhausted before scoring finishes, the search returns a
 `reembed_budget_exceeded` error instead of including unverified candidates.
 Increase `reembed_budget_ms` or set it to zero to remove the limit.
 Best-effort predicate searches cap the walk and fallback scan; full-effort

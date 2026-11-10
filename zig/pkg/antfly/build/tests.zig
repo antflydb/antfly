@@ -2835,6 +2835,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
+    const leann_regression_tests = b.addTest(.{
+        .name = "leann-regression-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "leann", "reembed", "chunked dense", "synchronous chunk", "synchronously builds chunk", "public table query handler preserves retryable", "preserves public query availability" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("leann-regression-test", "Run LEANN storage, provenance, split and recovery regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, leann_regression_tests).step);
+
     const leann_replication_runtime_tests = b.addTest(.{
         .root_module = data_implementation_module,
         .filters = &.{"leann replication round"},
