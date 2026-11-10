@@ -613,6 +613,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("cypher-remote-routing-test", "Verify compact routing generation fences and readiness cancellation")
         .dependOn(&addFilteredTestRunArtifact(b, cypher_remote_routing_tests).step);
+    const cypher_runtime_admission_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{ "graph endpoint cleanup routing", "data raft retry checkpoints survive changed ready windows and publication failure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-runtime-admission-test", "Verify cleanup routing and exactly-once retries across native owner admission contention")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_runtime_admission_tests).step);
     const sql_expression_apply_tests = b.addTest(.{
         .root_module = data_implementation_module,
         .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},

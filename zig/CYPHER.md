@@ -6080,5 +6080,20 @@ passed in 28 seconds; the three-metadata/three-data replicated-owner campaign
 passed in 207 seconds, covering graph reads/writes/search, SQL `GRAPH_TABLE`,
 catalog revisions, expression/normalization qualification and durable receipts.
 All qualification used Debug. The merged main's TypeScript formatter hook could
-not run without its pinned dependency installation; only the merge commit
-bypassed that hook. The implementation commit uses the normal staged checks.
+not run without its pinned dependency installation; only merge commits
+bypassed that hook. Implementation commits use the normal staged checks.
+
+
+A subsequent main update at `8802fa94a3` was merged and requalified. Both raw
+writer contention and the new `StorageOwnerAdmissionPending` outcome retain
+exactly-once Raft retries; the combined regression checks all four admission
+failures without replaying its increment. Initial graph captures retry temporary
+owner admission under their existing attempt/deadline/cancellation bounds.
+Exhaustion reports HTTP 503 and SQLSTATE `53300`, including through pgwire.
+The focused `cypher-runtime-admission-test` also executes cleanup routing after
+the full-budget callback change. The final Debug server and focused gates pass
+238/238 build steps and 26/26 standard-runner tests; all consumer suites pass.
+The nine SQL diagnostic tests, generated error identities, control-source catalog,
+and 2,560-file Apache boundary checks pass. The authenticated eight-owner
+standalone and replicated metadata/data campaigns pass again on this merged
+binary (53 and 215 seconds respectively).

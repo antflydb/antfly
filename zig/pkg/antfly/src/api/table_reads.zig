@@ -4100,7 +4100,7 @@ pub const ProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             return openCypherStatementAttempt(ptr, alloc, input) catch |err| {
-                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured and err != error.TopologyChanged) or attempt == 3) return err;
+                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured and err != error.StorageOwnerAdmissionPending and err != error.TopologyChanged) or attempt == 3) return err;
                 // A rejected owner has exposed no rows. Release the entire
                 // failed cohort, refresh routes, and acquire fresh capabilities.
                 // Never reuse or replay a cursor or a graph mutation.
