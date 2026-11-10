@@ -6919,7 +6919,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // storage suite's budget, so unrelated compiles can still run.
         .max_rss = 17 * 1024 * 1024 * 1024,
     });
-    b.step("artifact-repair-publication-test", "Verify producer publication retires prior consumer repair debt").dependOn(&b.addRunArtifact(repair_publication_tests).step);
+    // Bound execution, including teardown and blocked native lock acquisitions.
+    // Compilation has its separate memory admission above and no time budget here.
+    const run_repair_publication_tests = @import("../../../build_support/antfly/test_support.zig").addRequiredTestRunArtifact(b, repair_publication_tests, 5 * 60 * 1000);
+    b.step("artifact-repair-publication-test", "Verify producer publication retires prior consumer repair debt").dependOn(&run_repair_publication_tests.step);
     const source_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },
