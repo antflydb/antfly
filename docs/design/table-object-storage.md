@@ -406,7 +406,10 @@ to authenticate every member independently.
 ### Bounded scoring admission in opening bundles
 
 Opening publication captures up to 64 segment admission descriptors through the
-existing validated, fragmented routing cursor. Navigation roots retain priority;
+existing validated, fragmented routing cursor. Canonical and compacted serving
+roots both participate, since exact ordering can select canonical segments even
+when a compacted root exists. Routing roots deduplicate within the bounded queue.
+Navigation roots retain priority;
 at most 32 segment openings and 16 tiny complete segments are seeded, within the
 existing decoded-byte, read-byte and bundle-count limits. This is an optional
 prefix cache, never a segment-selection limit: demand outside the prefix uses
@@ -420,6 +423,13 @@ full physical-route validation. The decoded admission cache has its own type,
 so it cannot be mistaken for a fully validated physical FileGroup. Prepared cloud
 bindings own their locator metadata through teardown, including lazy SQL readers
 that outlive the publication parser.
+
+Legacy `numeric_range` predicates on declared integer columns lower to exact
+integer index bounds. A bounded binary search preserves f64 conversion plateaus
+at 2^53 and the signed endpoints, including inclusive/exclusive comparisons and
+NULL exclusion. Simple ceil/floor conversion is insufficient. Floating columns
+and non-finite bounds keep their existing residual path; no NaN ordering contract
+is inferred from an integer index.
 
 ## Storage binding and incarnation isolation
 

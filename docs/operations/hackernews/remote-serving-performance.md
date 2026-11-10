@@ -1318,3 +1318,28 @@ query motivated the bounded descriptor packing and admission-only decoding.
 Candidate timings must measure the resulting binary separately. The latest
 completed real-GCS parent sample remains 3.13 s cold / 1.62 s restart; sub-second
 cold latency has not yet been established on GCS.
+
+
+### Canonical-root and numeric-filter findings (baab016320)
+
+The merged candidate passed 10 focused and 88 broader targeted native tests, all
+98 optimized server/Lite build steps and the export check. Real-GCS stored-source
+qualification passed: 2.85 s cold, 3.17 s including startup, 232 ms server CPU and
+253.7 MiB peak RSS. All 862 task-owned object versions were deleted with zero
+remaining. This remains above the sub-second target.
+
+The simulator falsified the expected descriptor improvement: the 1,000-row
+common-term query still fetched 16 descriptors and took 1.20 s at 30 ms injected
+RTT. Publication warming followed the compacted serving root (one segment), while
+exact ordering selected the canonical root (16 segments). The regression now
+constructs distinct roots and checks both against the warmed byte cache. The
+bounded producer now covers both planner choices.
+
+A separate 10,000-row filter took 5.21 s with 400 Parquet range reads: the legacy
+f64 `numeric_range` operator could not prove integer index bounds and scanned all
+row groups. Exact integer lowering now preserves the original f64 comparisons,
+including rounding plateaus and NULL handling. Non-finite bounds and floating
+columns retain fallback. The simulator checks both legacy numeric and typed
+ranges, independent logical IDs, exact/lower-bound total validity and retained
+pages. These corrections require fresh candidate validation; the measurements
+above do not include them.

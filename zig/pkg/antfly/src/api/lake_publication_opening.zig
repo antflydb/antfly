@@ -46,7 +46,7 @@ const Producer = struct {
     count: usize = 0,
     position: usize = 0,
     segments: usize = 0,
-    text_roots: [16]@import("lake_index_native_text.zig").Root = undefined,
+    text_roots: [32]@import("lake_index_native_text.zig").Root = undefined,
     text_count: usize = 0,
     capture_small: bool = false,
     small: [16]artifacts.ChunkRef = undefined,
@@ -130,14 +130,13 @@ const Producer = struct {
             const ref = declaration.artifact;
             if (ref.byte_len > packs.max_decoded_bytes) continue;
             if (ref.kind == .text_segment and ref.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
-                const root = (try @import("lake_index_native_text.zig").loadDirectory(self.a, self.store.*, ref, self.token, self.cached)).root;
-                if (self.text_count < self.text_roots.len and root.seekable and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
-                    self.text_roots[self.text_count] = root;
-                    self.text_count += 1;
-                }
-                inline for (.{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.ordered, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds }) |page| self.add(root.domain, page, false, 0, false);
-                self.add(root.domain, root.directories.segments, false, 0, false);
-                for (root.open_packs) |pack| try self.read(sa, pack);
+                const corpus = @import("lake_index_native_text.zig");
+                const canonical = try corpus.loadRootDirectory(self.a, self.store.*, ref, self.token, self.cached);
+                try self.addTextRoot(sa, canonical);
+                // Exact ordering and physical visibility may select canonical
+                // segments even when a compacted serving root exists. Both
+                // are authoritative planner choices and need bounded seeds.
+                if (canonical.serving != null) try self.addTextRoot(sa, try corpus.servingRoot(self.a, self.store.*, canonical, self.token, self.cached));
             } else if (ref.kind == .ordered_row_index) {
                 const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, self.store.*, ref, self.token, self.cached);
                 inline for (.{ root.page, root.reverse, root.covering, root.ties, root.predicates }) |page| self.add(root.domain, page, false, 0, false);
@@ -177,6 +176,20 @@ const Producer = struct {
             defer scratch.deinit();
             _ = try @import("lake_index_seekable_text.zig").warmSmall(scratch.allocator(), .{ .store = self.store.*, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordLocator } }, ref, 512 * 1024);
         }
+    }
+    fn addTextRoot(self: *Producer, scratch: A, root: @import("lake_index_native_text.zig").Root) !void {
+        if (self.text_count < self.text_roots.len and root.seekable and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
+            const duplicate = for (self.text_roots[0..self.text_count]) |prior| {
+                if (std.mem.eql(u8, &prior.domain, &root.domain) and prior.directories.routing.?.eql(root.directories.routing.?)) break true;
+            } else false;
+            if (!duplicate) {
+                self.text_roots[self.text_count] = root;
+                self.text_count += 1;
+            }
+        }
+        inline for (.{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.ordered, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds }) |page| self.add(root.domain, page, false, 0, false);
+        self.add(root.domain, root.directories.segments, false, 0, false);
+        for (root.open_packs) |pack| try self.read(scratch, pack);
     }
     fn captureRoute(raw: *anyopaque, route: @import("lake_index_native_text.zig").SegmentRouting) !bool {
         const self: *Producer = @ptrCast(@alignCast(raw));

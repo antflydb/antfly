@@ -1004,7 +1004,7 @@ fn PredicateResolver(comptime Set: type) type {
                 const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, self.json, .{});
                 const compiled = try Graph.compilePatternFilter(ca, parsed);
                 var conditions: std.ArrayList(Condition) = .empty;
-                if (!try collectConditions(ca, compiled, &conditions, 0)) return null;
+                if (!try collectConditionsTyped(ca, compiled, &conditions, 0, self.resolver.table)) return null;
                 var predicate = (try rows.tryOpenPredicateWithContext(a, self.resolver.server, self.resolver.table, conditions.items, self.resolver.context, self.resolver.source, self.resolver.pinned)) orelse return null;
                 defer predicate.deinit();
                 if (!predicate.blocksMatch(target)) return null;
@@ -1157,7 +1157,7 @@ fn PredicateResolver(comptime Set: type) type {
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, json, .{});
             const compiled = try Graph.compilePatternFilter(ca, parsed);
             var conditions: std.ArrayList(Condition) = .empty;
-            if (try collectConditions(ca, compiled, &conditions, 0)) {
+            if (try collectConditionsTyped(ca, compiled, &conditions, 0, self.table)) {
                 if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) |predicate| {
                     var owned = predicate;
                     result.predicates.append(ca, owned) catch |err| {
@@ -1220,7 +1220,7 @@ fn PredicateResolver(comptime Set: type) type {
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, sa, json, .{});
             const compiled = try Graph.compilePatternFilter(sa, parsed);
             var conditions: std.ArrayList(Condition) = .empty;
-            try requiredConditions(sa, compiled, &conditions, 0);
+            try requiredConditionsForTable(sa, compiled, &conditions, 0, self.table);
             if (conditions.items.len == 0 or conditions.items.len > 64) return null;
             var best: ?rows.Predicate = null;
             errdefer if (best) |*predicate| predicate.deinit();
@@ -1463,7 +1463,7 @@ fn PredicateResolver(comptime Set: type) type {
             // Boolean combinations and residual predicates retain the planner.
             if (self.identities.spanCount() == 0) return null;
             var conditions: std.ArrayList(Condition) = .empty;
-            if (!try collectConditions(pa, compiled, &conditions, 0)) return null;
+            if (!try collectConditionsTyped(pa, compiled, &conditions, 0, self.table)) return null;
             var predicate = (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) orelse return null;
             errdefer predicate.deinit();
             if (!predicate.hasMembership()) {
@@ -1501,7 +1501,7 @@ fn PredicateResolver(comptime Set: type) type {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             var conditions: std.ArrayList(Condition) = .empty;
-            const scalar_conditions = try collectConditions(arena.allocator(), input, &conditions, depth);
+            const scalar_conditions = try collectConditionsTyped(arena.allocator(), input, &conditions, depth, self.table);
             if (scalar_conditions and allow_scan) {
                 if (try self.planConditions(a, conditions.items)) |result| return result;
             }
@@ -1989,13 +1989,19 @@ fn column(path: Compiled.FieldPath) ?[]const u8 {
 /// Only required predicates may bound an ordered producer. OR/NOT and
 /// unsupported leaves remain membership checks in the native collector.
 pub fn requiredConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize) anyerror!void {
+    return requiredConditionsTyped(a, input, out, depth, null);
+}
+pub fn requiredConditionsForTable(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize, table: local.sql_catalog.Table) anyerror!void {
+    return requiredConditionsTyped(a, input, out, depth, table);
+}
+fn requiredConditionsTyped(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize, table: ?local.sql_catalog.Table) anyerror!void {
     if (depth > 64) return;
     switch (input) {
-        .conjuncts => |children| for (children) |child| try requiredConditions(a, child, out, depth + 1),
-        .bool_query => |b| for (b.must) |child| try requiredConditions(a, child, out, depth + 1),
+        .conjuncts => |children| for (children) |child| try requiredConditionsTyped(a, child, out, depth + 1, table),
+        .bool_query => |b| for (b.must) |child| try requiredConditionsTyped(a, child, out, depth + 1, table),
         .field_matcher => {
             const before = out.items.len;
-            if (!try collectConditions(a, input, out, depth)) out.shrinkRetainingCapacity(before);
+            if (!try collectConditionsTyped(a, input, out, depth, table)) out.shrinkRetainingCapacity(before);
         },
         else => {},
     }
@@ -2006,20 +2012,29 @@ pub fn exactConditions(a: A, input: Compiled, out: *std.ArrayList(Condition)) !b
     return collectConditions(a, input, out, 0);
 }
 fn collectConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize) !bool {
+    return collectConditionsTyped(a, input, out, depth, null);
+}
+fn collectConditionsTyped(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize, table: ?local.sql_catalog.Table) !bool {
     if (depth > 64) return false;
     switch (input) {
         .conjuncts => |children| {
             if (children.len == 0) return false;
-            for (children) |child| if (!try collectConditions(a, child, out, depth + 1)) return false;
+            for (children) |child| if (!try collectConditionsTyped(a, child, out, depth + 1, table)) return false;
             return true;
         },
         .bool_query => |boolean| {
             if (boolean.min_should != 0 or boolean.must_not.len != 0 or boolean.must.len == 0) return false;
-            for (boolean.must) |child| if (!try collectConditions(a, child, out, depth + 1)) return false;
+            for (boolean.must) |child| if (!try collectConditionsTyped(a, child, out, depth + 1, table)) return false;
             return true;
         },
         .field_matcher => |field| {
             const name = column(field.path) orelse return false;
+            if (field.predicate == .numeric_range) {
+                const authority = table orelse return false;
+                const typed = authority.column(name) catch return false;
+                if (typed.type != .integer) return false;
+                return integerNumericConditions(a, name, field.predicate, out);
+            }
             if (field.predicate == .term) {
                 const value = try field.predicate.term.jsonValue();
                 if (value == .null or value == .number_string) return false;
@@ -2033,6 +2048,84 @@ fn collectConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), dept
         },
         else => return false,
     }
+}
+
+/// Preserve legacy f64 comparisons exactly, including rounding plateaus at
+/// 2^53 and the signed endpoints. Converting bounds with ceil/floor is wrong:
+/// several adjacent i64 keys can compare equal after conversion to f64.
+fn numericIntegerBoundary(bound: f64, strict: bool) i128 {
+    var lower: i128 = std.math.minInt(i64);
+    var upper: i128 = @as(i128, std.math.maxInt(i64)) + 1;
+    while (lower < upper) {
+        const middle = lower + @divTrunc(upper - lower, 2);
+        const value: f64 = @floatFromInt(@as(i64, @intCast(middle)));
+        if (if (strict) value > bound else value >= bound) upper = middle else lower = middle + 1;
+    }
+    return lower;
+}
+fn integerNumericConditions(a: A, name: []const u8, predicate: Compiled.FieldPredicate, out: *std.ArrayList(Condition)) !bool {
+    const kernel = (try predicate.numericKernel(f64)) orelse return false;
+    const lower = if (kernel.lower) |bound| numericIntegerBoundary(bound, !kernel.inclusive_lower) else std.math.minInt(i64);
+    const upper = if (kernel.upper) |bound| numericIntegerBoundary(bound, kernel.inclusive_upper) else @as(i128, std.math.maxInt(i64)) + 1;
+    if (lower >= upper) {
+        // An exact empty range, without an unrepresentable maxInt(i64)+1 key.
+        try out.append(a, .{ .column = name, .op = .gte, .value = .{ .integer = std.math.maxInt(i64) } });
+        try out.append(a, .{ .column = name, .op = .lt, .value = .{ .integer = std.math.maxInt(i64) } });
+    } else {
+        // Even an unbounded numeric range excludes SQL NULLs.
+        try out.append(a, .{ .column = name, .op = .gte, .value = .{ .integer = @intCast(lower) } });
+        if (upper <= std.math.maxInt(i64)) try out.append(a, .{ .column = name, .op = .lt, .value = .{ .integer = @intCast(upper) } });
+    }
+    return true;
+}
+
+test "external lake numeric ranges use exact integer index bounds across f64 rounding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "numbers", .schema_version = 1, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} };
+    const centres = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) + 2048, -9007199254740992, -1, 0, 1, 9007199254740992, std.math.maxInt(i64) - 2048, std.math.maxInt(i64) };
+    for (centres) |centre| for ([_]f64{ -0.5, 0, 0.5 }) |fraction| for ([_]bool{ false, true }) |inclusive| for ([_]bool{ false, true }) |upper| {
+        var range: std.json.Value = .{ .object = .empty };
+        try range.object.put(a, if (upper) "max" else "min", .{ .float = @as(f64, @floatFromInt(centre)) + fraction });
+        try range.object.put(a, if (upper) "inclusive_max" else "inclusive_min", .{ .bool = inclusive });
+        const predicate: Compiled.FieldPredicate = .{ .numeric_range = range };
+        const compiled: Compiled = .{ .field_matcher = .{ .path = .{ .single = "id" }, .predicate = predicate } };
+        var conditions: std.ArrayList(Condition) = .empty;
+        try std.testing.expect(try collectConditionsTyped(a, compiled, &conditions, 0, table));
+        try std.testing.expect(!try predicate.matches(a, &.{.null}));
+        for (centres) |value_centre| {
+            var offset: i64 = -1025;
+            while (offset <= 1025) : (offset += 1) {
+                const wide: i128 = @as(i128, value_centre) + offset;
+                if (wide < std.math.minInt(i64) or wide > std.math.maxInt(i64)) continue;
+                const value: i64 = @intCast(wide);
+                var indexed = true;
+                for (conditions.items) |condition| indexed = indexed and switch (condition.op) {
+                    .gte => value >= condition.value.integer,
+                    .lt => value < condition.value.integer,
+                    else => unreachable,
+                };
+                try std.testing.expectEqual(try predicate.matches(a, &.{.{ .integer = value }}), indexed);
+            }
+        }
+    };
+    // A floating column can contain NaNs; integer-only lowering must not
+    // withdraw its legacy unordered-comparison residual or coerce its keys.
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"numeric_range\":{\"field\":\"id\",\"min\":0,\"max\":99,\"inclusive_max\":true}}", .{});
+    const compiled = try Graph.compilePatternFilter(a, parsed);
+    var conditions: std.ArrayList(Condition) = .empty;
+    var floating = table;
+    floating.columns = &.{.{ .name = "id", .path = "id", .type = .number }};
+    try std.testing.expect(!try collectConditionsTyped(a, compiled, &conditions, 0, floating));
+    try std.testing.expectEqual(@as(usize, 0), conditions.items.len);
+    try std.testing.expect(try collectConditionsTyped(a, compiled, &conditions, 0, table));
+    try std.testing.expectEqual(@as(i64, 0), conditions.items[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 100), conditions.items[1].value.integer);
+    var nonfinite: std.json.Value = .{ .object = .empty };
+    try nonfinite.object.put(a, "min", .{ .float = std.math.nan(f64) });
+    conditions.clearRetainingCapacity();
+    try std.testing.expect(!try integerNumericConditions(a, "id", .{ .numeric_range = nonfinite }, &conditions));
 }
 
 test "external lake predicate planner shares term and range aliases with the compiler" {

@@ -190,9 +190,48 @@ def cases(rows, limit=7):
             "expected_ids": common_ids,
         },
     ]
+    result.append(
+        {
+            "name": "typed_filtered",
+            "request": {
+                **base,
+                "filter_query": {
+                    "range": {"field": "id", "gte": 0, "lte": min(rows - 1, 99)}
+                },
+            },
+            "expected_ids": common_ids,
+        }
+    )
     for case in result:
         case["identity_field"] = "id"
+        case["expected_total"] = (
+            len(range(17, rows, 257))
+            if case["name"] in ("rare", "phrase", "conjunction")
+            else 0
+            if case["name"] == "absent"
+            else min(rows, 100)
+            if case["name"] in ("filtered", "typed_filtered")
+            else rows
+        )
     return result
+
+
+def verify_answer(case, value):
+    checksum = archive.verify_case(case, value)
+    total = value["hits"]["total"]
+    actual = total["value"] if isinstance(total, dict) else total
+    relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
+    expected = case["expected_total"]
+    if (
+        relation not in ("eq", "exact", "gte")
+        or actual < len(value["hits"]["hits"])
+        or actual > expected
+        or (relation in ("eq", "exact") and actual != expected)
+    ):
+        raise AssertionError(
+            f"Incorrect match count for {case['name']}: {total}; expected {expected}"
+        )
+    return checksum
 
 
 def await_indexes(client, table, names):
@@ -468,7 +507,7 @@ def main(argv=None):
                 references = {}
                 for case in selected:
                     value = client.query(case)
-                    references[case["name"]] = archive.verify_case(case, value)
+                    references[case["name"]] = verify_answer(case, value)
                 report["pagination"] = (
                     [
                         qualify_pagination(client, server, case, args.cursor_pages)
@@ -536,7 +575,7 @@ def main(argv=None):
                                     elapsed_ns = time.perf_counter_ns() - started
                                 for lane_case, value, _ in values:
                                     if (
-                                        archive.verify_case(lane_case, value)
+                                        verify_answer(lane_case, value)
                                         != references[lane_case["name"]]
                                     ):
                                         raise AssertionError(

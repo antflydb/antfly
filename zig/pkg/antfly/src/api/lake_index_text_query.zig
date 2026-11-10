@@ -2290,7 +2290,7 @@ const Execution = struct {
             const parsed = try std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{});
             const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(a, parsed.value);
             var required: std.ArrayList(local.sql_catalog.Condition) = .empty;
-            try @import("lake_index_text_predicate.zig").requiredConditions(a, compiled, &required, 0);
+            try @import("lake_index_text_predicate.zig").requiredConditionsForTable(a, compiled, &required, 0, self.table);
             for (required.items) |condition| {
                 if (try sql_rows.compatibleSearchConditions(a, self.table, &.{condition})) try conditions.append(a, condition);
             }

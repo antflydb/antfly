@@ -253,11 +253,14 @@ test "external lake opening inventory coverage proofs bind immutable plans publi
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .converted_type = 0, .values = &.{"needle"} }});
+    var ids: [1000]i64 = undefined;
+    for (&ids, 0..) |*id, ordinal| id.* = @intCast(ordinal);
+    const bodies: [1000][]const u8 = @splat("needle");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .values = &ids }}, &.{.{ .column_id = "body", .converted_type = 0, .values = &bodies }});
     defer a.free(data);
     var upload = try client.putObject("antfly", "part.parquet", data, .{});
     upload.deinit(a);
-    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"object_mutability\":\"immutable\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}}}}}}}}}}", .{directory.path()});
+    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"object_mutability\":\"immutable\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\",\"row_identity\":{{\"key_columns\":[\"id\"]}}}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"integer\"}},\"body\":{{\"type\":\"string\"}}}}}}}}}}}}", .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
     defer binding.deinit(a);
@@ -318,12 +321,17 @@ test "external lake opening inventory coverage proofs bind immutable plans publi
         var capture: Capture = .{ .store = artifact_store, .read = opening_read, .a = sa };
         for (warmed_publication.declarations) |declaration| {
             if (declaration.artifact.kind != .text_segment) continue;
-            const root = (try corpus.loadDirectory(sa, artifact_store, declaration.artifact, .none, opening_read)).root;
-            const cursor = try @import("lake_index_text_directory.zig").RoutingCursor.create(sa, root, artifact_store, opening_read, .none);
-            defer cursor.deinit();
-            cursor.filter = .{ .ptr = &capture, .keep = Capture.keep };
-            var ids: [64][32]u8 = undefined;
-            _ = try cursor.next(&ids);
+            const canonical = try corpus.loadRootDirectory(sa, artifact_store, declaration.artifact, .none, opening_read);
+            const serving = try corpus.servingRoot(sa, artifact_store, canonical, .none, opening_read);
+            try std.testing.expect(canonical.serving != null);
+            try std.testing.expect(canonical.segment_count > serving.segment_count);
+            for ([_]corpus.Root{ canonical, serving }) |root| {
+                const cursor = try @import("lake_index_text_directory.zig").RoutingCursor.create(sa, root, artifact_store, opening_read, .none);
+                defer cursor.deinit();
+                cursor.filter = .{ .ptr = &capture, .keep = Capture.keep };
+                var identities: [64][32]u8 = undefined;
+                while (try cursor.next(&identities)) |_| {}
+            }
         }
         try std.testing.expect(capture.count > 0);
         try std.testing.expectEqual(seed_reads, opening_trace.snapshot().provider_reads);
@@ -347,6 +355,7 @@ test "external lake opening inventory coverage proofs bind immutable plans publi
     parsed.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
     parsed.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
     parsed.value.published.?.source_navigation = null;
+    parsed.value.published.?.row_identity = null;
     parsed.value.published.?.signature.source = (try coverage.finish(&source, .{}, try coverage.pinData(&source, .{}, null, null))).source;
     const legacy_json = try catalog.encode(a, parsed.value);
     defer a.free(legacy_json);
