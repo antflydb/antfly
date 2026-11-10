@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -241,6 +242,72 @@ func checkKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, cfg map[string
 	return nil
 }
 
+// Runtime diagnostics include independently administered table-scoped
+// consumers which need not appear in an index's inline declaration.
+type nativeKnowledgeResolver struct {
+	Name               string `json:"name"`
+	Table              string `json:"table"`
+	SourceArtifact     string `json:"source_artifact"`
+	ResolutionArtifact string `json:"resolution_artifact"`
+}
+
+func nativeGraphResolvers(g GraphBinding, idx nativeSearchIndex) []nativeKnowledgeResolver {
+	values := []nativeKnowledgeResolver{}
+	if idx.Status.ResolverReplay == nil {
+		return values
+	}
+	seen := map[nativeKnowledgeResolver]bool{}
+	for _, r := range idx.Status.ResolverReplay.Resolvers {
+		if containsString(g.Artifacts, r.SourceArtifact) && !seen[r] {
+			seen[r] = true
+			values = append(values, r)
+		}
+	}
+	sort.Slice(values, func(i, j int) bool {
+		a, b := values[i], values[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.Table != b.Table {
+			return a.Table < b.Table
+		}
+		if a.SourceArtifact != b.SourceArtifact {
+			return a.SourceArtifact < b.SourceArtifact
+		}
+		return a.ResolutionArtifact < b.ResolutionArtifact
+	})
+	return values
+}
+func checkNativeKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, idx nativeSearchIndex) error {
+	if err := checkKnowledgeGraph(k, g, idx.Config); err != nil {
+		return err
+	}
+	if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
+		return nil
+	}
+	if idx.Status.ResolverReplay == nil {
+		return fmt.Errorf("native graph resolver observation unavailable")
+	}
+	declared := map[string]EntityBinding{}
+	for _, e := range k.Entities {
+		if containsString(g.Entities, e.Name) {
+			declared[e.Resolver] = e
+		}
+	}
+	matched := map[string]bool{}
+	for _, r := range nativeGraphResolvers(g, idx) {
+		e, ok := declared[r.Name]
+		if !ok || r.Table != e.Table || r.SourceArtifact != e.SourceArtifact || r.ResolutionArtifact != e.ResolutionArtifact {
+			return fmt.Errorf("undeclared active native graph resolver target")
+		}
+		matched[r.Name] = true
+	}
+	if len(matched) != len(declared) {
+		return fmt.Errorf("native graph resolver observation incomplete")
+	}
+	return nil
+}
+
 // ValidateKnowledgeProcessing checks the complete desired graph before any DDL.
 // Actual native admission remains authoritative for extractor/resolver schemas.
 func ValidateKnowledgeProcessing(k *KnowledgeDeclaration, plan *ProcessingDeclaration, audience string) error {
@@ -343,7 +410,7 @@ func ValidateInstalledKnowledge(ctx context.Context, client SearchIndexClient, b
 		if !ok {
 			return fmt.Errorf("graph %s observation unavailable: %v", g.Name, failures[g.Index])
 		}
-		if err := checkKnowledgeGraph(b.Knowledge, g, idx.Config); err != nil {
+		if err := checkNativeKnowledgeGraph(b.Knowledge, g, idx); err != nil {
 			return fmt.Errorf("graph %s: %w", g.Name, err)
 		}
 	}
@@ -432,7 +499,7 @@ func knowledgeStatusFromIndexes(b Binding, audience string, cache map[string]nat
 		out.Entities = append(out.Entities, state(e.Name, e.Index, func(c map[string]any) error { return checkEntityBinding(e, c) }))
 	}
 	for _, g := range b.Knowledge.Graphs {
-		out.Graphs = append(out.Graphs, state(g.Name, g.Index, func(c map[string]any) error { return checkKnowledgeGraph(b.Knowledge, g, c) }))
+		out.Graphs = append(out.Graphs, state(g.Name, g.Index, func(c map[string]any) error { return checkNativeKnowledgeGraph(b.Knowledge, g, cache[g.Index]) }))
 	}
 	return out
 }
@@ -549,7 +616,7 @@ func QueryKnowledge(ctx context.Context, p KnowledgeQueryClient, b Binding, requ
 		if err != nil {
 			return [32]byte{}, err
 		}
-		if err = checkKnowledgeGraph(b.Knowledge, selected, idx.Config); err != nil {
+		if err = checkNativeKnowledgeGraph(b.Knowledge, selected, idx); err != nil {
 			return [32]byte{}, err
 		}
 		if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
@@ -561,10 +628,20 @@ func QueryKnowledge(ctx context.Context, p KnowledgeQueryClient, b Binding, requ
 		var wire struct {
 			Config json.RawMessage `json:"config"`
 			Status struct {
-				Readiness json.RawMessage `json:"readiness"`
+				Readiness      json.RawMessage `json:"readiness"`
+				ResolverReplay struct {
+					Resolvers json.RawMessage `json:"resolvers"`
+				} `json:"resolver_replay"`
 			} `json:"status"`
 		}
 		if err = json.Unmarshal(raw, &wire); err != nil {
+			return [32]byte{}, err
+		}
+		// Fence only consumers of this graph's artifact set. Table-wide
+		// diagnostics also contain unrelated resolvers; their creation or
+		// observation order must not invalidate an otherwise stable query.
+		wire.Status.ResolverReplay.Resolvers, err = json.Marshal(nativeGraphResolvers(selected, idx))
+		if err != nil {
 			return [32]byte{}, err
 		}
 		encoded, err := json.Marshal(wire)

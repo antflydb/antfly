@@ -141,17 +141,22 @@ func TestKnowledgeReadinessAndNoAcquisitionIdentityChange(t *testing.T) {
 }
 
 type knowledgeClient struct {
-	config      map[string]any
-	complete    bool
-	inspections int
-	response    string
-	generation  uint64
-	onQuery     func()
+	config        map[string]any
+	complete      bool
+	inspections   int
+	response      string
+	generation    uint64
+	extraResolver map[string]any
+	onQuery       func()
 }
 
 func (c *knowledgeClient) InspectSearchIndex(context.Context, string, string) ([]byte, error) {
 	c.inspections++
-	return json.Marshal(map[string]any{"config": c.config, "status": map[string]any{"readiness": map[string]any{"complete": c.complete, "queryable": c.complete, "incarnation": "knowledge-incarnation", "target_revision": c.generation, "published_revision": c.generation}}})
+	resolvers, _ := c.config["resolvers"].([]any)
+	if c.extraResolver != nil {
+		resolvers = append(append([]any{}, resolvers...), c.extraResolver)
+	}
+	return json.Marshal(map[string]any{"config": c.config, "status": map[string]any{"resolver_replay": map[string]any{"resolvers": resolvers}, "readiness": map[string]any{"complete": c.complete, "queryable": c.complete, "incarnation": "knowledge-incarnation", "target_revision": c.generation, "published_revision": c.generation}}})
 }
 func (c *knowledgeClient) CreateSearchIndex(context.Context, string, string, map[string]any) error {
 	return fmt.Errorf("unexpected DDL")
@@ -238,7 +243,7 @@ func TestLocalKnowledgeQueryRejectsConcurrentPublicationRetirement(t *testing.T)
 			_, _ = w.Write([]byte(`{"responses":[{"graph_results":{"source_knowledge":{"nodes":[]}}}],"live_read":true}`))
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"config": plan.Indexes[0].Config, "status": map[string]any{"readiness": map[string]any{"complete": true, "queryable": true}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"config": plan.Indexes[0].Config, "status": map[string]any{"resolver_replay": map[string]any{"resolvers": plan.Indexes[0].Config["resolvers"]}, "readiness": map[string]any{"complete": true, "queryable": true}}})
 	}))
 	defer server.Close()
 	s.mu.Lock()

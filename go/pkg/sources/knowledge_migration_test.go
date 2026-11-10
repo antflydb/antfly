@@ -87,3 +87,25 @@ func TestKnowledgeInstalledResolversCannotBeHidden(t *testing.T) {
 	client := &knowledgeClient{config: plan.Indexes[0].Config, complete: false}
 	require.NoError(t, ValidateInstalledKnowledge(t.Context(), client, Binding{Table: "docs", Knowledge: &k}, "research"), "configuration admission does not require completed backfill")
 }
+
+func TestKnowledgeRuntimeResolverTargetsCannotBeHidden(t *testing.T) {
+	plan, k := knowledgeFixture(t)
+	client := &knowledgeClient{config: plan.Indexes[0].Config, complete: true, extraResolver: map[string]any{"name": "independent", "table": "private", "source_artifact": k.Graphs[0].Artifacts[0], "resolution_artifact": "private_resolution"}}
+	until := time.Now().Add(time.Minute).Unix()
+	binding := Binding{ID: testSourceID, Table: "docs", Knowledge: &k, Status: "searchable", ValidUntil: &until}
+	require.ErrorContains(t, ValidateInstalledKnowledge(t.Context(), client, binding, "research"), "undeclared active")
+	called := false
+	client.onQuery = func() { called = true }
+	_, err := QueryKnowledge(t.Context(), client, binding, KnowledgeRequest{Graph: "facts", Start: []string{"a"}}, "research")
+	require.ErrorContains(t, err, "undeclared active")
+	require.False(t, called)
+	// An unrelated resolver may be added while this graph is being queried.
+	// It neither consumes these artifacts nor changes their target fence.
+	client.extraResolver = nil
+	client.response = `{"responses":[{"graph_results":{"source_knowledge":{"nodes":[]}}}]}`
+	client.onQuery = func() {
+		client.extraResolver = map[string]any{"name": "unrelated", "table": "other", "source_artifact": "other_input", "resolution_artifact": "other_resolution"}
+	}
+	_, err = QueryKnowledge(t.Context(), client, binding, KnowledgeRequest{Graph: "facts", Start: []string{"a"}}, "research")
+	require.NoError(t, err)
+}

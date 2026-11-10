@@ -61,6 +61,9 @@ func VectorSpaceIdentity(space VectorSpace) string {
 type nativeSearchIndex struct {
 	Config map[string]any `json:"config"`
 	Status struct {
+		ResolverReplay *struct {
+			Resolvers []nativeKnowledgeResolver `json:"resolvers"`
+		} `json:"resolver_replay"`
 		Readiness struct {
 			State     string `json:"state"`
 			Complete  bool   `json:"complete"`
