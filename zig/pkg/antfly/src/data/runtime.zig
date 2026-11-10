@@ -12687,6 +12687,16 @@ pub const DataServer = struct {
         return minimum;
     }
 
+    fn raftBatchRequestForActiveProtocol(req: antfly.db.types.BatchRequest, active_protocol_version: u16, realtime_ns: u64) antfly.db.types.BatchRequest {
+        var proposal = raftBatchRequestForProtocol(req, active_protocol_version >= data_raft_batch.timestamp_protocol_version, realtime_ns);
+        // Isolated control commands assign no document versions. Preserve their
+        // request scheme, including invalid explicit adjuncts for validation,
+        // rather than injecting a row-version marker during negotiation.
+        if (batchMutatesDocuments(req))
+            proposal.document_version_scheme = if (active_protocol_version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version) .revision_v1 else .legacy;
+        return proposal;
+    }
+
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
         // Keep proposal admission and the encoded envelope in lockstep as
@@ -13552,12 +13562,11 @@ pub const DataServer = struct {
                             if (minimum_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
-                        proposal_req = raftBatchRequestForProtocol(
+                        proposal_req = raftBatchRequestForActiveProtocol(
                             req,
-                            active_protocol_version >= data_raft_batch.timestamp_protocol_version,
+                            active_protocol_version,
                             self.dataRaftRealtimeNs(),
                         );
-                        proposal_req.document_version_scheme = if (active_protocol_version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version) .revision_v1 else .legacy;
                         const proposal_term = status.hard.current_term;
                         const encoded = if (comptime linked_storage)
                             try data_raft_batch.encodeWithStorageOwnerDescriptor(
@@ -42331,6 +42340,53 @@ fn consumerTests() type {
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 9, 17, 18));
         }
 
+        test "raft proposal preserves isolated catalog admission through document revision negotiation" {
+            const alloc = std.testing.allocator;
+            const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+            const catalogs: inventory.Catalogs = .{};
+            const request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+                .namespace = @splat(1),
+                .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) },
+                .catalogs = catalogs,
+            } };
+            var controls = [_]antfly.db.types.BatchRequest{ request, request };
+            controls[1].merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 1,
+                .donor_group_id = 2,
+                .receiver_group_id = 3,
+                .receiver_base_start = "m",
+                .receiver_base_end = "z",
+                .merged_start = "a",
+                .merged_end = "z",
+            };
+            const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+            for (controls) |control| {
+                for ([_]u16{ data_raft_batch.artifact_catalog_protocol_version, revisions - 1, revisions }) |active| {
+                    const proposal = DataServer.raftBatchRequestForActiveProtocol(control, active, 999);
+                    try std.testing.expectEqual(.admit_current, proposal.document_version_scheme);
+                    try std.testing.expectEqual(@as(u64, 0), proposal.timestamp_ns);
+                    try inventory.validateRequest(proposal);
+                    const encoded = try data_raft_batch.encode(alloc, "docs", proposal);
+                    defer alloc.free(encoded);
+                    var decoded = try data_raft_batch.decode(alloc, encoded);
+                    defer decoded.deinit(alloc);
+                    try inventory.validateRequest(decoded.batch.req);
+                    try std.testing.expectEqualDeep(control.artifact_catalog, decoded.batch.req.artifact_catalog);
+                    try std.testing.expectEqualDeep(control.merge_checkpoint, decoded.batch.req.merge_checkpoint);
+                }
+            }
+            // Negotiation must not sanitize an invalid caller-supplied control.
+            var invalid = request;
+            invalid.document_version_scheme = .legacy;
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.validateRequest(DataServer.raftBatchRequestForActiveProtocol(invalid, revisions, 999)));
+            for ([_]u16{ revisions - 1, revisions }) |active| {
+                const document = DataServer.raftBatchRequestForActiveProtocol(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} }, active, 999);
+                try std.testing.expectEqual(@as(u64, 999), document.timestamp_ns);
+                try std.testing.expectEqual(if (active >= revisions) antfly.db.types.DocumentVersionScheme.revision_v1 else .legacy, document.document_version_scheme);
+            }
+        }
+
         test "raft proposal materializes a default batch timestamp exactly once" {
             const alloc = std.testing.allocator;
             const materialized = DataServer.materializeRaftBatchTimestamp(.{
@@ -42369,9 +42425,10 @@ fn consumerTests() type {
                     .expected_phase = phase,
                     .expected_descriptor_digest = @splat(9),
                 }, .row_policy_install_bundle = "{\"table_id\":7}" };
-                for ([_]bool{ false, true }) |timestamp_protocol| {
-                    const proposal = DataServer.raftBatchRequestForProtocol(policy_request, timestamp_protocol, 999);
+                for ([_]u16{ 0, data_raft_batch.timestamp_protocol_version, @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version }) |active| {
+                    const proposal = DataServer.raftBatchRequestForActiveProtocol(policy_request, active, 999);
                     try std.testing.expectEqual(@as(u64, 0), proposal.timestamp_ns);
+                    try std.testing.expectEqual(.admit_current, proposal.document_version_scheme);
                     const policy_encoded = try data_raft_batch.encode(alloc, "docs", proposal);
                     defer alloc.free(policy_encoded);
                     var policy_decoded = try data_raft_batch.decode(alloc, policy_encoded);
