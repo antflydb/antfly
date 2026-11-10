@@ -31,6 +31,7 @@ type API interface {
 	ListSources(ctx context.Context, limit int, cursor string) (management.SourcePage, error)
 	GetSource(ctx context.Context, id string) (management.Source, error)
 	PutSource(ctx context.Context, s management.Source) (management.Source, error)
+	PutSourceIfMatch(ctx context.Context, s management.Source, revision string) (management.Source, error)
 	RemoveSource(ctx context.Context, id string, purge bool) (management.Mutation, error)
 	ListRuns(ctx context.Context, id string, limit int, cursor string) (management.RunPage, error)
 	GetRun(ctx context.Context, source, id string) (management.Run, error)
