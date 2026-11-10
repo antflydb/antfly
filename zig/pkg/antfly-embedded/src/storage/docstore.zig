@@ -2195,18 +2195,24 @@ pub const DocStore = struct {
         self.portable_import_reader_state.store(0, .release);
     }
 
-    /// Observe optional native summary bindings under the caller's writer fence.
-    /// Registry mutation/import invalidates the negative cache.
+    /// Active capture is distinct from retained generations still owned here.
+    /// Registry/marker mutation and import invalidate this negative cache.
     pub fn retainedSeriesActive(self: *DocStore) !bool {
         const observed = self.retained_series_cache.load(.acquire);
         if (observed & 1 != 0) return false;
         var txn = try self.beginReadTxn();
         defer txn.abort();
+        const active = try retained_series_capture.isCapturing(self.alloc, &txn);
+        if (!active) retained_series_capture.cacheAbsent(&self.retained_series_cache, observed);
+        return active;
+    }
+
+    /// Rare lifecycle admission must also account for closed local generations.
+    pub fn retainedSeriesPresent(self: *DocStore) !bool {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
         _ = txn.get(retained_series_capture.registry_key) catch |err| switch (err) {
-            error.NotFound => {
-                retained_series_capture.cacheAbsent(&self.retained_series_cache, observed);
-                return false;
-            },
+            error.NotFound => return false,
             else => return err,
         };
         return true;

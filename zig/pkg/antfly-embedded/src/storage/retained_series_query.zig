@@ -42,7 +42,7 @@ pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract
             if (poll.root_incarnation != root_incarnation) return error.RetainedSeriesResetRequired;
             if (poll.limit == 0 or poll.limit > 32) return error.RetainedSeriesBatchTooLarge;
             const spec = for (bindings) |binding| {
-                if (std.mem.eql(u8, &binding.spec.id, &poll.fence.id)) break binding.spec;
+                if (std.mem.eql(u8, &binding.spec.id, &poll.fence.id) and binding.spec.generation == poll.fence.generation) break binding.spec;
             } else return error.RetainedSeriesDefinitionMismatch;
             try control.requireFence(poll.fence, spec);
             const frames = try (series.Engine{ .alloc = a, .spec = spec }).poll(temp, txn, poll.cursor, poll.limit);

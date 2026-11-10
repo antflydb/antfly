@@ -8974,14 +8974,19 @@ pub const DB = struct {
         // Ordinary batch entry points cannot silently reinterpret it as a delete.
         if (req.expiration_deletes.len != 0) return error.InvalidRetainedSeries;
         if (req.retained_series != null) return self.applyRetainedSeriesBatch(req, opts);
-        if (try self.core.store.retainedSeriesActive()) {
-            // These routes need retained correction reservations and complete
-            // summary state handoff before activation can admit them safely.
-            if (req.transaction) |transaction| if (transaction == .prepare) return error.RetainedSeriesTransactionsUnsupported;
-            if (req.online_source != null or req.restore_staging != null or req.relational_topology != null or
-                req.split_checkpoint != null or req.split_transition != null or req.split_replication != null or
-                req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
-                req.merge_page != null or req.merge_artifacts.len != 0) return error.RetainedSeriesTopologyUnsupported;
+        // Transaction envelopes require the dispatcher, which commits their
+        // state machine operation and ordered receipt. A plain batch cannot
+        // acknowledge them as an empty primary mutation.
+        if (req.transaction != null) {
+            if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTransactionsUnsupported;
+            return error.UnsupportedOperation;
+        }
+        if (req.online_source != null or req.restore_staging != null or req.relational_topology != null or
+            req.split_checkpoint != null or req.split_transition != null or req.split_replication != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_page != null or req.merge_artifacts.len != 0)
+        {
+            if (try self.core.store.retainedSeriesPresent()) return error.RetainedSeriesTopologyUnsupported;
         }
         if (req.online_source != null) {
             if (comptime builtin.os.tag == .freestanding) {
@@ -20838,7 +20843,7 @@ pub const DB = struct {
     }
 
     fn requireSupportedRelationalTopology(self: *DB) !void {
-        if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTopologyUnsupported;
+        if (try self.core.store.retainedSeriesPresent()) return error.RetainedSeriesTopologyUnsupported;
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
         var view = self.core.acquireSchemaView();
         defer if (view) |*pinned| pinned.release();

@@ -24,6 +24,7 @@ const rows = @import("db/algebraic/relational_row_codec.zig");
 const datetime = @import("../datetime.zig");
 const A = std.mem.Allocator;
 pub const registry_key = "\x00\x00__metadata__:retained_series_bindings_v1";
+pub const active_key = "\x00\x00__metadata__:retained_series_active_v1";
 pub const sequence_key = "\x00\x00__metadata__:retained_series_sequence_v1";
 pub const Cache = std.atomic.Value(u64);
 const uncached_tag = std.math.maxInt(u64) - 1;
@@ -49,6 +50,7 @@ pub const Context = struct { sequence: u64, admitted_ns: i128, cause: series.Cau
 pub const DimensionType = enum { integer, number, boolean, string, datetime };
 pub const Binding = struct {
     spec: series.Spec,
+    closed: bool = false,
     timestamp: []const u8,
     dimensions: []const []const u8 = &.{},
     dimension_types: []const DimensionType = &.{},
@@ -72,15 +74,38 @@ pub const Binding = struct {
 };
 
 pub fn load(a: A, txn: anytype) ![]const Binding {
-    const raw = (try optional(txn, registry_key)) orelse return &.{};
+    const raw = (try optional(txn, registry_key)) orelse {
+        if (try optional(txn, active_key) != null) return error.RetainedSeriesCorrupt;
+        return &.{};
+    };
     if (raw.len > 32768) return error.RetainedSeriesCorrupt;
     const bindings = (try std.json.parseFromSlice([]const Binding, a, raw, .{ .allocate = .alloc_always })).value;
     if (bindings.len > max_bindings) return error.RetainedSeriesCorrupt;
     for (bindings, 0..) |b, i| {
         try b.validate();
-        for (bindings[0..i]) |old| if (std.mem.eql(u8, &old.spec.id, &b.spec.id)) return error.RetainedSeriesCorrupt;
+        for (bindings[0..i]) |old| if (std.mem.eql(u8, &old.spec.id, &b.spec.id) and (old.spec.generation == b.spec.generation or (!old.closed and !b.closed) or
+            (!old.closed and old.spec.generation < b.spec.generation) or (!b.closed and b.spec.generation < old.spec.generation))) return error.RetainedSeriesCorrupt;
     }
+    const marker = try optional(txn, active_key);
+    if (marker) |value| if (!std.mem.eql(u8, value, "1")) return error.RetainedSeriesCorrupt;
+    const active = for (bindings) |binding| {
+        if (!binding.closed) break true;
+    } else false;
+    if (active != (marker != null)) return error.RetainedSeriesCorrupt;
     return bindings;
+}
+
+/// The negative cache may certify a fully closed registry, but never a missing
+/// active marker for an active definition. Marker/registry updates are atomic.
+pub fn isCapturing(a: A, txn: anytype) !bool {
+    if (try optional(txn, active_key)) |value| {
+        if (!std.mem.eql(u8, value, "1")) return error.RetainedSeriesCorrupt;
+        return true;
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    _ = try load(arena.allocator(), txn);
+    return false;
 }
 
 /// A copied native registry cannot silently start producing under a different
@@ -97,9 +122,15 @@ pub fn requireNamespace(a: A, txn: anytype, namespace: [24]u8) !void {
 /// The caller derives complete_from_ns from certified existing source coverage.
 pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_from_ns: i128) !void {
     try binding.validate();
+    if (binding.closed) return error.InvalidRetainedSeries;
     const previous = try load(a, txn);
     if (previous.len == max_bindings) return error.RetainedSeriesBatchTooLarge;
-    for (previous) |old| if (std.mem.eql(u8, &old.spec.id, &binding.spec.id)) return error.RetainedSeriesAlreadyExists;
+    var latest: u64 = 0;
+    for (previous) |old| if (std.mem.eql(u8, &old.spec.id, &binding.spec.id)) {
+        if (!old.closed or old.spec.generation >= binding.spec.generation) return error.RetainedSeriesAlreadyExists;
+        latest = @max(latest, old.spec.generation);
+    };
+    if (latest != 0 and binding.spec.generation != std.math.add(u64, latest, 1) catch return error.InvalidRetainedSeries) return error.InvalidRetainedSeries;
     const next = try a.alloc(Binding, previous.len + 1);
     @memcpy(next[0..previous.len], previous);
     next[previous.len] = binding;
@@ -109,6 +140,27 @@ pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_
     try saveSequence(txn, sequence);
     try (series.Engine{ .alloc = a, .spec = binding.spec }).install(txn, sequence, context.admitted_ns, complete_from_ns);
     try txn.put(registry_key, raw);
+    try txn.put(active_key, "1");
+}
+
+pub fn closeBinding(a: A, txn: anytype, id: series.Id, generation: u64, admitted_ns: i128) !void {
+    const previous = try load(a, txn);
+    const next = try a.dupe(Binding, previous);
+    var found = false;
+    var active = false;
+    for (next) |*binding| {
+        if (std.mem.eql(u8, &binding.spec.id, &id) and binding.spec.generation == generation) {
+            try (series.Engine{ .alloc = a, .spec = binding.spec }).close(txn, admitted_ns);
+            binding.closed = true;
+            found = true;
+        }
+        active = active or !binding.closed;
+    }
+    if (!found) return error.RetainedSeriesDefinitionMismatch;
+    const raw = try std.json.Stringify.valueAlloc(a, next, .{});
+    if (raw.len > 32768) return error.RetainedSeriesBatchTooLarge;
+    try txn.put(registry_key, raw);
+    if (active) try txn.put(active_key, "1") else try txn.delete(active_key);
 }
 
 /// Physical inputs have already been schema-normalized by native intent
@@ -152,7 +204,7 @@ pub fn planPrepare(a: A, read: *@import("docstore.zig").DocStore.Txn, transactio
     if (inputs.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
     if (inputs.len > series.max_changes) return error.RetainedSeriesBatchTooLarge;
     const bindings = try load(a, read);
-    if (bindings.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+    if (!try isCapturing(a, read)) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
     var overlay = PrepareOverlay{ .a = a, .read = read };
     var selected = std.StringHashMapUnmanaged(PreparedInput).empty;
     for (inputs) |input| {
@@ -206,6 +258,7 @@ pub fn planPrepare(a: A, read: *@import("docstore.zig").DocStore.Txn, transactio
     const changes = try a.alloc(series.Change, decoded.len);
     var costs = std.StringHashMap(u64).init(a);
     for (bindings) |binding| {
+        if (binding.closed) continue;
         for (decoded, changes) |entry, *change| change.* = .{ .key = entry.input.key, .cause = entry.input.cause, .before = if (entry.before) |image| try normalizeImage(a, binding, image) else null, .after = if (entry.after) |image| try normalizeImage(a, binding, image) else null };
         std.mem.sort(series.Change, changes, {}, struct {
             fn less(_: void, left: series.Change, right: series.Change) bool {
@@ -288,7 +341,7 @@ pub const Capture = struct {
             self.context_touched = true;
             return;
         }
-        if (std.mem.eql(u8, key, registry_key)) {
+        if (std.mem.eql(u8, key, registry_key) or std.mem.eql(u8, key, active_key)) {
             self.registry_touched = true;
             if (cache) |c| invalidateCache(c);
             return;
@@ -307,8 +360,7 @@ pub const Capture = struct {
         errdefer self.poisoned = true;
         const observed = if (cache) |c| c.load(.acquire) else 0;
         if (!self.registry_touched and observed & 1 != 0) return;
-        const registry = try optional(txn, registry_key);
-        if (registry == null) {
+        if (!try isCapturing(a, txn)) {
             if (!self.registry_touched) if (cache) |c| cacheAbsent(c, observed);
             return;
         }
@@ -395,6 +447,7 @@ pub const Capture = struct {
         // definitions reference it. Binding-specific projections stay bounded.
         const changes = try alloc.alloc(series.Change, count);
         for (bindings) |binding| {
+            if (binding.closed) continue;
             for (decoded[0..count], changes) |entry, *change| {
                 change.* = .{ .key = entry.key, .before = if (entry.before) |value| try normalizeImage(alloc, binding, value) else null, .after = if (entry.after) |value| try normalizeImage(alloc, binding, value) else null };
             }
@@ -433,6 +486,7 @@ const Decoder = struct {
     fn init(a: A, bindings: []const Binding) !Decoder {
         var self = Decoder{ .a = a };
         for (bindings) |binding| {
+            if (binding.closed) continue;
             try self.want(binding.timestamp, true);
             for (binding.dimensions) |field| try self.want(field, true);
             for (binding.spec.laws, binding.fields) |law, field| if (field) |name| try self.want(name, law != .count);
@@ -575,15 +629,16 @@ pub fn appendContextForResolution(a: A, store: anytype, source_replay_sequence: 
 /// Scan current authoritative source rows under the control command's writer
 /// fence. Bound PHYSICAL entries as well as logical rows; derived keys cannot
 /// cause one maintenance command to scan an unbounded user namespace.
-pub fn backfillPage(a: A, txn: anytype, id: series.Id, expected_cursor: []const u8, limit: usize) !bool {
+pub fn backfillPage(a: A, txn: anytype, id: series.Id, generation: u64, expected_cursor: []const u8, limit: usize) !bool {
     if (limit == 0 or limit > series.max_changes) return error.RetainedSeriesBatchTooLarge;
     const bindings = try load(a, txn);
     var found: ?Binding = null;
-    for (bindings) |b| if (std.mem.eql(u8, &b.spec.id, &id)) {
+    for (bindings) |b| if (std.mem.eql(u8, &b.spec.id, &id) and b.spec.generation == generation) {
         found = b;
         break;
     };
     const binding = found orelse return error.RetainedSeriesDefinitionMismatch;
+    if (binding.closed) return error.RetainedSeriesSourceClosed;
     const changes = try a.alloc(series.Change, limit);
     var decoder = try Decoder.init(a, &.{binding});
     var input_bytes: usize = 0;
@@ -645,7 +700,7 @@ test "retained series native source commit coalesces corrections and preserves T
         const unready = try ExpirationGuard.init(alloc, &txn);
         try std.testing.expect(!try unready.allowed(alloc, &txn, first, 109));
         try std.testing.expect(try unready.allowed(alloc, &txn, first, 210));
-        try std.testing.expect(try backfillPage(alloc, &txn, binding.spec.id, "", 1024));
+        try std.testing.expect(try backfillPage(alloc, &txn, binding.spec.id, binding.spec.generation, "", 1024));
         const prepared = try ExpirationGuard.init(alloc, &txn);
         try std.testing.expect(!try prepared.allowed(alloc, &txn, first, 109));
         try std.testing.expect(try prepared.allowed(alloc, &txn, first, 110));
@@ -774,7 +829,8 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     defer db.abortTransaction(pending, 6) catch {};
     try std.testing.expectError(error.RetainedSeriesCorrectionWindow, db.writeIntents(pending, &.{.{ .key = "a", .value = first }}, &.{}));
     try std.testing.expectError(error.RetainedSeriesCorrectionWindow, db.writeTransaction(pending, .{ .writes = &.{.{ .key = "a", .value = first }} }));
-    try db.batch(.{ .timestamp_ns = 6, .transaction = .{ .resolve = .{ .txn_id = pending, .status = .aborted, .commit_version = 6 } } });
+    try std.testing.expectError(error.RetainedSeriesTransactionsUnsupported, db.batch(.{ .timestamp_ns = 6, .transaction = .{ .resolve = .{ .txn_id = pending, .status = .aborted, .commit_version = 6 } } }));
+    try db.abortTransaction(pending, 6);
     var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
     const page = try (series.Engine{ .alloc = a, .spec = binding.spec }).scan(alloc, &txn, 0, 10, 4, null, 10);
@@ -868,6 +924,31 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
         try std.testing.expectEqual(@as(i64, 1), retained.rows[0].rows);
         try std.testing.expectEqual(@as(?f64, 3), retained.rows[0].metrics[1].value(.sum));
     }
+    try db.batch(.{ .timestamp_ns = 263, .retained_series = .{ .action = .close, .fence = fence } });
+    try std.testing.expect(!try db.core.store.retainedSeriesActive());
+    try std.testing.expectError(error.UnsupportedOperation, db.batch(.{ .transaction = .{ .resolve = .{ .txn_id = pending, .status = .aborted, .commit_version = 6 } } }));
+    try std.testing.expect(try db.core.store.retainedSeriesPresent());
+    // A closed generation releases source-write restrictions, but retains its
+    // independently readable state until verified archive publication/eviction.
+    try db.batch(.{ .timestamp_ns = 264, .writes = &.{.{ .key = "after-close", .value = "{\"ts\":\"1970-01-01T00:00:00.000000001Z\",\"v\":21}" }} });
+    var next = binding;
+    next.spec.generation = 2;
+    next.spec.definition = @splat(8);
+    var next_fence = fence;
+    next_fence.generation = 2;
+    next_fence.definition = next.spec.definition;
+    try db.batch(.{ .timestamp_ns = 265, .retained_series = .{ .action = .install, .fence = next_fence, .binding = next, .complete_from_ns = 260 } });
+    try db.batch(.{ .timestamp_ns = 266, .retained_series = .{ .action = .backfill, .fence = next_fence, .work_limit = 1024 } });
+    try std.testing.expect(try db.core.store.retainedSeriesActive());
+    try db.batch(.{ .timestamp_ns = 267, .writes = &.{.{ .key = "new-generation", .value = "{\"ts\":\"1970-01-01T00:00:00.000000271Z\",\"v\":5}" }} });
+    const old_reader = try db.openRetainedSeriesRead(a, .{ .fence = fence, .start_ns = 0, .end_ns = 10, .admitted_ns = 268 });
+    defer old_reader.close();
+    const old_page = try old_reader.next(10);
+    try std.testing.expectEqual(@as(?f64, 3), old_page.rows[0].metrics[1].value(.sum));
+    const new_reader = try db.openRetainedSeriesRead(a, .{ .fence = next_fence, .start_ns = 270, .end_ns = 280, .admitted_ns = 268 });
+    defer new_reader.close();
+    const new_page = try new_reader.next(10);
+    try std.testing.expectEqual(@as(?f64, 5), new_page.rows[0].metrics[1].value(.sum));
 }
 
 /// Prepared once under the native writer fence, then used for each TTL
@@ -886,10 +967,14 @@ pub const ExpirationGuard = struct {
         return .{ .bindings = bindings, .progress = progress, .decoder = decoder };
     }
     pub fn allowed(self: ExpirationGuard, a: A, txn: anytype, physical: []const u8, admitted_ns: i128) !bool {
-        if (self.bindings.len == 0) return true;
+        const active = for (self.bindings) |binding| {
+            if (!binding.closed) break true;
+        } else false;
+        if (!active) return true;
         const now = admitted_ns;
         const value = try self.decoder.read(txn, physical);
         for (self.bindings, self.progress) |binding, p| {
+            if (binding.closed) continue;
             const row = try normalizeImage(a, binding, value);
             if (!try (series.Engine{ .alloc = a, .spec = binding.spec }).expirationReady(a, txn, p, row, now)) return false;
         }
@@ -961,7 +1046,7 @@ test "retained series activation fences stale negative cache readers and same tr
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try std.testing.expect(try backfillPage(alloc, &txn, binding.spec.id, "", 1024));
+        try std.testing.expect(try backfillPage(alloc, &txn, binding.spec.id, binding.spec.generation, "", 1024));
         try txn.commit();
     }
     var txn = try store.beginReadTxn();
@@ -1106,7 +1191,7 @@ test "retained series native prepare plans vote atomically and resolution marker
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try install(temp, &txn, binding, .{ .sequence = 0, .admitted_ns = 1 }, 0);
-        try std.testing.expect(try backfillPage(temp, &txn, binding.spec.id, "", 1024));
+        try std.testing.expect(try backfillPage(temp, &txn, binding.spec.id, binding.spec.generation, "", 1024));
         try txn.commit();
     }
     const effects = planned: {

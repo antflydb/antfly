@@ -65,7 +65,7 @@ pub fn read(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
     var total_bytes: usize = 0;
     const requested = try t.KeySpan.fromRange(range);
     for (plan.segments) |segment| {
-        if (segment.state_encoding != codec.encoding or !segment.finalized or !std.mem.eql(u8, &segment.schema, &definition.schema)) return error.InvalidDatasetSegment;
+        if ((segment.state_encoding != 1 and segment.state_encoding != codec.encoding) or !segment.finalized or !std.mem.eql(u8, &segment.schema, &definition.schema)) return error.InvalidDatasetSegment;
         if (segment.byte_len > limits.bytes - total_bytes) return error.DatasetPageBudgetExceeded;
         total_bytes += @intCast(segment.byte_len);
         // Placement may change after planning. acquire() atomically pins the
@@ -75,6 +75,7 @@ pub fn read(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         const location = try resolve.location(lease.pin.location);
         const bytes = try store.read(lease, location);
         defer store.context.alloc.free(bytes);
+        if (try codec.formatEncoding(bytes) != segment.state_encoding) return error.InvalidDatasetSegment;
         const decoded = try codec.decode(temp, spec, bytes);
         read_clock = @max(read_clock, decoded.receipt.admitted_ns);
         if (decoded.receipt.source_sequence != segment.source.sequence or !std.meta.eql(decoded.receipt.span, try segment.span())) return error.InvalidDatasetCoverage;

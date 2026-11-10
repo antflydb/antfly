@@ -20,7 +20,7 @@ const capture = @import("retained_series_capture.zig");
 const A = std.mem.Allocator;
 pub const Fence = struct { id: series.Id, generation: u64, definition: series.Id, partition: series.Id, incarnation: u64 };
 pub const Command = struct {
-    action: enum { install, backfill, tick, cleanup },
+    action: enum { install, backfill, tick, cleanup, close },
     fence: Fence,
     binding: ?capture.Binding = null,
     complete_from_ns: i128 = 0,
@@ -59,6 +59,7 @@ pub const Rejection = error{
     RetainedSeriesResetRequired,
     RetainedSeriesResolutionMismatch,
     RetainedSeriesSequenceMismatch,
+    RetainedSeriesSourceClosed,
     RetainedSeriesTimeOverflow,
 };
 pub fn requireFence(f: Fence, spec: series.Spec) !void {
@@ -93,14 +94,15 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
     }
     const bindings = try capture.load(a, txn);
     const spec = for (bindings) |binding| {
-        if (std.mem.eql(u8, &binding.spec.id, &command.fence.id)) break binding.spec;
+        if (std.mem.eql(u8, &binding.spec.id, &command.fence.id) and binding.spec.generation == command.fence.generation) break binding.spec;
     } else return error.RetainedSeriesDefinitionMismatch;
     try requireFence(command.fence, spec);
     const engine = series.Engine{ .alloc = a, .spec = spec };
     switch (command.action) {
         .install => unreachable,
-        .backfill => _ = try capture.backfillPage(a, txn, spec.id, command.expected_cursor, command.work_limit),
+        .backfill => _ = try capture.backfillPage(a, txn, spec.id, spec.generation, command.expected_cursor, command.work_limit),
         .tick => _ = try engine.tick(txn, admitted_ns, command.work_limit),
         .cleanup => _ = try engine.cleanupBackfill(txn, command.work_limit),
+        .close => try capture.closeBinding(a, txn, spec.id, spec.generation, admitted_ns),
     }
 }

@@ -20,12 +20,16 @@ const std = @import("std");
 const series = @import("retained_series.zig");
 const types = @import("../retained_dataset_types.zig");
 const A = std.mem.Allocator;
-pub const encoding: u32 = 1;
+pub const encoding: u32 = 2;
 pub const max_bytes = 16 * 1024 * 1024;
 pub const max_rows = 65536;
-const magic = "AFRS\x00\x00\x00\x01";
+const magic = "AFRS\x00\x00\x00\x02";
+const legacy_magic = "AFRS\x00\x00\x00\x01";
 pub const Receipt = struct {
     source_sequence: u64,
+    /// Produced only from a native generation-closure receipt. The codec is
+    /// never authority to close a source or evict its native state.
+    source_closed: bool = false,
     admitted_ns: i128,
     complete_from_ns: i128,
     span: types.KeySpan,
@@ -51,8 +55,10 @@ fn validateReceipt(spec: series.Spec, receipt: Receipt) !void {
         std.mem.order(u8, &receipt.span.start, &types.rowKey(receipt.complete_from_ns, @splat(0))) == .lt) return error.RetainedSeriesCoverageMissing;
     // Every key below this boundary belongs to a closed bucket. A partial
     // bucket span is allowed only when the complete bucket is finalized.
-    const frontier = try spec.bucket(std.math.sub(i128, receipt.admitted_ns, spec.mutable_for_ns) catch return error.RetainedSeriesTimeOverflow);
-    if (std.mem.order(u8, &receipt.span.end, &types.rowKey(frontier, @splat(0))) == .gt) return error.RetainedSeriesNotFinal;
+    if (!receipt.source_closed) {
+        const frontier = try spec.bucket(std.math.sub(i128, receipt.admitted_ns, spec.mutable_for_ns) catch return error.RetainedSeriesTimeOverflow);
+        if (std.mem.order(u8, &receipt.span.end, &types.rowKey(frontier, @splat(0))) == .gt) return error.RetainedSeriesNotFinal;
+    }
 }
 fn validateRows(spec: series.Spec, receipt: Receipt, rows: []const series.Bucket) !void {
     try validateReceipt(spec, receipt);
@@ -92,6 +98,7 @@ pub fn encode(a: A, spec: series.Spec, receipt: Receipt, rows: []const series.Bu
     try out.append(magic);
     try out.append(&try fingerprint(a, spec));
     try out.int(u64, receipt.source_sequence);
+    try out.int(u8, if (receipt.source_closed) 1 else 0);
     try out.int(i128, receipt.admitted_ns);
     try out.int(i128, receipt.complete_from_ns);
     try out.append(&receipt.span.start);
@@ -133,13 +140,26 @@ const Decoder = struct {
 };
 /// Returned dimensions borrow immutable bytes; metric arrays belong to a. Use
 /// a request arena, and verify the segment checksum before calling this codec.
+pub fn formatEncoding(bytes: []const u8) !u32 {
+    if (bytes.len < magic.len) return error.RetainedSeriesCorrupt;
+    if (std.mem.eql(u8, bytes[0..magic.len], magic)) return encoding;
+    if (std.mem.eql(u8, bytes[0..legacy_magic.len], legacy_magic)) return 1;
+    return error.RetainedSeriesCorrupt;
+}
+
 pub fn decode(a: A, spec: series.Spec, bytes: []const u8) !Decoded {
     if (bytes.len > max_bytes) return error.RetainedSeriesArchiveBudgetExceeded;
     var input = Decoder{ .bytes = bytes };
-    if (!std.mem.eql(u8, try input.take(magic.len), magic)) return error.RetainedSeriesCorrupt;
+    const version = try formatEncoding(bytes);
+    _ = try input.take(magic.len);
     if (!std.mem.eql(u8, try input.take(32), &try fingerprint(a, spec))) return error.RetainedSeriesDefinitionMismatch;
     var receipt: Receipt = undefined;
     receipt.source_sequence = try input.int(u64);
+    receipt.source_closed = if (version == 1) false else switch (try input.int(u8)) {
+        0 => false,
+        1 => true,
+        else => return error.RetainedSeriesCorrupt,
+    };
     receipt.admitted_ns = try input.int(i128);
     receipt.complete_from_ns = try input.int(i128);
     receipt.span.start = (try input.take(96))[0..96].*;
@@ -209,4 +229,27 @@ test "retained series archive requires closed complete coverage and ordered uniq
     try std.testing.expectError(error.RetainedSeriesCorrupt, encode(a, spec, receipt, &.{row}));
     receipt.complete_from_ns = 60;
     try std.testing.expectError(error.RetainedSeriesCoverageMissing, encode(a, spec, receipt, &.{}));
+}
+
+test "retained series archive preserves source closure and admits legacy event-finalized states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spec = series.Spec{ .id = @splat(1), .definition = @splat(2), .generation = 1, .source_partition = @splat(3), .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .laws = &.{.count} };
+    const receipt = Receipt{ .source_sequence = 1, .admitted_ns = 1, .complete_from_ns = 0, .source_closed = true, .span = try types.KeySpan.fromRange(.{ .start_ns = "600", .end_ns = "660" }) };
+    const closed = try encode(a, spec, receipt, &.{});
+    try std.testing.expect((try decode(a, spec, closed)).receipt.source_closed);
+    try std.testing.expectEqual(encoding, try formatEncoding(closed));
+    var invalid = try a.dupe(u8, closed);
+    invalid[48] = 2;
+    try std.testing.expectError(error.RetainedSeriesCorrupt, decode(a, spec, invalid));
+    var normal = receipt;
+    normal.source_closed = false;
+    normal.admitted_ns = 1000;
+    const modern = try encode(a, spec, normal, &.{});
+    const legacy = try std.mem.concat(a, u8, &.{ legacy_magic, modern[8..48], modern[49..] });
+    try std.testing.expectEqual(@as(u32, 1), try formatEncoding(legacy));
+    const decoded = try decode(a, spec, legacy);
+    try std.testing.expect(!decoded.receipt.source_closed);
+    try std.testing.expectEqual(normal.source_sequence, decoded.receipt.source_sequence);
 }

@@ -47,7 +47,7 @@ pub const Session = struct {
         const temp = arena.allocator();
         const bindings = try capture.load(temp, &txn);
         const spec = for (bindings) |binding| {
-            if (std.mem.eql(u8, &binding.spec.id, &query.fence.id)) break binding.spec;
+            if (std.mem.eql(u8, &binding.spec.id, &query.fence.id) and binding.spec.generation == query.fence.generation) break binding.spec;
         } else return error.RetainedSeriesDefinitionMismatch;
         try control.requireFence(query.fence, spec);
         if (query.start_ns >= query.end_ns or try spec.bucket(query.start_ns) != query.start_ns or try spec.bucket(query.end_ns) != query.end_ns) return error.RetainedSeriesResolutionMismatch;

@@ -105,6 +105,7 @@ pub const Progress = struct {
     admitted_ns: i128,
     complete_from_ns: i128,
     ready: bool = false,
+    closed: bool = false,
     backfill_cursor: []const u8 = "",
     backfill_clean: bool = false,
     feed_latest: u64 = 0,
@@ -186,7 +187,7 @@ pub const Engine = struct {
         const raw = try txn.get(k);
         const p = (try std.json.parseFromSlice(Progress, a, raw, .{ .allocate = .alloc_always })).value;
         if (!std.mem.eql(u8, &p.definition, &self.spec.definition) or p.source_incarnation != self.spec.source_incarnation) return error.RetainedSeriesDefinitionMismatch;
-        if (p.backfill_clean and !p.ready) return error.RetainedSeriesCorrupt;
+        if ((p.backfill_clean or p.closed) and !p.ready) return error.RetainedSeriesCorrupt;
         if (p.feed_floor > p.feed_latest or p.feed_latest - p.feed_floor > max_feed_frames or p.feed_bytes > max_feed_bytes or
             try self.spec.bucket(p.complete_from_ns) != p.complete_from_ns) return error.RetainedSeriesCorrupt;
         return p;
@@ -207,6 +208,26 @@ pub const Engine = struct {
         if ((try optional(txn, k)) != null) return error.RetainedSeriesAlreadyExists;
         try txn.put(try self.key(a, "definition"), try std.json.Stringify.valueAlloc(a, self.spec, .{}));
         try self.save(a, txn, .{ .definition = self.spec.definition, .source_incarnation = self.spec.source_incarnation, .source_sequence = sequence, .admitted_ns = admitted_ns, .complete_from_ns = complete_from_ns });
+    }
+    /// Close one immutable definition generation at a committed source cut.
+    /// Even no-contribution prepared intents must drain before closure; their
+    /// later resolution must never create a dependency on a retired producer.
+    pub fn close(self: Engine, txn: anytype, admitted_ns: i128) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var p = try self.load(a, txn);
+        if (p.closed) return;
+        if (!p.ready) return error.RetainedSeriesNotReady;
+        for ([_][]const u8{ "reservation:", "hold:" }) |suffix| {
+            const pending_prefix = try self.key(a, suffix);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            if (try cursor.seekAtOrAfter(pending_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, pending_prefix)) return error.RetainedSeriesPreparedHold;
+        }
+        p.admitted_ns = @max(p.admitted_ns, admitted_ns);
+        p.closed = true;
+        try self.save(a, txn, p);
     }
     fn bucketKey(self: Engine, a: A, row: Row) ![]u8 {
         var digest: Id = undefined;
@@ -393,6 +414,7 @@ pub const Engine = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const p = try self.load(a, txn);
+        if (p.closed) return error.RetainedSeriesSourceClosed;
         const now = @max(p.admitted_ns, admitted_ns);
         var seen = std.StringHashMap(void).init(a);
         for (changes) |change| {
@@ -461,7 +483,7 @@ pub const Engine = struct {
         }
         return keys.items.len;
     }
-    pub const ClosedCut = struct { source_sequence: u64, admitted_ns: i128, complete_from_ns: i128 };
+    pub const ClosedCut = struct { source_sequence: u64, admitted_ns: i128, complete_from_ns: i128, source_closed: bool };
     /// A finalized event extent is immutable only after every previously
     /// admitted transaction affecting its keys has resolved. Check the hold
     /// index even for an empty bucket: a prepared insert may not exist in the
@@ -479,7 +501,7 @@ pub const Engine = struct {
         if (!p.ready) return error.RetainedSeriesNotReady;
         if (start < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
         if (try self.spec.expired(start, p.admitted_ns)) return error.RetainedSeriesHistoryExpired;
-        if (!try self.spec.finalized(std.math.sub(i128, end, self.spec.interval_ns) catch return error.RetainedSeriesTimeOverflow, p.admitted_ns)) return error.RetainedSeriesNotFinal;
+        if (!p.closed and !try self.spec.finalized(std.math.sub(i128, end, self.spec.interval_ns) catch return error.RetainedSeriesTimeOverflow, p.admitted_ns)) return error.RetainedSeriesNotFinal;
         const prefix_key = try self.holdKey(a, try self.key(a, "bucket:"));
         const lower = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ prefix_key, span.start[0..32], span.start[32..] });
         const upper = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ prefix_key, span.end[0..32], span.end[32..] });
@@ -488,12 +510,13 @@ pub const Engine = struct {
         if (try cur.seekAtOrAfter(lower)) |entry| {
             if (std.mem.startsWith(u8, entry.key, prefix_key) and std.mem.order(u8, entry.key, upper) == .lt) return error.RetainedSeriesPreparedHold;
         }
-        return .{ .source_sequence = p.source_sequence, .admitted_ns = p.admitted_ns, .complete_from_ns = p.complete_from_ns };
+        return .{ .source_sequence = p.source_sequence, .admitted_ns = p.admitted_ns, .complete_from_ns = p.complete_from_ns, .source_closed = p.closed };
     }
     /// Synchronous maintenance makes the primary row and maintained progress
     /// share one cut. Outside declared coverage/retention there is no hold.
     pub fn expirationReady(self: Engine, a: A, txn: anytype, progress: Progress, row: Row, admitted_ns: i128) !bool {
         try self.validateRow(row);
+        if (progress.closed) return true;
         if (try self.spec.bucket(row.timestamp_ns) < progress.complete_from_ns) return true;
         const now = @max(progress.admitted_ns, admitted_ns);
         if (try self.spec.expired(row.timestamp_ns, now)) return true;
@@ -521,6 +544,7 @@ pub const Engine = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var p = try self.load(a, txn);
+        if (p.closed) return error.RetainedSeriesSourceClosed;
         if (sequence <= p.source_sequence) return error.RetainedSeriesSequenceMismatch;
         var now = @max(admitted_ns, p.admitted_ns);
         var reservations = std.StringHashMap(Reservation).init(a);
@@ -594,6 +618,7 @@ pub const Engine = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var p = try self.load(a, txn);
+        if (p.closed) return error.RetainedSeriesSourceClosed;
         if (p.ready or !std.mem.eql(u8, expected_cursor, p.backfill_cursor)) return error.RetainedSeriesBackfillFence;
         var touched = std.StringHashMap(Bucket).init(a);
         var previous = expected_cursor;
@@ -704,7 +729,7 @@ pub const Engine = struct {
                 if (entry.key.len < offset + 97 or !std.mem.startsWith(u8, entry.key[support.len..], buckets)) return error.RetainedSeriesCorrupt;
                 const biased = std.fmt.parseInt(u128, entry.key[offset..][0..32], 16) catch return error.RetainedSeriesCorrupt;
                 const start: i128 = @bitCast(biased ^ (@as(u128, 1) << 127));
-                if (!try self.spec.finalized(start, state.admitted_ns)) {
+                if (!state.closed and !try self.spec.finalized(start, state.admitted_ns)) {
                     state.support_cursor = "";
                     next = null;
                     break;

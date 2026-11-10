@@ -630,6 +630,7 @@ test "retained dataset archived summary serving checks exact state and filters c
         .{ .start_ns = 120, .dimensions = "[]", .rows = metrics[0].count, .metrics = &metrics },
     };
     var value = segment();
+    value.state_encoding = codec.encoding;
     value.coverage.end_ns = "180";
     const receipt = codec.Receipt{ .source_sequence = value.source.sequence, .admitted_ns = 1000, .complete_from_ns = 0, .span = try value.span() };
     const bytes = try codec.encode(a, spec, receipt, &rows);

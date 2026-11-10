@@ -696,3 +696,37 @@ test "retained series prepared expiration preserves history alongside ordinary c
     try std.testing.expectEqual(@as(i64, 1), page.rows[1].rows);
     try std.testing.expectEqual(@as(usize, 0), try e.releasePrepared(&store, @splat(1)));
 }
+
+test "retained series generation closure drains even no-op prepares and finalizes future observations" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const values = [_]?f64{ null, 3, 3, 3, 3 };
+    const row = sample(1001, &values);
+    try e.apply(&store, 1, 1, .mutation, &.{.{ .key = "future", .after = row }});
+    try e.prepare(&store, @splat(1), 1, &.{.{ .key = "future", .before = row, .after = row }});
+    try std.testing.expectError(error.RetainedSeriesPreparedHold, e.close(&store, 5));
+    try std.testing.expectEqual(@as(usize, 1), try e.releasePrepared(&store, @splat(1)));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const range = @import("../retained_dataset_types.zig").Range{ .start_ns = "1000", .end_ns = "1010" };
+    try std.testing.expectError(error.RetainedSeriesNotFinal, e.requireClosedSpan(temp, &store, range, null));
+    try e.close(&store, 5);
+    try e.close(&store, 999);
+    const cut = try e.requireClosedSpan(temp, &store, range, null);
+    try std.testing.expect(cut.source_closed);
+    try std.testing.expectEqual(@as(i128, 5), cut.admitted_ns);
+    try std.testing.expectEqual(@as(u64, 1), cut.source_sequence);
+    try std.testing.expectError(error.RetainedSeriesSourceClosed, e.apply(&store, 2, 6, .mutation, &.{.{ .key = "future", .before = row }}));
+    try std.testing.expectError(error.RetainedSeriesSourceClosed, e.prepare(&store, @splat(2), 6, &.{.{ .key = "new", .after = row }}));
+    const progress = try e.status(temp, &store);
+    try std.testing.expect(try e.expirationReady(temp, &store, progress, row, 5));
+    // Closed extrema no longer require source evidence, even before event time.
+    try std.testing.expectEqual(@as(usize, 2), try e.tick(&store, 6, 1024));
+    const page = try e.scan(temp, &store, 1000, 1010, 6, null, 10);
+    try std.testing.expectEqual(@as(i64, 1), page.rows[0].rows);
+    try std.testing.expectEqual(@as(?f64, 3), page.rows[0].metrics[3].value(.min));
+    try std.testing.expectEqual(@as(u64, 1), (try e.status(temp, &store)).source_sequence);
+}
