@@ -198,6 +198,49 @@ func checkGraphBinding(g GraphBinding, cfg map[string]any) error {
 	return nil
 }
 
+// checkKnowledgeGraph requires a complete declaration of the installed resolver
+// targets before a host may execute with its runtime-owned native credentials.
+// A graph may have no resolvers, but omission cannot hide an installed target.
+func checkKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, cfg map[string]any) error {
+	if err := checkGraphBinding(g, cfg); err != nil {
+		return err
+	}
+	declared := map[string]EntityBinding{}
+	for _, e := range k.Entities {
+		if !containsString(g.Entities, e.Name) {
+			continue
+		}
+		if e.Index != g.Index {
+			return fmt.Errorf("entity does not belong to graph")
+		}
+		if _, exists := declared[e.Resolver]; exists {
+			return fmt.Errorf("duplicate graph resolver binding")
+		}
+		declared[e.Resolver] = e
+	}
+	resolvers, _ := cfg["resolvers"].([]any)
+	if len(resolvers) != len(declared) {
+		return fmt.Errorf("every installed graph resolver requires an entity binding")
+	}
+	seen := map[string]bool{}
+	for _, v := range resolvers {
+		r, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("invalid native resolver")
+		}
+		name, _ := r["name"].(string)
+		e, ok := declared[name]
+		if !ok || seen[name] {
+			return fmt.Errorf("undeclared installed graph resolver")
+		}
+		if err := checkEntityBinding(e, cfg); err != nil {
+			return err
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
 // ValidateKnowledgeProcessing checks the complete desired graph before any DDL.
 // Actual native admission remains authoritative for extractor/resolver schemas.
 func ValidateKnowledgeProcessing(k *KnowledgeDeclaration, plan *ProcessingDeclaration, audience string) error {
@@ -264,7 +307,7 @@ func ValidateKnowledgeProcessing(k *KnowledgeDeclaration, plan *ProcessingDeclar
 		}
 	}
 	for _, g := range k.Graphs {
-		if err := checkGraphBinding(g, configs[g.Index]); err != nil {
+		if err := checkKnowledgeGraph(k, g, configs[g.Index]); err != nil {
 			return fmt.Errorf("graph %s: %w", g.Name, err)
 		}
 	}
@@ -274,6 +317,42 @@ func ValidateKnowledgeProcessing(k *KnowledgeDeclaration, plan *ProcessingDeclar
 			return fmt.Errorf("entity resolver requires its declared native graph")
 		}
 		if err := checkEntityBinding(e, cfg); err != nil {
+			return fmt.Errorf("entity %s: %w", e.Name, err)
+		}
+	}
+	return nil
+}
+
+// ValidateInstalledKnowledge checks independently managed resources and newly
+// reconciled declarations without treating their backfill as complete. Metadata
+// fanout, time and memory use share the discovery observer's fixed budgets.
+func ValidateInstalledKnowledge(ctx context.Context, client SearchIndexClient, b Binding, audience string) error {
+	if err := ValidateKnowledge(b.Knowledge, audience); err != nil {
+		return err
+	}
+	if b.Knowledge == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	b.Streams = nil
+	b.Artifacts = nil
+	cache, failures := observeSearchIndexes(ctx, client, b)
+	for _, g := range b.Knowledge.Graphs {
+		idx, ok := cache[g.Index]
+		if !ok {
+			return fmt.Errorf("graph %s observation unavailable: %v", g.Name, failures[g.Index])
+		}
+		if err := checkKnowledgeGraph(b.Knowledge, g, idx.Config); err != nil {
+			return fmt.Errorf("graph %s: %w", g.Name, err)
+		}
+	}
+	for _, e := range b.Knowledge.Entities {
+		idx, ok := cache[e.Index]
+		if !ok {
+			return fmt.Errorf("entity %s observation unavailable: %v", e.Name, failures[e.Index])
+		}
+		if err := checkEntityBinding(e, idx.Config); err != nil {
 			return fmt.Errorf("entity %s: %w", e.Name, err)
 		}
 	}
@@ -353,7 +432,7 @@ func knowledgeStatusFromIndexes(b Binding, audience string, cache map[string]nat
 		out.Entities = append(out.Entities, state(e.Name, e.Index, func(c map[string]any) error { return checkEntityBinding(e, c) }))
 	}
 	for _, g := range b.Knowledge.Graphs {
-		out.Graphs = append(out.Graphs, state(g.Name, g.Index, func(c map[string]any) error { return checkGraphBinding(g, c) }))
+		out.Graphs = append(out.Graphs, state(g.Name, g.Index, func(c map[string]any) error { return checkKnowledgeGraph(b.Knowledge, g, c) }))
 	}
 	return out
 }
@@ -470,15 +549,8 @@ func QueryKnowledge(ctx context.Context, p KnowledgeQueryClient, b Binding, requ
 		if err != nil {
 			return [32]byte{}, err
 		}
-		if err = checkGraphBinding(selected, idx.Config); err != nil {
+		if err = checkKnowledgeGraph(b.Knowledge, selected, idx.Config); err != nil {
 			return [32]byte{}, err
-		}
-		for _, e := range b.Knowledge.Entities {
-			if containsString(selected.Entities, e.Name) {
-				if err = checkEntityBinding(e, idx.Config); err != nil {
-					return [32]byte{}, err
-				}
-			}
 		}
 		if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
 			return [32]byte{}, fmt.Errorf("native graph is incomplete")
@@ -503,7 +575,7 @@ func QueryKnowledge(ctx context.Context, p KnowledgeQueryClient, b Binding, requ
 	if err != nil {
 		return nil, err
 	}
-	raw, err := p.Query(ctx, b.Table, query)
+	raw, err := p.Query(context.WithValue(ctx, responseLimitKey{}, management.MaxResponseBytes), b.Table, query)
 	if err != nil {
 		return nil, err
 	}
@@ -569,6 +641,27 @@ func EntityResources(b Binding, name string) (map[string]string, error) {
 			base := tablePath(b.Table) + "/resolvers/" + url.PathEscape(e.Resolver)
 			return map[string]string{"resolver": base, "render": base + ":render", "resolve": base + ":resolve", "redirects": base + "/redirects", "suppressions": base + "/suppressions", "reviews": base + "/reviews", "entity_table": tablePath(e.Table)}, nil
 		}
+	}
+	return nil, fmt.Errorf("unknown entity binding")
+}
+
+// EntityCurationResources addresses the native entity namespace authority. Unlike
+// resolver-local configured aliases, these revisions apply to every consumer of
+// the namespace, including coexisting recipe generations. Native authorization
+// and revision-fenced mutation semantics remain authoritative.
+func EntityCurationResources(b Binding, name, key string) (map[string]string, error) {
+	if b.Knowledge == nil {
+		return nil, fmt.Errorf("unknown entity binding")
+	}
+	for _, e := range b.Knowledge.Entities {
+		if e.Name != name {
+			continue
+		}
+		if _, err := EntityJoinKey("native", e, key); err != nil {
+			return nil, err
+		}
+		base := tablePath(e.Table) + "/entities/" + url.PathEscape(key)
+		return map[string]string{"redirects": base + "/redirects", "progress": base + "/progress", "merge": base + ":merge", "unmerge": base + ":unmerge", "suppress": base + ":suppress", "unsuppress": base + ":unsuppress", "distinct": base + ":distinct"}, nil
 	}
 	return nil, fmt.Errorf("unknown entity binding")
 }

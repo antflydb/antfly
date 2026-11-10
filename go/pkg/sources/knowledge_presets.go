@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -47,7 +48,9 @@ func BuildKnowledgeProcessing(p KnowledgePreset) (ProcessingDeclaration, Knowled
 		return plan, k, artifact, err
 	}
 	var owned KnowledgePreset
-	if err = json.Unmarshal(raw, &owned); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err = decoder.Decode(&owned); err != nil {
 		return plan, k, artifact, err
 	}
 	p = owned
@@ -67,12 +70,11 @@ func BuildKnowledgeProcessing(p KnowledgePreset) (ProcessingDeclaration, Knowled
 	}
 	artifactName := NativeIndexName(p.Name+"_extraction", asset)
 	asset["name"] = artifactName
-	config["enrichments"] = []any{asset}
+
 	source := p.Source
 	if source == nil {
 		source = map[string]any{"path": "$.relations[*]", "format": "extraction_relation"}
 	}
-	source["artifact"] = artifactName
 	if _, ok := source["format"]; !ok {
 		source["format"] = "extraction_relation"
 	}
@@ -112,9 +114,12 @@ func BuildKnowledgeProcessing(p KnowledgePreset) (ProcessingDeclaration, Knowled
 	if resolver == nil {
 		resolver = map[string]any{}
 	}
-	resolver["name"] = p.Name
+	// Execution identities are immutable; discovery and canonical namespaces
+	// remain stable while multiple recipe generations coexist.
+	delete(resolver, "name")
+	delete(resolver, "source_artifact")
+	delete(resolver, "resolution_artifact")
 	resolver["table"] = p.EntityTable
-	resolver["source_artifact"] = artifactName
 	resolver["source_artifact_kind"] = "asset"
 	if _, ok := resolver["config_generation"]; !ok {
 		resolver["config_generation"] = 1
@@ -126,12 +131,22 @@ func BuildKnowledgeProcessing(p KnowledgePreset) (ProcessingDeclaration, Knowled
 	if _, ok := resolver["min_confidence"]; !ok {
 		resolver["min_confidence"] = 0
 	}
+	execution := NativeIndexName(p.Name+"_resolver", map[string]any{"extraction": artifactName, "resolver": resolver})
+	// Native label routing is table-scoped by source artifact. A versioned local
+	// copy gives each resolver its own input stream without recomputing extraction.
+	input := map[string]any{"kind": "asset", "content_type": "application/json", "source_artifact_name": artifactName, "producer": map[string]any{"type": "copy"}}
+	inputName := NativeIndexName(execution+"_input", input)
+	input["name"] = inputName
+	config["enrichments"] = []any{asset, input}
+	source["artifact"] = inputName
+	resolver["name"] = execution
+	resolver["source_artifact"] = inputName
 	resolution := NativeIndexName(p.Name+"_resolution", resolver)
 	resolver["resolution_artifact"] = resolution
 	config["resolvers"] = []any{resolver}
 	index := NativeIndexName(p.Name+"_graph", config)
 	plan.Indexes = []management.NativeIndexDeclaration{{Name: index, Config: config}}
-	k = KnowledgeDeclaration{Version: 1, Mode: "instance_one_audience", Audience: p.Audience, Entities: []EntityBinding{{Name: p.Name, Index: index, Resolver: p.Name, Table: p.EntityTable, Namespace: namespace, SourceArtifact: artifactName, ResolutionArtifact: resolution, LocationField: p.LocationField, SchemaUri: p.SchemaURI}}, Graphs: []GraphBinding{{Name: p.Name, Index: index, Artifacts: []string{artifactName}, Entities: []string{p.Name}, Temporal: management.GraphTemporalBinding{Mapping: "native_intervals_v1", History: "current_state"}, LocationField: p.LocationField, SchemaUri: p.SchemaURI}}}
+	k = KnowledgeDeclaration{Version: 1, Mode: "instance_one_audience", Audience: p.Audience, Entities: []EntityBinding{{Name: p.Name, Index: index, Resolver: execution, Table: p.EntityTable, Namespace: namespace, SourceArtifact: inputName, ResolutionArtifact: resolution, LocationField: p.LocationField, SchemaUri: p.SchemaURI}}, Graphs: []GraphBinding{{Name: p.Name, Index: index, Artifacts: []string{inputName}, Entities: []string{p.Name}, Temporal: management.GraphTemporalBinding{Mapping: "native_intervals_v1", History: "current_state"}, LocationField: p.LocationField, SchemaUri: p.SchemaURI}}}
 	artifact = ArtifactBinding{Name: p.Name, Artifact: artifactName, ContentType: "application/json", Purpose: "structured_extraction", Generated: len(p.Producer) > 0, LocationField: p.LocationField, SchemaUri: p.SchemaURI}
 	if err = ValidateProcessing(&plan); err == nil {
 		err = ValidateKnowledgeProcessing(&k, &plan, p.Audience)

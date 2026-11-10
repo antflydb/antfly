@@ -31,8 +31,11 @@ import (
 )
 
 func knowledgeFixture(t *testing.T) (ProcessingDeclaration, KnowledgeDeclaration) {
+	return knowledgeFixtureForTable(t, "entities", "$")
+}
+func knowledgeFixtureForTable(t *testing.T, table, path string) (ProcessingDeclaration, KnowledgeDeclaration) {
 	t.Helper()
-	plan, k, _, err := BuildKnowledgeProcessing(KnowledgePreset{Name: "facts", SourceID: testSourceID, Audience: "research", Field: "facts", EntityTable: "entities", Source: map[string]any{"path": "$", "format": "extraction_relation", "nodes": map[string]any{"source": "{{ _item.source }}", "target": "{{ _item.target }}"}, "edge": map[string]any{"edge_id": "{{ _item.id }}", "type": "RELATES_TO", "metadata": map[string]any{"valid_at": "{{ _item.valid_at }}", "invalid_at": "{{ _item.invalid_at }}", "created_at": "{{ _item.created_at }}", "expired_at": "{{ _item.expired_at }}"}}}})
+	plan, k, _, err := BuildKnowledgeProcessing(KnowledgePreset{Name: "facts", SourceID: testSourceID, Audience: "research", Field: "facts", EntityTable: table, Source: map[string]any{"path": path, "format": "extraction_relation", "nodes": map[string]any{"source": "{{ _item.source }}", "target": "{{ _item.target }}"}, "edge": map[string]any{"edge_id": "{{ _item.id }}", "type": "RELATES_TO", "metadata": map[string]any{"valid_at": "{{ _item.valid_at }}", "invalid_at": "{{ _item.invalid_at }}", "created_at": "{{ _item.created_at }}", "expired_at": "{{ _item.expired_at }}"}}}})
 	require.NoError(t, err)
 	return plan, k
 }

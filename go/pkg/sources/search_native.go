@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -75,7 +76,9 @@ type nativeSearchIndex struct {
 
 func decodeSearchIndex(raw []byte) (nativeSearchIndex, error) {
 	var out nativeSearchIndex
-	err := json.Unmarshal(raw, &out)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	err := decoder.Decode(&out)
 	if err == nil && out.Config == nil {
 		err = fmt.Errorf("native index configuration missing")
 	}
@@ -563,7 +566,10 @@ func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source
 	if err := ValidateSearchBindings(source.SearchVersion, source.Streams, source.Artifacts); err != nil {
 		return err
 	}
-	return ReconcileProcessing(ctx, client, source.Table, source.Processing)
+	if err := ReconcileProcessing(ctx, client, source.Table, source.Processing); err != nil {
+		return err
+	}
+	return ValidateInstalledKnowledge(ctx, client, Binding{Table: source.Table, Knowledge: source.Knowledge}, audience)
 }
 
 func validateProcessingSecrets(value any) error { return validateProcessingSecretsDepth(value, 0) }

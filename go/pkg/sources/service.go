@@ -233,6 +233,7 @@ func serviceDecode(w http.ResponseWriter, r *http.Request, value any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
+	d.UseNumber()
 	if err := d.Decode(value); err != nil {
 		return err
 	}
@@ -255,7 +256,7 @@ func validConnectionName(name string) bool {
 func cloneProfile(p Profile) Profile {
 	b, _ := json.Marshal(p)
 	var out Profile
-	_ = json.Unmarshal(b, &out)
+	_ = decodeJSONExact(b, &out)
 	return out
 }
 

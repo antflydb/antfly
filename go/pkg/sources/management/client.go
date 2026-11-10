@@ -86,7 +86,15 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 		}
 		return Failure(response.StatusCode, failure.Code)
 	}
-	return json.Unmarshal(raw, output)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(output); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("invalid management response")
+	}
+	return nil
 }
 func (c *Client) Capabilities(ctx context.Context) (out Capabilities, err error) {
 	err = c.call(ctx, "GET", "/capabilities", "", nil, &out)

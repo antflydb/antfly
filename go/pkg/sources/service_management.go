@@ -41,7 +41,7 @@ func (b localManagement) Capabilities(context.Context) (management.Capabilities,
 }
 func managementSource(source Source) management.Source {
 	var cfg map[string]any
-	_ = json.Unmarshal(source.Config, &cfg)
+	_ = decodeJSONExact(source.Config, &cfg)
 	publication := source.Publication
 	if publication == "" {
 		publication = "native"

@@ -74,6 +74,7 @@ func Decode(w http.ResponseWriter, r *http.Request, value any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
+	d.UseNumber()
 	if d.Decode(value) != nil || d.Decode(new(any)) != io.EOF {
 		return Failure(400, "invalid_request")
 	}

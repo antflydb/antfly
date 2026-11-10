@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -228,7 +229,11 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			if err := r.Publisher.EnsureTable(ctx, source.Table); err != nil {
 				return err
 			}
-			if err := ReconcileProcessing(ctx, r.Publisher, source.Table, source.Processing); err != nil {
+			if err := ReconcileSourceSearch(ctx, r.Publisher, source, r.KnowledgeAudience); err != nil {
+				return err
+			}
+		} else if source.Knowledge != nil {
+			if err := ValidateInstalledKnowledge(ctx, r.Publisher, Binding{Table: source.Table, Knowledge: source.Knowledge}, r.KnowledgeAudience); err != nil {
 				return err
 			}
 		}
@@ -697,7 +702,7 @@ func loadJSON(path string, out any, limit int64) error {
 	if int64(len(raw)) > limit {
 		return fmt.Errorf("JSON state exceeds budget")
 	}
-	return json.Unmarshal(raw, out)
+	return decodeJSONExact(raw, out)
 }
 func writeJSON(path string, value any, limit int64) error {
 	raw, err := json.Marshal(value)
@@ -849,4 +854,18 @@ func UsesNativeResource(source Source, item Item) bool {
 // Provider authentication and resource allowlists remain the runtime's job.
 func PublicationConnector(connector Connector, source Source) (Connector, error) {
 	return publicationConnector(connector, source)
+}
+
+// Preserve opaque native configuration integers throughout profile persistence
+// and copying. Typed integer fields continue to use their ordinary decoders.
+func decodeJSONExact(raw []byte, out any) error {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	if err := d.Decode(out); err != nil {
+		return err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("expected exactly one JSON value")
+	}
+	return nil
 }

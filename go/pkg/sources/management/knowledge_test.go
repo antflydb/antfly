@@ -51,3 +51,19 @@ func TestKnowledgeTransportIsOptionalStrictAndLossless(t *testing.T) {
 	require.Equal(t, 400, r.Code)
 	require.Equal(t, 1, b.calls)
 }
+
+type exactProcessingBackend struct{ Backend }
+
+func (b exactProcessingBackend) PutSource(_ context.Context, source Source) (Source, error) {
+	return source, nil
+}
+func TestManagementRoundTripPreservesNativeRecipeIntegers(t *testing.T) {
+	server := httptest.NewServer(Handler(exactProcessingBackend{}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "management-token")
+	require.NoError(t, err)
+	input := Source{Id: "source", Connection: "connection", Table: "docs", Publication: "native", Config: map[string]any{}, Processing: &ProcessingDeclaration{Indexes: []NativeIndexDeclaration{{Name: "graph", Config: map[string]any{"type": "graph", "config_generation": json.Number("9007199254740993")}}}}}
+	output, err := client.PutSource(t.Context(), input)
+	require.NoError(t, err)
+	require.Equal(t, json.Number("9007199254740993"), output.Processing.Indexes[0].Config["config_generation"])
+}

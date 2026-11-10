@@ -44,15 +44,11 @@ func TestNativeSourceKnowledge(t *testing.T) {
 	p := &Publisher{Endpoint: endpoint}
 	table := fmt.Sprintf("source_knowledge_%d", time.Now().UnixNano())
 	require.NoError(t, p.EnsureTable(ctx, table))
-	plan, k := knowledgeFixture(t)
 	entityTable := table + "_entities"
+	plan, k := knowledgeFixtureForTable(t, entityTable, "$.relations[*]")
 	require.NoError(t, p.EnsureTable(ctx, entityTable))
-	k.Entities[0].Table = entityTable
-	plan.Indexes[0].Config["resolvers"].([]any)[0].(map[string]any)["table"] = entityTable
 	// Both claims use logical entity endpoints independent of parent ownership.
 	// Native resolution also reads stable mentions from this same structured asset.
-	source := plan.Indexes[0].Config["sources"].([]any)[0].(map[string]any)
-	source["path"] = "$.relations[*]"
 	require.NoError(t, ReconcileProcessing(ctx, p, table, &plan))
 	resources, err := EntityResources(Binding{Table: table, Knowledge: &k}, "facts")
 	require.NoError(t, err)
@@ -174,4 +170,119 @@ func TestNativeSourceKnowledge(t *testing.T) {
 		raw, err = p.QueryKnowledge(ctx, resolvedBinding, resolvedRequest, "research")
 		return err == nil && strings.Contains(string(raw), "employment")
 	}, 30*time.Second, 100*time.Millisecond)
+}
+
+// A recipe migration must coexist with the serving index on a real sharded
+// owner. Labeled resolvers exercise native table-wide label-routing admission.
+func TestNativeSourceKnowledgeRecipeMigration(t *testing.T) {
+	endpoint := os.Getenv("ANTFLY_SOURCES_E2E_URL")
+	if endpoint == "" {
+		t.Skip("set ANTFLY_SOURCES_E2E_URL to a disposable native owner")
+	}
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	require.True(t, u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("knowledge_migration_%d", time.Now().UnixNano())
+	entities := table + "_entities"
+	for _, name := range []string{table, entities} {
+		_, err = p.call(ctx, "POST", tablePath(name), map[string]any{"num_shards": 2})
+		require.NoError(t, err)
+	}
+	preset := KnowledgePreset{Name: "facts", SourceID: testSourceID, Audience: "research", Field: "facts", EntityTable: entities, Resolver: map[string]any{"labels": []string{"person", "organization"}}}
+	plans := []ProcessingDeclaration{}
+	bindings := []Binding{}
+	until := time.Now().Add(5 * time.Minute).Unix()
+	parent := func(source string) map[string]any {
+		facts := func(org string) map[string]any {
+			return map[string]any{"entities": []any{map[string]any{"id": "p", "label": "person", "text": "Alice"}, map[string]any{"id": "o", "label": "organization", "text": org}}, "relations": []any{map[string]any{"id": "employment", "source": "p", "target": "o", "type": "WORKS_AT"}}}
+		}
+		return map[string]any{"source_id": source, "source": map[string]any{"id": source, "revision": "r1"}, "facts": facts("Acme"), "facts_v2": facts("Contoso")}
+	}
+	query := KnowledgeRequest{Graph: "facts", Entity: "facts", Start: []string{"source/" + testSourceID + "/facts/person/alice"}, Depth: 2, Limit: 10}
+	for version := 0; version < 3; version++ {
+		if version == 1 {
+			preset.Field = "facts_v2"
+		}
+		if version == 2 {
+			preset.Resolver["config_generation"] = 2
+		}
+		plan, k, _, err := BuildKnowledgeProcessing(preset)
+		require.NoError(t, err)
+		require.NoError(t, ReconcileSourceSearch(ctx, p, Source{ID: testSourceID, Table: table, Knowledge: &k, Processing: &plan}, "research"))
+		plans = append(plans, plan)
+		bindings = append(bindings, Binding{ID: testSourceID, Table: table, Knowledge: &k, Status: "searchable", ValidUntil: &until})
+		if version == 0 {
+			_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"a-owner": parent(testSourceID), "z-owner": parent(testSourceID), "other-owner": parent("22222222-2222-4222-8222-222222222222")}, "sync_level": "full_index"})
+			require.NoError(t, err)
+		}
+		for i, binding := range bindings {
+			want := "organization/acme"
+			if i > 0 {
+				want = "organization/contoso"
+			}
+			require.Eventually(t, func() bool {
+				raw, err := QueryKnowledge(ctx, p, binding, query, "research")
+				return err == nil && strings.Contains(string(raw), want) && strings.Contains(string(raw), "a-owner") && strings.Contains(string(raw), "z-owner") && !strings.Contains(string(raw), "other-owner")
+			}, 45*time.Second, 100*time.Millisecond, "version %d serving generation %d", version, i)
+		}
+	}
+	// Scorer-only migrations consume the same extraction artifact but an
+	// independent local resolver stream; no model/provider work is repeated.
+	inputs := func(plan ProcessingDeclaration) []any { return plan.Indexes[0].Config["enrichments"].([]any) }
+	require.Equal(t, inputs(plans[1])[0], inputs(plans[2])[0])
+	require.NotEqual(t, inputs(plans[1])[1], inputs(plans[2])[1])
+	last, err := EntityResources(bindings[2], "facts")
+	require.NoError(t, err)
+	from := query.Start[0]
+	to := strings.TrimSuffix(from, "alice") + "alicia"
+	shared, err := EntityCurationResources(bindings[0], "facts", from)
+	require.NoError(t, err)
+	_, err = p.call(ctx, "POST", shared["merge"], map[string]any{"into": to, "actor": "migration-fixture", "reason": "stable namespace across recipes"})
+	require.NoError(t, err)
+	rendered, err := p.call(ctx, "POST", last["render"], map[string]any{"text": "Alice", "label": "person"})
+	require.NoError(t, err)
+	require.Contains(t, string(rendered), to)
+	if path := os.Getenv("ANTFLY_SOURCES_KNOWLEDGE_RESTART_STATE"); path != "" {
+		query.Start = []string{to}
+		for _, b := range bindings {
+			require.Eventually(t, func() bool {
+				raw, err := QueryKnowledge(ctx, p, b, query, "research")
+				return err == nil && strings.Contains(string(raw), "a-owner") && strings.Contains(string(raw), "z-owner")
+			}, 30*time.Second, 100*time.Millisecond)
+		}
+		require.NoError(t, writeJSON(path, knowledgeMigrationRestartState{Bindings: bindings, Request: query}, 2<<20))
+	}
+}
+
+type knowledgeMigrationRestartState struct {
+	Bindings []Binding        `json:"bindings"`
+	Request  KnowledgeRequest `json:"request"`
+}
+
+func TestNativeSourceKnowledgeAfterRestart(t *testing.T) {
+	endpoint, path := os.Getenv("ANTFLY_SOURCES_E2E_URL"), os.Getenv("ANTFLY_SOURCES_KNOWLEDGE_RESTART_STATE")
+	if endpoint == "" || path == "" {
+		t.Skip("requires the disposable-owner restart harness")
+	}
+	var state knowledgeMigrationRestartState
+	require.NoError(t, loadJSON(path, &state, 2<<20))
+	require.Len(t, state.Bindings, 3)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	p := &Publisher{Endpoint: endpoint}
+	verify := func(absent string) {
+		for _, b := range state.Bindings {
+			require.Eventually(t, func() bool {
+				raw, err := QueryKnowledge(ctx, p, b, state.Request, "research")
+				return err == nil && strings.Contains(string(raw), "z-owner") && (absent == "" && strings.Contains(string(raw), "a-owner") || absent != "" && !strings.Contains(string(raw), absent))
+			}, 30*time.Second, 100*time.Millisecond)
+		}
+	}
+	verify("")
+	_, err := p.call(ctx, "POST", tablePath(state.Bindings[0].Table)+"/batch", map[string]any{"deletes": []string{"a-owner"}, "sync_level": "full_index"})
+	require.NoError(t, err)
+	verify("a-owner")
 }
