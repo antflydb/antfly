@@ -2073,6 +2073,7 @@ test "io threaded scheduled terminal pass releases its retained session" {
         null,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
     var worker = Worker{
@@ -2111,6 +2112,7 @@ test "io threaded forced persist errors unwind snapshot ownership safely" {
         testThreadedRuntimeApply,
         testThreadedRuntimePersist,
         testThreadedRuntimeTruncate,
+        null,
         null,
         null,
         null,
@@ -2159,6 +2161,7 @@ test "io threaded applied callback observes published watermark outside runtime 
         null,
         testThreadedRuntimeAppliedSequenceAdvanced,
         null,
+        null,
     );
     capture.runtime = &runtime;
     defer runtime.deinit();
@@ -2206,6 +2209,7 @@ test "io threaded wait observes worker-owned catch-up close" {
         testThreadedRuntimeTruncate,
         testThreadedRuntimeBeginCatchUp,
         testThreadedRuntimeFinishCatchUp,
+        null,
         null,
         null,
         null,
@@ -2300,6 +2304,7 @@ test "io threaded wait requests prompt worker catch-up close" {
         null,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -2369,6 +2374,7 @@ test "io threaded wait observes failed worker-owned catch-up close" {
         testThreadedRuntimeTruncate,
         testThreadedRuntimeBeginCatchUp,
         testThreadedRuntimeFinishCatchUp,
+        null,
         null,
         null,
         null,
@@ -2463,6 +2469,7 @@ test "io threaded worker backoffs and retries replay truncation writer lock" {
         null,
         null,
         &manager,
+        null,
     );
     defer runtime.deinit();
 
@@ -2513,6 +2520,7 @@ test "io threaded dense catch-up NotFound closes session before retry" {
         null,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -2558,6 +2566,7 @@ test "io threaded dense publish NotFound retries with a fresh session" {
         testThreadedRuntimeTruncate,
         testThreadedRuntimeBeginCatchUp,
         testThreadedRuntimeFinishCatchUp,
+        null,
         null,
         null,
         null,
@@ -2616,6 +2625,7 @@ fn testFullTextAdmissionRetry(admission_error: anyerror) !void {
         testThreadedRuntimeTruncate,
         testThreadedRuntimeBeginCatchUp,
         testThreadedRuntimeFinishCatchUp,
+        null,
         null,
         null,
         null,
@@ -2795,6 +2805,7 @@ test "issue1015 full-text catch-up WouldBlock retries without poisoning worker" 
         null,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -2861,6 +2872,7 @@ test "issue-lwa-catchup-gate derived worker persist OutcomeUnknown retries repea
         testThreadedRuntimeTruncate,
         testThreadedRuntimeBeginCatchUp,
         testThreadedRuntimeFinishCatchUp,
+        null,
         null,
         null,
         null,
