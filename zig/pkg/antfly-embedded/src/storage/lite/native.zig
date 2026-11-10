@@ -15315,9 +15315,25 @@ fn probeDocumentIndexNode(raw: []const u8, key: []const u8) !IndexProbe {
 /// same way the decode pass does (a corrupt length here must not read out
 /// of `raw`), but does not validate key ordering or any other invariant --
 /// the decode pass still does that on its own, identical, walk.
-fn sumInlineDocumentIndexKeyBytes(raw: []const u8, start_pos: usize, count: usize) !usize {
+const InlineDocumentIndexKeyTotals = struct {
+    /// Sum of every inline key's byte length -- what `key_storage` must be
+    /// sized to hold. Zero whenever every inline key in this node happens
+    /// to be empty (e.g. `""`), which is not the same thing as "no inline
+    /// keys at all": `has_inline` is the field that distinguishes those,
+    /// and is what `decodeDocumentIndexNode` must check before deciding
+    /// `key_storage` can stay `null`. An empty-but-inline key still needs
+    /// a (zero-length, but non-null) slot in `key_storage` for its
+    /// `keys[i]` slice to point into -- see that function's own
+    /// `key_storage.?` dereference for every inline key, regardless of
+    /// length.
+    bytes: usize,
+    has_inline: bool,
+};
+
+fn sumInlineDocumentIndexKeyBytes(raw: []const u8, start_pos: usize, count: usize) !InlineDocumentIndexKeyTotals {
     var pos = start_pos;
     var total: usize = 0;
+    var has_inline = false;
     for (0..count) |_| {
         if (pos + 10 > raw.len) return error.InvalidDocumentIndex;
         const key_len: usize = std.mem.readInt(u16, raw[pos..][0..2], .little);
@@ -15327,11 +15343,12 @@ fn sumInlineDocumentIndexKeyBytes(raw: []const u8, start_pos: usize, count: usiz
             pos += 8;
         } else {
             if (key_len > index_inline_key_limit or pos + key_len > raw.len) return error.InvalidDocumentIndex;
+            has_inline = true;
             total += key_len;
             pos += key_len;
         }
     }
-    return total;
+    return .{ .bytes = total, .has_inline = has_inline };
 }
 
 fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndexNode {
@@ -15372,8 +15389,22 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
     // one `dupe` per key -- see `DocumentIndexNode.key_storage`'s doc
     // comment for why (measured as the single largest allocation-site
     // contributor in the write-amplification CPU attribution).
-    const inline_bytes_total = try sumInlineDocumentIndexKeyBytes(raw, pos, count);
-    const key_storage = if (inline_bytes_total != 0) try allocator.alloc(u8, inline_bytes_total) else null;
+    //
+    // `key_storage` must be allocated (even to zero length) whenever
+    // *any* key in this node is inline, not merely when their bytes sum
+    // to something nonzero: a node mixing one empty inline key (`""`,
+    // `key_len == 0`) with otherwise-external keys (every other key's
+    // length over `index_inline_key_limit`) has `inline_totals.bytes == 0`
+    // despite genuinely needing a slot for that empty key's `keys[i]`
+    // slice to point into below (`key_storage.?`) -- gating the
+    // allocation on `.bytes != 0` instead of `.has_inline` left that one
+    // case with `key_storage == null`, panicing on the first such node
+    // (reachable with a mix of a zero-length and multiple
+    // `> index_inline_key_limit`-byte keys in the same leaf/internal node,
+    // e.g. the catalog index after inserting an empty key alongside
+    // several oversized ones).
+    const inline_totals = try sumInlineDocumentIndexKeyBytes(raw, pos, count);
+    const key_storage = if (inline_totals.has_inline) try allocator.alloc(u8, inline_totals.bytes) else null;
     errdefer if (key_storage) |storage| allocator.free(storage);
     var storage_used: usize = 0;
     for (keys, 0..) |*key, i| {
@@ -15410,6 +15441,38 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
     }
     if (pos != raw.len) return error.InvalidDocumentIndex;
     return .{ .kind = kind, .keys = keys, .pointers = pointers, .key_pages = key_pages, .key_storage = key_storage };
+}
+
+// Regression for a panic in `decodeDocumentIndexNode`: a node mixing one
+// empty, genuinely inline key (`""`, zero bytes) with external
+// (`> index_inline_key_limit`-byte) siblings used to decode with
+// `key_storage == null` -- `sumInlineDocumentIndexKeyBytes`'s byte total
+// summed to zero even though a key *was* inline -- and then panic
+// dereferencing `key_storage.?` for that empty key. See `has_inline` on
+// `InlineDocumentIndexKeyTotals`, the fix for exactly this.
+test "lite native document index node decode allocates storage for an empty inline key beside external siblings" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, index_inline_key_limit + 1);
+    defer a.free(big);
+    @memset(big, 'x');
+    var keys = [_][]u8{ try a.dupe(u8, ""), try a.dupe(u8, big) };
+    defer for (keys) |key| a.free(key);
+    var key_pages = [_]u64{ 0, 7 };
+    var pointers = [_]u64{ 1, 2 };
+    const node: DocumentIndexNode = .{
+        .kind = .leaf,
+        .keys = &keys,
+        .pointers = &pointers,
+        .key_pages = &key_pages,
+    };
+    const encoded = try encodeDocumentIndexNode(a, node);
+    defer a.free(encoded);
+    var decoded = try decodeDocumentIndexNode(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), decoded.keys.len);
+    try std.testing.expectEqualStrings("", decoded.keys[0]);
+    try std.testing.expectEqual(@as(u64, 0), decoded.key_pages.?[0]);
+    try std.testing.expect(decoded.key_pages.?[1] != 0);
 }
 
 fn decodeValuePage(raw: []const u8) !ValuePage {
