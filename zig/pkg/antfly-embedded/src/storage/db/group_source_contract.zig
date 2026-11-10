@@ -192,6 +192,7 @@ pub fn validateRequest(req: anytype) !void {
     try command.validate();
     const empty: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |name, T| {
+        if (comptime std.mem.eql(u8, name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, name, "group_source") and !std.mem.eql(u8, name, "sync_level")) {
             if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
                 if (@field(req, name).len != 0) return error.InvalidGroupedSourceCommand;

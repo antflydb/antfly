@@ -22,9 +22,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Tokenizer vtables include additive token-byte decoding. Reject older
-// native handles before interpreting the added callback slot.
-pub const abi_version: u32 = 10;
+// Routing-generation callbacks now carry the complete cancellation/clock budget.
+// Reject older callers before interpreting callback arguments; shallow contracts
+// cannot detect the changed function signature behind catalog vtables.
+pub const abi_version: u32 = 12;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {
