@@ -86,7 +86,15 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 		}
 		return Failure(response.StatusCode, failure.Code)
 	}
-	return json.Unmarshal(raw, output)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(output); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("invalid management response")
+	}
+	return nil
 }
 func (c *Client) Capabilities(ctx context.Context) (out Capabilities, err error) {
 	err = c.call(ctx, "GET", "/capabilities", "", nil, &out)
@@ -102,6 +110,7 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	return
 }
 func (c *Client) PutSource(ctx context.Context, source Source) (out Source, err error) {
+	source.KnowledgeStatus = nil
 	source.SearchStatus = nil // GET observations are never submitted as desired state.
 	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out)
 	return
@@ -138,4 +147,14 @@ func (c *Client) PreviewProcessing(ctx context.Context, id string, input Process
 func (c *Client) ProcessingJob(ctx context.Context, id string, input ProcessingJobRequest) (out map[string]any, err error) {
 	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(id)+"/processing-jobs", "", input, &out)
 	return
+}
+
+// QueryKnowledge executes a bounded source graph query on an explicitly enabled runtime.
+func (c *Client) QueryKnowledge(ctx context.Context, id string, input KnowledgeRequest) (json.RawMessage, error) {
+	var out json.RawMessage
+	if !validID(id) {
+		return nil, Failure(400, "invalid_source_id")
+	}
+	err := c.call(ctx, http.MethodPost, "/sources/"+id+"/knowledge-query", "", input, &out)
+	return out, err
 }

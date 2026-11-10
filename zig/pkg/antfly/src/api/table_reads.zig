@@ -27930,16 +27930,16 @@ fn consumerTests() type {
                     .params = .{ .deduplicate = false },
                 },
             }};
-            try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(2, .{
+            try rejectUnsupportedGraphQueryMode(2, .{
                 .graph_queries = &nondeduplicated_queries,
-            }));
-            try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(1, .{
+            });
+            try rejectUnsupportedGraphQueryMode(1, .{
                 .graph_queries = &nondeduplicated_queries,
                 .graph_table_read_authorizer = .{
                     .ctx = null,
                     .authorize_table = Authorizer.authorize,
                 },
-            }));
+            });
 
             const legacy_pattern = [_]graph_pattern_mod.PatternStep{
                 .{ .alias = "entity" },

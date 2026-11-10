@@ -30,21 +30,23 @@ type Catalog struct {
 	Principals []string  `json:"principals"`
 }
 type Binding struct {
-	SearchVersion     int               `json:"search_version,omitempty"`
-	Artifacts         []ArtifactBinding `json:"artifacts,omitempty"`
-	Fields            *DocumentFields   `json:"fields,omitempty"`
-	Streams           []TextStream      `json:"streams,omitempty"`
-	Publication       string            `json:"publication,omitempty"`
-	DocumentVersion   int               `json:"document_version,omitempty"`
-	PublishedRevision string            `json:"published_revision,omitempty"`
-	ID                string            `json:"id"`
-	Alias             string            `json:"alias"`
-	Table             string            `json:"table"`
-	DocumentField     string            `json:"document_field,omitempty"`
-	Filter            json.RawMessage   `json:"filter"`
-	Status            string            `json:"status"`
-	AccessID          string            `json:"access_id,omitempty"`
-	ValidUntil        *int64            `json:"valid_until,omitempty"`
+	AcquisitionID     string                `json:"acquisition_id,omitempty"`
+	Knowledge         *KnowledgeDeclaration `json:"knowledge,omitempty"`
+	SearchVersion     int                   `json:"search_version,omitempty"`
+	Artifacts         []ArtifactBinding     `json:"artifacts,omitempty"`
+	Fields            *DocumentFields       `json:"fields,omitempty"`
+	Streams           []TextStream          `json:"streams,omitempty"`
+	Publication       string                `json:"publication,omitempty"`
+	DocumentVersion   int                   `json:"document_version,omitempty"`
+	PublishedRevision string                `json:"published_revision,omitempty"`
+	ID                string                `json:"id"`
+	Alias             string                `json:"alias"`
+	Table             string                `json:"table"`
+	DocumentField     string                `json:"document_field,omitempty"`
+	Filter            json.RawMessage       `json:"filter"`
+	Status            string                `json:"status"`
+	AccessID          string                `json:"access_id,omitempty"`
+	ValidUntil        *int64                `json:"valid_until,omitempty"`
 }
 
 func SourceFilter(id string) json.RawMessage {
