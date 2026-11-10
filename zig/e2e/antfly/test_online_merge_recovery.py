@@ -148,11 +148,17 @@ def test_constraint_activation_wait_preserves_process_failure():
 
 
 def parse_owner_control(body, path):
-    """Inspect object control envelopes without interpreting opaque batch roots."""
+    """Inspect control objects and the batch codec's explicit version envelopes."""
     try:
         control = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return {}
+    if (
+        isinstance(control, list)
+        and len(control) == 2
+        and control[0] in ("row-semantics-batch-v1", "document-revisions-batch-v1")
+    ):
+        control = control[1]
     if not isinstance(control, dict):
         return {}
     control["_fault_path"] = path
@@ -401,7 +407,15 @@ class OwnerLinkFault:
 
 
 @pytest.mark.parametrize(
-    "body", [b'[{"operation":{"snapshot":{}}}]', b'"batch"', b"null", b"7", b"\xff"]
+    "body",
+    [
+        b'[{"operation":{"snapshot":{}}}]',
+        b'["unknown-v1",{"operation":{"snapshot":{}}}]',
+        b'"batch"',
+        b"null",
+        b"7",
+        b"\xff",
+    ],
 )
 def test_owner_link_fault_ignores_opaque_batch_roots(body):
     fault = OwnerLinkFault("snapshot")
@@ -414,6 +428,27 @@ def test_owner_link_fault_ignores_opaque_batch_roots(body):
         b'{"operation":{"snapshot":{}}}', "/internal/groups/7/online-merge-io"
     )
     assert fault.block(0, snapshot)
+    assert fault.observed() == {0}
+
+
+@pytest.mark.parametrize(
+    "marker", ["row-semantics-batch-v1", "document-revisions-batch-v1"]
+)
+@pytest.mark.parametrize(
+    "window,payload",
+    [
+        ("release", {"_online_source": {"release": {}}}),
+        (
+            "accept",
+            {"_merge_checkpoint": {"kind": "page_v4_accept"}, "_artifact_catalog": {}},
+        ),
+    ],
+)
+def test_owner_link_fault_matches_versioned_control_batches(marker, window, payload):
+    fault = OwnerLinkFault(window)
+    body = json.dumps([marker, payload]).encode()
+    control = parse_owner_control(body, "/internal/groups/7/batch-routed-v1")
+    assert fault.block(0, control)
     assert fault.observed() == {0}
 
 
