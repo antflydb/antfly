@@ -646,9 +646,12 @@ pub const Repository = struct {
         if (max_entries == 0) return;
         const scan = try store.scan(a, namespace, cancellation);
         var entries: std.ArrayList(retention_budget.Entry) = .empty;
-        for (scan.entries) |entry| if (entry.namespace.eql(namespace)) {
+        for (scan.entries) |entry| {
+            if (!entry.namespace.eql(namespace)) continue;
+            const horizon = if (entry.linked) @as(u64, 30_000) else 3 * cache_window_ms + 30_000;
+            if (entry.expires_ms +| horizon >= now) continue;
             try entries.append(a, entry);
-        };
+        }
         if (entries.items.len == 0) return;
         std.mem.sort(retention_budget.Entry, entries.items, {}, struct {
             fn less(_: void, left: retention_budget.Entry, right: retention_budget.Entry) bool {
@@ -667,8 +670,6 @@ pub const Repository = struct {
             try cancellation.check();
             const entry = entries.items[(start + offset) % entries.items.len];
             last = entry.id;
-            const horizon = if (entry.linked) @as(u64, 30_000) else 3 * cache_window_ms + 30_000;
-            if (entry.expires_ms +| horizon >= now) continue;
             if (self.store.opened.fs_client) |filesystem| {
                 const parent = try self.linkedNamespace(a, namespace);
                 const expiry = try std.fmt.allocPrint(a, "{d:0>20}", .{entry.expires_ms});
@@ -2957,7 +2958,7 @@ test "external lake native budget reclamation advances past leased cohorts acros
     defer directory.cleanup();
     var repository = try Repository.init(a, null, null, .standalone, directory.path());
     defer repository.deinit();
-    repository.retained_limits = .{ .max_cuts = 4, .max_bytes = 4 };
+    repository.retained_limits = .{ .max_cuts = 5, .max_bytes = 5 };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -2967,6 +2968,9 @@ test "external lake native budget reclamation advances past leased cohorts acros
     for ([_]u8{ 'a', 'b', 'c', 'd' }, 0..) |letter, index| {
         try store.reserve(a, .{ .id = @splat(letter), .namespace = namespace, .expires_ms = if (index < 2) expires else expires - 1000, .bytes = 1, .inventory = @splat(letter), .linked = true }, .none);
     }
+    // A not-yet-expired entry sorts before the held cohort. It must remain
+    // charged without consuming the physical inspection budget.
+    try store.reserve(a, .{ .id = @splat('0'), .namespace = namespace, .expires_ms = expires + 120_000, .bytes = 1, .inventory = @splat('0'), .linked = true }, .none);
     const parent = try repository.linkedNamespace(scratch, namespace);
     const held = try std.fmt.allocPrint(scratch, "{s}/{d:0>20}", .{ parent, expires });
     try fs.createDirPathPortable(io, held);
@@ -2976,7 +2980,7 @@ test "external lake native budget reclamation advances past leased cohorts acros
     defer lease.unlock(io);
     // The entire first inspection budget is consumed by one leased cohort.
     try repository.releaseReclaimedBudget(io, namespace, expires + 30_001, 2, true, .none);
-    try std.testing.expectEqual(@as(usize, 4), (try store.snapshot(scratch, .none)).len);
+    try std.testing.expectEqual(@as(usize, 5), (try store.snapshot(scratch, .none)).len);
     try std.testing.expectEqual(@as([64]u8, @splat('b')), (try store.scan(scratch, namespace, .none)).after.?);
     // A new adapter must resume from the persisted cursor, not begin at a/b.
     var reopened = try Repository.init(a, null, null, .standalone, directory.path());
@@ -2984,8 +2988,8 @@ test "external lake native budget reclamation advances past leased cohorts acros
     reopened.retained_limits = repository.retained_limits;
     try reopened.releaseReclaimedBudget(io, namespace, expires + 30_001, 2, true, .none);
     const remaining = try store.snapshot(scratch, .none);
-    try std.testing.expectEqual(@as(usize, 2), remaining.len);
-    for (remaining) |entry| try std.testing.expect(entry.id[0] == 'a' or entry.id[0] == 'b');
+    try std.testing.expectEqual(@as(usize, 3), remaining.len);
+    for (remaining) |entry| try std.testing.expect(entry.id[0] == '0' or entry.id[0] == 'a' or entry.id[0] == 'b');
     try std.Io.Dir.cwd().access(io, held, .{});
     // Reclaimed store-wide capacity is available to an unrelated namespace
     // while the original reader continues holding its cohort.
