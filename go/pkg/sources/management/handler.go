@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -107,6 +108,24 @@ func page(r *http.Request) (int, string, error) {
 	return limit, cursor, nil
 }
 
+// sourcePrecondition accepts one strong entity tag or a bare revision.
+func sourcePrecondition(values []string) (string, error) {
+	if len(values) != 1 {
+		return "", Failure(400, "invalid_precondition")
+	}
+	revision := strings.TrimSpace(values[0])
+	if strings.HasPrefix(revision, "W/") || revision == "*" {
+		return "", Failure(400, "invalid_precondition")
+	}
+	if len(revision) >= 2 && revision[0] == '"' && revision[len(revision)-1] == '"' {
+		revision = revision[1 : len(revision)-1]
+	}
+	if revision == "" || strings.ContainsAny(revision, "\", \t\r\n") {
+		return "", Failure(400, "invalid_precondition")
+	}
+	return revision, nil
+}
+
 // Handler expects a base-relative path. The caller mounts and authenticates it.
 // Route validation and JSON/error semantics are shared by both hosting runtimes.
 func Handler(b Backend) http.Handler {
@@ -151,7 +170,23 @@ func Handler(b Backend) http.Handler {
 						err = Failure(400, "invalid_source")
 						break
 					}
-					result, err = b.PutSource(r.Context(), source)
+					source.Revision = ""
+					values := r.Header.Values("If-Match")
+					if values == nil {
+						result, err = b.PutSource(r.Context(), source)
+						break
+					}
+					revision, e := sourcePrecondition(values)
+					if e != nil {
+						err = e
+						break
+					}
+					backend, ok := b.(PreconditionBackend)
+					if !ok {
+						err = Failure(501, "revision_preconditions_unsupported")
+						break
+					}
+					result, err = backend.PutSourceIfMatch(r.Context(), source, revision)
 				case http.MethodDelete:
 					purge := r.URL.Query().Get("purge")
 					if purge != "" && purge != "true" && purge != "false" {
@@ -224,6 +259,19 @@ func Handler(b Backend) http.Handler {
 		if err != nil {
 			WriteError(w, err)
 			return
+		}
+		switch value := result.(type) {
+		case Source:
+			value.Revision = SourceRevision(value)
+			w.Header().Set("ETag", `"`+value.Revision+`"`)
+			result = value
+		case SourcePage:
+			// The backend may retain its page; only mutate handler-owned sources.
+			value.Data = slices.Clone(value.Data)
+			for i := range value.Data {
+				value.Data[i].Revision = SourceRevision(value.Data[i])
+			}
+			result = value
 		}
 		WriteJSON(w, status, result)
 	})

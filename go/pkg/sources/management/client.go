@@ -42,7 +42,7 @@ func NewClient(base, token string) (*Client, error) {
 	}
 	return NewClientWithOptions(base, opts)
 }
-func (c *Client) call(ctx context.Context, method, path, key string, input, output any) error {
+func (c *Client) call(ctx context.Context, method, path, key string, input, output any, headers ...http.Header) error {
 	token, err := c.token(ctx)
 	if err != nil {
 		return fmt.Errorf("source-management token: %w", err)
@@ -66,6 +66,13 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 	r.Header.Set("Content-Type", "application/json")
 	if key != "" {
 		r.Header.Set("Idempotency-Key", key)
+	}
+	for _, header := range headers {
+		for name, values := range header {
+			for _, value := range values {
+				r.Header.Add(name, value)
+			}
+		}
 	}
 	response, err := c.http.Do(r)
 	if err != nil {
@@ -114,10 +121,27 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	err = c.call(ctx, "GET", "/sources/"+url.PathEscape(id), "", nil, &out)
 	return
 }
-func (c *Client) PutSource(ctx context.Context, source Source) (out Source, err error) {
+func (c *Client) PutSource(ctx context.Context, source Source) (Source, error) {
+	return c.putSource(ctx, source, "")
+}
+
+// PutSourceIfMatch requires a matching declaration revision for a PUT.
+func (c *Client) PutSourceIfMatch(ctx context.Context, source Source, revision string) (Source, error) {
+	if revision == "" {
+		return Source{}, Failure(400, "invalid_precondition")
+	}
+	return c.putSource(ctx, source, revision)
+}
+
+func (c *Client) putSource(ctx context.Context, source Source, revision string) (out Source, err error) {
+	source.Revision = ""
 	source.KnowledgeStatus = nil
 	source.SearchStatus = nil // GET observations are never submitted as desired state.
-	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out)
+	var headers http.Header
+	if revision != "" {
+		headers = http.Header{"If-Match": {`"` + revision + `"`}}
+	}
+	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out, headers)
 	return
 }
 func (c *Client) RemoveSource(ctx context.Context, id string, purge bool) (out Mutation, err error) {
