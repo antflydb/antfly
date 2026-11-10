@@ -170,7 +170,7 @@ const Factory = struct {
         var owned_reads = cached;
         owned_reads.context = owned_context;
         owner.resolver = .{ .root = owned_root, .store = owner.store.artifactStore(), .cached = owned_reads, .token = token };
-        const delete_proof: ?local.serverless_query_lake_serving.DeleteQualification.Proof = if (root.delete_proof) |proof| proven: {
+        const delete_proof: ?local.serverless_query_lake_serving.DeleteQualification.Proof = if (owned_root.delete_proof) |proof| proven: {
             break :proven .{ .ptr = owner, .count = proof.count, .recipe = proof.recipe, .digest = proof.digest, .source = proof.source, .data = proof.data, .lookup = Owner.deleteVersion };
         } else null;
         var statistics: std.ArrayList(local.sql_catalog.ColumnStatistics) = .empty;

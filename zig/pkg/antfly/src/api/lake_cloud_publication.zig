@@ -43,6 +43,7 @@ pub const Binding = struct {
     previous_roots: []const [32]u8,
     previous_until: u64,
     publication_key: ?catalog.Digest = null,
+    owned_locators: ?std.json.Parsed([]catalog.OpeningBundle) = null,
     pub fn initMap(a: A, object: *Object, cloud: catalog.CloudGenerations, token: Token) !Binding {
         try cloud.root.validate();
         try token.check();
@@ -102,7 +103,18 @@ pub const Binding = struct {
                 until = certificate.until_ms;
             }
         };
-        try self.reader.bindPublicationLocators(publication.opening_bundles);
+        // SQL navigation can outlive the temporary publication-selection
+        // arena. Keep the admitted hints under this binding's ownership; an
+        // immutable borrowed slice would still become a dangling pointer.
+        var owned: ?std.json.Parsed([]catalog.OpeningBundle) = null;
+        errdefer if (owned) |*parsed| parsed.deinit();
+        if (publication.opening_bundles.len != 0) {
+            const bytes = try std.json.Stringify.valueAlloc(self.a, publication.opening_bundles, .{});
+            defer self.a.free(bytes);
+            owned = try std.json.parseFromSlice([]catalog.OpeningBundle, self.a, bytes, .{ .allocate = .alloc_always });
+        }
+        try self.reader.bindPublicationLocators(if (owned) |parsed| parsed.value else &.{});
+        self.owned_locators = owned;
         const old_roots = self.roots;
         self.roots = roots;
         self.publication_key = key;
@@ -116,6 +128,7 @@ pub const Binding = struct {
         self.object.cloud_certified_roots = self.previous_roots;
         self.object.cloud_certificate_until_ms = self.previous_until;
         self.reader.deinit();
+        if (self.owned_locators) |*owned| owned.deinit();
         maps.freeRef(self.a, self.reader.root.?);
         self.a.destroy(self.reader);
         if (self.roots.len != 0) self.a.free(self.roots);
@@ -338,7 +351,17 @@ test "external lake global frontier cloud certificates bind publications restart
     defer promoted.cloud_binding.?.deinit();
     const stable_reader = promoted.cloud_binding.?.reader;
     const clocks = provider.clock_reads.load(.acquire);
-    try promoted.bindPublication(publication, .none);
+    {
+        // The selected catalog owner is temporary, as in SQL's lazy file
+        // navigation factory. A bound reader must survive freeing it.
+        var temporary = std.heap.ArenaAllocator.init(a);
+        defer temporary.deinit();
+        const ta = temporary.allocator();
+        const source_bytes = try std.json.Stringify.valueAlloc(ta, publication, .{});
+        const selected_publication = try std.json.parseFromSliceLeaky(catalog.Publication, ta, source_bytes, .{ .allocate = .alloc_always });
+        try promoted.bindPublication(selected_publication, .none);
+        try std.testing.expect(promoted.cloud_binding.?.reader.publication_locators.ptr != selected_publication.opening_bundles.ptr);
+    }
     try std.testing.expectEqual(stable_reader, promoted.cloud_binding.?.reader);
     try std.testing.expectEqual(stable_reader, promoted.implementation.cloud_reader.?);
     try std.testing.expectEqual(provider.until_ms, promoted.implementation.cloud_certificate_until_ms);
