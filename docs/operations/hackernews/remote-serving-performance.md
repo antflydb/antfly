@@ -1363,3 +1363,27 @@ The corrected pre-build gate passes 15 focused tests, 93 broader targeted native
 tests, six simulator tests and 19 archive-helper tests, without failures or leaks.
 Ordered filter proofs now use the same typed lowering, with a regression that
 rejects a bound widened by f64 rounding. Fresh optimized timings remain pending.
+
+### Completed row-map candidate (b728670528)
+
+All 98 optimized server/Lite build steps, comparison/matrix/scale/mixed-hydration
+fixtures, both original-settings GCS cases and the assembled HN regression pass.
+On 10,000 synthetic rows at 30 ms injected RTT, cold common-term search takes
+482 ms, highlights 470 ms and the legacy numeric filter 559 ms (previously
+5.21 s). Physical row-manifest GETs fall to zero. Four mixed cold queries with
+Parquet hydration and two I/O slots take 477–607 ms. These are single samples,
+not tail qualification or real-provider forecasts.
+
+Real GCS remains above target: stored-source cold search takes 2.70 s (3.03 s
+including startup), 241 ms server CPU and 267.1 MiB peak RSS. Parquet hydration
+takes 3.81 s (4.13 s including startup), 283 ms CPU and 274.4 MiB peak RSS.
+All 878 and 817 task-owned object versions respectively were removed, with zero
+remaining. Cache GC completed successfully.
+
+The stored-source profile still shows three generation-map reads totaling
+396 ms of provider time, two payload reads totaling 1.04 s, and 831 ms of native
+hydration phase time. These counters overlap and must not be summed into a
+critical path. The next candidate prioritizes payload locators within the fixed
+catalog envelope, captures bounded complete ranking/identity/compact-column
+working sets, and batches adjacent selected hydration chunks. Its correctness
+and latency require separate validation; sub-second GCS remains unproven.

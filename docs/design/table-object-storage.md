@@ -212,8 +212,11 @@ publication-level opening bundles. Metadata capability 86 fences older readers
 from new lake catalog writes.
 
 Protocol 99 additionally admits up to 128 provider-qualified demand locators
-inside the authenticated opening descriptors. The producer spends at most 256
-lookup attempts collecting navigation and native-pack locators. Their identity,
+inside the authenticated opening descriptors. The producer spends at most 512
+lookup attempts, with navigation limited to the first 256 attempts. Native payload
+selectors displace lower-priority navigation already copied into byte-cache
+bundles; duplicate IDs upgrade priority without changing the admitted selector.
+The fixed 128-entry catalog envelope remains unchanged. Their identity,
 length, generation and retention fields participate in the publication's existing
 certificate binding. A reader borrows them only under the exact admitted map
 root, including its generation, checksum, length and retention identity; namespace
@@ -417,6 +420,22 @@ existing decoded-byte, read-byte and bundle-count limits. This is an optional
 prefix cache, never a segment-selection limit: demand outside the prefix uses
 the original authenticated objects and generation-map fallback. No wire-format
 change or rewritten source identity is required.
+
+After navigation, up to 32 admitted segments contribute at most 8 MiB of useful
+working-set units, at most 2 MiB per segment. Complete small inverted sections
+are preferred; larger sections can contribute complete bounded dictionary/norm
+tails. Compact identity bytes and source-column sections up to 256 KiB follow.
+A selected section either fits in the remaining unit budget or stays on demand;
+arbitrary posting prefixes do not consume the remaining envelope. These copies
+use the existing four authenticated opening bundles and their byte limits.
+Every member retains its original range digest and provider fallback.
+
+Winner hydration plans adjacent selected source chunks together before submitting
+prefetch. A tile emits at most four physical spans and one MiB, examines at most
+64 selected positions, and merges only physically contiguous selected chunks.
+Sparse gaps are excluded and required reads retain identity validation, exact
+field projection and cancellation. Planning does not change the cursor's live
+decoded chunk or transfer its value ownership.
 
 Canonical hints are optional when a compacted serving representation exists:
 compaction may have reclaimed their original postings. An opt-in artifact read

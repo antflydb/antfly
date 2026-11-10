@@ -107,6 +107,32 @@ pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
 pub fn warmOpening(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
     return warmMode(a, read, ref, maximum_bytes, true);
 }
+test "external lake cold working set locators cover late physical packs beyond the old block prefix" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("late-payload-locators");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(51), 1, std.testing.io);
+    const bytes = try sa.alloc(u8, 9 * pack_bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i / pack_bytes);
+    const ref = try publish(a, sa, &store, bytes, .none);
+    const Probe = struct {
+        ids: std.StringHashMapUnmanaged(void) = .empty,
+        a: A,
+        fn record(raw: *anyopaque, pack: Ref) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.ids.put(self.a, pack.artifact_id, {});
+        }
+    };
+    var probe: Probe = .{ .a = sa };
+    _ = try warmOpening(sa, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none, .locator = .{ .ptr = &probe, .record = Probe.record } }, ref, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 9), probe.ids.count());
+}
 /// Publication-only second pass, after every navigation root has priority.
 /// Tiny complete segments fit in the same opening bundle; large archive
 /// segments retain selective demand reads rather than arbitrary prefixes.
@@ -124,14 +150,102 @@ pub fn warmSmall(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
     }
     return spent;
 }
+/// Publication-owned working set, independent of query history. Complete
+/// bounded ranking sections serve arbitrary terms; compact identities/columns
+/// remove decoder discovery round trips without copying a large archive body.
+/// Every captured unit retains its original authenticated range identity.
+pub fn warmWorkingSet(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    if (maximum_bytes == 0) return 0;
+    try read.check();
+    const directory = try loadDirectory(a, read, ref);
+    var data = try load(a, read, ref);
+    defer data.deinit(a);
+    var reader = try local.segment.RangeSegmentReader.init(a, data.source(), .{});
+    reader.owns_source = false;
+    defer reader.deinit();
+    var selected: [64]Range = undefined;
+    var count: usize = 0;
+    // A large inverted section keeps demand-driven postings, but its complete
+    // bounded dictionary and norms can still remove dependent term discovery.
+    for (reader.fields) |field| for (field.sections) |section| {
+        if (section.section_type != .inverted_text or section.length == 0 or count == selected.len) continue;
+        const view = (try reader.sectionView(field.name, .inverted_text)).?;
+        if (view.length <= maximum_bytes) {
+            selected[count] = .{ .offset = @intCast(view.offset), .len = @intCast(view.length) };
+            count += 1;
+        } else {
+            const inverted = try local.section_inverted.RangeInvertedIndexReader.init(a, view, pack_bytes);
+            const begin = if (inverted.norms_length != 0) @min(inverted.blocks_offset, inverted.norms_offset) else inverted.blocks_offset;
+            if (view.length - begin <= maximum_bytes) {
+                selected[count] = .{ .offset = @intCast(view.offset + begin), .len = @intCast(view.length - begin) };
+                count += 1;
+            }
+        }
+    };
+    if (reader.id_bytes_length != 0 and reader.id_bytes_length <= maximum_bytes and count < selected.len) {
+        selected[count] = .{ .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24 + @as(u64, reader.num_blocks) * 12), .len = @intCast(reader.id_bytes_length) };
+        count += 1;
+    }
+    for (reader.fields) |field| for (field.sections) |section| {
+        if (section.section_type != .columnar_stored or section.length == 0 or section.length > 256 * 1024 or count == selected.len) continue;
+        const view = (try reader.sectionView(field.name, .columnar_stored)).?;
+        selected[count] = .{ .offset = @intCast(view.offset), .len = @intCast(view.length) };
+        count += 1;
+    };
+    var spent: usize = 0;
+    // Selection order gives ranking priority. One physical span per adjacent
+    // run amortizes producer I/O; capture still authenticates every 64 KiB unit.
+    const seen = try a.alloc(bool, directory.blocks.len);
+    defer a.free(seen);
+    @memset(seen, false);
+    for (selected[0..count]) |range| {
+        var needed: u64 = 0;
+        for (directory.blocks, seen) |piece, captured| {
+            if (!captured and piece.offset < range.offset + range.len and piece.offset + piece.ref.byte_len > range.offset) needed += piece.ref.byte_len;
+        }
+        // A complete useful section either fits or stays demand-driven. Do
+        // not spend the remaining envelope on an arbitrary posting prefix.
+        if (needed > maximum_bytes - spent) continue;
+        var index: usize = 0;
+        while (index < directory.blocks.len) {
+            const piece = directory.blocks[index];
+            if (seen[index] or piece.offset >= range.offset + range.len or piece.offset + piece.ref.byte_len <= range.offset or piece.ref.byte_len > maximum_bytes - spent) {
+                index += 1;
+                continue;
+            }
+            var end = index + 1;
+            var bytes: usize = @intCast(piece.ref.byte_len);
+            if (piece.pack) |pack| while (end < directory.blocks.len) : (end += 1) {
+                const next = directory.blocks[end];
+                if (seen[end] or next.offset >= range.offset + range.len or next.offset != piece.offset + bytes or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + bytes or next.ref.byte_len > maximum_bytes - spent - bytes) break;
+                bytes += @intCast(next.ref.byte_len);
+            };
+            var group: ?CoalescedRead = if (piece.pack) |pack| .{ .planned = true, .store = read.store, .pack = pack, .start = piece.pack_offset, .length = bytes, .logical_end = piece.offset + bytes, .cancellation = read.cancellation, .a = a, .pieces = directory.blocks[index..end] } else null;
+            defer if (group) |*value| value.deinit();
+            for (directory.blocks[index..end], index..) |unit, at| {
+                try read.check();
+                var held = try readPieceLeaseCoalesced(a, read.store, unit, read.cancellation, read.cache, if (group) |*value| value else null, false);
+                defer held.deinit();
+                if (read.cache) |cache| if (cache.capture) |capture| try capture.record(capture.ptr, unit.ref.artifact_id, try stores.sha256DigestFromChecksum(unit.ref.checksum), held.bytes());
+                seen[at] = true;
+                spent += @intCast(unit.ref.byte_len);
+            }
+            index = end;
+        }
+    }
+    return spent;
+}
 fn warmMode(a: A, read: Read, ref: Ref, maximum_bytes: usize, opening_only: bool) !usize {
     if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
     try read.check();
     const directory = try loadDirectory(a, read, ref);
     if (read.locator) |hook| {
-        for (directory.metadata) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
-        for (directory.blocks[0..@min(directory.blocks.len, 128)]) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
-        if (directory.metadata_bundle) |bundle| try hook.record(hook.ptr, bundle);
+        // Metadata is already copied into opening bundles. The scarce inline
+        // selector budget belongs to original packs still read on demand.
+        // The directory is already bounded; deduplication and lookup admission
+        // belong to the publication locator collector, not an arbitrary block
+        // prefix that misses later packs selected by a different query.
+        for (directory.blocks) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
     }
     var spent: usize = @intCast(ref.byte_len);
     var bundled = false;
@@ -2692,6 +2806,38 @@ test "external lake seekable metadata opens all field navigation with two authen
     var store = fs.artifactStore();
     store.upload_scope = try stores.UploadScope.forPublication(@splat(19), 1, std.testing.io);
     const ref = try publish(ca, ca, &store, bytes, .none);
+    {
+        const opening = @import("lake_index_text_opening_pack.zig");
+        var capture_cache = ServingCache.initWithMemoryLimit(a, 0);
+        defer capture_cache.deinit();
+        var collector: opening.Collector = .{ .a = a, .out = ca, .store = &store, .cancellation = .none, .version = 2, .max_packs = 4 };
+        defer collector.deinit();
+        const capture_read: Read = .{ .store = store, .cache = .{ .cache = &capture_cache, .scope = @splat(2), .context = .{}, .capture = .{ .ptr = &collector, .record = opening.Collector.capture } }, .context = .{}, .cancellation = .none };
+        _ = try warmOpening(ca, capture_read, ref, 1024 * 1024);
+        const spent = try warmWorkingSet(ca, capture_read, ref, 2 * 1024 * 1024);
+        try std.testing.expect(spent != 0 and spent <= 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(usize, 0), try warmWorkingSet(ca, capture_read, ref, block_bytes - 1));
+        try collector.flush();
+        var warm_cache = ServingCache.init(a);
+        defer warm_cache.deinit();
+        const seeded: artifacts.CachedRead = .{ .cache = &warm_cache, .scope = @splat(2), .context = .{} };
+        for (collector.refs.items) |pack| try opening.warmPublication(a, store, pack, store.upload_scope.?.domain, seeded, .none);
+        const before = warm_cache.snapshot().provider_reads;
+        const opened = try load(a, .{ .store = store, .cache = seeded, .context = .{}, .cancellation = .none }, ref);
+        var index = try local.index.IndexWriter.init(a);
+        defer index.deinit();
+        try index.addSegmentWithIdData(1, opened);
+        var result = try local.search_search.execute(a, index.snapshot(), .{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .k = 4, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 4), result.hits.len);
+        for (result.hits) |hit| try std.testing.expect((try index.snapshot().storedIdScoped(ca, hit.doc_id)) != null);
+        // Ranking and winner identities must hit the captured immutable units,
+        // including a fresh reader's dictionary, norms and posting pulls.
+        try std.testing.expectEqual(before, warm_cache.snapshot().provider_reads);
+        var expired = capture_read;
+        expired.context.deadline_ns = 0;
+        try std.testing.expectError(error.DeadlineExceeded, warmWorkingSet(ca, expired, ref, 2 * 1024 * 1024));
+    }
     var cache = ServingCache.init(a);
     defer cache.deinit();
     const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(2), .context = .{ .io = std.testing.io } };

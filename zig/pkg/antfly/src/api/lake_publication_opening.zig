@@ -36,6 +36,49 @@ const decode_budget = 64 * 1024 * 1024;
 const parallel_budget = 32 * 1024 * 1024;
 
 const Navigation = struct { domain: [32]u8, ref: tree.Ref, depth: u8 = 0, optional: bool = false };
+// Byte-cached navigation does not need a second inline provider selector.
+// Reserve the fixed catalog envelope for payloads that remain demand reads.
+const LocatorSet = struct {
+    const Entry = struct { value: catalog.ProviderLocator, priority: u8 };
+    entries: std.ArrayList(Entry) = .empty,
+    fn candidate(self: *LocatorSet, id: []const u8, priority: u8) bool {
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, entry.value.id, id)) {
+            entry.priority = @max(entry.priority, priority);
+            return false;
+        };
+        if (self.entries.items.len < 128) return true;
+        for (self.entries.items) |entry| if (entry.priority < priority) return true;
+        return false;
+    }
+    fn put(self: *LocatorSet, a: A, value: catalog.ProviderLocator, priority: u8) !void {
+        if (!self.candidate(value.id, priority)) return;
+        if (self.entries.items.len == 128) {
+            var lowest: usize = 0;
+            for (self.entries.items, 0..) |entry, i| if (entry.priority < self.entries.items[lowest].priority) {
+                lowest = i;
+            };
+            _ = self.entries.orderedRemove(lowest);
+        }
+        try self.entries.append(a, .{ .value = value, .priority = priority });
+    }
+};
+
+test "external lake cold working set payload locators displace cached navigation without widening catalog bounds" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var set: LocatorSet = .{};
+    defer set.entries.deinit(a);
+    for (0..128) |i| try set.put(a, .{ .id = try std.fmt.allocPrint(arena.allocator(), "navigation-{d}", .{i}), .bytes = 42, .generation = "v1" }, 0);
+    // Duplicates upgrade priority in place, preserving their admitted selector.
+    try std.testing.expect(!set.candidate("navigation-0", 1));
+    for (0..127) |i| try set.put(a, .{ .id = try std.fmt.allocPrint(arena.allocator(), "payload-{d}", .{i}), .bytes = 43, .generation = "v2" }, 1);
+    try std.testing.expectEqual(@as(usize, 128), set.entries.items.len);
+    try std.testing.expectEqualStrings("navigation-0", set.entries.items[0].value.id);
+    for (set.entries.items) |entry| try std.testing.expectEqual(@as(u8, 1), entry.priority);
+    try std.testing.expect(!set.candidate("uncached-navigation", 0));
+    try std.testing.expect(!set.candidate("overflow-payload", 1));
+}
 const Producer = struct {
     a: A,
     store: *stores.ArtifactStore,
@@ -54,15 +97,22 @@ const Producer = struct {
     seed_reads: usize = 0,
     small: [16]struct { ref: artifacts.ChunkRef, optional: bool } = undefined,
     small_count: usize = 0,
-    locators: std.ArrayList(catalog.ProviderLocator) = .empty,
+    working: [32]struct { ref: artifacts.ChunkRef, optional: bool } = undefined,
+    working_count: usize = 0,
+    locators: LocatorSet = .{},
     locator_attempts: usize = 0,
     remaining: u64 = read_budget,
     token: Token,
 
     fn recordLocator(raw: *anyopaque, ref: artifacts.ChunkRef) !void {
+        return recordLocatorPriority(raw, ref, 0);
+    }
+    fn recordPayloadLocator(raw: *anyopaque, ref: artifacts.ChunkRef) !void {
+        return recordLocatorPriority(raw, ref, 1);
+    }
+    fn recordLocatorPriority(raw: *anyopaque, ref: artifacts.ChunkRef, priority: u8) !void {
         const self: *Producer = @ptrCast(@alignCast(raw));
-        if (self.locators.items.len == 128 or self.locator_attempts == 256) return;
-        for (self.locators.items) |value| if (std.mem.eql(u8, value.id, ref.artifact_id)) return;
+        if (!self.locators.candidate(ref.artifact_id, priority) or self.locator_attempts == 512 or (priority == 0 and self.locator_attempts >= 256)) return;
         const object = self.store.providerStore() orelse return;
         const writer = object.cloud_writer orelse return;
         // Relocated/legacy dependencies may remain valid demand inputs while
@@ -78,10 +128,11 @@ const Producer = struct {
         var record = found orelse return;
         defer record.deinit(self.a);
         if (record.bytes != ref.byte_len) return error.InvalidCloudGenerationMap;
-        try self.locators.append(self.a, .{ .id = try self.a.dupe(u8, record.id), .bytes = record.bytes, .generation = try self.a.dupe(u8, record.generation), .retention_until_ms = record.retention_until_ms });
+        try self.locators.put(self.a, .{ .id = try self.a.dupe(u8, record.id), .bytes = record.bytes, .generation = try self.a.dupe(u8, record.generation), .retention_until_ms = record.retention_until_ms }, priority);
     }
     fn capture(raw: *anyopaque, identity: []const u8, digest: [32]u8, bytes: []const u8) !void {
         const self: *Producer = @ptrCast(@alignCast(raw));
+        if (self.collector.full()) return error.OpeningBundleBudgetExceeded;
         if (bytes.len > self.remaining) return error.OpeningBundleBudgetExceeded;
         self.remaining -= bytes.len;
         // Physical object captures also cover child navigation pages reached
@@ -204,6 +255,20 @@ const Producer = struct {
                 return err;
             };
         }
+        // Metadata has first claim. Pack bounded complete ranking sections,
+        // identity bytes and compact source columns next; arbitrary archive
+        // prefixes never displace navigation or trigger an unbounded scan.
+        var working_bytes: usize = 0;
+        for (self.working[0..self.working_count]) |entry| {
+            if (self.collector.full() or working_bytes == 8 * 1024 * 1024) break;
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            const read_store = if (entry.optional) self.store.optionalReadView() else self.store.*;
+            working_bytes += @import("lake_index_seekable_text.zig").warmWorkingSet(scratch.allocator(), .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token }, entry.ref, @min(2 * 1024 * 1024, 8 * 1024 * 1024 - working_bytes)) catch |err| {
+                if (entry.optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        }
     }
     fn addTextRoot(self: *Producer, scratch: A, root: @import("lake_index_native_text.zig").Root) !void {
         if (self.text_count < self.text_roots.len and root.seekable and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
@@ -264,7 +329,11 @@ const Producer = struct {
         }
         // Bound navigation decoding separately from descriptor capture. Demand
         // retains the original authenticated fallback beyond this prefix.
-        if (self.segments <= 32) _ = try @import("lake_index_seekable_text.zig").warmOpening(a, .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordLocator } }, route.ref, 1024 * 1024);
+        if (self.segments <= 32) {
+            _ = try @import("lake_index_seekable_text.zig").warmOpening(a, .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordPayloadLocator } }, route.ref, 1024 * 1024);
+            self.working[self.working_count] = .{ .ref = .{ .artifact_id = try self.a.dupe(u8, route.ref.artifact_id), .checksum = try self.a.dupe(u8, route.ref.checksum), .byte_len = route.ref.byte_len }, .optional = self.capture_optional };
+            self.working_count += 1;
+        }
         if (self.capture_small and route.bytes <= 256 * 1024 and self.small_count < self.small.len) {
             for (self.small[0..self.small_count]) |*prior| if (std.mem.eql(u8, prior.ref.artifact_id, route.ref.artifact_id)) {
                 prior.optional = prior.optional and self.capture_optional;
@@ -320,8 +389,8 @@ pub fn publish(a: A, store: *stores.ArtifactStore, publication: catalog.Publicat
             out.provider_generation = try a.dupe(u8, record.generation);
         };
     }
-    if (publication.reader_protocol >= 99 and result.len != 0 and producer.locators.items.len != 0) {
-        const locators = try a.alloc(catalog.ProviderLocator, producer.locators.items.len);
+    if (publication.reader_protocol >= 99 and result.len != 0 and producer.locators.entries.items.len != 0) {
+        const locators = try a.alloc(catalog.ProviderLocator, producer.locators.entries.items.len);
         var copied: usize = 0;
         errdefer {
             for (locators[0..copied]) |value| {
@@ -330,7 +399,8 @@ pub fn publish(a: A, store: *stores.ArtifactStore, publication: catalog.Publicat
             }
             a.free(locators);
         }
-        for (producer.locators.items, locators) |value, *out| {
+        for (producer.locators.entries.items, locators) |entry, *out| {
+            const value = entry.value;
             const id = try a.dupe(u8, value.id);
             errdefer a.free(id);
             out.* = .{ .id = id, .bytes = value.bytes, .generation = try a.dupe(u8, value.generation), .retention_until_ms = value.retention_until_ms };
