@@ -230,6 +230,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
         .dependOn(&addFilteredTestRunArtifact(b, batch_contract_tests).step);
 
+    const cypher_control_wire_tests = b.addTest(.{
+        .root_module = batch_contract_mod,
+        .filters = &.{ "distributed txn private control wire", "internal batch topology control", "ordered artifact inventory private batch", "ordered artifact inventory merge proof adoption is private", "artifact publication upload control is private", "row policy publication Raft codec", "internal batch graph endpoint cleanup", "leann record survives the internal batch wire", "time series document revision wire" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-control-wire-test", "Verify private control exclusivity across document revision wire versions")
+        .dependOn(&b.addRunArtifact(cypher_control_wire_tests).step);
+
     const functions_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/functions_test_root.zig"),
         .target = target,
@@ -368,6 +376,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const cypher_owner_readiness = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "selected owner readiness", "system catalog baseline resumes after snapshot and activates atomically before sparse updates" } });
+    const cypher_owner_readiness_step = b.step("cypher-owner-readiness-test", "Verify compact selected-owner report and namespace readiness");
+    cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_readiness).step);
+    const cypher_owner_transitions = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "selected owner readiness transition index", "catalog projection" } });
+    cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_transitions).step);
     const cypher_metadata_frames = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{"metadata durable job state and transaction sessions retain distinct command frames"},
@@ -593,6 +606,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         auth.addImport("antfly_platform", platform_mod);
         module.addImport("usermgr_storage", auth);
     }
+    const cypher_remote_routing_tests = b.addTest(.{
+        .root_module = data_consumer_module,
+        .filters = &.{"remote graph"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-remote-routing-test", "Verify compact routing generation fences and readiness cancellation")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_remote_routing_tests).step);
+    const cypher_runtime_admission_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{ "graph endpoint cleanup routing", "data raft retry checkpoints survive changed ready windows and publication failure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-runtime-admission-test", "Verify cleanup routing and exactly-once retries across native owner admission contention")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_runtime_admission_tests).step);
     const sql_expression_apply_tests = b.addTest(.{
         .root_module = data_implementation_module,
         .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},
@@ -3271,7 +3298,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
     const cypher_capture_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins release every provider allocation", "graph statements bind privacy versions before capturing owners" },
+        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins", "graph statements bind privacy versions before capturing owners", "graph readiness failures remain retryable" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-native-capture-test", "Verify immutable materialization and native capture capabilities")
