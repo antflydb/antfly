@@ -27,6 +27,10 @@ fn planFor(resource: u64, source: u64) model.Plan {
     std.mem.writeInt(u64, &bytes, source, .big);
     std.crypto.hash.sha2.Sha256.hash(&bytes, &source_id, .{});
     var plan: model.Plan = .{ .id = @splat(0), .resource = resource, .dataset = dataset, .generation = 1, .definition = @splat(3), .source = source_id, .source_table = source, .topology_generation = 2, .membership = @splat(5) };
+    var membership: @import("topology_protocol.zig").RangeMembershipAccumulator = .{};
+    membership.add(71) catch unreachable;
+    if (resource == 41) membership.add(72) catch unreachable;
+    plan.membership = membership.finish(source).digest;
     plan.id = plan.identity();
     return plan;
 }

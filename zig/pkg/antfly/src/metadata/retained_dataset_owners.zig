@@ -21,6 +21,19 @@ const std = @import("std");
 const types = @import("antfly_local_sources").retained_dataset_types;
 pub const Id = types.Id;
 pub const max_owners = 4096;
+pub const Registration = struct {
+    resource: u64,
+    generation: u64,
+    plan: Id,
+    revision: u64,
+    limit: u16 = 64,
+
+    pub fn validate(self: Registration) !void {
+        if (self.resource == 0 or self.generation == 0 or self.generation > types.max_public_counter or
+            self.revision == 0 or self.revision > types.max_public_counter or types.zero(self.plan) or self.limit == 0 or self.limit > 64)
+            return error.InvalidRetainedOwnerPlan;
+    }
+};
 pub const Phase = enum { activating, active, closing, closed, retiring, retired };
 pub const Mode = enum { registered, installed, ready, closed, revoked };
 pub const Cut = struct {
@@ -87,6 +100,7 @@ pub const Plan = struct {
     registration_after: u64 = 0,
     registration_complete: bool = false,
     registered: u32 = 0,
+    registration_membership: @import("topology_protocol.zig").RangeMembershipAccumulator = .{},
     ready: u32 = 0,
     stopped: u32 = 0,
     revoked: u32 = 0,
@@ -115,8 +129,11 @@ pub const Plan = struct {
             types.zero(self.membership) or self.revision == 0 or self.revision > types.max_public_counter or self.registered > max_owners or
             self.ready > self.registered or self.stopped > self.registered or self.revoked > self.stopped or self.independent > self.registered or
             self.ready > self.registered - self.revoked or self.independent > self.ready + self.revoked or
+            self.registration_membership.count != self.registered or
             (self.registered == 0) != (self.registration_after == 0)) return error.InvalidRetainedOwnerPlan;
         if (self.registration_complete and self.registered == 0) return error.InvalidRetainedOwnerPlan;
+        if (self.registered == 0 and !types.zero(self.registration_membership.xor_digest)) return error.InvalidRetainedOwnerPlan;
+        if (self.registration_complete and !std.mem.eql(u8, &self.registration_membership.finish(self.source_table).digest, &self.membership)) return error.InvalidRetainedOwnerPlan;
         if (self.phase == .active and (!self.registration_complete or self.ready != self.registered or self.stopped != 0)) return error.InvalidRetainedOwnerPlan;
         if (self.phase == .closing and !self.registration_complete) return error.InvalidRetainedOwnerPlan;
         if (self.source_release_receipt) |receipt| if (types.zero(receipt) or self.revoked != self.registered or
@@ -141,6 +158,7 @@ pub const Plan = struct {
         if (self.phase != .activating or self.registration_complete or owner.mode != .registered or owner.revision != 1 or
             !std.mem.eql(u8, &owner.plan, &self.id) or owner.group <= self.registration_after or self.registered == max_owners) return error.RetainedOwnerPlanChanged;
         next.registered += 1;
+        try next.registration_membership.add(owner.group);
         next.registration_after = owner.group;
         try next.validate();
         return next;
@@ -238,6 +256,9 @@ fn adjust(current: u32, before: u32, after: u32) !u32 {
 
 fn fixture() Plan {
     var plan: Plan = .{ .id = @splat(0), .resource = 41, .dataset = @splat(2), .generation = 1, .definition = @splat(3), .source = @splat(4), .source_table = 7, .topology_generation = 2, .membership = @splat(5) };
+    var membership: @import("topology_protocol.zig").RangeMembershipAccumulator = .{};
+    membership.add(71) catch unreachable;
+    plan.membership = membership.finish(plan.source_table).digest;
     plan.id = plan.identity();
     return plan;
 }
@@ -300,6 +321,16 @@ test "retained owner plans require closed coverage and independent publication b
     defer decoded.deinit();
     try decoded.value.validate();
     try std.testing.expectEqualDeep(plan, decoded.value);
+}
+
+test "retained owner registration verifies exact frozen membership instead of count alone" {
+    var plan = fixture();
+    plan = try plan.register(.{ .plan = plan.id, .group = 72, .partition = @splat(6), .incarnation = 1 });
+    try std.testing.expectError(error.InvalidRetainedOwnerPlan, plan.completeRegistration());
+    // The incomplete plan can still be cancelled and every attempted owner
+    // revoked; an inconsistent index must never make activation possible.
+    plan = try plan.retire();
+    try std.testing.expect(plan.phase == .retiring and !plan.registration_complete);
 }
 
 test "retained owner plan identity rejects source or topology rebinding" {
