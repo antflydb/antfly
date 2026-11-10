@@ -9024,8 +9024,7 @@ pub const IndexManager = struct {
         return null;
     }
 
-    /// Whether an index other than `index_name` consumes `embedding_name` and
-    /// reads stored vectors (anything but another transient LEANN index).
+    /// An int8 rewrite must respect every other consumer's media policy.
     fn embeddingHasFullMediaConsumer(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
         for (self.dense_indexes.items) |*other| {
             if (std.mem.eql(u8, other.config.name, index_name)) continue;
@@ -9036,6 +9035,7 @@ pub const IndexManager = struct {
         return false;
     }
 
+    /// Whether another consumer requires the full stored artifact.
     fn embeddingHasPersistentConsumer(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
         for (self.dense_indexes.items) |*other| {
             if (std.mem.eql(u8, other.config.name, index_name)) continue;
@@ -24092,8 +24092,8 @@ pub const IndexManager = struct {
                 configureDensePostingProjectionBuild(index, vector_loader_context);
                 self.attachVectorBlockResidencyPolicy(index);
                 if (dense_cfg.leann) |leann_opts| {
-                    // LEANN keeps its graph in a file beside the (empty) HBC
-                    // root; remote dense storage is not supported yet.
+                    // LEANN persists its graph beside the empty HBC root
+                    // through the configured storage provider.
                     const leann_store = try leann_store_mod.LeannStore.open(self.alloc, self.checkpointIo(), path, .{
                         .dims = dense_cfg.dims,
                         .metric = dense_cfg.metric,

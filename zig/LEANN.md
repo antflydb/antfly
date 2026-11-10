@@ -5,9 +5,8 @@
 Dense `embeddings` indexes accept `algorithm: "leann"` (default `"hbc"`)
 with optional `leann` tuning (`max_degree`, `quantizer`, `vector_storage`,
 `search_ef`, `bound_scale`, `batch_size`). The code width is the dense
-index's top-level `quantization_bits`, shared with HBC (default 4 for LEANN). Embedder-backed
-indexes keep only a small stub per document once the graph covers it and
-re-embed query candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
+index's top-level `quantization_bits`, shared with HBC (default 4 for LEANN). Eligible text embeddings become small stubs once the graph covers them;
+queries re-embed candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
 `lib/vectorindex/src/leann.zig`; the table integration is described in
 [Table integration](#table-integration). Not yet supported for LEANN indexes:
 native backups of replicated LEANN (local graph files are pinned in native backups) ([Remaining work](#remaining-work)).
@@ -598,8 +597,8 @@ Three modes:
    child buffers to `build_threshold`, then plans per-key deltas) and a
    production-cluster VOPR that checks replica graph equality across a
    split.
-3. **Leader replication follow-ups.** CI verification of the data runtime
-   pieces (see [Leader replication](#leader-replication)).
+3. **Cluster qualification.** Production-cluster VOPR and end-to-end
+   verification (see [Leader replication](#leader-replication)).
 
 Done since the first version: filter-aware traversal (`SearchOptions.filter`),
 a per-query re-embedding budget and cancellation (`leann.reembed_budget_ms`,
@@ -649,7 +648,7 @@ plan-then-revert is exact; stale and corrupt deltas are rejected) and
 lagging followers, a deposed leader's late record, inline first build,
 out-of-band rebuild, missing and corrupt generations, restart).
 
-### Wiring into Raft (done, server side pending CI)
+### Wiring into Raft
 
 1. **Raft entry.** `BatchRequest.leann_record` (`storage/db/types.zig`)
    travels as the internal `_leann_record` field of the batch wire

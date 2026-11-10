@@ -59,8 +59,8 @@ pub const Options = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
-    /// Re-embedding time per query before the remaining candidates are
-    /// ranked by estimate; 0 disables the budget.
+    /// Re-embedding time per query before reporting incomplete coverage.
+    /// Zero disables the budget.
     reembed_budget_ms: u32 = 0,
     /// Persist through this storage provider (Lite, remote dense storage)
     /// instead of host files. The path is the same logical path.

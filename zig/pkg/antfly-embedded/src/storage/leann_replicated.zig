@@ -83,8 +83,8 @@ pub const Options = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
-    /// Re-embedding time per query before the rest are ranked by estimate;
-    /// 0 disables the budget.
+    /// Re-embedding time per query before reporting incomplete coverage;
+    /// zero disables the budget.
     reembed_budget_ms: u32 = 0,
     /// `vector_storage: transient`: stored vectors the graph covers are
     /// replaced by stubs (through elide records), so rebuilds use the
