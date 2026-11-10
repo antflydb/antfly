@@ -44,12 +44,14 @@ export default function GraphCatalogPage() {
   const client = useApi();
   const current = useRef(client);
   current.current = client;
+  const nextEditorId = useRef(0);
+  const newEditorId = useCallback(() => String(nextEditorId.current++), []);
   const [graphs, setGraphs] = useState<GraphCatalogEntry[]>([]);
   const [tables, setTables] = useState<string[]>([]);
   const [graphIndexes, setGraphIndexes] = useState<Record<string, string[]>>({});
   const [name, setName] = useState("");
   const [labels, setLabels] = useState<NodeMapping[]>(() => [
-    { editorId: crypto.randomUUID(), name: "Document", table: "", predicate: "" },
+    { editorId: newEditorId(), name: "Document", table: "", predicate: "" },
   ]);
   const [relationships, setRelationships] = useState<EdgeMapping[]>([]);
   const [busy, setBusy] = useState(false);
@@ -65,7 +67,7 @@ export default function GraphCatalogPage() {
     setName(entry.name);
     setLabels(
       entry.definition.labels.map((label) => ({
-        editorId: crypto.randomUUID(),
+        editorId: newEditorId(),
         name: label.name,
         table: typeof label.table === "string" ? label.table : label.table.table,
         database: typeof label.table === "string" ? undefined : label.table.database,
@@ -76,7 +78,7 @@ export default function GraphCatalogPage() {
     setRelationships(
       (entry.definition.relationships ?? []).map((edge) => ({
         ...edge,
-        editorId: crypto.randomUUID(),
+        editorId: newEditorId(),
       }))
     );
     setMessage("");
@@ -105,11 +107,11 @@ export default function GraphCatalogPage() {
     setSelected(undefined);
     setEditing(undefined);
     setName("");
-    setLabels([{ editorId: crypto.randomUUID(), name: "Document", table: "", predicate: "" }]);
+    setLabels([{ editorId: newEditorId(), name: "Document", table: "", predicate: "" }]);
     setRelationships([]);
     setMessage("");
     void refresh();
-  }, [refresh]);
+  }, [refresh, newEditorId]);
   const activeGraph = graphs.find((entry) => entry.name === selected);
   const readinessScope = useRef({
     client,
@@ -503,7 +505,7 @@ export default function GraphCatalogPage() {
                 onClick={() =>
                   setLabels([
                     ...labels,
-                    { editorId: crypto.randomUUID(), name: "", table: "", predicate: "" },
+                    { editorId: newEditorId(), name: "", table: "", predicate: "" },
                   ])
                 }
               >
@@ -587,7 +589,7 @@ export default function GraphCatalogPage() {
                   setRelationships([
                     ...relationships,
                     {
-                      editorId: crypto.randomUUID(),
+                      editorId: newEditorId(),
                       name: "",
                       index: "",
                       source_label: "",
@@ -612,7 +614,7 @@ export default function GraphCatalogPage() {
                     setEditing(undefined);
                     setName("");
                     setLabels([
-                      { editorId: crypto.randomUUID(), name: "Document", table: "", predicate: "" },
+                      { editorId: newEditorId(), name: "Document", table: "", predicate: "" },
                     ]);
                     setRelationships([]);
                     setMessage("");
