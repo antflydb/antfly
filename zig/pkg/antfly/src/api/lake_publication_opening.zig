@@ -59,6 +59,11 @@ const Producer = struct {
         for (self.locators.items) |value| if (std.mem.eql(u8, value.id, ref.artifact_id)) return;
         const object = self.store.providerStore() orelse return;
         const writer = object.cloud_writer orelse return;
+        // Relocated/legacy dependencies may remain valid demand inputs while
+        // belonging to another map namespace. Optional hints cannot authorize
+        // those IDs or make an otherwise valid publication unreadable.
+        const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return;
+        if (!std.mem.eql(u8, &scope.domain, &writer.scope.domain)) return;
         self.locator_attempts += 1;
         const found = writer.lookup(self.a, ref.artifact_id, self.token) catch |err| switch (err) {
             error.CloudGenerationMissing => return,
@@ -185,7 +190,7 @@ pub fn publish(a: A, store: *stores.ArtifactStore, publication: catalog.Publicat
     var producer: Producer = .{ .a = sa, .store = store, .collector = .{ .a = sa, .out = a, .store = store, .cancellation = token, .version = 2, .max_packs = max_bundles }, .cache = Cache.initWithMemoryLimit(sa, 0), .token = token };
     defer producer.collector.deinit();
     defer producer.cache.deinit();
-    producer.cached = .{ .cache = &producer.cache, .scope = publication.signature.store, .context = context, .capture = .{ .ptr = &producer, .record = Producer.capture } };
+    producer.cached = .{ .cache = &producer.cache, .scope = publication.signature.store, .context = context, .capture = .{ .ptr = &producer, .record = Producer.capture }, .locator = .{ .ptr = &producer, .record = Producer.recordLocator } };
     producer.collect(publication, declarations) catch |err| switch (err) {
         error.OpeningBundleBudgetExceeded => {},
         else => return err,

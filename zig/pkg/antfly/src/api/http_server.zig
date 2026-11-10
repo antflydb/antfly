@@ -4050,6 +4050,9 @@ pub const ApiHttpServer = struct {
     table_definition_cache: tables_api.DefinitionCache = .{},
     alloc: std.mem.Allocator,
     owner_alloc: std.mem.Allocator,
+    // Production constructors use the concurrent process request allocator.
+    // Borrowed testing allocators can be arenas and retain serial source work.
+    source_query_concurrency: bool = false,
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
     sql_preparation_admission: RequestAdmission,
@@ -4354,6 +4357,7 @@ pub const ApiHttpServer = struct {
         return .{
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
+            .source_query_concurrency = !builtin.is_test,
             .cfg = cfg,
             .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
             .sql_preparation_admission = RequestAdmission.init(@max(1, cfg.sql_max_concurrent_preparations)),
@@ -23284,33 +23288,92 @@ pub const ApiHttpServer = struct {
                 server: *ApiHttpServer,
                 profile: *@import("lake_query_metrics.zig").ComposedProfile,
                 lake_scope: @import("lake_index_text_query.zig").Scope,
+                lanes: [16]*SourceLane = undefined,
+                lane_count: usize = 0,
                 overlay: bool,
                 deadline: ?u64,
                 identity: ?AuthenticatedIdentity,
                 cancellation: ?*const http_common.RequestCancellation,
+                const Self = @This();
+                const SourceLane = struct {
+                    runner: *Self,
+                    name: []const u8,
+                    scope: @import("lake_index_text_query.zig").Scope,
+                    profile: @import("lake_query_metrics.zig").ComposedProfile = .{},
+                    cancellation: http_common.RequestCancellation,
+                };
                 fn checkpoint(raw: *anyopaque) !void {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
                     try ensureRequestActive(if (runner.cancellation) |cancel| cancel.token() else null);
                     try ensureRequestDeadline(runner.deadline);
                 }
-                fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
-                    const runner: *@This() = @ptrCast(@alignCast(raw));
+                fn sourceLane(coordinator: *Self, name: []const u8) !*SourceLane {
+                    for (coordinator.lanes[0..coordinator.lane_count]) |lane| if (std.mem.eql(u8, lane.name, name)) return lane;
+                    if (coordinator.lane_count == coordinator.lanes.len) return error.QueryCandidateBudgetExceeded;
+                    const a_ = coordinator.lake_scope.budget.allocator();
+                    const lane = try a_.create(SourceLane);
+                    errdefer a_.destroy(lane);
+                    const owned_name = try a_.dupe(u8, name);
+                    errdefer a_.free(owned_name);
+                    lane.* = .{ .runner = coordinator, .name = owned_name, .scope = undefined, .cancellation = .fromToken(if (coordinator.cancellation) |cancel| cancel.token() else .none) };
+                    try coordinator.lake_scope.initChild(&lane.scope);
+                    coordinator.lanes[coordinator.lane_count] = lane;
+                    coordinator.lane_count += 1;
+                    return lane;
+                }
+                fn execute(raw: *anyopaque, a_: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
+                    const coordinator: *Self = @ptrCast(@alignCast(raw));
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer coordinator.profile.record(&coordinator.server.lake_query_metrics, .composed_leaf_wall, started);
+                    const lane = try coordinator.sourceLane(name);
+                    lane.profile = .{};
+                    defer coordinator.profile.merge(&lane.profile);
+                    return executeLane(lane, a_, name, query);
+                }
+                fn prepareLane(raw: *anyopaque, name: []const u8) !*anyopaque {
+                    const coordinator: *Self = @ptrCast(@alignCast(raw));
+                    try checkpoint(raw);
+                    const lane = try coordinator.sourceLane(name);
+                    lane.profile = .{};
+                    return lane;
+                }
+                fn runLane(raw: *anyopaque, a_: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
+                    return executeLane(@ptrCast(@alignCast(raw)), a_, name, query);
+                }
+                fn cancelLane(raw: *anyopaque) void {
+                    const lane: *SourceLane = @ptrCast(@alignCast(raw));
+                    lane.cancellation.cancel();
+                }
+                fn finishLane(raw: *anyopaque) void {
+                    const lane: *SourceLane = @ptrCast(@alignCast(raw));
+                    lane.runner.profile.merge(&lane.profile);
+                }
+                fn executeMany(raw: *anyopaque, a_: std.mem.Allocator, requests: []const composed.SourceRequest) !composed.SourceBatch {
+                    const coordinator: *Self = @ptrCast(@alignCast(raw));
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer coordinator.profile.record(&coordinator.server.lake_query_metrics, .composed_leaf_wall, started);
+                    var serial_scheduler: @import("antfly_local_sources").sql_parallel_scheduler.Scheduler = .{ .max_pull_workers = 0 };
+                    const scheduler = if (coordinator.server.source_query_concurrency) @import("antfly_local_sources").sql_parallel_scheduler.global() else &serial_scheduler;
+                    return @import("composed_query_batch.zig").run(a_, coordinator.server.alloc, coordinator.server.embedding_provider_runtime.io, requests, .{ .ptr = coordinator, .prepare = prepareLane, .execute = runLane, .cancel = cancelLane, .finish = finishLane }, scheduler);
+                }
+                fn executeLane(lane: *SourceLane, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
+                    const runner = lane.runner;
                     const leaf_started = @import("antfly_platform").time.monotonicNs();
-                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_leaf, leaf_started);
-                    const leaf_profile = runner.profile.beginLeaf(name);
-                    runner.lake_scope.active_leaf = leaf_profile;
-                    defer runner.lake_scope.active_leaf = null;
-                    const io_before = runner.lake_scope.ioSnapshot();
+                    defer lane.profile.record(&runner.server.lake_query_metrics, .composed_leaf, leaf_started);
+                    const leaf_profile = lane.profile.beginLeaf(name);
+                    lane.scope.active_leaf = leaf_profile;
+                    defer lane.scope.active_leaf = null;
+                    const io_before = lane.scope.ioSnapshot();
                     defer if (leaf_profile) |leaf| {
                         leaf.total_ns = @import("antfly_platform").time.monotonicNs() -| leaf_started;
-                        leaf.io = runner.lake_scope.ioSnapshot().since(io_before);
+                        leaf.io = lane.scope.ioSnapshot().since(io_before);
                     };
                     if (!admittedTablePermissionAllowed(runner.identity, name, .read)) return contextual_operations.jsonErrorAlloc(a, 403, "forbidden");
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
                     const scratch = arena.allocator();
                     const leaf_query = if (runner.deadline) |leaf_deadline| blk: {
-                        try checkpoint(raw);
+                        try checkpoint(runner);
                         const remaining_ms = (leaf_deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
                         var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, query, .{});
                         try request.object.put(scratch, "timeout_ms", .{ .integer = @intCast(remaining_ms) });
@@ -23318,8 +23381,8 @@ pub const ApiHttpServer = struct {
                     } else query;
                     var identity = try cloneCatalogIdentity(a, runner.identity);
                     defer if (identity) |*owned| owned.deinit(a);
-                    var resolver = CatalogQueryResolver{ .arena = scratch, .lake_scope = &runner.lake_scope };
-                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = runner.deadline, .cancellation = if (runner.cancellation) |cancel| cancel.token() else .none };
+                    var resolver = CatalogQueryResolver{ .arena = scratch, .lake_scope = &lane.scope };
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = runner.deadline, .cancellation = lane.cancellation.token() };
                     var binding = binding: {
                         const started = @import("antfly_platform").time.monotonicNs();
                         defer if (leaf_profile) |leaf| {
@@ -23355,8 +23418,8 @@ pub const ApiHttpServer = struct {
                             leaf.dispatch_ns = @import("antfly_platform").time.monotonicNs() -| native_started;
                         };
                         defer if (bound.storage.engine != .object and external == null)
-                            runner.profile.record(&runner.server.lake_query_metrics, .composed_native_leaf, native_started);
-                        break :response try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                            lane.profile.record(&runner.server.lake_query_metrics, .composed_native_leaf, native_started);
+                        break :response try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, &lane.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
                     };
                     if (response.status != 200) return response;
                     errdefer response.deinit(runner.server.alloc);
@@ -23412,8 +23475,12 @@ pub const ApiHttpServer = struct {
             defer {
                 composed_profile.io = runner.lake_scope.ioSnapshot();
                 runner.lake_scope.deinit();
+                for (runner.lanes[0..runner.lane_count]) |lane| {
+                    runner.lake_scope.budget.allocator().free(lane.name);
+                    runner.lake_scope.budget.allocator().destroy(lane);
+                }
             }
-            return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
+            return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .execute_many = Runner.executeMany, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
     }

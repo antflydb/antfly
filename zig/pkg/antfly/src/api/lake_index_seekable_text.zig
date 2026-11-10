@@ -946,7 +946,10 @@ const CoalescedRead = struct {
 fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     var lease = try readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
     errdefer lease.deinit();
-    if (cached) |cache| if (cache.capture) |capture| try capture.record(capture.ptr, piece.ref.artifact_id, try stores.sha256DigestFromChecksum(piece.ref.checksum), lease.bytes());
+    if (cached) |cache| {
+        if (cache.locator) |hook| try hook.record(hook.ptr, piece.retainedArtifact());
+        if (cache.capture) |capture| try capture.record(capture.ptr, piece.ref.artifact_id, try stores.sha256DigestFromChecksum(piece.ref.checksum), lease.bytes());
+    }
     return lease;
 }
 /// A demanded posting/source block is the only trigger. Small immutable packs
@@ -1208,11 +1211,15 @@ const Owner = struct {
             self.recent_cursor = (self.recent_cursor + 1) % self.recent_pages.len;
         }
         fn reap(self: *@This(), io: std.Io) void {
-            for (&self.pending, &self.offsets, &self.directory_pins) |*slot, *offset, *pin| {
+            for (&self.pending, &self.offsets, &self.lengths, &self.directory_pins) |*slot, *offset, length, *pin| {
                 if (slot.*) |*task| {
                     if (!task.isComplete()) continue;
                     const succeeded = if (task.await(io)) |_| true else |_| false;
-                    if (succeeded) self.rememberPage(offset.*.? / block_bytes);
+                    if (succeeded) {
+                        var page_ = offset.*.? / block_bytes;
+                        const last_page = (offset.*.? + length - 1) / block_bytes;
+                        while (page_ <= last_page) : (page_ += 1) self.rememberPage(page_);
+                    }
                     slot.* = null;
                     offset.* = null;
                     if (pin.*) |owned| owned.destroy();
@@ -1253,9 +1260,12 @@ const Owner = struct {
                 if (block) |i| if (piece.pack) |pack| {
                     var end = i + 1;
                     var finish = piece.offset + piece.ref.byte_len;
-                    while (end < directory.blocks.len) : (end += 1) {
+                    while (end < directory.blocks.len and end - i < 32) : (end += 1) {
                         const next = directory.blocks[end];
-                        if (next.offset != finish or next.offset >= start + length or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + finish - piece.offset) break;
+                        // One adjacent payload block amortizes a posting-header hint
+                        // and its next decoder pull. Physical adjacency, pack bounds
+                        // and the shared request allowance cap amplification.
+                        if (next.offset != finish or next.offset >= @max(start + length, piece.offset + 2 * block_bytes) or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + finish - piece.offset) break;
                         finish += next.ref.byte_len;
                     }
                     pieces = directory.blocks[i..end];
@@ -1995,6 +2005,11 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     var sample: [1]u8 = undefined;
     try source.readInto(block_bytes * 3, &sample);
     try std.testing.expectEqual(@as(u8, 3), sample[0]);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
+    // A header hint also batches the bounded adjacent payload block. The next
+    // decoder pull must not introduce another dependent object-store RTT.
+    try source.readInto(block_bytes * 17, &sample);
+    try std.testing.expectEqual(@as(u8, 17), sample[0]);
     try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
     // A warm required unit returns while a larger overlapping speculative
     // task is gated. This catches accidental joining of the whole pack.

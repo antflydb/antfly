@@ -375,6 +375,28 @@ retain map warming. These changes do not establish a sub-second cold-query
 result; candidate qualification must measure them separately from the earlier
 roughly five-second fixture.
 
+
+Independent composed sources use waves of at most four initial page/count calls.
+Each source owns its mutable preparation scope, cancellation signal, and phase
+profile. The root scope shares the 64 MiB preparation budget, sixteen prepared
+reader slots, and 8 MiB read-ahead allowance across all sources. Pull coordinators
+leave child I/O/CPU admission available; denied optional admission runs serially.
+Responses are bounded and moved or copied to the caller only after joining.
+A failing source cancels siblings before joining parked providers and preserves
+the initiating failure. Overlay suppression and global ranking run after initial
+pages arrive; serial refills reuse the same source scope and retained cut. Cursor
+publication resolves readers across all child scopes. Leaf elapsed sums overlap;
+`composed_leaf_wall` measures actual source-wave/refill wall time.
+
+Publication capture records physical artifact selectors separately from synthetic
+range cache keys. Thus a page inside a navigation pack retains the pack's exact
+provider selector in the publication-bound locator set. Missing/overflow locators
+still take the authoritative map path. Payload prefetch may include one adjacent
+64 KiB block from the same physical pack, batching a header hint and the next
+posting pull. The existing shared byte allowance, queue cap, physical adjacency,
+pack limits, and at-most-32-member envelopes bound speculation; demand continues
+to authenticate every member independently.
+
 ## Storage binding and incarnation isolation
 
 Use the capability-scoped `storage.artifacts` destination for native object

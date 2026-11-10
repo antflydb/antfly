@@ -1201,3 +1201,34 @@ file, remaining map/opening dependencies, and per-leaf attribution of refill and
 current-source costs. The assembled HN HTTP regression passed in 177 seconds.
 All 1,673 test object versions were deleted with absence verified, and private
 credential files removed. Raw logs and fixture results remain outside the PR.
+
+
+### Selected row-group candidate (b9fb4d7260, November 9)
+
+The optimized server/Lite gate completed all 98 steps and the 141-function export
+check. The focused gate passed 34 cases and the broader gate passed 124 cases
+(77 API / 47 local), with no failures, skips or leaks. Both original-settings
+real-GCS cases and the assembled HN mutation/restart regression passed; HN took
+174.54 seconds. No quiet-host rerun was required.
+
+| Delivery | Warm median | First query after restart | Empty-cache query |
+|---|---:|---:|---:|
+| Stored source | 13.21 ms | 1.91 s | 3.71 s |
+| Parquet hydration | 7.94 ms | 1.29 s | 3.79 s |
+
+These are individual developer-host samples. The preceding cold results were
+4.97 / 4.95 seconds; sub-second cold latency remains unmet. The Parquet case
+recorded eight admitted row-group lane submissions, none declined, peak source
+concurrency seven, and 27 source reads (previously 33). Both cases confirmed two
+preparations across three leaf calls. Both still performed six generation-map
+reads. Stored-source leaf times were 3.35 s for archive, 356 ms for current, and
+1.57 ms for the current refill, motivating independent source waves and physical
+locator capture for range-backed navigation.
+
+Cold stored-source CPU/RSS/footprint were 436 ms / 173.7 MiB / 219.5 MiB;
+Parquet values were 385 ms / 284.9 MiB / 254.2 MiB. The server SHA-256 is
+`03426db292ca9cdb64e1b8451718681387f99c5a4ad0b8dcfc3a2b288df66607`;
+Lite remains `e35df9fdd37c19ddab8aebeafd37f4a0b197d9eed640dbb6e5a32c4184031e9d`.
+All 1,734 versioned objects from the two scoped prefixes were deleted with zero
+remaining, and private credential files were removed. Subsequent source-wave,
+locator-capture and posting-lookahead changes are not measured by these results.

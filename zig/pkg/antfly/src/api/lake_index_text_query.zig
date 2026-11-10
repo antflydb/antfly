@@ -104,9 +104,13 @@ pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.com
 /// One bounded owner per composed request. Tables remain authorized and bound
 /// by the HTTP runner on every leaf; only immutable, cut-bound readers are shared.
 pub const Scope = struct {
-    // Borrowed only during a serial composed leaf callback; never retained by
+    // Borrowed only during this source's leaf callback; never retained by
     // prepared readers, jobs, caches or returned pages.
     active_leaf: ?*@import("lake_query_metrics.zig").ComposedProfile.Leaf = null,
+    children: [16]*Scope = undefined,
+    child_count: usize = 0,
+    parent: ?*Scope = null,
+    reserved: std.atomic.Value(usize) = .init(0),
     read_ahead_budget: local.serverless_query_lake_read_context.ReadAheadBudget = .{},
     io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     budget: local.sql_memory_budget,
@@ -114,6 +118,52 @@ pub const Scope = struct {
     len: usize = 0,
     pub fn init(a: A) Scope {
         return .{ .budget = .{ .backing = a, .limit = 64 * 1024 * 1024 } };
+    }
+    pub fn initChild(self: *Scope, child: *Scope) !void {
+        if (self.parent != null or self.child_count == self.children.len) return error.QueryCandidateBudgetExceeded;
+        child.* = Scope.init(self.budget.allocator());
+        child.parent = self;
+        self.children[self.child_count] = child;
+        self.child_count += 1;
+    }
+    fn reserveSlot(self: *Scope) bool {
+        if (self.len == self.entries.len) return false;
+        const root = self.parent orelse self;
+        var count_ = root.reserved.load(.monotonic);
+        while (count_ < root.entries.len) {
+            if (root.reserved.cmpxchgWeak(count_, count_ + 1, .monotonic, .monotonic)) |observed| count_ = observed else return true;
+        }
+        return false;
+    }
+    fn releaseSlot(self: *Scope) void {
+        const root = self.parent orelse self;
+        _ = root.reserved.fetchSub(1, .monotonic);
+    }
+    const Readers = struct {
+        root: *const Scope,
+        scope_index: usize = 0,
+        entry_index: usize = 0,
+        fn next(self: *Readers) ?*Prepared {
+            while (self.scope_index <= self.root.child_count) {
+                const scope_ = if (self.scope_index == 0) self.root else self.root.children[self.scope_index - 1];
+                if (self.entry_index < scope_.len) {
+                    const entry = scope_.entries[self.entry_index];
+                    self.entry_index += 1;
+                    return entry;
+                }
+                self.scope_index += 1;
+                self.entry_index = 0;
+            }
+            return null;
+        }
+    };
+    fn readers(self: *const Scope) Readers {
+        return .{ .root = self };
+    }
+    fn tokenReader(self: *Scope, token: []const u8) ?*Prepared {
+        var iterator = self.readers();
+        while (iterator.next()) |entry| if (entry.serving_token != null and std.mem.eql(u8, entry.serving_token.?, token)) return entry;
+        return null;
     }
     /// Cached readers are sampled once at request completion, including all
     /// refills. Preserve deltas only for failed/uncached readers whose owners
@@ -124,10 +174,13 @@ pub const Scope = struct {
     }
     pub fn ioSnapshot(self: *const Scope) local.serverless_query_lake_read_context.IoTrace.Snapshot {
         var result = self.io;
-        for (self.entries[0..self.len]) |entry| result.add(entry.io_trace.snapshot());
+        var iterator = self.readers();
+        while (iterator.next()) |entry| result.add(entry.io_trace.snapshot());
+        for (self.children[0..self.child_count]) |child| result.add(child.io);
         return result;
     }
     pub fn deinit(self: *Scope) void {
+        for (self.children[0..self.child_count]) |child| child.deinit();
         for (self.entries[0..self.len]) |entry| entry.deinit();
     }
     /// Turn only capabilities referenced by the returned continuation durable.
@@ -143,15 +196,14 @@ pub const Scope = struct {
             const remote = position.object.getPtr("remote_snapshot") orelse return error.InvalidQueryRequest;
             if (remote.* != .string) return error.InvalidQueryRequest;
             if (!std.mem.startsWith(u8, remote.string, "request-lake:")) continue;
-            const owner = for (self.entries[0..self.len]) |entry| {
-                if (entry.serving_token != null and std.mem.eql(u8, remote.string, entry.serving_token.?)) break entry;
-            } else return error.CatalogGenerationChanged;
+            const owner = self.tokenReader(remote.string) orelse return error.CatalogGenerationChanged;
             remote.* = .{ .string = try owner.publish(server) };
         }
         return std.json.Stringify.valueAlloc(a, root.value, .{});
     }
     pub fn sealCursor(self: *Scope, a: A, payload: []const u8) !?[]const u8 {
-        const signer = for (self.entries[0..self.len]) |entry| {
+        var reader_iterator = self.readers();
+        const signer = while (reader_iterator.next()) |entry| {
             if (entry.native_cut != null and entry.native_owner != null) break entry;
         } else return null;
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, payload, .{});
@@ -160,9 +212,7 @@ pub const Scope = struct {
         for (positions) |position| {
             const token = position.object.get("remote_snapshot").?.string;
             if (std.mem.startsWith(u8, token, "lake3:")) {
-                const entry = for (self.entries[0..self.len]) |candidate| {
-                    if (candidate.serving_token != null and std.mem.eql(u8, candidate.serving_token.?, token)) break candidate;
-                } else return error.CatalogGenerationChanged;
+                const entry = self.tokenReader(token) orelse return error.CatalogGenerationChanged;
                 expiry = @min(expiry, entry.native_expires_ms);
             } else {
                 const token_prefix = if (std.mem.startsWith(u8, token, "lake2:")) "lake2:" else if (std.mem.startsWith(u8, token, "native2:")) "native2:" else return error.InvalidQueryRequest;
@@ -616,7 +666,9 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
         if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
     }
-    const cache = shared != null and reused == null and shared.?.len < shared.?.entries.len;
+    const cache = shared != null and reused == null and shared.?.reserveSlot();
+    var reservation = cache;
+    defer if (reservation) shared.?.releaseSlot();
     const prepared = reused orelse prepared: {
         const started = @import("antfly_platform").time.monotonicNs();
         defer if (is_lake) {
@@ -627,12 +679,13 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         };
         break :prepared try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent) orelse return null;
     };
-    if (scope) |owner| prepared.io_trace.read_ahead_shared = &owner.read_ahead_budget;
+    if (scope) |owner| prepared.io_trace.read_ahead_shared = &(owner.parent orelse owner).read_ahead_budget;
     trace_owner = prepared;
     if (cache) {
         prepared.local_id = shared.?.len;
         shared.?.entries[shared.?.len] = prepared;
         shared.?.len += 1;
+        reservation = false;
         prepared.deferred_cursor = req.remote_snapshot == null;
     }
     defer if (shared == null or (reused == null and !cache)) prepared.deinit();
@@ -6789,4 +6842,27 @@ test "external lake opening composed I/O profiles include refills once and prese
     try std.testing.expectEqual(@as(u64, 6), result.provider_reads);
     try std.testing.expectEqual(@as(u64, 2), result.peak_inflight);
     try std.testing.expectEqual(@as(u64, 1), result.ram_hits);
+}
+
+test "external lake independent source scopes share preparation capacity and memory admission" {
+    const a = std.testing.allocator;
+    var root = Scope.init(a);
+    defer root.deinit();
+    var first: Scope = undefined;
+    var second: Scope = undefined;
+    try root.initChild(&first);
+    try root.initChild(&second);
+    for (0..8) |_| try std.testing.expect(first.reserveSlot());
+    for (0..8) |_| try std.testing.expect(second.reserveSlot());
+    try std.testing.expect(!first.reserveSlot());
+    try std.testing.expect(!second.reserveSlot());
+    for (0..8) |_| first.releaseSlot();
+    for (0..8) |_| second.releaseSlot();
+    try std.testing.expectEqual(@as(usize, 0), root.reserved.load(.acquire));
+    root.budget.limit = 32;
+    const held = try first.budget.allocator().alloc(u8, 24);
+    defer first.budget.allocator().free(held);
+    try std.testing.expectError(error.OutOfMemory, second.budget.allocator().alloc(u8, 16));
+    try std.testing.expect(root.budget.exhausted);
+    try std.testing.expectEqual(@as(usize, 24), root.budget.live);
 }

@@ -45,6 +45,7 @@ pub const Phase = enum {
     composed_total,
     composed_definition,
     composed_leaf,
+    composed_leaf_wall,
     composed_native_leaf,
     composed_cursor,
     admission,
@@ -75,8 +76,8 @@ pub const Navigation = struct {
     overflow_subtrees: u64 = 0,
     metadata_read_bytes: u64 = 0,
 };
-/// Owned by one composed request, including its serial leaf callbacks. Global
-/// deltas cannot attribute one slow request inside a concurrent/warm burst.
+/// Owned by one coordinator or isolated source lane. Parallel lanes merge
+/// after joining; global deltas cannot attribute concurrent request work.
 pub const ComposedProfile = struct {
     nanoseconds: [count]u64 = @splat(0),
     io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
@@ -98,12 +99,17 @@ pub const ComposedProfile = struct {
         io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     };
     pub fn beginLeaf(self: *ComposedProfile, name: []const u8) ?*Leaf {
+        return self.appendLeaf(.{ .source = std.hash.Wyhash.hash(0, name) });
+    }
+    fn appendLeaf(self: *ComposedProfile, input: Leaf) ?*Leaf {
         if (self.leaf_count == self.leaves.len) {
             self.leaf_overflow +|= 1;
             return null;
         }
-        const hash = std.hash.Wyhash.hash(0, name);
-        var value: Leaf = .{ .source = hash, .source_slot = self.leaf_count };
+        const hash = input.source;
+        var value = input;
+        value.source_slot = self.leaf_count;
+        value.repeated = false;
         for (self.leaves[0..self.leaf_count]) |prior| if (prior.source == hash) {
             value.source_slot = prior.source_slot;
             value.repeated = true;
@@ -113,6 +119,12 @@ pub const ComposedProfile = struct {
         result.* = value;
         self.leaf_count += 1;
         return result;
+    }
+    pub fn merge(self: *ComposedProfile, other: *const ComposedProfile) void {
+        for (&self.nanoseconds, other.nanoseconds) |*out, value| out.* +|= value;
+        self.io.add(other.io);
+        self.leaf_overflow +|= other.leaf_overflow;
+        for (other.leaves[0..other.leaf_count]) |leaf| _ = self.appendLeaf(leaf);
     }
     pub fn record(self: *ComposedProfile, metrics: *Metrics, phase: Phase, start: u64) void {
         self.add(metrics, phase, @import("antfly_platform").time.monotonicNs() -| start);
@@ -133,7 +145,7 @@ pub const ComposedProfile = struct {
         return self.nanoseconds[@backingInt(phase)];
     }
     fn composition(self: ComposedProfile) u64 {
-        return self.duration(.composed_total) -| self.duration(.composed_definition) -| self.duration(.composed_leaf) -| self.duration(.composed_cursor);
+        return self.duration(.composed_total) -| self.duration(.composed_definition) -| (if (self.duration(.composed_leaf_wall) != 0) self.duration(.composed_leaf_wall) else self.duration(.composed_leaf)) -| self.duration(.composed_cursor);
     }
 };
 pub const Stats = struct {
@@ -348,7 +360,7 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_io_" ++ field, "gauge", "Request-owned covered lake immutable I/O across serial composed leaves; parallel elapsed sums overlap", @field(profile.io, field));
         }
 
-        inline for (.{ "total", "definition", "leaf", "native_leaf", "cursor" }) |phase| {
+        inline for (.{ "total", "definition", "leaf", "leaf_wall", "native_leaf", "cursor" }) |phase| {
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of the slowest composed request above 750 ms since startup; nested phases overlap", profile.duration(@field(Phase, "composed_" ++ phase)));
         }
         try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_leaf_overflow", "gauge", "Leaf calls exceeding the bounded request-local diagnostic slots", profile.leaf_overflow);
@@ -569,4 +581,27 @@ test "external lake bounded window profiles retain each refill without cross-req
     try append(&output.writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), metrics.snapshot());
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "composed_call_2_repeated 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "archive") == null);
+}
+
+test "external lake independent source profiles merge refills without double counting overlapping wall time" {
+    var metrics: Metrics = .{};
+    var merged: ComposedProfile = .{};
+    var a: ComposedProfile = .{};
+    var b: ComposedProfile = .{};
+    a.beginLeaf("archive").?.preparations = 1;
+    b.beginLeaf("recent").?.preparations = 1;
+    a.add(&metrics, .composed_leaf, 900);
+    b.add(&metrics, .composed_leaf, 300);
+    merged.merge(&a);
+    merged.merge(&b);
+    b = .{};
+    _ = b.beginLeaf("recent");
+    merged.merge(&b);
+    merged.add(&metrics, .composed_leaf_wall, 1000);
+    merged.add(&metrics, .composed_total, 1100);
+    try std.testing.expectEqual(@as(u64, 100), merged.composition());
+    try std.testing.expectEqual(@as(u64, 1200), merged.duration(.composed_leaf));
+    try std.testing.expect(merged.leaves[2].repeated);
+    try std.testing.expectEqual(@as(usize, 1), merged.leaves[2].source_slot);
+    try std.testing.expectEqual(@as(u64, 1), metrics.snapshot().calls[@backingInt(Phase.composed_leaf_wall)]);
 }

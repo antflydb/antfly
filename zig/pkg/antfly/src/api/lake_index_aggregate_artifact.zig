@@ -24,6 +24,9 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const CachedRead = struct {
+    /// Publication-only physical dependency capture, including range-backed
+    /// navigation whose synthetic cache identity is not a provider object.
+    locator: ?struct { ptr: *anyopaque, record: *const fn (*anyopaque, ChunkRef) anyerror!void } = null,
     /// Publication-time capture of verified opening bytes, never request
     /// authority. The callback is borrowed for the synchronous read only.
     capture: ?struct { ptr: *anyopaque, record: *const fn (*anyopaque, []const u8, [32]u8, []const u8) anyerror!void } = null,
@@ -84,6 +87,7 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
         const digest = try stores.sha256DigestFromChecksum(ref.checksum);
         const bytes = try cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, digest, cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
         errdefer a.free(bytes);
+        if (cache.locator) |hook| try hook.record(hook.ptr, ref);
         if (cache.capture) |capture| try capture.record(capture.ptr, ref.artifact_id, digest, bytes);
         return bytes;
     }
@@ -136,6 +140,7 @@ fn readBoundedRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u6
         const key = try std.fmt.bufPrint(&identity, "{s}:page:{x}:{x}", .{ ref.artifact_id, offset, length });
         const bytes = try cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
         errdefer a.free(bytes);
+        if (cache.locator) |hook| try hook.record(hook.ptr, ref);
         if (cache.capture) |capture| try capture.record(capture.ptr, key, digest, bytes);
         return bytes;
     }
@@ -3189,4 +3194,49 @@ test "external lake opening artifact transports preserve scoped deadline errors 
     probe.expired = false;
     try std.testing.expectError(error.DeadlineExceeded, readPhysicalRange(a, store, &id, 0, 1, parent, cached));
     try std.testing.expectEqual(@as(usize, 3), probe.polls);
+}
+
+test "external lake independent source opening capture records physical selectors for synthetic range keys" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("opening-physical-locators");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(71), 1, std.testing.io);
+    const payload = "full physical object with selected navigation";
+    const ref = try store.putWithCancellation(payload, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    defer if (ref.provider_version) |value| a.free(value);
+    const Capture = struct {
+        expected: []const u8,
+        physical: usize = 0,
+        synthetic: usize = 0,
+        fn locator(raw: *anyopaque, value: ChunkRef) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings(self.expected, value.artifact_id);
+            try std.testing.expectEqual(@as(u64, payload.len), value.byte_len);
+            self.physical += 1;
+        }
+        fn capture(raw: *anyopaque, key: []const u8, _: [32]u8, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(std.mem.indexOf(u8, key, ":page:") != null);
+            try std.testing.expectEqualStrings(payload[5..13], bytes);
+            self.synthetic += 1;
+        }
+    };
+    var captured: Capture = .{ .expected = ref.artifact_id };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{}, .locator = .{ .ptr = &captured, .record = Capture.locator }, .capture = .{ .ptr = &captured, .record = Capture.capture } };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[5..13], &digest, .{});
+    for (0..2) |_| {
+        const bytes = try readPageRange(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 5, 8, digest, .none, cached);
+        a.free(bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), captured.physical);
+    try std.testing.expectEqual(@as(usize, 2), captured.synthetic);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.provider_reads);
 }
