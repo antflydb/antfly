@@ -25,33 +25,37 @@ pub const Coverage = struct {
 pub fn inspect(alloc: std.mem.Allocator, manifest: []const u8) !Coverage {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    return inspectValue(parsed.value);
+}
+
+fn inspectValue(value: std.json.Value) !Coverage {
+    if (value != .object) return error.InvalidDocumentExtractionManifest;
     var coverage: Coverage = .{};
-    if (parsed.value.object.get("unsupported_reason")) |reason| {
+    if (value.object.get("unsupported_reason")) |reason| {
         if (reason != .string and reason != .null) return error.InvalidDocumentExtractionManifest;
         coverage.failed = reason == .string and reason.string.len > 0;
     }
     for ([_][]const u8{ "incomplete_unit_count", "retryable_incomplete_unit_count" }) |field| {
-        if (parsed.value.object.get(field)) |count| {
+        if (value.object.get(field)) |count| {
             if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
             coverage.failed = coverage.failed or count.integer > 0;
             if (std.mem.eql(u8, field, "retryable_incomplete_unit_count")) coverage.retryable = coverage.retryable or count.integer > 0;
         }
     }
-    if (parsed.value.object.get("ocr_failed_count")) |count| {
+    if (value.object.get("ocr_failed_count")) |count| {
         if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
         coverage.failed = coverage.failed or count.integer > 0;
     }
-    if (parsed.value.object.get("ocr_retryable_failed_count")) |count| {
+    if (value.object.get("ocr_retryable_failed_count")) |count| {
         if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
         coverage.retryable = coverage.retryable or count.integer > 0;
         coverage.failed = coverage.failed or coverage.retryable;
     }
-    if (parsed.value.object.get("ocr_failed_page_numbers")) |pages| {
+    if (value.object.get("ocr_failed_page_numbers")) |pages| {
         if (pages != .array) return error.InvalidDocumentExtractionManifest;
         coverage.failed = coverage.failed or pages.array.items.len > 0;
     }
-    if (parsed.value.object.get("ocr_failure_details")) |details| {
+    if (value.object.get("ocr_failure_details")) |details| {
         if (details != .array) return error.InvalidDocumentExtractionManifest;
         coverage.failed = coverage.failed or details.array.items.len > 0;
         for (details.array.items) |detail| {
@@ -102,4 +106,40 @@ test "missing modality producers and transcription failures remain incomplete" {
     try std.testing.expect(transient.failed and transient.retryable);
     const unsupported = try inspect(a, "{\"unsupported_reason\":\"video route not configured\"}");
     try std.testing.expect(unsupported.failed and !unsupported.retryable);
+}
+
+/// A converged merge can still contain incomplete OCR or another modality.
+/// All repair paths use this predicate instead of equating readability with
+/// complete extraction. Parse once; never inspect retained child bodies.
+pub const PublicationState = enum { pending, failed, complete };
+pub fn publicationState(alloc: std.mem.Allocator, manifest: []const u8) !PublicationState {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest, .{});
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return error.InvalidDocumentExtractionManifest;
+    const route = value.object.get("route_type") orelse return .pending;
+    if (route != .string or route.string.len == 0) return .pending;
+    if (std.mem.eql(u8, route.string, "error") or value.object.get("last_error") != null) return .failed;
+    if (value.object.get("merge_plan") orelse value.object.get("merge")) |merge| {
+        if (merge != .object) return error.InvalidDocumentExtractionManifest;
+        const status = merge.object.get("status") orelse return .pending;
+        if (status != .string) return error.InvalidDocumentExtractionManifest;
+        if (std.mem.eql(u8, status.string, "failed")) return .failed;
+        if (!std.mem.eql(u8, status.string, "converged")) return .pending;
+    }
+    if (value.object.get("merge_status")) |status| {
+        if (status != .string) return error.InvalidDocumentExtractionManifest;
+        if (std.mem.eql(u8, status.string, "failed")) return .failed;
+        if (!std.mem.eql(u8, status.string, "converged")) return .pending;
+    }
+    return if ((try inspectValue(value)).failed) .failed else .complete;
+}
+
+test "publication health separates readable partial and pending extraction from success" {
+    const a = std.testing.allocator;
+    const prefix = "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"converged\"},\"unit_count\":25,";
+    try std.testing.expectEqual(PublicationState.complete, try publicationState(a, prefix ++ "\"ocr_failed_count\":0}"));
+    inline for (.{ "\"ocr_failed_count\":1", "\"ocr_failed_page_numbers\":[7]", "\"ocr_failure_details\":[{\"retryable\":false}]", "\"incomplete_unit_count\":1", "\"unsupported_reason\":\"missing_transcriber\"", "\"last_error\":{\"code\":\"ReadTransientFailure\"}" }) |failure|
+        try std.testing.expectEqual(PublicationState.failed, try publicationState(a, prefix ++ failure ++ "}"));
+    try std.testing.expectEqual(PublicationState.pending, try publicationState(a, "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"in_progress\"}}"));
 }

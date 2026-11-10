@@ -24910,7 +24910,9 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (options.cancelled()) return error.Canceled;
         var effective_options = options;
-        if (req.target == .index and req.control == null) {
+        if ((req.target == .index or req.repair_job_id != null) and req.control == null) {
+            // Durable artifact jobs, like index repairs, submit restartable
+            // producer work instead of running remote OCR under this guard.
             // Persist the generation intent while the group lifecycle guard is
             // held, then let the DataServer's BackendRuntime maintenance owner
             // perform the admitted long-running work. This request remains a

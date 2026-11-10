@@ -347,9 +347,9 @@ const ManualRuntime = struct {
         self.backlog.releaseThrough(sequence);
     }
 
-    fn canAdvanceToTarget(self: *ManualRuntime, worker: *ManualWorker, from_sequence: u64, target_sequence: u64) !bool {
+    fn canAdvanceToTarget(self: *ManualRuntime, worker: *ManualWorker, from_sequence: u64, target_sequence: u64, replayed_through_sequence: u64) !bool {
         if (self.can_advance_to_target_fn) |callback| {
-            return try callback(self.ctx, worker.kind, from_sequence, target_sequence);
+            return try callback(self.ctx, worker.kind, from_sequence, target_sequence, replayed_through_sequence);
         }
         return true;
     }
@@ -415,7 +415,7 @@ const ManualRuntime = struct {
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
             else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
+                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence, stats.targetAdvanceFromSequence(worker.applied_sequence, worker.target_sequence)))
                 worker.target_sequence
             else
                 worker.applied_sequence;
@@ -465,7 +465,7 @@ const ManualRuntime = struct {
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
             else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
+                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence, stats.targetAdvanceFromSequence(worker.applied_sequence, worker.target_sequence)))
                 worker.target_sequence
             else
                 worker.applied_sequence;
