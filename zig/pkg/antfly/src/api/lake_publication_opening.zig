@@ -131,7 +131,7 @@ const Producer = struct {
             if (ref.byte_len > packs.max_decoded_bytes) continue;
             if (ref.kind == .text_segment and ref.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
                 const root = (try @import("lake_index_native_text.zig").loadDirectory(self.a, self.store.*, ref, self.token, self.cached)).root;
-                if (self.text_count < self.text_roots.len and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
+                if (self.text_count < self.text_roots.len and root.seekable and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
                     self.text_roots[self.text_count] = root;
                     self.text_count += 1;
                 }
