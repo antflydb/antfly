@@ -300,13 +300,36 @@ def test_logical_identity_reuses_reordered_native_indexes(
 
         def ready(name, after=None):
             deadline = time.monotonic() + 90
-            while True:
-                # Fresh-source query failure schedules publication without a
-                # definition change, so it cannot disguise a rebuild as reuse.
-                response = raw("POST", f"/tables/{name}/query", text)
-                assert response.ok or response.status_code in (409, 503), (
-                    response.text + server.debug_logs()
+
+            def probe(*, bounded=True):
+                # A fresh-source query schedules publication without changing
+                # the definition, preserving the reuse-versus-rebuild proof.
+                # Bound only readiness traffic. A successful probe is always
+                # followed by the original full-budget query below.
+                response = raw(
+                    "POST",
+                    f"/tables/{name}/query",
+                    {**text, "timeout_ms": 1000} if bounded else text,
                 )
+                deadline_expired = (
+                    bounded
+                    and response.status_code == 504
+                    and response.json().get("code") == "query_timeout"
+                    and response.json().get("retryable") is True
+                )
+                assert (
+                    response.ok
+                    or response.status_code in (409, 503)
+                    or deadline_expired
+                ), response.text + server.debug_logs()
+                return response
+
+            probe()
+            while True:
+                # Pending queries can hold coherent-read admission for seconds.
+                # Poll published readiness while the owner builds, then confirm
+                # the new revision with the same query instead of continuously
+                # competing with publication for owner admission.
                 indexes = call("GET", f"/tables/{name}/indexes")
                 assert all(
                     i["status"]["readiness"]["state"] != "failed" for i in indexes
@@ -317,12 +340,12 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     if i["config"]["name"] == "text"
                 )
                 if (
-                    response.ok
-                    and revision is not None
+                    revision is not None
                     and revision != after
                     and all(i["status"]["readiness"]["queryable"] for i in indexes)
                 ):
-                    return revision
+                    if probe().ok and probe(bounded=False).ok:
+                        return revision
                 assert time.monotonic() < deadline, str(indexes) + server.debug_logs()
                 time.sleep(0.1)
 
