@@ -134315,6 +134315,7 @@ test "db native snapshot pins a local leann graph file" {
     var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = .query_readonly, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
     defer restored.close();
     const entry = restored.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+    try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
     const query = [_]f32{ 3, 4.23, 1, 4 };
     var results = try entry.index.searchWithRequest(.{ .query = &query, .k = 1 });
     defer results.deinit();

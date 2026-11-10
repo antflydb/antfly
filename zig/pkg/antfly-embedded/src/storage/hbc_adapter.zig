@@ -8024,6 +8024,13 @@ pub const HBCIndex = struct {
         const loader = self.external_vector_loader orelse return error.MissingVectorLoader;
         store.setLoader(.{ .ctx = self.external_vector_ctx.?, .load = loader });
         self.leann = store;
+        // The wrapper can open an empty native HBC root during restore, but
+        // LEANN owns graph durability and uses the generic replay checkpoint.
+        // It must never claim an authoritative HBC posting generation.
+        self.experimental_posting_wal_authoritative.store(false, .release);
+        self.experimental_posting_wal_authoritative_persisted = false;
+        self.experimental_posting_native_authority_persisted = false;
+        self.experimental_posting_authority_transition_permitted = false;
     }
 
     pub fn setExternalVectorLoader(self: *HBCIndex, ctx: *anyopaque, loader: ExternalVectorLoader) void {
