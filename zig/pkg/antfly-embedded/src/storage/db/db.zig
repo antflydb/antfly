@@ -19718,7 +19718,7 @@ pub const DB = struct {
                 const status = try inventory.status(owned, &read, command_namespace);
                 // A publication authority with the right bytes/epoch can
                 // still lack the protocol needed by a newly admitted producer.
-                const required_protocol = try catalogs.effectProtocolFor(owned, status.ordered, 16);
+                const required_protocol = try self.core.index_manager.artifact_semantic_cache.effectProtocolFor(owned, catalogs, status.ordered, 16);
                 const ready = if (active) |value| status.ready and status.ordered != null and status.ordered.?.effect_protocol >= required_protocol and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                 break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
             },
