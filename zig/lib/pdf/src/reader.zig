@@ -37741,7 +37741,9 @@ test "reader optional frame pressure preserves both selected replacements and ba
 }
 
 test "reader optional frame pressure preserves ownership through every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildMetadataFramePressureTestPdfAlloc(a);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseMetadataFramePressureAllocations, .{sample});
