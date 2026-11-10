@@ -45013,7 +45013,7 @@ test "selected owner readiness reads indexed namespaces and ignores unrelated un
         try std.testing.expectEqual(@as(usize, 2), narrowed[0].runtime_statuses.len);
     }
     const baseline_bytes = measured: {
-        var counter = std.testing.FailingAllocator.init(a, .{});
+        var counter = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         const narrowed = try store.readSelectedStores(counter.allocator(), 21, &.{2}, true, .{});
         store.freeStores(counter.allocator(), narrowed);
         try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
@@ -45043,13 +45043,13 @@ test "selected owner readiness reads indexed namespaces and ignores unrelated un
         try txn.commit();
     }
     {
-        var counter = std.testing.FailingAllocator.init(a, .{});
+        var counter = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         const narrowed = try store.readSelectedStores(counter.allocator(), 21, &.{2}, true, .{});
         store.freeStores(counter.allocator(), narrowed);
         try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
-        // Warming storage buffers may reduce allocation, but unrelated
-        // inventory must never increase the selected read's allocation.
-        try std.testing.expect(counter.allocated_bytes <= baseline_bytes);
+        // Disable arena resizing in both measurements so heap fragmentation
+        // cannot affect the exact allocation bound for an identical read.
+        try std.testing.expectEqual(baseline_bytes, counter.allocated_bytes);
     }
     var request: @import("../api.zig").OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 1, .range_id = 1 }, .{ .group_id = 2, .shard_id = 2, .range_id = 2 } } };
     try std.testing.expectEqual(.ready, (try store.ownerReadiness(a, 21, request, .{})).status);
