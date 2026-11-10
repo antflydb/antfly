@@ -19,6 +19,12 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:18591")
     parser.add_argument("--shards", type=int, choices=[1, 2], default=2)
     parser.add_argument("--preexisting-producers", action="store_true")
+    parser.add_argument(
+        "--contract",
+        choices=("all", "mutations", "producers"),
+        default="all",
+        help="Run independent mutation or producer contracts; all remains the CLI default",
+    )
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
     headers = {
@@ -93,7 +99,8 @@ def main():
         assert result["complete"] is True, result
         return result["rows"]
 
-    try:
+    def verify_mutations():
+        nonlocal created_table, created_graph
         call(
             f"/tables/{table}",
             {
@@ -280,6 +287,8 @@ def main():
                 assert query(f"MATCH {patterns} RETURN length(p)") == [
                     [{"type": "integer", "value": "2"}]
                 ]
+
+    def verify_producers():
         # Use a relational fixture for SQL writes; the earlier graph exercises
         # dynamic document properties. Distributed transactions support READ
         # COMMITTED, while bare BEGIN requests serializable range guards.
@@ -599,9 +608,18 @@ def main():
                 call(f"/graphs/{owned_graph}", method="DELETE")
         finally:
             call(f"/tables/{owned_table}", method="DELETE")
-        print(
-            "32 authenticated Cypher mutation semantics checks passed; producer postimages and deferred shortest paths passed"
-        )
+
+    try:
+        if args.contract in ("all", "mutations"):
+            verify_mutations()
+        if args.contract in ("all", "producers"):
+            verify_producers()
+        if args.contract == "all":
+            print(
+                "32 authenticated Cypher mutation semantics checks passed; producer postimages and deferred shortest paths passed"
+            )
+        else:
+            print(f"Authenticated Cypher {args.contract} contract passed")
     finally:
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")
