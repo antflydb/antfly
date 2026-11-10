@@ -3855,6 +3855,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (sync_level != .enrichments or sequence == 0) return;
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const runtime_stats = runtime.stats();
+            if (runtime_stats.applied_sequence >= sequence) return;
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
             if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {

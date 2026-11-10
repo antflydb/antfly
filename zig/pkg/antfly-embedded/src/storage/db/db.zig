@@ -54777,6 +54777,7 @@ fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionCont
     if (sync_level != .enrichments or sequence == 0) return;
     const runtime = ctx.enrichment_runtime orelse return;
     const runtime_stats = runtime.stats();
+    if (runtime_stats.applied_sequence >= sequence) return;
     if (try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence)) {
         try runtime.markAppliedThrough(sequence);
     }
@@ -77970,8 +77971,40 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqual(@as(u64, 1), hook_ctx.status_calls);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 
+    const runtime = db.enrichment_runtime.?;
+    runtime.target_sequence = 2;
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = 42;
+    runtime.retry_failure_count = 2;
+    for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
+        try enrichment_state.saveReplayCursor(runtime.store, scope, .{
+            .base_applied_sequence = 1,
+            .sequence = 2,
+            .doc_key = @constCast("pending-doc"),
+        });
+    }
+    // Waiting for an already applied cut must preserve later retry/cursor
+    // state and must not publish another replicated status write.
+    const status_before_wait = hook_ctx.status_calls;
+    try db.markPrecomputedEnrichmentAppliedForSync(.enrichments, 1);
+    const context = db.batchContext();
+    try markPrecomputedEnrichmentAppliedForSyncContext(&context, .enrichments, 1);
+    // The runtime also fences a worker advance racing the callers' snapshot.
+    try runtime.markAppliedThrough(1);
+    try runtime.markAppliedThrough(0);
+    try std.testing.expectEqual(status_before_wait, hook_ctx.status_calls);
+    try std.testing.expect(runtime.retrying);
+    try std.testing.expectEqual(@as(u64, 42), runtime.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 2), runtime.retry_failure_count);
+    for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
+        var cursor = (try enrichment_state.loadReplayCursor(alloc, runtime.store, scope)) orelse return error.TestExpectedEqual;
+        defer cursor.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 2), cursor.sequence);
+        try std.testing.expectEqualStrings("pending-doc", cursor.doc_key);
+    }
+
     try db.enrichment_runtime.?.markAppliedThrough(2);
-    try std.testing.expectEqual(@as(u64, 2), hook_ctx.status_calls);
+    try std.testing.expectEqual(status_before_wait + 1, hook_ctx.status_calls);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 }
 

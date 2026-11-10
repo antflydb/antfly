@@ -8323,14 +8323,16 @@ const PlatformEnrichmentRuntime = struct {
     pub fn markAppliedThrough(self: *EnrichmentRuntime, sequence: u64) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
-        var changed = false;
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
-        if (sequence > self.applied_sequence) {
-            self.applied_sequence = sequence;
-            changed = true;
-        }
         self.target_sequence = @max(self.target_sequence, sequence);
+        // Match the single-threaded runtime: an already acknowledged cut
+        // must not erase newer retry/cursor state or replicate another status.
+        if (sequence <= self.applied_sequence) {
+            self.mutex.unlock(io);
+            return;
+        }
+        self.applied_sequence = sequence;
         self.last_error_name = null;
         self.retrying = false;
         clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
@@ -8347,9 +8349,7 @@ const PlatformEnrichmentRuntime = struct {
         broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
 
-        if (changed) {
-            try saveAppliedSequenceWithRetry(self, scope_name, sequence);
-        }
+        try saveAppliedSequenceWithRetry(self, scope_name, sequence);
         try clearReplayCursorWithRetry(self);
         try saveRuntimeStatusWithRetry(self, scope_name, status);
         self.notifyStatusHook();
