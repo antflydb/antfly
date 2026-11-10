@@ -39132,14 +39132,18 @@ fn exerciseNestedFrameOwnership(a: Allocator, sample: []const u8, encrypted: boo
 }
 
 test "reader LRU frame ownership survives every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildNestedFontContainerTestAlloc(a, 2, 2048);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNestedFrameOwnership, .{ sample, false });
 }
 
 test "reader encrypted LRU frames preserve source keys and allocator ownership" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildNestedFontContainerTestAlloc(a, 2, 2048);
     defer a.free(sample);
     {
