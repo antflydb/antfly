@@ -19,36 +19,37 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // Client targets an explicit source-management mount, not a database listener.
 // Credential installation remains a hosting-runtime operation.
 type Client struct {
-	base, token string
-	http        *http.Client
+	base  string
+	token func(context.Context) (string, error)
+	http  *http.Client
 }
 
 func NewClient(base, token string) (*Client, error) {
-	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("invalid source-management endpoint")
+	opts := Options{}
+	if token != "" && !strings.ContainsAny(token, "\r\n") {
+		opts.Token = func(context.Context) (string, error) { return token, nil }
 	}
-	local := u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"
-	if u.Scheme != "https" && !(u.Scheme == "http" && local) {
-		return nil, fmt.Errorf("source-management endpoint requires HTTPS or loopback HTTP")
-	}
-	if token == "" || strings.ContainsAny(token, "\r\n") {
-		return nil, fmt.Errorf("invalid source-management token")
-	}
-	return &Client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return NewClientWithOptions(base, opts)
 }
 func (c *Client) call(ctx context.Context, method, path, key string, input, output any) error {
+	token, err := c.token(ctx)
+	if err != nil {
+		return fmt.Errorf("source-management token: %w", err)
+	}
+	if token == "" || strings.ContainsAny(token, "\r\n") {
+		return fmt.Errorf("invalid source-management token")
+	}
 	var body io.Reader
 	if input != nil {
 		raw, err := json.Marshal(input)
@@ -61,14 +62,18 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 	if err != nil {
 		return err
 	}
-	r.Header.Set("Authorization", "Bearer "+c.token)
+	r.Header.Set("Authorization", "Bearer "+token)
 	r.Header.Set("Content-Type", "application/json")
 	if key != "" {
 		r.Header.Set("Idempotency-Key", key)
 	}
 	response, err := c.http.Do(r)
 	if err != nil {
-		return fmt.Errorf("source-management transport failed")
+		var urlErr *url.Error
+		return &TransportError{
+			Timeout: errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &urlErr) && urlErr.Timeout()),
+			cause:   ctx.Err(),
+		}
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, MaxResponseBytes+1))
