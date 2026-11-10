@@ -5,6 +5,7 @@ import argparse
 import base64
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,7 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:18591")
     parser.add_argument("--shards", type=int, choices=[1, 2], default=2)
     parser.add_argument("--preexisting-producers", action="store_true")
+    parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
     headers = {
         "Content-Type": "application/json",
@@ -29,6 +31,16 @@ def main():
     created_table = created_graph = False
 
     def call(path, body=None, method="POST", status=None):
+        began = time.monotonic()
+        if args.progress:
+            statement = (
+                body.get("query", body.get("statement", ""))
+                if isinstance(body, dict)
+                else ""
+            )
+            print(
+                f"START {method} {path} {statement[:200]}", file=sys.stderr, flush=True
+            )
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -60,6 +72,12 @@ def main():
                 time.sleep(0.25)
                 continue
             break
+        if args.progress:
+            print(
+                f"DONE {code} {time.monotonic() - began:.3f}s {path}",
+                file=sys.stderr,
+                flush=True,
+            )
         assert (200 <= code < 300) if status is None else code == status, (
             path,
             code,

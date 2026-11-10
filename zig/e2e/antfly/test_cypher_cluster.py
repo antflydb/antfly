@@ -204,23 +204,42 @@ def test_authenticated_cypher_producer_postimages_on_replicated_owners(
     script = (
         Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_mutations.py"
     )
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--url",
-            endpoint,
-            *(["--preexisting-producers"] if preexisting_producers else []),
-        ],
-        env={
-            **os.environ,
-            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
-        },
-        capture_output=True,
-        text=True,
-        timeout=220,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--url",
+                endpoint,
+                "--progress",
+                *(["--preexisting-producers"] if preexisting_producers else []),
+            ],
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=220,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+
+        def output(value):
+            return (
+                value.decode(errors="replace")
+                if isinstance(value, bytes)
+                else value or ""
+            )
+
+        pytest.fail(
+            "Cypher mutation qualification timed out.\n"
+            + output(error.stdout)
+            + output(error.stderr)
+            + "\n"
+            + cluster.debug_logs(),
+            pytrace=False,
+        )
     witnesses = []
     if result.returncode != 0:
         for metadata_node in range(3):
