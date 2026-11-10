@@ -123,6 +123,7 @@ pub fn requireNamespace(a: A, txn: anytype, namespace: [24]u8) !void {
 pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_from_ns: i128) !void {
     try binding.validate();
     if (binding.closed) return error.InvalidRetainedSeries;
+    try @import("retained_series_revocation.zig").requireInstall(txn, .{ .id = binding.spec.id, .generation = binding.spec.generation, .definition = binding.spec.definition, .partition = binding.spec.source_partition, .incarnation = binding.spec.source_incarnation });
     const previous = try load(a, txn);
     if (previous.len == max_bindings) return error.RetainedSeriesBatchTooLarge;
     var latest: u64 = 0;
@@ -141,6 +142,33 @@ pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_
     try (series.Engine{ .alloc = a, .spec = binding.spec }).install(txn, sequence, context.admitted_ns, complete_from_ns);
     try txn.put(registry_key, raw);
     try txn.put(active_key, "1");
+}
+
+/// The cancellation receipt and producer stop commit together. Missing native
+/// installations still acquire a tombstone before metadata releases a source.
+pub fn revokeBinding(a: A, txn: anytype, fence: @import("retained_series_revocation.zig").Fence, admitted_ns: i128) !void {
+    try fence.validate();
+    const previous = try load(a, txn);
+    const next = try a.dupe(Binding, previous);
+    var found = false;
+    var active = false;
+    for (next) |*binding| {
+        if (std.mem.eql(u8, &binding.spec.id, &fence.id) and binding.spec.generation == fence.generation) {
+            if (!std.mem.eql(u8, &binding.spec.definition, &fence.definition) or
+                !std.mem.eql(u8, &binding.spec.source_partition, &fence.partition) or binding.spec.source_incarnation != fence.incarnation) return error.RetainedSeriesDefinitionMismatch;
+            try (series.Engine{ .alloc = a, .spec = binding.spec }).revoke(txn, admitted_ns);
+            binding.closed = true;
+            found = true;
+        }
+        active = active or !binding.closed;
+    }
+    if (found) {
+        const raw = try std.json.Stringify.valueAlloc(a, next, .{});
+        if (raw.len > 32768) return error.RetainedSeriesBatchTooLarge;
+        try txn.put(registry_key, raw);
+        if (active) try txn.put(active_key, "1") else try txn.delete(active_key);
+    }
+    try @import("retained_series_revocation.zig").stage(txn, fence);
 }
 
 pub fn closeBinding(a: A, txn: anytype, id: series.Id, generation: u64, admitted_ns: i128) !void {
@@ -949,6 +977,31 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     defer new_reader.close();
     const new_page = try new_reader.next(10);
     try std.testing.expectEqual(@as(?f64, 5), new_page.rows[0].metrics[1].value(.sum));
+    try db.batch(.{ .timestamp_ns = 269, .retained_series = .{ .action = .revoke, .fence = next_fence } });
+    try db.batch(.{ .timestamp_ns = 270, .retained_series = .{ .action = .revoke, .fence = next_fence } });
+    try std.testing.expect(!try db.core.store.retainedSeriesActive());
+    try std.testing.expectError(error.RetainedSeriesSourceRevoked, db.batch(.{ .timestamp_ns = 271, .retained_series = .{ .action = .install, .fence = next_fence, .binding = next, .complete_from_ns = 260 } }));
+    var cancelled = next;
+    cancelled.spec.generation = 3;
+    cancelled.spec.definition = @splat(9);
+    var cancelled_fence = next_fence;
+    cancelled_fence.generation = 3;
+    cancelled_fence.definition = cancelled.spec.definition;
+    try db.batch(.{ .timestamp_ns = 272, .retained_series = .{ .action = .install, .fence = cancelled_fence, .binding = cancelled, .complete_from_ns = 260 } });
+    try std.testing.expect(try db.core.store.retainedSeriesActive());
+    // Cancel before even the first backfill page; this must never certify
+    // partial aggregates as independently retained coverage.
+    try db.batch(.{ .timestamp_ns = 273, .retained_series = .{ .action = .revoke, .fence = cancelled_fence } });
+    try std.testing.expect(!try db.core.store.retainedSeriesActive());
+    var missing = cancelled;
+    missing.spec.id = @splat(7);
+    missing.spec.generation = 1;
+    var missing_fence = cancelled_fence;
+    missing_fence.id = missing.spec.id;
+    missing_fence.generation = 1;
+    try db.batch(.{ .timestamp_ns = 274, .retained_series = .{ .action = .revoke, .fence = missing_fence } });
+    try std.testing.expectError(error.RetainedSeriesSourceRevoked, db.batch(.{ .timestamp_ns = 275, .retained_series = .{ .action = .install, .fence = missing_fence, .binding = missing } }));
+    try db.batch(.{ .timestamp_ns = 276, .writes = &.{.{ .key = "after-cancel", .value = "{\"unrelated\":true}" }} });
 }
 
 /// Prepared once under the native writer fence, then used for each TTL

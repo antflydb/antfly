@@ -730,3 +730,28 @@ test "retained series generation closure drains even no-op prepares and finalize
     try std.testing.expectEqual(@as(?f64, 3), page.rows[0].metrics[3].value(.min));
     try std.testing.expectEqual(@as(u64, 1), (try e.status(temp, &store)).source_sequence);
 }
+
+test "retained series cancellation drains prepares without certifying unfinished backfill" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try e.install(&store, 0, 1, 0);
+    const values = [_]?f64{ null, 3, 3, 3, 3 };
+    const row = sample(1, &values);
+    try e.prepare(&store, @splat(1), 1, &.{.{ .key = "new", .after = row }});
+    try std.testing.expectError(error.RetainedSeriesPreparedHold, e.revoke(&store, 2));
+    _ = try e.releasePrepared(&store, @splat(1));
+    try e.revoke(&store, 3);
+    try e.revoke(&store, 99);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const p = try e.status(arena.allocator(), &store);
+    try std.testing.expect(p.closed and p.revoked and !p.ready);
+    try std.testing.expectEqual(@as(i128, 3), p.admitted_ns);
+    try std.testing.expectError(error.RetainedSeriesSourceRevoked, e.close(&store, 4));
+    try std.testing.expectError(error.RetainedSeriesSourceRevoked, e.snapshotCursor(&store));
+    try std.testing.expectError(error.RetainedSeriesSourceRevoked, e.requireClosedSpan(arena.allocator(), &store, .{ .start_ns = "0", .end_ns = "10" }, null));
+    try std.testing.expectError(error.RetainedSeriesSourceClosed, e.apply(&store, 1, 4, .mutation, &.{.{ .key = "late", .after = row }}));
+    var planner: @import("retained_series_maintenance.zig").Planner = .{};
+    try std.testing.expectEqual(@as(?@import("retained_series_maintenance.zig").Task, null), try planner.next(&.{.{ .spec = e.spec, .progress = p }}, 100));
+}

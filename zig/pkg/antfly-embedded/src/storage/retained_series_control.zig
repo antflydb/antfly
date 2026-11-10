@@ -18,9 +18,9 @@ const std = @import("std");
 const series = @import("retained_series.zig");
 const capture = @import("retained_series_capture.zig");
 const A = std.mem.Allocator;
-pub const Fence = struct { id: series.Id, generation: u64, definition: series.Id, partition: series.Id, incarnation: u64 };
+pub const Fence = @import("retained_series_revocation.zig").Fence;
 pub const Command = struct {
-    action: enum { install, backfill, tick, cleanup, close },
+    action: enum { install, backfill, tick, cleanup, close, revoke },
     fence: Fence,
     binding: ?capture.Binding = null,
     complete_from_ns: i128 = 0,
@@ -60,6 +60,7 @@ pub const Rejection = error{
     RetainedSeriesResolutionMismatch,
     RetainedSeriesSequenceMismatch,
     RetainedSeriesSourceClosed,
+    RetainedSeriesSourceRevoked,
     RetainedSeriesTimeOverflow,
 };
 pub fn requireFence(f: Fence, spec: series.Spec) !void {
@@ -92,6 +93,10 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
         try capture.install(a, txn, command.binding.?, .{ .sequence = source_sequence, .admitted_ns = admitted_ns }, command.complete_from_ns);
         return;
     }
+    if (command.action == .revoke) {
+        try capture.revokeBinding(a, txn, command.fence, admitted_ns);
+        return;
+    }
     const bindings = try capture.load(a, txn);
     const spec = for (bindings) |binding| {
         if (std.mem.eql(u8, &binding.spec.id, &command.fence.id) and binding.spec.generation == command.fence.generation) break binding.spec;
@@ -99,7 +104,7 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
     try requireFence(command.fence, spec);
     const engine = series.Engine{ .alloc = a, .spec = spec };
     switch (command.action) {
-        .install => unreachable,
+        .install, .revoke => unreachable,
         .backfill => _ = try capture.backfillPage(a, txn, spec.id, spec.generation, command.expected_cursor, command.work_limit),
         .tick => _ = try engine.tick(txn, admitted_ns, command.work_limit),
         .cleanup => _ = try engine.cleanupBackfill(txn, command.work_limit),

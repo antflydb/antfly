@@ -106,6 +106,8 @@ pub const Progress = struct {
     complete_from_ns: i128,
     ready: bool = false,
     closed: bool = false,
+    /// Terminal producer cancellation; incomplete backfill never becomes coverage.
+    revoked: bool = false,
     backfill_cursor: []const u8 = "",
     backfill_clean: bool = false,
     feed_latest: u64 = 0,
@@ -187,7 +189,8 @@ pub const Engine = struct {
         const raw = try txn.get(k);
         const p = (try std.json.parseFromSlice(Progress, a, raw, .{ .allocate = .alloc_always })).value;
         if (!std.mem.eql(u8, &p.definition, &self.spec.definition) or p.source_incarnation != self.spec.source_incarnation) return error.RetainedSeriesDefinitionMismatch;
-        if ((p.backfill_clean or p.closed) and !p.ready) return error.RetainedSeriesCorrupt;
+        if ((p.backfill_clean or (p.closed and !p.revoked)) and !p.ready) return error.RetainedSeriesCorrupt;
+        if (p.revoked and !p.closed) return error.RetainedSeriesCorrupt;
         if (p.feed_floor > p.feed_latest or p.feed_latest - p.feed_floor > max_feed_frames or p.feed_bytes > max_feed_bytes or
             try self.spec.bucket(p.complete_from_ns) != p.complete_from_ns) return error.RetainedSeriesCorrupt;
         return p;
@@ -213,12 +216,30 @@ pub const Engine = struct {
     /// Even no-contribution prepared intents must drain before closure; their
     /// later resolution must never create a dependency on a retired producer.
     pub fn close(self: Engine, txn: anytype, admitted_ns: i128) !void {
+        return self.stop(txn, admitted_ns, false);
+    }
+    /// Cancellation drains transactions but need not finish an initial scan.
+    /// Revoked progress is terminal and cannot certify archival coverage.
+    pub fn revoke(self: Engine, txn: anytype, admitted_ns: i128) !void {
+        return self.stop(txn, admitted_ns, true);
+    }
+    fn stop(self: Engine, txn: anytype, admitted_ns: i128, revoking: bool) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var p = try self.load(a, txn);
-        if (p.closed) return;
-        if (!p.ready) return error.RetainedSeriesNotReady;
+        if (p.revoked) {
+            if (revoking) return;
+            return error.RetainedSeriesSourceRevoked;
+        }
+        if (p.closed) {
+            if (revoking) {
+                p.revoked = true;
+                try self.save(a, txn, p);
+            }
+            return;
+        }
+        if (!revoking and !p.ready) return error.RetainedSeriesNotReady;
         for ([_][]const u8{ "reservation:", "hold:" }) |suffix| {
             const pending_prefix = try self.key(a, suffix);
             var cursor = try txn.openCursor();
@@ -227,6 +248,7 @@ pub const Engine = struct {
         }
         p.admitted_ns = @max(p.admitted_ns, admitted_ns);
         p.closed = true;
+        p.revoked = revoking;
         try self.save(a, txn, p);
     }
     fn bucketKey(self: Engine, a: A, row: Row) ![]u8 {
@@ -498,6 +520,7 @@ pub const Engine = struct {
         const end = try range.end();
         if (try self.spec.bucket(start) != start or try self.spec.bucket(end) != end) return error.RetainedSeriesResolutionMismatch;
         const p = try self.load(a, txn);
+        if (p.revoked) return error.RetainedSeriesSourceRevoked;
         if (!p.ready) return error.RetainedSeriesNotReady;
         if (start < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
         if (try self.spec.expired(start, p.admitted_ns)) return error.RetainedSeriesHistoryExpired;
@@ -570,6 +593,7 @@ pub const Engine = struct {
                 if (change.after != null) return error.RetainedSeriesNotReady;
                 if (change.before) |r| {
                     if (try self.spec.bucket(r.timestamp_ns) < p.complete_from_ns or try self.spec.expired(r.timestamp_ns, now)) continue;
+                    if (p.revoked) return error.RetainedSeriesSourceRevoked;
                     if (!p.ready) return error.RetainedSeriesNotReady;
                     if (!try self.spec.finalized(r.timestamp_ns, now)) return error.RetainedSeriesCorrectionWindow;
                     // Drop mutable extrema support only after finality. The
@@ -683,6 +707,7 @@ pub const Engine = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var state = try self.load(a, txn);
+        if (state.revoked) return error.RetainedSeriesSourceRevoked;
         if (!state.ready) return error.RetainedSeriesNotReady;
         state.admitted_ns = @max(state.admitted_ns, admitted_ns);
         state.last_tick_ns = state.admitted_ns;
@@ -800,6 +825,7 @@ pub const Engine = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var p = try self.load(a, txn);
+        if (p.revoked) return error.RetainedSeriesSourceRevoked;
         if (!p.ready) return error.RetainedSeriesNotReady;
         if (p.backfill_clean) return 0;
         const marker = try self.key(a, "backfill:");
@@ -829,6 +855,7 @@ pub const Engine = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const p = try self.load(arena.allocator(), txn);
+        if (p.revoked) return error.RetainedSeriesSourceRevoked;
         if (!p.ready) return error.RetainedSeriesNotReady;
         return .{ .definition = p.definition, .partition = self.spec.source_partition, .incarnation = p.source_incarnation, .sequence = p.feed_latest };
     }
@@ -836,6 +863,7 @@ pub const Engine = struct {
     pub fn poll(self: Engine, a: A, txn: anytype, cursor: Cursor, limit: usize) ![]const Frame {
         if (limit == 0 or limit > max_feed_frames) return error.RetainedSeriesBatchTooLarge;
         const p = try self.load(a, txn);
+        if (p.revoked) return error.RetainedSeriesSourceRevoked;
         if (!p.ready) return error.RetainedSeriesNotReady;
         if (!std.mem.eql(u8, &cursor.definition, &p.definition) or !std.mem.eql(u8, &cursor.partition, &self.spec.source_partition) or cursor.incarnation != p.source_incarnation or cursor.sequence < p.feed_floor or cursor.sequence > p.feed_latest) return error.RetainedSeriesResetRequired;
         const count: usize = @intCast(@min(p.feed_latest - cursor.sequence, limit));

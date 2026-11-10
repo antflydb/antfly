@@ -43,6 +43,7 @@ pub const Planner = struct {
             self.next_slot = (slot + 1) % slots;
             const index = slot / 3;
             const entry = entries[index];
+            if (entry.progress.revoked) continue;
             try entry.spec.validate();
             if (!std.mem.eql(u8, &entry.spec.definition, &entry.progress.definition) or entry.spec.source_incarnation != entry.progress.source_incarnation) return error.RetainedSeriesDefinitionMismatch;
             switch (slot % 3) {
