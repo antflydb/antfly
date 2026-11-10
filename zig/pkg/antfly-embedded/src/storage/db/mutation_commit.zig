@@ -2768,12 +2768,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &write_buffers.owned_store_values,
                 );
             }
-            try @import("../retained_series_capture.zig").appendContext(
+            try @import("../retained_series_capture.zig").appendContextForResolution(
                 S.ownerField(self, "alloc").*,
                 S.ownerField(self, "core").*.store,
                 sequence,
                 batch_timestamp_ns,
                 .mutation,
+                if (opts.transaction_resolution) |resolution| .{ .transaction = resolution.txn_id, .decision = .committed } else null,
                 &write_buffers.store_writes,
                 &write_buffers.owned_store_values,
             );
@@ -4037,15 +4038,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
+                var completion_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+                defer completion_writes.deinit(alloc);
+                var completion_values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (completion_values.items) |value| alloc.free(value);
+                    completion_values.deinit(alloc);
+                }
+                try completion_writes.appendSlice(alloc, marker_writes);
+                try @import("../retained_series_capture.zig").appendContextForResolution(alloc, S.ownerField(self, "core").*.store, 0, commit_version, .mutation, .{ .transaction = txn_id, .decision = .aborted }, &completion_writes, &completion_values);
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
-                    .completion_writes = marker_writes,
+                    .completion_writes = completion_writes.items,
                     .resolved_participant = resolved_participant,
                 }) catch |err| switch (err) {
                     // An abort decision for a participant that was declared but
                     // never enlisted is already satisfied. Treat it as an
                     // idempotent no-op so coordinator recovery can acknowledge it.
                     transactions_mod.TxnError.TxnNotFound => {
-                        if (marker_writes.len != 0) try S.ownerField(self, "core").*.store.putBatch(marker_writes, &.{});
+                        if (completion_writes.items.len != 0) try S.ownerField(self, "core").*.store.putBatch(completion_writes.items, &.{});
                         return;
                     },
                     else => return err,
@@ -4086,12 +4096,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             return err;
                         };
                     };
+                    var completion_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+                    defer completion_writes.deinit(alloc);
+                    var completion_values = std.ArrayListUnmanaged([]u8).empty;
+                    defer {
+                        for (completion_values.items) |value| alloc.free(value);
+                        completion_values.deinit(alloc);
+                    }
+                    completion_writes.appendSlice(alloc, marker_writes) catch |err| {
+                        S.ownerField(self, "core").*.unlockApply();
+                        return err;
+                    };
+                    @import("../retained_series_capture.zig").appendContextForResolution(alloc, S.ownerField(self, "core").*.store, 0, commit_version, .mutation, .{ .transaction = txn_id, .decision = .committed }, &completion_writes, &completion_values) catch |err| {
+                        S.ownerField(self, "core").*.unlockApply();
+                        return err;
+                    };
                     const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                         txn_id,
                         status,
                         commit_version,
                         .{
-                            .completion_writes = marker_writes,
+                            .completion_writes = completion_writes.items,
                             .resolved_participant = resolved_participant,
                             .expected_intent_revision = intents.revision,
                             .known_intent_keys = intent_keys,

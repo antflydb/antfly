@@ -44,7 +44,8 @@ pub fn cacheAbsent(cache: *Cache, observed: u64) void {
 pub const context_key = "\x00\x00__metadata__:retained_series_context_v1";
 pub const max_bindings = 8;
 pub const max_capture_bytes = 64 * 1024 * 1024;
-pub const Context = struct { sequence: u64, admitted_ns: i128, cause: series.Cause = .mutation, source_replay_sequence: u64 = 0 };
+pub const Resolution = struct { transaction: [16]u8, decision: enum { committed, aborted } };
+pub const Context = struct { sequence: u64, admitted_ns: i128, cause: series.Cause = .mutation, source_replay_sequence: u64 = 0, resolution: ?Resolution = null };
 pub const DimensionType = enum { integer, number, boolean, string, datetime };
 pub const Binding = struct {
     spec: series.Spec,
@@ -98,6 +99,143 @@ pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_
     try saveSequence(txn, sequence);
     try (series.Engine{ .alloc = a, .spec = binding.spec }).install(txn, sequence, context.admitted_ns, complete_from_ns);
     try txn.put(registry_key, raw);
+}
+
+/// Physical inputs have already been schema-normalized by native intent
+/// preparation. Metadata intents are excluded by that caller before planning.
+pub const PreparedInput = struct { key: []const u8, logical_key: []const u8, after: ?[]const u8 };
+pub const AdmissionCost = series.AdmissionCost;
+pub const PrepareEffects = struct { writes: []const @import("docstore.zig").KVPair, deletes: []const []const u8, costs: []const AdmissionCost };
+const PreparedBudget = struct { count: usize = 0, before: usize = 0, after: usize = 0 };
+const PreparedMember = struct { key: []const u8, before: usize, after: usize };
+const prepared_prefix = "\x00\x00__metadata__:retained_series_prepared_v1:";
+fn preparedKeysPrefix(a: A, transaction: [16]u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}{s}:keys:", .{ prepared_prefix, std.fmt.bytesToHex(transaction, .lower) });
+}
+fn preparedCountKey(a: A, transaction: [16]u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}{s}:count", .{ prepared_prefix, std.fmt.bytesToHex(transaction, .lower) });
+}
+/// A point-only overlay plans metadata under the DB apply fence without
+/// opening a second writer or changing state before the intent vote commits.
+/// All returned bytes belong to the caller's preparation arena.
+const PrepareOverlay = struct {
+    a: A,
+    read: *@import("docstore.zig").DocStore.Txn,
+    pending: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+        if (self.pending.get(key)) |value| return value orelse error.NotFound;
+        return self.read.get(key);
+    }
+    pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+        const entry = try self.pending.getOrPut(self.a, key);
+        if (!entry.found_existing) entry.key_ptr.* = try self.a.dupe(u8, key);
+        entry.value_ptr.* = try self.a.dupe(u8, value);
+    }
+    pub fn delete(self: *@This(), key: []const u8) !void {
+        const entry = try self.pending.getOrPut(self.a, key);
+        if (!entry.found_existing) entry.key_ptr.* = try self.a.dupe(u8, key);
+        entry.value_ptr.* = null;
+    }
+};
+
+pub fn planPrepare(a: A, read: *@import("docstore.zig").DocStore.Txn, transaction: [16]u8, admitted_ns: i128, inputs: []const PreparedInput) !PrepareEffects {
+    if (inputs.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+    if (inputs.len > series.max_changes) return error.RetainedSeriesBatchTooLarge;
+    const bindings = try load(a, read);
+    if (bindings.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+    var overlay = PrepareOverlay{ .a = a, .read = read };
+    var selected = std.StringHashMapUnmanaged(PreparedInput).empty;
+    for (inputs) |input| {
+        if (!keys.isStoredDocumentRowKey(input.key)) return error.InvalidRetainedSeriesRow;
+        // Match native last-intent-wins semantics within a prepare request.
+        try selected.put(a, input.key, input);
+    }
+    const Decoded = struct { input: PreparedInput, before: ?Image, after: ?Image, member_bytes: usize };
+    const decoded = try a.alloc(Decoded, selected.count());
+    var iterator = selected.iterator();
+    var count: usize = 0;
+    var decoder = try Decoder.init(a, bindings);
+    const key_prefix = try preparedKeysPrefix(a, transaction);
+    const count_key = try preparedCountKey(a, transaction);
+    var total = if (try optional(&overlay, count_key)) |raw| try std.json.parseFromSliceLeaky(PreparedBudget, a, raw, .{}) else PreparedBudget{};
+    if (total.count > series.max_changes or total.before > max_capture_bytes or total.after > max_capture_bytes) return error.RetainedSeriesCorrupt;
+    while (iterator.next()) |entry| {
+        const input = entry.value_ptr.*;
+        const borrowed_before = try optional(&overlay, input.key);
+        const before = if (borrowed_before) |value| try a.dupe(u8, value) else null;
+        const before_size = std.math.add(usize, input.key.len, if (before) |value| value.len else 0) catch return error.RetainedSeriesBatchTooLarge;
+        // AROW metadata finalization preserves length. Document source bytes
+        // use the same bounded encoding proof as retained intent admission.
+        const after_size = if (input.after) |value| if (rows.looksLikeRow(value) or std.mem.startsWith(u8, value, "AJV1")) value.len else try @import("document_value_bound.zig").maximumStoredBytes(a, value) else 0;
+        var digest: series.Id = undefined;
+        std.crypto.hash.sha2.Sha256.hash(input.key, &digest, .{});
+        const member = try std.fmt.allocPrint(a, "{s}{s}", .{ key_prefix, std.fmt.bytesToHex(digest, .lower) });
+        if (try optional(&overlay, member)) |existing| {
+            const prior = try std.json.parseFromSliceLeaky(PreparedMember, a, existing, .{ .allocate = .alloc_always });
+            if (!std.mem.eql(u8, prior.key, input.key) or prior.before != before_size) return error.RetainedSeriesCorrupt;
+            total.before = std.math.sub(usize, total.before, prior.before) catch return error.RetainedSeriesCorrupt;
+            total.after = std.math.sub(usize, total.after, prior.after) catch return error.RetainedSeriesCorrupt;
+        } else {
+            if (total.count >= series.max_changes) return error.RetainedSeriesBatchTooLarge;
+            total.count += 1;
+        }
+        if (before_size > max_capture_bytes - total.before or after_size > max_capture_bytes - total.after) return error.RetainedSeriesBatchTooLarge;
+        total.before += before_size;
+        total.after += after_size;
+        // Decoder materializes/copies the before image before another schema
+        // lookup can invalidate the backend's borrowed point-read scratch.
+        const old = if (before) |value| try decoder.read(&overlay, value) else null;
+        const encoded_member = try std.json.Stringify.valueAlloc(a, PreparedMember{ .key = input.key, .before = before_size, .after = after_size }, .{});
+        if (encoded_member.len > 32768) return error.RetainedSeriesBatchTooLarge;
+        try overlay.put(member, encoded_member);
+        decoded[count] = .{ .input = input, .before = old, .after = if (input.after) |value| try decoder.read(&overlay, value) else null, .member_bytes = member.len + encoded_member.len };
+        count += 1;
+    }
+    const encoded_budget = try std.json.Stringify.valueAlloc(a, total, .{});
+    try overlay.put(count_key, encoded_budget);
+    const changes = try a.alloc(series.Change, decoded.len);
+    var costs = std.StringHashMap(u64).init(a);
+    for (bindings) |binding| {
+        for (decoded, changes) |entry, *change| change.* = .{ .key = entry.input.key, .before = if (entry.before) |image| try normalizeImage(a, binding, image) else null, .after = if (entry.after) |image| try normalizeImage(a, binding, image) else null };
+        std.mem.sort(series.Change, changes, {}, struct {
+            fn less(_: void, left: series.Change, right: series.Change) bool {
+                return std.mem.order(u8, left.key, right.key) == .lt;
+            }
+        }.less);
+        try (series.Engine{ .alloc = a, .spec = binding.spec }).prepareWithCosts(&overlay, transaction, admitted_ns, changes, &costs);
+    }
+    var writes: std.ArrayList(@import("docstore.zig").KVPair) = .empty;
+    var deletes: std.ArrayList([]const u8) = .empty;
+    var pending = overlay.pending.iterator();
+    while (pending.next()) |entry| {
+        if (entry.value_ptr.*) |value| try writes.append(a, .{ .key = entry.key_ptr.*, .value = value }) else try deletes.append(a, entry.key_ptr.*);
+    }
+    std.mem.sort(@import("docstore.zig").KVPair, writes.items, {}, struct {
+        fn less(_: void, left: @import("docstore.zig").KVPair, right: @import("docstore.zig").KVPair) bool {
+            return std.mem.order(u8, left.key, right.key) == .lt;
+        }
+    }.less);
+    const charges = try a.alloc(AdmissionCost, decoded.len);
+    for (decoded, charges) |entry, *charge| charge.* = .{ .key = entry.input.logical_key, .bytes = std.math.add(u64, costs.get(entry.input.key) orelse 0, entry.member_bytes + count_key.len + encoded_budget.len + 128) catch return error.RetainedSeriesBatchTooLarge };
+    return .{ .writes = writes.items, .deletes = deletes.items, .costs = charges };
+}
+
+fn releasePreparedKeys(a: A, txn: anytype, transaction: [16]u8) !void {
+    const p = try preparedKeysPrefix(a, transaction);
+    var remove: std.ArrayList([]const u8) = .empty;
+    {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var next = try cursor.seekAtOrAfter(p);
+        while (next) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, p)) break;
+            if (remove.items.len == series.max_changes) return error.RetainedSeriesCorrupt;
+            try remove.append(a, try a.dupe(u8, entry.key));
+            next = try cursor.next();
+        }
+    }
+    for (remove.items) |key| try txn.delete(key);
+    try txn.delete(try preparedCountKey(a, transaction));
 }
 
 pub const Capture = struct {
@@ -156,9 +294,23 @@ pub const Capture = struct {
     }
     pub fn stage(self: *Capture, a: A, txn: anytype) !void {
         if (self.poisoned) return error.RetainedSeriesTransactionPoisoned;
+        errdefer self.poisoned = true;
         if (self.before.count() == 0) {
             // Context-only maintenance batches do not leave a reusable marker.
-            if (self.context_touched) try txn.delete(context_key);
+            if (self.context_touched) {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const temp = arena.allocator();
+                if (try optional(txn, context_key)) |raw| {
+                    const context = try std.json.parseFromSliceLeaky(Context, temp, raw, .{});
+                    if (context.resolution) |resolution| {
+                        const bindings = try load(temp, txn);
+                        for (bindings) |binding| _ = try (series.Engine{ .alloc = a, .spec = binding.spec }).releasePrepared(txn, resolution.transaction);
+                        try releasePreparedKeys(temp, txn, resolution.transaction);
+                    }
+                }
+                try txn.delete(context_key);
+            }
             return;
         }
         self.staging = true;
@@ -172,6 +324,7 @@ pub const Capture = struct {
         const raw_context = (try optional(txn, context_key)) orelse return error.RetainedSeriesCommitContextMissing;
         const context = (try std.json.parseFromSlice(Context, alloc, raw_context, .{})).value;
         if (context.sequence == 0) return error.RetainedSeriesSequenceMismatch;
+        if (context.resolution) |resolution| if (resolution.decision != .committed) return error.RetainedSeriesReservationMismatch;
         const Decoded = struct { key: []const u8, before: ?Image, after: ?Image };
         const decoded = try alloc.alloc(Decoded, self.before.count());
         var decoder = try Decoder.init(alloc, bindings);
@@ -209,9 +362,12 @@ pub const Capture = struct {
                     return std.mem.order(u8, l.key, r.key) == .lt;
                 }
             }.less);
-            if (count == 0) continue;
-            try (series.Engine{ .alloc = alloc, .spec = binding.spec }).apply(txn, context.sequence, context.admitted_ns, context.cause, changes);
+            const engine = series.Engine{ .alloc = alloc, .spec = binding.spec };
+            if (context.resolution) |resolution| {
+                if (count == 0) _ = try engine.releasePrepared(txn, resolution.transaction) else try engine.applyPrepared(txn, resolution.transaction, context.sequence, context.admitted_ns, context.cause, changes);
+            } else if (count != 0) try engine.apply(txn, context.sequence, context.admitted_ns, context.cause, changes);
         }
+        if (context.resolution) |resolution| try releasePreparedKeys(alloc, txn, resolution.transaction);
         if (count != 0) try saveSequence(txn, context.sequence);
         try txn.delete(context_key);
     }
@@ -359,11 +515,14 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
 /// Append canonical context before primary replication captures its effects.
 /// Inactive tables avoid both the metadata write and capture allocations.
 pub fn appendContext(a: A, store: anytype, source_replay_sequence: u64, admitted_ns: i128, cause: series.Cause, writes: anytype, owned: anytype) !void {
+    return appendContextForResolution(a, store, source_replay_sequence, admitted_ns, cause, null, writes, owned);
+}
+pub fn appendContextForResolution(a: A, store: anytype, source_replay_sequence: u64, admitted_ns: i128, cause: series.Cause, resolution: ?Resolution, writes: anytype, owned: anytype) !void {
     if (!try store.retainedSeriesActive()) return;
     var read = try store.beginReadTxn();
     defer read.abort();
     const sequence = std.math.add(u64, try sourceSequence(&read, null), 1) catch return error.RetainedSeriesSequenceMismatch;
-    const context = Context{ .sequence = sequence, .admitted_ns = admitted_ns, .cause = cause, .source_replay_sequence = source_replay_sequence };
+    const context = Context{ .sequence = sequence, .admitted_ns = admitted_ns, .cause = cause, .source_replay_sequence = source_replay_sequence, .resolution = resolution };
     const bytes = try std.json.Stringify.valueAlloc(a, context, .{});
     owned.append(a, bytes) catch |err| {
         a.free(bytes);
@@ -558,8 +717,8 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     }
     const pending = try db.beginTransaction(5);
     defer db.abortTransaction(pending, 6) catch {};
-    try std.testing.expectError(error.RetainedSeriesTransactionsUnsupported, db.writeIntents(pending, &.{.{ .key = "a", .value = first }}, &.{}));
-    try std.testing.expectError(error.RetainedSeriesTransactionsUnsupported, db.writeTransaction(pending, .{ .writes = &.{.{ .key = "a", .value = first }} }));
+    try std.testing.expectError(error.RetainedSeriesCorrectionWindow, db.writeIntents(pending, &.{.{ .key = "a", .value = first }}, &.{}));
+    try std.testing.expectError(error.RetainedSeriesCorrectionWindow, db.writeTransaction(pending, .{ .writes = &.{.{ .key = "a", .value = first }} }));
     try db.batch(.{ .timestamp_ns = 6, .transaction = .{ .resolve = .{ .txn_id = pending, .status = .aborted, .commit_version = 6 } } });
     var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
@@ -595,6 +754,52 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     try std.testing.expectEqual(@as(?f64, 9), replay.frames[0].edits[0].row.?.metrics[1].value(.sum));
     try std.testing.expectEqual(cut.sequence + 1, replay.cursor.sequence);
     try std.testing.expectError(error.RetainedSeriesResetRequired, db.queryRetainedSeriesJson(a, .{ .poll = .{ .fence = fence, .root_incarnation = db.root_incarnation ^ 1, .cursor = cut } }));
+    const previous_quota = db.core.table_catalog.transaction_admission_bytes;
+    const quota_txn = try db.beginTransaction(50);
+    db.core.table_catalog.transaction_admission_bytes = try @import("transactions.zig").intentAdmissionBytes(.{ .key = "a", .value = first }) + 256;
+    try std.testing.expectError(error.TransactionTooLarge, db.writeTransaction(quota_txn, .{ .admitted_timestamp_ns = 50, .writes = &.{.{ .key = "a", .value = first }} }));
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectError(error.NotFound, current.get(try preparedCountKey(alloc, quota_txn)));
+    }
+    try db.abortTransaction(quota_txn, 51);
+    db.core.table_catalog.transaction_admission_bytes = previous_quota;
+    const prepared_txn = try db.beginTransaction(109);
+    try db.writeTransaction(prepared_txn, .{ .admitted_timestamp_ns = 109, .writes = &.{.{ .key = "a", .value = first }} });
+    try db.batch(.{ .timestamp_ns = 120, .retained_series = .{ .action = .tick, .fence = fence } });
+    try db.writeTransaction(prepared_txn, .{ .admitted_timestamp_ns = 120, .writes = &.{.{ .key = "a", .value = first }} });
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        const budget = try std.json.parseFromSliceLeaky(PreparedBudget, alloc, try current.get(try preparedCountKey(alloc, prepared_txn)), .{});
+        try std.testing.expectEqual(@as(usize, 1), budget.count);
+    }
+    try db.resolveTransactionIntents(prepared_txn, .committed, 120);
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        const committed = try (series.Engine{ .alloc = a, .spec = binding.spec }).scan(alloc, &current, 0, 10, 120, null, 10);
+        try std.testing.expectEqual(@as(?f64, 3), committed.rows[0].metrics[1].value(.sum));
+        try std.testing.expectError(error.NotFound, current.get(try preparedCountKey(alloc, prepared_txn)));
+    }
+    const aborted_txn = try db.beginTransaction(121);
+    try db.writeTransaction(aborted_txn, .{ .admitted_timestamp_ns = 121, .writes = &.{.{ .key = "c", .value = "{\"ts\":\"1970-01-01T00:00:00.000000121Z\",\"v\":7}" }} });
+    try db.abortTransaction(aborted_txn, 250);
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectError(error.NotFound, current.get(try preparedCountKey(alloc, aborted_txn)));
+        try std.testing.expectError(error.NotFound, current.get(try keys.documentKeyAlloc(alloc, "c")));
+    }
+    const noop_txn = try db.beginTransaction(251);
+    try db.writeTransaction(noop_txn, .{ .admitted_timestamp_ns = 251, .deletes = &.{"absent"} });
+    try db.resolveTransactionIntents(noop_txn, .committed, 260);
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectError(error.NotFound, current.get(try preparedCountKey(alloc, noop_txn)));
+    }
 }
 
 /// Prepared once under the native writer fence, then used for each TTL
@@ -812,4 +1017,118 @@ test "retained series packed JSON literal null remains distinct from SQL null wh
     try std.testing.expectEqual(@as(?f64, null), sql.values[1]);
     try std.testing.expectEqual(@as(?f64, 1), nested.values[0]);
     try std.testing.expectEqual(@as(?f64, null), nested.values[1]);
+}
+
+test "retained series native prepare plans vote atomically and resolution markers release commit and abort evidence" {
+    const a = std.testing.allocator;
+    var backend = @import("mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const primary = try keys.documentKeyAlloc(temp, "a");
+    const first = "{\"ts\":\"1970-01-01T00:00:00.000000001Z\",\"v\":3}";
+    const second = "{\"ts\":\"1970-01-01T00:00:00.000000001Z\",\"v\":9}";
+    try store.put(primary, first);
+    const binding = Binding{ .spec = .{ .id = @splat(1), .definition = @splat(2), .generation = 1, .source_partition = @splat(3), .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 100, .retention_ns = 200, .laws = &.{ .count, .min, .max } }, .timestamp = "ts", .fields = &.{ null, "v", "v" } };
+    const engine = series.Engine{ .alloc = a, .spec = binding.spec };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try install(temp, &txn, binding, .{ .sequence = 0, .admitted_ns = 1 }, 0);
+        try std.testing.expect(try backfillPage(temp, &txn, binding.spec.id, "", 1024));
+        try txn.commit();
+    }
+    const effects = planned: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :planned try planPrepare(temp, &read, @splat(1), 109, &.{.{ .key = primary, .logical_key = "a", .after = second }});
+    };
+    try std.testing.expectEqual(@as(usize, 1), effects.costs.len);
+    try std.testing.expectEqualStrings("a", effects.costs[0].key);
+    try std.testing.expect(effects.costs[0].bytes != 0);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        for (effects.writes) |write| try txn.put(write.key, write.value);
+        for (effects.deletes) |key| try txn.delete(key);
+        // A vote publishes only intent metadata; the primary is unchanged.
+        try std.testing.expectEqualStrings(first, try txn.get(primary));
+        try txn.commit();
+    }
+    const original_budget = budget: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :budget try temp.dupe(u8, try read.get(try preparedCountKey(temp, @splat(1))));
+    };
+    for ([_]PreparedBudget{ .{ .count = series.max_changes }, .{ .count = 1, .after = max_capture_bytes } }) |full| {
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(try preparedCountKey(temp, @splat(1)), try std.json.Stringify.valueAlloc(temp, full, .{}));
+            try txn.commit();
+        }
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.RetainedSeriesBatchTooLarge, planPrepare(temp, &read, @splat(1), 109, &.{.{ .key = try keys.documentKeyAlloc(temp, "another"), .logical_key = "another", .after = second }}));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try preparedCountKey(temp, @splat(1)), original_budget);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(usize, 0), try engine.tick(&txn, 120, 1024));
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(context_key, try std.json.Stringify.valueAlloc(temp, Context{ .sequence = 1, .admitted_ns = 120, .resolution = .{ .transaction = @splat(1), .decision = .committed } }, .{}));
+        try txn.put(primary, second);
+        try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const page = try engine.scan(temp, &read, 0, 10, 120, null, 10);
+        try std.testing.expectEqual(@as(?f64, 9), page.rows[0].metrics[1].value(.min));
+        try std.testing.expectEqual(@as(u64, 1), try sourceSequence(&read, null));
+        try std.testing.expectError(error.NotFound, read.get(try preparedCountKey(temp, @splat(1))));
+    }
+    const fresh = try keys.documentKeyAlloc(temp, "fresh");
+    const fresh_value = "{\"ts\":\"1970-01-01T00:00:00.000000121Z\",\"v\":7}";
+    const aborted = planned: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :planned try planPrepare(temp, &read, @splat(2), 120, &.{.{ .key = fresh, .logical_key = "fresh", .after = fresh_value }});
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        for (aborted.writes) |write| try txn.put(write.key, write.value);
+        for (aborted.deletes) |key| try txn.delete(key);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(context_key, try std.json.Stringify.valueAlloc(temp, Context{ .sequence = 2, .admitted_ns = 250, .resolution = .{ .transaction = @splat(2), .decision = .aborted } }, .{}));
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u64, 1), try sourceSequence(&txn, null));
+        try std.testing.expectEqual(@as(usize, 0), try engine.releasePrepared(&txn, @splat(2)));
+        try std.testing.expectError(error.NotFound, txn.get(try preparedCountKey(temp, @splat(2))));
+        _ = try engine.tick(&txn, 250, 1024);
+        _ = try engine.requireClosedSpan(temp, &txn, .{ .start_ns = "120", .end_ns = "130" }, null);
+        try txn.commit();
+    }
 }

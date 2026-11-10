@@ -88,7 +88,7 @@ pub const Clock = struct {
     ptr: ?*const anyopaque = null,
     unix_fn: ?*const fn (*const anyopaque) u64 = null,
     authority_fn: ?*const fn (*const anyopaque) u64 = null,
-    fn unix(self: Clock) u64 {
+    pub fn unix(self: Clock) u64 {
         return if (self.unix_fn) |f| f(self.ptr.?) else @import("antfly_platform").time.realtimeNs();
     }
     fn authority(self: Clock) u64 {

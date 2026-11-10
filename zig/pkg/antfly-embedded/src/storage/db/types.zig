@@ -1755,6 +1755,8 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    /// Canonical replicated prepare-admission time; zero is local ingress only.
+    admitted_timestamp_ns: u64 = 0,
     document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",

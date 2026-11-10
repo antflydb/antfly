@@ -534,3 +534,136 @@ test "retained series replay rejects corrupted bucket identities and row states"
     try store.put(frame_key, try std.json.Stringify.valueAlloc(temp, broken, .{}));
     try std.testing.expectError(error.RetainedSeriesCorrupt, e.poll(temp, &store, cut, 1));
 }
+
+test "retained series prepared corrections retain extrema past finality and retire holds atomically" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const old = [_]?f64{ null, 3, 3, 3, 3 };
+    const updated = [_]?f64{ null, 9, 9, 9, 9 };
+    const changes = [_]series.Change{.{ .key = "a", .before = sample(1, &old), .after = sample(1, &updated) }};
+    try e.apply(&store, 1, 5, .mutation, &.{.{ .key = "a", .after = sample(1, &old) }});
+    try e.prepare(&store, @splat(1), 109, &changes);
+    // An exact retry preserves admission; changing the value does not obtain
+    // a new correction exception merely because its bucket already has a hold.
+    try e.prepare(&store, @splat(1), 120, &changes);
+    var rejected = try store.begin();
+    defer rejected.deinit();
+    try std.testing.expectError(error.RetainedSeriesCorrectionWindow, e.prepare(&rejected, @splat(1), 120, &.{ .{ .key = "a", .before = sample(1, &old), .after = sample(1, &old) }, .{ .key = "b", .after = sample(1, &updated) } }));
+    try std.testing.expectEqual(@as(usize, 0), try e.tick(&store, 120, 1024));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const progress = try e.status(temp, &store);
+    try std.testing.expect(!try e.expirationReady(temp, &store, progress, sample(1, &old), 120));
+    const before = try e.scan(temp, &store, 0, 10, 120, null, 10);
+    try std.testing.expectEqual(@as(?f64, 3), before.rows[0].metrics[3].value(.min));
+    try e.applyPrepared(&store, @splat(1), 2, 120, .mutation, &changes);
+    const after = try e.scan(temp, &store, 0, 10, 120, null, 10);
+    try std.testing.expectEqual(@as(?f64, 9), after.rows[0].metrics[3].value(.min));
+    try std.testing.expectEqual(@as(?f64, 9), after.rows[0].metrics[4].value(.max));
+    try std.testing.expectEqual(@as(usize, 0), try e.releasePrepared(&store, @splat(1)));
+    try std.testing.expectEqual(@as(usize, 2), try e.tick(&store, 120, 1024));
+    try std.testing.expect(try e.expirationReady(temp, &store, try e.status(temp, &store), sample(1, &updated), 120));
+    try std.testing.expectError(error.RetainedSeriesCorrectionWindow, e.apply(&store, 3, 121, .mutation, &.{.{ .key = "a", .before = sample(1, &updated), .after = sample(1, &old) }}));
+}
+
+test "retained series held buckets do not starve other finalized support and abort releases only its references" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const old = [_]?f64{ null, 3, 3, 3, 3 };
+    const updated = [_]?f64{ null, 9, 9, 9, 9 };
+    try e.apply(&store, 1, 5, .mutation, &.{
+        .{ .key = "a", .after = sample(1, &old) },
+        .{ .key = "b", .after = sample(1, &old) },
+        .{ .key = "later", .after = sample(11, &old) },
+    });
+    try e.prepare(&store, @splat(1), 109, &.{.{ .key = "a", .before = sample(1, &old), .after = sample(1, &updated) }});
+    try e.prepare(&store, @splat(2), 109, &.{.{ .key = "b", .before = sample(1, &old), .after = sample(1, &updated) }});
+    // A physical work budget of one visits the hold once, then continues from
+    // its durable cursor rather than revisiting all documents in that bucket.
+    try std.testing.expectEqual(@as(usize, 0), try e.tick(&store, 120, 1));
+    try std.testing.expectEqual(@as(usize, 1), try e.tick(&store, 120, 1));
+    try std.testing.expectEqual(@as(usize, 1), try e.tick(&store, 120, 1));
+    try std.testing.expectEqual(@as(usize, 1), try e.releasePrepared(&store, @splat(1)));
+    try std.testing.expectEqual(@as(usize, 0), try e.tick(&store, 120, 1024));
+    try std.testing.expectEqual(@as(usize, 1), try e.releasePrepared(&store, @splat(2)));
+    try std.testing.expectEqual(@as(usize, 4), try e.tick(&store, 120, 1024));
+}
+
+test "retained series prepared contribution proofs cannot authorize different rows or values" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const old = [_]?f64{ null, 3, 3, 3, 3 };
+    const updated = [_]?f64{ null, 9, 9, 9, 9 };
+    try e.apply(&store, 1, 5, .mutation, &.{.{ .key = "a", .after = sample(1, &old) }});
+    try e.prepare(&store, @splat(1), 109, &.{.{ .key = "a", .before = sample(1, &old), .after = sample(1, &updated) }});
+    var wrong = try store.begin();
+    defer wrong.deinit();
+    try std.testing.expectError(error.RetainedSeriesReservationMismatch, e.applyPrepared(&wrong, @splat(1), 2, 120, .mutation, &.{.{ .key = "a", .before = sample(1, &old) }}));
+    try std.testing.expectError(error.RetainedSeriesReservationMismatch, e.applyPrepared(&wrong, @splat(2), 2, 120, .mutation, &.{.{ .key = "a", .before = sample(1, &old), .after = sample(1, &updated) }}));
+    try std.testing.expectEqual(@as(usize, 1), try e.releasePrepared(&store, @splat(1)));
+}
+
+test "retained series freeze proof refuses prepared inserts in otherwise empty coverage" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const values = [_]?f64{ null, 3, 3, 3, 3 };
+    try e.prepare(&store, @splat(1), 109, &.{.{ .key = "not-yet-visible", .after = sample(1, &values) }});
+    _ = try e.tick(&store, 120, 1024);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const range = @import("../retained_dataset_types.zig").Range{ .start_ns = "0", .end_ns = "10" };
+    try std.testing.expectError(error.RetainedSeriesPreparedHold, e.requireClosedSpan(temp, &store, range, null));
+    try std.testing.expectEqual(@as(usize, 1), try e.releasePrepared(&store, @splat(1)));
+    const cut = try e.requireClosedSpan(temp, &store, range, null);
+    try std.testing.expectEqual(@as(u64, 0), cut.source_sequence);
+    try std.testing.expectEqual(@as(i128, 120), cut.admitted_ns);
+}
+
+fn preparedAllocationScenario(allocator: std.mem.Allocator) !void {
+    var store = Store.init();
+    defer store.deinit();
+    var e = engine();
+    e.alloc = allocator;
+    try ready(e, &store);
+    const old = [_]?f64{ null, 3, 3, 3, 3 };
+    const updated = [_]?f64{ null, 9, 9, 9, 9 };
+    try e.apply(&store, 1, 5, .mutation, &.{.{ .key = "a", .after = sample(1, &old) }});
+    const changes = [_]series.Change{.{ .key = "a", .before = sample(1, &old), .after = sample(1, &updated) }};
+    try e.prepare(&store, @splat(1), 109, &changes);
+    _ = try e.tick(&store, 120, 1);
+    try e.applyPrepared(&store, @splat(1), 2, 120, .mutation, &changes);
+    _ = try e.tick(&store, 120, 1024);
+}
+
+test "retained series prepared reservations release all memory on admission and resolution allocation failures" {
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), preparedAllocationScenario, .{});
+}
+
+test "retained series prepared admission clock cannot reopen finalized history on a lower-clock commit" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const old = [_]?f64{ null, 3, 3, 3, 3 };
+    const updated = [_]?f64{ null, 9, 9, 9, 9 };
+    const changes = [_]series.Change{.{ .key = "a", .before = sample(1, &old), .after = sample(1, &updated) }};
+    try e.apply(&store, 1, 5, .mutation, &.{.{ .key = "a", .after = sample(1, &old) }});
+    try e.prepare(&store, @splat(1), 109, &changes);
+    try e.prepare(&store, @splat(1), 120, &changes);
+    try e.applyPrepared(&store, @splat(1), 2, 6, .mutation, &changes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(i128, 120), (try e.status(arena.allocator(), &store)).admitted_ns);
+    try std.testing.expectError(error.RetainedSeriesCorrectionWindow, e.apply(&store, 3, 7, .mutation, &.{.{ .key = "a", .before = sample(1, &updated), .after = sample(1, &old) }}));
+}

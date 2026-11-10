@@ -131,6 +131,10 @@ pub fn rowKey(timestamp: i128, dimensions: Id) RowKey {
     bytes[16..].* = dimensions;
     return std.fmt.bytesToHex(bytes, .lower);
 }
+pub fn rowKeyTimestamp(key: RowKey) !i128 {
+    const biased = std.fmt.parseInt(u128, key[0..32], 16) catch return error.InvalidDatasetCoverage;
+    return @bitCast(biased ^ (@as(u128, 1) << 127));
+}
 pub const KeySpan = struct {
     start: RowKey,
     end: RowKey,
@@ -218,6 +222,13 @@ pub const Segment = struct {
         const extent = try self.span();
         try extent.validate();
         if (!(try KeySpan.fromRange(self.coverage)).contains(extent)) return error.InvalidDatasetCoverage;
+        if (self.key_span != null) {
+            if (try rowKeyTimestamp(extent.start) != try self.coverage.start()) return error.InvalidDatasetCoverage;
+            const last = try rowKeyTimestamp(extent.end);
+            const width: i128 = if (definition.summary) |summary| summary.interval_ns else 1;
+            const end = if (std.mem.allEqual(u8, extent.end[32..], '0')) last else std.math.add(i128, last, width) catch return error.InvalidDatasetCoverage;
+            if (end != try self.coverage.end()) return error.InvalidDatasetCoverage;
+        }
         if (self.format != 1 or zero(self.id) or zero(self.location) or zero(self.checksum) or zero(self.source.partition) or
             self.source.incarnation == 0 or self.source.incarnation > max_public_counter or self.placement_revision > max_public_counter or self.state_encoding == 0 or self.byte_len == 0 or self.placement_revision == 0 or
             !std.mem.eql(u8, &self.dataset, &definition.id) or self.definition_generation != definition.generation or

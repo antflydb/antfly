@@ -44,6 +44,9 @@ pub const Spec = struct {
     /// Empty means every count is COUNT(*); true positions are COUNT(field).
     count_nonnull: []const bool = &.{},
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+    }
     pub fn countsNonNull(s: Spec, i: usize) bool {
         return s.count_nonnull.len != 0 and s.count_nonnull[i];
     }
@@ -71,7 +74,7 @@ pub const Spec = struct {
                 (law == .max and (m.count == 0) != (m.maximum == null))) return error.RetainedSeriesCorrupt;
         }
     }
-    fn expired(s: Spec, timestamp: i128, now: i128) !bool {
+    pub fn expired(s: Spec, timestamp: i128, now: i128) !bool {
         const end = try std.math.add(i128, try s.bucket(timestamp), s.interval_ns);
         const expiry = std.math.add(i128, end, s.retention_ns) catch return false;
         return expiry <= now;
@@ -85,6 +88,7 @@ pub const Spec = struct {
 /// A decoder supplies typed, canonical dimensions and numeric inputs. Missing
 /// numeric inputs are null (SQL aggregate null semantics); count counts rows.
 pub const Row = struct { timestamp_ns: i128, dimensions: []const u8, values: []const ?f64 };
+pub const AdmissionCost = struct { key: []const u8, bytes: u64 };
 pub const Change = struct { key: []const u8, before: ?Row = null, after: ?Row = null };
 pub const Cause = enum { mutation, expiration };
 pub const Progress = struct {
@@ -98,6 +102,12 @@ pub const Progress = struct {
     feed_latest: u64 = 0,
     feed_floor: u64 = 0,
     feed_bytes: usize = 0,
+    support_cursor: []const u8 = "",
+    maintenance_pending: bool = false,
+    last_tick_ns: i128 = 0,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+    }
 };
 pub const Scalar = union(enum) { null, integer: i64, number: f64 };
 pub const Metric = struct {
@@ -143,7 +153,15 @@ pub const Bucket = struct { start_ns: i128, dimensions: []const u8, rows: i64 = 
 pub const Edit = struct { key: []const u8, row: ?Bucket };
 pub const Frame = struct { sequence: u64, source_sequence: u64, edits: []const Edit };
 pub const Page = struct { rows: []const Bucket, after: ?[]const u8, cursor: Cursor };
-pub const Cursor = struct { definition: Id, partition: Id, incarnation: u64, sequence: u64 };
+pub const Cursor = struct {
+    definition: Id,
+    partition: Id,
+    incarnation: u64,
+    sequence: u64,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+    }
+};
 
 pub const Engine = struct {
     alloc: A,
@@ -275,6 +293,191 @@ pub const Engine = struct {
             try txn.put(entry.key_ptr.*, try std.json.Stringify.valueAlloc(a, b.*, .{}));
         }
     }
+    const TxnId = [16]u8;
+    const Reservation = struct {
+        cause: Cause = .mutation,
+        admitted_ns: i128 = 0,
+        document: []const u8,
+        before: ?Id,
+        after: ?Id,
+        holds: []const []const u8,
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+        }
+    };
+    fn reservationPrefix(self: Engine, a: A, transaction: TxnId) ![]u8 {
+        return self.key(a, try std.fmt.allocPrint(a, "reservation:{s}:", .{std.fmt.bytesToHex(transaction, .lower)}));
+    }
+    fn reservationKey(self: Engine, a: A, transaction: TxnId, document: []const u8) ![]u8 {
+        var hash: Id = undefined;
+        std.crypto.hash.sha2.Sha256.hash(document, &hash, .{});
+        return std.fmt.allocPrint(a, "{s}{s}", .{ try self.reservationPrefix(a, transaction), std.fmt.bytesToHex(hash, .lower) });
+    }
+    fn contribution(self: Engine, row: ?Row) !?Id {
+        const r = row orelse return null;
+        try self.validateRow(r);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/retained-contribution/v1");
+        var instant: [16]u8 = undefined;
+        std.mem.writeInt(i128, &instant, try self.spec.bucket(r.timestamp_ns), .big);
+        hash.update(&instant);
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, r.dimensions.len, .big);
+        hash.update(&length);
+        hash.update(r.dimensions);
+        for (r.values) |value| {
+            hash.update(&.{@intFromBool(value != null)});
+            if (value) |number| {
+                std.mem.writeInt(u64, &length, @bitCast(if (number == 0) @as(f64, 0) else number), .big);
+                hash.update(&length);
+            }
+        }
+        return hash.finalResult();
+    }
+    fn readReservation(self: Engine, a: A, txn: anytype, transaction: TxnId, document: []const u8) !?Reservation {
+        const raw = (try optional(txn, try self.reservationKey(a, transaction, document))) orelse return null;
+        if (raw.len > 32768) return error.RetainedSeriesCorrupt;
+        const value = try std.json.parseFromSliceLeaky(Reservation, a, raw, .{ .allocate = .alloc_always });
+        if (!std.mem.eql(u8, value.document, document) or value.holds.len > 2) return error.RetainedSeriesCorrupt;
+        const buckets = try self.key(a, "bucket:");
+        for (value.holds, 0..) |held_bucket, i| {
+            if (!std.mem.startsWith(u8, held_bucket, buckets) or held_bucket.len != buckets.len + 97) return error.RetainedSeriesCorrupt;
+            if (i != 0 and std.mem.eql(u8, held_bucket, value.holds[0])) return error.RetainedSeriesCorrupt;
+        }
+        return value;
+    }
+    fn holdKey(self: Engine, a: A, bucket: []const u8) ![]u8 {
+        return self.key(a, try std.mem.concat(a, u8, &.{ "hold:", bucket }));
+    }
+    fn held(self: Engine, a: A, txn: anytype, bucket: []const u8) !bool {
+        const raw = (try optional(txn, try self.holdKey(a, bucket))) orelse return false;
+        const count = std.fmt.parseInt(u64, raw, 10) catch return error.RetainedSeriesCorrupt;
+        if (count == 0) return error.RetainedSeriesCorrupt;
+        return true;
+    }
+    fn changeHold(self: Engine, a: A, txn: anytype, bucket: []const u8, acquire: bool) !void {
+        const k = try self.holdKey(a, bucket);
+        const previous = if (try optional(txn, k)) |raw| std.fmt.parseInt(u64, raw, 10) catch return error.RetainedSeriesCorrupt else 0;
+        if (acquire) {
+            const count = std.math.add(u64, previous, 1) catch return error.RetainedSeriesNumericOverflow;
+            try txn.put(k, try std.fmt.allocPrint(a, "{d}", .{count}));
+        } else {
+            if (previous == 0) return error.RetainedSeriesCorrupt;
+            if (previous == 1) try txn.delete(k) else try txn.put(k, try std.fmt.allocPrint(a, "{d}", .{previous - 1}));
+        }
+    }
+    fn includesHold(value: Reservation, bucket: []const u8) bool {
+        for (value.holds) |held_bucket| if (std.mem.eql(u8, held_bucket, bucket)) return true;
+        return false;
+    }
+    /// Called in the SAME transaction as intent preparation, under the source
+    /// writer fence. An error requires aborting that entire transaction. A
+    /// replacement may grandfather only its exact previously admitted effects.
+    pub fn prepare(self: Engine, txn: anytype, transaction: TxnId, admitted_ns: i128, changes: []const Change) !void {
+        return self.prepareWithCosts(txn, transaction, admitted_ns, changes, null);
+    }
+    /// Optional per-document metadata charges belong to the caller's admission
+    /// allocator; borrowed keys have the same lifetime as the supplied changes.
+    pub fn prepareWithCosts(self: Engine, txn: anytype, transaction: TxnId, admitted_ns: i128, changes: []const Change, costs: ?*std.StringHashMap(u64)) !void {
+        if (changes.len > max_changes or std.mem.allEqual(u8, &transaction, 0)) return error.RetainedSeriesBatchTooLarge;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const p = try self.load(a, txn);
+        const now = @max(p.admitted_ns, admitted_ns);
+        var seen = std.StringHashMap(void).init(a);
+        for (changes) |change| {
+            if (change.key.len == 0 or change.key.len > 4096) return error.InvalidRetainedSeriesRow;
+            if ((try seen.getOrPut(change.key)).found_existing) return error.RetainedSeriesDuplicateRow;
+            const before = try self.contribution(change.before);
+            const after = try self.contribution(change.after);
+            const previous = try self.readReservation(a, txn, transaction, change.key);
+            if (previous) |old| if (!std.meta.eql(old.before, before)) return error.RetainedSeriesReservationMismatch;
+            var holds: std.ArrayList([]const u8) = .empty;
+            if (!std.meta.eql(before, after)) {
+                for ([_]?Row{ change.before, change.after }, 0..) |optional_row, side| {
+                    const row = optional_row orelse continue;
+                    if (try self.spec.expired(row.timestamp_ns, now)) continue;
+                    if (try self.spec.bucket(row.timestamp_ns) < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
+                    const bucket = try self.bucketKey(a, row);
+                    const fingerprint = if (side == 0) before else after;
+                    const grandfathered = if (previous) |old| std.meta.eql(fingerprint, if (side == 0) old.before else old.after) and includesHold(old, bucket) else false;
+                    if (!grandfathered and try self.spec.finalized(row.timestamp_ns, now)) return error.RetainedSeriesCorrectionWindow;
+                    if (holds.items.len == 0 or !std.mem.eql(u8, holds.items[0], bucket)) try holds.append(a, bucket);
+                }
+            }
+            if (previous) |old| for (old.holds) |bucket| try self.changeHold(a, txn, bucket, false);
+            for (holds.items) |bucket| try self.changeHold(a, txn, bucket, true);
+            const raw = try std.json.Stringify.valueAlloc(a, Reservation{ .admitted_ns = if (previous) |old| @max(now, old.admitted_ns) else now, .document = change.key, .before = before, .after = after, .holds = holds.items }, .{});
+            if (raw.len > 32768) return error.RetainedSeriesBatchTooLarge;
+            const reservation_key = try self.reservationKey(a, transaction, change.key);
+            try txn.put(reservation_key, raw);
+            if (costs) |out| {
+                var charge: u64 = @intCast(reservation_key.len + raw.len + 64);
+                for (holds.items) |bucket| charge = std.math.add(u64, charge, (try self.holdKey(a, bucket)).len + 20 + 64) catch return error.RetainedSeriesBatchTooLarge;
+                try out.put(change.key, std.math.add(u64, out.get(change.key) orelse 0, charge) catch return error.RetainedSeriesBatchTooLarge);
+            }
+        }
+    }
+    /// Resolution and abort retire evidence in the same source transaction.
+    /// Native admission bounds TOTAL prepared source keys, not just each page.
+    pub fn releasePrepared(self: Engine, txn: anytype, transaction: TxnId) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const p = try self.reservationPrefix(a, transaction);
+        var keys: std.ArrayList([]const u8) = .empty;
+        {
+            var cur = try txn.openCursor();
+            defer cur.close();
+            var next = try cur.seekAtOrAfter(p);
+            while (next) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, p)) break;
+                if (keys.items.len == max_changes) return error.RetainedSeriesBatchTooLarge;
+                try keys.append(a, try a.dupe(u8, entry.key));
+                next = try cur.next();
+            }
+        }
+        for (keys.items) |k| {
+            const raw = try txn.get(k);
+            if (raw.len > 32768) return error.RetainedSeriesCorrupt;
+            const value = try std.json.parseFromSliceLeaky(Reservation, a, raw, .{ .allocate = .alloc_always });
+            const checked = (try self.readReservation(a, txn, transaction, value.document)) orelse return error.RetainedSeriesCorrupt;
+            if (!std.mem.eql(u8, k, try self.reservationKey(a, transaction, checked.document))) return error.RetainedSeriesCorrupt;
+            for (checked.holds) |bucket| try self.changeHold(a, txn, bucket, false);
+            try txn.delete(k);
+        }
+        return keys.items.len;
+    }
+    pub const ClosedCut = struct { source_sequence: u64, admitted_ns: i128, complete_from_ns: i128 };
+    /// A finalized event extent is immutable only after every previously
+    /// admitted transaction affecting its keys has resolved. Check the hold
+    /// index even for an empty bucket: a prepared insert may not exist in the
+    /// aggregate index yet. Capture this proof and rows from one read cut.
+    pub fn requireClosedSpan(self: Engine, a: A, txn: anytype, range: @import("../retained_dataset_types.zig").Range, requested: ?@import("../retained_dataset_types.zig").KeySpan) !ClosedCut {
+        const contract = @import("../retained_dataset_types.zig");
+        const complete = try contract.KeySpan.fromRange(range);
+        const span = requested orelse complete;
+        try span.validate();
+        if (!complete.contains(span)) return error.RetainedSeriesResolutionMismatch;
+        const start = try range.start();
+        const end = try range.end();
+        if (try self.spec.bucket(start) != start or try self.spec.bucket(end) != end) return error.RetainedSeriesResolutionMismatch;
+        const p = try self.load(a, txn);
+        if (!p.ready) return error.RetainedSeriesNotReady;
+        if (start < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
+        if (try self.spec.expired(start, p.admitted_ns)) return error.RetainedSeriesHistoryExpired;
+        if (!try self.spec.finalized(std.math.sub(i128, end, self.spec.interval_ns) catch return error.RetainedSeriesTimeOverflow, p.admitted_ns)) return error.RetainedSeriesNotFinal;
+        const prefix_key = try self.holdKey(a, try self.key(a, "bucket:"));
+        const lower = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ prefix_key, span.start[0..32], span.start[32..] });
+        const upper = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ prefix_key, span.end[0..32], span.end[32..] });
+        var cur = try txn.openCursor();
+        defer cur.close();
+        if (try cur.seekAtOrAfter(lower)) |entry| {
+            if (std.mem.startsWith(u8, entry.key, prefix_key) and std.mem.order(u8, entry.key, upper) == .lt) return error.RetainedSeriesPreparedHold;
+        }
+        return .{ .source_sequence = p.source_sequence, .admitted_ns = p.admitted_ns, .complete_from_ns = p.complete_from_ns };
+    }
     /// Synchronous maintenance makes the primary row and maintained progress
     /// share one cut. Outside declared coverage/retention there is no hold.
     pub fn expirationReady(self: Engine, a: A, txn: anytype, progress: Progress, row: Row, admitted_ns: i128) !bool {
@@ -284,19 +487,38 @@ pub const Engine = struct {
         if (try self.spec.expired(row.timestamp_ns, now)) return true;
         if (!progress.ready) return false;
         if (!try self.spec.finalized(row.timestamp_ns, now)) return false;
+        if (try self.held(a, txn, try self.bucketKey(a, row))) return false;
         return (try self.readBucket(a, txn, try self.bucketKey(a, row))) != null;
     }
     /// Exactly one call per committed source command. A replay at/below the
     /// checkpoint is rejected, never silently applied twice. Expiration is a
     /// distinct operation: it cannot retract historical aggregates.
     pub fn apply(self: Engine, txn: anytype, sequence: u64, admitted_ns: i128, cause: Cause, changes: []const Change) !void {
+        return self.applyInternal(txn, sequence, admitted_ns, cause, changes, null);
+    }
+    /// Only a verified native transaction resolution may supply this identity.
+    /// The exact prepared contributions are checked before granting finality
+    /// exceptions; resolution and reservation retirement are one transaction.
+    pub fn applyPrepared(self: Engine, txn: anytype, transaction: TxnId, sequence: u64, admitted_ns: i128, cause: Cause, changes: []const Change) !void {
+        try self.applyInternal(txn, sequence, admitted_ns, cause, changes, transaction);
+        _ = try self.releasePrepared(txn, transaction);
+    }
+    fn applyInternal(self: Engine, txn: anytype, sequence: u64, admitted_ns: i128, cause: Cause, changes: []const Change, prepared: ?TxnId) !void {
         if (changes.len > max_changes) return error.RetainedSeriesBatchTooLarge;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var p = try self.load(a, txn);
         if (sequence <= p.source_sequence) return error.RetainedSeriesSequenceMismatch;
-        const now = @max(admitted_ns, p.admitted_ns);
+        var now = @max(admitted_ns, p.admitted_ns);
+        var reservations = std.StringHashMap(Reservation).init(a);
+        if (prepared) |transaction| for (changes) |change| {
+            if ((try reservations.getOrPut(change.key)).found_existing) return error.RetainedSeriesDuplicateRow;
+            const value = (try self.readReservation(a, txn, transaction, change.key)) orelse return error.RetainedSeriesReservationMismatch;
+            if (value.cause != cause or !std.meta.eql(value.before, try self.contribution(change.before)) or !std.meta.eql(value.after, try self.contribution(change.after))) return error.RetainedSeriesReservationMismatch;
+            now = @max(now, value.admitted_ns);
+            try reservations.put(change.key, value);
+        };
         var touched = std.StringHashMap(Bucket).init(a);
         var seen = std.StringHashMap(void).init(a);
         for (changes) |change| {
@@ -306,6 +528,7 @@ pub const Engine = struct {
             if (entry.found_existing) return error.RetainedSeriesDuplicateRow;
             if (change.before) |r| try self.validateRow(r);
             if (change.after) |r| try self.validateRow(r);
+            const reserved = reservations.get(change.key);
             if (cause == .expiration) {
                 if (change.after != null) return error.RetainedSeriesNotReady;
                 if (change.before) |r| {
@@ -315,6 +538,7 @@ pub const Engine = struct {
                     // Drop mutable extrema support only after finality. The
                     // cached aggregate survives source physical reclamation.
                     const k = try self.bucketKey(a, r);
+                    if (try self.held(a, txn, k)) return error.RetainedSeriesPreparedHold;
                     if (!try self.spec.expired(r.timestamp_ns, now) and try self.readBucket(a, txn, k) == null) return error.RetainedSeriesCoverageMissing;
                     for (self.spec.laws, r.values, 0..) |law, input, m| if ((law == .min or law == .max) and input != null) {
                         try txn.delete(try self.supportKey(a, k, m, input.?, change.key));
@@ -329,8 +553,8 @@ pub const Engine = struct {
                 const after = if (change.after) |r| if (try self.spec.expired(r.timestamp_ns, now)) null else r else null;
                 if (before) |r| if (try self.spec.bucket(r.timestamp_ns) < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
                 if (after) |r| if (try self.spec.bucket(r.timestamp_ns) < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
-                if (before) |r| if (try self.spec.finalized(r.timestamp_ns, now)) return error.RetainedSeriesCorrectionWindow;
-                if (after) |r| if (try self.spec.finalized(r.timestamp_ns, now)) return error.RetainedSeriesCorrectionWindow;
+                if (before) |r| if (try self.spec.finalized(r.timestamp_ns, now) and !(reserved != null and includesHold(reserved.?, try self.bucketKey(a, r)))) return error.RetainedSeriesCorrectionWindow;
+                if (after) |r| if (try self.spec.finalized(r.timestamp_ns, now) and !(reserved != null and includesHold(reserved.?, try self.bucketKey(a, r)))) return error.RetainedSeriesCorrectionWindow;
                 const marker = try self.markerKey(a, change.key);
                 const incorporated = p.ready or (try optional(txn, marker)) != null;
                 if (incorporated) if (before) |r| try self.adjust(a, txn, change.key, r, -1, &touched);
@@ -423,6 +647,7 @@ pub const Engine = struct {
         var state = try self.load(a, txn);
         if (!state.ready) return error.RetainedSeriesNotReady;
         state.admitted_ns = @max(state.admitted_ns, admitted_ns);
+        state.last_tick_ns = state.admitted_ns;
         var touched = std.StringHashMap(void).init(a);
         const expired = try a.alloc([]const u8, limit);
         var n: usize = 0;
@@ -447,21 +672,47 @@ pub const Engine = struct {
         const support = try self.key(a, "support:");
         const buckets = try self.key(a, "bucket:");
         var supports: std.ArrayList([]const u8) = .empty;
-        {
+        var visited: usize = 0;
+        var support_more = false;
+        if (n < limit) {
             var cur = try txn.openCursor();
             defer cur.close();
-            var next = try cur.seekAtOrAfter(support);
+            if (state.support_cursor.len != 0 and !std.mem.startsWith(u8, state.support_cursor, support)) return error.RetainedSeriesCorrupt;
+            const seek = if (state.support_cursor.len == 0) support else try std.mem.concat(a, u8, &.{ state.support_cursor, "\x00" });
+            var next = try cur.seekAtOrAfter(seek);
             while (next) |entry| {
-                if (n + supports.items.len == limit or !std.mem.startsWith(u8, entry.key, support)) break;
+                if (n + visited == limit) break;
+                if (!std.mem.startsWith(u8, entry.key, support)) {
+                    state.support_cursor = "";
+                    next = null;
+                    break;
+                }
                 const offset = support.len + buckets.len;
-                if (entry.key.len < offset + 32 or !std.mem.startsWith(u8, entry.key[support.len..], buckets)) return error.RetainedSeriesCorrupt;
+                if (entry.key.len < offset + 97 or !std.mem.startsWith(u8, entry.key[support.len..], buckets)) return error.RetainedSeriesCorrupt;
                 const biased = std.fmt.parseInt(u128, entry.key[offset..][0..32], 16) catch return error.RetainedSeriesCorrupt;
                 const start: i128 = @bitCast(biased ^ (@as(u128, 1) << 127));
-                if (!try self.spec.finalized(start, state.admitted_ns)) break;
-                try supports.append(a, try a.dupe(u8, entry.key));
+                if (!try self.spec.finalized(start, state.admitted_ns)) {
+                    state.support_cursor = "";
+                    next = null;
+                    break;
+                }
+                visited += 1;
+                const bucket = entry.key[support.len .. offset + 97];
+                if (!try self.spec.expired(start, state.admitted_ns) and try self.held(a, txn, bucket)) {
+                    // Jump over the entire held bucket, including every
+                    // measure/document, rather than scanning its evidence.
+                    state.support_cursor = try std.mem.concat(a, u8, &.{ support, bucket, "~" });
+                    next = try cur.seekAtOrAfter(state.support_cursor);
+                    continue;
+                }
+                state.support_cursor = try a.dupe(u8, entry.key);
+                try supports.append(a, state.support_cursor);
                 next = try cur.next();
             }
+            support_more = next != null;
+            if (next == null) state.support_cursor = "";
         }
+        state.maintenance_pending = n == limit or support_more;
         for (supports.items) |k| try txn.delete(k);
         try self.publish(a, txn, &state, &touched);
         try self.save(a, txn, state);

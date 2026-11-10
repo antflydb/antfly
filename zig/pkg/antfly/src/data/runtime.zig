@@ -1266,6 +1266,8 @@ const RaftTableApplyStateMachine = struct {
         RetainedSeriesDuplicateRow,
         RetainedSeriesHistoryExpired,
         RetainedSeriesNotReady,
+        RetainedSeriesPreparedHold,
+        RetainedSeriesReservationMismatch,
         RetainedSeriesNumericOverflow,
         RetainedSeriesResetRequired,
         RetainedSeriesResolutionMismatch,

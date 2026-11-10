@@ -30,7 +30,7 @@ pub const Result = struct {
         self.* = undefined;
     }
 };
-pub const Limits = struct { segments: usize = 32, rows: usize = 65536, bytes: usize = 64 * 1024 * 1024 };
+pub const Limits = struct { segments: usize = 32, rows: usize = 65536, bytes: usize = 64 * 1024 * 1024, read_clock_ns: i128 = 0 };
 
 /// `resolve` is a host capability with resolve.location(id) returning Location.
 /// The caller authorizes the independent dataset resource before invoking this.
@@ -50,6 +50,12 @@ pub fn read(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
     }
     if (limits.segments == 0 or limits.segments > catalog.max_page or limits.rows == 0 or limits.rows > codec.max_rows or limits.bytes == 0 or limits.bytes > 256 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
     if (try spec.bucket(try range.start()) != try range.start() or try spec.bucket(try range.end()) != try range.end()) return error.RetainedSeriesResolutionMismatch;
+    const now = store.clock.unix();
+    if (now == 0) return error.DatasetLeaseExpired;
+    // File retention follows its newest covered bucket. Older rows in that
+    // same file still obey their own bucket lifetime, exactly as native scans.
+    var read_clock = @max(@as(i128, now), limits.read_clock_ns);
+    if (try spec.expired(try range.start(), read_clock)) return error.RetainedSeriesHistoryExpired;
     var plan = try store.planCoveringRange(spec.generation, spec.source_partition, spec.source_incarnation, range, limits.segments);
     defer plan.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
@@ -70,6 +76,7 @@ pub fn read(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         const bytes = try store.read(lease, location);
         defer store.context.alloc.free(bytes);
         const decoded = try codec.decode(temp, spec, bytes);
+        read_clock = @max(read_clock, decoded.receipt.admitted_ns);
         if (decoded.receipt.source_sequence != segment.source.sequence or !std.meta.eql(decoded.receipt.span, try segment.span())) return error.InvalidDatasetCoverage;
         for (decoded.rows) |row| {
             const key = codec.key(row);
@@ -80,5 +87,6 @@ pub fn read(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
             try rows.append(temp, owned);
         }
     }
+    if (try spec.expired(try range.start(), read_clock)) return error.RetainedSeriesHistoryExpired;
     return .{ .arena = arena, .rows = rows.items };
 }

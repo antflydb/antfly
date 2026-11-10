@@ -619,7 +619,8 @@ test "retained dataset archived summary serving checks exact state and filters c
     const store = catalog(&memory, &clock);
     const hot = location(&memory, false);
     const cold = location(&memory, true);
-    const def = definition(.summary);
+    var def = definition(.summary);
+    def.retention_ns = 1000;
     try store.create(def);
     const spec = series.Spec{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
     var metrics = [_]series.Metric{.{ .count = 9_007_199_254_740_993 }};
@@ -654,6 +655,12 @@ test "retained dataset archived summary serving checks exact state and filters c
     try std.testing.expectEqual(@as(i128, 60), result.rows[0].start_ns);
     try std.testing.expectEqual(metrics[0].count, (try result.rows[0].metrics[0].finalize(.count)).integer);
     try std.testing.expectError(error.DatasetPageBudgetExceeded, api.summary_read.read(a, store, def, spec, range, .{ .bytes = 1 }, resolver));
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.read(a, store, def, spec, range, .{ .read_clock_ns = 1120 }, resolver));
+    clock.now = 1100;
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.read(a, store, def, spec, .{ .start_ns = "0", .end_ns = "60" }, .{}, resolver));
+    var live = try api.summary_read.read(a, store, def, spec, range, .{}, resolver);
+    defer live.deinit();
+    try std.testing.expectEqual(@as(i128, 60), live.rows[0].start_ns);
     var changed = spec;
     changed.source_incarnation += 1;
     try std.testing.expectError(error.DatasetCoverageUnavailable, api.summary_read.read(a, store, def, changed, range, .{}, resolver));
@@ -675,4 +682,14 @@ test "retained dataset archived summary serving checks exact state and filters c
     unavailable.checksum = digest(empty_bytes);
     try store.publish(unavailable, restore, empty_bytes);
     try std.testing.expectError(error.DatasetRestoreRequired, api.summary_read.read(a, store, def, spec, unavailable.coverage, .{}, resolver));
+}
+
+test "retained dataset sliced coverage cannot extend logical lifetime through exaggerated event bounds" {
+    var value = segment();
+    value.key_span = .{ .start = t.rowKey(0, @splat(0)), .end = t.rowKey(0, @splat(128)) };
+    try value.validate(definition(.summary));
+    value.coverage.end_ns = "120";
+    try std.testing.expectError(error.InvalidDatasetCoverage, value.validate(definition(.summary)));
+    value.coverage = .{ .start_ns = "-60", .end_ns = "60" };
+    try std.testing.expectError(error.InvalidDatasetCoverage, value.validate(definition(.summary)));
 }

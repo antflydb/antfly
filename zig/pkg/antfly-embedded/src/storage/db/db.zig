@@ -25450,9 +25450,10 @@ pub const DB = struct {
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
+        const admitted_timestamp_ns = currentTimeNs();
         var retries: usize = 0;
         while (true) {
-            self.writeIntentsPreparedOnce(txn_id, intents, predicates, preparation.guard.allocator()) catch |err| switch (err) {
+            self.writeIntentsPreparedOnce(txn_id, intents, predicates, preparation.guard.allocator(), admitted_timestamp_ns) catch |err| switch (err) {
                 error.PreparedGenerationChanged => {
                     if (retries >= 2) return err;
                     retries += 1;
@@ -25464,12 +25465,29 @@ pub const DB = struct {
         }
     }
 
+    fn prepareRetainedIntentEffects(self: *DB, a: Allocator, transaction: transactions_mod.TxnId, admitted_timestamp_ns: u64, intents: []const transactions_mod.WriteIntent) !@import("../retained_series_capture.zig").PrepareEffects {
+        const capture = @import("../retained_series_capture.zig");
+        if (!try self.core.store.retainedSeriesActive()) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+        var inputs: std.ArrayList(capture.PreparedInput) = .empty;
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key) or isProtectedIntegrityKey(intent.key) or isProtectedRangeWriteKey(intent.key)) continue;
+            const physical = if (relationalColumns(self) != null) try relational_store.keyAlloc(a, intent.key) else try internal_keys.documentKeyAlloc(a, intent.key);
+            try inputs.append(a, .{ .key = physical, .logical_key = intent.key, .after = intent.prepared_row orelse intent.value });
+        }
+        if (inputs.items.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+        if (admitted_timestamp_ns == 0) return error.InvalidRetainedSeries;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return capture.planPrepare(a, &read, transaction, admitted_timestamp_ns, inputs.items);
+    }
+
     fn writeIntentsPreparedOnce(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
         preparation_alloc: Allocator,
+        admitted_timestamp_ns: u64,
     ) !void {
         const schema_namespace = self.core.schemaNamespaceGeneration();
         const prepared_intents = try preparation_alloc.dupe(transactions_mod.WriteIntent, intents);
@@ -25494,7 +25512,9 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTransactionsUnsupported;
+        // Legacy local intent admission chooses its time at ingress. Ordered
+        // owners must use TransactionIntentRequest's replicated admission time.
+        if (try self.core.store.retainedSeriesActive() and try self.maintenanceRequiresOrderedApply()) return error.RetainedSeriesTransactionsUnsupported;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
@@ -25516,7 +25536,13 @@ pub const DB = struct {
         var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, prepared_intents, view, &guarded_predicates);
+        var retained_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer retained_arena.deinit();
+        const retained = try self.prepareRetainedIntentEffects(retained_arena.allocator(), txn_id, admitted_timestamp_ns, prepared_intents);
         try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, guarded_predicates.items, .{
+            .writes = retained.writes,
+            .deletes = retained.deletes,
+            .retained_series_costs = retained.costs,
             .preparation_allocator = preparation_alloc,
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
             .index_span_digests = index_spans,
@@ -25581,9 +25607,11 @@ pub const DB = struct {
         preparation.init(self);
         defer preparation.deinit();
         const max_prepared_retries = 2;
+        var admitted_request = req;
+        if (admitted_request.admitted_timestamp_ns == 0 and ordered_receipt == null) admitted_request.admitted_timestamp_ns = currentTimeNs();
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, admitted_request, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -25812,7 +25840,6 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTransactionsUnsupported;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
@@ -25937,6 +25964,9 @@ pub const DB = struct {
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        var retained_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer retained_arena.deinit();
+        const retained_alloc = retained_arena.allocator();
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
@@ -25944,14 +25974,22 @@ pub const DB = struct {
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
+            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items);
+            var retained_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+            try retained_writes.appendSlice(retained_alloc, retained.writes);
+            try retained_writes.append(retained_alloc, marker);
             try self.core.writeIntentsExtraBatch(
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .writes = retained_writes.items, .deletes = retained.deletes, .retained_series_costs = retained.costs, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
+            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items);
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .writes = retained.writes,
+                .deletes = retained.deletes,
+                .retained_series_costs = retained.costs,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },

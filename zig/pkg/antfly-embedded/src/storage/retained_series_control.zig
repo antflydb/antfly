@@ -53,6 +53,8 @@ pub const Rejection = error{
     RetainedSeriesDuplicateRow,
     RetainedSeriesHistoryExpired,
     RetainedSeriesNotReady,
+    RetainedSeriesPreparedHold,
+    RetainedSeriesReservationMismatch,
     RetainedSeriesNumericOverflow,
     RetainedSeriesResetRequired,
     RetainedSeriesResolutionMismatch,
