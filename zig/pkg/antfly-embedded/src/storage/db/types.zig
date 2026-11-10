@@ -5575,11 +5575,7 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
         if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "leann_record") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             const value = @field(req, field_name);
-            if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) {
-                // The private wire decodes an absent version as legacy;
-                // LEANN records have no document writes to version.
-                if (value != .legacy and value != .admit_current) return error.InvalidBatchRequest;
-            } else if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (value.len != 0) return error.InvalidBatchRequest;
             } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
         }
@@ -5589,7 +5585,8 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
 test "leann record command must stand alone" {
     try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .sync_level = .write });
     try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .legacy });
-    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .revision_v1 }));
+    // Version tags have no document effect on this standalone control.
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .revision_v1 });
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "", .record = "r" } }));
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "" } }));
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .deletes = &.{"doc"} }));
