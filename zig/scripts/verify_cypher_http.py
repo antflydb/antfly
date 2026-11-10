@@ -22,7 +22,7 @@ from cypher_qualification_retry import retry_allowed
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18591")
-    parser.add_argument("--shards", type=int, choices=[1, 2], default=2)
+    parser.add_argument("--shards", type=int, choices=[1, 2, 8], default=2)
     parser.add_argument("--skip-sql", action="store_true")
     parser.add_argument("--receipt-artifact", type=Path)
     parser.add_argument(
@@ -240,6 +240,29 @@ def main():
             and search["stats"]["search_candidates"] >= 1
         )
         checks += 1
+        for key, expected in (("a", "a"), ("β", "b"), ("missing", None)):
+            point = query(
+                "MATCH(n:Document) WHERE antfly.documentKey(n)=$key AND n.id IS NOT NULL RETURN n.id",
+                parameters={"key": key},
+                limits={"scanned_anchors": 1},
+            )
+            assert point["rows"] == (
+                [] if expected is None else [[{"type": "string", "value": expected}]]
+            ), point
+            checks += 1
+        for predicate in (
+            "antfly.documentKey(n) IN $keys",
+            "antfly.documentKey(n)=$first OR antfly.documentKey(n)=$second",
+        ):
+            bounded = query(
+                f"MATCH(n:Document) WHERE {predicate} RETURN n.id ORDER BY n.id",
+                parameters={"keys": ["a", "β", "a", None], "first": "a", "second": "β"},
+            )
+            assert bounded["rows"] == [
+                [{"type": "string", "value": "a"}],
+                [{"type": "string", "value": "b"}],
+            ], bounded
+            checks += 1
         selective = call(
             "POST",
             f"/graphs/{graph}/query",
@@ -354,6 +377,19 @@ def main():
             )
             assert response["rows"] == [["b"]]
             checks += 1
+            point_sql = f"SELECT g.id,h.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE antfly.documentKey(n)=$1 COLUMNS (n.id AS id)) g JOIN GRAPH_TABLE({graph} MATCH (n IS Document) WHERE antfly.documentKey(n)=$2 COLUMNS (n.id AS id)) h ON true"
+            for keys, expected in (
+                (["a", "β"], [["a", "b"]]),
+                (["β", "a"], [["b", "a"]]),
+            ):
+                response = call(
+                    "POST",
+                    "/sql",
+                    {"statement": point_sql, "parameters": keys},
+                    read_only=True,
+                )
+                assert response["rows"] == expected, response
+                checks += 1
             joined = f"SELECT g.key, d._id FROM GRAPH_TABLE({graph} MATCH (n IS Document) COLUMNS (antfly.documentKey(n) AS key)) AS g JOIN {table} AS d ON d._id=g.key ORDER BY g.key"
             response = call("POST", "/sql", {"statement": joined}, read_only=True)
             assert response["rows"] == [["a", "a"], ["c", "c"], ["β", "β"]]
@@ -558,6 +594,28 @@ def main():
         assert len(rows) == 1
         cell(rows[0][0], "string", "a")
         checks += 1
+        # A narrowed cohort must still apply owner row policies to every get.
+        for key, expected in (("a", [[{"type": "string", "value": "a"}]]), ("β", [])):
+            visible = query(
+                "MATCH(n:Document) WHERE antfly.documentKey(n)=$key RETURN n.id",
+                credential=credential,
+                parameters={"key": key},
+            )
+            assert visible["rows"] == expected, visible
+            checks += 1
+            if not args.skip_sql:
+                response = call(
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": f"SELECT g.id FROM GRAPH_TABLE({graph} MATCH(n IS Document) WHERE antfly.documentKey(n)=$1 COLUMNS(n.id AS id)) g",
+                        "parameters": [key],
+                    },
+                    credential=credential,
+                    read_only=True,
+                )
+                assert response["rows"] == ([["a"]] if key == "a" else []), response
+                checks += 1
         assert (
             query(
                 f"CALL antfly.search('{table}', {{query:'Beta',limit:2}}) YIELD node RETURN node",

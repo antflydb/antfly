@@ -37,6 +37,7 @@ pub const Store = struct {
     bucket: []const u8,
     prefix: []const u8,
     context: catalog.types.Context = .{},
+    native_owner: ?[16]u8 = null,
 
     pub fn open(self: *const Store, a: A, initialize: bool) !ObjectWal {
         try self.context.ensureActive();
@@ -49,6 +50,7 @@ pub const Store = struct {
         // Unmarked, nonempty prefixes fail closed. Pre-release lake state must
         // be exported/rebuilt into a fresh incarnation, never silently hidden.
         try wal.enableIndexed(.{ .read_state = true, .packed_pages = true, .managed_collection = true, .initialize = initialize });
+        wal.indexed.?.native_owner = self.native_owner;
         try self.context.ensureActive();
         return wal;
     }

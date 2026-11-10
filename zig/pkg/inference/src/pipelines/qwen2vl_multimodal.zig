@@ -182,6 +182,11 @@ pub fn parsePreprocessorConfig(allocator: std.mem.Allocator, json_bytes: []const
     };
 
     var config = PreprocessorConfig{};
+    if (obj.get("resample")) |value| {
+        if (value != .integer) return error.UnsupportedQwen2VlPreprocessorConfig;
+        const code = std.math.cast(u8, value.integer) orelse return error.UnsupportedQwen2VlPreprocessorConfig;
+        config.resample = std.enums.fromInt(qwen2vl_types.ImageResample, code) orelse return error.UnsupportedQwen2VlPreprocessorConfig;
+    }
     if (obj.get("do_resize")) |v| {
         if (jsonBool(v)) |value| config.do_resize = value;
     }
@@ -231,30 +236,72 @@ pub fn parsePreprocessorConfig(allocator: std.mem.Allocator, json_bytes: []const
     return config;
 }
 
-pub fn prepareImage(allocator: std.mem.Allocator, image_bytes: []const u8, config: PreprocessorConfig) !PreparedImage {
+pub const ImageGeometry = struct {
+    resized_width: u32,
+    resized_height: u32,
+    image_grid_thw: [3]u32,
+    image_token_count: usize,
+};
+
+fn validatePreprocessor(config: PreprocessorConfig) !void {
     if (!config.do_resize or !config.do_rescale or !config.do_normalize or !config.do_convert_rgb) {
         return error.UnsupportedQwen2VlPreprocessorConfig;
     }
+    if (!std.math.isFinite(config.rescale_factor) or config.rescale_factor <= 0) return error.UnsupportedQwen2VlPreprocessorConfig;
+    for (config.image_mean, config.image_std) |mean, std_dev| {
+        if (!std.math.isFinite(mean) or !std.math.isFinite(std_dev) or std_dev <= 0) return error.UnsupportedQwen2VlPreprocessorConfig;
+    }
+}
+
+fn imageResample(config: PreprocessorConfig) image.Resample {
+    return switch (config.resample) {
+        .nearest => .nearest,
+        .bilinear => .pillow_bilinear,
+        .bicubic => .pillow_bicubic,
+    };
+}
+
+pub fn imageGeometry(width: u32, height: u32, config: PreprocessorConfig) !ImageGeometry {
+    try validatePreprocessor(config);
+    const dims = try smartResize(width, height, config);
+    const grid_h = dims.height / config.patch_size;
+    const grid_w = dims.width / config.patch_size;
+    const merge = config.merge_size;
+    if (grid_h % merge != 0 or grid_w % merge != 0) return error.InvalidPatchMergeFactor;
+    return .{ .resized_width = dims.width, .resized_height = dims.height, .image_grid_thw = .{ 1, grid_h, grid_w }, .image_token_count = @as(usize, grid_h / merge) * (grid_w / merge) };
+}
+
+/// Header-only planning shares exact geometry with execution.
+pub fn imageGeometryForEncoded(bytes: []const u8, config: PreprocessorConfig) !ImageGeometry {
+    const info = try image.inspectEncodedForInference(bytes, null);
+    return imageGeometry(info.width, info.height, config);
+}
+
+/// Initial preparation forecast. Earlier normalized images remain live during
+/// the current decode/resize. Executors must use admitted allocation ownership:
+/// codec scratch and allocator bookkeeping may exceed this geometry forecast.
+pub fn imageWorkingBytes(images: []const []const u8, config: PreprocessorConfig) !usize {
+    var retained: usize = 0;
+    var peak: usize = 0;
+    for (images) |bytes| {
+        const info = try image.inspectEncodedForInference(bytes, null);
+        const geometry = try imageGeometry(info.width, info.height, config);
+        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(info.width, info.height, geometry.resized_width, geometry.resized_height, imageResample(config));
+        const decode = try image.sourceDecodeWorkingBytes(info.width, info.height);
+        peak = @max(peak, try std.math.add(usize, retained, try std.math.add(usize, decode, preprocess)));
+        retained = try std.math.add(usize, retained, try std.math.mul(usize, try std.math.mul(usize, geometry.resized_width, geometry.resized_height), 12));
+    }
+    return peak;
+}
+
+pub fn prepareImage(allocator: std.mem.Allocator, image_bytes: []const u8, config: PreprocessorConfig) !PreparedImage {
+    try validatePreprocessor(config);
     const decoded = try image.decode(allocator, image_bytes);
     defer decoded.deinit(allocator);
 
-    const dims = try smartResize(decoded.width, decoded.height, config);
-    const pixel_values = try image.preprocessDecodedToSize(allocator, decoded, dims.width, dims.height, config.image_mean, config.image_std);
-    errdefer allocator.free(pixel_values);
-
-    const patch_grid_h = dims.height / config.patch_size;
-    const patch_grid_w = dims.width / config.patch_size;
-    const merge = @max(config.merge_size, 1);
-    if (patch_grid_h % merge != 0 or patch_grid_w % merge != 0) return error.InvalidPatchMergeFactor;
-    const grid_t: u32 = 1;
-    return .{
-        .allocator = allocator,
-        .pixel_values = pixel_values,
-        .resized_width = dims.width,
-        .resized_height = dims.height,
-        .image_grid_thw = .{ grid_t, patch_grid_h, patch_grid_w },
-        .image_token_count = @as(usize, grid_t) * (patch_grid_h / merge) * (patch_grid_w / merge),
-    };
+    const geometry = try imageGeometry(decoded.width, decoded.height, config);
+    const pixel_values = try image.preprocessDecodedRectScaledWithResample(allocator, decoded, geometry.resized_width, geometry.resized_height, config.image_mean, config.image_std, config.rescale_factor, imageResample(config));
+    return .{ .allocator = allocator, .pixel_values = pixel_values, .resized_width = geometry.resized_width, .resized_height = geometry.resized_height, .image_grid_thw = geometry.image_grid_thw, .image_token_count = geometry.image_token_count };
 }
 
 pub fn expandPromptTokensForPreparedImages(
@@ -308,7 +355,7 @@ pub fn prepareExpandedPromptEmbeddings(
     var prepared_images = try allocator.alloc(PreparedImage, images.len);
     defer allocator.free(prepared_images);
     var prepared_count: usize = 0;
-    errdefer {
+    defer {
         for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
     }
     for (images, 0..) |image_bytes, idx| {
@@ -316,9 +363,6 @@ pub fn prepareExpandedPromptEmbeddings(
         prepared_images[idx] = try prepareImage(allocator, image_bytes, prep_cfg);
         debugQwenVlStage("prepared image {d} resized={}x{} tokens={d}", .{ idx, prepared_images[idx].resized_width, prepared_images[idx].resized_height, prepared_images[idx].image_token_count });
         prepared_count += 1;
-    }
-    defer {
-        for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
     }
 
     debugQwenVlStage("expand prompt tokens", .{});
@@ -751,4 +795,58 @@ test "qwen admission image-token bound covers aligned preprocessing" {
         error.InvalidPreprocessorConfig,
         maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
     );
+}
+
+test "model processor resampling is declared independently of PDF sampling" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(qwen2vl_types.ImageResample.bicubic, (try parsePreprocessorConfig(a, "{}")).resample);
+    for ([_]struct { json: []const u8, filter: qwen2vl_types.ImageResample }{
+        .{ .json = "{\"resample\":0}", .filter = .nearest },
+        .{ .json = "{\"resample\":2}", .filter = .bilinear },
+        .{ .json = "{\"image_processor\":{\"resample\":3}}", .filter = .bicubic },
+    }) |case| try std.testing.expectEqual(case.filter, (try parsePreprocessorConfig(a, case.json)).resample);
+    for ([_][]const u8{ "{\"resample\":1}", "{\"resample\":999}", "{\"resample\":-1}", "{\"resample\":\"bicubic\"}", "{\"image_processor\":{\"resample\":null}}" }) |json|
+        try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, parsePreprocessorConfig(a, json));
+}
+
+test "model processor resampling changes prepared pixels without changing geometry" {
+    const a = std.testing.allocator;
+    const png = try @import("antfly_image").png.encodeRgba(a, 2, 1, &.{ 255, 0, 0, 255, 0, 0, 255, 255 });
+    defer a.free(png);
+    var config = PreprocessorConfig{ .resample = .nearest, .min_pixels = 8, .max_pixels = 8, .patch_size = 1, .merge_size = 1 };
+    var nearest = try prepareImage(a, png, config);
+    defer nearest.deinit();
+    config.resample = .bicubic;
+    var bicubic = try prepareImage(a, png, config);
+    defer bicubic.deinit();
+    try std.testing.expectEqual(nearest.resized_width, bicubic.resized_width);
+    try std.testing.expectEqual(nearest.resized_height, bicubic.resized_height);
+    try std.testing.expectEqual(nearest.image_grid_thw, bicubic.image_grid_thw);
+    try std.testing.expect(!std.mem.eql(f32, nearest.pixel_values, bicubic.pixel_values));
+    config.rescale_factor = 0;
+    try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, prepareImage(a, png, config));
+    config.rescale_factor = 1.0 / 255.0;
+    config.image_std[0] = 0;
+    try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, prepareImage(a, png, config));
+}
+
+test "model processor resampling header-only geometry matches execution for every filter" {
+    const a = std.testing.allocator;
+    const png = try @import("antfly_image").png.encodeRgba(a, 2, 1, &.{ 255, 0, 0, 255, 0, 0, 255, 255 });
+    defer a.free(png);
+    for ([_]qwen2vl_types.ImageResample{ .nearest, .bilinear, .bicubic }) |filter| {
+        const config = PreprocessorConfig{ .resample = filter, .min_pixels = 8, .max_pixels = 8, .patch_size = 1, .merge_size = 1 };
+        const geometry = try imageGeometryForEncoded(png, config);
+        // A header-only buffer is sufficient: preflight must not decode IDAT.
+        try std.testing.expectEqualDeep(geometry, try imageGeometryForEncoded(png[0..24], config));
+        var actual = try prepareImage(a, png, config);
+        defer actual.deinit();
+        try std.testing.expectEqual(geometry.resized_width, actual.resized_width);
+        try std.testing.expectEqual(geometry.resized_height, actual.resized_height);
+        try std.testing.expectEqual(geometry.image_grid_thw, actual.image_grid_thw);
+        try std.testing.expectEqual(geometry.image_token_count, actual.image_token_count);
+        const single = try imageWorkingBytes(&.{png}, config);
+        const pair = try imageWorkingBytes(&.{ png, png }, config);
+        try std.testing.expectEqual(single + actual.pixel_values.len * @sizeOf(f32), pair);
+    }
 }

@@ -1099,9 +1099,18 @@ implementation and qualification log is summarized in
 - Garbage collection marks everything reachable from live publication, reader and
   builder leases, including checkpoints. Incomplete traversals never authorize a
   sweep.
-- Readiness warms planning navigation once per publication: at most four
-  publications concurrently, four I/O lanes of 4 MiB, 64 pages, two interior
-  levels and a two-second deadline. It never warms postings or source rows.
+- Required serving-cut recovery runs before optional navigation warming, with
+  four process-wide recovery lanes, per-table/incarnation coalescing, caller
+  cancellation, shutdown cancellation and a 60-second maximum deadline. Ownership
+  becomes active only when a complete first cut is durably admitted. Failed first
+  captures retain strict reads; active sources report ready only when their cut
+  can cover the configured cursor horizon.
+- Optional warming admits four publications and four I/O lanes of 4 MiB, up to
+  64 navigation pages, three child levels, and 16 segments/16 MiB of working
+  blocks within two seconds. Four bounded continuation plans resume completed
+  waves after timeout; immutable references carry no request credentials or
+  leases. Eviction permits rewarming after a five-second cooldown. Compressed
+  metadata bundles replace individual-piece fetches during warming.
   Counters: `antfly_lake_navigation_warming_{attempts,failures,pages,nanoseconds}_total`.
 - Cloud generation maps, retained-closure certificates and cloud GC are described
   in [Cloud generations and retention evidence](REMOTE_TABLE_SERVING.md#cloud-generations-and-retention-evidence).

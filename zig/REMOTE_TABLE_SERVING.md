@@ -15,6 +15,11 @@ alone must not establish source commitment or index readiness.
 
 ## Implementation status
 
+Native owner serving cuts use staged admission, bounded coalesced recovery and
+credential-scoped durable caching for retained state, row groups and sealed
+manifests. The complete authority, retention and warming contract is maintained in
+[Native owner serving cuts](../docs/design/table-object-storage.md#native-owner-serving-cuts).
+
 The serving path now connects the existing persistent range cache beneath shared
 RAM reads for SQL and typed HTTP rows, including Parquet files referenced by
 Iceberg. Cache initialization belongs to the API owner and happens after table

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.created_enrichment_config_embedding_input import CreatedEnrichmentConfigEmbeddingInput
 from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
@@ -32,6 +33,8 @@ class CreatedEnrichmentConfig:
         template (str | Unset):
         source_artifact_name (str | Unset):
         expected_dims (int | Unset):
+        embedding_input (CreatedEnrichmentConfigEmbeddingInput | Unset): Effective embedding input mode; PDF pages are
+            rasterized before embedding.
         vector_space (str | Unset): Optional stable model/token-space identifier asserted for this embedding artifact.
         chunk_size (int | Unset):
         chunk_overlap (int | Unset):
@@ -58,6 +61,7 @@ class CreatedEnrichmentConfig:
     template: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
     expected_dims: int | Unset = UNSET
+    embedding_input: CreatedEnrichmentConfigEmbeddingInput | Unset = UNSET
     vector_space: str | Unset = UNSET
     chunk_size: int | Unset = UNSET
     chunk_overlap: int | Unset = UNSET
@@ -88,6 +92,10 @@ class CreatedEnrichmentConfig:
         source_artifact_name = self.source_artifact_name
 
         expected_dims = self.expected_dims
+
+        embedding_input: str | Unset = UNSET
+        if not isinstance(self.embedding_input, Unset):
+            embedding_input = self.embedding_input.value
 
         vector_space = self.vector_space
 
@@ -133,6 +141,8 @@ class CreatedEnrichmentConfig:
             field_dict["source_artifact_name"] = source_artifact_name
         if expected_dims is not UNSET:
             field_dict["expected_dims"] = expected_dims
+        if embedding_input is not UNSET:
+            field_dict["embedding_input"] = embedding_input
         if vector_space is not UNSET:
             field_dict["vector_space"] = vector_space
         if chunk_size is not UNSET:
@@ -189,6 +199,13 @@ class CreatedEnrichmentConfig:
 
         expected_dims = d.pop("expected_dims", UNSET)
 
+        _embedding_input = d.pop("embedding_input", UNSET)
+        embedding_input: CreatedEnrichmentConfigEmbeddingInput | Unset
+        if isinstance(_embedding_input, Unset):
+            embedding_input = UNSET
+        else:
+            embedding_input = CreatedEnrichmentConfigEmbeddingInput(_embedding_input)
+
         vector_space = d.pop("vector_space", UNSET)
 
         chunk_size = d.pop("chunk_size", UNSET)
@@ -231,6 +248,7 @@ class CreatedEnrichmentConfig:
             template=template,
             source_artifact_name=source_artifact_name,
             expected_dims=expected_dims,
+            embedding_input=embedding_input,
             vector_space=vector_space,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,

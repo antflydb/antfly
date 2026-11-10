@@ -30,6 +30,7 @@ from conftest import (
     DEFAULT_ANTFLY_BIN,
     InferenceEmbeddingServer,
     StandaloneAntflyServer,
+    lookup_key_path,
     ready_index_status,
     resolve_binary_path,
 )
@@ -335,13 +336,21 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 assert {
                     node.get("document", {}).get("canonical_name")
                     for node in graph["nodes"]
-                    if node.get("table") == "concepts"
                 } == {f"Orchard {ordinal}", "Harvest"}, {
                     "graph": graph,
                     "index": call("GET", "/tables/docs/indexes/knowledge"),
                     "resolver": call("GET", "/tables/docs/resolvers/concepts"),
                     "logs": server.debug_logs(),
                 }
+                # Returned qualifiers are canonical storage identities. Prove
+                # hydration against the public target rather than filtering
+                # valid nodes out by the mutable logical name.
+                assert len({node["table"] for node in graph["nodes"]}) == 1
+                for node in graph["nodes"]:
+                    assert node["table"]
+                    assert node["document"] == call(
+                        "GET", lookup_key_path("concepts", node["key"])
+                    )
 
         for offset in range(0, 608, batch_size):
             write(offset, min(offset + batch_size, 608))

@@ -67,7 +67,7 @@ const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
 const backups_api = @import("backups.zig");
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
@@ -385,6 +385,8 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
 fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
     return switch (err) {
+        error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot => jsonErrorResponse(ctx, 400, "invalid lake manifest: files require immutable identity, supported format, positive size, and valid inventory metadata"),
+        error.ExternalSourceSnapshotTooLarge => jsonErrorResponse(ctx, 400, "lake manifest exceeds supported inventory limits"),
         error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
         error.ExternalLakeSchemaMismatch => jsonErrorResponse(ctx, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
         error.ExternalLakeSchemaUnavailable => jsonErrorResponse(ctx, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
@@ -583,7 +585,12 @@ const RetrievalSseSink = struct {
         try self.writer.?.writeEvent(name, json);
     }
 
-    fn emitError(self: *@This()) !void {
+    fn emitError(self: *@This(), err: anyerror) !void {
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            const json = try std.json.Stringify.valueAlloc(self.context.allocator, detail.payload(err), .{});
+            defer self.context.allocator.free(json);
+            return emitJson(self, self.context.allocator, "error", json);
+        }
         try emitJson(self, self.context.allocator, "error", "{\"error\":\"RetrievalFailed\"}");
     }
 
@@ -874,8 +881,13 @@ const AgentGenerationRunner = struct {
     fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
         return .{
             .ptr = runner,
-            .vtable = &.{ .execute_chain = executeChain },
+            .vtable = &.{ .execute_chain = executeChain, .check = check },
         };
+    }
+
+    fn check(raw: *anyopaque) !void {
+        const runner: *@This() = @ptrCast(@alignCast(raw));
+        try runner.request_context.check();
     }
 
     fn executeChain(
@@ -1528,7 +1540,7 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
-        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1 };
+        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1, routes.memory_mcp_v1_agent };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
             try server.get(path, mcp_handler);
@@ -1958,7 +1970,7 @@ pub const AntflyApiHandler = struct {
             inline for (.{ "cursor", "start", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
                 try query_body.put(a, field, .{ .string = decoded });
             };
-            inline for (.{ "limit", "valid_at", "known_at" }) |field| if (ctx.query(field)) |v| {
+            inline for (.{ "limit", "valid_at", "known_at", "token_budget" }) |field| if (ctx.query(field)) |v| {
                 const number = std.fmt.parseInt(i64, v, 10) catch return memoryFailure(ctx, error.InvalidMemoryRequest);
                 try query_body.put(a, field, .{ .integer = number });
             };
@@ -2170,8 +2182,9 @@ pub const AntflyApiHandler = struct {
         };
         const path = ctx.request.uri.path;
         var extension_name: ?[]const u8 = null;
-        const is_memory = std.mem.eql(u8, path, routes.memory_mcp_v1);
-        var endpoint_path: []const u8 = if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
+        const is_memory_agent = std.mem.eql(u8, path, routes.memory_mcp_v1_agent);
+        const is_memory = is_memory_agent or std.mem.eql(u8, path, routes.memory_mcp_v1);
+        var endpoint_path: []const u8 = if (is_memory_agent) routes.memory_mcp_v1_agent else if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
         if (std.mem.startsWith(u8, path, routes.mcp_v1_extension_profiles_prefix)) {
             const profile = path[routes.mcp_v1_extension_profiles_prefix.len..];
             if (!std.mem.eql(u8, profile, "copilot"))
@@ -2192,7 +2205,7 @@ pub const AntflyApiHandler = struct {
             .body = body,
         };
         var response = if (is_memory)
-            try protocol_adapters.executeMemoryMcpRequest(self.api_server, request, authenticated_identity)
+            try protocol_adapters.executeMemoryMcpProfileRequest(self.api_server, request, authenticated_identity, if (is_memory_agent) .agent else .full)
         else if (extension_name) |name|
             try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
         else
@@ -7576,7 +7589,7 @@ pub const AntflyApiHandler = struct {
                     const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = generation_runner.chatgpt_failure.summary() }, .{});
                     defer ctx.allocator.free(json);
                     try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
-                } else try sink.emitError();
+                } else try sink.emitError(err);
                 try sink.close();
                 return ctx.response.build();
             }
@@ -7691,6 +7704,9 @@ pub const AntflyApiHandler = struct {
     }
 
     fn respondGenerationOutputError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            return try ctx.status(detail.status).json(detail.payload(err));
+        }
         var response = (try http_server_mod.generationOutputErrorResponse(ctx.allocator, err)) orelse return null;
         return try respondOwnedContextualResponse(ctx, &response, ctx.allocator);
     }
@@ -7763,7 +7779,7 @@ pub const AntflyApiHandler = struct {
                     const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = runners.generation.chatgpt_failure.summary() }, .{});
                     defer ctx.allocator.free(json);
                     try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
-                } else try sink.emitError();
+                } else try sink.emitError(err);
                 try sink.close();
                 return ctx.response.build();
             }
@@ -8572,10 +8588,6 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
-        @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(ctx.allocator, body_data) catch |err| {
-            if (err == error.PrivacyManagedGraph) return jsonErrorResponse(ctx, 400, "privacy policies and managed producers must be configured through the table Privacy API");
-            return err;
-        };
         // Reject oversized requests before JSON allocation, credential
         // sealing, or remote embedding-model probes. Forwarding has a larger
         // envelope allowance, but the user definition itself is capped here.
@@ -8583,6 +8595,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(413);
             return ctx.text("create table request too large");
         }
+        @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(ctx.allocator, body_data) catch |err| {
+            if (err == error.PrivacyManagedGraph) return jsonErrorResponse(ctx, 400, "privacy policies and managed producers must be configured through the table Privacy API");
+            return err;
+        };
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
@@ -19373,6 +19389,60 @@ test "httpx agent generation output failures preserve terminal upstream status a
     }
 }
 
+test "httpx agent generation output failures preserve context errors across stream commit" {
+    const Transport = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        starts: usize = 0,
+        closed: bool = false,
+        fn start(raw: ?*anyopaque, status: u16, _: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u16, 200), status);
+            self.starts += 1;
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closed = true;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.AgentContextBudgetExceeded, error.ContextSummaryMissingCitation, error.InvalidContextRequest, error.TestPrivateProviderFailure }) |err| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/agents/retrieval");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var transport = Transport{};
+        defer transport.bytes.deinit(a);
+        ctx.stream_delegate = .{ .ptr = &transport, .start = Transport.start, .write = Transport.write, .close = Transport.close };
+        var sink = RetrievalSseSink{ .context = &ctx };
+        // Retrieval has committed its headers before preparation fails.
+        try RetrievalSseSink.emitJson(&sink, a, "hit", "{}");
+        try sink.emitError(err);
+        try sink.close();
+        try std.testing.expectEqual(@as(usize, 1), transport.starts);
+        try std.testing.expect(transport.closed);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, transport.bytes.items, "event: error\n"));
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, @errorName(err)) != null);
+            var json_ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer json_ctx.deinit();
+            var response = (try AntflyApiHandler.respondGenerationOutputError(&json_ctx, err)).?;
+            defer response.deinit();
+            try std.testing.expectEqual(detail.status, response.status.code);
+            const encoded = try std.json.Stringify.valueAlloc(a, detail.payload(err), .{});
+            defer a.free(encoded);
+            try std.testing.expectEqualStrings(encoded, response.body.?);
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, encoded) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, "RetrievalFailed") != null);
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, @errorName(err)) == null);
+        }
+    }
+}
+
 test "httpx retrieval read failures preserve retryable JSON and conflict status" {
     const alloc = std.testing.allocator;
     for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.IndexRebuilding }) |failure| {
@@ -20242,6 +20312,215 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     });
     defer listed.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), listed.status);
+}
+
+test "native memory brief, consolidation, pins and the agent MCP profile" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    const adapters = @import("protocol_adapters.zig");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("native-memory-layers");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .principal = "local", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    a.free(created);
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7002, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{}, status_source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+
+    const observe_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/observations", .{base});
+    defer a.free(observe_url);
+    const body =
+        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Deploys require a change ticket"}],"assertions":[{"id":"ticket","subject":"deploys","predicate":"requires","value":"ticket","kind":"constraint","statement":"Deploys require a change ticket","evidence":[{"id":"e1"}]},{"id":"guess","subject":"deploys","predicate":"owner","value":"infra","stability":"provisional","statement":"Infra probably owns deploys","evidence":[{"id":"e1"}]}]}
+    ;
+    var observed = try requestWithRetry(&client, threaded.io(), .POST, observe_url, body, &.{ .{ "content-type", "application/json" }, .{ "idempotency-key", "observe" } }, 20);
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), observed.status.code);
+
+    // Storage adapters must project the policy metadata before transporting a
+    // brief page; ordinary record reads still return the full procedure.
+    const procedure_payload = try a.alloc(u8, 16 * 1024);
+    defer a.free(procedure_payload);
+    @memset(procedure_payload, 'x');
+    const procedure_body = try std.json.Stringify.valueAlloc(a, module.memory.types.ObservationRequest{
+        .evidence = &.{.{ .id = "procedure-note", .text = "Deployment procedure" }},
+        .entities = &.{.{ .id = "deploys", .name = "Deployments", .evidence = &.{.{ .id = "procedure-note" }} }},
+        .assertions = &.{.{ .id = "procedure", .subject = "deploys", .predicate = "procedure", .value = "release", .statement = "A bounded deployment procedure", .kind = .procedural, .steps = &.{procedure_payload}, .evidence = &.{.{ .id = "procedure-note" }} }},
+    }, .{});
+    defer a.free(procedure_body);
+    var procedure = try requestWithRetry(&client, threaded.io(), .POST, observe_url, procedure_body, &.{ .{ "content-type", "application/json" }, .{ "idempotency-key", "procedure" } }, 20);
+    defer procedure.deinit();
+    try std.testing.expectEqual(@as(u16, 200), procedure.status.code);
+    {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const backend = native.backend();
+        const projected = try backend.scan_metadata.?(backend.ptr, scratch, "assertion/", null, 16);
+        var found_procedure = false;
+        for (projected.rows) |row| {
+            const record = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, row.json, .{});
+            try std.testing.expectEqual(@as(usize, 0), record.assertion.steps.len);
+            if (std.mem.eql(u8, record.assertion.id, "procedure")) {
+                found_procedure = true;
+                try std.testing.expect(row.json.len < procedure_payload.len);
+                const one = (try backend.get_metadata.?(backend.ptr, scratch, row.key)).?;
+                const single = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, one.json, .{});
+                try std.testing.expectEqual(@as(usize, 0), single.assertion.steps.len);
+                const hydrated = try backend.get_many_metadata.?(backend.ptr, scratch, &.{row.key});
+                const selected = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, hydrated[0].?.json, .{});
+                try std.testing.expectEqual(@as(usize, 0), selected.assertion.steps.len);
+            }
+        }
+        try std.testing.expect(found_procedure);
+        const full_json = try (module.memory.Service{ .backend = backend, .context = context }).execute(scratch, .get, "procedure", "{}", "");
+        const full = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, full_json, .{});
+        try std.testing.expectEqual(@as(usize, 1), full.assertion.steps.len);
+    }
+
+    // Lineage maps entities to immutable entity snapshots. Assertion-only
+    // projections must never be applied to this batched root hydration.
+    const inspect_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team?limit=256", .{base});
+    defer a.free(inspect_url);
+    var inspection = try requestWithRetry(&client, threaded.io(), .GET, inspect_url, "", &.{}, 20);
+    defer inspection.deinit();
+    try std.testing.expectEqual(@as(u16, 200), inspection.status.code);
+    const inspected = try std.json.parseFromSlice(module.memory.types.Inspection, a, inspection.body.?, .{});
+    defer inspected.deinit();
+    try std.testing.expectEqual(@as(u32, 1), inspected.value.statistics.stats.entities);
+    try std.testing.expectEqual(@as(u32, 3), inspected.value.statistics.stats.memories);
+
+    const brief_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/brief?limit=4&token_budget=2048", .{base});
+    defer a.free(brief_url);
+    var brief = try requestWithRetry(&client, threaded.io(), .GET, brief_url, "", &.{}, 20);
+    defer brief.deinit();
+    try std.testing.expectEqual(@as(u16, 200), brief.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, brief.body.?, "\"id\":\"ticket\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, brief.body.?, "\"id\":\"guess\"") == null);
+
+    const pins_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/pins", .{base});
+    defer a.free(pins_url);
+    var unkeyed = try requestWithRetry(&client, threaded.io(), .POST, pins_url, "{\"id\":\"ticket\"}", &.{.{ "content-type", "application/json" }}, 20);
+    defer unkeyed.deinit();
+    try std.testing.expectEqual(@as(u16, 400), unkeyed.status.code);
+    var pinned = try requestWithRetry(&client, threaded.io(), .POST, pins_url, "{\"id\":\"ticket\"}", &.{ .{ "content-type", "application/json" }, .{ "idempotency-key", "pin" } }, 20);
+    defer pinned.deinit();
+    try std.testing.expectEqual(@as(u16, 200), pinned.status.code);
+
+    const review_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/consolidation", .{base});
+    defer a.free(review_url);
+    var review = try requestWithRetry(&client, threaded.io(), .POST, review_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer review.deinit();
+    try std.testing.expectEqual(@as(u16, 200), review.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, review.body.?, "\"kind\":\"unverified\",\"memory_ids\":[\"guess\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review.body.?, "\"pinned\":1") != null);
+
+    var initialized = try adapters.executeMemoryMcpProfileRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp/agent",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-agent-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null), .agent);
+    defer initialized.deinit(a);
+    const session_id = for (initialized.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var listed = try adapters.executeMemoryMcpProfileRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp/agent",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null), .agent);
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_outcome") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_fork_lineage") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_review_entity") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "Start here each session") != null);
+
+    // Agent writes may omit idempotency_key; an identical retry replays.
+    const outcome_call =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_outcome","arguments":{"space":"team","body":{"id":"o1","task_id":"deploy","success":true,"used_memory_ids":["ticket"]}}}}
+    ;
+    const reordered_call =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_outcome","arguments":{"body":{"used_memory_ids":["ticket"],"success":true,"task_id":"deploy","id":"o1"},"space":"team"}}}
+    ;
+    var first_recorded: ?[]u8 = null;
+    defer if (first_recorded) |first| a.free(first);
+    for ([_][]const u8{ outcome_call, outcome_call, reordered_call }) |call| {
+        var recorded = try adapters.executeMemoryMcpProfileRequest(&api, .{ .method = .post, .endpoint_path = "/memory/v1/mcp/agent", .session_id = session_id, .body = call }, @as(?AuthenticatedIdentity, null), .agent);
+        defer recorded.deinit(a);
+        try std.testing.expectEqual(@as(u16, 200), recorded.status);
+        try std.testing.expect(std.mem.indexOf(u8, recorded.body, "isError\":true") == null);
+        try std.testing.expect(std.mem.indexOf(u8, recorded.body, "succeeded") != null);
+        if (first_recorded) |first| try std.testing.expectEqualStrings(first, recorded.body) else first_recorded = try a.dupe(u8, recorded.body);
+    }
+    var agent_brief = try adapters.executeMemoryMcpProfileRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp/agent",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_brief\",\"arguments\":{\"space\":\"team\"}}}",
+    }, @as(?AuthenticatedIdentity, null), .agent);
+    defer agent_brief.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), agent_brief.status);
+    try std.testing.expect(std.mem.indexOf(u8, agent_brief.body, "successes") != null);
+
+    // The full catalog still requires explicit keys.
+    var full_init = try adapters.executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-full-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer full_init.deinit(a);
+    const full_session = for (full_init.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var full_listed = try adapters.executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = full_session,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer full_listed.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, full_listed.body, "memory_fork_lineage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_listed.body, "memory_consolidate") != null);
+}
+
+test "native memory agent idempotency keys are content addressed" {
+    const adapters = @import("protocol_adapters.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o1\"}", .{});
+    const ordered = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o1\",\"nested\":{\"a\":1,\"b\":2}}", .{});
+    const reordered = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"nested\":{\"b\":2,\"a\":1},\"id\":\"o1\"}", .{});
+    try std.testing.expectEqualStrings(try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", ordered), try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", reordered));
+    const other = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o2\"}", .{});
+    const first = try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", body);
+    try std.testing.expectEqualStrings(first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", body));
+    try std.testing.expect(!std.mem.eql(u8, first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", other)));
+    try std.testing.expect(!std.mem.eql(u8, first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "other", "", "", body)));
+    try std.testing.expect(first.len <= 256 and std.mem.startsWith(u8, first, "agent:"));
+    var nested = body;
+    for (0..66) |_| {
+        var array = try std.array_list.Managed(std.json.Value).initCapacity(a, 1);
+        array.appendAssumeCapacity(nested);
+        nested = .{ .array = array };
+    }
+    try std.testing.expectError(error.InvalidMemoryRequest, adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", nested));
 }
 
 test "native memory catalog ownership denies generic and batched data admission" {

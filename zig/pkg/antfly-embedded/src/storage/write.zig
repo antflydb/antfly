@@ -324,9 +324,7 @@ fn persistPrivacyExecution(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_jso
 }
 
 pub fn batchWritesAsTransactionWrites(writes: []const db_mod.types.BatchWrite) []const db_mod.types.TransactionWrite {
-    comptime std.debug.assert(@sizeOf(db_mod.types.BatchWrite) == @sizeOf(db_mod.types.TransactionWrite));
-    comptime std.debug.assert(@alignOf(db_mod.types.BatchWrite) == @alignOf(db_mod.types.TransactionWrite));
-    return @ptrCast(writes);
+    return writes;
 }
 
 pub fn corruptEmbeddingArtifactInDb(

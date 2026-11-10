@@ -46,7 +46,18 @@ pub const JudgeOutput = struct {
         return .{ .label = self.label, .ranking = self.ranking, .reason = self.reason };
     }
 };
-pub const Prediction = struct { admitted: ?bool = null, label: ?Label = null, ranking: ?[]const []const u8 = null, reason: []const u8 = "" };
+pub const Prediction = struct {
+    admitted: ?bool = null,
+    label: ?Label = null,
+    ranking: ?[]const []const u8 = null,
+    reason: []const u8 = "",
+    /// Rendered response bytes for policy retrieval: the token cost an agent
+    /// pays for this answer. Compare runs with different recall policies.
+    token_upper_bound: ?u64 = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyOmitting(self, writer, &.{"token_upper_bound"});
+    }
+};
 pub const Verdict = struct { case_id: []const u8, case_revision: u64, input_fingerprint: []const u8, prediction: JudgeOutput, invalid_output: bool = false };
 pub const Submit = struct { expected_revision: u64, verdicts: []const Verdict, actor: []const u8 = "", model: ?t.Model = null };
 pub const Result = struct { invalid_output: bool = false, scrubbed: bool = false, run: []const u8, case_id: []const u8, case_revision: u64, input_fingerprint: []const u8, prediction: ?Prediction = null, unavailable: bool = false, principal: []const u8, actor: []const u8, model: ?t.Model, revision: u64, recorded_at: i64 };
@@ -62,13 +73,30 @@ pub const Counts = struct {
     false_positive: u64 = 0,
     false_negative: u64 = 0,
     true_negative: u64 = 0,
+    /// Sum of prediction token_upper_bound and how many predictions had one.
+    tokens: u64 = 0,
+    token_cases: u64 = 0,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyOmitting(self, writer, &.{ "tokens", "token_cases" });
+    }
     pub fn report(self: Counts) Report {
         const precision = ratio(self.true_positive, self.true_positive + self.false_positive);
         const recall = ratio(self.true_positive, self.true_positive + self.false_negative);
-        return .{ .counts = self, .precision = precision, .recall = recall, .f1 = if (precision != null and recall != null) if (precision.? + recall.? > 0) 2 * precision.? * recall.? / (precision.? + recall.?) else 0 else null, .coverage = ratio(self.graded, self.cases - self.unavailable), .accuracy = ratio(self.correct, self.graded) };
+        return .{ .counts = self, .precision = precision, .recall = recall, .f1 = if (precision != null and recall != null) if (precision.? + recall.? > 0) 2 * precision.? * recall.? / (precision.? + recall.?) else 0 else null, .coverage = ratio(self.graded, self.cases - self.unavailable), .accuracy = ratio(self.correct, self.graded), .mean_tokens = ratio(self.tokens, self.token_cases) };
     }
 };
-pub const Report = struct { counts: Counts, precision: ?f64, recall: ?f64, f1: ?f64, coverage: ?f64, accuracy: ?f64 };
+pub const Report = struct {
+    counts: Counts,
+    precision: ?f64,
+    recall: ?f64,
+    f1: ?f64,
+    coverage: ?f64,
+    accuracy: ?f64,
+    mean_tokens: ?f64 = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyOmitting(self, writer, &.{"mean_tokens"});
+    }
+};
 pub const Run = struct {
     version: u8 = 1,
     id: []const u8,
@@ -81,6 +109,7 @@ pub const Run = struct {
     visibility: t.Visibility,
     mode: @FieldType(Start, "mode"),
     knowledge_revision: u64,
+    feedback_revision: u64 = 0,
     config_generation: u64,
     config_fingerprint: []const u8,
     source_config_fingerprint: []const u8,
@@ -101,7 +130,48 @@ pub const Status = struct { run: Run, identity: Report, relationship: Report, su
 pub const JudgeTask = struct { case_id: []const u8, case_revision: u64, input_fingerprint: []const u8, input: JudgeInput };
 pub const TaskPage = struct { items: []const JudgeTask, next_cursor: ?[]const u8, complete: bool, run_fingerprint: []const u8 };
 pub const CasePage = struct { items: []const StoredCase, next_cursor: ?[]const u8, complete: bool, revision: u64 };
-pub const PolicyInput = struct { seed: []const u8 = "", target: []const u8 = "", entity_candidates: t.EntityCandidateRequest = .{}, supersession_candidates: t.SupersessionCandidateRequest = .{}, recall: t.Recall = .{} };
+pub const RetrievalPolicy = enum { recall, brief, none };
+pub const PolicyInput = struct {
+    retrieval: RetrievalPolicy = .recall,
+    brief: t.BriefRequest = .{},
+    seed: []const u8 = "",
+    target: []const u8 = "",
+    entity_candidates: t.EntityCandidateRequest = .{},
+    supersession_candidates: t.SupersessionCandidateRequest = .{},
+    recall: t.Recall = .{},
+
+    pub fn jsonStringify(self: PolicyInput, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(PolicyInput).@"struct".field_names) |field| {
+            const skip = if (comptime std.mem.eql(u8, field, "retrieval")) self.retrieval == .recall else if (comptime std.mem.eql(u8, field, "brief")) self.retrieval != .brief else false;
+            if (!skip) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+};
+
+/// Encode a struct, omitting the named optional-or-zero fields when unset, so
+/// additive metrics never change bytes of results recorded before them.
+fn stringifyOmitting(value: anytype, writer: anytype, comptime omitted: []const []const u8) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
+        const skip = comptime for (omitted) |name| {
+            if (std.mem.eql(u8, name, field)) break true;
+        } else false;
+        const unset = if (comptime skip) switch (@typeInfo(@FieldType(@TypeOf(value), field))) {
+            .optional => @field(value, field) == null,
+            else => @field(value, field) == 0,
+        } else false;
+        if (!unset) {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+    }
+    try writer.endObject();
+}
 
 fn ratio(n: u64, d: u64) ?f64 {
     return if (d == 0) null else @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(d));
@@ -139,6 +209,10 @@ pub fn score(counts: *Counts, value: Case, prediction: ?Prediction) !void {
         counts.unavailable += 1;
         return;
     };
+    if (result.token_upper_bound) |tokens| {
+        counts.tokens +|= tokens;
+        counts.token_cases += 1;
+    }
     if (value.task == .retrieval) {
         if (result.label != null) return error.InvalidMemoryRequest;
         const ranking = result.ranking orelse {
@@ -210,6 +284,23 @@ test "evaluation metrics distinguish abstention availability wrong positive clas
     try score(&retrieval, .{ .id = "query", .task = .retrieval, .input = .null, .relevant_ids = &.{ "a", "b" } }, .{ .ranking = &.{ "b", "c" } });
     try std.testing.expectEqual(@as(f64, 0.5), retrieval.report().precision.?);
     try std.testing.expectEqual(@as(f64, 0.5), retrieval.report().recall.?);
+    try std.testing.expect(retrieval.report().mean_tokens == null);
+    try score(&retrieval, .{ .id = "query", .task = .retrieval, .input = .null, .relevant_ids = &.{"a"} }, .{ .ranking = &.{"a"}, .token_upper_bound = 300 });
+    try score(&retrieval, .{ .id = "query", .task = .retrieval, .input = .null, .relevant_ids = &.{"a"} }, .{ .ranking = &.{"a"}, .token_upper_bound = 500 });
+    try std.testing.expectEqual(@as(f64, 400), retrieval.report().mean_tokens.?);
+}
+
+test "evaluation token metrics are omitted until recorded" {
+    const a = std.testing.allocator;
+    const plain = try std.json.Stringify.valueAlloc(a, Prediction{ .ranking = &.{"a"} }, .{});
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "token_upper_bound") == null);
+    const counts = try std.json.Stringify.valueAlloc(a, (Counts{}).report(), .{});
+    defer a.free(counts);
+    try std.testing.expect(std.mem.indexOf(u8, counts, "tokens") == null and std.mem.indexOf(u8, counts, "mean_tokens") == null);
+    const measured = try std.json.Stringify.valueAlloc(a, Prediction{ .ranking = &.{"a"}, .token_upper_bound = 7 }, .{});
+    defer a.free(measured);
+    try std.testing.expect(std.mem.indexOf(u8, measured, "\"token_upper_bound\":7") != null);
 }
 
 pub fn scoreAdmission(counts: *Counts, value: Case, admitted: bool) !void {

@@ -29,7 +29,26 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from managed_api import authorization_headers, open_request, validate_backend
+from managed_api import (
+    authorization_headers,
+    correlation_evidence,
+    open_request,
+    validate_backend,
+)
+
+
+# Match native inline capability bounds; reserve room for search controls.
+MAX_CURSOR_BYTES = 2 * 1024 * 1024 + 4096
+MAX_SEARCH_REQUEST_BYTES = MAX_CURSOR_BYTES + 8192
+
+
+def validate_cursor(cursor):
+    if (
+        not isinstance(cursor, str)
+        or not cursor.isascii()
+        or not 1 <= len(cursor) <= MAX_CURSOR_BYTES
+    ):
+        raise ValueError("Invalid cursor")
 
 
 class RateLimit:
@@ -145,8 +164,7 @@ def search_request(value):
             predicates[0] if len(predicates) == 1 else {"conjuncts": predicates}
         )
     if cursor is not None:
-        if not isinstance(cursor, str) or not 1 <= len(cursor) <= 65536:
-            raise ValueError("Invalid cursor")
+        validate_cursor(cursor)
         if view == "all":
             query["source_cursor"] = cursor
         else:
@@ -192,7 +210,10 @@ def cursor_query_key(query):
 
 def next_cursor(query, result):
     if "source" in query:
-        return result.get("next_source_cursor")
+        cursor = result.get("next_source_cursor")
+        if cursor is not None:
+            validate_cursor(cursor)
+        return cursor
     hits = result["hits"]["hits"]
     if len(hits) < query["limit"]:
         return None
@@ -202,7 +223,7 @@ def next_cursor(query, result):
         "after": hits[-1]["_sort"],
     }
     cursor = base64.urlsafe_b64encode(json.dumps(page).encode()).decode()
-    if len(cursor) > 65536:
+    if len(cursor) > MAX_CURSOR_BYTES:
         raise ValueError("Cursor too large")
     return cursor
 
@@ -213,6 +234,7 @@ class Gateway(BaseHTTPRequestHandler):
         pass
 
     def upstream(self, path, body=None, timeout=15):
+        self.backend_correlation = {}
         headers = {"Content-Type": "application/json"}
         headers.update(getattr(self.server, "backend_headers", {}))
         request = Request(
@@ -220,8 +242,13 @@ class Gateway(BaseHTTPRequestHandler):
             None if body is None else json.dumps(body).encode(),
             headers,
         )
-        with open_request(request, timeout=timeout) as response:
-            raw = response.read(4194305)
+        try:
+            with open_request(request, timeout=timeout) as response:
+                self.backend_correlation = correlation_evidence(response.headers)
+                raw = response.read(4194305)
+        except HTTPError as error:
+            self.backend_correlation = correlation_evidence(error.headers)
+            raise
         if len(raw) > 4194304:
             raise ValueError("Search response too large")
         return json.loads(raw)
@@ -240,6 +267,13 @@ class Gateway(BaseHTTPRequestHandler):
             self.send_header(
                 "Server-Timing", f"antfly_upstream;dur={backend_seconds * 1000:.3f}"
             )
+            for field, header in (
+                ("request_id", "X-Antfly-Upstream-Request-ID"),
+                ("cf_ray", "X-Antfly-Upstream-CF-Ray"),
+            ):
+                value = getattr(self, "backend_correlation", {}).get(field)
+                if value:
+                    self.send_header(header, value)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header(
@@ -303,15 +337,39 @@ class Gateway(BaseHTTPRequestHandler):
         except (URLError, TimeoutError, ValueError):
             return False
 
+    body_read_timeout_seconds = 10.0
+
+    def read_search_body(self, length):
+        # Socket timeouts bound idle time only. Recompute a monotonic deadline
+        # before each receive so trickled input cannot hold admitted capacity.
+        deadline = time.monotonic() + self.body_read_timeout_seconds
+        chunks = []
+        remaining = length
+        try:
+            while remaining:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("Search body deadline exceeded")
+                self.connection.settimeout(budget)
+                chunk = self.rfile.read1(min(65536, remaining))
+                if not chunk:
+                    raise ValueError("Incomplete search body")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            self.connection.settimeout(10)
+
     def do_POST(self):
         if self.path != "/api/search":
             return self.respond(404, {"error": "Not found"})
         self.connection.settimeout(10)
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 131072 or self.headers.get("Transfer-Encoding"):
+            if not 0 < length <= MAX_SEARCH_REQUEST_BYTES or self.headers.get(
+                "Transfer-Encoding"
+            ):
                 raise ValueError("Invalid request length")
-            query = search_request(json.loads(self.rfile.read(length)))
         except (ValueError, TimeoutError):
             return self.respond(400, {"error": "Invalid search request"})
         limiter = getattr(self.server, "rate_limit", None)
@@ -322,6 +380,11 @@ class Gateway(BaseHTTPRequestHandler):
                 429, {"error": "Search capacity reached; retry shortly"}
             )
         try:
+            # Bound body allocation as well as backend work by admitted searches.
+            try:
+                query = search_request(json.loads(self.read_search_body(length)))
+            except (ValueError, TimeoutError):
+                return self.respond(400, {"error": "Invalid search request"})
             started = time.monotonic()
             result = self.upstream(
                 f"/tables/{query['table']}/query" if "table" in query else "/query",

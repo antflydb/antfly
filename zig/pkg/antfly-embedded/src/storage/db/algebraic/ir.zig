@@ -27,7 +27,10 @@ pub const QueryKind = enum {
     date_histogram,
 };
 
+pub const TimeRange = struct { start_ns: i128, end_ns: i128 };
+
 pub const Constraint = struct {
+    time_range: ?TimeRange = null,
     field: []const u8,
     value: []const u8,
 };

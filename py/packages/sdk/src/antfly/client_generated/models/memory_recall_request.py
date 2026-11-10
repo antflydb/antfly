@@ -42,6 +42,7 @@ class MemoryRecallRequest:
         cursor (None | str | Unset):
         embedding (list[float] | None | Unset):
         embedding_model (MemoryRecallRequestEmbeddingModelType0 | None | Unset):
+        utility_weight (float | Unset):  Default: 0.0.
     """
 
     graph: MemoryRecallRequestGraphType0 | None | Unset = UNSET
@@ -64,6 +65,7 @@ class MemoryRecallRequest:
     cursor: None | str | Unset = UNSET
     embedding: list[float] | None | Unset = UNSET
     embedding_model: MemoryRecallRequestEmbeddingModelType0 | None | Unset = UNSET
+    utility_weight: float | Unset = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
@@ -170,6 +172,8 @@ class MemoryRecallRequest:
         else:
             embedding_model = self.embedding_model
 
+        utility_weight = self.utility_weight
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -213,6 +217,8 @@ class MemoryRecallRequest:
             field_dict["embedding"] = embedding
         if embedding_model is not UNSET:
             field_dict["embedding_model"] = embedding_model
+        if utility_weight is not UNSET:
+            field_dict["utility_weight"] = utility_weight
 
         return field_dict
 
@@ -386,6 +392,8 @@ class MemoryRecallRequest:
 
         embedding_model = _parse_embedding_model(d.pop("embedding_model", UNSET))
 
+        utility_weight = d.pop("utility_weight", UNSET)
+
         memory_recall_request = cls(
             graph=graph,
             query=query,
@@ -407,6 +415,7 @@ class MemoryRecallRequest:
             cursor=cursor,
             embedding=embedding,
             embedding_model=embedding_model,
+            utility_weight=utility_weight,
         )
 
         return memory_recall_request

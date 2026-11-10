@@ -20,6 +20,8 @@ def zipped(value, name="pin.json"):
 class FakeAPI:
     def __init__(self):
         self.writes = []
+        self.checks = []
+        self.artifact_reads = 0
         self.manifest = {
             "version": 1,
             "request": "10-1",
@@ -52,7 +54,10 @@ class FakeAPI:
             self.writes.append((path, method, body))
         if "/actions/workflows/" in path:
             return {"workflow_runs": [self.run]}
+        if "/check-runs?" in path:
+            return {"check_runs": self.checks}
         if path.endswith("/artifacts"):
+            self.artifact_reads += 1
             return {
                 "artifacts": [{"id": 13, "name": "antfly-pin-10-1", "expired": False}]
             }
@@ -92,6 +97,149 @@ class FakeAPI:
 
 
 class PublisherTests(unittest.TestCase):
+    def test_repository_credentials_stay_with_their_own_authority(self):
+        api = p.GitHub("COLONY_SENTINEL", "ANTFLY_SENTINEL")
+        paths = [
+            (f"repos/{p.COLONY}/git/ref/heads/main", "COLONY_SENTINEL"),
+            (f"repos/{p.UPSTREAM}/compare/{OLD}...{TARGET}", "ANTFLY_SENTINEL"),
+            (f"repos/{p.UPSTREAM}/compare/{TARGET}...main", "ANTFLY_SENTINEL"),
+            (f"repos/{p.COLONY}/git/commits/{BASE}", "COLONY_SENTINEL"),
+        ]
+        with patch.object(
+            api.opener, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"{}")
+        ) as opened:
+            for path, _ in paths:
+                api.request(path)
+        for call, (path, token) in zip(opened.call_args_list, paths):
+            request = call.args[0]
+            self.assertEqual(request.full_url, p.API_ROOT + path)
+            self.assertEqual(request.get_header("Authorization"), "Bearer " + token)
+
+    def test_upstream_reads_never_fall_back_to_private_writer_credentials(self):
+        api = p.GitHub("COLONY_SENTINEL")
+        with patch.object(api.opener, "open", return_value=io.BytesIO(b"{}")) as opened:
+            api.request(f"repos/{p.UPSTREAM}/compare/{OLD}...{TARGET}")
+        self.assertIsNone(opened.call_args.args[0].get_header("Authorization"))
+        with patch.object(api.opener, "open") as opened:
+            for path, method in [
+                (f"repos/{p.UPSTREAM}/git/refs/heads/main", "PATCH"),
+                ("repos/other/repository/git/ref/heads/main", "GET"),
+            ]:
+                with self.assertRaises(p.PublicationError):
+                    api.request(path, method)
+            opened.assert_not_called()
+
+    def report(self, api):
+        return {
+            "id": 34,
+            "name": p.MANIFEST_CHECK,
+            "external_id": "antfly-pin:10-1:12:1",
+            "app": {"slug": "github-actions"},
+            "head_sha": BASE,
+            "details_url": f"https://github.com/{p.COLONY}/actions/runs/12",
+            "status": "completed",
+            "conclusion": "success",
+            "output": {"text": json.dumps(api.manifest)},
+        }
+
+    def test_trusted_report_does_not_require_artifact_storage(self):
+        for path in ("actions/runs/12", "runs/34"):
+            with self.subTest(path=path):
+                api = FakeAPI()
+                report = self.report(api)
+                report["details_url"] = f"https://github.com/{p.COLONY}/{path}"
+                api.checks = [report]
+                run, manifest = p.wait_for_validation(api, "10-1", timeout=1)
+                self.assertEqual(manifest, api.manifest)
+                self.assertEqual(api.artifact_reads, 0)
+                self.assertEqual(p.publish(api, run, manifest), COMMIT)
+
+    def test_report_url_must_identify_the_selected_run_or_check(self):
+        urls = [
+            f"https://github.com/{p.COLONY}/actions/runs/34",
+            f"https://github.com/{p.COLONY}/runs/12",
+            "https://github.com/other/repo/runs/34",
+            f"https://example.test/{p.COLONY}/runs/34",
+            f"http://github.com/{p.COLONY}/runs/34",
+            f"https://github.com/{p.COLONY}/runs/34?other=1",
+            f"https://github.com/{p.COLONY}/runs/34#other",
+            None,
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                api = FakeAPI()
+                api.checks = [{**self.report(api), "details_url": url}]
+                with self.assertRaisesRegex(
+                    p.PublicationError, "Untrusted validation report"
+                ):
+                    p.wait_for_validation(api, "10-1", timeout=1)
+                self.assertEqual(api.artifact_reads, 0)
+                self.assertEqual(api.writes, [])
+
+    def test_canonical_report_url_requires_a_positive_integer_check_id(self):
+        for check_id in (None, "34", True, 0, -1):
+            with self.subTest(check_id=check_id):
+                api = FakeAPI()
+                report = self.report(api)
+                report.update(
+                    id=check_id,
+                    details_url=f"https://github.com/{p.COLONY}/runs/{check_id}",
+                )
+                api.checks = [report]
+                with self.assertRaisesRegex(
+                    p.PublicationError, "Untrusted validation report"
+                ):
+                    p.wait_for_validation(api, "10-1", timeout=1)
+                self.assertEqual(api.writes, [])
+
+    def test_canonical_report_preserves_request_run_and_attempt_binding(self):
+        api = FakeAPI()
+        api.run["run_attempt"] = 2
+        report = {
+            **self.report(api),
+            "external_id": "antfly-pin:10-1:12:2",
+            "details_url": f"https://github.com/{p.COLONY}/runs/34",
+        }
+        api.checks = [
+            {**report, "external_id": identity, "output": {"text": "invalid"}}
+            for identity in (
+                "antfly-pin:99-1:12:2",
+                "antfly-pin:10-1:99:2",
+                "antfly-pin:10-1:12:1",
+            )
+        ] + [report]
+        _, manifest = p.wait_for_validation(api, "10-1", timeout=1)
+        self.assertEqual(manifest, api.manifest)
+        self.assertEqual(api.artifact_reads, 0)
+        self.assertEqual(api.writes, [])
+
+    def test_report_origin_binding_and_size_fail_closed(self):
+        changes = [
+            {"name": "other"},
+            {"app": {"slug": "other"}},
+            {"head_sha": OLD},
+            {"details_url": "https://example.test/run/12"},
+            {"status": "in_progress"},
+            {"conclusion": "failure"},
+            {"output": {"text": "x" * 4097}},
+            {"output": {"text": json.dumps({**FakeAPI().manifest, "request": "99-1"})}},
+        ]
+        for path in ("actions/runs/12", "runs/34"):
+            for change in changes:
+                with self.subTest(path=path, change=change):
+                    api = FakeAPI()
+                    report = self.report(api)
+                    report["details_url"] = f"https://github.com/{p.COLONY}/{path}"
+                    api.checks = [{**report, **change}]
+                    with self.assertRaises(p.PublicationError):
+                        p.wait_for_validation(api, "10-1", timeout=1)
+                    self.assertEqual(api.artifact_reads, 0)
+                    self.assertEqual(api.writes, [])
+        api = FakeAPI()
+        api.checks = [self.report(api), self.report(api)]
+        with self.assertRaises(p.PublicationError):
+            p.wait_for_validation(api, "10-1", timeout=1)
+
     def test_success_writes_only_gitlink_and_records_validation(self):
         api = FakeAPI()
         run, manifest = p.wait_for_validation(api, "10-1", timeout=1)
@@ -262,6 +410,27 @@ class PublisherTests(unittest.TestCase):
                 self.assertIn("reason=" + expected, summary)
                 for private in ("SENTINEL_TOKEN", "PRIVATE", "https://", body):
                     self.assertNotIn(private, summary)
+
+    def test_check_refusal_identifies_the_missing_permission_without_private_data(self):
+        api = p.GitHub("SENTINEL_TOKEN")
+        error = urllib.error.HTTPError(
+            "https://api.github.com/PRIVATE",
+            403,
+            "PRIVATE",
+            {
+                "X-GitHub-Request-Id": "id",
+                "X-Accepted-GitHub-Permissions": "checks=read",
+            },
+            io.BytesIO(b"Resource not accessible by personal access token PRIVATE"),
+        )
+        with patch.object(api.opener, "open", side_effect=error):
+            with self.assertRaises(p.PublicationError) as caught:
+                api.request(f"repos/{p.COLONY}/commits/{BASE}/check-runs?filter=all")
+        message = str(caught.exception)
+        self.assertIn("validation check read", message)
+        self.assertIn("required=checks=read", message)
+        for private in ("SENTINEL_TOKEN", "PRIVATE", p.COLONY, BASE):
+            self.assertNotIn(private, message)
 
     def test_requests_identify_the_publisher_and_keep_credentials_off_redirects(self):
         api = p.GitHub("SENTINEL_TOKEN")

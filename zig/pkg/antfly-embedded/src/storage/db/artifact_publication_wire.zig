@@ -380,7 +380,7 @@ test "ordered artifact inventory baseline control binds binary cursors rows and 
 
 test "privacy batch publication transport keeps large UTF8 identities compact and binary identities exact" {
     const a = std.testing.allocator;
-    const batch = @import("../../api/batch.zig");
+    const batch = @import("../../api/batch_internal.zig");
     const document = try a.alloc(u8, 1_100_000);
     defer a.free(document);
     @memset(document, 'x');

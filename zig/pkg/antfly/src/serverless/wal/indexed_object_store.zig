@@ -35,6 +35,8 @@ pub const IndexedObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
     max_attempts: usize = 8,
+    /// Required for every mutation after native serving ownership is claimed.
+    native_owner: ?[16]u8 = null,
     cancellation: ?objectstore.CancellationToken = null,
     /// Optional host admission ceiling. Existing receipts bypass this limit.
     max_new_lsn: ?u64 = null,
@@ -107,6 +109,7 @@ pub const IndexedObjectStore = struct {
     pub const DocumentIndex = struct { first_lsn: u64, root: ?tree.Ref = null };
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
     pub const Head = struct {
+        native_owner: ?[16]u8 = null,
         format: u32 = 2,
         external_payloads: ?bool = null,
         packed_pages: ?bool = null,
@@ -181,6 +184,7 @@ pub const IndexedObjectStore = struct {
             var current = if (borrowed) initial.?.current else try ctx.readHead();
             defer if (!borrowed) current.deinit(self.alloc);
             try Context.check(&ctx);
+            try self.requireOwner(current.value);
             ctx.setEpoch(current.value.write_epoch);
             var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
@@ -312,6 +316,7 @@ pub const IndexedObjectStore = struct {
             const scratch = attempt.allocator();
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
+            try self.requireOwner(current.value);
             ctx.setEpoch(current.value.write_epoch);
             var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
@@ -668,6 +673,35 @@ pub const IndexedObjectStore = struct {
             return self.owner.commit(self.namespace, self.timestamp, self.payload, self.operation_id, self.current.value.latest_lsn, self);
         }
     };
+    fn requireOwner(self: *const @This(), head: Head) !void {
+        if (!std.meta.eql(head.native_owner, self.native_owner)) return error.LakeSourceOwnerRequired;
+    }
+    /// Claim by HEAD CAS: a pre-claim writer can no longer publish its old
+    /// observation; old binaries reject the new field on their next read.
+    pub fn claimNativeOwner(self: *@This(), namespace_: []const u8, owner: [16]u8) !void {
+        if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidWal;
+        var ctx = try Context.init(self, namespace_, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (head.value.native_owner) |previous| {
+                if (!std.mem.eql(u8, &previous, &owner)) return error.LakeSourceOwnerRequired;
+                self.native_owner = owner;
+                return;
+            }
+            var next = head.value;
+            next.native_owner = owner;
+            next.write_epoch = std.math.add(u64, next.write_epoch, 1) catch return error.WalLsnExhausted;
+            self.native_owner = owner;
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.LakeCheckpointConflict;
+    }
     pub fn beginAdmission(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8) !Admission {
         if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
         if (operation_id.len == 0 or operation_id.len > 4096) return error.InvalidWalOperationId;
@@ -675,6 +709,7 @@ pub const IndexedObjectStore = struct {
         defer ctx.deinit();
         var head = try ctx.readHead();
         errdefer head.deinit(self.alloc);
+        try self.requireOwner(head.value);
         const accepted = try self.findReceipt(ctx.store(), head.value, timestamp, payload, operation_id);
         return .{ .owner = self, .namespace = namespace, .timestamp = timestamp, .payload = payload, .operation_id = operation_id, .current = head, .accepted = accepted, .captured = .{ .head = head.value, .snapshot = try describeHead(self.alloc, ctx.domain, head.value), .observed_ns = ctx.opened_ns, .scope = try self.captureScope(namespace) } };
     }
@@ -1223,6 +1258,7 @@ pub const IndexedObjectStore = struct {
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
+            if (head.native_owner) |owner| if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidWal;
             if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6 and head.format != 7) return error.InvalidWal;
             if ((head.format != 7 and (head.deferred_indexes == true) != (head.format == 6)) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
             if (head.deferred_tail) |*tail| try tail.validate(head.latest_lsn);
@@ -1277,6 +1313,7 @@ pub const IndexedObjectStore = struct {
         }
         fn writeHead(self: *@This(), head: Head, revision: ?objectstore.ObjectRevision) !void {
             try check(self);
+            try self.owner.requireOwner(head);
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);

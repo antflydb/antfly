@@ -4,7 +4,59 @@
 import json
 import unittest
 
-from cypher_qualification_retry import retry_allowed
+from cypher_qualification_retry import await_durable_graph_commit, retry_allowed
+
+
+class QualificationReceiptTests(unittest.TestCase):
+    def result(self, status="unknown", complete=False):
+        return {
+            "complete": complete,
+            "read_only": False,
+            "commit": {"status": status, "transaction_id": "original"},
+        }
+
+    def test_pending_writes_poll_only_the_original_receipt_until_durable(self):
+        for outcome in ("unknown", "committed_pending"):
+            calls = []
+            receipts = iter(
+                [
+                    {"code": "temporarily_unavailable"},
+                    {"disposition": "committed", "durable": False},
+                    {"disposition": "committed", "durable": True},
+                ]
+            )
+
+            def read(transaction):
+                calls.append(transaction)
+                return next(receipts)
+
+            await_durable_graph_commit(
+                self.result(outcome), read, clock=lambda: 0, sleep=lambda _: None
+            )
+            self.assertEqual(calls, ["original"] * 3)
+
+    def test_definite_commit_requires_complete_results_and_no_poll(self):
+        def unexpected(_):
+            self.fail("committed write must not poll")
+
+        await_durable_graph_commit(self.result("committed", True), unexpected)
+        with self.assertRaises(AssertionError):
+            await_durable_graph_commit(self.result("committed", False), unexpected)
+
+    def test_abort_and_unresolved_deadline_remain_failures(self):
+        with self.assertRaises(AssertionError):
+            await_durable_graph_commit(
+                self.result(), lambda _: {"disposition": "aborted", "durable": True}
+            )
+        ticks = iter([0, 1])
+        with self.assertRaises(AssertionError):
+            await_durable_graph_commit(
+                self.result(),
+                lambda _: {"disposition": "outcome_unknown"},
+                timeout_s=1,
+                clock=lambda: next(ticks),
+                sleep=lambda _: self.fail("deadline must bound polling"),
+            )
 
 
 class QualificationRetryTests(unittest.TestCase):

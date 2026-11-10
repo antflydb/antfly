@@ -161,7 +161,7 @@ pub const DeciderConfig = struct {
             self.model.len != 0 or self.model_identity != null or self.embedding_options != null or self.url.len != 0 or self.api_key != null or
             self.account_id != null or self.gateway_id != null or self.max_image_input_tokens != null or self.rate_limit != null or
             self.max_rows != defaults.max_rows or self.max_input_tokens != defaults.max_input_tokens or self.batch_size != defaults.batch_size) return error.InvalidDeciderConfig;
-        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        var arena = std.heap.ArenaAllocator.init(if (@import("builtin").single_threaded) std.heap.page_allocator else std.heap.smp_allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const definition = cascade_contract.compile(a, self.cascade orelse return error.InvalidDeciderConfig) catch |err|
@@ -184,7 +184,7 @@ pub const DeciderConfig = struct {
     /// stage admits.
     fn cascadeCapabilities(self: @This()) Capabilities {
         var caps = Capabilities{ .max_levels = 0, .cascade = true, .images = true, .messages = true };
-        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        var arena = std.heap.ArenaAllocator.init(if (@import("builtin").single_threaded) std.heap.page_allocator else std.heap.smp_allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const value = self.cascade orelse return .{ .max_levels = 0, .cascade = true };

@@ -35,7 +35,7 @@ fn imageKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_check_progress") or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_index_progress:") or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:document_mutation_revision_v1:") or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:document_revision_v2:") or
         std.mem.startsWith(u8, key, "\x00\x00__columnar__:");
 }
 

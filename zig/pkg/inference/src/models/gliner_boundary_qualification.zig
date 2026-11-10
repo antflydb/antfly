@@ -1298,7 +1298,7 @@ test "boundary qualification range matching has no saturating or overflow accept
 
 test "boundary qualification Transformers wrapper has exactly the original fp32 profiles" {
     const identity = fastino_gliner25_base_v1_transformers;
-    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
+    const bytes = try @import("../architectures/gliner/fixture_bytes.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
     defer std.testing.allocator.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});

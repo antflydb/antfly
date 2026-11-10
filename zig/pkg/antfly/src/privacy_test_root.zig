@@ -19,6 +19,12 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+// Focused transport filters must discover these tests independently of the
+// broad suite's named import test, which may itself be filtered out.
+test "privacy compact owner readiness transport discovery" {
+    _ = @import("api/privacy_transport_test.zig");
+}
+
 test "privacy API and transport contracts" {
     _ = @import("api/privacy.zig");
     _ = @import("api/privacy_mutation_test.zig");

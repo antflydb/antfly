@@ -17,6 +17,7 @@
 pub const antfly_sources = @import("source_owner_storage.zig");
 pub const runtime_impl = @import("capi_embedded_root.zig");
 pub const storage_engine = @import("storage/engine.zig");
+pub const sql_binding = @import("capi/sql.zig");
 pub const capi = @import("capi/db.zig");
 pub const write_amplification_bench = @import("storage/lite/write_amplification_bench_test.zig");
 pub const write_amplification_cpu_bench = @import("storage/lite/write_amplification_cpu_bench_test.zig");

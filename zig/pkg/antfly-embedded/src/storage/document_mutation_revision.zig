@@ -29,6 +29,10 @@ const prefix = "\x00\x00__metadata__:document_revision_v2:";
 pub const Key = [prefix.len + 32]u8;
 pub const Content = struct { revision: u64, bytes: u64, kind: u8, digest: [32]u8 };
 
+pub fn keyFromHash(digest: [32]u8) Key {
+    return prefix.* ++ digest;
+}
+
 /// Combined on-disk value: revision (8 bytes) + presence flag (1 byte) +
 /// content authority (49 bytes) when present. `encoded_len_without_content`
 /// is the revision-only form written by artifact/TTL-only commits and by
@@ -68,13 +72,19 @@ fn decodeContent(raw: []const u8) !Content {
 pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     if (!keys.isStoredDocumentRowKey(physical)) return null;
     const key = keyForPhysical(physical).?;
+    return loadContentByKey(txn, key, physical[physical.len - 1]);
+}
+/// A durable locator can revalidate authoritative content without fetching or
+/// rehashing an oversized opaque document key on every scheduler poll. In the
+/// v2 combined layout this is one read of the revision/content record itself.
+pub fn loadContentByKey(txn: anytype, key: Key, kind: u8) !?Content {
     const raw = txn.get(&key) catch |err| {
         if (err == error.NotFound) return null;
         return err;
     };
     const combined = try decodeCombined(raw);
     const value = combined.content orelse return null;
-    if (value.kind != physical[physical.len - 1] or value.revision != combined.revision) return null;
+    if (value.kind != kind or value.revision != combined.revision) return null;
     return value;
 }
 /// Decode a bounded proof window from one sorted, deduplicated metadata read.
@@ -137,8 +147,7 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
             if (decoded.content) |content| contents[entry.row] = content;
         },
         .timestamp => {
-            if (raw.len != 8) return error.InvalidTimestamp;
-            timestamps[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
+            timestamps[entry.row] = @import("ttl.zig").writeVersion(raw) orelse return error.InvalidTimestamp;
         },
     };
     if (mutation_revisions) |out| @memcpy(out, revisions[0..out.len]);

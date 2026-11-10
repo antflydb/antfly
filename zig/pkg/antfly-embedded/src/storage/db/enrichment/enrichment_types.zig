@@ -246,6 +246,23 @@ pub const GeneratedEnrichmentRef = struct {
     doc_key: []const u8,
 };
 
+/// PDF rasterization owns one original document, never a text chunk stream.
+/// Keep the shape predicate shared by declaration admission and replay guards.
+pub fn validateEmbeddingInputShape(input: EmbeddingInput, document_input: bool, has_chunking: bool) !void {
+    if (input == .pdf_page_images and (!document_input or has_chunking))
+        return error.InvalidEnrichmentConfig;
+}
+
+pub fn validateGeneratedEmbeddingInput(request: GeneratedEnrichmentRequest) !void {
+    if (request.embedding_input == .text) return;
+    if (request.kind != .dense_embedding) return error.InvalidEnrichmentConfig;
+    try validateEmbeddingInputShape(
+        request.embedding_input,
+        request.input_kind == .document and request.upstream_artifact_name.len == 0,
+        request.chunk_size != 0 or request.chunker_json.len != 0,
+    );
+}
+
 pub const GeneratedEnrichmentRequestList = []const GeneratedEnrichmentRequest;
 
 pub const LeaseRecord = struct {

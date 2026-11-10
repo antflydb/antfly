@@ -42,6 +42,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const metadata = if (b.option(bool, "metadata", "Qualify stable test metadata") orelse false)
+        @import("lib/build_info/build_support.zig").create(b, .{ .root = b.path("lib/build_info"), .target = target, .optimize = optimize, .version = b.option([]const u8, "release-version", "Release identity") orelse "first" })
+    else
+        null;
+    if (metadata) |info| {
+        provider.root_module.addImport("build_info", info.module);
+        consumer_module.addImport("build_info", info.module);
+    }
     consumer_module.addImport("antfly_test_error_logs", error_logs);
     if (early_provider) consumer_module.linkLibrary(provider);
     if (native_link) @import("antfly_platform").addMacosSdkPaths(b, consumer_module, target);
@@ -53,6 +61,9 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     consumer.executable.root_module.linkLibrary(provider);
+    if (metadata) |info| info.linkTest(consumer.executable.root_module);
+    if (consumer.executable.root_module.import_table.count() != 0)
+        @panic("link-only test executable must not import a Zig root");
     const implementation = b.addTest(.{
         .name = "fixture-implementation",
         .root_module = b.createModule(.{

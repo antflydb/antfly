@@ -31,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .storage_owner_admission_pending, .err = error.StorageOwnerAdmissionPending },
     .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
     .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
     .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
@@ -1214,12 +1215,14 @@ test "logical value exact sort rejection survives both compiled query boundaries
 }
 
 test "document job failures retain distinct semantic identities at the compiled boundary" {
-    try std.testing.expectEqual(@as(u32, 68), abi.abi_version);
+    // Later boundary revisions retain these released error identities.
+    try std.testing.expect(abi.abi_version >= 68);
     try std.testing.expectEqual(@as(u32, 839), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
     try std.testing.expectEqual(@as(u32, 840), @backingInt(statusFromError(error.TooManyActiveJobs)));
     try std.testing.expectEqual(@as(u32, 842), @backingInt(statusFromError(error.ReadTransientFailure)));
     try std.testing.expectEqual(@as(u32, 847), @backingInt(statusFromError(error.InvalidConnectionCredentials)));
-    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.CypherAggregateScope)));
+    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
+    try std.testing.expectEqual(@as(u32, 849), @backingInt(statusFromError(error.CypherAggregateScope)));
     try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
     try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
 }
@@ -1244,4 +1247,15 @@ test "privacy committed Raft contention survives the active storage owner ABI" {
     }
     try std.testing.expect(statusFromError(error.WriterLocked) != statusFromError(error.RaftApplyWriterUnavailable));
     try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
+}
+
+test "storage owner lease admission retains its independent stable identity" {
+    const err = error.StorageOwnerAdmissionPending;
+    const value = statusFromError(err);
+    try std.testing.expectEqual(@as(u32, 913), @backingInt(value));
+    try std.testing.expectError(err, statusToError(value));
+    try std.testing.expect(value != statusFromError(error.RaftApplyWriterUnavailable));
+    const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(value, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
 }

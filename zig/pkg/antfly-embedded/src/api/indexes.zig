@@ -270,6 +270,7 @@ pub fn artifactEnrichmentConfigsEqual(
         std.mem.eql(u8, a.field, b.field) and
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.embedding_input == b.embedding_input and
         a.expected_dims == b.expected_dims and
         std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and

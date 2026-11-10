@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const batch = @import("antfly_local_sources").api_batch;
+const batch = @import("antfly_local_sources").api_internal_batch;
 const http_client = @import("api/http_client.zig");
 const internal_transition_wire = @import("api/internal_transition_wire.zig");
 const provisioned_storage = @import("api/provisioned_storage.zig");

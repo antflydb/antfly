@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const distributed_txn = @import("distributed_txn.zig");
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
@@ -5478,9 +5478,8 @@ pub fn isEmptySessionCommitBody(body: []const u8) bool {
 }
 
 fn parseTableBatch(alloc: std.mem.Allocator, value: std.json.Value) !batch_api.OwnedBatchRequest {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    return try batch_api.parseBatchRequest(alloc, encoded);
+    var owned = try batch_api.public_codec.parseBatchValue(alloc, value);
+    return batch_api.takePublic(&owned);
 }
 
 fn applyReadSetPredicates(alloc: std.mem.Allocator, req: *OwnedTransactionCommitRequest) !void {

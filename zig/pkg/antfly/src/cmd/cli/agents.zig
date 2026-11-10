@@ -44,6 +44,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var table_name: ?[]const u8 = null;
     var web_connection: ?[]const u8 = null;
     var generator_json: ?[]const u8 = null;
+    var context_json: ?[]const u8 = null;
     var semantic_search: ?[]const u8 = null;
     var full_text_search: ?[]const u8 = null;
     var indexes_str: ?[]const u8 = null;
@@ -74,6 +75,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--web-search-connection")) {
             takeUniqueValue(args, &web_connection, arg);
+        } else if (std.mem.eql(u8, arg, "--context-management")) {
+            takeUniqueValue(args, &context_json, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
             takeUniqueValue(args, &generator_json, arg);
         } else if (std.mem.eql(u8, arg, "--max-internal-iterations")) {
@@ -141,6 +144,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
     defer generator_value.deinit();
+    var context_value = if (context_json) |raw| parseJsonArg(antfly_client.types.AgentContextManagement, allocator, "--context-management", raw) else null;
+    defer if (context_value) |*value| value.deinit();
 
     var full_text_value: ?std.json.Parsed(antfly_client.types.RawQuery) = null;
     defer if (full_text_value) |*parsed| parsed.deinit();
@@ -199,6 +204,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .max_internal_iterations = iterations,
         .stream = streaming,
         .generator = generator_value.value,
+        .context_management = if (context_value) |value| value.value else null,
         .steps = steps,
     };
 
@@ -341,6 +347,7 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     var question: ?[]const u8 = null;
     var table_name: ?[]const u8 = null;
     var generator_json: ?[]const u8 = null;
+    var context_json: ?[]const u8 = null;
     var full_text_search: ?[]const u8 = null;
     var semantic_search: ?[]const u8 = null;
     var indexes_str: ?[]const u8 = null;
@@ -368,6 +375,8 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             takeUniqueValue(args, &question, arg);
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             takeUniqueValue(args, &table_name, arg);
+        } else if (std.mem.eql(u8, arg, "--context-management")) {
+            takeUniqueValue(args, &context_json, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
             takeUniqueValue(args, &generator_json, arg);
         } else if (std.mem.eql(u8, arg, "--full-text-search")) {
@@ -424,6 +433,8 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
     defer generator_value.deinit();
+    var context_value = if (context_json) |raw| parseJsonArg(antfly_client.types.AgentContextManagement, allocator, "--context-management", raw) else null;
+    defer if (context_value) |*value| value.deinit();
     var full_text_value: ?std.json.Parsed(antfly_client.types.RawQuery) = null;
     defer if (full_text_value) |*parsed| parsed.deinit();
     if (full_text_search) |text| full_text_value = buildFullTextSearchValue(allocator, text);
@@ -449,6 +460,7 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         .queries = if (table_name != null) queries[0..] else &.{},
         .agent_knowledge = knowledge,
         .generator = generator_value.value,
+        .context_management = if (context_value) |value| value.value else null,
         .tools = if (web_connection != null or hosts != null) .{
             .web_search_connection = web_connection,
             .fetch_config = if (hosts) |list| .{ .allowed_hosts = list } else null,
@@ -629,6 +641,7 @@ test "agent CLI execution request round trips through the server schema" {
         .query = "Find anatomy",
         .queries = &.{.{ .table = "docs", .full_text_search = .{ .bytes = "{\"match\":\"anatomy\",\"field\":\"title\"}" }, .limit = 10 }},
         .generator = .{ .provider = "antfly", .model = "ggml-org/gemma-4-E4B-it-GGUF", .max_tokens = 512, .temperature = 0 },
+        .context_management = .{ .context_window_tokens = 32768, .target_input_tokens = 12000, .summarizer = .{ .provider = "openai", .model = "summary" } },
         .stream = false,
         .max_internal_iterations = 4,
         .steps = .{ .generation = .{ .enabled = true } },
@@ -638,6 +651,10 @@ test "agent CLI execution request round trips through the server schema" {
     var parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").RetrievalAgentRequest, alloc, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?i64, 4), parsed.value.max_internal_iterations);
+    try std.testing.expectEqual(@as(?i64, 12000), parsed.value.context_management.?.target_input_tokens);
+    const summary_json = try std.json.Stringify.valueAlloc(alloc, parsed.value.context_management.?.summarizer.?, .{});
+    defer alloc.free(summary_json);
+    try std.testing.expect(std.mem.indexOf(u8, summary_json, "summary") != null);
 }
 
 fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(antfly_client.types.RawQuery) {

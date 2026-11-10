@@ -798,7 +798,9 @@ def _seed_artifact_links(database, extraction, *, mixed=False):
 
 
 def test_artifact_assertions_preserve_ownership_and_producer_identity(require_native, aflite_path):
-    options = af.OpenOptions(profile=af.Profile.NATIVE, generated_enrichment_replay=True)
+    # Ownership, pagination and clean reopen are the contract here. Retain the
+    # multi-page producer corpus while avoiding per-artifact durability flushes.
+    options = af.OpenOptions(profile=af.Profile.NATIVE, generated_enrichment_replay=True, no_sync=True)
     extraction = {
         "entities": [{"id": "a", "label": "thing", "text": "A"}, {"id": "b", "label": "thing", "text": "B"}],
         "relations": [{"type": "link", "source": "a", "target": "b"}],

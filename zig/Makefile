@@ -47,6 +47,30 @@ unit-test: unit-test-ownership-check ## Run the existing repository unit gate ac
 antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)
 
+# Incremental compilation keeps its state in the watching process, so it only
+# pays off with --watch: after the first build, an edit to a storage file
+# rebuilds and reruns in seconds instead of minutes.
+WATCH_STEP ?= antfly-storage-db-test
+WATCH_FILTER ?=
+# Zig 0.17's incremental Mach-O linker panics on linked archives
+# (TODO(MachO2): load archive). Keep watch usable on macOS, with an override
+# for testing newer compilers. Linux retains the measured incremental loop.
+ifeq ($(shell uname -s),Darwin)
+WATCH_INCREMENTAL ?= false
+else
+WATCH_INCREMENTAL ?= true
+endif
+
+.PHONY: watch
+
+watch: ## Rebuild and rerun WATCH_STEP on every save with incremental compilation (WATCH_FILTER selects tests).
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build $(WATCH_STEP) $(if $(filter true,$(WATCH_INCREMENTAL)),-fincremental,-fno-incremental) --watch $(ZIG_BUILD_FLAGS) $(if $(WATCH_FILTER),-- "$(WATCH_FILTER)",)
+
+.PHONY: watch-plans
+watch-plans: WATCH_STEP = query-paging-test
+watch-plans: ## Watch focused planners without configuring the complete product/test graph.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build --build-file build.focused.zig $(WATCH_STEP) $(if $(filter true,$(WATCH_INCREMENTAL)),-fincremental,-fno-incremental) --watch $(ZIG_BUILD_FLAGS) $(if $(WATCH_FILTER),-- "$(WATCH_FILTER)",)
+
 .PHONY: inference-e2e-models
 
 inference-e2e-models: ## Prefetch the curated inference E2E model set with `antfly inference pull`.
@@ -215,3 +239,15 @@ endif
 	  echo "No spec-compatible transactions found after filtering"; \
 	  exit 1; \
 	fi
+
+# Zig watch uses fanotify; Docker's default seccomp policy blocks it.
+.PHONY: watch-linux
+watch-linux: WATCH_STEP = query-paging-test
+watch-linux: ## Use pinned Linux incremental watch through Docker (default: focused plans).
+	@image="antfly-zig-dev:$$(shasum -a 256 toolchain.env | cut -c1-16)"; \
+	docker build -f Dockerfile.dev -t "$$image" .. || exit $$?; \
+	watch_target=watch; \
+	case "$(WATCH_STEP)" in query-paging-test|aggregation-plan-test|mutation-plan-test) watch_target=watch-plans ;; esac; \
+	docker run --rm --init -it --security-opt seccomp=unconfined --mount "type=bind,source=$$(cd .. && pwd),target=/workspace" \
+	  $(if $(ANTFLY_ZIG_MAX_RSS),-e ANTFLY_ZIG_MAX_RSS,) \
+	  "$$image" make "$$watch_target" WATCH_STEP="$(WATCH_STEP)" WATCH_FILTER="$(WATCH_FILTER)" WATCH_INCREMENTAL=true

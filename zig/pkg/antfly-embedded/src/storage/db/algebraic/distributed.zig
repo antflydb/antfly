@@ -203,6 +203,10 @@ const PendingBucket = struct {
 };
 
 pub fn mergePartialsAlloc(alloc: Allocator, partials: []const Partial) !MergeSet {
+    return mergePartialsWithControlAlloc(alloc, partials, .{});
+}
+
+pub fn mergePartialsWithControlAlloc(alloc: Allocator, partials: []const Partial, control: @import("../../../search/execution_control.zig").ExecutionControl) !MergeSet {
     var map = std.StringHashMapUnmanaged(Pending).empty;
     defer {
         var it = map.iterator();
@@ -213,6 +217,7 @@ pub fn mergePartialsAlloc(alloc: Allocator, partials: []const Partial) !MergeSet
         map.deinit(alloc);
     }
     for (partials) |partial| {
+        try control.check();
         const merge_key = try partialMergeKeyAlloc(alloc, partial.canonical_axis, partial.metric, partial.law_id);
         var merge_key_owned = true;
         errdefer if (merge_key_owned) alloc.free(merge_key);

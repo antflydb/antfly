@@ -25,11 +25,24 @@ fn physicalOwner(owner: anytype) if (@typeInfo(@TypeOf(owner.*)) == .pointer) @T
 }
 const requiresDurableLifecycleReplication = @import("antfly_local_sources").storage_db_replication_contract.requiresDurableLifecycleReplication;
 
+/// Only the committed-entry owner can replay these admission refusals. Keep
+/// the stable storage errors unchanged on ordinary request paths.
+pub fn normalizeOrderedApplyError(err: anyerror) anyerror {
+    return switch (err) {
+        error.WriterLocked, error.GraphMaintenanceInProgress, error.StorageOwnerAdmissionPending => error.RaftApplyWriterUnavailable,
+        else => err,
+    };
+}
+
 pub fn applyOrdered(
     owner: anytype,
     req: types.BatchRequest,
     identity: types.OrderedApplyReceipt,
 ) anyerror!void {
+    return applyOrderedInternal(owner, req, identity) catch |err| return normalizeOrderedApplyError(err);
+}
+
+fn applyOrderedInternal(owner: anytype, req: types.BatchRequest, identity: types.OrderedApplyReceipt) anyerror!void {
     const db = physicalOwner(owner);
     if (req.row_policy_publication) |publication| {
         // Policy phases have their own durable bundle/receipt transaction.
@@ -48,12 +61,7 @@ pub fn applyOrdered(
     // admission, transform expansion, and derived-payload construction.
     // batchInternal repeats this check under the mutation lock, which is
     // the correctness fence if another caller advances the marker here.
-    const already_applied = db.orderedMutationAlreadyApplied(identity) catch |err| switch (err) {
-        // WriterLocked is the stable storage ABI identity. Normalize only at
-        // the Raft owner boundary, where the committed entry can be retried.
-        error.WriterLocked => return error.RaftApplyWriterUnavailable,
-        else => return err,
-    };
+    const already_applied = try db.orderedMutationAlreadyApplied(identity);
     if (already_applied) {
         // Admission commits its write fence before sealing the immutable
         // pin. A crash in that window must repair the exact pending cut
@@ -80,10 +88,7 @@ pub fn applyOrdered(
         try @import("antfly_local_sources").storage_db_artifact_inventory.validateRequest(req);
         try db.reconcileReplicatedArtifactAdmission(req, identity);
     };
-    db.applyOrderedCommittedMutation(apply_req, identity, !mirror_scoped_restore) catch |err| switch (err) {
-        error.GraphMaintenanceInProgress, error.WriterLocked => return error.RaftApplyWriterUnavailable,
-        else => return err,
-    };
+    try db.applyOrderedCommittedMutation(apply_req, identity, !mirror_scoped_restore);
 }
 
 pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snapshots.Capture {

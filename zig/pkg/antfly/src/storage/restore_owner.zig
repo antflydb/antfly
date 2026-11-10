@@ -198,23 +198,18 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         .start_optional_runtimes = false,
         .staged_generation = &candidate,
     };
-    switch (source.artifact.format) {
-        .native => {
-            var decoder = try db.DB.openVerifiedRestoreSourceWithCancellation(&candidate, alloc, artifact.path(), candidate.path(), opts, input.scope.source_namespace, context.cancellation);
-            decoder.close();
+    try db.DB.materializeRestoreSourceDecoder(&candidate, alloc, env.io, candidate.path(), opts, .{
+        .format = switch (source.artifact.format) {
+            .native => .native,
+            .portable => .portable,
         },
-        .portable => {
-            var decoder = try db.DB.open(alloc, candidate.path(), opts);
-            defer decoder.close();
-            const file = try std.Io.Dir.cwd().openFile(env.io, source_path, .{});
-            defer file.close(env.io);
-            const stat = try file.stat(env.io);
-            if (source.artifact.cohort_seal) |seal| {
-                try decoder.importCohortPortableFileIntoUnpublishedEmpty(alloc, env.io, file, stat.size, .{ .seal = seal, .namespace = input.scope.source_namespace }, context.cancellation);
-            } else try decoder.importPortableFileIntoUnpublishedEmpty(alloc, env.io, file, stat.size, input.scope.source_namespace);
-            try materialization.bindPortableDecoderRange(alloc, decoder.core.store, owner_range);
-        },
-    }
+        .source_path = source_path,
+        .expected_namespace = input.scope.source_namespace,
+        .owner_range = owner_range,
+        .cohort_seal = source.artifact.cohort_seal,
+        .cancellation = context.cancellation,
+    });
+
     const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{candidate.path()});
     defer alloc.free(candidate_marker);
     _ = try native_backup.writeFileDurable(env.io, candidate_marker, &input.scope.digest());

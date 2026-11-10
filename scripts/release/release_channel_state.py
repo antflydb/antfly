@@ -20,11 +20,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from objectstore_channel import (
+    ConditionalWriteConflict,
+    S3ConditionalStore,
+    StoredBytes,
+)
 
 from release_channels import (
     compare_channel_tags,
@@ -151,69 +156,28 @@ class StoredState:
     etag: str | None
 
 
-class S3ChannelStore:
-    def __init__(self, endpoint: str | None, bucket: str, key: str) -> None:
-        try:
-            import boto3
-            from botocore.exceptions import ClientError
-        except ImportError as exc:
-            raise SystemExit(
-                "boto3 is required; install scripts/release/requirements.lock"
-            ) from exc
-        self.bucket = bucket
-        self.key = key
-        self.client_error = ClientError
-        self.client = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            region_name="auto",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
-        )
-
+class S3ChannelStore(S3ConditionalStore):
     def load(self) -> StoredState:
-        try:
-            response = self.client.get_object(Bucket=self.bucket, Key=self.key)
-        except self.client_error as exc:
-            error = str(exc.response.get("Error", {}).get("Code"))
-            if error in {"404", "NoSuchKey", "NotFound"}:
-                return StoredState(
-                    {"schema_version": 1, "current": None, "pending": None}, None
-                )
-            raise
-        document = json.load(response["Body"])
+        stored = self.load_bytes()
+        if stored.body is None:
+            return StoredState(
+                {"schema_version": 1, "current": None, "pending": None}, None
+            )
+        document = json.loads(stored.body)
         if not isinstance(document, dict) or document.get("schema_version") != 1:
             raise SystemExit("unsupported release-channel state")
-        return StoredState(document, str(response["ETag"]))
+        return StoredState(document, stored.etag)
 
     def compare_and_swap(self, previous: StoredState, document: dict[str, Any]) -> None:
         body = (
             json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
-        request: dict[str, Any] = {
-            "Bucket": self.bucket,
-            "Key": self.key,
-            "Body": body,
-            "ContentType": "application/json",
-        }
-        if previous.etag is None:
-            request["IfNoneMatch"] = "*"
-        else:
-            request["IfMatch"] = previous.etag
         try:
-            self.client.put_object(**request)
-        except self.client_error as exc:
-            error = exc.response.get("Error", {})
-            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if str(error.get("Code")) in {
-                "409",
-                "412",
-                "ConditionalRequestConflict",
-                "PreconditionFailed",
-            } or status in {409, 412}:
-                raise SystemExit("release channel changed concurrently; retry") from exc
-            raise
+            self.compare_and_swap_bytes(
+                StoredBytes(None, previous.etag), body, "application/json"
+            )
+        except ConditionalWriteConflict as exc:
+            raise SystemExit("release channel changed concurrently; retry") from exc
 
     def create_completion(self, document: dict[str, str | int]) -> None:
         validated = validate_completion_receipt(document)

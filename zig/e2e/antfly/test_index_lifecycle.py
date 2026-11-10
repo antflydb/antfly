@@ -3059,7 +3059,9 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(
         lambda current: current.get("head_version", 0) >= target_head_version,
         reason=f"serverless rebuild did not reach head version {target_head_version}",
     )
-    assert status["head_artifact_actions"]["document_segment"] == "rebuild"
+    # Incremental publication reuses the packed body cache; document facts
+    # carry the changed body. Verify visibility as well as reuse below.
+    assert status["head_artifact_actions"]["document_segment"] == "reuse"
     assert status["head_artifact_actions"]["full_text"] == "rebuild"
     assert status["head_artifact_actions"]["dense_vector"] == "reuse"
     assert status["head_artifact_actions"]["sparse_vector"] == "reuse"
@@ -3069,6 +3071,12 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(
     )
     assert _named_action(status, "head_vector_index_actions", "semantic_a") == "reuse"
     assert _named_action(status, "head_sparse_index_actions", "sparse_a") == "reuse"
+    published = serverless_api.query_published(table_name)
+    documents = {
+        item["doc_id"]: json.loads(item["body"]) for item in published["documents"]
+    }
+    assert documents["doc-1"]["text"] == "bravo", published
+    assert documents["doc-1"]["_embeddings"]["semantic_a"] == [1.0, 0.0, 0.0]
 
 
 def test_serverless_schema_migration_republishes_versioned_full_text_indexes(

@@ -84,8 +84,9 @@ pub const Session = struct {
         if (@as(u64, reader.track.width) * reader.track.height > options.max_pixels) return error.ResourceLimitExceeded;
         const self = try a.create(Session);
         errdefer a.destroy(self);
-        const reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.max_decode_bytes }) else media.admission.Token{};
-        self.* = .{ .allocator = a, .reader = reader, .options = options, .budget = .{ .backing = a, .limit = options.max_decode_bytes }, .reservation = reservation };
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.max_decode_bytes }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        self.* = .{ .allocator = a, .reader = reader, .options = options, .budget = .{ .backing = a, .limit = options.max_decode_bytes }, .reservation = reservation, .decoder = try image.webp.Vp8Decoder.init(a) };
         return self;
     }
     pub fn deinit(self: *Session) void {

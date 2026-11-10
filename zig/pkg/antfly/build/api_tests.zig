@@ -76,6 +76,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
     const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
+    const owner_readiness_transport_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy compact owner readiness transport"} });
+    b.step("cypher-owner-readiness-transport-test", "Verify compact selected-owner HTTP transport budgets and namespaces")
+        .dependOn(&b.addRunArtifact(owner_readiness_transport_tests).step);
     const public_api_parity_default_filters = [_][]const u8{
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
@@ -183,6 +186,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "api query contract parses direct JSON-pointer path aliases",
+        "api query contract scalar evidence preserves JSON-shaped plaintext bytes",
+        "api query contract structured dollar projection never exposes internal fields",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
@@ -845,7 +850,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
-            "aggregation domain",
             "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
@@ -983,7 +987,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, write_implementation_module, true, true);
+    var write_implementation_imports = test_imports;
+    write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
+    write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
@@ -1169,6 +1175,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read RPC",
             "retained read client",
             "privacy source vtables retain static lifetime",
+            "certified graph point cohorts",
             "api http client preserves public batch retry safety classifications",
             "relational row query response budget",
             "relational statement retries unavailable capture and releases fences before pages or deadline",
@@ -1194,7 +1201,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
-            "aggregation domain",
             "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
@@ -1444,6 +1450,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     b.step("antfly-api-internal-read-availability-test", "Run internal scan leadership availability and wire classification regressions").dependOn(&api_internal_read_availability_tests.run(b).step);
+    const cypher_cohort_tests = @import("linked_tests.zig").add(b, .{
+        .name = "cypher-cohort-domain-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{"certified graph point cohorts"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-cohort-domain-test", "Verify certified graph routing before read-index admission").dependOn(&cypher_cohort_tests.run(b).step);
     const api_internal_routed_batch_tests = @import("linked_tests.zig").add(b, .{
         .name = "api-internal-routed-batch-tests",
         .root_module = api_table_reads_docid_test_mod,
@@ -1701,10 +1714,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
+        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
+    // Pure domain tests have one small compiler owner, shared by manual API
+    // gates and the normal unit aggregate instead of repeated API roots.
+    inline for (.{ "antfly-api-aggregation-test", "antfly-api-table-read-test" }) |name|
+        b.top_level_steps.get(name).?.step.dependOn(&b.top_level_steps.get("aggregation-plan-test").?.step);
     const rewrite_admission_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },
@@ -2522,7 +2539,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
         .hosted_recovery_tests = hosted_recovery_tests,
         .hosted_recovery_step = hosted_recovery_step,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, lib_api_auth_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, lib_api_auth_tests, cypher_cohort_tests.executable, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

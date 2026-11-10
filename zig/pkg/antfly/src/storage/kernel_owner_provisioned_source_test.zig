@@ -1260,7 +1260,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             true,
             null,
         )) != null);
-        try std.testing.expectError(error.RaftApplyWriterUnavailable, owner_source.writeSource().replicatedBatchGroupLocal(
+        try std.testing.expectError(error.StorageOwnerAdmissionPending, owner_source.writeSource().replicatedBatchGroupLocal(
             alloc,
             7002,
             "unprepared",

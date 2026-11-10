@@ -1234,11 +1234,20 @@ fn bitmapSpillScenario(backing: Allocator, exact: bool, repeats: usize) !void {
     }
     try std.testing.expect((try (if (exact) group.nextPartial(arena.allocator()) else group.next(arena.allocator()))) == null);
     try std.testing.expect(manager.written_bytes > 0);
+    try std.testing.expect(manager.merges > 0);
 }
 
 test "SQL bitmap DISTINCT spill unions words with scalar and generic partials" {
+    // Enumerate every failing allocation with the same safety and leak checks,
+    // without repeatedly unwinding allocation/free backtraces thousands of
+    // times. Enable ANTFLY_TEST_ALLOCATOR_TRACES for full diagnostics.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const alloc = checked.allocator();
     inline for (.{ false, true }) |exact| {
-        try bitmapSpillScenario(std.testing.allocator, exact, 64);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, bitmapSpillScenario, .{ exact, @as(usize, 2) });
+        try bitmapSpillScenario(alloc, exact, 64);
+        // One of every ingress form still crosses the external merge path.
+        // Enumerate its allocations once; the stress run covers repeated runs.
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, bitmapSpillScenario, .{ exact, @as(usize, 1) });
     }
 }

@@ -1,0 +1,257 @@
+name: Profile Zig compile costs
+
+# Opt-in experiments only. Normal CI keeps its existing Debug/release lanes.
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        type: choice
+        default: memory-test
+        options: [products, compiled-pdf-native-test, compiled-template-pdf-test, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
+      optimize:
+        type: choice
+        default: debug
+        options: [debug, fast, safe]
+      target:
+        description: CPU-only target profile (qualify release backends separately)
+        type: choice
+        default: x86_64-linux-gnu
+        options: [x86_64-linux-gnu, aarch64-linux-musl]
+      strip:
+        description: Strip during compilation (false retains ELF symbol attribution)
+        type: boolean
+        default: true
+      time_report:
+        description: Additional forced rebuild for compiler declaration and LLVM timings
+        type: boolean
+        default: false
+      shared_pdf_templates:
+        description: Route production template PDF helpers through the compiled media owner
+        type: boolean
+        default: true
+      shared_pdf_sessions:
+        description: Use the retained PDF owner (required for compiled-pdf-native-test)
+        type: boolean
+        default: false
+      shared_image_operations:
+        description: Route encoded-image and VP8 operations through media
+        type: boolean
+        default: false
+      shared_lake_execution:
+        description: Route whole lake builds through serverless
+        type: boolean
+        default: false
+      cli_optimize:
+        description: CLI entry module experiment (shared dependencies retain product mode)
+        type: choice
+        default: inherit
+        options: [inherit, small]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache
+  ANTFLY_ZIG_MAX_RSS: '21474836480'
+
+jobs:
+  profile:
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Install diagnostic tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config llvm time
+      - uses: ./.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
+      - name: Verify diagnostic attribution
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*zig*memory.py'
+          python3 -m unittest discover -s scripts -p 'test_report_zig_*.py'
+          python3 -m unittest discover -s scripts -p 'test_collect_zig_time_report.py'
+      - name: Record exact experiment profile
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+          BUILD_TARGET: ${{ inputs.target }}
+          BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
+          SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
+        run: |
+          mkdir -p .benchmark-results/compile-costs
+          {
+            git rev-parse HEAD
+            zig version
+            sha256sum "$(command -v zig)"
+            git submodule status
+            uname -a
+            lscpu
+            printf 'step=%s\noptimize=%s\ncli_optimize=%s\ntarget=%s\nstrip=%s\ncpu=baseline\nmetal=false\ncuda=false\nsystem_blas=false\nshared_pdf_templates=%s\nshared_pdf_sessions=%s\n' "$BUILD_STEP" "$BUILD_OPTIMIZE" "$CLI_OPTIMIZE" "$BUILD_TARGET" "$BUILD_STRIP" "$SHARED_PDF_TEMPLATES" "$SHARED_PDF_SESSIONS"
+            printf 'shared_image_operations=%s\nshared_lake_execution=%s\n' "$SHARED_IMAGE_OPERATIONS" "$SHARED_LAKE_EXECUTION"
+            cat /proc/meminfo
+            cat /proc/self/cgroup
+            zig env
+          } > .benchmark-results/compile-costs/profile.txt
+      - name: Measure selected build without changing concurrency
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+          BUILD_TARGET: ${{ inputs.target }}
+          BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
+          SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
+        run: |
+          steps=("$BUILD_STEP")
+          if [ "$BUILD_STEP" = products ]; then steps=(antfly capi runtime-archives); fi
+          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" "-Dshared-image-operations=$SHARED_IMAGE_OPERATIONS" "-Dshared-lake-execution=$SHARED_LAKE_EXECUTION" -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all)
+          if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
+          scripts/diagnose-zig-build-memory.sh --command --label build --no-stack-sample \
+            --target "$BUILD_TARGET" --optimize "$BUILD_OPTIMIZE" --strip "$BUILD_STRIP" --install-step "$BUILD_STEP" -- \
+            /usr/bin/time -v python3 tools/run_bounded_zig_build.py -- "${args[@]}"
+      - name: Attribute emitted production owners
+        if: ${{ success() && (inputs.step == 'products' || inputs.step == 'antfly' || inputs.step == 'runtime-archives') }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+          BUILD_TARGET: ${{ inputs.target }}
+          BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
+          SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
+        run: |
+          args=(build runtime-archives "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" "-Dshared-image-operations=$SHARED_IMAGE_OPERATIONS" "-Dshared-lake-execution=$SHARED_LAKE_EXECUTION" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
+          if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
+          (cd zig && python3 tools/run_bounded_zig_build.py -- "${args[@]}")
+          artifacts=()
+          for archive in zig/zig-out/lib/libantfly*.a; do
+            owner=$(basename "$archive" .a)
+            artifacts+=(--artifact "$owner=$archive")
+          done
+          owner_checks=()
+          if [ "$BUILD_OPTIMIZE" = fast ]; then
+            owner_checks+=(--forbid 'libantfly-inference-core=ops.cuda.cuda_compute.')
+          fi
+          if [ "$SHARED_PDF_TEMPLATES" = true ] && [ "$BUILD_OPTIMIZE" = fast ]; then
+            owner_checks+=(--forbid 'libantfly-runtime-api_kernel=jpeg2000.codestream.parseState')
+            owner_checks+=(--forbid 'libantfly-runtime-api_kernel=reader.Reader.decodeImageToRgbaGuardedAlloc')
+          fi
+          if [ "$SHARED_PDF_SESSIONS" = true ] || [ "$SHARED_IMAGE_OPERATIONS" = true ]; then
+            owner_checks+=(--forbid 'libantfly-storage-engine=reader.Reader.decodeImageToRgbaGuardedAlloc')
+            owner_checks+=(--forbid 'libantfly-inference-core=reader.Reader.decodeImageToRgbaGuardedAlloc')
+          fi
+          if [ "$SHARED_IMAGE_OPERATIONS" = true ]; then
+            for owner in libantfly-storage-engine libantfly-inference-core libantfly-runtime-api_kernel libantfly-runtime-serverless; do
+              owner_checks+=(--forbid "$owner=jpeg.decodeRgba")
+              owner_checks+=(--forbid "$owner=webp.Vp8Decoder.decode")
+            done
+          fi
+          if [ "$SHARED_LAKE_EXECUTION" = true ]; then
+            owner_checks+=(--forbid 'libantfly-runtime-api_kernel=lake_execution_build_impl.')
+          fi
+          python3 scripts/report_zig_archive_work.py "${artifacts[@]}" \
+            --forbid 'libantfly-runtime-local_query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+            --forbid 'libantfly-storage-kernel=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+            "${owner_checks[@]}" \
+            --output .benchmark-results/compile-costs/archive-work.json
+      - name: Attribute linked symbols and embedded asset candidates
+        if: ${{ success() && !inputs.strip && (inputs.step == 'products' || inputs.step == 'antfly') }}
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+        run: |
+          python3 scripts/report_zig_binary_size.py zig/zig-out/bin/antfly --source-root zig \
+            --output .benchmark-results/compile-costs/binary-size.json
+          if [ "$BUILD_STEP" = products ]; then
+            python3 scripts/report_zig_binary_size.py zig/zig-out/lib/libantfly.so --source-root zig \
+              --output .benchmark-results/compile-costs/capi-binary-size.json
+          fi
+          # This is an attribution profile, not a substitute for -Dstrip=true.
+          llvm-strip --strip-all -o .benchmark-results/compile-costs/antfly.stripped zig/zig-out/bin/antfly
+          stat -c '%s' .benchmark-results/compile-costs/antfly.stripped > .benchmark-results/compile-costs/postlink-stripped-bytes.txt
+          rm .benchmark-results/compile-costs/antfly.stripped
+      - name: Record actual installed product hashes and bytes
+        if: ${{ success() && inputs.step == 'products' }}
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json
+          from pathlib import Path
+          paths = [Path("zig/zig-out/bin/antfly"), Path("zig/zig-out/lib/libantfly.so")]
+          products = []
+          for path in paths:
+              with path.open("rb") as stream:
+                  digest = hashlib.file_digest(stream, "sha256").hexdigest()
+              products.append(dict(path=str(path), bytes=path.stat().st_size, sha256=digest))
+          Path(".benchmark-results/compile-costs/products.json").write_text(json.dumps(products, indent=2) + "\n")
+          PYCODE
+      - name: Collect separate compiler time report (forces rebuilding)
+        if: ${{ success() && inputs.time_report }}
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+          BUILD_TARGET: ${{ inputs.target }}
+          BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
+          SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
+        working-directory: zig
+        run: |
+          steps=("$BUILD_STEP")
+          if [ "$BUILD_STEP" = products ]; then steps=(antfly capi runtime-archives); fi
+          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" "-Dshared-image-operations=$SHARED_IMAGE_OPERATIONS" "-Dshared-lake-execution=$SHARED_LAKE_EXECUTION" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
+          if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
+          python3 ../scripts/collect_zig_time_report.py \
+            --output ../.benchmark-results/compile-costs/compiler-time-report.json -- \
+            python3 tools/run_bounded_zig_build.py -- "${args[@]}"
+      - name: Verify compiled media owner cache isolation
+        if: ${{ success() && inputs.step == 'opaque-pdf-session-test' }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+        run: |
+          python3 zig/tools/check_media_owner_cache.py --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/media-owner-cache.json
+      - name: Verify retained PDF implementation and value cache isolation
+        if: ${{ success() && inputs.step == 'compiled-pdf-native-test' }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+        run: |
+          python3 zig/tools/check_media_owner_cache.py --retained --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/pdf-retained-cache.json
+      - name: Compare retained PDF GPU scene preparation
+        if: ${{ success() && inputs.step == 'compiled-pdf-native-test' }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+        run: |
+          python3 zig/tools/check_pdf_gpu_scene_transport.py --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/pdf-gpu-scene-transport.json
+      - name: Verify production query and storage owner cache isolation
+        if: ${{ success() && (inputs.step == 'antfly-storage-owner-test' || inputs.step == 'local-query-owner-test') }}
+        run: |
+          python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile-costs/query-owner-cache.json
+      - name: Retain measurements even on compiler failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          retention-days: 14
+          name: compile-costs-${{ inputs.step }}-${{ inputs.optimize }}-${{ inputs.target }}-strip-${{ inputs.strip }}-${{ inputs.cli_optimize }}-shared-pdf-${{ inputs.shared_pdf_templates }}-retained-${{ inputs.shared_pdf_sessions }}
+          path: .benchmark-results/compile-costs/
+          if-no-files-found: error

@@ -582,6 +582,10 @@ export interface AntflyConfig {
   auth?: AntflyAuth;
 }
 
+export type AgentContextManagement = components["schemas"]["AgentContextManagement"];
+export type AgentContextEvent = components["schemas"]["AgentContextEvent"];
+export type AgentContextDiagnostics = components["schemas"]["AgentContextDiagnostics"];
+
 // Retrieval Agent types
 export type RetrievalNavigationConfig = components["schemas"]["RetrievalNavigationConfig"];
 export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest"];
@@ -592,6 +596,7 @@ export type SSEToolMode = components["schemas"]["SSEToolMode"];
 
 // Retrieval Agent streaming callbacks for structured SSE events
 export interface RetrievalAgentStreamCallbacks {
+  onContextManagement?: (event: AgentContextEvent) => void;
   onClassification?: (data: ClassificationTransformationResult) => void;
   onReasoning?: (chunk: string) => void;
   onHit?: (hit: QueryHit) => void;
@@ -656,6 +661,7 @@ export interface ResearchSectionProgress {
 
 // Research Agent streaming callbacks for structured SSE events
 export interface ResearchAgentStreamCallbacks {
+  onContextManagement?: (event: AgentContextEvent) => void;
   onStepStarted?: (step: SSEStepStarted) => void;
   onPlan?: (plan: ResearchPlanProgress) => void;
   onSubQuestionStarted?: (event: ResearchSubQuestionStartedProgress) => void;

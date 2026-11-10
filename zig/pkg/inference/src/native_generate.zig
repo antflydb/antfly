@@ -507,12 +507,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    const prompt_media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
+    const prompt_media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
         allocator,
         opts.model_dir,
         &messages,
         gpt_config,
+        if (model.session.backend() == .cuda) .cuda else .generic,
     );
+    const prompt_media_allowance = prompt_media_admission.token_allowance;
     const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
     const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
         gpt_config,
@@ -661,6 +663,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
     }
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+    var media_budget_credit = try @import("pipelines/preprocessing_memory.zig").BudgetCredit.reserve(&run_budget, generation.fallbackImagePreparationBytes(gpt_config, model.manifest.gguf_projector_path, prompt_media_admission));
+    defer media_budget_credit.deinit();
+    const preparation_budget = run_budget;
     print("budget: host={d}MiB backend={d}MiB combined={d}MiB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
         budget_limits.backend_limit_bytes / (1024 * 1024),
@@ -767,6 +772,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_max_tokens,
         &config.prefill_chunk_size,
         &run_budget,
+        media_budget_credit.bytes,
     );
     defer generation_resources.release();
 
@@ -815,7 +821,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (fallback_kv_capacity_policy != kv_capacity_policy) {
         generation_resources.release();
         budget_components[0].kv_capacity_policy = fallback_kv_capacity_policy;
-        run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+        run_budget = preparation_budget;
         config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
             &run_budget,
             budget_components[0..budget_component_count],
@@ -838,6 +844,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             budget_max_tokens,
             &config.prefill_chunk_size,
             &run_budget,
+            media_budget_credit.bytes,
         );
     }
 
@@ -941,6 +948,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cb = cb,
         .session = model.session,
         .media_run_budget = &run_budget,
+        .media_prepaid = .{ .process_bytes = media_budget_credit.bytes, .budget_bytes = media_budget_credit.bytes },
         .explicit_scratch_limit = if (opts.scratch_budget_mb != 0) budget_limits.scratch_limit_bytes else 0,
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
@@ -8034,8 +8042,13 @@ fn acquireCliGenerationResources(
     max_tokens: usize,
     chunk: *usize,
     budget: *runtime.tier.memory.RunBudget,
+    media_host_bytes: usize,
 ) !model_manager_mod.GenerationAdmissionLease {
     const memory = runtime.tier.memory;
+    // Preserve fixed request reservations (including media) when a busy
+    // process controller makes us retry with a smaller model prefill chunk.
+    var fixed_budget = budget.*;
+    for (components) |component| fixed_budget.releaseEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*));
     var requests: [2]model_manager_mod.GenerationAdmissionRequest = undefined;
     while (true) {
         for (components, 0..) |component, i| {
@@ -8048,6 +8061,7 @@ fn acquireCliGenerationResources(
                 },
             };
         }
+        requests[0].resources.amounts = try requests[0].resources.amounts.merge(.{ .host_scratch_bytes = media_host_bytes });
         return manager.acquireGenerationResources(requests[0..components.len]) catch |err| {
             if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
             if (chunk.* <= 32) return err;
@@ -8056,7 +8070,7 @@ fn acquireCliGenerationResources(
             };
             const ceiling = std.math.ceilPowerOfTwo(usize, chunk.*) catch chunk.*;
             const smaller = @max(@as(usize, 32), ceiling / 2);
-            budget.* = runtime.tier.memory.RunBudget.init(limits);
+            budget.* = fixed_budget;
             chunk.* = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(budget, components, prompt_tokens, max_tokens, smaller);
             continue;
         };
@@ -9525,44 +9539,49 @@ test "native generate artifact tokenizer admission rejects oversized parse befor
 }
 
 test "native generate admits target draft transients beside residency and shrinks prefill" {
-    const a = std.testing.allocator;
-    const memory = runtime.tier.memory;
-    const cfg = gpt_mod.Config{
-        .family = .llama,
-        .hidden_size = 128,
-        .num_hidden_layers = 4,
-        .num_attention_heads = 4,
-        .num_key_value_heads = 4,
-        .intermediate_size = 256,
-        .vocab_size = 1024,
-    };
-    const small = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
-    const large = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
-    const resident_bytes = 4 * large.hostTotalBytes();
-    const limits = memory.Limits{ .host_limit_bytes = resident_bytes + 2 * small.hostTotalBytes(), .combined_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() };
-    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, limits);
-    defer resources.deinit();
-    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
-    defer manager.deinit();
-    try (model_manager_mod.ModelLoadPolicy{ .limits = limits, .resources = &resources }).configure(&manager);
-    var residency = try manager.admitHostPreflight(resident_bytes);
-    defer residency.release();
-    const session = backends.Session{ .ptr = undefined, .vtable = undefined };
-    const component = memory.GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f16, .config = cfg };
-    const components = [_]memory.GptGenerationBudgetComponent{ component, component };
-    var budget = memory.RunBudget.init(limits);
-    var chunk = try memory.reserveGptGenerationAtLargestChunk(&budget, &components, 256, 1, 256);
-    try std.testing.expectEqual(@as(usize, 256), chunk);
-    {
-        var lease = try acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget);
-        defer lease.release();
-        try std.testing.expectEqual(@as(usize, 32), chunk);
-        try std.testing.expectEqual(limits.host_limit_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+    for ([_]usize{ 0, 4096 }) |media_bytes| {
+        const a = std.testing.allocator;
+        const memory = runtime.tier.memory;
+        const cfg = gpt_mod.Config{
+            .family = .llama,
+            .hidden_size = 128,
+            .num_hidden_layers = 4,
+            .num_attention_heads = 4,
+            .num_key_value_heads = 4,
+            .intermediate_size = 256,
+            .vocab_size = 1024,
+        };
+        const small = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
+        const large = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
+        const resident_bytes = 4 * large.hostTotalBytes();
+        const limits = memory.Limits{ .host_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() + media_bytes, .combined_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() + media_bytes };
+        var resources = try model_manager_mod.ModelManager.SharedResources.init(a, limits);
+        defer resources.deinit();
+        var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer manager.deinit();
+        try (model_manager_mod.ModelLoadPolicy{ .limits = limits, .resources = &resources }).configure(&manager);
+        var residency = try manager.admitHostPreflight(resident_bytes);
+        defer residency.release();
+        const session = backends.Session{ .ptr = undefined, .vtable = undefined };
+        const component = memory.GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f16, .config = cfg };
+        const components = [_]memory.GptGenerationBudgetComponent{ component, component };
+        var budget = memory.RunBudget.init(limits);
+        var credit = try @import("pipelines/preprocessing_memory.zig").BudgetCredit.reserve(&budget, media_bytes);
+        defer credit.deinit();
+        var chunk = try memory.reserveGptGenerationAtLargestChunk(&budget, &components, 256, 1, 256);
+        try std.testing.expectEqual(@as(usize, 256), chunk);
+        {
+            var lease = try acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget, media_bytes);
+            defer lease.release();
+            try std.testing.expectEqual(@as(usize, 32), chunk);
+            try std.testing.expectEqual(media_bytes + 2 * small.scratchTotalBytes(), budget.scratchTotalBytes());
+            try std.testing.expectEqual(limits.host_limit_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+        }
+        try std.testing.expectEqual(resident_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+        var extra = try manager.admitHostPreflight(small.hostTotalBytes());
+        defer extra.release();
+        const before = manager.currentAdmissionAmounts();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget, media_bytes));
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
     }
-    try std.testing.expectEqual(resident_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
-    var extra = try manager.admitHostPreflight(small.hostTotalBytes());
-    defer extra.release();
-    const before = manager.currentAdmissionAmounts();
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget));
-    try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
 }

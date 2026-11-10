@@ -2254,7 +2254,7 @@ const DistributedRightJoinGroups = struct {
             try ctx.ensureExecutionDeadline();
             const index = session.table_indexes.get(table_name) orelse return error.TableNotFound;
             const record = session.snapshot.value.tables[index];
-            const refs = session.table_range_refs.get(record.table_id) orelse return null;
+            const refs = (session.table_range_refs.get(record.table_id) orelse return null).ranges;
             if (refs.len < min_group_count) return null;
             const ids = try alloc.alloc(u64, refs.len);
             for (refs, ids) |range, *id| id.* = range.group_id;
@@ -2285,7 +2285,7 @@ const DistributedRightJoinGroups = struct {
 
     fn groupForKey(self: @This(), key: []const u8) ?u64 {
         const session = self.routing orelse return self.table.groupForKey(key);
-        const refs = session.table_range_refs.get(self.table.table_id) orelse return null;
+        const refs = (session.table_range_refs.get(self.table.table_id) orelse return null).ranges;
         var low: usize = 0;
         var high = refs.len;
         while (low < high) {

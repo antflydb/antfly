@@ -25,6 +25,10 @@ export interface Capabilities {
   purge_sources?: boolean;
   media_proxy?: boolean;
   serialized_runs?: boolean;
+  search_versions?: Array<number>;
+  artifact_discovery?: boolean;
+  processing_presets?: boolean;
+  processing_jobs?: boolean;
 }
 
 export interface SourceIdentity {
@@ -43,7 +47,11 @@ export interface Source {
   identity?: SourceIdentity;
   rekeys?: boolean;
   permission_ttl_seconds?: number;
-  streams?: Array<TextStream>;
+  streams?: Array<SearchStream>;
+  search_version?: number;
+  artifacts?: Array<ArtifactBinding>;
+  search_status?: SearchStatus;
+  processing?: ProcessingDeclaration;
 }
 
 export interface Run {
@@ -88,14 +96,110 @@ export interface RunInput {
   operation?: "sync" | "purge";
 }
 
-export interface TextStream {
+export interface SearchStream {
   name: string;
   artifact?: string;
   index?: string;
-  field: string;
+  field?: string;
   purpose?: string;
   location_field?: string;
-  default: boolean;
+  default?: boolean;
   generated?: boolean;
   boundary?: "record" | "unit";
+  resource_field?: string;
+  retrieval?: RetrievalBindings;
+}
+
+export type TextStream = SearchStream;
+
+export interface RetrievalBindings {
+  exact?: ExactRetrieval;
+  full_text?: FullTextRetrieval;
+  semantic?: SemanticRetrieval;
+}
+
+export interface ExactRetrieval {
+  default?: boolean;
+}
+
+export interface FullTextRetrieval {
+  index: string;
+  default?: boolean;
+}
+
+export interface VectorSpace {
+  id: string;
+  dimension: number;
+  metric: "cosine" | "inner_product" | "l2_squared";
+  model: string;
+  revision: string;
+  query_preprocessing: string;
+  document_preprocessing: string;
+  query_modality: "text" | "image" | "audio" | "multimodal";
+  document_modality: "text" | "image" | "audio" | "multimodal";
+}
+
+export interface SemanticRetrieval {
+  index: string;
+  member_artifacts?: Array<string>;
+  vector_space: VectorSpace;
+  query_inputs: Array<"text" | "vector">;
+  default?: boolean;
+  external?: boolean;
+  member_field?: string;
+}
+
+export interface ArtifactBinding {
+  name: string;
+  artifact: string;
+  purpose?: string;
+  content_type: string;
+  schema_uri?: string;
+  location_field?: string;
+  generated?: boolean;
+}
+
+export interface RepresentationStatus {
+  name: string;
+  state: "disabled" | "building" | "ready" | "partial" | "failed" | "unsupported";
+  reason?: string;
+}
+
+export interface SearchStatus {
+  version: number;
+  streams: Array<RepresentationStatus>;
+  artifacts: Array<RepresentationStatus>;
+  observed_at: number;
+  consistency: "retained_snapshot" | "live_read" | "unknown";
+}
+
+export interface NativeIndexDeclaration {
+  name: string;
+  config: Record<string, unknown>;
+}
+
+export interface ProcessingDeclaration {
+  indexes?: Array<NativeIndexDeclaration>;
+}
+
+export interface ProcessingPreset {
+  name: string;
+  kind: "content" | "extract" | "transcription" | "caption" | "summary";
+  producer_config?: Record<string, unknown>;
+  embedder?: Record<string, unknown>;
+  dimension?: number;
+  metric?: "cosine" | "inner_product" | "l2_squared";
+}
+
+export interface ProcessingPreview {
+  processing: ProcessingDeclaration;
+  stream: SearchStream;
+  artifact: ArtifactBinding;
+}
+
+export interface ProcessingJobRequest {
+  artifact: string;
+  action: "start" | "status" | "advance" | "cancel";
+  job_id?: string;
+  limit?: number;
 }

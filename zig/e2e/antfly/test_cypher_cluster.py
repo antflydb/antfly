@@ -55,6 +55,74 @@ def cypher_principal_authority(monkeypatch):
     monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-cluster")
 
 
+def _policy_publication_diagnostics(cluster, endpoint):
+    policy_diagnostics = []
+    leader = urlsplit(endpoint)
+    try:
+        snapshot = cluster.metadata_snapshot(
+            cluster.metadata_admin_ports.index(leader.port), request_timeout_s=5
+        )
+        for table in snapshot.get("tables", []):
+            request = urllib.request.Request(
+                endpoint + "/internal/v1/system-catalog",
+                json.dumps(
+                    {"policy_publication_status": int(table["table_id"])}
+                ).encode(),
+                {
+                    **internal_service_headers(),
+                    "Content-Type": "application/json",
+                    "X-Antfly-Raft-Mutation-Remaining-Ms": "5000",
+                    "X-Antfly-Raft-Mutation-Forwards-Remaining": "0",
+                    "X-Antfly-Raft-Mutation-Campaign-Allowed": "false",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=6) as response:
+                policy_diagnostics.append(json.load(response))
+        body = json.dumps({"policy_publication_work": 0}).encode()
+        expires = int(time.time()) + 60
+        key = hmac.new(
+            os.environ["ANTFLY_SETTING_AUTHORITY_SECRET"].encode(),
+            b"antfly/sql-setting-authority/key/v1",
+            hashlib.sha256,
+        ).digest()
+        mac = hmac.new(
+            key,
+            b"sql-setting-catalog-v1"
+            + os.environ["ANTFLY_SETTING_AUTHORITY_ISSUER"].encode()
+            + b"\0read"
+            + struct.pack("<q", expires)
+            + hashlib.sha256(body).digest(),
+            hashlib.sha256,
+        ).hexdigest()
+        request = urllib.request.Request(
+            endpoint + "/internal/v1/system-catalog",
+            body,
+            {
+                **internal_service_headers(),
+                "Content-Type": "application/json",
+                "x-antfly-setting-grant": f"v1:{expires}:{mac}",
+                "X-Antfly-Raft-Mutation-Remaining-Ms": "5000",
+                "X-Antfly-Raft-Mutation-Forwards-Remaining": "0",
+                "X-Antfly-Raft-Mutation-Campaign-Allowed": "false",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=6) as response:
+            work = json.load(response)
+        publication = work.get("publication")
+        if publication:
+            policy_diagnostics.append(
+                {
+                    "phase": publication["phase"],
+                    "owners": len(publication["required_owners"]),
+                    "installed": len(publication["acknowledged_owners"]),
+                    "serving": len(publication["serving_acknowledged_owners"]),
+                }
+            )
+    except Exception as diagnostic_error:
+        policy_diagnostics.append({"diagnostic_error": str(diagnostic_error)})
+    return policy_diagnostics
+
+
 def test_authenticated_cypher_postimage_policy_on_replicated_owners(
     three_by_three_backup_cluster,
 ):
@@ -83,7 +151,12 @@ def test_authenticated_cypher_postimage_policy_on_replicated_owners(
             timeout=220,
         )
         assert result.returncode == 0, (
-            result.stdout + result.stderr + "\n" + cluster.debug_logs()
+            result.stdout
+            + result.stderr
+            + "\npolicy publication stamps: "
+            + json.dumps(_policy_publication_diagnostics(cluster, endpoint))
+            + "\n"
+            + cluster.debug_logs()
         )
         assert expected in result.stdout
 
@@ -258,14 +331,10 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
 
     for filename in [
         "verify_cypher_expressions.py",
-        "verify_cypher_mutations.py",
         "verify_cypher_normalization.py",
-        "verify_cypher_postimage_policy.py",
     ]:
-        # Mutations cover 32 checks and two independently bounded 60-second
-        # index-generation waits. Allow the full campaign to consume those
-        # budgets while retaining a bounded subprocess lifetime.
-        qualification_timeout = 300 if filename == "verify_cypher_mutations.py" else 180
+        # Mutation and postimage-policy campaigns have dedicated replicated
+        # owner tests above, including both producer-installation modes.
         qualification = subprocess.run(
             [sys.executable, str(script.with_name(filename)), "--url", endpoint]
             + (["--distributed"] if filename == "verify_cypher_expressions.py" else []),
@@ -275,82 +344,13 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
             },
             capture_output=True,
             text=True,
-            timeout=qualification_timeout,
+            timeout=180,
         )
-        policy_diagnostics = []
-        if (
-            qualification.returncode != 0
-            and filename == "verify_cypher_postimage_policy.py"
-        ):
-            try:
-                snapshot = cluster.metadata_snapshot(
-                    cluster.metadata_admin_ports.index(leader.port), request_timeout_s=5
-                )
-                for table in snapshot.get("tables", []):
-                    request = urllib.request.Request(
-                        endpoint + "/internal/v1/system-catalog",
-                        json.dumps(
-                            {"policy_publication_status": int(table["table_id"])}
-                        ).encode(),
-                        {
-                            **internal_service_headers(),
-                            "Content-Type": "application/json",
-                            "X-Antfly-Raft-Mutation-Remaining-Ms": "5000",
-                            "X-Antfly-Raft-Mutation-Forwards-Remaining": "0",
-                            "X-Antfly-Raft-Mutation-Campaign-Allowed": "false",
-                        },
-                    )
-                    with urllib.request.urlopen(request, timeout=6) as response:
-                        policy_diagnostics.append(json.load(response))
-                body = json.dumps({"policy_publication_work": 0}).encode()
-                expires = int(time.time()) + 60
-                key = hmac.new(
-                    os.environ["ANTFLY_SETTING_AUTHORITY_SECRET"].encode(),
-                    b"antfly/sql-setting-authority/key/v1",
-                    hashlib.sha256,
-                ).digest()
-                mac = hmac.new(
-                    key,
-                    b"sql-setting-catalog-v1"
-                    + os.environ["ANTFLY_SETTING_AUTHORITY_ISSUER"].encode()
-                    + b"\0read"
-                    + struct.pack("<q", expires)
-                    + hashlib.sha256(body).digest(),
-                    hashlib.sha256,
-                ).hexdigest()
-                request = urllib.request.Request(
-                    endpoint + "/internal/v1/system-catalog",
-                    body,
-                    {
-                        **internal_service_headers(),
-                        "Content-Type": "application/json",
-                        "x-antfly-setting-grant": f"v1:{expires}:{mac}",
-                        "X-Antfly-Raft-Mutation-Remaining-Ms": "5000",
-                        "X-Antfly-Raft-Mutation-Forwards-Remaining": "0",
-                        "X-Antfly-Raft-Mutation-Campaign-Allowed": "false",
-                    },
-                )
-                with urllib.request.urlopen(request, timeout=6) as response:
-                    work = json.load(response)
-                publication = work.get("publication")
-                if publication:
-                    policy_diagnostics.append(
-                        {
-                            "phase": publication["phase"],
-                            "owners": len(publication["required_owners"]),
-                            "installed": len(publication["acknowledged_owners"]),
-                            "serving": len(publication["serving_acknowledged_owners"]),
-                        }
-                    )
-            except Exception as diagnostic_error:
-                policy_diagnostics.append({"diagnostic_error": str(diagnostic_error)})
         assert qualification.returncode == 0, (
             filename
             + "\n"
             + qualification.stdout
             + qualification.stderr
-            + "\npolicy publication stamps: "
-            + json.dumps(policy_diagnostics)
             + "\n"
             + cluster.debug_logs()
         )

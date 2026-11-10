@@ -15,14 +15,100 @@
 
 """Resolver curation admission, owner progress, and namespace routes over HTTP."""
 
+import time
 from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
+import requests
 
 
 # Server ownership is dynamic/direct, outside static fixture inference.
 pytestmark = pytest.mark.e2e_resource("antfly_process")
+
+
+def _entity_progress(api, table, key):
+    """Observe each consumer through the bounded, revision-fenced public API."""
+    initial_path = f"/tables/{table}/entities/{quote(key, safe='')}/progress?limit=1"
+    path = initial_path
+    deadline = time.monotonic() + 10.0
+    results = []
+    seen = set()
+    while True:
+        try:
+            page = api.get(path)
+        except requests.HTTPError as error:
+            response = error.response
+            if response is None or response.status_code != 409:
+                raise
+            try:
+                detail = response.json()
+            except ValueError:
+                raise error
+            remaining = deadline - time.monotonic()
+            if (
+                not isinstance(detail, dict)
+                or detail.get("error") != "CatalogGenerationChanged"
+                or detail.get("retryable") is not True
+                or remaining <= 0
+            ):
+                raise
+            # A changed revision invalidates the entire paginated snapshot.
+            # Never combine earlier pages with the next generation's results.
+            results.clear()
+            seen.clear()
+            path = initial_path
+            time.sleep(min(0.05, remaining))
+            if time.monotonic() >= deadline:
+                raise
+            continue
+        assert len(page["results"]) <= 1, page
+        for row in page["results"]:
+            identity = (row["source_table"], row["resolver"], row["key_template"])
+            assert identity not in seen, page
+            seen.add(identity)
+            results.append(row)
+        cursor = page.get("next_cursor")
+        assert page["complete"] == (cursor is None), page
+        if cursor is None:
+            return results
+        path = path.partition("&cursor=")[0] + "&cursor=" + quote(cursor, safe="")
+
+
+def test_entity_progress_discards_partial_snapshot_on_catalog_change(monkeypatch):
+    before = {"source_table": "notes", "resolver": "concepts", "key_template": "a"}
+    after = {**before, "applied": True}
+    neighbor = {**after, "key_template": "b"}
+    response = requests.Response()
+    response.status_code = 409
+    response._content = b'{"error":"CatalogGenerationChanged","retryable":true}'
+    conflict = requests.HTTPError(response=response)
+    pages = iter(
+        [
+            {"results": [before], "next_cursor": "old", "complete": False},
+            conflict,
+            {"results": [after], "next_cursor": "new", "complete": False},
+            {"results": [neighbor], "complete": True},
+        ]
+    )
+
+    class Api:
+        def __init__(self):
+            self.paths = []
+
+        def get(self, path):
+            self.paths.append(path)
+            page = next(pages)
+            if isinstance(page, Exception):
+                raise page
+            return page
+
+    api = Api()
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    assert _entity_progress(api, "entities", "concept/a") == [after, neighbor]
+    assert api.paths[0] == api.paths[2]
+    assert api.paths[1] == api.paths[0] + "&cursor=old"
+    assert api.paths[3] == api.paths[0] + "&cursor=new"
 
 
 def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
@@ -88,8 +174,13 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     # Destination-owned policy is metadata, never an index or public config.
     assert "_resolver_namespaces" not in str(api.get_table(destination))
     assert "_resolver_namespaces" not in str(api.get(f"/tables/{destination}/indexes"))
-    assert len(merged["results"]) == 2
-    assert all(row["accepted"] and row["revision"] == 1 for row in merged["results"])
+    # Admission reports namespaces once; source observations are paginated.
+    assert merged["results"] == [], merged
+    assert len(merged["namespaces"]) == 1, merged
+    assert merged["namespaces"][0]["revision"] == 1, merged
+    progress = _entity_progress(api, destination, "concept/alpha")
+    assert len(progress) == 2, progress
+    assert all(row["applied"] and row["revision"] == 1 for row in progress), progress
     mention = {"text": "Alpha", "label": "concept"}
     for source in sources:
         rendered = api.post(f"/tables/{source}/resolvers/concepts:render", mention)
@@ -438,9 +529,15 @@ def test_entity_merge_adopts_matching_local_policy(request, monkeypatch, raft, p
     entity = f"/tables/{destination}/entities/{quote('concept/a', safe='')}:merge"
     merged = api.post(entity, {"into": "concept/b", "wait": wait})
     assert merged["changed"] and merged["applied"], merged
-    assert all(row["accepted"] for row in merged["results"]), merged
-    revision = merged["results"][0]["revision"]
+    assert merged["results"] == [], merged
+    assert len(merged["namespaces"]) == 1, merged
+    revision = merged["namespaces"][0]["revision"]
     assert revision == (1 if policy == "inline" else 2), merged
+    progress = _entity_progress(api, destination, "concept/a")
+    assert len(progress) == 2, progress
+    assert all(row["applied"] and row["revision"] == revision for row in progress), (
+        progress
+    )
     for source_name in (first, second):
         rendered = api.post(
             f"/tables/{source_name}/resolvers/concepts:render",
@@ -632,16 +729,30 @@ def test_runtime_entity_curation_preserves_future_promotion(
 
     expected_nodes = {"note-0", "note-1"} if action == "merge" else {"note-0"}
 
+    last_graph = None
+
     def graph_published():
+        nonlocal last_graph
         # Entity promotion and graph publication are independent consumers.
         # A write-level acknowledgement plus promoted rows does not fence graph
         # visibility, particularly with independently applied Raft publications.
         reached = traversal(qualified)
         assert reached.ok, reached.text
-        nodes = reached.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        last_graph = reached.json()
+        nodes = last_graph["responses"][0]["graph_results"]["incoming"]["nodes"]
         return nodes if {node["key"] for node in nodes} == expected_nodes else None
 
-    assert wait_until(graph_published, timeout_s=30), api.debug_logs()[-16000:]
+    assert wait_until(graph_published, timeout_s=30), (
+        json.dumps(
+            {
+                "last_query": last_graph,
+                "index": api.get(f"/tables/{source}/indexes/knowledge"),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+        + api.debug_logs()[-16000:]
+    )
     multiple_seeds = {"identities": list(qualified["identities"])}
     expected_paths = [(seed, "note-0")]
     if action == "merge":

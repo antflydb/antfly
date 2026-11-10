@@ -28,6 +28,8 @@ pub const appendSliceInto = qwen2vl.appendSliceInto;
 pub const loadPreprocessorConfig = qwen2vl.loadPreprocessorConfig;
 pub const parsePreprocessorConfig = qwen2vl.parsePreprocessorConfig;
 pub const prepareImage = qwen2vl.prepareImage;
+pub const imageGeometryForEncoded = qwen2vl.imageGeometryForEncoded;
+pub const imageWorkingBytes = qwen2vl.imageWorkingBytes;
 pub const smartResize = qwen2vl.smartResize;
 
 test {

@@ -31,22 +31,21 @@ pub const CheckpointReference = struct {
     files: []const remote_storage.File,
 };
 pub const ReuseProof = @import("native_query_reuse.zig").Proof;
-pub const WarmResult = struct { complete: bool, proof: ?ReuseProof = null };
 pub const VTable = struct {
     publish: *const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!void,
     recover: *const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!void,
     /// Null selects local recovery for this generation; a lease selects lazy reads.
     open_read: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!?StorageLease = null,
-    warm: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation, u64) anyerror!bool = null,
     can_evict: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, u64, Cancellation) anyerror!bool = null,
     reference: ?*const fn (*anyopaque, Executor, Request, Namespace, Storage, Cancellation) anyerror!bool = null,
     publish_with_proof: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation) anyerror!?ReuseProof = null,
-    warm_with_proof: ?*const fn (*anyopaque, Executor, []const u8, Request, Namespace, Cancellation, u64) anyerror!WarmResult = null,
     reuse: ?*const fn (*anyopaque, Executor, Request, Request, Namespace, ReuseProof, Cancellation) anyerror!?ReuseProof = null,
 };
 const Boundary = @import("../../runtime_callback_abi.zig").Boundary(VTable);
 pub const Port = struct {
     limits: @import("native_query_cut.zig").Limits = .{},
+    warming_enabled: bool = false,
+    warming_max_bytes: u64 = 256 * 1024 * 1024,
     ptr: *anyopaque,
     vtable: *const VTable,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
@@ -59,10 +58,6 @@ pub const Port = struct {
     pub fn openRead(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !?StorageLease {
         const open = self.vtable.open_read orelse return null;
         return try Boundary.call("open_read", self.dispatch, open, .{ self.ptr, Executor.init(&io), root, request, namespace, cancellation });
-    }
-    pub fn warm(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
-        const callback = self.vtable.warm orelse return true;
-        return Boundary.call("warm", self.dispatch, callback, .{ self.ptr, Executor.init(&io), root, request, namespace, cancellation, max_bytes });
     }
     /// Confirm a matching immutable repository manifest before local eviction.
     pub fn canEvict(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
@@ -77,10 +72,6 @@ pub const Port = struct {
         if (self.vtable.publish_with_proof) |callback| return Boundary.call("publish_with_proof", self.dispatch, callback, .{ self.ptr, Executor.init(&io), root, request, namespace, cancellation });
         try self.publish(io, root, request, namespace, cancellation);
         return null;
-    }
-    pub fn warmReusable(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !WarmResult {
-        if (self.vtable.warm_with_proof) |callback| return Boundary.call("warm_with_proof", self.dispatch, callback, .{ self.ptr, Executor.init(&io), root, request, namespace, cancellation, max_bytes });
-        return .{ .complete = try self.warm(io, root, request, namespace, cancellation, max_bytes) };
     }
     pub fn reuse(self: Port, io: std.Io, previous: Request, request: Request, namespace: Namespace, proof: ReuseProof, cancellation: Cancellation) !?ReuseProof {
         const callback = self.vtable.reuse orelse return null;

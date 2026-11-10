@@ -237,7 +237,9 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     )
 
 
-def _one_query_walk(api: _Api, start_key: str, timeout: float) -> str | None:
+def _one_query_walk(
+    api: _Api, start_key: str, timeout: float, observations: dict
+) -> str | None:
     """One depth-2 traversal reaching entity AND event, no re-seeding.
 
     Returns the discovered event key (table provenance verified on the
@@ -252,6 +254,7 @@ def _one_query_walk(api: _Api, start_key: str, timeout: float) -> str | None:
                     "start": {"keys": [start_key]},
                     "direction": "out",
                     "max_depth": 2,
+                    "include_documents": True,
                     "limit": 20,
                 },
             }
@@ -267,19 +270,33 @@ def _one_query_walk(api: _Api, start_key: str, timeout: float) -> str | None:
     result = (
         (response.get("responses") or [{}])[0].get("graph_results", {}).get("walk", {})
     )
-    nodes = {node.get("key"): node.get("table") for node in result.get("nodes", [])}
-    event_keys = [
-        key
-        for key, table in nodes.items()
-        if key and key.startswith("event/") and table == "events"
-    ]
-    if (
-        nodes.get("entity/x_ada_lovelace") == "entities"
-        and nodes.get("entity/x_antfly") == "entities"
-        and len(event_keys) == 1
-    ):
-        return event_keys[0]
-    return None
+    observations[start_key] = result
+    nodes = {node.get("key"): node for node in result.get("nodes", [])}
+    event_keys = [key for key in nodes if key and key.startswith("event/")]
+    entity_keys = ("entity/x_ada_lovelace", "entity/x_antfly")
+    if not (all(key in nodes for key in entity_keys) and len(event_keys) == 1):
+        return None
+    event_key = event_keys[0]
+    # Table qualifiers are immutable storage identities, not public names.
+    # Keep the cross-table provenance proof and verify hydration against each
+    # logical target without another graph traversal or a re-seeded walk.
+    entity_tables = {nodes[key].get("table") for key in entity_keys}
+    if len(entity_tables) != 1 or not all(entity_tables):
+        return None
+    if not nodes[event_key].get("table") or nodes[event_key]["table"] in entity_tables:
+        return None
+    try:
+        for key, table in [(key, "entities") for key in entity_keys] + [
+            (event_key, "events")
+        ]:
+            document = api.lookup(table, key, timeout=timeout)
+            if document is None or nodes[key].get("document") != document:
+                return None
+    except requests.RequestException as exc:
+        if not _transient_poll_error(exc):
+            raise
+        return None
+    return event_key
 
 
 def _live_events(api: _Api, timeout: float) -> tuple[list[str], dict[str, str]] | None:
@@ -305,10 +322,13 @@ def _live_events(api: _Api, timeout: float) -> tuple[list[str], dict[str, str]] 
 
 def _wait_for_converged_event(api: _Api, *, deadline: _Deadline) -> str:
     last: tuple | None = None
-    while not deadline.expired():
+    observations: dict = {}
+    while deadline.remaining() >= 0.1:
         timeout = deadline.request_timeout()
-        walk_a = _one_query_walk(api, "doc:a", timeout)
-        walk_b = _one_query_walk(api, "doc:b", timeout) if walk_a else None
+        walk_a = _one_query_walk(api, "doc:a", timeout, observations)
+        walk_b = (
+            _one_query_walk(api, "doc:b", timeout, observations) if walk_a else None
+        )
         events = _live_events(api, timeout)
         last = (walk_a, walk_b, events)
         if walk_a and walk_a == walk_b and events is not None:
@@ -320,6 +340,7 @@ def _wait_for_converged_event(api: _Api, *, deadline: _Deadline) -> str:
         deadline.sleep(0.5)
     raise AssertionError(
         f"compositional event convergence never settled: {last}\n"
+        f"last graph walks: {json.dumps(observations, sort_keys=True)}\n"
         f"{api._server.debug_logs()}"
     )
 

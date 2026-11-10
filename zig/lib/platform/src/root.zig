@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const allocator = @import("allocator.zig");
+pub const document_pipeline_metrics = @import("document_pipeline_metrics.zig");
 pub const atomic = @import("atomic.zig");
 pub const clock = @import("clock.zig");
 pub const env = @import("env.zig");

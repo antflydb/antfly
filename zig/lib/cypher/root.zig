@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const dependencies = @import("dependencies.zig");
+pub const read_domains = @import("read_domains.zig");
 pub const expressions = @import("expressions.zig");
 pub const ast = @import("ast.zig");
 pub const compiler = @import("compiler.zig");
@@ -47,6 +48,7 @@ test {
     _ = @import("owner_operations_test.zig");
     _ = catalog_guard;
     _ = dependencies;
+    _ = read_domains;
     _ = runtime;
     _ = integer_affine;
     _ = @import("compiler_test.zig");

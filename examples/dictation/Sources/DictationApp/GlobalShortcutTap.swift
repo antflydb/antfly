@@ -53,6 +53,10 @@ final class GlobalShortcutTap: @unchecked Sendable {
       lock.lock()
       loop = current
       lock.unlock()
+      guard let source = self.source, let tap = self.tap else {
+        ready.signal()
+        return
+      }
       CFRunLoopAddSource(current, source, .commonModes)
       CGEvent.tapEnable(tap: tap, enable: true)
       ready.signal()

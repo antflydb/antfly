@@ -33,6 +33,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const native_query_maintenance_filters = [_][]const u8{
         "db native checkpoint warming",
+        "db native checkpoint discovery",
         "db idle dense query captures",
         "external lake native warming",
         "source vector payloads debt policy bounds background deferral",
@@ -189,6 +190,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
         "#1210",
+        "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
@@ -223,6 +225,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
         "storage.db.db.test.db asset consumes another asset artifact and re-derives on upstream change",
         "storage.db.db.test.db asset consuming asset validates upstream references at admission",
+        "generic scalar chunks reject stale upstream and fence publication",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
         "asset producer neighbor context samples local graph adjacency into the input and skip state",
@@ -287,6 +290,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "PDF scratch growth distinguishes",
         "PDF partial scratch grants yield contention",
         "PDF composite lease admits two future overlap windows atomically",
+        "document preparation",
         "prepared document source cache isolates credentials and reuses bytes",
         "prepared document source cache accounts retained bytes through eviction",
         "prepared document cache single-flights concurrent PDF variants and drains leases",

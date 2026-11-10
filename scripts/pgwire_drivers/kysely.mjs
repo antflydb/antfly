@@ -299,15 +299,37 @@ try {
         { stdio: ["ignore", "inherit", "inherit", "ipc"] },
       );
       workers.add(child);
-      const message = once(child, "message", {
-        signal: AbortSignal.timeout(60_000),
-      }).then(([value]) => value);
+      // A worker can exit before reporting (including an unsettled top-level
+      // await). Surface that outcome immediately instead of masking it as an
+      // unrelated 60-second AbortError. Keep the deadline for a live stall.
+      const message = new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          child.off("message", reported);
+          child.off("exit", stopped);
+          child.off("error", failed);
+        };
+        const reported = (value) => { cleanup(); resolve(value); };
+        const failed = (error) => { cleanup(); reject(error); };
+        const stopped = (code, signal) => failed(new Error(
+          `Kysely ${mode} worker exited before reporting: code=${code} signal=${signal}`,
+        ));
+        const timer = setTimeout(() => failed(new Error(
+          `Kysely ${mode} worker did not report within 60 seconds (pid=${child.pid})`,
+        )), 60_000);
+        child.once("message", reported);
+        child.once("exit", stopped);
+        child.once("error", failed);
+      });
       const exited = once(child, "exit").then((value) => {
         workers.delete(child);
         return value;
       });
       return { child, message, exited };
     };
+    const stoppedEarly = spawnWorker("exit-before-report");
+    await assert.rejects(stoppedEarly.message, /exited before reporting: code=17/);
+    assert.deepEqual(await stoppedEarly.exited, [17, null]);
     const runners = [spawnWorker("migrate"), spawnWorker("migrate")];
     const outcomes = await Promise.all(runners.map((runner) => runner.message));
     await Promise.all(runners.map((runner) => runner.exited));

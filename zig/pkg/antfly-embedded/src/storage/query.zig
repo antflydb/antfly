@@ -280,10 +280,7 @@ pub fn algebraicIndexFreshEnoughForName(
     db: *db_mod.DB,
 ) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call("queryAlgebraicIndexFreshEnoughForName", .{ alloc, index_name_opt, db });
-    const entry = if (index_name_opt) |index_name|
-        db.core.index_manager.algebraicIndex(index_name) orelse return false
-    else
-        db.core.index_manager.algebraicIndex(null) orelse return false;
+    const entry = db.core.index_manager.algebraicIndex(index_name_opt) orelse return false;
     if (entry.index.hasErrors()) return false;
     const target_sequence = db.core.nextDerivedSequence();
     var applied_sequence = try db.core.loadAppliedSequence(alloc, entry.config.name);
@@ -317,7 +314,7 @@ pub fn collectTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitTextStats(alloc, explicit);
+            break :blk try db.collectExplicitTextStatsWithPrivacyPolicy(alloc, explicit, parsed.privacy_policy_version);
         },
         .background_fields => return error.InvalidQueryRequest,
     };
@@ -348,7 +345,7 @@ pub fn collectBackgroundTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitBackgroundTextStats(alloc, explicit);
+            break :blk try db.collectExplicitBackgroundTextStatsWithPrivacyPolicy(alloc, explicit, parsed.privacy_policy_version);
         },
         else => return error.InvalidQueryRequest,
     };
@@ -480,6 +477,10 @@ pub fn executeStorageKernelAlgebraicPartials(
     body: []const u8,
 ) ![]u8 {
     if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelAlgebraicPartials", .{ alloc, db, body });
+    var envelope = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer envelope.deinit();
+    if (envelope.value == .object and envelope.value.object.contains("temporal_query"))
+        return executeTemporalQuery(alloc, db, body, .{});
     var parsed = try parseAlgebraicPartialsRequest(alloc, body);
     defer parsed.deinit(alloc);
     const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed);
@@ -501,4 +502,75 @@ pub fn executeStorageKernelPreflight(
     var summary = try db.preflightSearchRequest(alloc, owned.req, wire.value.max_work);
     defer summary.deinit(alloc);
     return try std.json.Stringify.valueAlloc(alloc, summary, .{});
+}
+
+/// Coarse temporal plan/export/fold operation. No physical pointers escape this
+/// owner. All intermediate allocations have one bounded request lifetime.
+pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []const u8, control: @import("../search/query.zig").ExecutionControl) ![]u8 {
+    const started_ns = @import("antfly_platform").time.monotonicNs();
+    if (body.len > contract.temporal_max_bytes) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wire = try std.json.parseFromSliceLeaky(contract.TemporalWire, a, body, .{ .ignore_unknown_fields = true });
+    var owned = try query_api.parseQueryRequest(a, null, wire.table_name, wire.temporal_query);
+    if (control.cancellation != null) owned.req.cancellation = control.cancellation;
+    owned.req.execution_deadline_ns = wire.executionDeadline(started_ns, owned.req.execution_deadline_ns, control.deadline_ns);
+    const req = owned.req;
+    const execution: @import("../search/query.zig").ExecutionControl = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    try execution.check();
+    if (!contract.canConsiderAlgebraicAggregations(req)) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_unsupported_temporal_shape, .{});
+    const constraints = (try contract.algebraicConstraintsForRequestAlloc(a, req)) orelse return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_unproven_temporal_predicate, .{});
+    const requests = try query_api.parseAggregationRequestsJson(a, req.aggregations_json);
+    if (requests.len == 0) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_unsupported_temporal_shape, .{});
+    var lease = try db.beginQueryReadLease();
+    defer lease.release();
+    _ = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
+    const entry = db_mod.aggregations.resolveTemporalAlgebraicIndex(db.core.index_manager, req.index_name) orelse return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_missing_temporal_index, .{});
+    if (entry.index.hasErrors() or !entry.index.plannerLifecycleReady()) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_index_not_ready, .{});
+    if (!(try algebraicIndexFreshEnoughForName(a, entry.config.name, db))) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_stale_temporal_index, .{});
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    const time = @import("antfly_platform").time;
+    if (schema) |view| if (!contract.temporalRangeVisibleThroughDeadline(req, constraints, view.tableSchema().ttl_field, view.visibilityTtlDurationNs(), time.realtimeNs(), time.monotonicNs())) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_ttl_visibility, .{});
+    const signature = try std.json.Stringify.valueAlloc(a, .{ .name = entry.index.name, .config = entry.index.config() }, .{});
+    var budget = @import("db/aggregations_contract.zig").HistogramOutputBudget{};
+    var scan_budget = db_mod.algebraic.index.TemporalScanBudget{ .control = execution };
+    const ctx: db_mod.aggregations.Context = .{ .control = execution, .histogram_output_budget = &budget, .temporal_materializations_exact = true, .temporal_scan_budget = &scan_budget };
+    if (wire.shards_json) |json| {
+        if (json.len > contract.temporal_max_bytes) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
+        const shards = try std.json.parseFromSliceLeaky([]const contract.TemporalShard, a, json, .{});
+        for (shards) |shard| if (!std.mem.eql(u8, shard.signature, signature) or shard.partials.len != requests.len) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_schema_changed, .{});
+        const results = try a.alloc(db_mod.aggregations.SearchAggregationResult, requests.len);
+        var total_cells: usize = 0;
+        for (requests, 0..) |request, i| {
+            var partials = std.ArrayList(db_mod.algebraic.distributed.Partial).empty;
+            for (shards) |shard| {
+                const cells = shard.partials[i];
+                total_cells += cells.len;
+                if (total_cells > contract.temporal_max_cells) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
+                try partials.appendSlice(a, cells);
+            }
+            try execution.check();
+            var merged = try db_mod.algebraic.distributed.mergePartialsWithControlAlloc(a, partials.items, execution);
+            defer merged.deinit(a);
+            results[i] = (try db_mod.aggregations.temporalAggregationFromDistributedPartialsAlloc(a, entry.index, request, constraints, merged, ctx)) orelse return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_materialization_declined, .{});
+        }
+        try execution.check();
+        return std.json.Stringify.valueAlloc(alloc, results, .{});
+    }
+    const partials = try a.alloc([]const db_mod.algebraic.distributed.Partial, requests.len);
+    var total_cells: usize = 0;
+    for (requests, 0..) |request, i| {
+        partials[i] = (try db_mod.aggregations.temporalPartialsAlloc(a, entry.index, db.core.store, request, constraints, ctx)) orelse return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_materialization_declined, .{});
+        total_cells += partials[i].len;
+        if (total_cells > contract.temporal_max_cells) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
+    }
+    try execution.check();
+    const response = try std.json.Stringify.valueAlloc(alloc, contract.TemporalShard{ .signature = signature, .partials = partials }, .{});
+    if (response.len > contract.temporal_max_bytes) {
+        alloc.free(response);
+        return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
+    }
+    return response;
 }

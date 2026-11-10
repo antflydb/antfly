@@ -86,7 +86,9 @@ pub const block_flag_compressed: u8 = 1 << 0;
 /// Document value flags.
 pub const doc_value_flag_compressed: u8 = 1 << 0;
 pub const doc_value_flag_relational_row: u8 = 1 << 1;
-pub const doc_value_known_flags: u8 = doc_value_flag_compressed | doc_value_flag_relational_row;
+/// Appends a signed 128-bit TTL source after the unsigned write version.
+pub const doc_value_flag_ttl_source: u8 = 1 << 2;
+pub const doc_value_known_flags: u8 = doc_value_flag_compressed | doc_value_flag_relational_row | doc_value_flag_ttl_source;
 
 // --- File Header ---
 
@@ -106,6 +108,7 @@ pub const DocumentEntry = struct {
     value_flags: u8,
     value: []const u8,
     timestamp_ns: u64,
+    ttl_source_ns: ?i128 = null,
 };
 
 pub const EmbeddingEntry = struct {
@@ -550,10 +553,16 @@ pub fn encodeDocumentBatch(alloc: Allocator, entries: []const DocumentEntry) ![]
     for (entries) |e| {
         try appendU32LE(&buf, alloc, @intCast(e.key.len));
         try buf.appendSlice(alloc, e.key);
-        try buf.append(alloc, e.value_flags);
+        if (e.value_flags & doc_value_flag_ttl_source != 0 and e.ttl_source_ns == null) return error.InvalidBackupRequest;
+        try buf.append(alloc, e.value_flags | (if (e.ttl_source_ns != null) @as(u8, doc_value_flag_ttl_source) else 0));
         try appendU32LE(&buf, alloc, @intCast(e.value.len));
         try buf.appendSlice(alloc, e.value);
         try appendU64LE(&buf, alloc, e.timestamp_ns);
+        if (e.ttl_source_ns) |source| {
+            var encoded: [16]u8 = undefined;
+            std.mem.writeInt(i128, &encoded, source, .little);
+            try buf.appendSlice(alloc, &encoded);
+        }
     }
 
     return buf.toOwnedSlice(alloc);
@@ -685,12 +694,19 @@ pub fn decodeDocumentBatch(alloc: Allocator, data: []const u8) ![]DocumentEntry 
             if (data.len - off < 8) return error.Truncated;
             const timestamp_ns = std.mem.readInt(u64, data[off..][0..8], .little);
             off += 8;
+            const ttl_source_ns: ?i128 = if (value_flags & doc_value_flag_ttl_source != 0) source: {
+                if (data.len - off < 16) return error.Truncated;
+                const source = std.mem.readInt(i128, data[off..][0..16], .little);
+                off += 16;
+                break :source source;
+            } else null;
 
             break :blk DocumentEntry{
                 .key = key,
                 .value_flags = value_flags,
                 .value = value,
                 .timestamp_ns = timestamp_ns,
+                .ttl_source_ns = ttl_source_ns,
             };
         };
 
@@ -734,11 +750,19 @@ pub fn decodeDocumentBatchBorrowed(alloc: Allocator, data: []const u8) ![]Docume
         if (data.len - off < 8) return error.Truncated;
         const timestamp_ns = std.mem.readInt(u64, data[off..][0..8], .little);
         off += 8;
+        const ttl_source_ns: ?i128 = if (value_flags & doc_value_flag_ttl_source != 0) source: {
+            if (data.len - off < 16) return error.Truncated;
+            const source = std.mem.readInt(i128, data[off..][0..16], .little);
+            off += 16;
+            break :source source;
+        } else null;
+
         entry.* = .{
             .key = key,
             .value_flags = value_flags,
             .value = value,
             .timestamp_ns = timestamp_ns,
+            .ttl_source_ns = ttl_source_ns,
         };
     }
     if (off != data.len) return error.TrailingData;
@@ -760,6 +784,7 @@ pub fn documentBatchEntryCount(data: []const u8) !u32 {
         off += key_len;
 
         if (data.len - off < 1 + 4) return error.Truncated;
+        const value_flags = data[off];
         off += 1;
         const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
         off += 4;
@@ -768,6 +793,10 @@ pub fn documentBatchEntryCount(data: []const u8) !u32 {
 
         if (data.len - off < 8) return error.Truncated;
         off += 8;
+        if (value_flags & doc_value_flag_ttl_source != 0) {
+            if (data.len - off < 16) return error.Truncated;
+            off += 16;
+        }
     }
     if (off != data.len) return error.TrailingData;
     return count;

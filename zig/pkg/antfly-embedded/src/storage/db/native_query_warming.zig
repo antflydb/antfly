@@ -20,7 +20,10 @@ const runtime = @import("../background_runtime.zig");
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const backup = @import("native_backup.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;
+pub const ttl_ms: u64 = 120_000;
 pub const State = struct {
+    local_only: bool = false,
+    bytes: u64 = 0,
     request: @import("native_query_cut_contract.zig").Request,
     sequence: u64,
     complete: bool = false,
@@ -71,7 +74,7 @@ pub const Owner = struct {
     registration: ?runtime.MaintenanceScheduler.Handle = null,
     stopping: std.atomic.Value(bool) = .init(false),
     failures: u32 = 0,
-    pub const Port = struct { ptr: *anyopaque, runtime: *runtime.BackendRuntime, turn: *const fn (*anyopaque, Cancellation) anyerror!bool };
+    pub const Port = struct { name: []const u8 = "native checkpoint warming", ptr: *anyopaque, runtime: *runtime.BackendRuntime, turn: *const fn (*anyopaque, Cancellation) anyerror!bool };
     fn lock(self: *Owner) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
@@ -101,7 +104,7 @@ pub const Owner = struct {
         const complete = self.port.turn(self.port.ptr, .{ .ptr = self, .is_cancelled_fn = cancelled }) catch |err| {
             if (self.stopping.load(.acquire)) return null;
             self.failures +|= 1;
-            if (self.failures == 1 or self.failures % 16 == 0) std.log.warn("native checkpoint warming deferred: {}", .{err});
+            if (self.failures == 1 or self.failures % 16 == 0) std.log.warn("{s} deferred: {}", .{ self.port.name, err });
             return @min(@as(u64, 60000), @as(u64, 1000) << @intCast(@min(self.failures, 6)));
         };
         self.failures = 0;

@@ -8,12 +8,14 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.memory_error import MemoryError_
 from ...models.memory_inspection import MemoryInspection
-from ...types import Response, Unset
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     space: str,
     *,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
     x_antfly_memory_branch: str | Unset = "",
@@ -28,11 +30,20 @@ def _get_kwargs(
     if not isinstance(x_antfly_memory_branch, Unset):
         headers["X-Antfly-Memory-Branch"] = x_antfly_memory_branch
 
+    params: dict[str, Any] = {}
+
+    params["cursor"] = cursor
+
+    params["limit"] = limit
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/memory/v1/spaces/{space}".format(
             space=quote(str(space), safe=""),
         ),
+        "params": params,
     }
 
     _kwargs["headers"] = headers
@@ -113,6 +124,8 @@ def sync_detailed(
     space: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
     x_antfly_memory_branch: str | Unset = "",
@@ -120,6 +133,8 @@ def sync_detailed(
     """
     Args:
         space (str):
+        cursor (str | Unset):
+        limit (int | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
         x_antfly_memory_branch (str | Unset):  Default: ''.
@@ -134,6 +149,8 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         space=space,
+        cursor=cursor,
+        limit=limit,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
         x_antfly_memory_branch=x_antfly_memory_branch,
@@ -150,6 +167,8 @@ def sync(
     space: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
     x_antfly_memory_branch: str | Unset = "",
@@ -157,6 +176,8 @@ def sync(
     """
     Args:
         space (str):
+        cursor (str | Unset):
+        limit (int | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
         x_antfly_memory_branch (str | Unset):  Default: ''.
@@ -172,6 +193,8 @@ def sync(
     return sync_detailed(
         space=space,
         client=client,
+        cursor=cursor,
+        limit=limit,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
         x_antfly_memory_branch=x_antfly_memory_branch,
@@ -182,6 +205,8 @@ async def asyncio_detailed(
     space: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
     x_antfly_memory_branch: str | Unset = "",
@@ -189,6 +214,8 @@ async def asyncio_detailed(
     """
     Args:
         space (str):
+        cursor (str | Unset):
+        limit (int | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
         x_antfly_memory_branch (str | Unset):  Default: ''.
@@ -203,6 +230,8 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         space=space,
+        cursor=cursor,
+        limit=limit,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
         x_antfly_memory_branch=x_antfly_memory_branch,
@@ -217,6 +246,8 @@ async def asyncio(
     space: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
     x_antfly_memory_branch: str | Unset = "",
@@ -224,6 +255,8 @@ async def asyncio(
     """
     Args:
         space (str):
+        cursor (str | Unset):
+        limit (int | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
         x_antfly_memory_branch (str | Unset):  Default: ''.
@@ -240,6 +273,8 @@ async def asyncio(
         await asyncio_detailed(
             space=space,
             client=client,
+            cursor=cursor,
+            limit=limit,
             x_antfly_database=x_antfly_database,
             x_antfly_namespace=x_antfly_namespace,
             x_antfly_memory_branch=x_antfly_memory_branch,

@@ -16,7 +16,7 @@
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const records = @import("relational_index_records.zig");
-const rows = @import("relational_rows.zig");
+const rows = @import("read_session_backend").RelationalRows;
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 const schema_json =

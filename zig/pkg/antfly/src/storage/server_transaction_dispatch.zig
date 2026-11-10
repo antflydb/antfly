@@ -56,7 +56,8 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     req: db_mod.types.BatchRequest,
     raft_entry: db_mod.OrderedApplyReceipt,
 ) !void {
-    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
+    applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry) catch |err|
+        return @import("server_db_adapter.zig").normalizeOrderedApplyError(err);
 }
 
 pub fn applyReplicatedTransactionMutationInternal(
@@ -116,6 +117,7 @@ pub fn applyReplicatedTransactionMutationInternal(
         },
         .prepare => |prepare| {
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .document_version_scheme = req.document_version_scheme,
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,

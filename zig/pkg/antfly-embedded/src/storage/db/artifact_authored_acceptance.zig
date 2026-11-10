@@ -161,8 +161,7 @@ pub const Prepared = struct {
                 const source = final.get(primary) orelse continue;
                 const ttl = try keys.ttlKeyAlloc(a, parsed.doc_key);
                 const timestamp_bytes = final.get(ttl) orelse continue;
-                if (timestamp_bytes.len != 8) return error.InvalidBatchRequest;
-                const timestamp = std.mem.readInt(u64, timestamp_bytes[0..8], .little);
+                const timestamp = @import("../ttl.zig").writeVersion(timestamp_bytes) orelse return error.InvalidBatchRequest;
                 if (timestamp == 0) return error.InvalidBatchRequest;
                 try seen.put(scratch.allocator(), write.key, {});
                 const source_digest = try result.remember(a, primary, source);
@@ -703,7 +702,7 @@ test "ordered artifact inventory authored retirement cache binds owner clock epo
     }
 }
 
-test "ordered artifact inventory authored acceptance requires exact physical writer and postimages" {
+test "ordered artifact inventory authored acceptance requires exact physical writer and postimages including time series" {
     const alloc = std.testing.allocator;
     const docstore = @import("../docstore.zig");
     const owner = @import("../source_authority.zig");
@@ -740,8 +739,9 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         else
             try codec.encodeAuthoredSparseEmbeddingAlloc(alloc, &.{ 3, 8 }, &.{ 1, 2 });
         defer alloc.free(value);
-        var timestamp: [8]u8 = undefined;
-        std.mem.writeInt(u64, &timestamp, 17, .little);
+        var timestamp: [24]u8 = undefined;
+        std.mem.writeInt(u64, timestamp[0..8], 17, .little);
+        std.mem.writeInt(i128, timestamp[8..24], -1_000_000_000, .little);
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 1, .little);

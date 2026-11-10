@@ -317,11 +317,41 @@ impl SourcesClient {
     pub async fn source(&self, id: &str) -> Result<types::Source, SourceServiceError> {
         self.request(Method::GET, &["sources", id], None).await
     }
+    pub async fn preview_processing(
+        &self,
+        id: &str,
+        preset: &types::ProcessingPreset,
+    ) -> Result<types::ProcessingPreview, SourceServiceError> {
+        let body = serde_json::to_value(preset)
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid processing preset"))?;
+        self.request(
+            Method::POST,
+            &["sources", id, "processing-preview"],
+            Some(&body),
+        )
+        .await
+    }
+    pub async fn processing_job(
+        &self,
+        id: &str,
+        request: &types::ProcessingJobRequest,
+    ) -> Result<Value, SourceServiceError> {
+        let body = serde_json::to_value(request)
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid processing job"))?;
+        self.request(
+            Method::POST,
+            &["sources", id, "processing-jobs"],
+            Some(&body),
+        )
+        .await
+    }
     pub async fn put_source(
         &self,
         source: &types::Source,
     ) -> Result<types::Source, SourceServiceError> {
-        let body = serde_json::to_value(source)
+        let mut desired = source.clone();
+        desired.search_status = None;
+        let body = serde_json::to_value(desired)
             .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source"))?;
         self.request(Method::PUT, &["sources", &source.id], Some(&body))
             .await

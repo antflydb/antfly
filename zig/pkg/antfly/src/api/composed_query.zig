@@ -228,10 +228,15 @@ const Stream = struct {
         // batch per source. Fully suppressed overlay batches grow geometrically
         // to preserve bounded archive-scale traversal and amortize refill I/O.
         if (self.hidden.len != 0) {
-            const fully_hidden = for (self.hidden) |hidden| {
-                if (!hidden) break false;
-            } else true;
-            if (fully_hidden) self.page_rows = @min(batch_size, self.page_rows * 2);
+            var visible: usize = 0;
+            for (self.hidden) |hidden| if (!hidden) {
+                visible += 1;
+            };
+            // Partial suppression is common for archive/current overlays too.
+            // Estimate the physical window needed for one visible public page;
+            // a zero-density batch has no estimate and grows geometrically.
+            const next = if (visible == 0) self.page_rows * 2 else std.math.divCeil(usize, self.page_rows * self.hidden.len, visible) catch batch_size;
+            self.page_rows = @min(batch_size, @max(self.page_rows, next));
         }
         _ = self.arena.reset(.free_all);
         const pa = self.arena.allocator();
@@ -818,6 +823,7 @@ const ArchiveOverlayFixture = struct {
     checks: usize = 0,
     cancel_after: ?usize = null,
     lower_bounds: bool = false,
+    visible_every: usize = 0,
     fn checkpoint(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.checks += 1;
@@ -844,7 +850,7 @@ const ArchiveOverlayFixture = struct {
         } else if (request.object.get("filter_query")) |filter| {
             for (filter.object.get("disjuncts").?.array.items) |clause| {
                 const id = clause.object.get("conjuncts").?.array.items[0].object.get("term").?.object.get("value").?.integer;
-                if (id >= 5000) continue;
+                if (id >= 5000 or (self.visible_every != 0 and @mod(@as(usize, @intCast(id)), self.visible_every) == 0)) continue;
                 const value = try std.json.Stringify.valueAlloc(pa, .{ ._id = try std.fmt.allocPrint(pa, "c{d}", .{id}), ._source = .{ .id = id, .deleted = @mod(id, 2) == 0, .body = "new nonmatching version" } }, .{});
                 try hits.append(pa, try std.json.parseFromSliceLeaky(V, pa, value, .{}));
             }
@@ -1051,4 +1057,64 @@ test "external lake composition accepts an exact empty terminal window after unk
     try std.testing.expect(stream.done());
     try std.testing.expectEqual(@as(usize, 7), stream.position.total.?);
     try std.testing.expectEqual(@as(usize, 0), stream.hits.len);
+}
+
+test "external lake composition partial suppression bounds physical refills and preserves continuation ranks" {
+    const a = std.testing.allocator;
+    var fixture: ArchiveOverlayFixture = .{ .visible_every = 10 };
+    const body = "{\"source\":{\"overlay\":{\"base\":{\"table\":\"history\"},\"changes\":{\"table\":\"current\"},\"key\":[\"id\"]}},\"source_ranking\":\"rrf\",\"limit\":20}";
+    var first = try execute(a, body, fixture.executor());
+    defer first.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const result = (try std.json.parseFromSliceLeaky(V, pa, first.body, .{})).object.get("responses").?.array.items[0];
+    const hits = result.object.get("hits").?.object.get("hits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 20), hits.len);
+    try std.testing.expectEqual(@as(i64, 10004), hits[0].object.get("_source").?.object.get("id").?.integer);
+    for (hits[1..], 0..) |hit, i| try std.testing.expectEqual(@as(i64, @intCast(i * 10)), hit.object.get("_source").?.object.get("id").?.integer);
+    // Fixed small batches require about twenty source/probe round trips here.
+    try std.testing.expect(fixture.calls <= 8);
+    var request = try std.json.parseFromSliceLeaky(V, pa, body, .{});
+    try request.object.put(pa, "source_cursor", result.object.get("next_source_cursor").?);
+    var next = try execute(a, try std.json.Stringify.valueAlloc(pa, request, .{}), fixture.executor());
+    defer next.deinit(a);
+    const continuation = (try std.json.parseFromSliceLeaky(V, pa, next.body, .{})).object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items;
+    for (continuation, 0..) |hit, i| try std.testing.expectEqual(@as(i64, @intCast(190 + i * 10)), hit.object.get("_source").?.object.get("id").?.integer);
+}
+
+test "external lake composition probes buffered changes to reject duplicate replacements" {
+    const Fixture = struct {
+        probes: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(raw: *anyopaque, a: A, _: []const u8, body: []const u8) !Response {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probes += 1;
+            var parsed = try std.json.parseFromSlice(V, a, body, .{});
+            defer parsed.deinit();
+            const clauses = parsed.value.object.get("filter_query").?.object.get("disjuncts").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), clauses.len);
+            // One matching replacement is buffered; a second can be outside
+            // that ranked window. Only the unfiltered probe proves uniqueness.
+            return @import("contextual_operations.zig").json(try a.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"hits\":[{\"_source\":{\"id\":1}},{\"_source\":{\"id\":1}}]}}]}"), false);
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const one = try std.json.parseFromSliceLeaky(V, pa, "{\"_source\":{\"id\":1}}", .{});
+    var rows = [_]Hit{.{ .value = one, .table = "history", .id = "h1", .score = 0, .keys = &.{} }};
+    var hidden = [_]bool{false};
+    var base: Stream = .{ .position = .{ .table = "history" }, .arena = .init(a), .position_arena = .init(a), .hits = &rows, .hidden = &hidden };
+    defer base.arena.deinit();
+    defer base.position_arena.deinit();
+    var changes: Stream = .{ .position = .{ .table = "current" }, .arena = .init(a), .position_arena = .init(a), .hits = &rows };
+    defer changes.arena.deinit();
+    defer changes.position_arena.deinit();
+    var fixture: Fixture = .{};
+    const executor: Executor = .{ .ptr = &fixture, .execute = Fixture.run, .checkpoint = Fixture.checkpoint };
+    const root = try std.json.parseFromSliceLeaky(V, pa, "{}", .{});
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, maskBatch(&base, &changes, &.{"id"}, &.{}, root, a, executor));
+    try std.testing.expectEqual(@as(usize, 1), fixture.probes);
 }

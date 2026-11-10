@@ -686,6 +686,11 @@ pub const ExecutionCapabilities = struct {
     text_batch_tokens: usize = 0,
     /// Maximum sum of bucket-padded token rows in one encoder cohort.
     text_batch_padded_tokens: usize = 0,
+    /// Schema-aware boundary cohorts use their own prepared-input contract.
+    boundary_batch_rows: usize = 1,
+    boundary_batch_tokens: usize = 0,
+    boundary_batch_padded_tokens: usize = 0,
+    boundary_batch_collection_wait_us: u64 = 0,
     cooperative_steps: bool = false,
     max_active_requests: usize = 1,
     max_batch_rows: usize = 1,
@@ -693,6 +698,14 @@ pub const ExecutionCapabilities = struct {
     decode_only_batching: bool = true,
     /// Eager, immutable weight inventory; excludes KV and retained scratch.
     measured_resident_weights: ?usize = null,
+};
+
+/// A stage's bounded collection policy, applied only after row independence
+/// has been established. Stateful decoders do not inherit an encoder's policy.
+pub const ForwardBatchPolicy = struct {
+    max_items: usize = 8,
+    max_rows: usize = 64,
+    collection_wait_us: u64 = 0,
 };
 
 pub const Session = struct {
@@ -741,6 +754,7 @@ pub const Session = struct {
         /// whose static metadata cannot describe every invocation. A false
         /// result vetoes batching; null uses the pipeline opt-in plus metadata.
         independentBatchRows: ?*const fn (ptr: *anyopaque, inputs: []const Tensor) bool = null,
+        forwardBatchPolicy: ?*const fn (ptr: *anyopaque, inputs: []const Tensor) ForwardBatchPolicy = null,
         /// Allocation-free stage planning. Inputs describe logical geometry;
         /// batch is the requested physical row count (possibly fused).
         runGeometry: ?*const fn (ptr: *anyopaque, inputs: ShapeInputs, batch: usize) anyerror!?RunGeometry = null,
@@ -766,6 +780,10 @@ pub const Session = struct {
 
     pub fn executionCapabilities(self: Session) ExecutionCapabilities {
         return if (self.vtable.executionCapabilities) |query| query(self.ptr) else .{};
+    }
+
+    pub fn forwardBatchPolicy(self: Session, inputs: []const Tensor) ForwardBatchPolicy {
+        return if (self.vtable.forwardBatchPolicy) |query| query(self.ptr, inputs) else .{};
     }
 
     /// Run a forward pass with the given input tensors.

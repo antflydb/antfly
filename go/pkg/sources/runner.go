@@ -55,7 +55,10 @@ type Identity struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 type Source struct {
-	Streams []TextStream `json:"streams,omitempty"`
+	Processing    *ProcessingDeclaration `json:"processing,omitempty"`
+	SearchVersion int                    `json:"search_version,omitempty"`
+	Artifacts     []ArtifactBinding      `json:"artifacts,omitempty"`
+	Streams       []SearchStream         `json:"streams,omitempty"`
 	// Publication defaults to native acquisition. Binary rows require a revision-enforcing
 	// fetch resolver, supplied by the source service or an embedding application.
 	Publication          string          `json:"publication,omitempty"`
@@ -183,9 +186,9 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		binding := Binding{SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
 		if len(binding.Streams) == 0 && source.Publication != "media" {
-			binding.Streams = DefaultTextStreams()
+			binding.Streams = DefaultSearchStreams(source.SearchVersion)
 		}
 		binding.Publication = source.Publication
 		if binding.Publication == "" {
@@ -218,6 +221,14 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 	for i, source := range r.Profile.Sources {
 		if r.SourceID != "" && source.ID != r.SourceID {
 			continue
+		}
+		if source.Processing != nil {
+			if err := r.Publisher.EnsureTable(ctx, source.Table); err != nil {
+				return err
+			}
+			if err := ReconcileProcessing(ctx, r.Publisher, source.Table, source.Processing); err != nil {
+				return err
+			}
 		}
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
@@ -276,7 +287,10 @@ func (r *Runner) validate() error {
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
 		}
-		if err := ValidateTextStreams(s.Streams); err != nil {
+		if err := ValidateProcessing(s.Processing); err != nil {
+			return err
+		}
+		if err := ValidateSearchBindings(s.SearchVersion, s.Streams, s.Artifacts); err != nil {
 			return err
 		}
 		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" && s.Publication != "native" {
@@ -323,6 +337,9 @@ func canonicalID(id string) bool {
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
 	source.Streams = nil // Search/producer bindings do not change acquired bytes.
+	source.Artifacts = nil
+	source.SearchVersion = 0
+	source.Processing = nil
 	source.PermissionTTLSeconds = 0
 	source.Identity = Identity{} // Row keying, not acquisition; see IdentityKey.
 	identity, err := json.Marshal(struct {

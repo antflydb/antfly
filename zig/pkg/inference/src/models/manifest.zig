@@ -8908,7 +8908,7 @@ test "specialty canonical managed declarations pass extraction dispatch without 
 
         // The same synthesized declaration must survive listing and the next
         // extraction dispatch probe with config-derived specialty identity.
-        const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+        const fixtures = @import("../architectures/gliner/fixture_bytes.zig");
         try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
         try tmp.dir.deleteFile(io, "tokenizer.json");
         try tmp.dir.createDirPath(io, "encoder_config");
@@ -8944,7 +8944,7 @@ test "specialty canonical managed declarations pass extraction dispatch without 
 test "specialty listing avoids full tokenizer reads without authenticating execution" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/fixture_bytes.zig");
     inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -9050,7 +9050,7 @@ test "specialty assertion rejects config drift and never grants a profile" {
 test "specialty same-size config drift rejects managed origin and only hints for renamed raw copies" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/fixture_bytes.zig");
     inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();

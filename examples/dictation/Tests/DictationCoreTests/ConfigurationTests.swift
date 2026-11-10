@@ -16,6 +16,7 @@ import Testing
 }
 @Test func importedSettingsRejectCredentialsAndInvalidVersions() throws {
   var config = Configuration()
+  config.connectionMode = .external
   config.server = "https://user:password@example.com"
   #expect(throws: DictationError.self) { try config.validated() }
   config = Configuration()
@@ -102,6 +103,7 @@ import Testing
 @Test func serverOriginValidationAcceptsLocalhostAndTrimsPastedWhitespace() throws {
   for address in ["http://localhost:8080", "http://127.0.0.1:8080", "https://example.com/"] {
     var config = Configuration()
+    config.connectionMode = .external
     config.server = " \n" + address + "\t "
     #expect(try config.validated().server == address)
   }
@@ -111,6 +113,7 @@ import Testing
     ("http://localhost:8080/api", "without a path"),
   ] {
     var config = Configuration()
+    config.connectionMode = .external
     config.server = address
     do {
       _ = try config.validated()

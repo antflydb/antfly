@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 import requests
 from conftest import DEFAULT_ANTFLY_BIN, StatefulAntflyServer, resolve_binary_path
+from e2e_scheduler import e2e_resource
 from helpers import wait_until
 from port_reservations import find_free_port
 from test_secrets import TableObjectStorage
@@ -37,6 +38,7 @@ QUERY = {"full_text_search": {"query": "text:Lovelace"}, "limit": 2, "fields": [
 
 
 @pytest.fixture(scope="module")
+@e2e_resource("antfly_process")
 def distributed_api_url():
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists() or Path(binary).name != "antfly":

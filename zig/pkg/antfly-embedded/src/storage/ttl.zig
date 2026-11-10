@@ -16,7 +16,7 @@
 //! Document-level TTL with query-time filtering and background cleanup.
 //!
 //! Matches Go antfly's TTL system:
-//!   - Timestamp stored as a structured internal TTL key (8-byte u64 LE, unix nanoseconds)
+//!   - Timestamp metadata stores a u64 write version plus an optional signed i128 TTL source
 //!   - Query-time filtering: isExpired() for immediate skip
 //!   - Background cleanup: cleanupExpired() with grace period for replication safety
 //!
@@ -45,6 +45,109 @@ pub const TtlConfig = struct {
 // Timestamp read/write
 // ============================================================================
 
+/// Legacy records contain an unsigned write version. Extended records preserve
+/// that version in the first eight bytes and append the signed TTL source instant.
+/// Keeping the two separate avoids turning historical event time into version zero.
+pub const TimestampMetadata = struct { version: u64, source: i128 };
+pub const document_version_watermark_key = "\x00\x00__metadata__:document_version_watermark_v1";
+
+/// Called under the primary apply fence. One sorted metadata read seeds a
+/// durable batch revision from both the allocator and legacy rows being changed.
+/// Deletions advance the watermark too, preventing delete/reinsert ABA.
+pub fn nextDocumentVersion(store: anytype, a: Allocator, wall: u64, writes: anytype, deletes: []const []const u8) !?u64 {
+    var keys = std.ArrayList([]const u8).empty;
+    defer {
+        for (keys.items) |key| if (!std.mem.eql(u8, key, document_version_watermark_key)) a.free(key);
+        keys.deinit(a);
+    }
+    try keys.append(a, document_version_watermark_key);
+    for (writes) |write| if (!internal_keys.isInternalUserKey(write.key) and !std.mem.startsWith(u8, write.key, "\x00\x00__metadata__:") and !std.mem.startsWith(u8, write.key, "splitstate:") and !std.mem.startsWith(u8, write.key, "splitdelta:")) {
+        const key = try internal_keys.ttlKeyAlloc(a, write.key);
+        errdefer a.free(key);
+        try keys.append(a, key);
+    };
+    for (deletes) |id| if (!internal_keys.isInternalUserKey(id) and !std.mem.startsWith(u8, id, "\x00\x00__metadata__:") and !std.mem.startsWith(u8, id, "splitstate:") and !std.mem.startsWith(u8, id, "splitdelta:")) {
+        const key = try internal_keys.ttlKeyAlloc(a, id);
+        errdefer a.free(key);
+        try keys.append(a, key);
+    };
+    if (keys.items.len == 1) return null;
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn less(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.less);
+    var unique = std.ArrayList([]const u8).empty;
+    defer unique.deinit(a);
+    for (keys.items) |key| if (unique.items.len == 0 or !std.mem.eql(u8, unique.items[unique.items.len - 1], key)) try unique.append(a, key);
+    const values = try a.alloc(?[]const u8, unique.items.len);
+    defer a.free(values);
+    var txn = if (comptime @TypeOf(store) == *DocStore) try store.beginProbeTxn() else blk: {
+        var backend = store;
+        break :blk try backend.beginProbe();
+    };
+    defer txn.abort();
+    try txn.getManySorted(unique.items, values);
+    var previous: u64 = 0;
+    for (unique.items, values) |key, value| if (value) |bytes| {
+        const version = if (std.mem.eql(u8, key, document_version_watermark_key)) blk: {
+            if (bytes.len != 8) return error.InvalidTimestamp;
+            break :blk std.mem.readInt(u64, bytes[0..8], .little);
+        } else writeVersion(bytes) orelse return error.InvalidTimestamp;
+        previous = @max(previous, version);
+    };
+    return @max(wall, std.math.add(u64, previous, 1) catch return error.InvalidTimestamp);
+}
+
+/// The only decoder for primary timestamp sidecars. Version fences must use
+/// `version`; expiration must use `source`, including epoch and negative instants.
+pub fn decodeTimestamp(value: []const u8) ?TimestampMetadata {
+    if (value.len != 8 and value.len != 24) return null;
+    const version = std.mem.readInt(u64, value[0..8], .little);
+    return .{ .version = version, .source = if (value.len == 24) std.mem.readInt(i128, value[8..24], .little) else @as(i128, version) };
+}
+
+pub fn writeVersion(value: []const u8) ?u64 {
+    return (decodeTimestamp(value) orelse return null).version;
+}
+
+pub fn sourceTimestamp(value: []const u8) ?i128 {
+    return (decodeTimestamp(value) orelse return null).source;
+}
+
+pub fn encodeTimestampAlloc(alloc: Allocator, version: u64, source: i128) ![]u8 {
+    const extended = source != @as(i128, version);
+    const bytes = try alloc.alloc(u8, if (extended) 24 else 8);
+    std.mem.writeInt(u64, bytes[0..8], version, .little);
+    if (extended) std.mem.writeInt(i128, bytes[8..24], source, .little);
+    return bytes;
+}
+
+pub fn readSourceTimestamp(store: *DocStore, alloc: Allocator, key: []const u8) !?i128 {
+    const ts_key = try internal_keys.ttlKeyAlloc(alloc, key);
+    defer alloc.free(ts_key);
+    const val = store.get(alloc, ts_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(val);
+    return sourceTimestamp(val);
+}
+
+/// The shared admission and persistence parser retains the full signed instant.
+pub fn parseSourceTimestamp(value: std.json.Value) !i128 {
+    return switch (value) {
+        .integer => |v| v,
+        .number_string => |text| std.fmt.parseInt(i128, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidTimestamp,
+        .string => |text| blk: {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (std.fmt.parseInt(i128, trimmed, 10)) |v| break :blk v else |_| {}
+            break :blk @import("../datetime.zig").parseRfc3339ToSignedNs(trimmed) orelse return error.InvalidTimestamp;
+        },
+        else => error.InvalidTimestamp,
+    };
+}
+
 /// Write a timestamp for a document key using the structured internal TTL key.
 pub fn writeTimestamp(store: *DocStore, key: []const u8, timestamp_ns: u64) !void {
     const ts_key = try internal_keys.ttlKeyAlloc(store.alloc, key);
@@ -63,8 +166,7 @@ pub fn readTimestamp(store: *DocStore, alloc: Allocator, key: []const u8) !?u64 
         else => return err,
     };
     defer alloc.free(val);
-    if (val.len < 8) return null;
-    return std.mem.readInt(u64, val[0..8], .little);
+    return writeVersion(val);
 }
 
 // ============================================================================
@@ -72,19 +174,19 @@ pub fn readTimestamp(store: *DocStore, alloc: Allocator, key: []const u8) !?u64 
 // ============================================================================
 
 /// Check if a document is expired (for query-time filtering, no grace period).
-pub fn isExpired(timestamp_ns: u64, duration_ns: u64, now_ns: u64) bool {
+pub fn isExpired(timestamp_ns: i128, duration_ns: u64, now_ns: u64) bool {
     return now_ns > timestamp_ns +| duration_ns;
 }
 
 /// Check if a document is expired with grace period (for background cleanup).
-pub fn isExpiredWithGrace(timestamp_ns: u64, duration_ns: u64, grace_ns: u64, now_ns: u64) bool {
+pub fn isExpiredWithGrace(timestamp_ns: i128, duration_ns: u64, grace_ns: u64, now_ns: u64) bool {
     return now_ns > (timestamp_ns +| duration_ns) +| grace_ns;
 }
 
 /// Convenience: check if a document key is expired by reading its timestamp.
 /// Returns true if expired, false if not expired or no timestamp exists.
 pub fn isDocExpired(store: *DocStore, alloc: Allocator, key: []const u8, config: TtlConfig, now_ns: u64) !bool {
-    const ts = (try readTimestamp(store, alloc, key)) orelse return false;
+    const ts = (try readSourceTimestamp(store, alloc, key)) orelse return false;
     return isExpired(ts, config.duration_ns, now_ns);
 }
 
@@ -120,9 +222,7 @@ pub fn cleanupExpired(
         fn cb(key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
             const self = active.?;
             if (!internal_keys.isTtlKey(key)) return .@"continue";
-            if (value.len < 8) return .@"continue";
-
-            const ts = std.mem.readInt(u64, value[0..8], .little);
+            const ts = sourceTimestamp(value) orelse return .@"continue";
             if (isExpiredWithGrace(ts, self.the_config.duration_ns, self.the_config.grace_period_ns, self.the_now_ns)) {
                 const base_key = (try internal_keys.decodeDocumentComponentAlloc(self.the_alloc, key)) orelse return .@"continue";
                 errdefer self.the_alloc.free(base_key);
@@ -327,4 +427,26 @@ test "grace period prevents premature cleanup" {
     const doc = try store.get(alloc, doc1_key);
     defer alloc.free(doc);
     try std.testing.expectEqualStrings("content", doc);
+}
+
+test "time series TTL signed source records retain versions and legacy compatibility" {
+    const a = std.testing.allocator;
+    const legacy = try encodeTimestampAlloc(a, 123, 123);
+    defer a.free(legacy);
+    try std.testing.expectEqual(@as(usize, 8), legacy.len);
+    try std.testing.expectEqual(@as(?i128, 123), sourceTimestamp(legacy));
+    const historical = try encodeTimestampAlloc(a, 456, -1_000_000_000);
+    defer a.free(historical);
+    try std.testing.expectEqual(@as(usize, 24), historical.len);
+    try std.testing.expectEqual(@as(u64, 456), std.mem.readInt(u64, historical[0..8], .little));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), sourceTimestamp(historical));
+    try std.testing.expectEqual(@as(?u64, 456), writeVersion(historical));
+    for ([_]usize{ 0, 7, 9, 16, 23 }) |length| try std.testing.expect(decodeTimestamp(historical[0..length]) == null);
+    try std.testing.expect(!isExpired(-1_000_000_000, 2_000_000_000, 1_000_000_000));
+    try std.testing.expect(isExpired(-1_000_000_000, 2_000_000_000, 1_000_000_001));
+    try std.testing.expect(!isExpiredWithGrace(-1_000_000_000, 2_000_000_000, 5, 1_000_000_005));
+    try std.testing.expect(isExpiredWithGrace(-1_000_000_000, 2_000_000_000, 5, 1_000_000_006));
+    try std.testing.expect(!isExpired(std.math.maxInt(i128), std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expect(isExpired(std.math.minInt(i128), std.math.maxInt(u64), 0));
+    try std.testing.expectEqual(@as(?i128, null), sourceTimestamp(historical[0..16]));
 }
