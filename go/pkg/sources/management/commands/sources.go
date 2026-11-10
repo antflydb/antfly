@@ -90,38 +90,48 @@ func ListSources(ctx context.Context, env Env, opts ListOptions) (management.Sou
 
 // listSources fetches without printing, so reference resolution stays silent.
 func listSources(ctx context.Context, api API, opts ListOptions) (management.SourcePage, error) {
+	data, cursor, err := listPages(ctx, opts, "source", func(ctx context.Context, limit int, cursor string) ([]management.Source, string, error) {
+		page, err := api.ListSources(ctx, limit, cursor)
+		return page.Data, page.NextCursor, err
+	})
+	return management.SourcePage{Data: data, NextCursor: cursor}, err
+}
+
+// listPages normalizes empty pages and bounds traversal, including empty pages
+// that carry a next cursor.
+func listPages[T any](ctx context.Context, opts ListOptions, resource string, fetch func(context.Context, int, string) ([]T, string, error)) ([]T, string, error) {
 	if opts.Limit == 0 {
 		opts.Limit = 20
 	}
 	if opts.Limit < 1 || opts.Limit > 100 {
-		return management.SourcePage{}, &Error{Code: CodeInvalid, Message: "source limit must be between 1 and 100"}
+		return nil, "", &Error{Code: CodeInvalid, Message: resource + " limit must be between 1 and 100"}
 	}
 	if !opts.All {
-		page, err := api.ListSources(ctx, opts.Limit, opts.Cursor)
-		if page.Data == nil {
-			page.Data = []management.Source{}
+		data, cursor, err := fetch(ctx, opts.Limit, opts.Cursor)
+		if data == nil {
+			data = []T{}
 		}
-		return page, err
+		return data, cursor, err
 	}
-	all := management.SourcePage{Data: []management.Source{}}
+	all := []T{}
 	seen := map[string]bool{opts.Cursor: true}
 	cursor := opts.Cursor
 	for range 1000 {
-		page, err := api.ListSources(ctx, opts.Limit, cursor)
+		data, next, err := fetch(ctx, opts.Limit, cursor)
 		if err != nil {
-			return management.SourcePage{}, err
+			return nil, "", err
 		}
-		all.Data = append(all.Data, page.Data...)
-		if page.NextCursor == "" {
-			return all, nil
+		all = append(all, data...)
+		if next == "" {
+			return all, "", nil
 		}
-		if seen[page.NextCursor] {
-			return management.SourcePage{}, &Error{Code: CodeFailed, Message: "source-management returned a repeated cursor"}
+		if seen[next] {
+			return nil, "", &Error{Code: CodeFailed, Message: "source-management returned a repeated cursor"}
 		}
-		seen[page.NextCursor] = true
-		cursor = page.NextCursor
+		seen[next] = true
+		cursor = next
 	}
-	return management.SourcePage{}, &Error{Code: CodeFailed, Message: "source-management exceeded the 1000-page limit"}
+	return nil, "", &Error{Code: CodeFailed, Message: "source-management exceeded the 1000-page limit"}
 }
 
 // ResolveSource resolves an ID first, then an exact, unambiguous source name.

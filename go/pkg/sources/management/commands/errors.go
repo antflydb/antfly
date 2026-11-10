@@ -63,8 +63,8 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.err }
 
 // ExitCode maps invalid input to 2, auth failures to 3, missing resources to 4,
-// conflicts to 5, unsupported features to 6, timeouts to 7, and failed runs to 8.
-// Other failures exit with 1.
+// conflicts to 5, unsupported features to 6, timeouts to 7, failed runs to 8,
+// and watch interruption to 130. Other failures exit with 1.
 func (e *Error) ExitCode() int {
 	switch e.Code {
 	case CodeInvalid:
@@ -81,6 +81,8 @@ func (e *Error) ExitCode() int {
 		return 7
 	case CodeRunFailed:
 		return 8
+	case CodeInterrupted:
+		return 130
 	default:
 		return 1
 	}
