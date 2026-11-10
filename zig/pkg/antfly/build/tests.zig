@@ -7859,9 +7859,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
-    // The C API crash sweep runs through capi-contract-test, whose module graph
-    // carries the capi wiring the storage test roots do not.
-    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "local_query_abi.zig" }) |source| {
+    // The C API crash sweep and the write-amplification benchmarks run
+    // through capi-contract-test, whose module graph carries the capi
+    // wiring the storage test roots do not (both benchmarks open their DB
+    // through the real capi.openLiteHandleWithRuntime seam, same reason as
+    // the crash sweep).
+    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "lite/write_amplification_bench_test.zig", "lite/write_amplification_cpu_bench_test.zig", "local_query_abi.zig" }) |source| {
         unit_storage_shard_audit.addArg("--local-dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }

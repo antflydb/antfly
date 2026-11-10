@@ -1214,8 +1214,8 @@ test "relational integrity accepted generation survives restart and bounded two-
         var successor = old;
         successor.constraint_generation = @splat(5);
         try std.testing.expect(!(try retirement.isRetired(&read, successor)));
-        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
-        try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}, null));
+        try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}, null));
         // The public parent-action cursor must not revive retired references.
         // With a one-record physical page, the first page is empty but still
         // advances; the live successor appears on the next page.
@@ -1273,7 +1273,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         try std.testing.expectEqualDeep(@import("retirement_set_summary.zig").emptySummary(), try retirement.authenticatedSummary(&read));
         _ = try integrity.Reference.decode(&live_key, try read.get(&live_key));
         try std.testing.expect(try retirement.isRetired(&read, old));
-        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}, null));
         read.deinit();
         read_open = false;
         // A coherent native seed carries both the durable retired-generation
@@ -1300,7 +1300,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         const seeded_scope = (try @import("relational_integrity_generation_admission.zig").load(&seeded_read, old.child_table, old.constraint_name)).?;
         try std.testing.expectEqual(@as(integrity.Generation, @splat(5)), seeded_scope.active_generation.?);
         try retirement.requireActivationAcknowledged(&seeded_read);
-        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &seeded_read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &seeded_read, &.{.{ .address = address, .operation = .{ .attach = old } }}, null));
     }
 }
 
