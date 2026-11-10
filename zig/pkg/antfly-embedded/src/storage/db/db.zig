@@ -33116,40 +33116,23 @@ pub const DB = struct {
         var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
         var initialized: usize = 0;
         errdefer {
-            for (resolvers[0..initialized]) |resolver| {
-                alloc.free(resolver.name);
-                alloc.free(resolver.table);
-                alloc.free(resolver.source_artifact);
-                alloc.free(resolver.resolution_artifact);
-                alloc.free(resolver.candidate_key_prefix);
-            }
+            for (resolvers[0..initialized]) |resolver| resolver.deinit(alloc);
             if (resolvers.len > 0) alloc.free(resolvers);
         }
-
         for (catalog) |cfg| {
-            const name = try alloc.dupe(u8, cfg.name);
-            errdefer alloc.free(name);
-            const table = try alloc.dupe(u8, cfg.table);
-            errdefer alloc.free(table);
-            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
-            errdefer alloc.free(source_artifact);
-            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
-            errdefer alloc.free(resolution_artifact);
-            const candidate_key_prefix = try alloc.dupe(u8, cfg.candidate_key_prefix);
-            errdefer alloc.free(candidate_key_prefix);
-            resolvers[initialized] = .{
-                .candidate_key_prefix = candidate_key_prefix,
-                .name = name,
+            resolvers[initialized] = try (types.ResolverReplayDiagnostic{
+                .candidate_key_prefix = cfg.candidate_key_prefix,
+                .name = cfg.name,
                 .config_generation = cfg.config_generation,
                 .effective_generation = cfg.effectiveGeneration(),
                 .curation_revision = cfg.curation_revision,
                 .namespace_curation_generation = cfg.namespace_curation_generation,
                 .namespace_curation_table_id = cfg.namespace_curation_table_id,
                 .namespace_curation_missing = cfg.namespace_curation_missing,
-                .table = table,
-                .source_artifact = source_artifact,
-                .resolution_artifact = resolution_artifact,
-            };
+                .table = cfg.table,
+                .source_artifact = cfg.source_artifact,
+                .resolution_artifact = cfg.resolution_artifact,
+            }).clone(alloc);
             initialized += 1;
         }
 
