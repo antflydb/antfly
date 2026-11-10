@@ -28,7 +28,14 @@ const Header = struct { state: objects.immutable_log.State, root_cursor: ?object
 const Row = struct { key: []const u8, value: []const u8 };
 pub const Read = struct { results: []const []const Row };
 const RetirementFloor = struct { through_ns: []const u8 };
-const Coverage = struct { segment: t.Id, start_ns: []const u8, end_ns: []const u8 };
+const Coverage = struct {
+    segment: t.Id,
+    start_ns: []const u8,
+    end_ns: []const u8,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try t.writeFields(self, .{}, writer);
+    }
+};
 pub const RangePlan = struct {
     arena: std.heap.ArenaAllocator,
     segments: []const t.Segment,
@@ -55,6 +62,9 @@ pub const Dependency = struct {
     id: t.Id,
     consumer: t.Id,
     consumer_generation: u64,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try t.writeFields(self, .{}, writer);
+    }
 };
 
 pub const Pin = struct {
@@ -63,6 +73,9 @@ pub const Pin = struct {
     location: t.Id,
     placement_revision: u64,
     expires_ns: u64,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try t.writeFields(self, .{}, writer);
+    }
 };
 
 pub const Clock = struct {

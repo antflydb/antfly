@@ -35,7 +35,7 @@ pub const Summary = struct {
     measures: []const Measure,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try writeDecimalFields(self, .{ "interval_ns", "mutable_for_ns" }, writer);
+        try writeFields(self, .{ "interval_ns", "mutable_for_ns" }, writer);
     }
     pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
         return fromWire(@This(), try std.json.innerParse(SummaryWire, a, source, options));
@@ -60,7 +60,7 @@ pub const Definition = struct {
     summary: ?Summary = null,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try writeDecimalFields(self, .{ "retention_ns", "local_residence_ns" }, writer);
+        try writeFields(self, .{ "retention_ns", "local_residence_ns" }, writer);
     }
     pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
         return fromWire(@This(), try std.json.innerParse(DefinitionWire, a, source, options));
@@ -117,7 +117,7 @@ pub const SourcePosition = struct {
     incarnation: u64,
     sequence: u64,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try writeDecimalFields(self, .{"sequence"}, writer);
+        try writeFields(self, .{"sequence"}, writer);
     }
     pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
         return fromWire(@This(), try std.json.innerParse(SourcePositionWire, a, source, options));
@@ -155,6 +155,10 @@ pub const Segment = struct {
     archive_collected: bool = false,
     local_retiring: bool = false,
     retiring: bool = false,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writeFields(self, .{}, writer);
+    }
 
     pub fn expired(self: Segment, definition: Definition, now_ns: u64) !bool {
         if (now_ns == 0) return error.DatasetLeaseExpired;
@@ -255,7 +259,7 @@ fn fromWire(comptime T: type, value: anytype) T {
     }
     return result;
 }
-fn writeDecimalFields(value: anytype, comptime names: anytype, writer: anytype) !void {
+pub fn writeFields(value: anytype, comptime names: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
         try writer.objectField(field);
@@ -268,7 +272,20 @@ fn writeDecimalFields(value: anytype, comptime names: anytype, writer: anytype) 
         if (decimal) {
             var buffer: [32]u8 = undefined;
             try writer.write(std.fmt.bufPrint(&buffer, "{d}", .{@field(value, field)}) catch unreachable);
-        } else try writer.write(@field(value, field));
+        } else {
+            const current = @field(value, field);
+            if (@TypeOf(current) == Id) {
+                try writeId(current, writer);
+            } else if (@TypeOf(current) == ?Id) {
+                if (current) |id| try writeId(id, writer) else try writer.write(null);
+            } else try writer.write(current);
+        }
     }
     try writer.endObject();
+}
+
+fn writeId(id: Id, writer: anytype) !void {
+    try writer.beginArray();
+    for (id) |byte| try writer.write(byte);
+    try writer.endArray();
 }

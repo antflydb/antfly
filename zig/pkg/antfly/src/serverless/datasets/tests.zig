@@ -454,3 +454,92 @@ test "retained dataset compaction bounds tombstones without resurrecting history
     fresh.coverage = .{ .start_ns = "120", .end_ns = "180" };
     try store.publish(fresh, hot, "states");
 }
+
+test "retained dataset colocated logical locations retain independent copies" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    var cold = location(&memory, true);
+    cold.bucket = hot.bucket;
+    cold.prefix = hot.prefix;
+    cold.storage_identity = hot.storage_identity;
+    try store.create(definition(.records));
+    try store.publish(segment(), hot, "states");
+    try store.migrate(segment().id, 1, hot, cold);
+    try std.testing.expect(!try store.reclaimLocal(segment().id, hot));
+    try std.testing.expect(try store.reclaimLocal(segment().id, hot));
+    const lease = try store.acquire(segment().id);
+    defer store.release(lease) catch unreachable;
+    const bytes = try store.read(lease, cold);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("states", bytes);
+}
+
+test "retained dataset cancelled copy cannot publish or authorize eviction" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    var store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    try store.create(definition(.records));
+    try store.publish(segment(), hot, "states");
+    var signal = std.atomic.Value(bool).init(false);
+    store.context.cancellation = objects.CancellationToken.fromAtomic(&signal);
+    const Callback = struct {
+        fn cancel(raw: *anyopaque) void {
+            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            flag.store(true, .release);
+        }
+    };
+    var fault = objects.scripted_fault.Client.init(a, memory.client());
+    defer fault.deinit();
+    fault.next_put = .{ .commit_then_callback = .{ .ptr = &signal, .run = Callback.cancel } };
+    var cold = location(&memory, true);
+    cold.client = fault.client();
+    try std.testing.expectError(error.Canceled, store.migrate(segment().id, 1, hot, cold));
+    signal.store(false, .release);
+    const current = try store.getSegment(segment().id);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 1), current.value.placement_revision);
+    try std.testing.expect(current.value.previous_local == null);
+    try store.migrate(segment().id, 1, hot, cold);
+}
+
+test "retained dataset reader admission is bounded and reclaims expired pins" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    try store.create(definition(.records));
+    try store.publish(segment(), location(&memory, false), "states");
+    for (0..64) |_| _ = try store.acquire(segment().id);
+    try std.testing.expectError(error.DatasetReaderBudgetExceeded, store.acquire(segment().id));
+    clock.now += api.catalog.pin_duration_ns + api.catalog.pin_grace_ns + 1;
+    clock.authority = clock.now;
+    const lease = try store.acquire(segment().id);
+    try store.release(lease);
+}
+
+test "retained dataset identities always use byte arrays on the JSON wire" {
+    const values = [_]t.Id{ @splat(7), @splat('a'), @splat(255) };
+    for (values) |id| {
+        var value = segment();
+        value.location = id;
+        value.archive = id;
+        const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+        defer a.free(encoded);
+        const dom = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+        defer dom.deinit();
+        for ([_][]const u8{ "id", "dataset", "schema", "checksum", "location", "archive" }) |field| {
+            try std.testing.expectEqual(std.json.Value.array, std.meta.activeTag(dom.value.object.get(field).?));
+        }
+        const restored = try std.json.parseFromSlice(t.Segment, a, encoded, .{});
+        defer restored.deinit();
+        try std.testing.expectEqual(id, restored.value.location);
+    }
+}
