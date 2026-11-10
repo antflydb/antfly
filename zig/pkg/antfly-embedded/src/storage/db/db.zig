@@ -92564,7 +92564,8 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
     var chunks = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
     defer chunks.deinit(a);
     var sink: usize = 0;
-    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .expected_dims = 2, .consumer_indexes = &.{@constCast("idx")} };
+    var consumers = [_][]u8{@constCast("idx")};
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .expected_dims = 2, .consumer_indexes = &consumers };
     const no_deletes = std.StringHashMapUnmanaged(void).empty;
     const body = "{\"body\":\"alpha\"}";
     try computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
