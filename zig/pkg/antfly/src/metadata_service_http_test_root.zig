@@ -59,3 +59,7 @@ test "selected owner readiness transition index discovery" {
 test "catalog projection cancellation and publication discovery" {
     _ = @import("metadata/catalog_projection_reader.zig");
 }
+
+test "retained owner controls discovery" {
+    _ = @import("system_catalog/server_call.zig");
+}

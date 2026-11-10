@@ -517,6 +517,41 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try context.ensureActive();
             break :blk bytes;
         },
+        .retained_owner_register => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try request.validate();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.retained_datasets_version);
+            svc.lockCatalogMutation();
+            defer svc.unlockCatalogMutation();
+            try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const before_bytes = try store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } });
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, before_bytes, .{});
+            defer before.deinit();
+            const plan = before.value orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &plan.id, &request.plan) or plan.revision != request.revision or plan.phase != .activating or plan.registration_complete) return error.RetainedOwnerPlanChanged;
+            const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .register_retained_owners = request });
+            svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+            const bytes = store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } }) catch return error.MetadataMutationOutcomeUnknown;
+            errdefer alloc.free(bytes);
+            var observed = std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+            defer observed.deinit();
+            const after = observed.value orelse return error.MetadataMutationOutcomeUnknown;
+            if (!std.mem.eql(u8, &after.id, &request.plan) or after.revision <= request.revision or after.registered <= plan.registered or after.phase != .activating) return error.MetadataMutationOutcomeUnknown;
+            try context.ensureActive();
+            break :blk bytes;
+        },
+        .retained_owner_read => |request| blk: {
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const bytes = try store.retainedOwnerReadJson(alloc, svc.metadata_group_id, request);
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
         .retained_dataset_work => |request| blk: {
             try context.ensureActive();
             try svc.ensureLinearizableReadWithContext(context);

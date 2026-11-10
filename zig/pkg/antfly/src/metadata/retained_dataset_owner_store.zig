@@ -19,7 +19,7 @@
 const std = @import("std");
 const model = @import("retained_dataset_owners.zig");
 const A = std.mem.Allocator;
-pub const Cursor = struct { resource: u64 = 0, generation: u64 = 0, owner_group: u64 = 0 };
+pub const Cursor = model.Cursor;
 pub const WorkKey = struct { cursor: Cursor, plan: model.Id };
 pub const root_limit = 16 * 1024;
 pub const owner_limit = 4096;

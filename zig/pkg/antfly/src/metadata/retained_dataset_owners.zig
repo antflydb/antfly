@@ -34,6 +34,25 @@ pub const Registration = struct {
             return error.InvalidRetainedOwnerPlan;
     }
 };
+/// Private reads use distinct tags so older peers reject unknown authority.
+pub const Cursor = struct { resource: u64 = 0, generation: u64 = 0, owner_group: u64 = 0 };
+pub const Read = union(enum) {
+    work: Cursor,
+    plan: struct { resource: u64, generation: u64 },
+    owner: struct { resource: u64, generation: u64, plan: Id, group: u64, revision: u64 },
+
+    pub fn validate(self: Read) !void {
+        switch (self) {
+            .work => |c| {
+                if ((c.resource == 0 or c.generation == 0 or c.owner_group == 0) and
+                    (c.resource != 0 or c.generation != 0 or c.owner_group != 0)) return error.InvalidRetainedOwnerPlan;
+            },
+            .plan => |q| if (q.resource == 0 or q.generation == 0 or q.generation > types.max_public_counter) return error.InvalidRetainedOwnerPlan,
+            .owner => |q| if (q.resource == 0 or q.generation == 0 or q.generation > types.max_public_counter or
+                types.zero(q.plan) or q.group == 0 or q.revision == 0 or q.revision > types.max_public_counter) return error.InvalidRetainedOwnerPlan,
+        }
+    }
+};
 pub const Phase = enum { activating, active, closing, closed, retiring, retired };
 pub const Mode = enum { registered, installed, ready, closed, revoked };
 pub const Cut = struct {
@@ -344,4 +363,11 @@ test "retained owner plan identity rejects source or topology rebinding" {
     changed = original;
     changed.definition = @splat(9);
     try std.testing.expectError(error.InvalidRetainedOwnerPlan, changed.validate());
+}
+
+test "retained owner reads reject ambiguous cursors and unbound exact requests" {
+    try (Read{ .work = .{} }).validate();
+    try std.testing.expectError(error.InvalidRetainedOwnerPlan, (Read{ .work = .{ .resource = 1 } }).validate());
+    try std.testing.expectError(error.InvalidRetainedOwnerPlan, (Read{ .plan = .{ .resource = 1, .generation = 0 } }).validate());
+    try std.testing.expectError(error.InvalidRetainedOwnerPlan, (Read{ .owner = .{ .resource = 1, .generation = 1, .plan = @splat(0), .group = 1, .revision = 1 } }).validate());
 }

@@ -12756,6 +12756,38 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, stamp, .{});
     }
 
+    /// One journal snapshot per read: never combine a queue key from one cut
+    /// with a replacement plan or a later owner revision.
+    pub fn retainedOwnerReadJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: retained_owner_model.Read) ![]u8 {
+        try request.validate();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (request == .plan) {
+            const q = request.plan;
+            return std.json.Stringify.valueAlloc(alloc, try retained_owner_journal.getPlan(a, &txn, group, q.resource, q.generation), .{});
+        }
+        const key: retained_owner_journal.WorkKey = if (request == .work)
+            (try retained_owner_journal.nextWork(&txn, group, request.work)) orelse return alloc.dupe(u8, "null")
+        else
+            .{ .cursor = .{ .resource = request.owner.resource, .generation = request.owner.generation, .owner_group = request.owner.group }, .plan = request.owner.plan };
+        const plan = (try retained_owner_journal.getPlan(a, &txn, group, key.cursor.resource, key.cursor.generation)) orelse return error.InvalidRetainedOwnerPlan;
+        if (!std.mem.eql(u8, &plan.id, &key.plan)) return error.RetainedOwnerPlanChanged;
+        var owner = (try retained_owner_journal.getOwner(a, &txn, group, plan.id, key.cursor.owner_group)) orelse return error.InvalidRetainedOwnerPlan;
+        defer owner.deinit();
+        if (request == .owner and owner.value.revision != request.owner.revision) return error.RetainedOwnerPlanChanged;
+        if (request == .work and owner.value.mode == .revoked) return error.InvalidRetainedOwnerPlan;
+        var resource = (try system_catalog_storage.getById(a, &txn, group, .dataset, plan.resource)) orelse return error.InvalidRetainedOwnerPlan;
+        defer resource.deinit();
+        var descriptor = try system_catalog.retained_datasets.parse(a, resource.value.source_json);
+        defer descriptor.deinit();
+        if (descriptor.value.definition.generation != plan.generation or
+            !std.mem.eql(u8, &try descriptor.value.definition.fingerprint(a), &plan.definition)) return error.RetainedOwnerPlanChanged;
+        return std.json.Stringify.valueAlloc(alloc, .{ .cursor = key.cursor, .plan = plan, .owner = owner.value, .resource = resource.value }, .{});
+    }
+
     pub fn retainedDatasetWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64, native: bool) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group);
         defer txn.abort();
@@ -45608,6 +45640,30 @@ test "system catalog retained activation journals source ownership atomically an
         var partition: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
         try std.testing.expectEqualDeep(partition, owner.value.partition);
+    }
+    // Transport projections preserve the same plan/owner/resource cut and
+    // reject delayed owner requests rather than serving a replacement row.
+    {
+        const bytes = try store.retainedOwnerReadJson(a, group, .{ .work = .{} });
+        defer a.free(bytes);
+        var value = try std.json.parseFromSlice(struct { cursor: retained_owner_model.Cursor, plan: retained_owner_model.Plan, owner: retained_owner_model.Owner, resource: system_catalog.Resource }, a, bytes, .{});
+        defer value.deinit();
+        try std.testing.expectEqual(@as(u64, 2), value.value.cursor.owner_group);
+        try std.testing.expectEqualDeep(original, value.value.plan);
+        try std.testing.expectEqual(original.resource, value.value.resource.id);
+        const exact: retained_owner_model.Read = .{ .owner = .{ .resource = original.resource, .generation = 1, .plan = original.id, .group = 2, .revision = 1 } };
+        const exact_bytes = try store.retainedOwnerReadJson(a, group, exact);
+        defer a.free(exact_bytes);
+        try std.testing.expectEqualStrings(bytes, exact_bytes);
+        var stale = exact;
+        stale.owner.revision = 2;
+        try std.testing.expectError(error.RetainedOwnerPlanChanged, store.retainedOwnerReadJson(a, group, stale));
+        stale = exact;
+        stale.owner.plan = @splat(9);
+        try std.testing.expectError(error.RetainedOwnerPlanChanged, store.retainedOwnerReadJson(a, group, stale));
+        const wrapped = try store.retainedOwnerReadJson(a, group, .{ .work = .{ .resource = original.resource, .generation = 1, .owner_group = 71 } });
+        defer a.free(wrapped);
+        try std.testing.expectEqualStrings(bytes, wrapped);
     }
     // Even an internally forwarded descriptor cannot promote an owner which
     // has never acknowledged installation, or detach by inventing a receipt.

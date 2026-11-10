@@ -126,12 +126,15 @@ pub const Call = union(enum) {
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
     lake_source_owner_read: u64,
-    /// Bounded private supervisor selection, protected by a body-bound read grant.
+    /// Bounded metadata-derived registration, protected by an administrative grant.
+    retained_owner_register: @import("../metadata/retained_dataset_owners.zig").Registration,
+    /// Point reads and bounded supervisor selection require a body-bound read grant.
+    retained_owner_read: @import("../metadata/retained_dataset_owners.zig").Read,
     retained_dataset_work: struct { after_id: u64 = 0, native: bool = true },
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate, .native_memory_create => true,
+            .retained_owner_register, .relation_replace, .relation_schema_mutate, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -143,6 +146,7 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .retained_owner_read,
             .retained_dataset_work,
             .lake_index_lifecycle_read,
             .lake_source_owner_read,
@@ -290,4 +294,27 @@ test "system catalog retained work is read only and requires a body bound superv
     try std.testing.expectEqual(@as(u64, 7), parsed.value.retained_dataset_work.after_id);
     const Legacy = union(enum) { resolve_many: ResolveMany, mutate: Request };
     try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Legacy, a, bytes, .{}));
+}
+
+test "retained owner controls bind grants to distinct private request bodies" {
+    const a = std.testing.allocator;
+    const calls = [_]Call{
+        .{ .retained_owner_read = .{ .work = .{} } },
+        .{ .retained_owner_read = .{ .plan = .{ .resource = 7, .generation = 1 } } },
+        .{ .retained_owner_read = .{ .owner = .{ .resource = 7, .generation = 1, .plan = @splat(3), .group = 11, .revision = 1 } } },
+        .{ .retained_owner_register = .{ .resource = 7, .generation = 1, .plan = @splat(3), .revision = 1 } },
+    };
+    for (calls) |request| {
+        const mutation = request == .retained_owner_register;
+        try std.testing.expectEqual(mutation, request.requiresAdministrativeGrant());
+        try std.testing.expectEqual(mutation, request.isMutation());
+        try std.testing.expectEqual(!mutation, request.requiresSettingAuthorityReadGrant());
+        const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(request, parsed.value);
+        const Legacy = union(enum) { retained_dataset_work: struct { after_id: u64 = 0 } };
+        try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Legacy, a, bytes, .{}));
+    }
 }
