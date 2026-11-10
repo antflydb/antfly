@@ -52,7 +52,7 @@ pub const Config = struct {
 
 pub const DeleteCandidate = struct {
     key: []u8,
-    timestamp_ns: u64,
+    timestamp_ns: i128,
 
     pub fn deinit(self: *DeleteCandidate, alloc: Allocator) void {
         alloc.free(self.key);
@@ -403,9 +403,7 @@ fn collectAndDelete(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
             try self.next_after.appendSlice(self.runtime.alloc, key);
             if (!internal_keys.isTtlKey(key)) return .@"continue";
             self.summary.scanned_timestamps += 1;
-            if (value.len < 8) return .@"continue";
-
-            const timestamp_ns = std.mem.readInt(u64, value[0..8], .little);
+            const timestamp_ns = ttl_mod.sourceTimestamp(value) orelse return .@"continue";
             if (!ttl_mod.isExpiredWithGrace(timestamp_ns, self.duration_ns, self.runtime.config.grace_period_ns, self.now_ns)) {
                 return .@"continue";
             }

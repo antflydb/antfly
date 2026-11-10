@@ -31,8 +31,12 @@ test {
     _ = lsm_backend;
 }
 
-/// Linked native owner fixtures use the control ABI without physical imports.
+/// Linked fixtures keep table storage behind its control ABI.
 pub const antfly_sources = @import("source_owner_control.zig");
+
+// The fixture keeps table storage behind its native owner, but standalone
+// still owns the lake publication coordinator used by these runtime paths.
+pub const lake_execution_backend = @import("api/lake_execution_build_impl.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

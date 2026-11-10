@@ -30,6 +30,14 @@ test "borrowed document batches cross compiled owner without payload ownership t
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(path);
+    // The shared control header keeps its own version when owner layouts
+    // advance. Reject a stale nested header before opening the physical DB.
+    try std.testing.expectError(error.InvalidAbiVersion, client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 1,
+        .initial_range_control = .{ .version = abi.query_abi_version - 1 },
+    }));
     var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 1 });
     defer owner.deinit();
     const document = try alloc.dupe(u8, "{\"id\":9007199254740993,\"text\":\"borrowed\"}");
@@ -373,7 +381,7 @@ test "opaque owner cold reopen preserves frozen document and relational backup c
         };
         const begin = try json.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } });
         defer alloc.free(begin);
-        var frozen = try owner.replicatedBatchAtRaftEntryJson("rows", begin, 1, 1);
+        var frozen = try applyRaftEntryEventually(&owner, "rows", begin, 1, 1);
         frozen.deinit();
         var before = try Read.call(topology.Status, owner.handle, .status);
         defer before.deinit();
@@ -414,7 +422,7 @@ test "opaque owner cold reopen preserves frozen document and relational backup c
         released.deinit();
         const cancel = try json.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .cancel, .fence = fence } });
         defer alloc.free(cancel);
-        var canceled = try owner.replicatedBatchAtRaftEntryJson("rows", cancel, 1, 2);
+        var canceled = try applyRaftEntryEventually(&owner, "rows", cancel, 1, 2);
         canceled.deinit();
         var resumed = try owner.batchJson("rows", "{\"inserts\":{\"b\":{\"id\":2}}}");
         resumed.deinit();
@@ -425,7 +433,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     const failure = error_identity.failureFromError(
         error.InvalidQueryRequest,
         .local_query,
-        abi.abi_version,
+        abi.query_abi_version,
         @backingInt(abi.LocalQueryOperation.parse_internal_request),
     );
     var forwarded: abi.FailureIdentity = .{};
@@ -452,7 +460,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     );
     try std.testing.expectEqual(abi.Status.invalid_boundary_failure_identity, replacement.status);
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
-    try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.validate_provider_response),
         replacement.operation,
@@ -488,7 +496,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
         fn apply(owner: *client.Owner, request: @import("antfly_local_sources").storage_db_types.BatchRequest, index: u64) !void {
             const json = try batch.encodeBatchRequest(std.testing.allocator, request);
             defer std.testing.allocator.free(json);
-            var response = try owner.replicatedBatchAtRaftEntryJson("docs", json, 1, index);
+            var response = try applyRaftEntryEventually(owner, "docs", json, 1, index);
             response.deinit();
         }
     };
@@ -696,10 +704,10 @@ test "opaque owner online source controls and status survive compiled boundary r
     };
     const admission = try batch.encodeBatchRequest(alloc, .{ .online_source = .{ .admit = .{ .scope = scope } } });
     defer alloc.free(admission);
-    var admitted = try owner.replicatedBatchAtRaftEntryJson("docs", admission, 1, 1);
+    var admitted = try applyRaftEntryEventually(&owner, "docs", admission, 1, 1);
     admitted.deinit();
     // Admission retains changes without freezing normal document writes.
-    var written = try owner.replicatedBatchAtRaftEntryJson("docs", "{\"writes\":{\"r\":{\"n\":1}},\"_timestamp_ns\":\"123\"}", 1, 2);
+    var written = try applyRaftEntryEventually(&owner, "docs", "{\"writes\":{\"r\":{\"n\":1}},\"_timestamp_ns\":\"123\"}", 1, 2);
     written.deinit();
     const status_json = try std.json.Stringify.valueAlloc(alloc, .{ .mode = "online_source_status", .scope = scope }, .{});
     defer alloc.free(status_json);
@@ -730,7 +738,7 @@ test "opaque owner online source controls and status survive compiled boundary r
     var repeated_publication = try owner.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
     defer repeated_publication.deinit();
     try std.testing.expectEqualStrings(publication.bytes(), repeated_publication.bytes());
-    var retry = try owner.replicatedBatchAtRaftEntryJson("docs", admission, 1, 3);
+    var retry = try applyRaftEntryEventually(&owner, "docs", admission, 1, 3);
     retry.deinit();
     try Read.check(alloc, &owner, status_request);
 }
@@ -797,7 +805,7 @@ test "opaque owner relational handoff preserves binary proofs across the compile
     destination.namespace.range_id = 7102;
     const begin = try handoff.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = source } });
     defer alloc.free(begin);
-    var applied = try owner.replicatedBatchAtRaftEntryJson("docs", begin, 1, 1);
+    var applied = try applyRaftEntryEventually(&owner, "docs", begin, 1, 1);
     applied.deinit();
     var frozen = try Read.call(topology.Status, alloc, owner.handle, .status);
     defer frozen.deinit();
@@ -825,12 +833,12 @@ test "opaque owner relational handoff preserves binary proofs across the compile
     try std.testing.expectEqual(@as(usize, 0), page.value.records.len);
     const release = try handoff.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .release, .fence = source } });
     defer alloc.free(release);
-    try std.testing.expectError(error.IntegrityTopologyCutoverRequired, owner.replicatedBatchAtRaftEntryJson("docs", release, 1, 2));
+    try std.testing.expectError(error.IntegrityTopologyCutoverRequired, applyRaftEntryEventually(&owner, "docs", release, 1, 2));
     // This fixture only inspected the frozen source; it never published a
     // destination. Cancel that attempt rather than manufacturing cutover.
     const cancel = try handoff.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .cancel, .fence = source } });
     defer alloc.free(cancel);
-    var released = try owner.replicatedBatchAtRaftEntryJson("docs", cancel, 1, 3);
+    var released = try applyRaftEntryEventually(&owner, "docs", cancel, 1, 3);
     released.deinit();
     var after = try Read.call(topology.Status, alloc, owner.handle, .status);
     defer after.deinit();
@@ -884,7 +892,7 @@ test "opaque owner exports exact backup seals and reclaims pins without opening 
     };
     const begin = try handoff.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } });
     defer alloc.free(begin);
-    var applied = try owner.replicatedBatchAtRaftEntryJson("docs", begin, 1, 1);
+    var applied = try applyRaftEntryEventually(&owner, "docs", begin, 1, 1);
     applied.deinit();
     const pin_json = try handoff.encode(alloc, seal.Request{ .seal = .{ .id = "cut", .fence = fence } });
     defer alloc.free(pin_json);
@@ -991,7 +999,7 @@ test "opaque ordinary owner range initialization preserves durable authority and
                 };
                 const freeze = try handoff.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } });
                 defer alloc.free(freeze);
-                var applied = try unbounded.replicatedBatchAtRaftEntryJson("docs", freeze, 1, 1);
+                var applied = try applyRaftEntryEventually(&unbounded, "docs", freeze, 1, 1);
                 applied.deinit();
             }
         }
@@ -1069,7 +1077,7 @@ test "opaque portable and native restore preserve bounded range through captured
                 const replay = try batch_wire.encodeBatchRequest(std.testing.allocator, parsed.req);
                 defer std.testing.allocator.free(replay);
                 self.index += 1;
-                var applied = try self.owner.replicatedBatchAtRaftEntryJson("docs", replay, 1, self.index);
+                var applied = try applyRaftEntryEventually(self.owner, "docs", replay, 1, self.index);
                 applied.deinit();
                 return self.call(.{ .scope = input.scope, .action = .status });
             }
@@ -1125,7 +1133,7 @@ test "opaque portable and native restore preserve bounded range through captured
         .catalog_digest = identity.catalog_digest,
     };
     source_driver.index += 1;
-    var frozen = try source.replicatedBatchAtRaftEntryJson("docs", try handoff.encode(scratch, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } }), 1, source_driver.index);
+    var frozen = try applyRaftEntryEventually(&source, "docs", try handoff.encode(scratch, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } }), 1, source_driver.index);
     frozen.deinit();
     var pin = try source.backupPinControlJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(try handoff.encode(scratch, seal.Request{ .seal = .{ .id = "bounded", .fence = fence } })) });
     defer pin.deinit();
@@ -1286,12 +1294,12 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
         try std.testing.expect(status.value.batch_json == null);
         try std.testing.expectError(error.InvalidBackupRequest, owner.restoreControlJson(.{ .control = .{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(padded) } }));
     }
-    var applied = try owner.replicatedBatchAtRaftEntryJson("docs", begin.value.batch_json.?, 1, 1);
+    var applied = try applyRaftEntryEventually(&owner, "docs", begin.value.batch_json.?, 1, 1);
     applied.deinit();
     var cancel = try Control.call(alloc, &owner, .{ .scope = scope, .action = .cancel });
     defer cancel.deinit();
     try std.testing.expectEqual(staging.Phase.importing, cancel.value.response.phase);
-    var canceled = try owner.replicatedBatchAtRaftEntryJson("docs", cancel.value.batch_json.?, 1, 2);
+    var canceled = try applyRaftEntryEventually(&owner, "docs", cancel.value.batch_json.?, 1, 2);
     canceled.deinit();
     var final = try Control.call(alloc, &owner, .{ .scope = scope, .action = .cancel });
     defer final.deinit();
@@ -1732,6 +1740,25 @@ test "opaque storage owner schedules source verification after reopen without tr
     return error.SourceVerificationDidNotRun;
 }
 
+// A committed entry is replayable at exactly this term/index. The production
+// Raft adapter normalizes a nonblocking writer lock into this retry identity;
+// maintenance can acquire that lock between any two fixture calls. Retry only
+// this admitted entry, never an ambiguous public write or a semantic rejection.
+fn applyRaftEntryEventually(owner: *client.Owner, table_name: []const u8, json: []const u8, term: u64, index: u64) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.replicatedBatchAtRaftEntryJson(table_name, json, term, index) catch |err| switch (err) {
+            error.RaftApplyWriterUnavailable => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     const time = @import("antfly_platform").time;
     const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -1985,21 +2012,24 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     // Exact Raft-entry apply must preserve the physical idempotence fence
     // across the opaque storage-owner ABI. In particular, replaying a
     // non-idempotent transform at the same term/index must be a no-op.
-    var raft_insert_response = try owner.replicatedBatchAtRaftEntryJson(
+    var raft_insert_response = try applyRaftEntryEventually(
+        &owner,
         "docs",
         "{\"inserts\":{\"doc:raft-counter\":{\"count\":0}},\"sync_level\":\"write\"}",
         3,
         40,
     );
     defer raft_insert_response.deinit();
-    var raft_increment_response = try owner.replicatedBatchAtRaftEntryJson(
+    var raft_increment_response = try applyRaftEntryEventually(
+        &owner,
         "docs",
         "{\"transforms\":[{\"key\":\"doc:raft-counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}",
         3,
         41,
     );
     defer raft_increment_response.deinit();
-    var raft_replay_response = try owner.replicatedBatchAtRaftEntryJson(
+    var raft_replay_response = try applyRaftEntryEventually(
+        &owner,
         "docs",
         "{\"transforms\":[{\"key\":\"doc:raft-counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}",
         3,
@@ -2014,7 +2044,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, raft_counter.bytes(), "\"count\":1") != null);
     try std.testing.expectError(
         error.InvalidArgument,
-        owner.replicatedBatchAtRaftEntryJson("docs", "{}", 0, 42),
+        applyRaftEntryEventually(&owner, "docs", "{}", 0, 42),
     );
     try std.testing.expectError(error.InvalidBatchRequest, owner.batchJson("docs", "{"));
     try std.testing.expectError(error.InvalidBatchRequest, owner.replicatedBatchJson("docs", "{"));
@@ -2094,6 +2124,13 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     for ([_][]const u8{ "{", "{\"query_json\":\"{\"}" }) |invalid_json| {
         try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", invalid_json));
     }
+    // Kernel operations relay query-provider errors under the query version,
+    // while failures originating in the outer owner retain its own version.
+    try std.testing.expectError(error.InvalidQueryRequest, owner.preflightJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.textStatsJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.algebraicPartialsJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.graphExpandJson("docs", "{", null, null, null));
+    try std.testing.expectError(error.InvalidArgument, owner.preflightJson("other", "{}"));
 
     // The nested distributed -> storage-owner -> local-query path must retain
     // both the semantic status and its originating stage, not merely rethrow a
@@ -2112,7 +2149,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.Status.invalid_query, invalid_query_status);
     try std.testing.expectEqual(invalid_query_status, invalid_query_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, invalid_query_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.parse_internal_request),
         invalid_query_failure.operation,
@@ -2124,7 +2161,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var invalid_abi_response: abi.QueryOwnedResponse = .{};
     var invalid_abi_failure: abi.FailureIdentity = .{};
     var invalid_abi_request = abi.LocalQueryRequest{};
-    invalid_abi_request.version = abi.abi_version - 1;
+    invalid_abi_request.version = abi.query_abi_version - 1;
     const invalid_abi_status = abi.antfly_local_query_execute(
         &invalid_abi_request,
         &invalid_abi_response,
@@ -2161,7 +2198,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_algebraic_status != .ok);
     try std.testing.expectEqual(invalid_algebraic_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.algebraic_partials),
         operation_failure.operation,
@@ -2177,7 +2214,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_text_stats_status != .ok);
     try std.testing.expectEqual(invalid_text_stats_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.text_stats),
         operation_failure.operation,
@@ -2193,7 +2230,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_preflight_status != .ok);
     try std.testing.expectEqual(invalid_preflight_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.preflight),
         operation_failure.operation,
@@ -2209,7 +2246,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_graph_status != .ok);
     try std.testing.expectEqual(invalid_graph_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.parse_graph_expand),
         operation_failure.operation,
@@ -2679,7 +2716,7 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_algebraic_partials_json(null, &invalid_operation, &response, &query_failure),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
-    const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.abi_version + 1 };
+    const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.query_abi_version + 1 };
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response, &query_failure));
@@ -2892,11 +2929,11 @@ test "opaque rejected Raft entry advances through empty batch without effects ac
     {
         var owner = try client.Owner.open(options);
         defer owner.deinit();
-        var initial = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":1}},\"sync_level\":\"write\"}", 3, 1);
+        var initial = try applyRaftEntryEventually(&owner, "rows", "{\"inserts\":{\"a\":{\"n\":1}},\"sync_level\":\"write\"}", 3, 1);
         initial.deinit();
         // The raw authority has rejected entry two; only its exact native
         // applied marker advances. The rejected command is never forwarded.
-        var rejected = try owner.replicatedBatchAtRaftEntryJson("rows", "{}", 3, 2);
+        var rejected = try applyRaftEntryEventually(&owner, "rows", "{}", 3, 2);
         rejected.deinit();
     }
     {
@@ -2904,13 +2941,13 @@ test "opaque rejected Raft entry advances through empty batch without effects ac
         defer owner.deinit();
         // A synthetic nonempty replay proves that the empty command persisted
         // its marker, not merely returned success without a durable effect.
-        var replay = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":999}},\"sync_level\":\"write\"}", 3, 2);
+        var replay = try applyRaftEntryEventually(&owner, "rows", "{\"inserts\":{\"a\":{\"n\":999}},\"sync_level\":\"write\"}", 3, 2);
         replay.deinit();
         var row = try owner.lookupJson("rows", "{\"key\":\"a\"}");
         defer row.deinit();
         try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
         try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "999") == null);
-        var next = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":2}},\"sync_level\":\"write\"}", 3, 3);
+        var next = try applyRaftEntryEventually(&owner, "rows", "{\"inserts\":{\"a\":{\"n\":2}},\"sync_level\":\"write\"}", 3, 3);
         next.deinit();
         var changed = try owner.lookupJson("rows", "{\"key\":\"a\"}");
         defer changed.deinit();
@@ -2941,7 +2978,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     const options: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(source_path), .table_name = .fromSlice("rows"), .group_id = 8181, .has_identity_namespace = 1, .identity_table_id = 81, .identity_shard_id = 8181, .identity_range_id = 8181, .schema_json = .fromSlice(schema), .indexes_json = .fromSlice("{\"full_text_index_v0\":{\"type\":\"full_text\"}}") };
     var owner = try client.Owner.open(options);
     defer owner.deinit();
-    var response = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":9007199254740993,\"body\":\"aardvark\"}},\"_timestamp_ns\":\"1234\",\"sync_level\":\"write\"}", 2, 5);
+    var response = try applyRaftEntryEventually(&owner, "rows", "{\"inserts\":{\"a\":{\"n\":9007199254740993,\"body\":\"aardvark\"}},\"_timestamp_ns\":\"1234\",\"sync_level\":\"write\"}", 2, 5);
     response.deinit();
     var source = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_source_path, .context = context.handle });
     defer source.deinit();
@@ -2970,7 +3007,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     try prepared.attachNative(capture.handle.?);
     capture.handle = null;
     try std.testing.expect(!released);
-    var later = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"later\":{\"n\":2}},\"_timestamp_ns\":\"1235\",\"sync_level\":\"write\"}", 2, 8);
+    var later = try applyRaftEntryEventually(&owner, "rows", "{\"inserts\":{\"later\":{\"n\":2}},\"_timestamp_ns\":\"1235\",\"sync_level\":\"write\"}", 2, 8);
     later.deinit();
     var artifact = try prepared.materializeFile(alloc);
     defer artifact.deinit(alloc);
@@ -2983,7 +3020,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     {
         var previous = try client.Owner.open(target_options);
         defer previous.deinit();
-        var old_row = try previous.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"old\":{\"n\":5,\"body\":\"previous\"}},\"_timestamp_ns\":\"1200\",\"sync_level\":\"write\"}", 1, 5);
+        var old_row = try applyRaftEntryEventually(&previous, "rows", "{\"inserts\":{\"old\":{\"n\":5,\"body\":\"previous\"}},\"_timestamp_ns\":\"1200\",\"sync_level\":\"write\"}", 1, 5);
         old_row.deinit();
     }
     var request: abi.SnapshotPrepareRequest = .{ .path = .fromSlice(target_path), .table_name = .fromSlice("rows"), .group_id = 8181, .identity_table_id = 81, .identity_shard_id = 8181, .identity_range_id = 8181, .schema_json = .fromSlice(schema), .encoded_snapshot = .fromSlice(bytes), .projection_store = target.handle, .expected_applied_index = 6 };
@@ -3047,7 +3084,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
             var reopened = try client.Owner.open(self.options);
             defer reopened.deinit();
             for (entries) |entry| {
-                var result = try reopened.replicatedBatchAtRaftEntryJson("rows", entry.data, entry.term, entry.index);
+                var result = try applyRaftEntryEventually(&reopened, "rows", entry.data, entry.term, entry.index);
                 result.deinit();
             }
             self.batches += 1;
@@ -3155,7 +3192,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     {
         var ahead = try client.Owner.open(target_options);
         defer ahead.deinit();
-        var result = try ahead.replicatedBatchAtRaftEntryJson("rows", suffix, 2, 8);
+        var result = try applyRaftEntryEventually(&ahead, "rows", suffix, 2, 8);
         result.deinit();
     }
     const legacy_root = try std.fmt.allocPrint(alloc, "{s}/legacy-provider", .{root});
@@ -4128,7 +4165,7 @@ test "storage kernel status registry is unique and lossless" {
         const failure = error_identity.failureFromError(
             expected,
             .local_query,
-            abi.abi_version,
+            abi.query_abi_version,
             @backingInt(abi.LocalQueryOperation.execute_internal_query),
         );
         var forwarded: abi.FailureIdentity = .{};
@@ -4761,4 +4798,85 @@ test "opaque storage pipeline metrics snapshot versions and ownership" {
     try std.testing.expect(rejected.ptr == null);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_pipeline_metrics_json(context.handle, 2, &rejected));
     try std.testing.expect(rejected.ptr == null);
+}
+
+test "time series owner query preserves invalid histogram class before runtime callbacks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7013,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 7013,
+        .identity_range_id = 7013,
+    });
+    defer owner.deinit();
+    var batch = try owner.batchJson("docs",
+        \\{"inserts":{"lo":{"ts":-170141183460469231731687303715884105728},"hi":{"ts":170141183460469231731687303715884105727}},"sync_level":"full_index"}
+    );
+    defer batch.deinit();
+    const runtime_error = @import("antfly_runtime_abi").error_abi;
+    for ([_][]const u8{
+        \\{"query":{"match_all":{}},"limit":0,"aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"1ns","min_doc_count":0}}}
+        ,
+        \\{"query":{"match_all":{}},"limit":0,"aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"1ns","min_doc_count":1}}}
+        ,
+    }) |query| {
+        var response: abi.QueryOwnedResponse = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&response.buffer);
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_query_json(owner.handle, &.{ .control = .{
+            .table_name = .fromSlice("docs"),
+            .request_json = .fromSlice(query),
+        } }, &response, &failure);
+        try std.testing.expectEqual(abi.Status.invalid_query, status);
+        try std.testing.expectEqual(status, failure.status);
+        try std.testing.expectEqual(abi.FailureBoundary.local_query, failure.boundary);
+        try std.testing.expectEqual(abi.query_abi_version, failure.boundary_version);
+        try std.testing.expectEqual(@backingInt(abi.LocalQueryOperation.execute_internal_query), failure.operation);
+        try std.testing.expectEqualStrings("InvalidQueryRequest", failure.errorName());
+        const received = blk: {
+            client.statusToError(status) catch |err| break :blk err;
+            return error.ExpectedInvalidHistogram;
+        };
+        const transported = runtime_error.statusFromError(received);
+        try std.testing.expectEqual(@backingInt(runtime_error.Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(error.InvalidQueryRequest, runtime_error.errorFromStatus(transported));
+    }
+    var healthy = try owner.queryJson("docs", "{\"query\":{\"match_all\":{}},\"limit\":1}");
+    defer healthy.deinit();
+}
+
+test "selected owner readiness compiled projections retain independent query control versions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const group = 7303;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "rows" } });
+    const input: @import("../metadata/api.zig").OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 3, .shard_id = 3, .range_id = 3 }} };
+    try std.testing.expectEqual(.topology_changed, (try store.ownerReadiness(a, group, input, .{})).status);
+    const checks = try store.ownerReadinessTransitions(a, group, input, .{});
+    defer a.free(checks);
+    try std.testing.expectEqual(@as(usize, 0), checks.len);
+    // A storage header cannot substitute for the independently versioned
+    // shared query control, even when the outer projection header is valid.
+    const invalid_control_version = if (abi.abi_version != abi.query_abi_version) abi.abi_version else abi.query_abi_version + 1;
+    const contract = @import("../metadata/storage/raft_apply_contract.zig");
+    for ([_]contract.CatalogProjectionRequest{ .{ .owner_readiness = input }, .{ .owner_readiness_transitions = input } }) |projection| {
+        const bytes = try std.json.Stringify.valueAlloc(a, projection, .{});
+        defer a.free(bytes);
+        var rejected: abi.OwnedBytes = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&rejected);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .kind = .system_catalog, .group_id = group, .key = .fromSlice(bytes), .control = .{ .version = invalid_control_version } }, &rejected));
+        try std.testing.expect(rejected.ptr == null);
+    }
 }

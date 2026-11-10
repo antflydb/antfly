@@ -360,7 +360,7 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
         .algebraic_aggregates => false,
-        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure"),
+        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure") or std.mem.eql(u8, field, "time") or std.mem.eql(u8, field, "bucket"),
         .relational_keys, .relational_predicates, .relational_expression_args => false,
         .relational_key => std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "expression") or std.mem.eql(u8, field, "result_type") or std.mem.eql(u8, field, "direction") or std.mem.eql(u8, field, "nulls") or std.mem.eql(u8, field, "collation"),
         .relational_expression => std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "value") or std.mem.eql(u8, field, "args") or std.mem.eql(u8, field, "collation"),
@@ -870,6 +870,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "scorer") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or
+        std.mem.eql(u8, field, "candidate_key_prefix") or
         std.mem.eql(u8, field, "candidate_ann_index") or
         std.mem.eql(u8, field, "candidate_limit") or
         std.mem.eql(u8, field, "name_embedding") or

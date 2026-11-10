@@ -253,6 +253,24 @@ fn BoundaryImpl(comptime VTable: type) type {
     };
 }
 
+test "graph descriptor epoch rejects legacy callbacks before dereferencing payloads" {
+    try std.testing.expect(native_abi.abi_version > 11);
+    const Table = struct { keys: ?[]const []const u8, name: []const u8 };
+    const Statement = struct { tables: []const Table };
+    const Callback = *const fn (*const Statement) anyerror!void;
+    const TestBoundary = BoundaryImpl(struct { open_cypher_statement: Callback });
+    const Args = std.meta.ArgsTuple(@typeInfo(Callback).pointer.child);
+    for ([_]u32{ 10, 11 }) |version| {
+        var legacy = native_abi.CallContract.of("open_cypher_statement", Callback, Args, void);
+        legacy.version = version;
+        legacy.function.version = version;
+        legacy.arguments.version = version;
+        legacy.output.version = version;
+        const status = TestBoundary.dispatchLocal(&legacy, @ptrFromInt(1), @ptrFromInt(1), null);
+        try std.testing.expectEqual(error.UnsupportedVersion, error_abi.errorFromStatus(status));
+    }
+}
+
 test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     const TestVTable = struct {
         value: *const fn (*u32, u32) anyerror!u32,
@@ -413,4 +431,23 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         error.InvalidArgument,
         TestBoundary.call("value", &callbacks.rejectingDispatch, &callbacks.value, .{ &base, 2 }),
     );
+}
+
+test "time series callback transport canonicalizes aggregation query failures" {
+    const VTable = struct { query: *const fn (*const anyerror) anyerror!u64 };
+    const TestBoundary = Boundary(VTable);
+    const Callbacks = struct {
+        fn query(failure: *const anyerror) anyerror!u64 {
+            return failure.*;
+        }
+    };
+    const cases = [_]struct { original: anyerror, expected: anyerror }{
+        .{ .original = error.InvalidAggregation, .expected = error.InvalidQueryRequest },
+        .{ .original = error.UnsupportedAggregation, .expected = error.UnsupportedQueryRequest },
+        .{ .original = error.OutOfMemory, .expected = error.OutOfMemory },
+        .{ .original = error.Timeout, .expected = error.Timeout },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, TestBoundary.callRemote("query", TestBoundary.local_dispatch, &Callbacks.query, .{&case.original}));
+    }
 }

@@ -3110,6 +3110,9 @@ pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut_contract.zig").ReadLease = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
+    native_query_cleanup: @import("native_query_warming.zig").Owner = .{},
+    // Allocate directory iterator buffers only while this owner is sweeping.
+    native_query_collector: ?*@import("native_query_cut_gc.zig").Collector = null,
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -5564,14 +5567,18 @@ pub const DB = struct {
 
     pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (comptime storage_engine.enabled) return storage_engine.call("createDetachedEnrichmentRuntime", .{ self, enrichment_cfg });
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !self.core.index_manager.hasGroupSources()) return null;
+        // Native assets/chunks and their graph consumers still need replay
+        // when no external inference provider is installed. Reconfiguration
+        // must not discard that owner after a repair created it.
+        const has_native_work = self.core.index_manager.hasGeneratedEnrichmentTargets();
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !has_native_work) return null;
         // Producer ownership moves through reconfiguration, but execution and
         // security capabilities belong to the resident DB. Hydrate every
         // replacement at this single construction boundary so live index DDL
         // cannot silently fall back to default remote-content policy or an
         // unrelated executor when it supplies only a new producer set.
         var runtime_cfg = enrichment_cfg.*;
-        if (self.core.index_manager.hasGroupSources()) runtime_cfg.enable_without_producers = true;
+        if (has_native_work) runtime_cfg.enable_without_producers = true;
         runtime_cfg.root_incarnation = self.root_incarnation;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
@@ -6120,6 +6127,12 @@ pub const DB = struct {
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
         self.native_query_warming.stop(self.backend_runtime);
+        self.native_query_cleanup.stop(self.backend_runtime);
+        if (self.native_query_collector) |collector| {
+            collector.deinit(self.backend_runtime.filesystemIo().?);
+            self.alloc.destroy(collector);
+            self.native_query_collector = null;
+        }
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.clearGraphReplacementManager();
@@ -6239,6 +6252,8 @@ pub const DB = struct {
         self.retained_query_lease = null;
         if (self.retained_remote_query_lease) |*lease| lease.deinit();
         self.retained_remote_query_lease = null;
+        if (self.local_execution.native_query_reuse) |*hint| hint.deinit();
+        self.local_execution.native_query_reuse = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -7734,6 +7749,7 @@ pub const DB = struct {
         // This boundary accepts a control only, never a mixed user mutation.
         const defaults: types.BatchRequest = .{};
         inline for (@typeInfo(types.BatchRequest).@"struct".field_names, @typeInfo(types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
             if (comptime !std.mem.eql(u8, reflected_name, "relational_topology") and !std.mem.eql(u8, reflected_name, "sync_level")) {
                 const value = @field(req, reflected_name);
                 if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
@@ -9000,6 +9016,9 @@ pub const DB = struct {
                         (!page.artifact_page and !page.projection_page and !page.source_generation_proof_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
+                    var ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+                    defer ttl_sources.deinit(self.alloc);
+                    if (page.document_timestamps != null and (relationalColumns(self) != null or page.artifact_page or page.projection_page or page.source_generation_proof_page)) return error.InvalidRestoreStagingCommand;
                     var input_bytes: usize = 0;
                     var previous_artifact: ?[]const u8 = null;
                     for (page.artifacts) |artifact| {
@@ -9025,7 +9044,12 @@ pub const DB = struct {
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                     }
                     for (page.timestamps, req.writes) |timestamp, row| {
-                        if (timestamp.timestamp == 0 or !std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
+                        if (!std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
+                        if (page.document_timestamps != null) {
+                            if (timestamp.ttl_source_ns) |source| {
+                                try ttl_sources.put(self.alloc, timestamp.key, source);
+                            } else if (timestamp.timestamp != 0) return error.InvalidRestoreStagingCommand;
+                        } else if (timestamp.timestamp == 0 or timestamp.ttl_source_ns != null) return error.InvalidRestoreStagingCommand;
                         input_bytes = std.math.add(usize, input_bytes, row.key.len +| row.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                         const entry = try timestamps.getOrPut(self.alloc, timestamp.key);
@@ -9046,6 +9070,8 @@ pub const DB = struct {
                     apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
                     apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
                     apply_opts.restore_timestamps = &timestamps;
+                    apply_opts.restore_ttl_sources = if (page.document_timestamps != null) &ttl_sources else null;
+                    apply_opts.restore_document_version_floor = if (page.document_timestamps) |metadata| metadata.version_floor else 0;
                     apply_opts.restore_replication_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
                     const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
@@ -9075,6 +9101,8 @@ pub const DB = struct {
         defer proof_witness_arena.deinit();
         var page_timestamps: std.StringHashMapUnmanaged(u64) = .empty;
         defer page_timestamps.deinit(self.alloc);
+        var page_ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer page_ttl_sources.deinit(self.alloc);
         var apply_opts = opts;
         var apply_req = req;
         var chunk_prepared: ?@import("merge_page_chunks.zig").Prepared = null;
@@ -9119,9 +9147,15 @@ pub const DB = struct {
         };
         if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
             if (page.chunk) |chunk| {
-                if (apply_req.writes.len != 0) try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+                if (apply_req.writes.len != 0) {
+                    try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+                    if (chunk.ttl_source) |source| try page_ttl_sources.put(self.alloc, chunk.row_key, std.mem.readInt(i128, &source, .little));
+                }
             } else for (apply_req.writes, page.timestamps) |row, timestamp| try page_timestamps.put(self.alloc, row.key, timestamp);
+            for (page.ttl_sources, 0..) |source, i| if (source) |value| try page_ttl_sources.put(self.alloc, apply_req.writes[i].key, std.mem.readInt(i128, &value, .little));
+            if (relationalColumns(self) != null and page_ttl_sources.count() != 0) return error.InvalidMergePage;
             apply_opts.restore_timestamps = &page_timestamps;
+            apply_opts.restore_ttl_sources = &page_ttl_sources;
             apply_opts.preserve_logical_values = true;
         };
         apply_opts.row_policy_principal = policy_opts.row_policy_principal;
@@ -10027,11 +10061,11 @@ pub const DB = struct {
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (internal_keys.isRelationalRowKey(store_key))
+                const timestamp_ns: ?i128 = if (internal_keys.isRelationalRowKey(store_key))
                     try relational_store.rowWriteTimestampNs(raw)
                 else
-                    try self.getTimestamp(alloc, key);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) {
+                    try ttl_mod.readSourceTimestamp(self.core.store, alloc, key);
+                if (timestamp_ns != null and ttl_mod.isExpired(timestamp_ns.?, ttl_duration_ns, currentTimeNs())) {
                     try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
                     return null;
                 }
@@ -19922,11 +19956,11 @@ pub const DB = struct {
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (ordinal_row) |row|
+                const timestamp_ns: ?i128 = if (ordinal_row) |row|
                     row.writeTimestampNs()
                 else
-                    primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
+                    try lookupSnapshotTtlTimestamp(alloc, key, probe);
+                if (timestamp_ns != null and ttl_mod.isExpired(timestamp_ns.?, ttl_duration_ns, currentTimeNs())) return null;
             }
         }
         try checkLookupOptionsActive(opts);
@@ -19981,6 +20015,16 @@ pub const DB = struct {
         return .{ .json = stored, .version = version, .expected_content_digest = digest };
     }
 
+    fn lookupSnapshotTtlTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !?i128 {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
+        defer alloc.free(timestamp_key);
+        const bytes = probe.get(timestamp_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return ttl_mod.sourceTimestamp(bytes) orelse error.InvalidTimestamp;
+    }
+
     fn lookupSnapshotTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !u64 {
         const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
         defer alloc.free(timestamp_key);
@@ -19989,8 +20033,7 @@ pub const DB = struct {
             else => return err,
         };
         const bytes = timestamp orelse return 0;
-        if (bytes.len != 8) return error.InvalidTimestamp;
-        return std.mem.readInt(u64, bytes[0..8], .little);
+        return ttl_mod.writeVersion(bytes) orelse error.InvalidTimestamp;
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
@@ -21193,19 +21236,26 @@ pub const DB = struct {
         defer arena.deinit();
         return self.nativeQueryReuseDigestLocked(arena.allocator());
     }
+    fn rememberNativeQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, proof: @import("native_query_reuse.zig").Proof) void {
+        // Retention has committed. Optional hint allocation cannot revoke it.
+        const next = @import("native_query_reuse.zig").State.init(self.alloc, request, proof) catch return;
+        if (self.local_execution.native_query_reuse) |*previous| previous.deinit();
+        self.local_execution.native_query_reuse = next;
+    }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
     fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
-        if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
+        if (repository.vtable.reuse == null) return false;
+        if (!basis.matchesSelection(request)) return false;
         if (std.mem.eql(u8, &basis.id, request.id)) return false;
         const digest = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
         if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
-        const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
+        const proof = (try repository.reuse(io, basis.asRequestWithIndexes(request.indexes), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
         // Rotate the logical authority, so expiry of the original manifest does
         // not force capture while the authenticated extents still cover readers.
-        self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+        self.rememberNativeQueryCut(request, proof);
         return true;
     }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
@@ -21219,16 +21269,43 @@ pub const DB = struct {
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
-            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
-        };
         var profile = QueryCaptureProfile.init(benchQueryProfileEnabled(), "query_pin_lock");
         defer profile.finish();
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         profile.next("reuse_and_admission");
+        var reference_checked = false;
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+            // Statistics, preflight and execution may capture the same cut.
+            // Its first committed generation remains authority even after live
+            // writes or warming rotate the owner's optional reuse hint. Lease
+            // that exact generation before considering any fresh capture.
+            const retained_path = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
+            defer self.alloc.free(retained_path);
+            const existing = try repository.openRead(io, retained_path, request, self.core.identity_namespace, token);
+            if (existing) |opened| {
+                var lease = opened;
+                lease.deinit();
+                return;
+            }
+            if (self.primary_lsm_storage) |storage| {
+                reference_checked = true;
+                if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+            }
+        };
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
-        try self.admitQueryCut(io, request.id, token);
+        // A process-local hint is optional. Recover an already committed
+        // binding before considering a fresh capture of mutable live state.
+        if (publish and !reference_checked) if (self.backend_runtime.query_cut_repository) |repository| {
+            // A custom storage owner already performed this lookup above.
+            // Default filesystem owners have no custom Storage override.
+            // They still need committed-binding discovery after hint loss;
+            // the native view simply has no remote checkpoint reference.
+            var native = lsm_backend_mod.storage_io.IoStorage.init(io);
+            const storage = self.primary_lsm_storage orelse native.storage();
+            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+        };
+        if (publish) try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
         const existed = try snapshotPathExists(io, root);
@@ -21236,7 +21313,7 @@ pub const DB = struct {
         // usable cursors. The parent guard excludes readers of this new root.
         errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
         profile.next("snapshot");
-        _ = self.snapshotInternal(request.id, true, token, self.snapshotMaintenanceDeadline(deadline), null, false, request) catch |err| {
+        if (!(publish and !existed and try self.cloneWarmQueryCut(io, root, request, token))) _ = self.snapshotInternal(request.id, true, token, self.snapshotMaintenanceDeadline(deadline), null, false, request) catch |err| {
             try token.check();
             return switch (err) {
                 error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported, error.BackupSealBackendUnsupported => error.UnsupportedQueryRequest,
@@ -21245,92 +21322,153 @@ pub const DB = struct {
                 else => err,
             };
         };
+        if (!publish) {
+            // This marker is local ownership metadata, outside the immutable
+            // file inventory. Promotion never copies it into a cursor binding.
+            const backup = @import("native_backup.zig");
+            const marker = try std.fs.path.join(self.alloc, &.{ root, ".local-warm" });
+            defer self.alloc.free(marker);
+            _ = try backup.writeFileDurable(io, marker, "1");
+            try fs_paths.syncDirPortable(io, root);
+        }
         profile.next("repository_publication");
-        try self.admitQueryCut(io, request.id, token);
+        if (publish) try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
-                self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+                self.rememberNativeQueryCut(request, proof);
             }
         };
     }
+    fn collectNativeQueryCaches(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+        const self: *DB = @ptrCast(@alignCast(raw));
+        const io = self.backend_runtime.filesystemIo() orelse return true;
+        if (self.native_query_collector == null) {
+            const path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins", .{self.core.path});
+            defer self.alloc.free(path);
+            std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return true,
+                else => return err,
+            };
+            const collector = try self.alloc.create(@import("native_query_cut_gc.zig").Collector);
+            collector.* = .{ .a = self.alloc };
+            self.native_query_collector = collector;
+        }
+        const collector = self.native_query_collector.?;
+        const complete = try collector.step(io, self.core.path, @import("native_query_cut.zig").nowMs(), 64, cancellation);
+        if (complete) {
+            collector.deinit(io);
+            self.alloc.destroy(collector);
+            self.native_query_collector = null;
+        }
+        return complete;
+    }
+    /// One local speculative slot, independently budgeted and never uploaded.
+    /// A foreground capture promotes its immutable files into its own binding.
     fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
         const self: *DB = @ptrCast(@alignCast(raw));
         const cut = @import("native_query_cut.zig");
+        const warming = @import("native_query_warming.zig");
         const repository = self.backend_runtime.query_cut_repository orelse return true;
         const io = self.backend_runtime.filesystemIo() orelse return true;
         const now = cut.nowMs();
-        const state_path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins/.warming.json", .{self.core.path});
-        defer self.alloc.free(state_path);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const state_path = try std.fmt.allocPrint(a, "{s}.query-pins/.warming.json", .{self.core.path});
+        var state = try warming.readState(a, io, state_path);
+        {
+            var guard = try cut.lock(a, io, self.core.path, cancellation);
+            defer guard.deinit();
+            if (state) |value| {
+                const old_root = try cut.pathAlloc(a, self.core.path, value.request.id);
+                reuse: {
+                    if (value.local_only and value.complete) {
+                        const current = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
+                        if (value.source_digest) |previous| if (std.mem.eql(u8, &previous, &current)) {
+                            if (value.bytes > repository.warming_max_bytes) {
+                                try cut.discardStatement(a, io, self.core.path, value.request.id);
+                                return true;
+                            }
+                            if (try snapshotPathExists(io, old_root)) {
+                                if (value.request.expires_ms <= now +| 60_000) {
+                                    var renewed = value;
+                                    renewed.request.expires_ms = now +| warming.ttl_ms;
+                                    cut.renewWarm(a, io, old_root, value.request, renewed.request, self.core.identity_namespace, cancellation) catch |err| switch (err) {
+                                        error.FileNotFound, error.CatalogGenerationChanged => break :reuse,
+                                        else => return err,
+                                    };
+                                    try warming.writeState(a, io, state_path, renewed);
+                                }
+                                return true;
+                            }
+                        };
+                    }
+                }
+                // Old durable warm roots are caches too. Never remove one
+                // behind an active lease, including during legacy recovery.
+                cut.discardStatement(a, io, self.core.path, value.request.id) catch |err| switch (err) {
+                    error.QueryCandidateBudgetExceeded => return false,
+                    else => return err,
+                };
+                state = null;
+            }
+        }
+        // A deterministic private slot also bounds interrupted captures whose
+        // hint write never committed. Foreground IDs remain random bindings.
+        var slot_digest: [32]u8 = undefined;
+        const slot = try std.json.Stringify.valueAlloc(a, .{ "native-local-warm-v1", self.core.path, self.core.identity_namespace }, .{});
+        std.crypto.hash.Blake3.hash(slot, &slot_digest, .{});
+        const id = std.fmt.bytesToHex(slot_digest, .lower);
+        {
+            var guard = try cut.lock(a, io, self.core.path, cancellation);
+            defer guard.deinit();
+            try cut.discardStatement(a, io, self.core.path, &id);
+        }
+        const request: cut.Request = .{ .id = &id, .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| warming.ttl_ms, .create = true, .timeout_ms = 2000 };
+        try self.captureQueryCutInternal(request, cancellation, false);
+        var guard = try cut.lock(a, io, self.core.path, cancellation);
+        defer guard.deinit();
+        const root = try cut.pathAlloc(a, self.core.path, request.id);
+        errdefer cut.discardStatement(a, io, self.core.path, request.id) catch {};
+        const bytes = try @import("native_backup.zig").readFileAlloc(a, io, try std.fs.path.join(a, &.{ root, "query-cut.json" }), @import("native_backup.zig").max_manifest_bytes);
+        const manifest = try std.json.parseFromSliceLeaky(cut.Manifest, a, bytes, .{});
+        var size: u64 = 0;
+        for (manifest.files) |file| size = std.math.add(u64, size, file.size) catch return error.QueryCandidateBudgetExceeded;
+        const digest = try cut.validateWithSourceProof(a, io, root, request, self.core.identity_namespace, cancellation);
+        try warming.writeState(a, io, state_path, .{ .local_only = true, .request = request, .sequence = manifest.sequence, .complete = true, .source_digest = digest, .bytes = size });
+        if (size > repository.warming_max_bytes) try cut.discardStatement(a, io, self.core.path, request.id);
+        return true;
+    }
+    /// Called with the query-pin guard held. The warm hint must match the
+    /// current fenced source and selected indexes before any file is promoted.
+    fn cloneWarmQueryCut(self: *DB, io: std.Io, root: []const u8, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
+        // The local slot contains every managed projection, so it also
+        // satisfies a foreground request selecting a subset of those indexes.
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const warming = @import("native_query_warming.zig");
-        var state = try warming.readState(a, io, state_path);
-        const sequence = self.core.nextDerivedSequence();
-        if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
-            state = null;
+        const cut = @import("native_query_cut.zig");
+        const state_path = try std.fmt.allocPrint(a, "{s}.query-pins/.warming.json", .{self.core.path});
+        const state = (try warming.readState(a, io, state_path)) orelse return false;
+        if (!state.local_only or !state.complete or state.request.table_id != request.table_id or state.request.expires_ms <= cut.nowMs()) return false;
+        const digest = state.source_digest orelse return false;
+        const current = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
+        if (!std.mem.eql(u8, &digest, &current)) return false;
+        const source = try cut.pathAlloc(a, self.core.path, state.request.id);
+        if (!try snapshotPathExists(io, source)) return false;
+        cut.clone(a, io, source, root, state.request, request, self.core.identity_namespace, cancellation) catch |err| switch (err) {
+            error.FileNotFound, error.CatalogGenerationChanged => {
+                cut.discardStatement(a, io, self.core.path, state.request.id) catch |cleanup_err| switch (cleanup_err) {
+                    error.QueryCandidateBudgetExceeded => return false,
+                    else => return cleanup_err,
+                };
+                std.Io.Dir.cwd().deleteFile(io, state_path) catch {};
+                return false;
+            },
+            else => return err,
         };
-        if (state) |value| if (value.complete and value.sequence == sequence) {
-            if (value.source_digest) |previous| {
-                // The query-pin guard also owns initialization of the local
-                // digest epoch; foreground captures use the same guard.
-                const renewal: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 2 * std.time.ns_per_s };
-                var guard = try cut.lock(self.alloc, io, self.core.path, renewal.token());
-                defer guard.deinit();
-                const current = (try self.nativeQueryReuseDigest(renewal.token())) orelse return false;
-                if (std.mem.eql(u8, &previous, &current)) {
-                    if (value.request.expires_ms > now +| 120_000) return true;
-                    var nonce: [32]u8 = undefined;
-                    try io.randomSecure(&nonce);
-                    const id = std.fmt.bytesToHex(nonce, .lower);
-                    const request: cut.Request = .{ .id = &id, .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 };
-                    if (try self.tryReuseNativeQueryCut(io, request, renewal.token())) {
-                        state.?.request = request;
-                        state.?.next_ms = now +| 60_000;
-                        try warming.writeState(a, io, state_path, state.?);
-                        return true;
-                    }
-                    // Never recapture an unchanged corpus on an expired
-                    // optional hint alone. Foreground capture can re-establish
-                    // a missing proof; a later tick can renew that live basis.
-                    return true;
-                }
-            } else if (value.next_ms > now) return true;
-        };
-        if (state == null or state.?.complete or state.?.request.expires_ms <= now +| 15000) {
-            // Keep one private warm cut; it never consumes all foreground cut
-            // capacity. Completed cuts are discarded after publishing hints.
-            if (state) |value| {
-                var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
-                defer guard.deinit();
-                try std.Io.Dir.cwd().deleteTree(io, try cut.pathAlloc(a, self.core.path, value.request.id));
-            }
-            var nonce: [32]u8 = undefined;
-            try io.randomSecure(&nonce);
-            const id = std.fmt.bytesToHex(nonce, .lower);
-            state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
-            // The parent directory is created by capture; persist only once
-            // the coherent local generation is sealed.
-            try self.captureQueryCutInternal(state.?.request, cancellation, false);
-            try warming.writeState(a, io, state_path, state.?);
-        }
-        const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
-        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
-        const warmed = try repository.warmReusable(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
-        const completed = warmed.complete;
-        if (completed) {
-            // Preserve the digest of the captured cut, not a later live read:
-            // writes may have resumed while publication was in progress.
-            state.?.source_digest = try cut.validateWithSourceProof(a, io, root, state.?.request, self.core.identity_namespace, control.token());
-            state.?.complete = true;
-            state.?.next_ms = now +| 60000;
-            try warming.writeState(a, io, state_path, state.?);
-            var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
-            defer guard.deinit();
-            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(state.?.request, proof);
-            try std.Io.Dir.cwd().deleteTree(io, root);
-        }
-        return completed;
+        return true;
     }
 
     fn copyQueryCutRowPolicyAuthority(self: *const DB, readonly: *DB) !void {
@@ -21361,11 +21499,15 @@ pub const DB = struct {
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
+        var stage: []const u8 = "request";
+        errdefer std.log.debug("native query cut open failed stage={s}", .{stage});
         try request.validate(cut.nowMs());
         const origin = try request.namespace(self.core.identity_namespace);
         const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
         defer self.alloc.free(cache_id);
+        stage = "capture";
         if (request.create) try self.captureQueryCut(request, cancellation);
+        stage = "local_manifest";
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const path = try cut.pathAlloc(self.alloc, self.core.path, cache_id);
         defer self.alloc.free(path);
@@ -21387,6 +21529,7 @@ pub const DB = struct {
         } else false;
         if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
             // The read lease retains the caller's token beyond this stack frame.
+            stage = "repository_lease";
             if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
@@ -21395,6 +21538,7 @@ pub const DB = struct {
                 // the filesystem publication guard across provider I/O.
                 guard.deinit();
                 guarded = false;
+                stage = "repository_database";
                 var readonly = try DB.open(self.alloc, path, .{
                     .open_mode = .query_readonly,
                     .query_indexes = request.indexes,
@@ -21415,16 +21559,19 @@ pub const DB = struct {
             // manifest. Protect active readers before replacing any invalid root.
             if (local_exists) try cut.discardInvalidCache(self.alloc, io, std.fs.path.dirname(path).?, cache_id, path);
             try self.admitQueryCut(io, cache_id, control.token());
+            stage = "repository_recovery";
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
             try self.admitQueryCut(io, cache_id, control.token());
             source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
+        stage = "local_lease";
         var reader = try cut.readLeaseOwned(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
         defer if (!transferred) reader.deinit() catch unreachable;
+        stage = "local_database";
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .query_indexes = request.indexes,
@@ -25793,10 +25940,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
@@ -30152,8 +30300,17 @@ pub const DB = struct {
         // here makes it finalize HBC once per producer window while competing
         // with artifact production, even though that generation will be
         // discarded. Install the worker at the shadow activation fence above.
+        // Legacy artifact-backed graphs materialize their durable source
+        // contributions in this worker. Deferring it would let a shadow publish
+        // an empty generation past the resolver event that should create them.
+        // Ordered publication owns those effects separately and can still defer
+        // the disposable projection worker until shadow activation.
+        const needs_legacy_graph_materialization = cfg.kind == .graph and
+            self.core.index_manager.graphArtifactSources(cfg.name).len != 0 and
+            !try orderedCoverageActive(self.core.store);
         const defer_worker_to_managed_repair = installed.managed_admission_pending and
             self.local_execution.optional_runtime_workers_enabled and
+            !needs_legacy_graph_materialization and
             try types.indexPublicationPolicy(self.alloc, cfg) == .atomic;
         if (self.start_index_workers and !defer_worker_to_managed_repair) {
             try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
@@ -32960,36 +33117,23 @@ pub const DB = struct {
         var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
         var initialized: usize = 0;
         errdefer {
-            for (resolvers[0..initialized]) |resolver| {
-                alloc.free(resolver.name);
-                alloc.free(resolver.table);
-                alloc.free(resolver.source_artifact);
-                alloc.free(resolver.resolution_artifact);
-            }
+            for (resolvers[0..initialized]) |resolver| resolver.deinit(alloc);
             if (resolvers.len > 0) alloc.free(resolvers);
         }
-
         for (catalog) |cfg| {
-            const name = try alloc.dupe(u8, cfg.name);
-            errdefer alloc.free(name);
-            const table = try alloc.dupe(u8, cfg.table);
-            errdefer alloc.free(table);
-            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
-            errdefer alloc.free(source_artifact);
-            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
-            errdefer alloc.free(resolution_artifact);
-            resolvers[initialized] = .{
-                .name = name,
+            resolvers[initialized] = try (types.ResolverReplayDiagnostic{
+                .candidate_key_prefix = cfg.candidate_key_prefix,
+                .name = cfg.name,
                 .config_generation = cfg.config_generation,
                 .effective_generation = cfg.effectiveGeneration(),
                 .curation_revision = cfg.curation_revision,
                 .namespace_curation_generation = cfg.namespace_curation_generation,
                 .namespace_curation_table_id = cfg.namespace_curation_table_id,
                 .namespace_curation_missing = cfg.namespace_curation_missing,
-                .table = table,
-                .source_artifact = source_artifact,
-                .resolution_artifact = resolution_artifact,
-            };
+                .table = cfg.table,
+                .source_artifact = cfg.source_artifact,
+                .resolution_artifact = cfg.resolution_artifact,
+            }).clone(alloc);
             initialized += 1;
         }
 
@@ -34751,9 +34895,11 @@ pub const DB = struct {
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         if (comptime !builtin.is_test and (builtin.single_threaded or builtin.os.tag == .freestanding)) return;
         if (!builtin.is_test and (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer)) return;
+        if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm)
+            self.native_query_cleanup.start(.{ .name = "native query cache cleanup", .ptr = self, .runtime = self.backend_runtime, .turn = collectNativeQueryCaches });
         if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm and
             self.core.identity_namespace.table_id != 0 and self.backend_runtime.query_cut_repository != null and
-            self.backend_runtime.query_cut_repository.?.vtable.warm != null and self.backend_runtime.query_cut_repository.?.limits.max_cuts > 1)
+            self.backend_runtime.query_cut_repository.?.warming_enabled)
             self.native_query_warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
         self.quarantine_recovery.start(.{
             .ptr = self,
@@ -40254,6 +40400,18 @@ pub const DB = struct {
         };
         var writes: std.ArrayList(types.BatchWrite) = .empty;
         var timestamps: std.ArrayList(staging.Timestamp) = .empty;
+        const document_timestamps = relationalColumns(source) == null;
+        var version_floor: u64 = 0;
+        if (document_timestamps) {
+            const watermark = source.core.store.get(owned, ttl_mod.document_version_watermark_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (watermark) |bytes| {
+                if (bytes.len != 8) return error.InvalidTimestamp;
+                version_floor = std.mem.readInt(u64, bytes[0..8], .little);
+            }
+        }
         var historical: ?schema_registry_mod.SchemaView = null;
         defer if (historical) |*view| view.release();
         var bytes: usize = 0;
@@ -40285,6 +40443,7 @@ pub const DB = struct {
             };
             if (!self.core.byteRange().contains(document_key)) return error.RestoreStagingScopeChanged;
             var timestamp: u64 = 0;
+            var ttl_source_ns: ?i128 = null;
             var json_null_fields: []const []const u8 = &.{};
             const json = if (internal_keys.isRelationalRowKey(row.key)) logical: {
                 if (program) |rewrite| {
@@ -40304,7 +40463,17 @@ pub const DB = struct {
                 json_null_fields = try typed.jsonNullFieldsAlloc(owned);
                 break :logical try typed.reconstructValueAlloc(owned);
             } else logical: {
-                timestamp = try source.getTimestamp(owned, document_key);
+                const timestamp_key = try internal_keys.ttlKeyAlloc(owned, document_key);
+                const timestamp_raw = source.core.store.get(owned, timestamp_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (timestamp_raw) |timestamp_bytes| {
+                    const metadata = ttl_mod.decodeTimestamp(timestamp_bytes) orelse return error.InvalidTimestamp;
+                    timestamp = metadata.version;
+                    ttl_source_ns = metadata.source;
+                    version_floor = @max(version_floor, timestamp);
+                }
                 if (program) |rewrite| break :logical try rewrite.preserveDocument(owned, row.value);
                 break :logical try owned.dupe(u8, row.value);
             };
@@ -40317,7 +40486,7 @@ pub const DB = struct {
             // not treated as new API input that fills today's defaults or
             // recomputes (and thereby repairs) stored generated results.
             try writes.append(owned, .{ .key = document_key, .value = json, .json_null_fields = json_null_fields });
-            try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp });
+            try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp, .ttl_source_ns = ttl_source_ns });
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update(&next.logical_digest);
             var length: [8]u8 = undefined;
@@ -40341,7 +40510,7 @@ pub const DB = struct {
         }
         next.cursor = try owned.dupe(u8, next.cursor);
         const encoded = try next.encode(owned);
-        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items };
+        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items, .document_timestamps = if (document_timestamps) .{ .version_floor = version_floor } else null };
         return .{
             .arena = arena,
             .phase = next.phase,
@@ -42740,7 +42909,7 @@ pub const DB = struct {
                 else
                     null;
                 if (state.ttl_duration_ns != 0) {
-                    const timestamp = if (relational)
+                    const timestamp: ?i128 = if (relational)
                         ordinal_row.?.writeTimestampNs()
                     else blk: {
                         state.ttl_key_scratch.clearRetainingCapacity();
@@ -42751,11 +42920,11 @@ pub const DB = struct {
                             else => return err,
                         };
                         break :blk if (timestamp_bytes) |value|
-                            if (value.len >= @sizeOf(u64)) std.mem.readInt(u64, value[0..8], .little) else 0
+                            ttl_mod.sourceTimestamp(value)
                         else
-                            0;
+                            null;
                     };
-                    if (timestamp != 0 and ttl_mod.isExpired(timestamp, state.ttl_duration_ns, state.now_ns))
+                    if (timestamp != null and ttl_mod.isExpired(timestamp.?, state.ttl_duration_ns, state.now_ns))
                         return .@"continue";
                 }
 
@@ -45219,6 +45388,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
         return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -45309,11 +45479,15 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        return self.collectExplicitTextStatsWithPrivacyPolicy(alloc, requests, null);
+    }
+
+    pub fn collectExplicitTextStatsWithPrivacyPolicy(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest, privacy_policy_version: ?[64]u8) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -45326,11 +45500,20 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        return self.collectExplicitBackgroundTextStatsWithPrivacyPolicy(alloc, requests, null);
+    }
+
+    pub fn collectExplicitBackgroundTextStatsWithPrivacyPolicy(
+        self: *DB,
+        alloc: Allocator,
+        requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+        privacy_policy_version: ?[64]u8,
+    ) ![]const aggregations_mod.DistributedBackgroundTextStats {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -45663,7 +45846,7 @@ pub const DB = struct {
         var kept = std.ArrayListUnmanaged([]const u8).empty;
         defer kept.deinit(alloc);
         for (doc_ids, timestamps) |doc_id, ts| {
-            if (ts != 0 and ttl_mod.isExpired(ts, duration_ns, expiry_now)) continue;
+            if (ts != null and ttl_mod.isExpired(ts.?, duration_ns, expiry_now)) continue;
             try kept.append(alloc, doc_id);
         }
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, kept.items, generation);
@@ -52114,6 +52297,7 @@ const ttlTimestampNsFromJsonValue = local_mutation.ttlTimestampNsFromJsonValue;
 const ttlTimestampNsFromString = local_mutation.ttlTimestampNsFromString;
 
 const encodeTimestampValue = local_mutation.encodeTimestampValue;
+const encodeDocumentTimestampValue = local_mutation.encodeDocumentTimestampValue;
 
 fn ttlDurationNs(self: *DB) u64 {
     var schema_view = self.core.acquireSchemaView();
@@ -52124,15 +52308,14 @@ fn ttlDurationNs(self: *DB) u64 {
 fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
     const duration_ns = ttlDurationNs(self);
     if (duration_ns == 0) return false;
-    const ts = try self.getTimestamp(alloc, key);
-    if (ts == 0) return false;
+    const ts = (try ttl_mod.readSourceTimestamp(self.core.store, alloc, key)) orelse return false;
     return ttl_mod.isExpired(ts, duration_ns, currentTimeNs());
 }
 
-fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]u64 {
-    const timestamps = try alloc.alloc(u64, keys.len);
+fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?i128 {
+    const timestamps = try alloc.alloc(?i128, keys.len);
     errdefer alloc.free(timestamps);
-    @memset(timestamps, 0);
+    @memset(timestamps, null);
     if (keys.len == 0) return timestamps;
 
     const PendingTimestampLoad = struct {
@@ -52175,8 +52358,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
 
     for (pending.items, 0..) |item, i| {
         const raw = read_values[i] orelse continue;
-        if (raw.len != 8) continue;
-        timestamps[item.original_index] = std.mem.readInt(u64, raw[0..8], .little);
+        timestamps[item.original_index] = ttl_mod.sourceTimestamp(raw) orelse continue;
     }
     return timestamps;
 }
@@ -52310,8 +52492,7 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     const timestamps = try loadDocumentTimestampsMany(self, alloc, parent_ids);
     defer alloc.free(timestamps);
     for (timestamps, 0..) |ts, i| {
-        if (ts == 0) continue;
-        keep[i] = !ttl_mod.isExpired(ts, duration_ns, expiry_now);
+        if (ts) |source| keep[i] = !ttl_mod.isExpired(source, duration_ns, expiry_now);
     }
     return keep;
 }
@@ -53217,7 +53398,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             }
         }
         for (guard.candidates) |candidate| {
-            const current = (try ttl_mod.readTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
+            const current = (try ttl_mod.readSourceTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
             if (current != candidate.timestamp_ns or
                 !ttl_mod.isExpiredWithGrace(current, guard.duration_ns, guard.grace_period_ns, guard.now_ns)) continue;
             try eligible.append(ctx.alloc, candidate.key);
@@ -74635,7 +74816,75 @@ test "db idle dense query captures retain the same immutable runs" {
     }
 }
 
-test "db native checkpoint warming skips unchanged expired cuts and resumes on content changes" {
+test "db native checkpoint discovery probes a repository once before capture" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cut = @import("native_query_cut.zig");
+    const port = @import("native_query_cut_repository.zig");
+    const Namespace = @import("doc_identity_namespace.zig").Namespace;
+    const Fixture = struct {
+        references: usize = 0,
+        publications: usize = 0,
+        committed: bool = false,
+        fn publish(raw: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.publications += 1;
+        }
+        fn recover(_: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn reference(raw: *anyopaque, _: port.Executor, _: cut.Request, _: Namespace, _: port.Storage, _: types.CancellationToken) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return self.committed;
+        }
+    };
+    var directory = try TestDirectory.init("native-discovery-once");
+    defer directory.cleanup();
+    const path = directory.path();
+    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{path});
+    defer a.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(io, pins) catch {};
+    var db = try DB.open(a, path, .{
+        .no_sync = true,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+    var fixture: Fixture = .{};
+    const previous_repository = db.backend_runtime.query_cut_repository;
+    defer db.backend_runtime.query_cut_repository = previous_repository;
+    db.backend_runtime.query_cut_repository = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.publish, .recover = Fixture.recover, .reference = Fixture.reference } };
+    const previous_storage = db.primary_lsm_storage;
+    defer db.primary_lsm_storage = previous_storage;
+    var native = try lsm_backend_mod.storage_io.NativeStorage.init(a, .threaded);
+    defer native.deinit();
+    for ([_]bool{ true, false }) |custom_storage| {
+        db.primary_lsm_storage = if (custom_storage) native.storage() else null;
+        const id: [64]u8 = @splat(if (custom_storage) @as(u8, 'a') else @as(u8, 'b'));
+        const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        fixture.references = 0;
+        fixture.committed = false;
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectEqual(@as(usize, 1), fixture.references);
+        // A committed binding must bypass capture even without open_read or
+        // an owner-local hint. Holding the snapshot lock makes that observable.
+        fixture.references = 0;
+        fixture.committed = true;
+        try std.testing.expect(db.snapshot_publication_mutex.tryLock());
+        defer db.snapshot_publication_mutex.unlock();
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectEqual(@as(usize, 1), fixture.references);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.publications);
+}
+
+test "db native checkpoint warming keeps one local slot and promotes only requested cursors" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const cut = @import("native_query_cut.zig");
@@ -74647,12 +74896,11 @@ test "db native checkpoint warming skips unchanged expired cuts and resumes on c
         fn unexpected(_: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
             return error.TestUnexpectedResult;
         }
-        fn warm(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: types.CancellationToken, _: u64) !bool {
+        fn publish(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: types.CancellationToken) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var receiver = try executor.receive();
             try cut.validate(std.testing.allocator, receiver.io(), root, request, namespace, cancellation);
             self.calls += 1;
-            return true;
         }
     };
     var fixture: Fixture = .{};
@@ -74684,37 +74932,68 @@ test "db native checkpoint warming skips unchanged expired cuts and resumes on c
     defer db.close();
     const previous_repository = db.backend_runtime.query_cut_repository;
     defer db.backend_runtime.query_cut_repository = previous_repository;
-    db.backend_runtime.query_cut_repository = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.unexpected, .recover = Fixture.unexpected, .warm = Fixture.warm } };
+    db.backend_runtime.query_cut_repository = .{ .warming_enabled = true, .ptr = &fixture, .vtable = &.{ .publish = Fixture.publish, .recover = Fixture.unexpected } };
+    db.backend_runtime.query_cut_repository.?.limits.max_cuts = 1;
     try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\",\"embedding\":[1,0]}" }}, .sync_level = .full_index });
     try db.runUntilIdle();
     try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var state = (try warming.readState(arena.allocator(), io, state_path)).?;
-    try std.testing.expect(state.source_digest != null);
-    const sequence = db.core.nextDerivedSequence();
-    // Simulate many elapsed ticks and expiry without wall-clock sleeps. A cut
-    // is optional warming, so expiry alone must never force a new snapshot.
-    state.next_ms = 0;
-    state.request.expires_ms = 1;
-    try warming.writeState(a, io, state_path, state);
+    const scratch = arena.allocator();
+    const first = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expect(first.local_only and first.complete and first.source_digest != null);
+    const warm_root = try cut.pathAlloc(scratch, path, first.request.id);
+    try std.Io.Dir.cwd().access(io, warm_root, .{});
     for (0..8) |_| try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    const same = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expectEqualStrings(first.request.id, same.request.id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    // Renew unchanged expired local metadata without publishing anything. A
+    // torn hint/manifest renewal is disposable and must self-heal on retry.
+    var expired = same;
+    expired.request.expires_ms = 1;
+    try cut.renewWarm(a, io, warm_root, same.request, expired.request, db.core.identity_namespace, .none);
+    try warming.writeState(a, io, state_path, expired);
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    const renewed = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expect(renewed.request.expires_ms > cut.nowMs());
+    try warming.writeState(a, io, state_path, expired); // manifest is newer
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    // Foreground promotion creates an independent authority with the requested
+    // expiry, without any speculative provider publication.
+    const request: cut.Request = .{ .id = &@as([64]u8, @splat('f')), .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    var reader = try db.openQueryCut(request, .none);
+    defer reader.close();
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
-    // Same-watermark changes must invalidate warming as they invalidate query
-    // reuse. Checking only the source sequence would miss this revision.
-    _ = db.core.store.query_generation_revision.fetchAdd(1, .acq_rel);
-    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    const promoted_root = try cut.pathAlloc(scratch, path, request.id);
+    const backup = @import("native_backup.zig");
+    const old_bytes = try backup.readFileAlloc(scratch, io, try std.fs.path.join(scratch, &.{ warm_root, "query-cut.json" }), backup.max_manifest_bytes);
+    const new_bytes = try backup.readFileAlloc(scratch, io, try std.fs.path.join(scratch, &.{ promoted_root, "query-cut.json" }), backup.max_manifest_bytes);
+    const old_manifest = try std.json.parseFromSliceLeaky(cut.Manifest, scratch, old_bytes, .{});
+    const new_manifest = try std.json.parseFromSliceLeaky(cut.Manifest, scratch, new_bytes, .{});
+    try std.testing.expectEqual(request.expires_ms, new_manifest.request.expires_ms);
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(scratch, old_manifest.files, .{}), try std.json.Stringify.valueAlloc(scratch, new_manifest.files, .{}));
+    // Changes replace the optional slot without invalidating an issued reader.
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"updated\",\"embedding\":[0,1]}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
     try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
-    // A different owner epoch also invalidates a persisted completed hint.
+    const replaced = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expectEqualStrings(first.request.id, replaced.request.id);
+    try std.testing.expect(replaced.sequence != first.sequence);
+    const original = (try reader.get(a, "doc")).?;
+    defer a.free(original);
+    try std.testing.expect(std.mem.indexOf(u8, original, "original") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    // Reopening an owner invalidates its optional digest, and a tiny optional
+    // budget cannot evict the foreground generation or publish remote bytes.
     db.local_execution.native_query_reuse_epoch_ready = false;
+    db.backend_runtime.query_cut_repository.?.warming_max_bytes = 1;
     try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+    try std.Io.Dir.cwd().access(io, promoted_root, .{});
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 test "db index catalog barrier disables published dense fast path" {
@@ -127113,7 +127392,7 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
     try std.testing.expectError(error.ForeignKeyCoordinationRequired, executeDeleteBatchContext(&context.batch, &.{"parent"}, .full_index, null));
 }
 
-test "db primary digest guards projected rows with unchanged custom ttl timestamps" {
+test "db primary digest guards projected rows with unchanged custom ttl timestamps including time series" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "document", "relational" }) |mode| {
         var path = try TestDirectory.init("ttl-primary-observation");
@@ -127125,15 +127404,15 @@ test "db primary digest guards projected rows with unchanged custom ttl timestam
         , .{mode});
         defer alloc.free(schema);
         try db.setSchemaJson(alloc, schema);
-        // Keep expiry well in the future, while deliberately preserving the
-        // timestamp across two distinct row images.
+        // Keep expiry well in the future. Explicitly reuse a mutation timestamp
+        // to verify the stronger digest fence independently of event time.
         const old_json = "{\"id\":1,\"expires\":\"2090-01-01T00:00:00Z\",\"value\":1}";
         const new_json = "{\"id\":1,\"expires\":\"2090-01-01T00:00:00Z\",\"value\":2}";
-        try db.batch(.{ .writes = &.{.{ .key = "row", .value = old_json }} });
+        try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = old_json }} });
         var before = (try db.lookup(alloc, "row", .{ .fields = &.{"id"}, .include_all_fields = false, .include_primary_digest = true })).?;
         defer before.deinit(alloc);
         try std.testing.expect(before.expected_content_digest != null and before.version != null);
-        try db.batch(.{ .writes = &.{.{ .key = "row", .value = new_json }} });
+        try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = new_json }} });
         var after = (try db.lookup(alloc, "row", .{ .include_primary_digest = true })).?;
         defer after.deinit(alloc);
         try std.testing.expectEqual(before.version, after.version);
@@ -149446,6 +149725,44 @@ test "privacy primed roots preserve durable retry deadlines and healthy consumer
     try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
 }
 
+test "db publication witness compact and legacy prefixes retire only the deleted document" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-witness-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .primary_backend = .{ .mem = .{} },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer db.close();
+    const document = try a.alloc(u8, internal_keys.inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'x');
+    try db.batch(.{ .writes = &.{ .{ .key = document, .value = "{}" }, .{ .key = "neighbor", .value = "{}" } }, .sync_level = .write });
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, document, "asset", "proof");
+    defer a.free(artifact);
+    const neighbor = try internal_keys.artifactNamedPrefixAlloc(a, "neighbor", "asset", "proof");
+    defer a.free(neighbor);
+    const privacy = @import("../../privacy/local_publication.zig");
+    const local = @import("artifact_local_publication.zig");
+    const metadata = [_][]u8{ try privacy.key(a, artifact), try privacy.legacyKey(a, artifact), try local.key(a, artifact), try local.legacyKey(a, artifact) };
+    defer for (metadata) |key| a.free(key);
+    const neighbor_key = try privacy.key(a, neighbor);
+    defer a.free(neighbor_key);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        for (metadata) |key| try write.put(key, "proof");
+        try write.put(neighbor_key, "published neighbor");
+        try write.commit();
+    }
+    try db.batch(.{ .deletes = &.{document}, .sync_level = .write });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    for (metadata) |key| try std.testing.expectError(error.NotFound, read.get(key));
+    try std.testing.expectEqualStrings("published neighbor", try read.get(neighbor_key));
+}
+
 test "privacy discovery regenerates completed artifacts whose local publication witness was not restored" {
     const a = std.testing.allocator;
     const privacy = @import("../../privacy/document.zig");
@@ -149600,6 +149917,493 @@ test "privacy protected hit hydration bounds row scratch and retains only select
     }
 }
 
+test "time series corrections fence mutations independently of event time" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("series-correction-versions");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    for ([_][]const u8{ "2026-11-06T12:00:00Z", "1970-01-01T00:00:00Z", "1969-12-31T23:59:59Z" }) |observed| {
+        const source = @import("../../datetime.zig").parseRfc3339ToSignedNs(observed).?;
+        const first = try std.fmt.allocPrint(a, "{{\"observed_at\":\"{s}\",\"v\":1}}", .{observed});
+        defer a.free(first);
+        const corrected = try std.fmt.allocPrint(a, "{{\"observed_at\":\"{s}\",\"v\":2}}", .{observed});
+        defer a.free(corrected);
+        try db.batch(.{ .timestamp_ns = 111, .writes = &.{.{ .key = observed, .value = first }} });
+        const initial_version = try db.getTimestamp(a, observed);
+        try std.testing.expect(initial_version != 0);
+        try db.batch(.{ .timestamp_ns = 222, .writes = &.{.{ .key = observed, .value = corrected }}, .predicates = &.{.{ .key = observed, .expected_version = initial_version }} });
+        try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .timestamp_ns = 333, .writes = &.{.{ .key = observed, .value = first }}, .predicates = &.{.{ .key = observed, .expected_version = initial_version }} }));
+        const corrected_version = try db.getTimestamp(a, observed);
+        try std.testing.expect(corrected_version > initial_version);
+        try std.testing.expectEqual(@as(?i128, source), try ttl_mod.readSourceTimestamp(db.core.store, a, observed));
+        const actual = (try db.get(a, observed)).?;
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(corrected, actual);
+        // Replay restores identity instead of minting a receiver-side version.
+        var restored: std.StringHashMapUnmanaged(u64) = .empty;
+        defer restored.deinit(a);
+        try restored.put(a, "restored", corrected_version);
+        try db.batchInternal(.{ .timestamp_ns = 999, .writes = &.{.{ .key = "restored", .value = corrected }} }, null, .{ .restore_timestamps = &restored, .preserve_logical_values = true });
+        try std.testing.expectEqual(corrected_version, try db.getTimestamp(a, "restored"));
+        try std.testing.expectEqual(@as(?i128, source), try ttl_mod.readSourceTimestamp(db.core.store, a, "restored"));
+    }
+    // An existing eight-byte record upgrades on its first correction.
+    const legacy_source: u64 = 1_793_966_400_000_000_000;
+    const legacy = "{\"observed_at\":\"2026-11-06T12:00:00Z\",\"v\":1}";
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = legacy_source, .writes = &.{.{ .key = "legacy", .value = legacy }} });
+    try db.batch(.{ .timestamp_ns = 444, .writes = &.{.{ .key = "legacy", .value = legacy }}, .predicates = &.{.{ .key = "legacy", .expected_version = legacy_source }} });
+    db.close();
+    db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    try std.testing.expectEqual(legacy_source + 1, try db.getTimestamp(a, "legacy"));
+    try std.testing.expectEqual(@as(?i128, legacy_source), try ttl_mod.readSourceTimestamp(db.core.store, a, "legacy"));
+}
+
+test "time series historical TTL sources preserve write versions and signed visibility" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("historical-ttl");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    try db.batch(.{
+        .timestamp_ns = 12345,
+        .writes = &.{.{ .key = "historical", .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":1}" }},
+    });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical"));
+    const value = (try db.get(a, "historical")) orelse return error.TestUnexpectedResult;
+    a.free(value);
+    var reading = (try db.lookup(a, "historical", .{ .include_primary_digest = true })) orelse return error.TestUnexpectedResult;
+    defer reading.deinit(a);
+    try std.testing.expectEqual(@as(?u64, 12345), reading.version);
+    var restored_versions: std.StringHashMapUnmanaged(u64) = .empty;
+    defer restored_versions.deinit(a);
+    try restored_versions.put(a, "historical_restored", 12345);
+    try restored_versions.put(a, "fallback_restored", 12347);
+    try db.batchInternal(.{
+        .timestamp_ns = 99999,
+        .writes = &.{
+            .{ .key = "historical_restored", .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":1}" },
+            .{ .key = "fallback_restored", .value = "{}" },
+        },
+    }, null, .{ .restore_timestamps = &restored_versions, .preserve_logical_values = true });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, 12347), try ttl_mod.readSourceTimestamp(db.core.store, a, "fallback_restored"));
+    // Receiver schema changes must not replace the snapshot's source instant.
+    try db.setSchema(.{ .version = 2 });
+    var sources: std.StringHashMapUnmanaged(i128) = .empty;
+    defer sources.deinit(a);
+    try sources.put(a, "historical_restored", -2_000_000_000);
+    try db.batchInternal(.{ .writes = &.{.{ .key = "historical_restored", .value = "{}" }} }, null, .{ .restore_timestamps = &restored_versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, -2_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
+    try db.setSchema(.{ .version = 3, .ttl_field = "observed_at", .ttl_duration_ns = std.time.ns_per_day });
+    try db.batch(.{
+        .timestamp_ns = 12346,
+        .writes = &.{.{ .key = "epoch", .value = "{\"observed_at\":\"1970-01-01T00:00:00Z\",\"v\":2}" }},
+    });
+    try std.testing.expect(try db.getTimestamp(a, "epoch") > 12345);
+    try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch"));
+    try std.testing.expect((try db.get(a, "historical")) == null);
+    try std.testing.expect((try db.lookup(a, "historical", .{})) == null);
+    try std.testing.expect((try db.get(a, "epoch")) == null);
+    var result = try db.search(a, .{ .query = .{ .match_all = {} }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .batch_size = 8, .grace_period_ns = 0 });
+    try db.ttl_runtime.?.runOnce();
+    try db.runUntilIdle();
+    try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "historical")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "epoch"));
+    try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch")) == null);
+}
+
+test "time series durable revisions survive frozen rollback zero clocks and deletion ABA" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("series-durable-revisions");
+    defer dir.cleanup();
+    var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    var previous: u64 = 0;
+    for ([_]u64{ 100, 100, 10, 0, 0 }) |wall| {
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = wall, .writes = &.{.{ .key = "reading", .value = "{\"at\":\"1970-01-01T00:00:00Z\",\"v\":1}" }} });
+        const next = try db.getTimestamp(a, "reading");
+        try std.testing.expect(next > previous);
+        try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "reading"));
+        previous = next;
+    }
+    try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "reading", .value = "{}" }}, .predicates = &.{.{ .key = "reading", .expected_version = 1 }} }));
+    try std.testing.expectEqual(previous, try db.getTimestamp(a, "reading"));
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+    db.close();
+    db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "reading", .value = "{}" }} });
+    try std.testing.expectEqual(previous + 2, try db.getTimestamp(a, "reading"));
+    // Historical admission rejects negative sources without committing a row
+    // or leaking a partially prepared timestamp key.
+    try std.testing.expectError(error.InvalidArgument, db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "rejected", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" }} }));
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "rejected"));
+    // Untagged historical commands replay their original event-time version.
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "old", .value = "{\"at\":\"1970-01-01T00:00:01Z\"}" }} });
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), try db.getTimestamp(a, "old"));
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "old", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s + 1), try db.getTimestamp(a, "old"));
+}
+
+test "time series retained afterimages preserve signed sources across restart and receiver policy" {
+    const a = std.testing.allocator;
+    const retained = @import("../retained_effects.zig");
+    const frame = @import("../retained_frame.zig");
+    for ([_]bool{ false, true }) |large| {
+        var dir = try TestDirectory.init("series-source-retention");
+        defer dir.cleanup();
+        var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+        try db.batch(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} });
+        var ns: retained.Namespace = undefined;
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            ns = (try txn.get(&internal_keys.identity_namespace_key))[0..24].*;
+            _ = try retained.admitWithSourceCapabilities(&txn, ns, 1, @splat(9), retained.default_limit, large, true, large, true);
+            try txn.commit();
+        }
+        const padding = try a.alloc(u8, if (large) 2 * 1024 * 1024 else 0);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const json = try std.fmt.allocPrint(a, "{{\"at\":\"1969-12-31T23:59:59Z\",\"padding\":\"{s}\"}}", .{padding});
+        defer a.free(json);
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "reading", .value = json }} });
+        db.close();
+        db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cache = try a.create(frame.View.ChunkCache);
+        defer a.destroy(cache);
+        const cache_bytes = try a.alloc(u8, frame.chunk_bytes);
+        defer a.free(cache_bytes);
+        cache.* = .{ .bytes = cache_bytes };
+        var captured = (try retained.readFrame(&read, ns, 1, @splat(9), 0, cache)).?;
+        try std.testing.expectEqual(large, captured == .chunked);
+        const source: [16]u8 = switch (captured) {
+            .contiguous => |*reader| (try reader.next()).?.ttl_source.?,
+            .chunked => |view| (try view.effectAt(0, cache)).ttl_source.?,
+        };
+        try std.testing.expectEqual(@as(i128, -std.time.ns_per_s), std.mem.readInt(i128, &source, .little));
+        var target_dir = try TestDirectory.init("series-retention-target");
+        defer target_dir.cleanup();
+        var target = try DB.open(a, target_dir.path(), .{ .start_optional_runtimes = false });
+        defer target.close();
+        var versions: std.StringHashMapUnmanaged(u64) = .empty;
+        defer versions.deinit(a);
+        var sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer sources.deinit(a);
+        try versions.put(a, "reading", 100);
+        try sources.put(a, "reading", std.mem.readInt(i128, &source, .little));
+        try target.batchInternal(.{ .writes = &.{.{ .key = "reading", .value = json }} }, null, .{ .restore_timestamps = &versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
+        try std.testing.expectEqual(@as(u64, 100), try target.getTimestamp(a, "reading"));
+        try std.testing.expectEqual(@as(?i128, -std.time.ns_per_s), try ttl_mod.readSourceTimestamp(target.core.store, a, "reading"));
+        // The final transaction's allocator floor survives removal of the
+        // live sidecar, in both inline and descriptor-backed retained frames.
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+        var deleted_read = try db.core.store.beginReadTxn();
+        defer deleted_read.abort();
+        var deleted = (try retained.readFrame(&deleted_read, ns, 1, @splat(9), 1, cache)).?;
+        try std.testing.expectEqual(large, deleted == .chunked);
+        const deletion_version = switch (deleted) {
+            .contiguous => |*reader| (try reader.next()).?.timestamp,
+            .chunked => |view| (try view.effectAt(0, cache)).timestamp,
+        };
+        try std.testing.expectEqual(@as(u64, 101), deletion_version);
+        // Restored live versions seed the allocator before any later source
+        // floor arrives, including a delete followed by clock rollback.
+        try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+        try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "reading", .value = "{}" }} });
+        try std.testing.expect((try target.getTimestamp(a, "reading")) > 100);
+    }
+}
+
+test "time series portable document codec preserves signed TTL and write versions" {
+    const a = std.testing.allocator;
+    const entries = [_]backup_codec.DocumentEntry{
+        .{ .key = "historical", .value_flags = 0, .value = "{}", .timestamp_ns = 123, .ttl_source_ns = -1_000_000_000 },
+        .{ .key = "legacy", .value_flags = 0, .value = "{}", .timestamp_ns = 456 },
+    };
+    const encoded = try backup_codec.encodeDocumentBatch(a, &entries);
+    defer a.free(encoded);
+    try std.testing.expectEqual(@as(u32, 2), try backup_codec.documentBatchEntryCount(encoded));
+    const borrowed = try backup_codec.decodeDocumentBatchBorrowed(a, encoded);
+    defer a.free(borrowed);
+    const owned = try backup_codec.decodeDocumentBatch(a, encoded);
+    defer {
+        for (owned) |entry| {
+            a.free(entry.key);
+            a.free(entry.value);
+        }
+        a.free(owned);
+    }
+    for ([_][]backup_codec.DocumentEntry{ borrowed, owned }) |decoded| {
+        try std.testing.expectEqual(@as(u64, 123), decoded[0].timestamp_ns);
+        try std.testing.expectEqual(@as(?i128, -1_000_000_000), decoded[0].ttl_source_ns);
+        try std.testing.expectEqual(@as(?i128, null), decoded[1].ttl_source_ns);
+    }
+    for (0..encoded.len) |length| {
+        try std.testing.expectError(if (length < 4) error.BatchTooShort else error.Truncated, backup_codec.documentBatchEntryCount(encoded[0..length]));
+    }
+}
+
+test "time series pinned Cypher uses signed source for visibility and revision for version" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("series-cypher-timestamps");
+    defer dir.cleanup();
+    var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 5 * std.time.ns_per_s });
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 100, .writes = &.{.{ .key = "legacy", .value = "{}" }} });
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 200, .writes = &.{
+        .{ .key = "negative", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" },
+        .{ .key = "epoch", .value = "{\"at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "future", .value = "{\"at\":\"1970-01-01T00:00:10Z\"}" },
+    } });
+    for ([_]u64{ 3 * std.time.ns_per_s, 6 * std.time.ns_per_s }) |now| {
+        var fence = (try db.tryStatementReadFence()) orelse return error.CypherSnapshotNotReady;
+        defer fence.release();
+        var cut = try db.captureCypherSelectedSnapshot(a, &fence, &.{}, now, .{});
+        defer cut.deinit();
+        fence.release();
+        const rows = try db.getCypherPinnedDocuments(a, &cut, &.{ "legacy", "negative", "epoch", "future" }, .{});
+        defer {
+            for (rows) |row| if (row) |value| {
+                var owned = value;
+                owned.deinit(a);
+            };
+            a.free(rows);
+        }
+        for (rows, 0..) |row, i| {
+            const visible = now == 3 * std.time.ns_per_s or i == 3;
+            try std.testing.expectEqual(visible, row != null);
+            if (row) |value| try std.testing.expectEqual(@as(u64, if (i == 0) 100 else 200), value.version);
+        }
+    }
+}
+
+test "time series graph TTL reconstructs admitted lifetimes and validates before mutation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("series-graph-ttl-source");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    const admitted = currentTimeNs();
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = "{\"at\":\"1969-12-31T23:59:59Z\",\"ref\":[\"b\",\"c\"]}" }} });
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}" });
+    const writes = [_]types.GraphEdgeWrite{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "link", .ttl_created_ns = admitted }};
+    try db.core.index_manager.applyGraphWrites(&writes);
+    db.close();
+    db = try DB.open(a, directory.path(), options);
+    try db.core.index_manager.applyGraphWrites(&writes);
+    const graph = db.core.index_manager.graphIndex("g").?;
+    const limits: graph_mod.EdgePageLimits = .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 };
+    {
+        var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
+        defer edges.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), edges.edges.len);
+        try std.testing.expect(edges.edges[0].field_derived);
+    }
+    const timestamp_key = try internal_keys.ttlKeyAlloc(a, "a");
+    defer a.free(timestamp_key);
+    const original = try db.core.store.get(a, timestamp_key);
+    defer a.free(original);
+    try db.core.store.put(timestamp_key, "invalid");
+    graph.neighbor_source_sequence = 123;
+    try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }}));
+    try std.testing.expectEqual(@as(u64, 0), graph.neighbor_source_sequence);
+    {
+        var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
+        defer edges.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), edges.edges.len);
+        try std.testing.expectEqualStrings("b", edges.edges[0].target);
+    }
+    try db.core.store.put(timestamp_key, original);
+    try db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }});
+    var live = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + std.time.ns_per_hour - 1);
+    defer live.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), live.edges.len);
+    var expired = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + std.time.ns_per_hour);
+    defer expired.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), expired.edges.len);
+}
+
+test "time series staged restore preserves timestamp presence sources and deleted revision floor" {
+    const a = std.testing.allocator;
+    const staging = @import("restore_staging.zig");
+    const wire = @import("../../api/batch_internal.zig");
+    const adapter = @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter;
+    var source_dir = try TestDirectory.init("series-staging-source");
+    defer source_dir.cleanup();
+    var target_dir = try TestDirectory.init("series-staging-target");
+    defer target_dir.cleanup();
+    const source_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .start_index_workers = false, .start_optional_runtimes = false };
+    const target_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 20, .shard_id = 21, .range_id = 21 }, .start_index_workers = false, .start_optional_runtimes = false };
+    var source = try DB.open(a, source_dir.path(), source_options);
+    defer source.close();
+    var target = try DB.open(a, target_dir.path(), target_options);
+    defer target.close();
+    const schema: schema_mod.TableSchema = .{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day };
+    try source.setSchema(schema);
+    try target.setSchema(schema);
+    for (0..2) |_| try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "fallback", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{
+        .{ .key = "historical", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" },
+        .{ .key = "epoch", .value = "{\"at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "wide", .value = "{\"at\":\"9999-12-31T23:59:59.999999999Z\"}" },
+        .{ .key = "missing", .value = "{}" },
+        .{ .key = "legacy_epoch", .value = "{}" },
+    } });
+    try source.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 400, .writes = &.{.{ .key = "legacy", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 10_000, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 10_000, .deletes = &.{"deleted"} });
+    for ([_][]const u8{ "missing", "legacy_epoch" }) |key| {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(a, key);
+        defer a.free(timestamp_key);
+        if (std.mem.eql(u8, key, "missing")) try source.core.store.delete(timestamp_key) else try source.core.store.put(timestamp_key, &@as([8]u8, @splat(0)));
+    }
+    const cases = [_]struct { key: []const u8, version: u64, source: ?i128 }{
+        .{ .key = "fallback", .version = 101, .source = 100 },
+        .{ .key = "historical", .version = 102, .source = -std.time.ns_per_s },
+        .{ .key = "epoch", .version = 102, .source = 0 },
+        .{ .key = "wide", .version = 102, .source = 253402300799999999999 },
+        .{ .key = "legacy", .version = 400, .source = 400 },
+        .{ .key = "legacy_epoch", .version = 0, .source = 0 },
+        .{ .key = "missing", .version = 0, .source = null },
+    };
+    source.close();
+    var readonly = source_options;
+    readonly.open_mode = .query_readonly;
+    source = try DB.open(a, source_dir.path(), readonly);
+    const serialized = try schema_mod.serializeSchema(a, target.core.schema orelse .{});
+    defer a.free(serialized);
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = target_options.identity_namespace.?, .target_schema_digest = staging.digest(serialized) };
+    try target.reserveRestoreStaging(a, scope.plan_id, scope.plan_digest, scope.target_namespace);
+    try target.beginRestoreStaging(a, scope);
+    var index: u64 = 0;
+    for (0..20) |_| {
+        var page = try target.prepareRestoreStagingPage(a, scope, &source, 1, .none);
+        defer page.deinit();
+        if (page.batch) |request| {
+            const encoded = try wire.encodeBatchRequest(a, request);
+            defer a.free(encoded);
+            var decoded = try wire.parseInternalBatchRequest(a, encoded);
+            defer decoded.deinit(a);
+            try std.testing.expect(wire.requiresDocumentVersionsEnvelope(decoded.req));
+            // Missing source with a nonzero version is malformed, not a request
+            // to silently recompute retention under the receiver's schema.
+            if (request.writes.len != 0 and request.restore_staging.?.import_page.timestamps[0].timestamp != 0) {
+                var invalid = decoded.req;
+                var timestamp = invalid.restore_staging.?.import_page.timestamps[0];
+                timestamp.ttl_source_ns = null;
+                invalid.restore_staging.?.import_page.timestamps = &.{timestamp};
+                try std.testing.expectError(error.InvalidRestoreStagingCommand, target.batch(invalid));
+            }
+            index += 1;
+            try adapter.applyOrdered(&target, decoded.req, .{ .term = 1, .index = index });
+            try adapter.applyOrdered(&target, decoded.req, .{ .term = 1, .index = index });
+        }
+        target.close();
+        target = try DB.open(a, target_dir.path(), target_options);
+        if (page.phase == .imported) break;
+    } else return error.TestUnexpectedResult;
+    for (cases) |case| {
+        try std.testing.expectEqual(case.version, try target.getTimestamp(a, case.key));
+        try std.testing.expectEqual(case.source, try ttl_mod.readSourceTimestamp(target.core.store, a, case.key));
+    }
+    const floor = try target.core.store.get(a, ttl_mod.document_version_watermark_key);
+    defer a.free(floor);
+    try std.testing.expectEqual(@as(u64, 10_001), std.mem.readInt(u64, floor[0..8], .little));
+    try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } });
+    try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
+    try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, 10_002), try target.getTimestamp(a, "deleted"));
+}
+
+test "time series graph repair requires authoritative lifetimes across clock rollback" {
+    const a = std.testing.allocator;
+    const documents = [_][]const u8{ "{\"ref\":\"b\"}", "{\"ref\":\"b\",\"at\":\"1969-12-31T23:59:59Z\"}", "{\"ref\":\"b\",\"at\":\"1970-01-01T00:00:00Z\"}" };
+    for (0..6) |profile| {
+        const json = documents[profile % documents.len];
+        const mixed = profile >= documents.len;
+        var directory = try TestDirectory.init("series-graph-lifetime-authority");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        if (profile % documents.len != 0) try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+        const admitted = currentTimeNs();
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted + 10 * std.time.ns_per_hour, .writes = &.{.{ .key = "b", .value = "{}" }} });
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = json }} });
+        try std.testing.expect(try db.getTimestamp(a, "a") > admitted + 10 * std.time.ns_per_hour);
+        if (mixed) try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (mixed)
+            "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}],\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}"
+        else
+            "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}" });
+        // Neither a logical revision nor an event timestamp is an admission
+        // clock. Repair cannot invent the missing historical edge lifetime.
+        try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+        // Re-admitting the field document through the normal mutation path
+        // creates a durable, replicated edge artifact and lifetime record.
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = json }} });
+        try db.runUntilIdle();
+        const graph = db.core.index_manager.graphIndex("g").?;
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(a, "a", "g", "link", "b", "a");
+        defer a.free(artifact_key);
+        const state_key = try internal_keys.graphDirectStateKeyAlloc(a, "a", "g");
+        defer a.free(state_key);
+        const lifetime_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(a, artifact_key, "g", graph.config.coverage_generation, state_key);
+        defer a.free(lifetime_key);
+        const artifact = try db.core.store.get(a, artifact_key);
+        defer a.free(artifact);
+        var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(a, artifact);
+        defer edge.deinit(a);
+        try std.testing.expectEqual(admitted, edge.ttl_created_ns);
+        if (mixed) {
+            const lifetime = try db.core.store.get(a, lifetime_key);
+            defer a.free(lifetime);
+            try std.testing.expectEqual(admitted, std.mem.readInt(u64, lifetime[0..8], .big));
+        }
+        db.close();
+        db = try DB.open(a, directory.path(), options);
+        _ = try projectGraphFieldContributionsForRepair(db.async_context, "g", "a");
+        const reopened_graph = db.core.index_manager.graphIndex("g").?;
+        var live = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + std.time.ns_per_hour - 1);
+        defer live.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), live.edges.len);
+        var expired = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + 2 * std.time.ns_per_hour);
+        defer expired.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), expired.edges.len);
+        // A missing artifact can be reconstructed only when a contributor
+        // lifetime survives. Direct-only edges require explicit re-admission.
+        try db.core.store.delete(artifact_key);
+        if (!mixed) {
+            try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+            continue;
+        }
+        _ = try projectGraphFieldContributionsForRepair(db.async_context, "g", "a");
+        var recovered = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + 2 * std.time.ns_per_hour);
+        defer recovered.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), recovered.edges.len);
+        // Corrupt lifetime authority is rejected before applying field edges.
+        try db.core.store.put(lifetime_key, "invalid");
+        try std.testing.expectError(error.InvalidGraphEdgeTtlLifetime, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+    }
+}
+
 test "external vector compatibility declaration rejects missing and mismatched writer identity" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -149633,6 +150437,76 @@ test "external vector compatibility declaration rejects missing and mismatched w
     // Withdrawing the receipt permits an acquisition update to retain hidden
     // vector bytes; source search independently requires the exact receipt.
     try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+}
+
+test "relational prepared writes validate orphan vector receipts before releasing parsed rows" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("relational-vector-receipt-lifetime");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"metadata":{"type":"json"},"revision":{"type":"text"},"embedding":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    // Preparation releases its parsed wrapper even without text consumers.
+    // A plain typed write must never dereference it during commit.
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{}" }}, .sync_level = .full_index });
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+    });
+    // Validation cannot be skipped merely because there are no vector writes:
+    // a matching receipt without its authored vector is an invalid assertion.
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "orphan", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+        .sync_level = .full_index,
+    }));
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+}
+
+test "time series prepared rows validate external vector receipts" {
+    for ([_][]const u8{ "document", "relational" }) |mode| {
+        const alloc = std.testing.allocator;
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(path);
+        var db = try DB.open(alloc, path, .{});
+        defer db.close();
+        if (std.mem.eql(u8, mode, "relational")) {
+            const columns = [_]schema_mod.RelationalColumn{
+                .{ .name = "metadata", .path = "metadata", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true },
+                .{ .name = "revision", .path = "revision", .column_type = .string, .allows_null = true },
+            };
+            try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        }
+        try db.addIndex(.{
+            .name = "external_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+        });
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        }));
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        }));
+        try db.batch(.{
+            .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+            .sync_level = .full_index,
+        }));
+        // Withdrawing the receipt permits an acquisition update to retain hidden
+        // vector bytes; source search independently requires the exact receipt.
+        try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+    }
 }
 
 test "scalar text asset chunks track parent updates and retirement" {
@@ -149839,4 +150713,68 @@ test "source semantic media input PDF page output cannot bind unrelated chunk de
     try std.testing.expectEqualStrings("uri", request.source_field);
     try std.testing.expectEqual(@as(u32, 0), request.chunk_size);
     try @import("enrichment/enrichment_types.zig").validateGeneratedEmbeddingInput(request);
+}
+
+test "source semantic media input graph resolution replays without mention edges" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("knowledge-resolution-relevance");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"facts","path":"$.relations[*]"},"artifact":{"name":"facts","kind":"asset","source":{"type":"field","value":"facts"},"content_type":"application/json"}}
+    });
+    try db.addResolver(.{ .name = "entities", .table = "entities", .source_artifact = "facts", .resolution_artifact = "resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false });
+    const resolution = try internal_keys.resolutionArtifactKeyAlloc(a, "parent", "resolved");
+    defer a.free(resolution);
+    const ref = index_manager_mod.ManagedIndexRef{ .name = "knowledge", .kind = .graph };
+    try std.testing.expectEqual(@as(usize, 0), db.core.index_manager.graphArtifactSources("knowledge")[0].mention_edge_type.len);
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexBatchApplicability(db.core.index_manager, .{ .changed_artifact_keys = &.{resolution} }, ref));
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .changed_artifact_keys = &.{resolution} }, ref));
+}
+
+test "source semantic media input canonical relations publish without mention edges" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("knowledge-canonical-replay");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"facts","path":"$.relations[*]"},"artifact":{"name":"facts","kind":"asset","source":{"type":"field","value":"facts"},"content_type":"application/json"}}
+    });
+    try db.addResolver(.{ .name = "entities", .table = "default", .source_artifact = "facts", .resolution_artifact = "resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false });
+    try db.batch(.{ .writes = &.{.{ .key = "claim", .value =
+        \\{"facts":{"entities":[{"id":"e0","label":"person","text":"Alice"},{"id":"e1","label":"person","text":"Bob"}],"relations":[{"source":"e0","target":"e1","type":"KNOWS"}]}}
+    }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved");
+    defer a.free(resolution_key);
+    const resolution = try db.core.store.get(a, resolution_key);
+    defer a.free(resolution);
+    try std.testing.expect(std.mem.indexOf(u8, resolution, "entity/alice") != null);
+    const edges = try waitForGraphEdges(a, &db, "knowledge", "entity/alice", "KNOWS", .out, 1);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("entity/bob", edges[0].target);
+}
+
+test "source semantic media input native asset replay survives provider-free reconfiguration" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("native-asset-runtime-owner");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime == null);
+    try db.addEnrichment(.{ .name = "facts", .kind = .asset, .field = "facts", .content_type = "application/json" });
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime != null);
+    try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime != null);
+    try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
 }

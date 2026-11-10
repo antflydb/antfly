@@ -1623,7 +1623,8 @@ fn unsupportedCrossRangeQuery(req: db_mod.types.SearchRequest, query: graph_quer
     // Incoming projections are partitioned with their source-owned edge.
     // Both traversal and edge-reader plans use exact batched reverse-index
     // probes before fetching from positive source shards.
-    if (!query.params.deduplicate) return .deduplicate_nodes_must_be_true;
+    if (!query.params.deduplicate and query.query_type != .traverse and query.query_type != .neighbors)
+        return .deduplicate_nodes_must_be_true;
     if (!supportsSelectorRef(req, query.start_nodes)) return .start_selector_not_supported;
     if (query.target_nodes) |target_nodes| {
         if (!supportsSelectorRef(req, target_nodes)) return .target_selector_not_supported;
@@ -2002,6 +2003,7 @@ const QueryState = struct {
     // Path-producing traversal visits (root, table, key), so one root never
     // suppresses another root's evidence. PathState IDs are request local.
     traversal_seen: std.AutoHashMapUnmanaged(u32, graph_node_identity.Map(void)) = .empty,
+    traversal_deduplicate: bool = true,
     work_budget: ?*graph_pattern_mod.WorkBudget = null,
     seen_memory: ?graph_work_budget.RetainedAllocator = null,
     metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
@@ -2192,6 +2194,9 @@ const QueryState = struct {
     }
 
     fn putTraversalSeenIfAbsent(self: *QueryState, alloc: std.mem.Allocator, item: FrontierState, ref: graph_node_identity.Ref) !bool {
+        // Evidence traversal retains every relationship path, including cycles.
+        // Depth, result, physical-work and retained-state budgets still apply.
+        if (!self.traversal_deduplicate) return true;
         const path = item.path_state_id orelse return self.putSeenIfAbsent(alloc, ref);
         const root = self.path_states.items[path].root_id;
         const a = self.seenAllocator(alloc);
@@ -4083,6 +4088,11 @@ fn canonicalGraphStepInMemory(
     const scratch_alloc = memory.tracked.allocator();
     var table_scratch = graph_traversal_mod.MetadataScratch.init(scratch_alloc, null);
     errdefer table_scratch.deinit();
+    // Selectors carry public logical names; durable edge metadata carries
+    // physical identities. Compare only after the same authorization/cache
+    // used to route and hydrate these nodes has bound both table names.
+    const current_table_name = (try reader.admission.ensureTable(current_table)).table_name;
+    const expansion_table_name = (try reader.admission.ensureTable(expansion_table)).table_name;
     var edge_bytes: usize = 0;
     for (edges, 0..) |edge, edge_index| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
@@ -4092,7 +4102,7 @@ fn canonicalGraphStepInMemory(
         const evaluated = try reader.admission.evaluateEdge(params.edge_filter, edge, &table_scratch);
         if (!evaluated.matched) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;
-        const endpoint = @import("antfly_local_sources").graph_metadata_tables.adjacentInTables(edge, key, current_table, evaluated.source_table orelse expansion_table, evaluated.target_table orelse expansion_table, params.direction);
+        const endpoint = @import("antfly_local_sources").graph_metadata_tables.adjacentInTables(edge, key, current_table_name, evaluated.source_table orelse expansion_table_name, evaluated.target_table orelse expansion_table_name, params.direction);
         if (!endpoint.connected) continue;
         if (memory.descriptors.items.len == limit) {
             if (work_budget.remaining_nodes <= work_budget.remaining_edges)
@@ -5493,6 +5503,7 @@ fn executeDistributedTraverse(
     var state = QueryState{
         .name = try alloc.dupe(u8, graph_query.name),
         .work_budget = request_work_budget,
+        .traversal_deduplicate = graph_query.query.params.deduplicate,
     };
     defer state.deinit(alloc);
     try state.initMetrics(alloc, metric_reads);
@@ -5517,7 +5528,7 @@ fn executeDistributedTraverse(
     defer edge_batch.deinit();
     var read_cache = TraversalReadCache{};
     defer read_cache.deinit();
-    const reuse_reads = include_paths and state.traversal_seen.count() > 1;
+    const reuse_reads = !state.traversal_deduplicate or (include_paths and state.traversal_seen.count() > 1);
     const batch_edges = defer_result_limit or result_limit == 0;
     while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
         var completed_depth: u32 = 0;
@@ -5528,7 +5539,7 @@ fn executeDistributedTraverse(
             next_frontier.deinit(alloc);
         }
 
-        var root_groups = try RootFrontierGroups.init(alloc, request_work_budget, frontier, include_paths and state.traversal_seen.count() > 1);
+        var root_groups = try RootFrontierGroups.init(alloc, request_work_budget, frontier, reuse_reads);
         defer root_groups.deinit();
         var canonical_round = graph_canonical_edges;
         if (!canonical_round) {
@@ -11490,6 +11501,7 @@ fn makeGraphExpandRequestWithAlgebraicModeAndTargetConstraints(
     // exclusions. Node deduplication here would discard parallel fact weights.
     params.deduplicate = switch (named_query.query.query_type) {
         .shortest_path, .k_shortest_paths => false,
+        .neighbors, .traverse => named_query.query.params.deduplicate,
         else => true,
     };
     if (!params.deduplicate) params.max_results = 0;
@@ -18947,4 +18959,38 @@ test "incoming resolver qualification recognizes the owning logical table" {
     try std.testing.expect(!graphConfigHasForeignResolver(local_config.value, "docs", null));
     try std.testing.expect(!graphConfigHasForeignResolver(local_config.value, "table:7", "docs"));
     try std.testing.expect(graphConfigHasForeignResolver(local_config.value, "table:8", "other"));
+}
+
+test "system catalog evidence traversal preserves parallel paths and cycles under shared budgets" {
+    const a = std.testing.allocator;
+    var budget = graph_pattern_mod.WorkBudget.init(100, 100);
+    var state = QueryState{ .name = try a.dupe(u8, "evidence"), .work_budget = &budget, .traversal_deduplicate = false };
+    defer state.deinit(a);
+    const root = try appendRootPathState(a, &state, "alice", null);
+    const parent = FrontierState{ .key = @constCast("alice"), .path_state_id = root };
+    var next = std.ArrayListUnmanaged(FrontierState).empty;
+    defer {
+        for (next.items) |*item| item.deinit(a);
+        next.deinit(a);
+    }
+    const ids = [_][]const u8{ "claim-a", "claim-b" };
+    for (ids) |id| {
+        const edge = graph_query_mod.PathEdgeInfo{ .source = "alice", .target = "acme", .edge_type = "works_at", .edge_id = id, .owner_document = id, .weight = 1, .metadata = "" };
+        const node = graph_query_mod.GraphResultNode{ .key = "acme", .depth = 1, .distance = 1, .path_edges = &.{edge} };
+        try std.testing.expect((try mergeTraversalNode(a, &state, parent, node, null, true, 2, null, &next, &budget)) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.nodes.items.len);
+    for (ids, state.nodes.items) |id, node| try std.testing.expectEqualStrings(id, node.path_edges.?[0].edge_id);
+    const cycle = graph_query_mod.GraphResultNode{ .key = "alice", .depth = 1, .distance = 1 };
+    try std.testing.expect((try mergeTraversalNode(a, &state, next.items[0], cycle, null, true, 2, null, &next, &budget)) != null);
+    try std.testing.expectEqual(@as(u32, 2), state.nodes.items[2].depth);
+    try std.testing.expectEqual(@as(usize, 2), next.items.len);
+    try std.testing.expect(budget.retained_state_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 0), state.seen.count());
+    const named = db_mod.types.NamedGraphQuery{ .name = "evidence", .query = .{ .query_type = .traverse, .index_name = "g", .start_nodes = .{ .keys = &.{"alice"} }, .params = .{ .deduplicate = false, .include_paths = true, .max_depth = 2, .max_results = 10 } } };
+    var request = try makeGraphExpandRequestWithAlgebraicMode(a, named, &.{parent}, &.{0}, &.{}, &.{}, true, false);
+    defer request.deinit(a);
+    try std.testing.expect(!request.params.deduplicate);
+    try std.testing.expectEqual(@as(u32, 0), request.params.max_results);
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &.{named} }));
 }

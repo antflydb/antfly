@@ -64,7 +64,12 @@ def refusal_summary(error):
     accepted = headers.get("X-Accepted-GitHub-Permissions", "")
     required = [
         permission
-        for permission in ("actions=read", "contents=read", "contents=write")
+        for permission in (
+            "actions=read",
+            "checks=read",
+            "contents=read",
+            "contents=write",
+        )
         if permission
         in [value.strip() for value in accepted.replace(";", ",").split(",")]
     ]
@@ -77,28 +82,49 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GitHub:
-    def __init__(self, token):
+    def __init__(self, token, upstream_token=None):
         self.token = token
+        self.upstream_token = upstream_token
         self.opener = urllib.request.build_opener(NoRedirect)
 
     def request(self, path, method="GET", body=None):
+        repository = "/".join(path.split("/", 3)[:3])
+        upstream = repository == f"repos/{UPSTREAM}"
+        require(
+            repository == f"repos/{COLONY}" or (upstream and method == "GET"),
+            "Publisher request is outside its repository authority",
+        )
+        # A fine-grained Colony PAT need not grant access to Antfly, even for
+        # public reads. Keep credentials on their owning repository; use the
+        # read-only Antfly workflow token for forward-ancestry validation.
+        token = self.upstream_token if upstream else self.token
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            headers["Authorization"] = "Bearer " + token
         request = urllib.request.Request(
             API_ROOT + path,
             method=method,
             data=json.dumps(body).encode() if body is not None else None,
-            headers={
-                "Authorization": "Bearer " + self.token,
-                "User-Agent": USER_AGENT,
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+            headers=headers,
         )
         try:
             with self.opener.open(request, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            area = "Actions read" if "/actions/" in path else "repository contents"
+            area = (
+                "upstream ancestry read"
+                if upstream
+                else "validation check read"
+                if "/check-runs?" in path
+                else "Actions read"
+                if "/actions/" in path
+                else "Colony repository contents"
+            )
             raise PublicationError(
                 f"GitHub {method} {area} failed with HTTP {exc.code}; {refusal_summary(exc)}; no token/body logged"
             ) from None
@@ -180,12 +206,20 @@ def check_manifest(api, run, request):
         return None  # Older Colony validators publish the bounded ZIP instead.
     require(len(selected) == 1, "Ambiguous validation reports")
     check = selected[0]
+    # GitHub may replace the supplied workflow URL with this check's own URL.
+    # Accept only these exact identities; external_id still binds the request,
+    # workflow run and attempt, alongside the app and commit checks below.
     require(
         check.get("name") == MANIFEST_CHECK
         and check.get("app", {}).get("slug") == "github-actions"
         and check.get("head_sha") == run["head_sha"]
+        and type(check.get("id")) is int
+        and check["id"] > 0
         and check.get("details_url")
-        == f"https://github.com/{COLONY}/actions/runs/{run['id']}"
+        in (
+            f"https://github.com/{COLONY}/actions/runs/{run['id']}",
+            f"https://github.com/{COLONY}/runs/{check['id']}",
+        )
         and check.get("status") == "completed"
         and check.get("conclusion") == "success",
         "Untrusted validation report",
@@ -326,7 +360,7 @@ def publish(api, run, manifest):
 def main():
     request = os.environ["SYNC_REQUEST"]
     require(re.fullmatch(r"[0-9]+-[0-9]+", request), "Invalid request identifier")
-    api = GitHub(os.environ["COLONY_DISPATCH_TOKEN"])
+    api = GitHub(os.environ["COLONY_DISPATCH_TOKEN"], os.environ["ANTFLY_READ_TOKEN"])
     run, manifest = wait_for_validation(api, request)
     publish(api, run, manifest)
 

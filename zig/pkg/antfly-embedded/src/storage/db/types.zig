@@ -246,6 +246,11 @@ pub const TransactionMutation = union(enum) {
     },
 };
 
+/// The ordered command owns version semantics, including during WAL/Raft
+/// replay. `admit_current` is local ingress only; absent private wire fields
+/// decode as legacy. The admission timestamp is separate from the revision.
+pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
+
 pub const BatchRequest = struct {
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
@@ -318,6 +323,9 @@ pub const BatchRequest = struct {
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
+    /// `admit_current` is local admission only. Persisted commands explicitly
+    /// select revision_v1; an absent wire field always decodes as legacy.
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
@@ -1745,6 +1753,7 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -3629,6 +3638,7 @@ pub const ResolverReplayObservation = struct {
 };
 
 pub const ResolverReplayDiagnostic = struct {
+    candidate_key_prefix: []const u8 = "",
     name: []const u8 = "",
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
@@ -3639,6 +3649,26 @@ pub const ResolverReplayDiagnostic = struct {
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
+
+    // Diagnostics cross cache/snapshot ownership boundaries. Keep all textual
+    // fields in one cloning contract so adding a fence cannot introduce a
+    // borrowed pointer into an otherwise owned snapshot.
+    pub fn clone(self: @This(), alloc: Allocator) !@This() {
+        var owned = self;
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(owned, name) = "";
+        }
+        errdefer owned.deinit(alloc);
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(owned, name) = try alloc.dupe(u8, @field(self, name));
+        }
+        return owned;
+    }
+    pub fn deinit(self: @This(), alloc: Allocator) void {
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) alloc.free(@field(self, name));
+        }
+    }
 };
 
 pub const ResolverReplayDiagnostics = struct {
@@ -5324,12 +5354,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
-    for (stats.resolvers) |resolver| {
-        alloc.free(resolver.name);
-        alloc.free(resolver.table);
-        alloc.free(resolver.source_artifact);
-        alloc.free(resolver.resolution_artifact);
-    }
+    for (stats.resolvers) |resolver| resolver.deinit(alloc);
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }
 
@@ -5509,6 +5534,7 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
     if (command.record.len == 0 or command.record.len > leann_record_max_bytes) return error.InvalidBatchRequest;
     const defaults = BatchRequest{};
     inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "leann_record") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             const value = @field(req, field_name);
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
@@ -5538,6 +5564,7 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
     if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
     const defaults = BatchRequest{};
     inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field_name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             if (comptime std.mem.eql(u8, field_name, "deletes") or std.mem.eql(u8, field_name, "graph_deletes") or std.mem.eql(u8, field_name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field_name, "merge_artifacts")) {
                 if (!req.graph_endpoint_cleanup_planned and @field(req, field_name).len != 0) return error.InvalidBatchRequest;
@@ -5604,4 +5631,17 @@ test "graph relationship protocol gates document effects before extraction" {
         "{}",
     }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
     try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
+}
+
+fn testResolverDiagnosticOwnership(a: Allocator) !void {
+    const original = ResolverReplayDiagnostic{ .name = "facts", .table = "entities", .source_artifact = "input", .resolution_artifact = "output", .candidate_key_prefix = "source/ours/", .config_generation = 42 };
+    const copy = try original.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqualStrings(original.candidate_key_prefix, copy.candidate_key_prefix);
+    try std.testing.expect(copy.candidate_key_prefix.ptr != original.candidate_key_prefix.ptr);
+    try std.testing.expectEqual(original.config_generation, copy.config_generation);
+}
+
+test "resolver diagnostics cloning owns every textual fence under allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolverDiagnosticOwnership, .{});
 }

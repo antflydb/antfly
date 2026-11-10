@@ -17,6 +17,10 @@ pub const AlgebraicAggregateConfig = struct {
     name: []const u8,
     op: []const u8,
     group_by: ?[]const []const u8 = null,
+    /// Schema datetime column used for temporal grouping. Requires bucket.
+    time: ?[]const u8 = null,
+    /// UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
+    bucket: ?[]const u8 = null,
     /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
     measure: ?[]const u8 = null,
 
@@ -25,6 +29,8 @@ pub const AlgebraicAggregateConfig = struct {
         .{ "name", "name", false },
         .{ "op", "op", false },
         .{ "group_by", "group_by", true },
+        .{ "time", "time", true },
+        .{ "bucket", "bucket", true },
         .{ "measure", "measure", true },
     };
 
@@ -44,6 +50,14 @@ pub const AlgebraicAggregateConfig = struct {
         try jw.write(self.op);
         if (self.group_by) |value| {
             try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.time) |value| {
+            try jw.objectField("time");
+            try jw.write(value);
+        }
+        if (self.bucket) |value| {
+            try jw.objectField("bucket");
             try jw.write(value);
         }
         if (self.measure) |value| {
@@ -9181,6 +9195,8 @@ pub const GraphResolverConfig = struct {
     suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
+    /// Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
+    candidate_key_prefix: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
     candidate_limit: ?i64 = null,
     name_embedding: ?[]const u8 = null,
@@ -9210,6 +9226,7 @@ pub const GraphResolverConfig = struct {
         .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
+        .{ "candidate_key_prefix", "candidate_key_prefix", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
         .{ "candidate_limit", "candidate_limit", true },
         .{ "name_embedding", "name_embedding", true },
@@ -9280,6 +9297,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.candidate_search) |value| {
             try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_key_prefix) |value| {
+            try jw.objectField("candidate_key_prefix");
             try jw.write(value);
         }
         if (self.candidate_ann_index) |value| {

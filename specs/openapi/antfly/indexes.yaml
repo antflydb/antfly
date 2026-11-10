@@ -728,6 +728,9 @@ components:
         candidate_search:
           type: string
           enum: ["", exact_key, prefix, ann]
+        candidate_key_prefix:
+          type: string
+          description: Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
         candidate_ann_index: { type: string }
         candidate_limit: { type: integer, format: uint, minimum: 0 }
         name_embedding: { type: string }
@@ -1712,6 +1715,12 @@ components:
           items:
             type: string
             minLength: 1
+        time:
+          type: string
+          description: Schema datetime column used for temporal grouping. Requires bucket.
+        bucket:
+          type: string
+          description: UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
         measure:
           type: string
           minLength: 1

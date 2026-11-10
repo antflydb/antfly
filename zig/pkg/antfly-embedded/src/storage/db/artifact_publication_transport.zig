@@ -129,6 +129,7 @@ pub fn validateBatchRequest(request: anytype) !void {
     try control.validate();
     const defaults: @TypeOf(request) = .{};
     inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication_transport") and
             !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {

@@ -97,6 +97,13 @@ def contents(zig):
         "    }\n",
         "}\n",
     ]
+    lines += [
+        'test "engine errors preserve context management failure identities" {\n',
+        "    for ([_]anyerror{ error.AgentContextBudgetExceeded, error.ContextCompactionBatchLimitExceeded, error.ContextOutputReservationTooSmall, error.InsufficientContextReduction, error.UnsupportedContextMedia, error.ContextSummaryMissingCitation }) |err| {\n",
+        "        try std.testing.expectEqual(err, fromName(@errorName(err)));\n",
+        "    }\n",
+        "}\n",
+    ]
     return subprocess.check_output(
         [zig, "fmt", "--stdin"], input="".join(lines), text=True
     )

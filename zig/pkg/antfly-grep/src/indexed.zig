@@ -26,7 +26,7 @@ const MediaField = struct { field: []const u8, mode: ?enum { identity } = null, 
 const MediaSelection = struct { fields: []const MediaField };
 const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { search_version: u32 = 1, artifacts: []const std.json.Value = &.{}, fields: ?record_view.Fields = null, streams: []const record_view.Stream = &.{}, selected_stream: ?record_view.Stream = null, published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { acquisition_id: ?[]const u8 = null, knowledge: ?std.json.Value = null, search_version: u32 = 1, artifacts: []const std.json.Value = &.{}, fields: ?record_view.Fields = null, streams: []const record_view.Stream = &.{}, selected_stream: ?record_view.Stream = null, published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,

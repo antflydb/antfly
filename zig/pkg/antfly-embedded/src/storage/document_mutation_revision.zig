@@ -25,6 +25,9 @@ pub const Key = [prefix.len + 32]u8;
 const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
 pub const ContentKey = [content_prefix.len + 32]u8;
 pub const Content = struct { revision: u64, bytes: u64, kind: u8, digest: [32]u8 };
+pub fn keyFromHash(digest: [32]u8) Key {
+    return prefix.* ++ digest;
+}
 pub fn contentKey(key: Key) ContentKey {
     var result: ContentKey = undefined;
     @memcpy(result[0..content_prefix.len], content_prefix);
@@ -40,12 +43,17 @@ fn decodeContent(raw: []const u8) !Content {
 pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     if (!keys.isStoredDocumentRowKey(physical)) return null;
     const key = keyForPhysical(physical).?;
+    return loadContentByKey(txn, key, physical[physical.len - 1]);
+}
+/// A durable locator can revalidate authoritative content without fetching or
+/// rehashing an oversized opaque document key on every scheduler poll.
+pub fn loadContentByKey(txn: anytype, key: Key, kind: u8) !?Content {
     const raw = txn.get(&contentKey(key)) catch |err| {
         if (err == error.NotFound) return null;
         return err;
     };
     const value = try decodeContent(raw);
-    if (value.kind != physical[physical.len - 1] or value.revision != try load(txn, key)) return null;
+    if (value.kind != kind or value.revision != try load(txn, key)) return null;
     return value;
 }
 /// Decode a bounded proof window from one sorted, deduplicated metadata read.
@@ -112,8 +120,7 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
             revisions[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
         },
         .timestamp => {
-            if (raw.len != 8) return error.InvalidTimestamp;
-            timestamps[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
+            timestamps[entry.row] = @import("ttl.zig").writeVersion(raw) orelse return error.InvalidTimestamp;
         },
     };
     if (mutation_revisions) |out| @memcpy(out, revisions[0..out.len]);

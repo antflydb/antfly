@@ -16,6 +16,49 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 
+test "external lake Cypher execution reads immutable native document and graph cuts with privacy-bound statistics" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-stats-privacy");
+    defer directory.cleanup();
+    var db = try local.storage_db_db.DB.open(a, directory.path(), .{});
+    defer db.close();
+    const contract = local.api_local_query_contract;
+    const version = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for ([_][]const u8{
+        "\"query_request\":{\"query\":{\"match_all\":{}}}",
+        "\"fields\":[]",
+        "\"background_fields\":[]",
+    }) |mode| {
+        const unbound = try std.fmt.allocPrint(a, "{{{s}}}", .{mode});
+        defer a.free(unbound);
+        var parsed_unbound = try contract.parseTextStatsRequest(a, "docs", unbound);
+        defer parsed_unbound.deinit(a);
+        for ([_][]const u8{ "none", version }) |expected| {
+            const body = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",{s}}}", .{ expected, mode });
+            defer a.free(body);
+            var parsed = try contract.parseTextStatsRequest(a, "docs", body);
+            defer parsed.deinit(a);
+            const bound = switch (parsed) {
+                .query_request => |request| request.req.privacy_policy_version,
+                .explicit_fields => |request| request.privacy_policy_version,
+                .background_fields => |request| request.privacy_policy_version,
+            };
+            try std.testing.expectEqual(@as([64]u8, @splat(if (std.mem.eql(u8, expected, "none")) 0 else 'a')), bound.?);
+            if (std.mem.eql(u8, expected, "none")) {
+                const response = try local.storage_local_query.executeStorageKernelTextStats(a, &db, "docs", body);
+                defer a.free(response);
+            } else try std.testing.expectError(error.IndexRebuilding, local.storage_local_query.executeStorageKernelTextStats(a, &db, "docs", body));
+        }
+        for ([_][]const u8{ "\"bad\"", "7", "\"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg\"" }) |invalid| {
+            const body = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":{s},{s}}}", .{ invalid, mode });
+            defer a.free(body);
+            try std.testing.expectError(error.InvalidQueryRequest, contract.parseTextStatsRequest(a, "docs", body));
+        }
+    }
+    const conflict = "{\"_privacy_policy_version\":\"none\",\"query_request\":{\"query\":{\"match_all\":{}},\"_privacy_policy_version\":\"" ++ version ++ "\"}}";
+    try std.testing.expectError(error.InvalidQueryRequest, contract.parseTextStatsRequest(a, "docs", conflict));
+}
+
 test "external lake composed native cut preserves primary and vector generations across writes and restart" {
     try verifyNativeCut(false);
     try verifyNativeCut(true);
@@ -931,4 +974,22 @@ test "external lake Cypher execution hides pending privacy records in native poi
         try std.testing.expect(hidden[0] == null);
     }
     try std.testing.expectError(error.IndexRebuilding, db.getCypherPinnedDocuments(a, &cut, &.{"one"}, .{ .privacy_policy_version = @as([64]u8, @splat('a')), .fields = &.{}, .include_all_fields = false }));
+}
+
+test "external lake Cypher execution reads immutable native document and graph cuts preserve relational vector receipt validation" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("relational-external-vector-receipts");
+    defer directory.cleanup();
+    var db = try local.storage_db_db.DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"metadata":{"type":"object"},"revision":{"type":"string"},"embedding":{"type":"array","items":{"type":"number"}}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "external_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}" });
+    // Relational ingress accepts schema fields; external vector envelopes are
+    // tested by the document-mode contract. A receipt without an authored
+    // vector must still be rejected before the parsed relational root expires.
+    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r1\",\"metadata\":{}}" }} });
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }} }));
+    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }} });
 }

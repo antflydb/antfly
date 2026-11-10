@@ -5902,6 +5902,28 @@ fn reconcileLeaseCacheNextRefreshAtMs(
         now_ms;
 }
 
+fn lockReadinessTransitions(mutex: *std.Io.Mutex, budget: @import("../api/table_catalog.zig").RoutingBudget) !void {
+    try budget.checkpoint();
+    while (!mutex.tryLock()) {
+        try budget.checkpoint();
+        try budget.sleepNs(std.time.ns_per_ms);
+    }
+}
+
+fn selectedOwnersAllowIdentityRead(service: anytype, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !bool {
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const checks = try store.ownerReadinessTransitions(service.alloc, service.metadata_group_id, request, budget);
+    defer service.alloc.free(checks);
+    for (checks) |check| {
+        try budget.checkpoint();
+        if (try service.observeMergeTransitionWithBudget(check.id, budget)) |observation| {
+            if ((check.donor and observation.donor_local_leader and observation.donor.allow_doc_identity_reassignment) or
+                (check.receiver and observation.receiver_local_leader and observation.receiver.allow_doc_identity_reassignment)) return false;
+        }
+    }
+    return true;
+}
+
 pub const MetadataService = struct {
     online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     alloc: std.mem.Allocator,
@@ -7633,6 +7655,15 @@ pub const MetadataService = struct {
         return try self.raft.observeSplitTransition(transition_id);
     }
 
+    pub fn observeMergeTransitionWithBudget(self: *MetadataService, transition_id: u64, budget: @import("../api/table_catalog.zig").RoutingBudget) !?transition_state.MergeObservation {
+        try lockReadinessTransitions(&self.transition_mutex, budget);
+        defer self.transition_mutex.unlock(std.Options.debug_io);
+        try budget.checkpoint();
+        const observation = try self.raft.observeMergeTransition(transition_id);
+        try budget.checkpoint();
+        return observation;
+    }
+
     pub fn observeMergeTransition(self: *MetadataService, transition_id: u64) !?transition_state.MergeObservation {
         self.lockTransitions();
         defer self.unlockTransitions();
@@ -7744,6 +7775,10 @@ pub const MetadataService = struct {
         return try self.catalog_projection_reader.acquireRoutingGeneration(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), deadline_ns);
     }
 
+    pub fn acquireCatalogRoutingGenerationWithBudget(self: *MetadataService, budget: @import("../api/table_catalog.zig").RoutingBudget) !*@import("../api/table_catalog.zig").RoutingGeneration {
+        return self.catalog_projection_reader.acquireRoutingGenerationWithBudget(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), budget);
+    }
+
     pub fn acquireCatalogJoinPlanning(self: *MetadataService, budget: @import("../api/table_router.zig").RouteBudget) !*@import("../api/join_planning.zig").Generation {
         return try self.catalog_projection_reader.acquireJoinPlanning(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), budget);
     }
@@ -7755,6 +7790,19 @@ pub const MetadataService = struct {
             self.catalogProjectionSource(),
             deadline_ns,
         );
+    }
+
+    pub fn ownerReadiness(self: *MetadataService, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const allowed = try selectedOwnersAllowIdentityRead(self, request, budget);
+        var result = try store.ownerReadiness(self.alloc, self.metadata_group_id, request, budget);
+        if (result.status == .ready and !allowed) result.status = .identity_unavailable;
+        result.metadata_group_id = self.metadata_group_id;
+        result.metadata_incarnation = try self.metadataIncarnation();
+        try budget.checkpoint();
+        return result;
     }
 
     pub fn privacyPolicyBinding(self: *MetadataService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -9101,6 +9149,46 @@ pub const MetadataHttpService = struct {
 
     pub fn baseUri(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]u8 {
         return try self.raft.baseUri(alloc);
+    }
+
+    /// Listeners and the restore supervisor are already live during bootstrap.
+    /// Publish the initial owner, routes and managed updates under the same
+    /// runtime authority as request and progress handlers.
+    pub fn bootstrapMetadataGroup(
+        self: *MetadataHttpService,
+        record: raft_catalog.ReplicaRecord,
+        updates: []const @import("../raft/metadata_view.zig").MetadataUpdate,
+    ) !void {
+        if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
+        for (updates) |update| switch (update) {
+            .replica_intent => |intent| switch (intent) {
+                .upsert => |value| if (value.record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId,
+                else => return error.UnsupportedOperation,
+            },
+            .peer_route => |route| switch (route) {
+                .upsert => |value| if (value.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId,
+                else => return error.UnsupportedOperation,
+            },
+            else => return error.UnsupportedOperation,
+        };
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.raft.host.status(record.group_id) == .absent)
+            _ = try self.raft.host.http_host.ensureReplica(record);
+        for (updates) |update| if (update == .peer_route) {
+            const route = update.peer_route.upsert;
+            _ = try self.raft.host.http_host.upsertResolvedPeerEndpoints(route.group_id, route.node_id, route.endpoints);
+        };
+        try self.raft.submitBatch(updates);
+        _ = try self.raft.syncPendingRaftProgressOnly();
+    }
+
+    pub fn ensureInitialMetadataReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !void {
+        if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.raft.host.status(record.group_id) == .absent)
+            _ = try self.raft.host.http_host.ensureReplica(record);
     }
 
     pub fn ensureMetadataReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
@@ -10972,7 +11060,11 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
-        try self.runRoundInternal(true);
+        try self.runRoundInternal(true, false);
+    }
+
+    pub fn runBootstrapRound(self: *MetadataHttpService) !void {
+        try self.runRoundInternal(true, true);
     }
 
     /// Advances only the latency-sensitive Raft runtime. Production runtimes
@@ -11066,10 +11158,10 @@ pub const MetadataHttpService = struct {
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.
     pub fn runControlRoundOnly(self: *MetadataHttpService) !void {
-        try self.runRoundInternal(false);
+        try self.runRoundInternal(false, false);
     }
 
-    fn runRoundInternal(self: *MetadataHttpService, advance_raft: bool) !void {
+    fn runRoundInternal(self: *MetadataHttpService, advance_raft: bool, skip_local_replica_root: bool) !void {
         var run_round_trace = MetadataRunRoundTrace.init();
         defer run_round_trace.logIfSlow();
         var phase_start_ns = platform_time.monotonicNs();
@@ -11108,7 +11200,7 @@ pub const MetadataHttpService = struct {
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
-        if (!self.observe_local_replica_root) return;
+        if (skip_local_replica_root or !self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -11391,6 +11483,15 @@ pub const MetadataHttpService = struct {
         self.transition_mutex.lockUncancelable(std.Options.debug_io);
         defer self.transition_mutex.unlock(std.Options.debug_io);
         return try self.raft.observeSplitTransition(transition_id);
+    }
+
+    pub fn observeMergeTransitionWithBudget(self: *MetadataHttpService, transition_id: u64, budget: @import("../api/table_catalog.zig").RoutingBudget) !?transition_state.MergeObservation {
+        try lockReadinessTransitions(&self.transition_mutex, budget);
+        defer self.transition_mutex.unlock(std.Options.debug_io);
+        try budget.checkpoint();
+        const observation = try self.raft.observeMergeTransition(transition_id);
+        try budget.checkpoint();
+        return observation;
     }
 
     pub fn observeMergeTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.MergeObservation {
@@ -11814,6 +11915,10 @@ pub const MetadataHttpService = struct {
         return try self.catalog_projection_reader.acquireRoutingGeneration(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), deadline_ns);
     }
 
+    pub fn acquireCatalogRoutingGenerationWithBudget(self: *MetadataHttpService, budget: @import("../api/table_catalog.zig").RoutingBudget) !*@import("../api/table_catalog.zig").RoutingGeneration {
+        return self.catalog_projection_reader.acquireRoutingGenerationWithBudget(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), budget);
+    }
+
     pub fn acquireCatalogJoinPlanning(self: *MetadataHttpService, budget: @import("../api/table_router.zig").RouteBudget) !*@import("../api/join_planning.zig").Generation {
         return try self.catalog_projection_reader.acquireJoinPlanning(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), budget);
     }
@@ -11825,6 +11930,19 @@ pub const MetadataHttpService = struct {
             self.catalogProjectionSource(),
             deadline_ns,
         );
+    }
+
+    pub fn ownerReadiness(self: *MetadataHttpService, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const allowed = try selectedOwnersAllowIdentityRead(self, request, budget);
+        var result = try store.ownerReadiness(self.alloc, self.metadata_group_id, request, budget);
+        if (result.status == .ready and !allowed) result.status = .identity_unavailable;
+        result.metadata_group_id = self.metadata_group_id;
+        result.metadata_incarnation = try self.metadataIncarnation();
+        try budget.checkpoint();
+        return result;
     }
 
     pub fn privacyPolicyBinding(self: *MetadataHttpService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -23617,4 +23735,80 @@ test "metadata.lake combined table features retain the highest decoder floor" {
         table.lake_index_catalog_json = "";
         try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = before, .replacement = table } }));
     }
+}
+
+test "selected owner readiness transition index distinguishes selected runtime roles from queued permissions" {
+    const Fake = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        selected: metadata_api.OwnerTransitionCheck = .{ .id = 9, .donor = true },
+        observation: ?transition_state.MergeObservation = null,
+        observations: usize = 0,
+        metadata_group_id: u64 = 1,
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn ownerReadinessTransitions(self: *@This(), a: std.mem.Allocator, _: u64, _: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) ![]metadata_api.OwnerTransitionCheck {
+            try budget.checkpoint();
+            return a.dupe(metadata_api.OwnerTransitionCheck, &.{self.selected});
+        }
+        pub fn observeMergeTransitionWithBudget(self: *@This(), id: u64, budget: @import("../api/table_catalog.zig").RoutingBudget) !?transition_state.MergeObservation {
+            try budget.checkpoint();
+            self.observations += 1;
+            try std.testing.expectEqual(@as(u64, 9), id);
+            return self.observation;
+        }
+    };
+    var fake: Fake = .{};
+    const request: metadata_api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 1, .shard_id = 1, .range_id = 1 }} };
+    // A queued transition has no runtime observation. Catalog permission must
+    // not block it, nor an online copy which never enables raw reassignment.
+    try std.testing.expect(try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    const idle: @FieldType(transition_state.MergeObservation, "donor") = .{
+        .phase = .prepare,
+        .donor_group_id = 1,
+        .receiver_group_id = 2,
+        .receiver_accepts_donor_range = false,
+        .bootstrapped = false,
+        .replay_required = false,
+        .replay_caught_up = false,
+        .cutover_ready = false,
+        .receiver_ready_for_reads = true,
+        .donor_delta_sequence = 0,
+        .receiver_delta_sequence = 0,
+    };
+    fake.observation = .{ .donor = idle, .receiver = idle, .donor_local_leader = true, .receiver_local_leader = true };
+    try std.testing.expect(try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    fake.observation.?.receiver.allow_doc_identity_reassignment = true;
+    try std.testing.expect(try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    fake.selected.receiver = true;
+    try std.testing.expect(!try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    fake.selected.receiver = false;
+    fake.observation.?.donor.allow_doc_identity_reassignment = true;
+    try std.testing.expect(!try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    fake.selected = .{ .id = 9, .receiver = true };
+    fake.observation.?.receiver.allow_doc_identity_reassignment = false;
+    try std.testing.expect(try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    fake.selected.donor = true;
+    fake.observation.?.donor_local_leader = false;
+    try std.testing.expect(try selectedOwnersAllowIdentityRead(&fake, request, .{}));
+    try std.testing.expectEqual(@as(usize, 7), fake.observations);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, selectedOwnersAllowIdentityRead(&fake, request, .{ .deadline_ns = 0 }));
+}
+
+test "selected owner readiness transition index cancels while observations are locked" {
+    var mutex: std.Io.Mutex = .init;
+    try std.testing.expect(mutex.tryLock());
+    defer mutex.unlock(std.Options.debug_io);
+    const Cancel = struct {
+        calls: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return self.calls >= 3;
+        }
+    };
+    var cancellation: Cancel = .{};
+    try std.testing.expectError(error.Canceled, lockReadinessTransitions(&mutex, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancel.canceled } }));
+    try std.testing.expectEqual(@as(usize, 3), cancellation.calls);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, lockReadinessTransitions(&mutex, .{ .deadline_ns = 0 }));
 }

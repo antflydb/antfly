@@ -3,6 +3,9 @@
 
 pub const types = @import("types.zig");
 
+pub const AgentContextDiagnostics = types.AgentContextDiagnostics;
+pub const AgentContextEvent = types.AgentContextEvent;
+pub const AgentContextManagement = types.AgentContextManagement;
 pub const AgentDecision = types.AgentDecision;
 pub const AgentQuestion = types.AgentQuestion;
 pub const AgentQuestionKind = types.AgentQuestionKind;

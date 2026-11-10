@@ -1,0 +1,161 @@
+{
+  "table": {
+    "num_shards": 1,
+    "schema": {
+      "default_type": "reading",
+      "document_schemas": {
+        "reading": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "attrs": {
+                "type": "object",
+                "required": [
+                  "observed_at",
+                  "region"
+                ],
+                "properties": {
+                  "observed_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-antfly-field": {
+                      "type": "date",
+                      "sortable": true
+                    }
+                  },
+                  "device_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "x-antfly-field": {
+                      "type": "keyword",
+                      "sortable": true
+                    }
+                  },
+                  "region": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "keyword",
+                      "sortable": true
+                    }
+                  },
+                  "temperature": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "options": {
+    "table": "fixture",
+    "timestamp": "attrs.observed_at",
+    "start": "2026-11-06T12:00:00Z",
+    "end": "2026-11-06T12:20:00Z",
+    "bucket": {
+      "every": "5m"
+    },
+    "groupBy": [
+      "attrs.device_id",
+      "attrs.region"
+    ],
+    "dimensions": {
+      "attrs.region": "west"
+    },
+    "measures": {
+      "average": {
+        "op": "avg",
+        "field": "attrs.temperature"
+      },
+      "total": {
+        "op": "sum",
+        "field": "attrs.temperature"
+      },
+      "readings": {
+        "op": "count",
+        "field": "attrs.observed_at"
+      }
+    },
+    "maxSeries": 1,
+    "emptyBuckets": false
+  },
+  "query": {
+    "table": "fixture",
+    "timeout_ms": 30000,
+    "filter_query": {
+      "conjuncts": [
+        {
+          "field": "attrs.observed_at",
+          "start": "2026-11-06T12:00:00Z",
+          "end": "2026-11-06T12:20:00Z",
+          "inclusive_start": true,
+          "inclusive_end": false
+        },
+        {
+          "field": "attrs.region",
+          "equals": "west"
+        }
+      ]
+    },
+    "limit": 0,
+    "aggregations": {
+      "series": {
+        "type": "terms",
+        "fields": [
+          "attrs.device_id",
+          "attrs.region"
+        ],
+        "exclude_null": true,
+        "size": 1,
+        "sub_aggregations": {
+          "points": {
+            "type": "date_histogram",
+            "field": "attrs.observed_at",
+            "fixed_interval": "5m",
+            "min_doc_count": 1,
+            "sub_aggregations": {
+              "average": {
+                "type": "avg",
+                "field": "attrs.temperature"
+              },
+              "total": {
+                "type": "sum",
+                "field": "attrs.temperature"
+              },
+              "readings": {
+                "type": "count",
+                "field": "attrs.observed_at"
+              },
+              "__antfly_series_count_total": {
+                "type": "avg",
+                "field": "attrs.temperature"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "sql": {
+    "statement": "WITH \"__antfly_series_selected\" AS (SELECT jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id') AS \"attrs.device_id\", jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') AS \"attrs.region\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" AS \"__antfly_series_source\" WHERE jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime >= $1::datetime AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime < $2::datetime AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') = $5 AND NOT is_missing(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id')) AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id') IS NOT NULL AND NOT is_missing(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region')) AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') IS NOT NULL GROUP BY jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id'), jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id'))::text, 'null'), ',', COALESCE(to_jsonb(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region'))::text, 'null'), ']') ASC LIMIT $6) SELECT jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id') AS \"attrs.device_id\", jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') AS \"attrs.region\", date_bin($3, jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime, $4::datetime) AS \"bucket\", AVG((jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'temperature'))::double precision) AS \"average\", SUM((jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'temperature'))::double precision) AS \"total\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id') IS NOT DISTINCT FROM \"__antfly_series_selected\".\"attrs.device_id\" AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') IS NOT DISTINCT FROM \"__antfly_series_selected\".\"attrs.region\" WHERE jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime >= $1::datetime AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime < $2::datetime AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') = $5 AND NOT is_missing(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id')) AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id') IS NOT NULL AND NOT is_missing(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region')) AND jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region') IS NOT NULL GROUP BY jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id'), jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region'), date_bin($3, jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'device_id'))::text, 'null'), ',', COALESCE(to_jsonb(jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'region'))::text, 'null'), ']') ASC, date_bin($3, jsonb_extract_path_text(\"__antfly_series_source\".\"attrs\", 'observed_at')::datetime, $4::datetime)",
+    "parameters": [
+      "2026-11-06T12:00:00Z",
+      "2026-11-06T12:20:00Z",
+      "5m",
+      "1970-01-01T00:00:00Z",
+      "west",
+      1
+    ]
+  }
+}

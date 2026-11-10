@@ -33,6 +33,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const native_query_maintenance_filters = [_][]const u8{
         "db native checkpoint warming",
+        "db native checkpoint discovery",
         "db idle dense query captures",
         "external lake native warming",
         "source vector payloads debt policy bounds background deferral",
@@ -189,6 +190,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
         "#1210",
+        "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",

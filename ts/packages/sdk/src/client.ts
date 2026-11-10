@@ -1,5 +1,14 @@
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 import { encodeGraphParameter } from "./graph-wire.js";
+import {
+  SeriesImportError,
+  type SeriesQueryOptions,
+  type SeriesRange,
+  seriesBatch,
+  seriesQuery,
+  seriesRead,
+  seriesResults,
+} from "./time-series.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -599,6 +608,40 @@ export async function readLimitedResponseText(
 
 function parseJSON<T>(text: string): T {
   return JSON.parse(text) as T;
+}
+
+/** Join ordinary work, but let cancellation release a caller waiting on user
+ * code. Both handlers stay attached so a late rejection is always observed. */
+function waitForSeriesStep<T>(
+  step: () => T | PromiseLike<T>,
+  signal: AbortSignal | undefined,
+  aborted: () => void
+): Promise<T> {
+  if (!signal) return Promise.resolve().then(step);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      complete();
+    };
+    const onAbort = () =>
+      finish(() => {
+        aborted();
+        reject(signal.reason);
+      });
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) return onAbort();
+    try {
+      Promise.resolve(step()).then(
+        (value) => finish(() => resolve(value)),
+        (cause) => finish(() => reject(cause))
+      );
+    } catch (cause) {
+      finish(() => reject(cause));
+    }
+  });
 }
 
 /** Resolves after `ms`, or rejects immediately/on abort when `signal` fires. */
@@ -1678,6 +1721,193 @@ export class AntflyClient {
     return data?.responses?.[0];
   }
 
+  /** Import bounded sequential batches. An error stops the import; committed
+   * earlier batches remain committed. No automatic ambiguous-write retry occurs.
+   */
+  async writeSeries(
+    table: string,
+    timestamp: string,
+    readings:
+      | AsyncIterable<{ id: string; document: Record<string, unknown> }>
+      | Iterable<{ id: string; document: Record<string, unknown> }>,
+    options?: WriteOptions & {
+      batchSize?: number;
+      syncLevel?: BatchRequest["sync_level"];
+      onBatch?: (outcome: BatchResult, submitted: number) => void | Promise<void>;
+    }
+  ) {
+    const batchSize = options?.batchSize ?? 500;
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1000)
+      throw new RangeError("batchSize must be 1–1000");
+    let batch: { id: string; document: Record<string, unknown> }[] = [];
+    let submitted = 0;
+    let committedPendingBatches = 0;
+    let repairRequiredBatches = 0;
+    let lastOutcome: BatchResult | undefined;
+    const state: { phase: "source" | "validation" | "submission" | "callback" | "aborted" } = {
+      phase: "source",
+    };
+    let pendingIds: string[] = [];
+    type Reading = { id: string; document: Record<string, unknown> };
+    let iterator: AsyncIterator<Reading> | Iterator<Reading> | undefined;
+    let sourceDone = false;
+    const aborted = () => {
+      state.phase = "aborted";
+    };
+    const checkAbort = () => {
+      if (options?.signal?.aborted) {
+        state.phase = "aborted";
+        options.signal.throwIfAborted();
+      }
+    };
+    const flush = async () => {
+      if (!batch.length) return;
+      checkAbort();
+      state.phase = "validation";
+      const request = { ...seriesBatch(batch, timestamp), sync_level: options?.syncLevel };
+      state.phase = "submission";
+      pendingIds = Object.keys(request.inserts ?? {});
+      const outcome = await this.tables.batchWithOptions(table, request, options);
+      submitted += batch.length;
+      lastOutcome = outcome;
+      if (outcome.status === "committed_pending") committedPendingBatches++;
+      if (outcome.status === "committed_repair_required") repairRequiredBatches++;
+      batch = [];
+      pendingIds = [];
+      state.phase = "callback";
+      if (options?.onBatch)
+        await waitForSeriesStep(
+          () => options.onBatch!(outcome, submitted),
+          options.signal,
+          aborted
+        );
+      state.phase = "source";
+    };
+    try {
+      checkAbort();
+      const asyncIterator = (readings as AsyncIterable<Reading>)[Symbol.asyncIterator];
+      const synchronous = asyncIterator == null;
+      iterator = synchronous
+        ? (readings as Iterable<Reading>)[Symbol.iterator]()
+        : asyncIterator.call(readings);
+      while (true) {
+        checkAbort();
+        const next = await waitForSeriesStep(() => iterator!.next(), options?.signal, aborted);
+        if (next.done) {
+          sourceDone = true;
+          break;
+        }
+        // Match for-await's AsyncFromSyncIterator value unwrapping.
+        const reading = synchronous
+          ? await waitForSeriesStep(() => next.value, options?.signal, aborted)
+          : next.value;
+        batch.push(reading);
+        checkAbort();
+        if (batch.length === batchSize) await flush();
+      }
+      await flush();
+    } catch (cause) {
+      const failure = new SeriesImportError(submitted, pendingIds, cause, {
+        phase: state.phase,
+        bufferedIds:
+          state.phase === "submission"
+            ? []
+            : batch.flatMap((reading) => {
+                try {
+                  const id = reading?.id;
+                  return typeof id === "string" ? [id] : [];
+                } catch {
+                  return [];
+                }
+              }),
+        mayHaveCommitted: state.phase === "submission",
+        committedPendingBatches,
+        repairRequiredBatches,
+        lastOutcome,
+      });
+      if (iterator && !sourceDone) {
+        try {
+          // Invoke return even when next is still pending. An uncooperative
+          // source may never finish closing; abort must still release the caller.
+          const closing = Promise.resolve(iterator.return?.());
+          if (options?.signal?.aborted) void closing.catch(() => {});
+          else
+            await waitForSeriesStep(
+              () => closing,
+              options?.signal,
+              () => {}
+            );
+        } catch {
+          // Iterator cleanup must not replace the original import failure.
+        }
+      }
+      throw failure;
+    }
+    return { submitted, committedPendingBatches, repairRequiredBatches, lastOutcome };
+  }
+
+  /** Latest N for an explicit bounded selection of series, with four requests
+   * in flight at most. Each result retains its independent snapshot cursor.
+   */
+  async latestSeries(
+    request: Omit<SeriesRange, "dimensions"> & {
+      table: string;
+      series: Record<string, string>[];
+      limit?: number;
+    },
+    options?: QueryExecutionOptions
+  ) {
+    if (request.series.length > 100) throw new RangeError("Select at most 100 series");
+    // Validate the complete selection before starting any network work.
+    const requests = request.series.map((dimensions) => seriesRead({ ...request, dimensions }));
+    const results: QueryResult[] = new Array(requests.length);
+    const stop = new AbortController();
+    const signal = options?.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal;
+    signal.throwIfAborted();
+    let next = 0;
+    let failed = false;
+    let failure: unknown;
+    // Each worker absorbs its error so Promise.all joins every in-flight call.
+    // The first failure closes admission and cancels siblings, preserving its cause.
+    await Promise.all(
+      Array.from({ length: Math.min(4, requests.length) }, async () => {
+        while (!failed && next < requests.length) {
+          try {
+            signal.throwIfAborted();
+            const index = next++;
+            results[index] = this.requireSeriesResult(
+              await this.query(requests[index]!, { ...options, signal })
+            );
+          } catch (cause) {
+            if (!failed) {
+              failed = true;
+              failure = cause;
+              stop.abort(cause);
+            }
+          }
+        }
+      })
+    );
+    if (failed) throw failure;
+    signal.throwIfAborted();
+    return results;
+  }
+
+  /** Query bucketed series using the ordinary JSON query and aggregation API. */
+  async series(request: SeriesQueryOptions, options?: QueryExecutionOptions) {
+    const result = this.requireSeriesResult(await this.query(seriesQuery(request), options));
+    return { series: seriesResults(result, request.fill), result };
+  }
+
+  private requireSeriesResult(result: QueryResult | undefined): QueryResult {
+    if (!result) throw new Error("Time-series query returned no result");
+    if (result.error || (result.status !== undefined && result.status >= 400))
+      throw new AntflyResponseError(
+        `Time-series query failed (${result.status ?? "unknown"}): ${result.error ?? "unsuccessful query result"}`
+      );
+    return result;
+  }
+
   /**
    * Execute multiple queries in a single request
    */
@@ -1779,6 +2009,9 @@ export class AntflyClient {
               break;
             case "generation":
               callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "context_management":
+              callbacks.onContextManagement?.(JSON.parse(frame.data));
               break;
             case "step_started":
               callbacks.onStepStarted?.(JSON.parse(frame.data));
@@ -1980,6 +2213,9 @@ export class AntflyClient {
           switch (frame.event) {
             case "generation":
               callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "context_management":
+              callbacks.onContextManagement?.(JSON.parse(frame.data));
               break;
             case "step_started":
               callbacks.onStepStarted?.(JSON.parse(frame.data));

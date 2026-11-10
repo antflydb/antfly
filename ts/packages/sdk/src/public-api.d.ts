@@ -10245,6 +10245,11 @@ export interface components {
             /** @description Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON. */
             fields?: string[];
             /**
+             * @description Exclude explicit nulls from terms grouping keys (including array elements). Missing fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use the same non-null dimension model.
+             * @default false
+             */
+            exclude_null?: boolean;
+            /**
              * @description Maximum number of buckets to return (for bucketing aggregations)
              * @example 10
              */
@@ -10258,6 +10263,20 @@ export interface components {
              * @description Fixed interval for histogram aggregations
              */
             interval?: number;
+            /** @description Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets per histogram and 100000 generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are supported with these bounds. */
+            date_bounds?: {
+                /** Format: date-time */
+                start: string;
+                /** Format: date-time */
+                end: string;
+            };
+            /** @description Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default. */
+            fixed_interval?: string;
+            /**
+             * Format: date-time
+             * @description RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries and reject this field.
+             */
+            bucket_origin?: string;
             /** @description Calendar-aware interval for date_histogram aggregations */
             calendar_interval?: components["schemas"]["CalendarInterval"];
             /**
@@ -10322,51 +10341,51 @@ export interface components {
         };
         AggregationResult: {
             /**
-             * Format: float
+             * Format: double
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
             /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
             approximate?: boolean;
             /**
-             * Format: float
+             * Format: double
              * @description For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
              */
             relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Minimum value for stats aggregations
              */
             min?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Maximum value for stats aggregations
              */
             max?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Sum for stats aggregations
              */
             sum?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Sum of squares for stats aggregations
              */
             sum_of_squares?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Average for stats aggregations
              */
             avg?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Standard deviation for stats aggregations
              */
             std_deviation?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Variance for stats aggregations
              */
             variance?: number;
@@ -12449,6 +12468,83 @@ export interface components {
              */
             eval?: components["schemas"]["EvalConfig"];
         };
+        AgentContextEvent: {
+            counting_method: string;
+            /** Format: int64 */
+            latency_ms: number;
+            summary_provider?: string;
+            summary_model?: string;
+            diagnostics: components["schemas"]["AgentContextDiagnostics"];
+        };
+        /** @description Summary usage is separate from destination generation usage; retries are always zero. */
+        AgentContextDiagnostics: {
+            /** Format: int64 */
+            contract_version?: number;
+            /** Format: int64 */
+            original_input_tokens?: number;
+            /** Format: int64 */
+            effective_input_tokens?: number;
+            /** Format: int64 */
+            retained_messages?: number;
+            /** Format: int64 */
+            compacted_messages?: number;
+            /** Format: int64 */
+            batches?: number;
+            /** Format: int64 */
+            retries?: number;
+            /** Format: int64 */
+            summary_input_tokens?: number;
+            /** Format: int64 */
+            summary_output_tokens?: number;
+        };
+        /**
+         * @description Opt-in conversation/evidence preparation before agent model calls. The
+         *     summarizer uses the same GeneratorConfig, secrets and provider dispatch
+         *     as generation; omitted summarizer inherits the effective generator
+         *     (the first link when a chain is configured). Summary calls have no
+         *     fallback or retries and consume the agent's model-call budget.
+         *     A remote summarizer receives the selected conversation and tool evidence.
+         *     Input accounting conservatively charges serialized UTF-8 bytes plus
+         *     framing and tool schemas. Configure windows supported by both models.
+         *     Failure returns a typed error without replacing authoritative history.
+         *     Derived memory is request-local; continuations supply authoritative
+         *     history/research_state and are prepared again. This does not alter KV caches.
+         */
+        AgentContextManagement: {
+            /**
+             * @description Inspect only reports; reject fails oversized prompts; window drops eligible exchanges; compact summarizes them.
+             * @default compact
+             * @enum {string}
+             */
+            mode?: "inspect" | "reject" | "window" | "compact";
+            /** @description Destination model capacity including reserved generation output. */
+            context_window_tokens: number;
+            /** @description Compaction threshold and final input ceiling; defaults to context_window_tokens minus reserved_output_tokens. */
+            target_input_tokens?: number;
+            /**
+             * @description Must cover every destination generator's configured output limit.
+             * @default 4000
+             */
+            reserved_output_tokens?: number;
+            /**
+             * @description Prior completed user turns retained verbatim. Current question, most recent exchange and open tool transactions are always retained.
+             * @default 2
+             */
+            keep_recent_turns?: number;
+            summarizer?: components["schemas"]["GeneratorConfig"];
+            /**
+             * @description Independent summary capacity, including instructions, schema, prior memory, one complete exchange and summary output.
+             * @default 8192
+             */
+            summarizer_context_window_tokens?: number;
+            /** @default 1024 */
+            summary_output_tokens?: number;
+            /**
+             * @description Maximum summary calls per preparation. No automatic retries or provider fallback.
+             * @default 8
+             */
+            max_summary_batches?: number;
+        };
         /**
          * @description Request for the retrieval agent. Queries define which tables and indexes
          *     to search, each as an ordinary QueryRequest. Optional tree or graph exploration
@@ -12468,6 +12564,7 @@ export interface components {
          *     traversal. They cannot be replaced or weakened by model tool arguments.
          */
         RetrievalAgentRequest: {
+            context_management?: components["schemas"]["AgentContextManagement"];
             /**
              * @description User's natural language query
              * @example How do I configure OAuth?
@@ -12590,6 +12687,8 @@ export interface components {
         };
         /** @description Result from the retrieval agent */
         RetrievalAgentResult: {
+            /** @description Per-model-call preparation diagnostics, also emitted as context_management SSE events. */
+            context_management?: components["schemas"]["AgentContextEvent"][];
             /**
              * @description Unique response ID for logging and tracing
              * @example ragr_cr3ig20h5tbs73e3ahrg
@@ -13004,6 +13103,7 @@ export interface components {
          *     widen tables, filters, tools or budgets.
          */
         ResearchAgentRequest: {
+            context_management?: components["schemas"]["AgentContextManagement"];
             /**
              * @description The research question.
              * @example How do Antfly's hybrid search and reranking interact, and what are the tuning trade-offs?
@@ -13052,6 +13152,8 @@ export interface components {
         };
         /** @description Result from the research agent. */
         ResearchAgentResult: {
+            /** @description Per-model-call preparation diagnostics, also emitted as context_management SSE events. */
+            context_management?: components["schemas"]["AgentContextEvent"][];
             /**
              * @description Unique response ID.
              * @example resr_cr3ig20h5tbs73e3ahrg
@@ -14303,6 +14405,8 @@ export interface components {
          *     when the request sets `profile: true`.
          */
         QueryProfile: {
+            /** @description Aggregation execution path, such as materialized_temporal or scan. Present when the executor reports it. */
+            aggregation_execution?: string;
             /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
             value_verification?: {
                 /** Format: int64 */
@@ -18849,6 +18953,8 @@ export interface components {
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
+            /** @description Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching. */
+            candidate_key_prefix?: string;
             candidate_ann_index?: string;
             /** Format: uint */
             candidate_limit?: number;
@@ -18909,6 +19015,10 @@ export interface components {
             /** @enum {string} */
             op: "count" | "sum" | "avg" | "min" | "max";
             group_by?: string[];
+            /** @description Schema datetime column used for temporal grouping. Requires bucket. */
+            time?: string;
+            /** @description UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch. */
+            bucket?: string;
             /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
             measure?: string;
         };
@@ -19604,6 +19714,15 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            /** @description Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead. */
+            index_sort?: {
+                field: string;
+                /**
+                 * @default asc
+                 * @enum {string}
+                 */
+                order?: "asc" | "desc";
+            }[];
             storage_mode?: components["schemas"]["TableStorageMode"];
             /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
@@ -25539,6 +25658,8 @@ export interface components {
             tool_name: string;
             /** @description Compacted evidence attributed to this completed tool call. */
             facts: string;
+            /** @description Exact source identities attributed to this tool result. Optional for legacy checkpoints; summaries must preserve server-supplied identities without shortening or substitution. */
+            source_ids?: string[];
         };
         InferenceContextUnresolvedToolCall: {
             tool_call_id: string;

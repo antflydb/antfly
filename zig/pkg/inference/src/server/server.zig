@@ -15411,9 +15411,7 @@ pub const Node = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.control.check();
             var preflight = try directGeneratePreflightForMessages(messages);
-            const schema = try std.json.parseFromSlice(std.json.Value, allocator,
-                \\{"type":"object","additionalProperties":false,"required":["conversation","tool_evidence","unresolved_tool_calls"],"properties":{"conversation":{"type":"string"},"tool_evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name","facts"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"},"facts":{"type":"string"}}}},"unresolved_tool_calls":{"type":"array","maxItems":0,"items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"}}}}}}
-            , .{});
+            const schema = try std.json.parseFromSlice(std.json.Value, allocator, @import("antfly_generating").context_management.summary_schema, .{});
             defer schema.deinit();
             const grammar = try grammar_mod.buildJsonSchemaGrammarWithOptions(allocator, schema.value, .{ .bounded_whitespace = true });
             defer allocator.free(grammar);
@@ -22337,11 +22335,17 @@ pub const Node = struct {
         const required_units = @max(reserved_units, estimateGenerateAdmissionUnitsFromShape((prompt orelse @as([]const u8, AudioReadInput.default_prompt)).len, 1, tokens));
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
-        const output = self.generateMessagesDirectPrepared(a, model_path, &messages, tokens, preflight, reserved_units, null, false, null, false, null, null, null, control) catch |err| {
+        // Model execution has its own checked KV/workspace budget and resource
+        // admission. Keep its reclaimable allocations out of the document
+        // arena: that arena bounds source/evidence/output bytes, and retains
+        // logically freed tensor scratch until the complete document finishes.
+        const output = self.generateMessagesDirectPrepared(self.allocator, model_path, &messages, tokens, preflight, reserved_units, null, false, null, false, null, null, null, control) catch |err| {
             return if (err == error.EmbeddingSequenceTooLong) error.AudioTooLong else err;
         };
-        errdefer a.free(output.text);
-        return .{ .text = output.text, .prompt_tokens = output.prompt_tokens, .completion_tokens = output.completion_tokens, .truncated = output.truncated, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}), .origin = if (prompt != null and !std.mem.eql(u8, prompt.?, AudioReadInput.default_prompt)) .interpretation else .transcription };
+        defer self.allocator.free(output.text);
+        const text = try a.dupe(u8, output.text);
+        errdefer a.free(text);
+        return .{ .text = text, .prompt_tokens = output.prompt_tokens, .completion_tokens = output.completion_tokens, .truncated = output.truncated, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}), .origin = if (prompt != null and !std.mem.eql(u8, prompt.?, AudioReadInput.default_prompt)) .interpretation else .transcription };
     }
 
     pub fn readAudioJsonWithControl(self: *Node, a: std.mem.Allocator, raw: []const u8, supplied_control: InferenceExecutionControl) ![]u8 {
@@ -27710,6 +27714,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
 }
 
 test {
+    _ = context_management;
     _ = @import("../documents/executor.zig");
     _ = @import("../documents/artifacts.zig");
     _ = @import("../documents/service.zig");

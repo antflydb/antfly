@@ -1867,7 +1867,7 @@ def test_executable_embedding_artifact_producer_survives_restart(
 def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
     stateful_api, openai_embedder
 ):
-    """Produced, skipped, and failed sources settle every coverage policy."""
+    """Produced, omitted, unsupported, and corrupt sources settle every policy."""
 
     def indexes_for_policy(policy: str) -> dict:
         units = _document_units_index_config()
@@ -1930,16 +1930,16 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         current = stateful_api.get_index(tables[policy], "document_vectors")
         status = current.get("status", {})
         coverage = status.get("coverage", {})
-        expected_covered = {"strict": 1, "partial": 2, "best_effort": 3}[policy]
+        expected_covered = {"strict": 1, "partial": 2, "best_effort": 4}[policy]
         expected_complete = policy == "best_effort"
         if not (
-            coverage.get("source_total") == 3
+            coverage.get("source_total") == 4
             and coverage.get("produced") == 1
             and coverage.get("skipped") == 1
-            and coverage.get("terminal_failed") == 1
+            and coverage.get("terminal_failed") == 2
             and coverage.get("covered") == expected_covered
             # Pending is unsettled work, not policy-specific uncovered work.
-            # All three source documents have reached terminal outcomes.
+            # All four source documents have reached terminal outcomes.
             and coverage.get("pending") == 0
             and coverage.get("observation_complete") is True
             and coverage.get("complete") is expected_complete
@@ -1964,8 +1964,16 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
             "version": "1",
             "url": "data:text/plain;base64,cHJvZHVjZWQgY292ZXJhZ2UgZG9jdW1lbnQ=",
         },
+        # Omitted source input is intentionally skipped. An unsupported
+        # supplied document is a terminal extraction failure, not coverage.
         "skipped": {
-            "filename": "intentional.skip",
+            "filename": "omitted.txt",
+            "mime_type": "text/plain",
+            "version": "1",
+            "url": "",
+        },
+        "unsupported": {
+            "filename": "unsupported.skip",
             "mime_type": "application/x-antfly-intentional-skip",
             "version": "1",
             "url": "data:application/octet-stream;base64,c2tpcA==",
@@ -1991,7 +1999,7 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         merged = stateful_api.linear_merge(
             table_name, records=records, sync_level="full_index"
         )
-        assert merged["upserted"] == 3
+        assert merged["upserted"] == 4
         cleanup = stateful_api.linear_merge(
             table_name,
             records={},
@@ -2017,12 +2025,18 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         json.loads(failed_manifest["manifest_json"])["last_error"]["stage"]
         == "pdf_structure"
     )
-    skipped_manifest = stateful_api.get(
-        f"{_document_artifact_path(tables['strict'], 'skipped', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
+    skipped = stateful_api._request(
+        "GET",
+        f"{_document_artifact_path(tables['strict'], 'skipped', DOCUMENT_UNITS_ARTIFACT)}?detail=raw",
     )
-    assert skipped_manifest["merge_status"] == "converged"
-    assert skipped_manifest["route_type"] == "unsupported"
-    assert skipped_manifest["unit_count"] == 0
+    assert skipped.status_code == 404, skipped.text
+    unsupported_manifest = stateful_api.get(
+        f"{_document_artifact_path(tables['strict'], 'unsupported', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
+    )
+    # Publication convergence and coverage success are separate contracts.
+    assert unsupported_manifest["merge_status"] == "converged"
+    assert unsupported_manifest["route_type"] == "unsupported"
+    assert unsupported_manifest["unit_count"] == 0
 
     stateful_api.restart_server()
     for policy in tables:
@@ -2587,6 +2601,8 @@ def test_unreachable_pdf_error_identity_and_successful_repair_clear_debt(statefu
     """Exercise the released server's fetch/error/publication boundaries."""
     import socket
 
+    # Close the reservation before connecting. On Darwin, a bound socket
+    # without listen() silently drops SYNs instead of refusing connections.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         closed_port = listener.getsockname()[1]
@@ -2604,17 +2620,23 @@ def test_unreachable_pdf_error_identity_and_successful_repair_clear_debt(statefu
     stateful_api.batch_write(table, inserts={"broken": document}, sync_level="write")
     artifact_path = _document_artifact_path(table, "broken", DOCUMENT_UNITS_ARTIFACT)
 
+    last_manifest = None
+
     def failed_manifest():
-        response = requests.get(
-            stateful_api.url + artifact_path, params={"detail": "raw"}, timeout=10
-        )
+        nonlocal last_manifest
+        response = stateful_api._request("GET", artifact_path + "?detail=raw")
+        last_manifest = {"status": response.status_code, "body": response.text[:12000]}
+        assert response.status_code in (200, 404, 503), response.text
         if response.status_code != 200:
             return None
         manifest = response.json()
         return manifest if manifest.get("route_type") == "error" else None
 
     failed = wait_until(failed_manifest, timeout_s=90, interval_s=0.5)
-    assert failed is not None
+    assert failed is not None, {
+        "manifest": last_manifest,
+        "index": stateful_api.get_index(table, "units"),
+    }
     raw_manifest = failed["manifest_json"]
     if isinstance(raw_manifest, str):
         raw_manifest = json.loads(raw_manifest)
@@ -2628,8 +2650,8 @@ def test_unreachable_pdf_error_identity_and_successful_repair_clear_debt(statefu
         stateful_api.post(issues_path, {"kind": "embedding", "limit": 100})["issues"]
         == []
     )
-    wrong_filter = requests.post(
-        stateful_api.url + issues_path, json={"artifact_kind": "embedding"}, timeout=10
+    wrong_filter = stateful_api._request(
+        "POST", issues_path, {"artifact_kind": "embedding"}
     )
     assert wrong_filter.status_code == 400, wrong_filter.text
 

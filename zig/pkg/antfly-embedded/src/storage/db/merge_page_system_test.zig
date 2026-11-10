@@ -26,7 +26,7 @@ const schema =
     \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"later","expression":{"op":"literal","type":"integer","value":"9"}}],"generated_columns":[{"column":"doubled","expression":{"op":"multiply","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":"2"}]}}],"relational_indexes":[{"name":"by_id","keys":[{"column":"id"}],"include_columns":["doubled"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"doubled":{"type":"integer"},"later":{"type":"integer"}},"additionalProperties":false}}}}
 ;
 
-test "relational index system merge tail streams REF5 oversized row with bounded resume chunks" {
+test "time series merge tail streams source-preserving oversized row with bounded resume chunks" {
     const retained = @import("../retained_effects.zig");
     const frame = @import("../retained_frame.zig");
     const internal = @import("../internal_keys.zig");
@@ -51,7 +51,7 @@ test "relational index system merge tail streams REF5 oversized row with bounded
     {
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
-        _ = try retained.admitWithCapabilities(&txn, scope.namespace(), 1, pin, retained.default_limit, false, true);
+        _ = try retained.admitWithSourceCapabilities(&txn, scope.namespace(), 1, pin, retained.default_limit, false, true, false, true);
         try txn.commit();
     }
     const key = try internal.documentKeyAlloc(alloc, "large-row");
@@ -59,7 +59,25 @@ test "relational index system merge tail streams REF5 oversized row with bounded
     const value = try alloc.alloc(u8, 17 * 1024 * 1024);
     defer alloc.free(value);
     @memset(value, 'x');
-    try db.core.store.put(key, value);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const ts_key = try internal.ttlKeyAlloc(alloc, "large-row");
+        defer alloc.free(ts_key);
+        const ts_value = try @import("../ttl.zig").encodeTimestampAlloc(alloc, 333, -1);
+        defer alloc.free(ts_value);
+        try txn.put(ts_key, ts_value);
+        // Put a tombstone before the oversized row in the same chunked frame.
+        // The retained timestamp word must carry the final allocator floor.
+        const gone = try internal.documentKeyAlloc(alloc, "a-deleted");
+        defer alloc.free(gone);
+        try txn.delete(gone);
+        var floor_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &floor_bytes, 101, .little);
+        try txn.put(@import("../ttl.zig").document_version_watermark_key, &floor_bytes);
+        try txn.put(key, value);
+        try txn.commit();
+    }
     var read = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
     var transferred = false;
     errdefer if (!transferred) read.abort();
@@ -78,12 +96,17 @@ test "relational index system merge tail streams REF5 oversized row with bounded
         .chunk_buffer = scratch,
         .chunk_cache = cache,
         .scope = scope,
-        .admission = .{ .namespace = scope.namespace(), .consumer_epoch = 1, .pin = pin, .start = 0, .acknowledged = 0, .snapshot_certificate = @splat(5), .admitted_applied_index = 1 },
+        .admission = .{ .ttl_sources = true, .namespace = scope.namespace(), .consumer_epoch = 1, .pin = pin, .start = 0, .acknowledged = 0, .snapshot_certificate = @splat(5), .admitted_applied_index = 1 },
         .sequence = 1,
         .total = view.effect_count,
     };
     transferred = true;
     defer session.deinit();
+    var deletion = (try session.next(alloc, pages.max_rows, pages.max_bytes, .none)).?;
+    defer deletion.deinit();
+    try std.testing.expectEqualStrings("a-deleted", deletion.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 101), deletion.document_version_floor);
+    try std.testing.expect(!deletion.frame_complete);
     var fragment = (try session.next(alloc, pages.max_rows, pages.max_bytes, .none)).?;
     defer fragment.deinit();
     try std.testing.expect(fragment.streamed != null);
@@ -93,6 +116,15 @@ test "relational index system merge tail streams REF5 oversized row with bounded
     try std.testing.expectError(error.MergePageChunkRequired, fragment.request(source, context, 1));
     const chunks = try fragment.chunkRequests(source, context, 1);
     const first = try chunks.requestAt(0);
+    try std.testing.expectEqual(@as(u64, 333), first.merge_page.?.chunk.?.timestamp);
+    try std.testing.expectEqual(@as(u64, 333), first.merge_page.?.document_version_floor);
+    try std.testing.expectEqual(@as(i128, -1), std.mem.readInt(i128, &first.merge_page.?.chunk.?.ttl_source.?, .little));
+    const wire = try @import("../../api/batch_internal.zig").encodeBatchRequest(alloc, first);
+    defer alloc.free(wire);
+    var decoded = try @import("../../api/batch_internal.zig").parseInternalBatchRequest(alloc, wire);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(first.merge_page.?.chunk.?.ttl_source, decoded.req.merge_page.?.chunk.?.ttl_source);
+    try std.testing.expectEqual(first.merge_page.?.document_version_floor, decoded.req.merge_page.?.document_version_floor);
     try std.testing.expectEqual(@as(u64, value.len), first.merge_page.?.chunk.?.total_bytes);
     try std.testing.expectEqualSlices(u8, value[0..pages.chunk_bytes], first.merge_page.?.chunk.?.data);
     const resumed = try chunks.requestAt(pages.chunk_bytes);
@@ -393,6 +425,7 @@ test "relational index system retained merge tail fragments preserve deletes tim
         page.next = "b";
         page.timestamps = &.{123};
         try apply(&db, &index, seal(.{ .merge_replication = context, .merge_page = page, .writes = &.{.{ .key = "b", .value = "{\"id\":1,\"doubled\":2}" }} }));
+        if (!relational) try std.testing.expectError(error.NotFound, db.core.store.get(alloc, @import("../ttl.zig").document_version_watermark_key));
         page.sequence = 3;
         page.phase = .artifacts;
         page.next = "";

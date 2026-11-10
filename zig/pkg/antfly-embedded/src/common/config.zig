@@ -214,8 +214,16 @@ pub const Config = struct {
         navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {
             retention_ms: u64 = 300_000,
+            /// Per-shard disposable local cursor cache.
             max_native_cuts: usize = 64,
             max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            /// Store-wide durable bindings and conservative inventory bytes.
+            max_durable_native_cuts: usize = 4096,
+            max_durable_native_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            /// One optional local checkpoint; never a speculative durable upload.
+            max_native_warm_bytes: u64 = 256 * 1024 * 1024,
+            /// Explicit opt-in only. Serverless immutable reads use their own pins.
+            background_warming: ?bool = null,
         } = .{},
         text_cache: struct {
             /// Maximum corpus admitted by one streaming ranking window.
@@ -232,6 +240,11 @@ pub const Config = struct {
             max_marked: usize = 262144,
             max_read_bytes: u64 = 512 * 1024 * 1024,
         } = .{},
+
+        pub fn nativeSnapshotWarmingEnabled(self: LakeIndexConfig, deployment: DeploymentMode) bool {
+            _ = deployment;
+            return self.query_cursors.background_warming orelse false;
+        }
     };
 
     pub const StorageConfig = struct {
@@ -3987,9 +4000,30 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     if (text.admission_window_segments == 0 or text.admission_window_segments > 64 or text.admission_window_bytes == 0 or text.admission_window_bytes > 32 * 1024 * 1024) return error.InvalidConfig;
     const cursors = parsed.value.query_cursors;
     if (cursors.retention_ms < 1000 or cursors.retention_ms > std.time.ms_per_hour or cursors.max_native_cuts == 0 or cursors.max_native_cuts > 4096 or cursors.max_native_retained_bytes == 0 or cursors.max_native_retained_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
+    if (cursors.max_durable_native_cuts == 0 or cursors.max_durable_native_cuts > 4096 or cursors.max_durable_native_bytes == 0 or cursors.max_durable_native_bytes > 1024 * 1024 * 1024 * 1024 or cursors.max_native_warm_bytes == 0 or cursors.max_native_warm_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
     const gc = parsed.value.artifact_gc;
     if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
     return parsed.value;
+}
+
+test "external lake native snapshot warming defaults by deployment and accepts explicit overrides" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expect(defaults.lake_indexes.query_cursors.background_warming == null);
+    inline for (std.meta.tags(DeploymentMode)) |deployment| {
+        try std.testing.expect(!defaults.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+    }
+    for ([_]bool{ false, true }) |enabled| {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .lake_indexes = .{ .query_cursors = .{ .background_warming = enabled } } }, .{});
+        defer a.free(bytes);
+        var config = try Config.parseFromSlice(a, bytes);
+        defer config.deinit();
+        inline for (std.meta.tags(DeploymentMode)) |deployment| {
+            try std.testing.expectEqual(enabled, config.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+        }
+    }
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, "{\"lake_indexes\":{\"query_cursors\":{\"background_warming\":\"false\"}}}"));
 }
 
 test "external lake native artifact collection config validates bounded operator controls" {
@@ -4051,6 +4085,10 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":3600001}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_cuts\":4097}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_bytes\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_native_warm_bytes\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
 }

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const context_management = @import("context_management.zig");
 pub const anthropic_api = @import("anthropic_api");
 pub const cloudflare = @import("antfly_cloudflare_config");
 pub const localGenerationStatusError = @import("local_failure.zig").localGenerationStatusError;
@@ -252,7 +253,7 @@ pub const GenerateResult = struct {
     }
 };
 
-pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
+pub fn appleGenerationRequestAlloc(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage) ![]u8 {
     try cfg.validate();
     if (cfg.provider != .apple) return error.InvalidGeneratorConfig;
     if (messages.len == 0 or messages.len > 128) return error.UnsupportedAppleGenerationOptions;
@@ -299,10 +300,49 @@ pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: [
         .messages = normalized,
         .max_tokens = cfg.max_tokens,
         .temperature = cfg.temperature,
-        .require_completion = control.require_completion,
+        // Foundation Models cannot report a token-cap finish reason. Always
+        // verify natural completion, including generic /generate callers.
+        .require_completion = true,
     }, .{});
+    return request;
+}
+
+pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
+    const request = try appleGenerationRequestAlloc(alloc, cfg, messages);
     defer alloc.free(request);
-    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc, .finish_reason = if (control.require_completion) .stop else null };
+    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc, .finish_reason = .stop };
+}
+
+test "generic Apple generation always requests verified natural completion" {
+    const a = std.testing.allocator;
+    const request = try appleGenerationRequestAlloc(a, .{ .provider = .apple, .model = "", .url = "", .max_tokens = 32 }, &.{.{ .role = .user, .content = .{ .text = "Hello" } }});
+    defer a.free(request);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("require_completion").?.bool);
+    try std.testing.expectEqual(@as(i64, 32), parsed.value.object.get("max_tokens").?.integer);
+}
+
+test "Apple generation validates token budgets before serializing bridge requests" {
+    const a = std.testing.allocator;
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "Hello" } }};
+    var cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
+    for ([_]i64{ 0, -1, apple_max_tokens + 1, @as(i64, 1) << 60, std.math.maxInt(i64) }) |budget| {
+        cfg.max_tokens = budget;
+        try std.testing.expectError(error.InvalidGeneratorConfig, cfg.validate());
+        try std.testing.expectError(error.InvalidGeneratorConfig, appleGenerationRequestAlloc(a, cfg, &messages));
+        const config_json = try std.fmt.allocPrint(a, "{{\"provider\":\"apple\",\"max_tokens\":{d}}}", .{budget});
+        defer a.free(config_json);
+        try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(a, config_json));
+    }
+    for ([_]i64{ 1, apple_max_tokens }) |budget| {
+        cfg.max_tokens = budget;
+        const request = try appleGenerationRequestAlloc(a, cfg, &messages);
+        defer a.free(request);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(budget, parsed.value.object.get("max_tokens").?.integer);
+    }
 }
 
 test "Apple generation configuration is local and rejects unsupported options" {
@@ -340,6 +380,7 @@ test "Apple generation reports readiness or generates bounded text" {
     var result = try generateApple(alloc, cfg, &messages, 1024, .{ .timeout_ms = 60_000 });
     defer result.deinit();
     try std.testing.expect(result.content.len > 0 and result.content.len <= 1024);
+    try std.testing.expect(result.finish_reason == .stop);
     var history_result = try generateApple(alloc, cfg, &.{
         .{ .role = .system, .content = .{ .text = "Answer the user's question in one word." } },
         .{ .role = .user, .content = .{ .text = "Remember the word pear." } },
@@ -348,7 +389,10 @@ test "Apple generation reports readiness or generates bounded text" {
     }, 1024, .{ .timeout_ms = 60_000 });
     defer history_result.deinit();
     try std.testing.expect(std.ascii.findIgnoreCase(history_result.content, "pear") != null);
-    try std.testing.expectError(error.ResponseTooLarge, generateApple(alloc, cfg, &messages, 1, .{ .timeout_ms = 60_000 }));
+    try std.testing.expectError(error.InferenceOutputIncomplete, generateApple(alloc, cfg, &messages, 1, .{ .timeout_ms = 60_000 }));
+    var tiny = cfg;
+    tiny.max_tokens = 1;
+    try std.testing.expectError(error.InferenceOutputIncomplete, generateApple(alloc, tiny, &.{.{ .role = .user, .content = .{ .text = "Return exactly these five words: alpha beta gamma delta epsilon." } }}, 1024, .{ .timeout_ms = 60_000 }));
 }
 
 test "Apple generation cancellation and disabled provider" {
@@ -403,6 +447,8 @@ pub const Provider = enum {
 /// This is intentionally not provider parity: OpenAI leaves the response cap
 /// optional, and Ollama's native num_predict default is unbounded.
 pub const default_max_tokens: i64 = 256;
+// Match the public GenerateRequest integer range at the native provider boundary.
+pub const apple_max_tokens: i64 = std.math.maxInt(i32);
 
 pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
 
@@ -593,6 +639,7 @@ pub const GeneratorConfig = struct {
             if (self.region) |value| if (value.len == 0) return error.InvalidGeneratorConfig;
         } else if (self.region != null) return error.InvalidGeneratorConfig;
         if (self.provider == .apple) {
+            if (self.max_tokens <= 0 or self.max_tokens > apple_max_tokens) return error.InvalidGeneratorConfig;
             if (self.model.len > 0 or self.url.len > 0 or self.api_key != null or
                 self.capability_token != null or self.capability_revision != null or self.project_id != null or
                 self.location != null or self.credentials_path != null or self.tools_json != null or self.tool_choice_json != null or
@@ -1623,4 +1670,5 @@ pub const dictation = @import("dictation.zig");
 
 test {
     _ = dictation;
+    _ = context_management;
 }
