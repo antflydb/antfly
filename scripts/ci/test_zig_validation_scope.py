@@ -424,7 +424,8 @@ class ZigValidationScopeTests(unittest.TestCase):
             self.assertNotIn(name, native)
         for command in (
             "node pkg/antfly-embedded/wasm_client_test.mjs",
-            "build wasm-test inference-wasm",
+            "build wasm-test -Dmetal=false -j1",
+            "build inference-wasm -Dmetal=false -j1",
             "zig build inference-wasm -Dwebgpu=true",
             "zig build inference-wasm -Dwasm-memory-model=wasm64",
             "zig build wasm -Dwasm=true -j1",
@@ -433,6 +434,15 @@ class ZigValidationScopeTests(unittest.TestCase):
             "node web/test-wasm-abi.mjs wasm64",
         ):
             self.assertIn(command, wasm)
+        self.assertIn("Install glibc-linked Zig", wasm)
+        self.assertNotIn("mlugg/setup-zig", wasm)
+        self.assertIn("--report reports/wasm-embedded-build.json", wasm)
+        self.assertIn("--report reports/wasm-inference-build.json", wasm)
+        self.assertLess(
+            wasm.index("build wasm-test -Dmetal=false -j1"),
+            wasm.index("build inference-wasm -Dmetal=false -j1"),
+        )
+        self.assertIn("path: zig/reports/wasm-*-build.json", wasm)
         libraries, evaluation = models.split(
             "      - name: Exercise real Lite extraction through public graph APIs", 1
         )
