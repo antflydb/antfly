@@ -377,3 +377,8 @@ wrapper keeps native hits and extension fields as opaque JSON while attaching
 binding metadata; external-vector helpers preserve parent JSON numbers during
 deep copying. Large identifiers and high-precision numeric evidence are never
 coerced through floating-point values by these adapters.
+
+Source-backed extraction, resolver/entity discovery and bounded graph inspection
+compose with these streams through the independent versioned
+[knowledge contract](source-knowledge.md). They reuse native declarations and
+require an explicitly isolated one-audience deployment; discovery installs no ACLs.

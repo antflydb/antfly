@@ -5574,14 +5574,18 @@ pub const DB = struct {
 
     pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (comptime storage_engine.enabled) return storage_engine.call("createDetachedEnrichmentRuntime", .{ self, enrichment_cfg });
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !self.core.index_manager.hasGroupSources()) return null;
+        // Native assets/chunks and their graph consumers still need replay
+        // when no external inference provider is installed. Reconfiguration
+        // must not discard that owner after a repair created it.
+        const has_native_work = self.core.index_manager.hasGeneratedEnrichmentTargets();
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !has_native_work) return null;
         // Producer ownership moves through reconfiguration, but execution and
         // security capabilities belong to the resident DB. Hydrate every
         // replacement at this single construction boundary so live index DDL
         // cannot silently fall back to default remote-content policy or an
         // unrelated executor when it supplies only a new producer set.
         var runtime_cfg = enrichment_cfg.*;
-        if (self.core.index_manager.hasGroupSources()) runtime_cfg.enable_without_producers = true;
+        if (has_native_work) runtime_cfg.enable_without_producers = true;
         runtime_cfg.root_incarnation = self.root_incarnation;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
@@ -30445,8 +30449,17 @@ pub const DB = struct {
         // here makes it finalize HBC once per producer window while competing
         // with artifact production, even though that generation will be
         // discarded. Install the worker at the shadow activation fence above.
+        // Legacy artifact-backed graphs materialize their durable source
+        // contributions in this worker. Deferring it would let a shadow publish
+        // an empty generation past the resolver event that should create them.
+        // Ordered publication owns those effects separately and can still defer
+        // the disposable projection worker until shadow activation.
+        const needs_legacy_graph_materialization = cfg.kind == .graph and
+            self.core.index_manager.graphArtifactSources(cfg.name).len != 0 and
+            !try orderedCoverageActive(self.core.store);
         const defer_worker_to_managed_repair = installed.managed_admission_pending and
             self.local_execution.optional_runtime_workers_enabled and
+            !needs_legacy_graph_materialization and
             try types.indexPublicationPolicy(self.alloc, cfg) == .atomic;
         if (self.start_index_workers and !defer_worker_to_managed_repair) {
             try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
@@ -33253,36 +33266,23 @@ pub const DB = struct {
         var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
         var initialized: usize = 0;
         errdefer {
-            for (resolvers[0..initialized]) |resolver| {
-                alloc.free(resolver.name);
-                alloc.free(resolver.table);
-                alloc.free(resolver.source_artifact);
-                alloc.free(resolver.resolution_artifact);
-            }
+            for (resolvers[0..initialized]) |resolver| resolver.deinit(alloc);
             if (resolvers.len > 0) alloc.free(resolvers);
         }
-
         for (catalog) |cfg| {
-            const name = try alloc.dupe(u8, cfg.name);
-            errdefer alloc.free(name);
-            const table = try alloc.dupe(u8, cfg.table);
-            errdefer alloc.free(table);
-            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
-            errdefer alloc.free(source_artifact);
-            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
-            errdefer alloc.free(resolution_artifact);
-            resolvers[initialized] = .{
-                .name = name,
+            resolvers[initialized] = try (types.ResolverReplayDiagnostic{
+                .candidate_key_prefix = cfg.candidate_key_prefix,
+                .name = cfg.name,
                 .config_generation = cfg.config_generation,
                 .effective_generation = cfg.effectiveGeneration(),
                 .curation_revision = cfg.curation_revision,
                 .namespace_curation_generation = cfg.namespace_curation_generation,
                 .namespace_curation_table_id = cfg.namespace_curation_table_id,
                 .namespace_curation_missing = cfg.namespace_curation_missing,
-                .table = table,
-                .source_artifact = source_artifact,
-                .resolution_artifact = resolution_artifact,
-            };
+                .table = cfg.table,
+                .source_artifact = cfg.source_artifact,
+                .resolution_artifact = cfg.resolution_artifact,
+            }).clone(alloc);
             initialized += 1;
         }
 
@@ -150934,4 +150934,68 @@ test "source semantic media input PDF page output cannot bind unrelated chunk de
     try std.testing.expectEqualStrings("uri", request.source_field);
     try std.testing.expectEqual(@as(u32, 0), request.chunk_size);
     try @import("enrichment/enrichment_types.zig").validateGeneratedEmbeddingInput(request);
+}
+
+test "source semantic media input graph resolution replays without mention edges" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("knowledge-resolution-relevance");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"facts","path":"$.relations[*]"},"artifact":{"name":"facts","kind":"asset","source":{"type":"field","value":"facts"},"content_type":"application/json"}}
+    });
+    try db.addResolver(.{ .name = "entities", .table = "entities", .source_artifact = "facts", .resolution_artifact = "resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false });
+    const resolution = try internal_keys.resolutionArtifactKeyAlloc(a, "parent", "resolved");
+    defer a.free(resolution);
+    const ref = index_manager_mod.ManagedIndexRef{ .name = "knowledge", .kind = .graph };
+    try std.testing.expectEqual(@as(usize, 0), db.core.index_manager.graphArtifactSources("knowledge")[0].mention_edge_type.len);
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexBatchApplicability(db.core.index_manager, .{ .changed_artifact_keys = &.{resolution} }, ref));
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .changed_artifact_keys = &.{resolution} }, ref));
+}
+
+test "source semantic media input canonical relations publish without mention edges" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("knowledge-canonical-replay");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"facts","path":"$.relations[*]"},"artifact":{"name":"facts","kind":"asset","source":{"type":"field","value":"facts"},"content_type":"application/json"}}
+    });
+    try db.addResolver(.{ .name = "entities", .table = "default", .source_artifact = "facts", .resolution_artifact = "resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false });
+    try db.batch(.{ .writes = &.{.{ .key = "claim", .value =
+        \\{"facts":{"entities":[{"id":"e0","label":"person","text":"Alice"},{"id":"e1","label":"person","text":"Bob"}],"relations":[{"source":"e0","target":"e1","type":"KNOWS"}]}}
+    }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved");
+    defer a.free(resolution_key);
+    const resolution = try db.core.store.get(a, resolution_key);
+    defer a.free(resolution);
+    try std.testing.expect(std.mem.indexOf(u8, resolution, "entity/alice") != null);
+    const edges = try waitForGraphEdges(a, &db, "knowledge", "entity/alice", "KNOWS", .out, 1);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("entity/bob", edges[0].target);
+}
+
+test "source semantic media input native asset replay survives provider-free reconfiguration" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("native-asset-runtime-owner");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime == null);
+    try db.addEnrichment(.{ .name = "facts", .kind = .asset, .field = "facts", .content_type = "application/json" });
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime != null);
+    try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime != null);
+    try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
 }

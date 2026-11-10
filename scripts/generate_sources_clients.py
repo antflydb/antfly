@@ -175,11 +175,28 @@ if __name__ == "__main__":
             "SemanticRetrieval",
             "VectorSpace",
             "ArtifactBinding",
+            "KnowledgeDeclaration",
+            "EntityBinding",
+            "GraphBinding",
+            "GraphTemporalBinding",
         ]:
             schema = json.loads(
                 json.dumps(SCHEMAS[name]).replace("#/components/schemas/", "#/$defs/")
             )
             data["$defs"][name] = schema
+
+        def add_knowledge(node):
+            if isinstance(node, dict):
+                props = node.get("properties", {})
+                if "search_version" in props and "artifacts" in props:
+                    props["knowledge"] = {"$ref": "#/$defs/KnowledgeDeclaration"}
+                for value in list(node.values()):
+                    add_knowledge(value)
+            elif isinstance(node, list):
+                for value in node:
+                    add_knowledge(value)
+
+        add_knowledge(data)
         content = json.dumps(data, indent=2) + "\n"
         if args.check:
             if path.read_text() != content:

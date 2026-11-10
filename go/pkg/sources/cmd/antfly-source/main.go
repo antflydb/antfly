@@ -38,6 +38,9 @@ func main() {
 	}
 }
 func run() error {
+	if len(os.Args) >= 2 && os.Args[1] == "knowledge" {
+		return knowledgeCommand(os.Args[2:])
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "search" {
 		return searchCommand(os.Args[2:])
 	}
@@ -51,6 +54,7 @@ func run() error {
 		return migrateLocal(os.Args[2:])
 	}
 	flags := flag.NewFlagSet("antfly-source sync", flag.ContinueOnError)
+	knowledgeAudience := flags.String("knowledge-audience", "", "operator assertion of one native instance audience")
 	profile := flags.String("config", "", "source profile JSON")
 	state := flags.String("state-dir", "", "private durable state directory")
 	catalog := flags.String("catalog-out", "", "portable search catalog path")
@@ -71,7 +75,7 @@ func run() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	runner := sources.Runner{Profile: configuration, StateDir: *state, CatalogPath: *catalog, Restart: *restart}
+	runner := sources.Runner{KnowledgeAudience: *knowledgeAudience, Profile: configuration, StateDir: *state, CatalogPath: *catalog, Restart: *restart}
 	return runner.Sync(ctx)
 }
 
@@ -90,6 +94,7 @@ func loadProfile(path string) (sources.Profile, error) {
 		return configuration, fmt.Errorf("source profile exceeds 1 MiB")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&configuration); err != nil {
 		return configuration, fmt.Errorf("invalid source profile: %w", err)

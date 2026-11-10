@@ -3646,6 +3646,7 @@ pub const ResolverReplayObservation = struct {
 };
 
 pub const ResolverReplayDiagnostic = struct {
+    candidate_key_prefix: []const u8 = "",
     name: []const u8 = "",
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
@@ -3656,6 +3657,26 @@ pub const ResolverReplayDiagnostic = struct {
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
+
+    // Diagnostics cross cache/snapshot ownership boundaries. Keep all textual
+    // fields in one cloning contract so adding a fence cannot introduce a
+    // borrowed pointer into an otherwise owned snapshot.
+    pub fn clone(self: @This(), alloc: Allocator) !@This() {
+        var owned = self;
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(owned, name) = "";
+        }
+        errdefer owned.deinit(alloc);
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(owned, name) = try alloc.dupe(u8, @field(self, name));
+        }
+        return owned;
+    }
+    pub fn deinit(self: @This(), alloc: Allocator) void {
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) alloc.free(@field(self, name));
+        }
+    }
 };
 
 pub const ResolverReplayDiagnostics = struct {
@@ -5341,12 +5362,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
-    for (stats.resolvers) |resolver| {
-        alloc.free(resolver.name);
-        alloc.free(resolver.table);
-        alloc.free(resolver.source_artifact);
-        alloc.free(resolver.resolution_artifact);
-    }
+    for (stats.resolvers) |resolver| resolver.deinit(alloc);
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }
 
@@ -5639,4 +5655,17 @@ pub fn validateExpirationDeletes(req: anytype) !void {
         for (req.writes) |write| if (std.mem.eql(u8, key, write.key)) return error.InvalidBatchRequest;
         for (req.transforms) |transform| if (std.mem.eql(u8, key, transform.key)) return error.InvalidBatchRequest;
     }
+}
+
+fn testResolverDiagnosticOwnership(a: Allocator) !void {
+    const original = ResolverReplayDiagnostic{ .name = "facts", .table = "entities", .source_artifact = "input", .resolution_artifact = "output", .candidate_key_prefix = "source/ours/", .config_generation = 42 };
+    const copy = try original.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqualStrings(original.candidate_key_prefix, copy.candidate_key_prefix);
+    try std.testing.expect(copy.candidate_key_prefix.ptr != original.candidate_key_prefix.ptr);
+    try std.testing.expectEqual(original.config_generation, copy.config_generation);
+}
+
+test "resolver diagnostics cloning owns every textual fence under allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolverDiagnosticOwnership, .{});
 }

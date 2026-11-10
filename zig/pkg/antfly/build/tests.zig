@@ -2297,7 +2297,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const resolver_adjudication_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "resolver adjudication public policy", "DistributedCandidateSource" },
+        .filters = &.{ "resolver adjudication public policy", "DistributedCandidateSource", "resolver curation status cloning" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-resolver-adjudication-api-test", "Validate resolver adjudication admission and distributed candidate adapters")
@@ -7098,7 +7098,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const resolver_candidate_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"SourceCandidateProvider"},
+        .filters = &.{ "SourceCandidateProvider", "resolver diagnostics cloning" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-resolver-candidate-test", "Verify bounded resolver candidate retrieval and provider batches")
@@ -7106,7 +7106,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const resolver_backfill_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill" },
+        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill", "resolver config persists and reader-fences candidate namespaces" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const resolver_backfill_step = b.step("antfly-resolver-backfill-test", "Run resolver catalog and durable backfill regressions");

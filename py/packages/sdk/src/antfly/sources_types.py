@@ -33,6 +33,8 @@ class Capabilities(TypedDict):
     artifact_discovery: NotRequired[bool]
     processing_presets: NotRequired[bool]
     processing_jobs: NotRequired[bool]
+    knowledge_versions: NotRequired[list[int]]
+    knowledge_audience: NotRequired[str]
 
 
 class SourceIdentity(TypedDict):
@@ -56,6 +58,8 @@ class Source(TypedDict):
     artifacts: NotRequired[list[ArtifactBinding]]
     search_status: NotRequired[SearchStatus]
     processing: NotRequired[ProcessingDeclaration]
+    knowledge: NotRequired[KnowledgeDeclaration]
+    knowledge_status: NotRequired[KnowledgeStatus]
 
 
 class Run(TypedDict):
@@ -207,3 +211,58 @@ class ProcessingJobRequest(TypedDict):
     action: Literal["start", "status", "advance", "cancel"]
     job_id: NotRequired[str]
     limit: NotRequired[int]
+
+
+class KnowledgeDeclaration(TypedDict):
+    version: Literal[1]
+    mode: Literal["instance_one_audience"]
+    audience: str
+    entities: NotRequired[list[EntityBinding]]
+    graphs: NotRequired[list[GraphBinding]]
+
+
+class EntityBinding(TypedDict):
+    name: str
+    index: str
+    resolver: str
+    table: str
+    namespace: str
+    source_artifact: str
+    resolution_artifact: str
+    schema_uri: NotRequired[str]
+    location_field: NotRequired[str]
+
+
+class GraphBinding(TypedDict):
+    name: str
+    index: str
+    artifacts: list[str]
+    entities: NotRequired[list[str]]
+    temporal: GraphTemporalBinding
+    location_field: NotRequired[str]
+    schema_uri: NotRequired[str]
+
+
+class GraphTemporalBinding(TypedDict):
+    mapping: Literal["native_intervals_v1"]
+    history: Literal["current_state"]
+
+
+class KnowledgeStatus(TypedDict):
+    version: int
+    entities: list[RepresentationStatus]
+    graphs: list[RepresentationStatus]
+    observed_at: int
+    mode: str
+    audience: NotRequired[str]
+
+
+class KnowledgeRequest(TypedDict):
+    graph: str
+    start: list[str]
+    depth: NotRequired[int]
+    limit: NotRequired[int]
+    valid_at: NotRequired[str]
+    known_at: NotRequired[str]
+    require_snapshot: NotRequired[bool]
+    entity: NotRequired[str]
