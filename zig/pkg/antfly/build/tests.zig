@@ -3146,6 +3146,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // The page engine is shared with Lite/object-store users. Dependency
     // module tests need their own compilation root after the extraction.
+    const retained_dataset_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/retained_dataset_test_root.zig"), .target = target, .optimize = optimize });
+    retained_dataset_mod.addImport("objectstore", antfly_imports.objectstore);
+    retained_dataset_mod.addImport("antfly_platform", platform_mod);
+    const retained_dataset_tests = b.addTest(.{ .root_module = retained_dataset_mod, .filters = selectTestFilters(b, &.{"retained dataset"}), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_dataset_step = b.step("retained-dataset-test", "Run durable dataset placement, replay coverage and reader-safe retention contracts");
+    retained_dataset_step.dependOn(&b.addRunArtifact(retained_dataset_tests).step);
+    serverless_test_step.dependOn(retained_dataset_step);
+
     const ordered_tree_mod = b.createModule(.{ .root_source_file = b.path("lib/objectstore/src/ordered_tree.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, ordered_tree_mod, true, true);
     const ordered_tree_tests = b.addTest(.{ .root_module = ordered_tree_mod, .filters = &.{"serverless"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });

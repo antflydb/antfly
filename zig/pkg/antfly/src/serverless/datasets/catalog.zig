@@ -1,0 +1,723 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Durable dataset metadata on the existing conditional authority and ordered
+//! pages. A segment has one authoritative placement; migration never adds rows.
+const std = @import("std");
+const objects = @import("objectstore");
+const coordinator = objects.transactional_store;
+const t = @import("types.zig");
+const A = std.mem.Allocator;
+pub const max_page = 128;
+pub const max_segment_bytes = 16 * 1024 * 1024;
+pub const pin_duration_ns = 10 * std.time.ns_per_min;
+pub const pin_grace_ns = 30 * std.time.ns_per_s;
+const Header = struct { state: objects.immutable_log.State, root_cursor: ?objects.conditional_root.Cursor = null };
+const Row = struct { key: []const u8, value: []const u8 };
+pub const Read = struct { results: []const []const Row };
+const RetirementFloor = struct { through_ns: []const u8 };
+const Coverage = struct { segment: t.Id, start_ns: []const u8, end_ns: []const u8 };
+pub const RangePlan = struct {
+    arena: std.heap.ArenaAllocator,
+    segments: []const t.Segment,
+    pub fn deinit(self: *RangePlan) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Locations are host capabilities. Persist only their opaque identity, never
+/// credentials or a user-supplied URL. The host retains their bindings while
+/// catalog records, reader pins or reclamation jobs refer to them.
+pub const Location = struct {
+    id: t.Id,
+    /// Stable fingerprint supplied by the host for the physical store binding.
+    storage_identity: t.Id,
+    client: objects.Client,
+    bucket: []const u8,
+    prefix: []const u8,
+    access: t.Access,
+};
+
+pub const Dependency = struct {
+    id: t.Id,
+    consumer: t.Id,
+    consumer_generation: u64,
+};
+
+pub const Pin = struct {
+    id: t.Id,
+    segment: t.Id,
+    location: t.Id,
+    placement_revision: u64,
+    expires_ns: u64,
+};
+
+pub const Clock = struct {
+    ptr: ?*const anyopaque = null,
+    unix_fn: ?*const fn (*const anyopaque) u64 = null,
+    authority_fn: ?*const fn (*const anyopaque) u64 = null,
+    fn unix(self: Clock) u64 {
+        return if (self.unix_fn) |f| f(self.ptr.?) else @import("antfly_platform").time.realtimeNs();
+    }
+    fn authority(self: Clock) u64 {
+        return if (self.authority_fn) |f| f(self.ptr.?) else @import("antfly_platform").time.authorityNs();
+    }
+};
+
+pub const Lease = struct {
+    pin: Pin,
+    authority_deadline: u64,
+};
+
+pub const Catalog = struct {
+    context: coordinator.Context,
+    dataset: t.Id,
+    owner: [16]u8,
+    clock: Clock = .{},
+
+    fn open(self: Catalog, write: bool) !std.json.Parsed(Header) {
+        const expected = std.fmt.bytesToHex(self.dataset, .lower);
+        if (!std.mem.eql(u8, self.context.namespace, &expected) or t.zero(self.dataset) or std.mem.allEqual(u8, &self.owner, 0)) return error.InvalidDatasetBinding;
+        const raw = try self.context.execute(.{ .root_backend = .conditional, .action = if (write) .begin else .observe_committed, .owner = self.owner });
+        defer self.context.alloc.free(raw);
+        return std.json.parseFromSlice(Header, self.context.alloc, raw, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    }
+
+    fn commit(self: Catalog, session: Header, commands: []const coordinator.Command) !void {
+        const raw = try self.context.execute(.{ .root_backend = .conditional, .action = .commit, .owner = self.owner, .state = session.state, .root_cursor = session.root_cursor, .commands = commands });
+        self.context.alloc.free(raw);
+    }
+
+    fn get(self: Catalog, session: Header, comptime T: type, key: []const u8) !?std.json.Parsed(T) {
+        const values = try self.context.readSnapshotValuesAlloc(.conditional, session.state, &.{key}, .{});
+        defer {
+            for (values) |value| if (value) |bytes| self.context.alloc.free(bytes);
+            self.context.alloc.free(values);
+        }
+        const raw = values[0] orelse return null;
+        return try std.json.parseFromSlice(T, self.context.alloc, raw, .{ .allocate = .alloc_always });
+    }
+
+    fn definition(self: Catalog, session: Header) !std.json.Parsed(t.Definition) {
+        const value = (try self.get(session, t.Definition, "definition")) orelse return error.DatasetNotFound;
+        errdefer value.deinit();
+        try value.value.validate();
+        if (!std.mem.eql(u8, &value.value.id, &self.dataset)) return error.InvalidDatasetBinding;
+        return value;
+    }
+
+    fn segment(self: Catalog, session: Header, id: t.Id) !std.json.Parsed(t.Segment) {
+        const key = try segmentKey(self.context.alloc, id);
+        defer self.context.alloc.free(key);
+        const result = (try self.get(session, t.Segment, key)) orelse return error.DatasetSegmentNotFound;
+        errdefer result.deinit();
+        const definition_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{result.value.definition_generation});
+        defer self.context.alloc.free(definition_key);
+        const def = (try self.get(session, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
+        defer def.deinit();
+        try result.value.validate(def.value);
+        if (!std.mem.eql(u8, &result.value.id, &id)) return error.InvalidDatasetSegment;
+        return result;
+    }
+
+    fn checkLocation(self: Catalog, session: Header, location: Location, allow_new: bool) !bool {
+        if (t.zero(location.id) or t.zero(location.storage_identity)) return error.InvalidDatasetBinding;
+        const key = try locationKey(self.context.alloc, location.id);
+        defer self.context.alloc.free(key);
+        const Binding = struct { storage_identity: t.Id, access: t.Access };
+        const existing = (try self.get(session, Binding, key)) orelse {
+            if (!allow_new) return error.DatasetLocationUnavailable;
+            return false;
+        };
+        defer existing.deinit();
+        if (!std.mem.eql(u8, &existing.value.storage_identity, &location.storage_identity) or existing.value.access != location.access) return error.DatasetLocationConflict;
+        return true;
+    }
+
+    pub fn create(self: Catalog, value: t.Definition) !void {
+        try value.validate();
+        if (!std.mem.eql(u8, &value.id, &self.dataset)) return error.InvalidDatasetBinding;
+        var session = try self.open(true);
+        defer session.deinit();
+        if (try self.get(session.value, t.Definition, "definition")) |existing| {
+            existing.deinit();
+            return error.DatasetAlreadyExists;
+        }
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, value, .{});
+        defer self.context.alloc.free(raw);
+        const generation_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{value.generation});
+        defer self.context.alloc.free(generation_key);
+        try self.commit(session.value, &.{ .{ .kind = .put, .key = "definition", .value = raw }, .{ .kind = .put, .key = generation_key, .value = raw } });
+    }
+
+    /// Definition versions remain readable after schema/recipe evolution. The
+    /// new generation has no implied backfill coverage and cannot reinterpret
+    /// older immutable state using a new decoder or aggregate expression.
+    pub fn evolve(self: Catalog, expected_generation: u64, next: t.Definition) !void {
+        try next.validate();
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.definition(session.value);
+        defer current.deinit();
+        const generation = std.math.add(u64, expected_generation, 1) catch return error.DatasetDefinitionConflict;
+        if (current.value.kind != next.kind or current.value.generation != expected_generation or next.generation != generation or !std.mem.eql(u8, &next.id, &self.dataset)) return error.DatasetDefinitionConflict;
+        const key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{next.generation});
+        defer self.context.alloc.free(key);
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, next, .{});
+        defer self.context.alloc.free(raw);
+        try self.commit(session.value, &.{ .{ .kind = .put, .key = "definition", .value = raw }, .{ .kind = .put, .key = key, .value = raw } });
+    }
+
+    pub fn getDefinition(self: Catalog) !std.json.Parsed(t.Definition) {
+        var session = try self.open(false);
+        defer session.deinit();
+        return self.definition(session.value);
+    }
+
+    pub fn getSegment(self: Catalog, id: t.Id) !std.json.Parsed(t.Segment) {
+        var session = try self.open(false);
+        defer session.deinit();
+        return self.segment(session.value, id);
+    }
+
+    /// The caller supplies a bounded, complete immutable segment. Content is
+    /// uploaded and read-verified before the authoritative metadata is committed.
+    pub fn publish(self: Catalog, value: t.Segment, location: Location, bytes: []const u8) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const def = try self.definition(session.value);
+        defer def.deinit();
+        try value.validate(def.value);
+        if (value.retiring or value.local_retiring or value.previous_local != null or value.archive != null or value.location_collected or value.archive_collected or value.placement_revision != 1 or
+            !std.mem.eql(u8, &value.location, &location.id) or value.access != location.access or value.byte_len != bytes.len) return error.InvalidDatasetSegment;
+        const key = try segmentKey(self.context.alloc, value.id);
+        defer self.context.alloc.free(key);
+        if (try self.get(session.value, t.Segment, key)) |existing| {
+            existing.deinit();
+            return error.DatasetSegmentAlreadyExists;
+        }
+        const floor_key = try retirementKey(self.context.alloc, value);
+        defer self.context.alloc.free(floor_key);
+        if (try self.get(session.value, RetirementFloor, floor_key)) |floor| {
+            defer floor.deinit();
+            const through = std.fmt.parseInt(i128, floor.value.through_ns, 10) catch return error.InvalidDatasetCoverage;
+            if (try value.coverage.start() < through) return error.DatasetSegmentRetired;
+        }
+        const prefix = try coveragePrefix(self.context.alloc, value.definition_generation, value.source.partition, value.source.incarnation);
+        defer self.context.alloc.free(prefix);
+        const after = try coverageAfter(self.context.alloc, prefix, try value.coverage.start());
+        defer self.context.alloc.free(after);
+        const successor = try self.list(session.value, prefix, after, 1);
+        defer successor.deinit();
+        if (successor.value.results[0].len != 0) {
+            const index = try std.json.parseFromSlice(Coverage, self.context.alloc, successor.value.results[0][0].value, .{});
+            defer index.deinit();
+            const range = t.Range{ .start_ns = index.value.start_ns, .end_ns = index.value.end_ns };
+            if (try value.coverage.overlaps(range)) return error.DatasetCoverageOverlap;
+        }
+        _ = try self.checkLocation(session.value, location, true);
+        // Encode before object I/O to reject metadata that exceeds page limits.
+        const encoded = try std.json.Stringify.valueAlloc(self.context.alloc, value, .{});
+        defer self.context.alloc.free(encoded);
+        if (encoded.len > 32768) return error.DatasetSegmentBudgetExceeded;
+        try self.writeVerified(value, location, bytes);
+        try self.putSegmentWithLocation(session.value, value, location);
+    }
+
+    pub fn hold(self: Catalog, id: t.Id, dependency: Dependency) !void {
+        if (t.zero(dependency.id) or t.zero(dependency.consumer) or dependency.consumer_generation == 0 or dependency.consumer_generation > t.max_public_counter) return error.InvalidDatasetDependency;
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        if (current.value.retiring) return error.DatasetSegmentRetired;
+        const key = try dependencyKey(self.context.alloc, id, dependency.id);
+        defer self.context.alloc.free(key);
+        if (try self.get(session.value, Dependency, key)) |existing| {
+            defer existing.deinit();
+            if (!std.meta.eql(existing.value, dependency)) return error.DatasetDependencyConflict;
+            return;
+        }
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, dependency, .{});
+        defer self.context.alloc.free(raw);
+        try self.commit(session.value, &.{.{ .kind = .put, .key = key, .value = raw }});
+    }
+
+    /// Consumer authority must be checked by the host. Exact identity prevents
+    /// a stale release from clearing a replacement generation's dependency.
+    pub fn releaseHold(self: Catalog, id: t.Id, dependency: Dependency) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const key = try dependencyKey(self.context.alloc, id, dependency.id);
+        defer self.context.alloc.free(key);
+        const existing = (try self.get(session.value, Dependency, key)) orelse return;
+        defer existing.deinit();
+        if (!std.meta.eql(existing.value, dependency)) return error.DatasetDependencyConflict;
+        try self.commit(session.value, &.{.{ .kind = .delete, .key = key }});
+    }
+
+    /// Copy first, then change one authoritative placement with exact-root CAS.
+    /// A failed/cancelled attempt cannot authorize local reclamation.
+    pub fn migrate(self: Catalog, id: t.Id, expected_revision: u64, source: Location, destination: Location) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        var next = current.value;
+        if (next.retiring or !next.finalized or next.previous_local != null or next.local_retiring or next.placement_revision != expected_revision or
+            !std.mem.eql(u8, &next.location, &source.id) or next.access != source.access or std.mem.eql(u8, &source.id, &destination.id)) return error.DatasetPlacementConflict;
+        if (source.access != .local or destination.access == .local or (next.archive != null and !std.mem.eql(u8, &next.archive.?, &destination.id))) return error.DatasetMigrationUnsupported;
+        _ = try self.checkLocation(session.value, source, false);
+        _ = try self.checkLocation(session.value, destination, true);
+        const bytes = try self.readVerified(next, source);
+        defer self.context.alloc.free(bytes);
+        try self.writeVerified(next, destination, bytes);
+        next.previous_local = source.id;
+        next.archive = destination.id;
+        next.location = destination.id;
+        next.access = destination.access;
+        next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
+        try self.putSegmentWithLocation(session.value, next, destination);
+    }
+
+    fn list(self: Catalog, session: Header, prefix: []const u8, after: []const u8, limit: usize) !std.json.Parsed(Read) {
+        if (limit == 0 or limit > max_page) return error.DatasetPageBudgetExceeded;
+        const raw = try self.context.execute(.{ .root_backend = .conditional, .action = .read, .owner = session.state.owner, .state = session.state, .root_cursor = session.root_cursor, .commands = &.{.{ .kind = .list, .key = prefix, .after = after, .limit = limit }}, .read_limits = .{ .max_encoded_bytes = 4 * 1024 * 1024, .max_value_bytes = 32768 } });
+        defer self.context.alloc.free(raw);
+        return std.json.parseFromSlice(Read, self.context.alloc, raw, .{ .allocate = .alloc_always });
+    }
+
+    pub fn listSegments(self: Catalog, after: []const u8, limit: usize) !std.json.Parsed(Read) {
+        var session = try self.open(false);
+        defer session.deinit();
+        const def = try self.definition(session.value);
+        defer def.deinit();
+        return self.list(session.value, "segments/", after, limit);
+    }
+
+    /// Resolve one source partition/generation by ordered event-time seeks.
+    /// This is a preparation result, not a read lease: acquire every selected
+    /// segment before exposing any result. Empty history requires an explicit
+    /// empty-state segment; absence is never silently converted into zero.
+    pub fn planRange(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, range: t.Range, limit: usize) !RangePlan {
+        try range.validate();
+        if (limit == 0 or limit > max_page or generation == 0 or incarnation == 0 or t.zero(partition)) return error.DatasetPageBudgetExceeded;
+        var arena = std.heap.ArenaAllocator.init(self.context.alloc);
+        errdefer arena.deinit();
+        const temp = arena.allocator();
+        var catalog = self;
+        catalog.context.alloc = temp;
+        // Everything belongs to the returned arena; no allocator capability or
+        // parsed-header arena escapes by reference to this stack frame.
+        const session = try catalog.open(false);
+        const prefix = try coveragePrefix(temp, generation, partition, incarnation);
+        const after = try coverageAfter(temp, prefix, try range.start());
+        const page = try catalog.list(session.value, prefix, after, limit);
+        var selected = std.ArrayList(Coverage).empty;
+        var keys = std.ArrayList([]const u8).empty;
+        var covered = try range.start();
+        const end = try range.end();
+        for (page.value.results[0]) |row| {
+            const index = try std.json.parseFromSliceLeaky(Coverage, temp, row.value, .{});
+            const extent = t.Range{ .start_ns = index.start_ns, .end_ns = index.end_ns };
+            try extent.validate();
+            if (try extent.start() != covered) return error.DatasetCoverageUnavailable;
+            if (try extent.end() > end) return error.DatasetResolutionUnavailable;
+            try selected.append(temp, index);
+            try keys.append(temp, try segmentKey(temp, index.segment));
+            covered = try extent.end();
+            if (covered == end) break;
+        }
+        if (covered != end) return if (selected.items.len == limit) error.DatasetPageBudgetExceeded else error.DatasetCoverageUnavailable;
+        const definition_key = try std.fmt.allocPrint(temp, "definitions/{d}", .{generation});
+        const def = (try catalog.get(session.value, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
+        try def.value.validate();
+        // One bounded multi-key traversal shares navigation pages across all
+        // selected segments; definitions are resolved once per range plan.
+        const raw = try catalog.context.readSnapshotValuesAlloc(.conditional, session.value.state, keys.items, .{});
+        const entries = try temp.alloc(t.Segment, selected.items.len);
+        const now = catalog.clock.unix();
+        for (raw, selected.items, entries) |value, index, *part| {
+            part.* = try std.json.parseFromSliceLeaky(t.Segment, temp, value orelse return error.InvalidDatasetCoverage, .{ .allocate = .alloc_always });
+            try part.validate(def.value);
+            if (!std.mem.eql(u8, &part.id, &index.segment) or !std.mem.eql(u8, &part.source.partition, &partition) or part.source.incarnation != incarnation or
+                try part.coverage.start() != try std.fmt.parseInt(i128, index.start_ns, 10) or try part.coverage.end() != try std.fmt.parseInt(i128, index.end_ns, 10)) return error.InvalidDatasetCoverage;
+            if (part.retiring or try part.expired(def.value, now)) return error.DatasetCoverageUnavailable;
+            if (part.access == .restore_required) return error.DatasetRestoreRequired;
+        }
+        return .{ .arena = arena, .segments = entries };
+    }
+
+    /// Register protection before returning an authoritative location. The root
+    /// CAS races atomically with migration/retirement; no GET-then-pin gap.
+    pub fn acquire(self: Catalog, id: t.Id) !Lease {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        const value = current.value;
+        if (value.retiring) return error.DatasetSegmentRetired;
+        if (value.access == .restore_required) return error.DatasetRestoreRequired;
+        const now = self.clock.unix();
+        const authority = self.clock.authority();
+        if (now == 0 or authority == 0) return error.DatasetLeaseExpired;
+        const definition_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{value.definition_generation});
+        defer self.context.alloc.free(definition_key);
+        const def = (try self.get(session.value, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
+        defer def.deinit();
+        if (try value.expired(def.value, now)) return error.DatasetSegmentExpired;
+        var id_bytes: t.Id = undefined;
+        self.context.io.random(&id_bytes);
+        if (t.zero(id_bytes)) return error.InvalidDatasetBinding;
+        const authority_deadline = std.math.add(u64, authority, pin_duration_ns) catch return error.DatasetLeaseExpired;
+        const pin = Pin{ .id = id_bytes, .segment = id, .location = value.location, .placement_revision = value.placement_revision, .expires_ns = std.math.add(u64, now, pin_duration_ns) catch return error.DatasetLeaseExpired };
+        const prefix = try pinPrefix(self.context.alloc, id);
+        defer self.context.alloc.free(prefix);
+        const pins = try self.list(session.value, prefix, "", 65);
+        defer pins.deinit();
+        if (pins.value.results[0].len > 64) return error.DatasetReaderBudgetExceeded;
+        var commands = std.ArrayList(coordinator.Command).empty;
+        defer commands.deinit(self.context.alloc);
+        var live: usize = 0;
+        for (pins.value.results[0]) |row| {
+            const existing = try std.json.parseFromSlice(Pin, self.context.alloc, row.value, .{});
+            defer existing.deinit();
+            if (!std.mem.eql(u8, &existing.value.segment, &id) or std.mem.eql(u8, &existing.value.id, &pin.id)) return error.InvalidDatasetPin;
+            if (existing.value.expires_ns +| pin_grace_ns < now) try commands.append(self.context.alloc, .{ .kind = .delete, .key = row.key }) else live += 1;
+        }
+        if (live >= 64) return error.DatasetReaderBudgetExceeded;
+        const key = try pinKey(self.context.alloc, pin);
+        defer self.context.alloc.free(key);
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, pin, .{});
+        defer self.context.alloc.free(raw);
+        try commands.append(self.context.alloc, .{ .kind = .put, .key = key, .value = raw });
+        try self.commit(session.value, commands.items);
+        return .{ .pin = pin, .authority_deadline = authority_deadline };
+    }
+
+    fn checkLease(self: Catalog, lease: Lease) !void {
+        const now = self.clock.unix();
+        const authority = self.clock.authority();
+        if (now == 0 or authority == 0 or now >= lease.pin.expires_ns or authority >= lease.authority_deadline) return error.DatasetLeaseExpired;
+    }
+
+    pub fn read(self: Catalog, lease: Lease, location: Location) ![]u8 {
+        try self.checkLease(lease);
+        var session = try self.open(false);
+        defer session.deinit();
+        const key = try pinKey(self.context.alloc, lease.pin);
+        defer self.context.alloc.free(key);
+        const stored = (try self.get(session.value, Pin, key)) orelse return error.DatasetLeaseExpired;
+        defer stored.deinit();
+        if (!std.meta.eql(stored.value, lease.pin) or !std.mem.eql(u8, &lease.pin.location, &location.id)) return error.InvalidDatasetPin;
+        const current = try self.segment(session.value, lease.pin.segment);
+        defer current.deinit();
+        _ = try self.checkLocation(session.value, location, false);
+        const bytes = try self.readVerified(current.value, location);
+        errdefer self.context.alloc.free(bytes);
+        try self.checkLease(lease);
+        return bytes;
+    }
+
+    pub fn release(self: Catalog, lease: Lease) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const key = try pinKey(self.context.alloc, lease.pin);
+        defer self.context.alloc.free(key);
+        const stored = (try self.get(session.value, Pin, key)) orelse return;
+        defer stored.deinit();
+        if (!std.meta.eql(stored.value, lease.pin)) return error.InvalidDatasetPin;
+        try self.commit(session.value, &.{.{ .kind = .delete, .key = key }});
+    }
+
+    fn requireNoReaders(self: Catalog, session: Header, id: t.Id, location: ?t.Id) !void {
+        const now = self.clock.unix();
+        if (now == 0) return error.DatasetLeaseExpired;
+        const prefix = try pinPrefix(self.context.alloc, id);
+        defer self.context.alloc.free(prefix);
+        const pins = try self.list(session, prefix, "", 65);
+        defer pins.deinit();
+        if (pins.value.results[0].len > 64) return error.DatasetReaderBudgetExceeded;
+        for (pins.value.results[0]) |row| {
+            const pin = try std.json.parseFromSlice(Pin, self.context.alloc, row.value, .{});
+            defer pin.deinit();
+            if (!std.mem.eql(u8, &pin.value.segment, &id)) return error.InvalidDatasetPin;
+            if ((location == null or std.mem.eql(u8, &location.?, &pin.value.location)) and pin.value.expires_ns +| pin_grace_ns >= now) return error.DatasetReadersActive;
+        }
+    }
+
+    /// Two durable steps: fence readers first, then delete the old copy. A
+    /// restart resumes the same deletion; no new rights can target that copy.
+    pub fn reclaimLocal(self: Catalog, id: t.Id, location: Location) !bool {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        var next = current.value;
+        const previous = next.previous_local orelse return true;
+        if (location.access != .local or !std.mem.eql(u8, &previous, &location.id)) return error.DatasetPlacementConflict;
+        if (!next.local_retiring) {
+            try self.requireNoReaders(session.value, id, previous);
+            next.local_retiring = true;
+            try self.putSegment(session.value, next);
+            return false;
+        }
+        _ = try self.checkLocation(session.value, location, false);
+        try self.removeObject(next, location);
+        next.previous_local = null;
+        next.local_retiring = false;
+        try self.putSegment(session.value, next);
+        return true;
+    }
+
+    /// Expiration is independent of local residence. Finalized historical state
+    /// may be retired only after the caller has checked downstream dependencies.
+    /// Retirement rejects new readers before any object deletion is attempted.
+    pub fn retire(self: Catalog, id: t.Id, expected_revision: u64) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        const definition_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{current.value.definition_generation});
+        defer self.context.alloc.free(definition_key);
+        const def = (try self.get(session.value, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
+        defer def.deinit();
+        var next = current.value;
+        if (next.retiring) return;
+        const now = self.clock.unix();
+        const expires = std.math.add(i128, try next.coverage.end(), def.value.retention_ns) catch return error.DatasetRetentionPending;
+        if (now == 0 or expires > now or !next.finalized or next.previous_local != null or expected_revision != next.placement_revision) return error.DatasetRetentionPending;
+        const prefix = try std.fmt.allocPrint(self.context.alloc, "dependencies/{s}/", .{std.fmt.bytesToHex(id, .lower)});
+        defer self.context.alloc.free(prefix);
+        const dependencies = try self.list(session.value, prefix, "", 1);
+        defer dependencies.deinit();
+        if (dependencies.value.results[0].len != 0) return error.DatasetDependencyPending;
+        try self.requireNoReaders(session.value, id, null);
+        next.retiring = true;
+        try self.putSegment(session.value, next);
+    }
+
+    pub fn collect(self: Catalog, id: t.Id, location: Location) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        var next = current.value;
+        const primary = std.mem.eql(u8, &location.id, &next.location);
+        const archive = next.archive != null and std.mem.eql(u8, &location.id, &next.archive.?);
+        if (!next.retiring or next.previous_local != null or (!primary and !archive)) return error.DatasetRetentionPending;
+        if ((!primary or next.location_collected) and (!archive or next.archive_collected)) return;
+        _ = try self.checkLocation(session.value, location, false);
+        try self.removeObject(next, location);
+        if (primary) next.location_collected = true;
+        if (archive) next.archive_collected = true;
+        // Keep the tombstone: old publication retries must never resurrect it.
+        try self.putSegment(session.value, next);
+    }
+
+    /// Retire detailed tombstones in event order into one durable lower bound.
+    /// This bounds metadata growth for an indefinitely running retained dataset
+    /// without allowing delayed publications to resurrect expired history.
+    pub fn compact(self: Catalog, id: t.Id) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = self.segment(session.value, id) catch |err| switch (err) {
+            error.DatasetSegmentNotFound => return,
+            else => return err,
+        };
+        defer current.deinit();
+        const value = current.value;
+        if (!value.retiring or !value.location_collected or value.previous_local != null or (value.archive != null and !value.archive_collected)) return error.DatasetRetentionPending;
+        const prefix = try coveragePrefix(self.context.alloc, value.definition_generation, value.source.partition, value.source.incarnation);
+        defer self.context.alloc.free(prefix);
+        const first = try self.list(session.value, prefix, "", 1);
+        defer first.deinit();
+        if (first.value.results[0].len != 1) return error.InvalidDatasetCoverage;
+        const index = try std.json.parseFromSlice(Coverage, self.context.alloc, first.value.results[0][0].value, .{});
+        defer index.deinit();
+        if (!std.mem.eql(u8, &index.value.segment, &id)) return error.DatasetCompactionOrder;
+        const floor_key = try retirementKey(self.context.alloc, value);
+        defer self.context.alloc.free(floor_key);
+        if (try self.get(session.value, RetirementFloor, floor_key)) |floor| {
+            defer floor.deinit();
+            const previous = std.fmt.parseInt(i128, floor.value.through_ns, 10) catch return error.InvalidDatasetCoverage;
+            if (try value.coverage.end() <= previous) return error.InvalidDatasetCoverage;
+        }
+        const pins_prefix = try pinPrefix(self.context.alloc, id);
+        defer self.context.alloc.free(pins_prefix);
+        const pins = try self.list(session.value, pins_prefix, "", 65);
+        defer pins.deinit();
+        if (pins.value.results[0].len > 64) return error.DatasetReaderBudgetExceeded;
+        var commands = std.ArrayList(coordinator.Command).empty;
+        defer commands.deinit(self.context.alloc);
+        const segment_key = try segmentKey(self.context.alloc, id);
+        defer self.context.alloc.free(segment_key);
+        const coverage_key = try coverageKey(self.context.alloc, value);
+        defer self.context.alloc.free(coverage_key);
+        const floor = try std.json.Stringify.valueAlloc(self.context.alloc, RetirementFloor{ .through_ns = value.coverage.end_ns }, .{});
+        defer self.context.alloc.free(floor);
+        try commands.appendSlice(self.context.alloc, &.{ .{ .kind = .delete, .key = segment_key }, .{ .kind = .delete, .key = coverage_key }, .{ .kind = .put, .key = floor_key, .value = floor } });
+        for (pins.value.results[0]) |row| try commands.append(self.context.alloc, .{ .kind = .delete, .key = row.key });
+        try self.commit(session.value, commands.items);
+    }
+
+    fn putSegmentWithLocation(self: Catalog, session: Header, value: t.Segment, location: Location) !void {
+        const bound = try self.checkLocation(session, location, true);
+        const key = try segmentKey(self.context.alloc, value.id);
+        defer self.context.alloc.free(key);
+        const binding_key = try locationKey(self.context.alloc, location.id);
+        defer self.context.alloc.free(binding_key);
+        const binding = try std.json.Stringify.valueAlloc(self.context.alloc, .{ .storage_identity = location.storage_identity, .access = location.access }, .{});
+        defer self.context.alloc.free(binding);
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, value, .{});
+        defer self.context.alloc.free(raw);
+        const coverage_key = try coverageKey(self.context.alloc, value);
+        defer self.context.alloc.free(coverage_key);
+        const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns }, .{});
+        defer self.context.alloc.free(coverage);
+        const commands = [_]coordinator.Command{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = coverage_key, .value = coverage } };
+        try self.commit(session, commands[if (bound) @as(usize, 1) else 0..]);
+    }
+
+    fn putSegment(self: Catalog, session: Header, value: t.Segment) !void {
+        const key = try segmentKey(self.context.alloc, value.id);
+        defer self.context.alloc.free(key);
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, value, .{});
+        defer self.context.alloc.free(raw);
+        try self.commit(session, &.{.{ .kind = .put, .key = key, .value = raw }});
+    }
+
+    fn removeObject(self: Catalog, value: t.Segment, location: Location) !void {
+        const key = try self.objectKey(self.context.alloc, value, location);
+        defer self.context.alloc.free(key);
+        var client = location.client;
+        client.allocator = self.context.alloc;
+        client.deleteObject(location.bucket, key, .{ .cancellation = self.context.cancellation }) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    pub fn restore(self: Catalog, id: t.Id, expected_revision: u64, source: Location, destination: Location) !void {
+        var session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        var next = current.value;
+        if (next.retiring or next.previous_local != null or next.placement_revision != expected_revision or destination.access != .local or
+            source.access == .local or next.access != source.access or !std.mem.eql(u8, &next.location, &source.id) or std.mem.eql(u8, &source.id, &destination.id)) return error.DatasetPlacementConflict;
+        _ = try self.checkLocation(session.value, source, false);
+        _ = try self.checkLocation(session.value, destination, true);
+        const bytes = try self.readVerified(next, source);
+        defer self.context.alloc.free(bytes);
+        try self.writeVerified(next, destination, bytes);
+        // The archive remains durable until an independent logical-retention
+        // decision. Restore does not authorize deleting its source copy.
+        next.archive = source.id;
+        next.location = destination.id;
+        next.access = .local;
+        next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
+        try self.putSegmentWithLocation(session.value, next, destination);
+    }
+
+    fn objectKey(self: Catalog, alloc: A, value: t.Segment, location: Location) ![]u8 {
+        if (t.zero(location.id) or location.prefix.len == 0 or location.bucket.len == 0) return error.InvalidDatasetBinding;
+        return std.fmt.allocPrint(alloc, "{s}/datasets/{s}/{s}/{d}/{s}/{s}", .{ location.prefix, std.fmt.bytesToHex(location.id, .lower), std.fmt.bytesToHex(self.dataset, .lower), value.definition_generation, std.fmt.bytesToHex(value.id, .lower), std.fmt.bytesToHex(value.checksum, .lower) });
+    }
+
+    fn readVerified(self: Catalog, value: t.Segment, location: Location) ![]u8 {
+        if (value.byte_len > max_segment_bytes) return error.DatasetSegmentBudgetExceeded;
+        const key = try self.objectKey(self.context.alloc, value, location);
+        defer self.context.alloc.free(key);
+        var client = location.client;
+        client.allocator = self.context.alloc;
+        var result = try client.getObject(location.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = @intCast(value.byte_len), .cancellation = self.context.cancellation });
+        errdefer result.deinit(self.context.alloc);
+        try verify(value, result.body);
+        result.metadata.deinit(self.context.alloc);
+        return result.body;
+    }
+
+    fn writeVerified(self: Catalog, value: t.Segment, location: Location, bytes: []const u8) !void {
+        try verify(value, bytes);
+        const key = try self.objectKey(self.context.alloc, value, location);
+        defer self.context.alloc.free(key);
+        var client = location.client;
+        client.allocator = self.context.alloc;
+        var result = client.putObject(location.bucket, key, bytes, .{ .if_none_match = true, .cancellation = self.context.cancellation }) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                const existing = try self.readVerified(value, location);
+                self.context.alloc.free(existing);
+                return;
+            },
+            else => return err,
+        };
+        result.deinit(self.context.alloc);
+        const copied = try self.readVerified(value, location);
+        self.context.alloc.free(copied);
+    }
+};
+
+fn segmentKey(a: A, id: t.Id) ![]u8 {
+    return std.fmt.allocPrint(a, "segments/{s}", .{std.fmt.bytesToHex(id, .lower)});
+}
+fn verify(value: t.Segment, bytes: []const u8) !void {
+    if (bytes.len > max_segment_bytes) return error.DatasetSegmentBudgetExceeded;
+    var checksum: t.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &checksum, .{});
+    if (value.byte_len != bytes.len or !std.mem.eql(u8, &checksum, &value.checksum)) return error.DatasetSegmentCorrupt;
+}
+
+fn pinPrefix(a: A, id: t.Id) ![]u8 {
+    return std.fmt.allocPrint(a, "pins/{s}/", .{std.fmt.bytesToHex(id, .lower)});
+}
+fn pinKey(a: A, pin: Pin) ![]u8 {
+    return std.fmt.allocPrint(a, "pins/{s}/{s}", .{ std.fmt.bytesToHex(pin.segment, .lower), std.fmt.bytesToHex(pin.id, .lower) });
+}
+
+fn dependencyKey(a: A, segment: t.Id, id: t.Id) ![]u8 {
+    return std.fmt.allocPrint(a, "dependencies/{s}/{s}", .{ std.fmt.bytesToHex(segment, .lower), std.fmt.bytesToHex(id, .lower) });
+}
+
+fn locationKey(a: A, id: t.Id) ![]u8 {
+    return std.fmt.allocPrint(a, "locations/{s}", .{std.fmt.bytesToHex(id, .lower)});
+}
+
+fn coveragePrefix(a: A, generation: u64, partition: t.Id, incarnation: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "coverage/{d}/{s}/{d}/", .{ generation, std.fmt.bytesToHex(partition, .lower), incarnation });
+}
+fn orderedInstant(value: i128) [32]u8 {
+    var bytes: [16]u8 = undefined;
+    std.mem.writeInt(u128, &bytes, @as(u128, @bitCast(value)) ^ (@as(u128, 1) << 127), .big);
+    return std.fmt.bytesToHex(bytes, .lower);
+}
+fn coverageAfter(a: A, prefix: []const u8, start: i128) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}{s}~", .{ prefix, orderedInstant(start) });
+}
+fn coverageKey(a: A, value: t.Segment) ![]u8 {
+    const prefix = try coveragePrefix(a, value.definition_generation, value.source.partition, value.source.incarnation);
+    defer a.free(prefix);
+    return std.fmt.allocPrint(a, "{s}{s}/{s}", .{ prefix, orderedInstant(try value.coverage.end()), std.fmt.bytesToHex(value.id, .lower) });
+}
+
+fn nextPlacementRevision(value: u64) !u64 {
+    if (value >= t.max_public_counter) return error.DatasetPlacementConflict;
+    return value + 1;
+}
+
+fn retirementKey(a: A, value: t.Segment) ![]u8 {
+    return std.fmt.allocPrint(a, "retired/{d}/{s}/{d}", .{ value.definition_generation, std.fmt.bytesToHex(value.source.partition, .lower), value.source.incarnation });
+}

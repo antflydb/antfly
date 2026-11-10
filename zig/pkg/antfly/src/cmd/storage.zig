@@ -34,6 +34,7 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         printUsage();
         return;
     }
+    if (std.mem.eql(u8, kind, "dataset")) return @import("dataset.zig").runFromIterator(init, iterator);
     if (!std.mem.eql(u8, kind, "migrate")) return error.InvalidArguments;
     const alloc = init.arena.allocator();
     var arguments: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -167,7 +168,8 @@ fn printProgress(_: ?*anyopaque, raw: []const u8) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: antfly storage migrate --table NAME --to vector-store --job ID [options]
+        \\usage: antfly storage dataset --request FILE
+        \\       antfly storage migrate --table NAME --to vector-store --job ID [options]
         \\
         \\Online: --url http://HOST:PORT [--action run|start|step|publish|cancel|status]
         \\Offline: --catalog PATH --replica-root PATH [--once | --cancel | --action status]

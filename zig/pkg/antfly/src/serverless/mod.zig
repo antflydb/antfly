@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const datasets = @import("datasets/mod.zig");
 pub const sql = @import("sql/mod.zig");
 pub const manifest = @import("manifest/mod.zig");
 pub const artifacts = @import("artifacts/mod.zig");
