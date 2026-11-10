@@ -481,6 +481,10 @@ fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, p
     return 1;
 }
 
+fn reclaimLiteInferenceHostMemory(_: *anyopaque, target: u64) callconv(.c) u64 {
+    return @import("resource_manager.zig").retired_file_cache.reclaim(target);
+}
+
 fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
     const owner = try std.heap.c_allocator.create(LiteInferenceResourceOwner);
     owner.* = .{};
@@ -498,6 +502,7 @@ fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResou
         .release_admission = releaseLiteInferenceResources,
         .observe_prompt_cache = observeLiteInferencePromptCache,
         .observe_tokenizer_cache = observeLiteInferenceTokenizerCache,
+        .reclaim_host = reclaimLiteInferenceHostMemory,
     };
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,

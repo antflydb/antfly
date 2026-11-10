@@ -6255,6 +6255,7 @@ pub fn runFromIterator(
         .release_admission = releaseInferenceResources,
         .observe_prompt_cache = observeInferencePromptCache,
         .observe_tokenizer_cache = observeInferenceTokenizerCache,
+        .reclaim_host = reclaimInferenceHostMemory,
     };
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
@@ -9336,6 +9337,11 @@ fn releaseInferenceResourceOwner(context: *anyopaque) callconv(.c) void {
     if (current <= 1)
         @panic("inference resource capability released its owner's base reference");
     owner.references.store(current - 1, .release);
+}
+
+fn reclaimInferenceHostMemory(context: *anyopaque, target: u64) callconv(.c) u64 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    return owner.manager.reclaimHostMemory(target);
 }
 
 fn reserveInferenceResources(

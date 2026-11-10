@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
 // Retained document capabilities and incremental HTTP request-body reads.
-pub const abi_version: u32 = 34;
+pub const abi_version: u32 = 35;
 pub const DocumentStoreView = @import("antfly_runtime_abi").document_abi.View;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
@@ -148,6 +148,7 @@ pub const ResourceBudget = extern struct {
     release_admission: *const fn (*anyopaque, usize) callconv(.c) void,
     observe_prompt_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
     observe_tokenizer_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
+    reclaim_host: ?*const fn (*anyopaque, u64) callconv(.c) u64 = null,
 };
 
 /// Stable operation identifiers for the embedded inference service. Requests

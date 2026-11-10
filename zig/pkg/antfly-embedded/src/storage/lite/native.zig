@@ -35,6 +35,40 @@ const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
 const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
 
+test "lite native retirement preserves snapshot data and excludes internal readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const path = try testPath(a, dir, "retire-source.aflite");
+    defer a.free(path);
+    const snapshot_path = try testPath(a, dir, "retire-snapshot.aflite");
+    defer a.free(snapshot_path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var manager_closed = false;
+    defer if (!manager_closed) manager.deinit(a);
+    const owner = @intFromPtr(&manager);
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .resource_manager = &manager });
+        defer file.close();
+        try file.putDocument("doc", "preserved");
+        _ = try file.copyStableSnapshotToPath(snapshot_path, false);
+        const pending = resource_manager_mod.retired_file_cache.pendingForOwner(owner);
+        {
+            var reader = try NativeFile.openWithIo(a, io, snapshot_path, .{ .read_only = true, .internal_reader = true, .resource_manager = &manager });
+            defer reader.close();
+            const value = (try reader.getDocumentAlloc(a, "doc")).?;
+            defer a.free(value);
+            try std.testing.expectEqualStrings("preserved", value);
+        }
+        try std.testing.expectEqual(pending, resource_manager_mod.retired_file_cache.pendingForOwner(owner));
+        if (builtin.os.tag == .linux) try std.testing.expect(pending > 0);
+    }
+    manager.deinit(a);
+    manager_closed = true;
+    try std.testing.expectEqual(@as(usize, 0), resource_manager_mod.retired_file_cache.pendingForOwner(owner));
+}
+
 test "lite index prefix comparison scales past 4096 records and detects mutations" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4707,6 +4741,9 @@ pub const NativeFile = struct {
     path: []u8,
     file: std.Io.File,
     writer_lock_file: ?std.Io.File = null,
+    /// Internal readers close frequently and share the owner's hot pages.
+    /// Only public owners and completed bulk outputs retire file-cache rights.
+    retire_file_cache_on_close: bool = false,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
@@ -4870,6 +4907,7 @@ pub const NativeFile = struct {
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
+            .retire_file_cache_on_close = !opts.internal_reader,
             .externally_locked = opts.externally_locked,
             .reader_coordinator = opts.reader_coordinator,
             .header = header,
@@ -5009,6 +5047,7 @@ pub const NativeFile = struct {
             .file = file,
             .writer_lock_file = writer_lock_file,
             .header = initialized_header,
+            .retire_file_cache_on_close = true,
             .read_only = false,
             .no_sync = no_sync,
             .page_cache_enabled = .init(true),
@@ -5032,11 +5071,13 @@ pub const NativeFile = struct {
         self.transaction_writes = null;
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        const cache_owner = self.page_cache.resource_manager;
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(io);
         }
+        if (self.retire_file_cache_on_close) retireFileCache(cache_owner, io, self.file);
         self.file.close(io);
         self.allocator.free(self.path);
         if (self.borrowed_io == null) self.io_impl.deinit();
@@ -10182,6 +10223,7 @@ pub const NativeFile = struct {
             try destination.bindPrivateEpochNamespace(dest_path);
             try out_file.setLength(io, snapshot_size);
             try out_file.sync(io);
+            retireFileCache(self.page_cache.resource_manager, io, out_file);
         }
 
         renameFilePath(io, tmp_path, dest_path) catch |err| {
@@ -11916,6 +11958,13 @@ pub const NativeFile = struct {
         return .complete;
     }
 };
+
+fn retireFileCache(manager: ?*resource_manager_mod.ResourceManager, io: std.Io, file: std.Io.File) void {
+    if (manager) |owner| {
+        const stat = file.stat(io) catch return;
+        resource_manager_mod.retired_file_cache.retire(@intFromPtr(owner), io, file, stat.size);
+    } else resource_manager_mod.retired_file_cache.discardUnowned(io, file);
+}
 
 fn appendPageToFile(
     allocator: Allocator,

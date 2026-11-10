@@ -6882,6 +6882,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const memory_pressure_tests = b.addTest(.{
+        .name = "memory-pressure-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "resource manager physical pressure", "lite native retirement" }),
+        .max_rss = 6 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-memory-pressure-test", "Verify physical reclamation and Lite snapshot cache ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, memory_pressure_tests).step);
     const source_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },

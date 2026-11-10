@@ -6790,6 +6790,12 @@ pub const ModelManager = struct {
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
+        switch (pressure) {
+            .live_host => if (self.admissionController().reclaimHostCapacity() != 0) {
+                return true;
+            },
+            else => {},
+        }
         const cold_host_cache_can_help = switch (pressure) {
             .domain_scratch => true, // retained preflight/index leases
             else => pressureCanBeRelievedByHostCache(pressure),
@@ -6832,11 +6838,13 @@ pub const ModelManager = struct {
             if (err != error.ResourceTemporarilyUnavailable) return err;
             spinLock(&self.eviction_lock);
             defer self.eviction_lock.unlock();
+            var reclaim_attempts: usize = 0;
             while (true) {
+                reclaim_attempts += 1;
                 if (self.admissionController().reserveLiveCapacity(bytes)) |reservation| return reservation else |retry| {
                     if (retry != error.ResourceTemporarilyUnavailable) return retry;
                 }
-                if (!self.reclaimOneForAdmission(.live_host)) return error.ResourceTemporarilyUnavailable;
+                if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(.live_host)) return error.ResourceTemporarilyUnavailable;
             }
         };
     }
@@ -6865,7 +6873,9 @@ pub const ModelManager = struct {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
+                var reclaim_attempts: usize = 0;
                 while (true) {
+                    reclaim_attempts += 1;
                     if (self.admissionController().tryAcquireWithPressure(
                         backend_class,
                         limits,
@@ -6879,7 +6889,7 @@ pub const ModelManager = struct {
                             return retry_err;
                         },
                     }
-                    if (!self.reclaimOneForAdmission(
+                    if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     )) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, &requests);
@@ -6912,7 +6922,9 @@ pub const ModelManager = struct {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
+                var reclaim_attempts: usize = 0;
                 while (true) {
+                    reclaim_attempts += 1;
                     if (self.admissionController().tryAcquireRequestsWithPressure(
                         requests,
                         true,
@@ -6926,7 +6938,7 @@ pub const ModelManager = struct {
                             return retry_err;
                         },
                     }
-                    if (!self.reclaimOneForAdmission(
+                    if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     )) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, requests);

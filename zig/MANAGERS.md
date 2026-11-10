@@ -308,12 +308,51 @@ envelope, not its changing availability: small explicit budgets retain usable
 inference capacity while allocations still stop at a stable safety boundary.
 Envelopes of 4 GiB and above retain the 512 MiB reserve. Automatic
 host/cgroup sizing retains the dynamic pressure reserve. Current node or finite
-cgroup pressure also remains authoritative when it is tighter, so an explicit
-value cannot weaken a physical pressure signal. The working set is
+cgroup pressure also remains authoritative when it is tighter: the controller
+retains the original physical capacity after its reserve and admits against
+the minimum of that capacity and the explicit-envelope capacity. Comparing raw
+availability before applying different reserves would weaken physical safety.
+The working set is
 `memory.current - inactive_file`: it includes anonymous memory, the test
 harness, sibling processes, and active mapped pages while excluding file pages
 that the kernel can reclaim. The kubelet uses the same working-set signal to
 rank memory-pressure evictions.
+
+Every new live reservation re-probes memory, including while another load or
+run remains pending. Unmaterialized reservations remain charged against the
+fresh sample: a new sample cannot spend promises made to concurrent work.
+Materialization transfers pending credit into kernel-observed residency;
+releasing an old residency lease cannot inflate a newer sample. This is
+deliberately conservative for estimates whose physical materialization is not
+known; it never infers ownership from RSS growth. Probes occur at admission and
+batched metadata reservation boundaries, not on cache hits or individual parser
+allocations.
+
+Physical denial can also ask the process owner to reclaim host caches, even
+when the managed ledger is below its ceiling. Standalone uses ResourceManager's
+existing weighted cache reclamation; embedded Lite supplies the retired-file
+capability through the same versioned inference bridge. Worker transport forwards
+that capability without holding its lease mutex. All paths re-probe memory after
+reclamation: callback counters and advisory hints never grant allocation credit.
+
+Linux Lite file owners and completed snapshot outputs retire clean-file-cache
+opportunities before closing. A fixed 64-entry registry owns CLOEXEC duplicates,
+so callbacks never reopen paths or borrow destroyed owners. Normal closes retain
+warm pages; pressure issues best-effort DONTNEED advice, while owner teardown and
+registry overflow release the descriptors and advise their clean ranges. Internal
+readers do not retire shared hot files. Abstract I/O is excluded; native Threaded
+and Evented file capabilities are checked explicitly. Other platforms retain
+their existing behavior. Dirty, pinned and writeback pages remain protected by
+the kernel. A declined hint retains a cooled-down opportunity for a later request,
+and each admission has a bounded reclaim-pass budget, preventing retry spins.
+
+The focused `antfly-memory-pressure-test` checks managed reclamation and Lite
+snapshot/reader ownership. The Linux kernel regression in
+`scripts/ci/run_inference_memory_pressure.py` uses a 1 CPU / 2 GiB no-swap cgroup,
+creates clean active file cache in a writer that exits, and verifies that the
+real inference controller recovers a denied request through the owner capability.
+It requires no model download; it does not substitute for workload-specific
+embedding/indexing throughput and snapshot recovery qualification.
 
 An explicit envelope also makes its live-usage probe mandatory. If the
 leaf-cgroup working set or macOS process footprint is temporarily unavailable,

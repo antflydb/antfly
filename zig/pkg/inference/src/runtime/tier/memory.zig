@@ -269,6 +269,9 @@ pub const SystemMemoryInfo = struct {
     /// Preserve only the emergency reserve inside that bounded view instead
     /// of applying dynamic host headroom a second time.
     live_admission_policy: LiveAdmissionPolicy = .dynamic_pressure,
+    /// Capacity under the original host/cgroup pressure policy, before an
+    /// explicit envelope changes total/availability. Both constraints apply.
+    physical_capacity_bytes: ?usize = null,
 };
 
 pub const AvailabilityBasis = enum {
@@ -725,6 +728,9 @@ pub const AdmissionResourceBudget = struct {
     try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!usize,
     retain: *const fn (*anyopaque, usize, AdmissionAmounts) AdmissionResourceError!void,
     release: *const fn (*anyopaque, usize) void,
+    /// Bounded best-effort host reclamation. Its return value is progress,
+    /// never admission credit; the controller must re-probe physical memory.
+    reclaim_host: ?*const fn (*anyopaque, usize) usize = null,
 
     pub fn hasValidLifetimeHooks(self: @This()) bool {
         return (self.retain_context == null) == (self.release_context == null);
@@ -903,15 +909,16 @@ pub const LiveReservation = struct {
 
 pub const AdmissionController = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    /// Serializes reservations against one sampled live-memory capacity. While
-    /// any lease is pending, every concurrent admission consumes the same
-    /// sample instead of independently spending MemAvailable.
+    /// Serializes live probes with pending reservations. Fresh samples never
+    /// erase promises to concurrent work; materialization explicitly transfers
+    /// bytes from pending credit to kernel-observed residency.
     live_mutex: std.atomic.Mutex = .unlocked,
     live_capacity_bytes: usize = 0,
     live_pending_bytes: usize = 0,
+    live_reclaim_target_bytes: usize = 0,
     live_epoch: u64 = 0,
     /// Suppress a warning storm while repeated requests are denied by the
-    /// same live-memory pressure condition. A successful new epoch clears it.
+    /// same live-memory pressure condition. Successful admission clears it.
     live_denial_reported: bool = false,
     /// Aggregate accounting is retained for observability and for the optional
     /// process-owner resource budget. Host memory is enforced against the
@@ -1012,6 +1019,29 @@ pub const AdmissionController = struct {
         ) orelse return false;
         checkLiveHostMemoryWithInfo(info, 1) catch return true;
         return false;
+    }
+
+    /// Borrow the process owner's reclamation capability without holding an
+    /// admission lock across storage callbacks. The lifetime survives a
+    /// concurrent capability reconfiguration; progress never grants bytes.
+    pub fn reclaimHostCapacity(self: *AdmissionController) usize {
+        spinLockAdmission(&self.mutex);
+        const budget = self.resource_budget orelse {
+            self.mutex.unlock();
+            return 0;
+        };
+        const reclaim = budget.reclaim_host orelse {
+            self.mutex.unlock();
+            return 0;
+        };
+        const retained = budget.retainContext();
+        self.mutex.unlock();
+        if (!retained) return 0;
+        defer budget.releaseContext();
+        spinLockAdmission(&self.live_mutex);
+        const target = @max(self.live_reclaim_target_bytes, mib(64));
+        self.live_mutex.unlock();
+        return reclaim(budget.context, target);
     }
 
     pub fn configureResourceBudget(
@@ -1395,14 +1425,10 @@ pub const AdmissionController = struct {
         spinLockAdmission(&self.live_mutex);
         defer self.live_mutex.unlock();
 
-        const info = if (self.live_pending_bytes == 0)
-            currentSystemMemoryInfoForLimit(
-                self.process_memory_limit_bytes,
-                self.process_memory_limit_provenance,
-            )
-        else
-            null;
-        const starts_new_epoch = self.live_pending_bytes == 0;
+        const info = currentSystemMemoryInfoForLimit(
+            self.process_memory_limit_bytes,
+            self.process_memory_limit_provenance,
+        );
         const reserved = self.tryReserveLiveCapacityLocked(incremental_bytes, info) catch |err| {
             if (err == error.ResourceTemporarilyUnavailable and !self.live_denial_reported) {
                 if (info) |memory_info| {
@@ -1426,7 +1452,7 @@ pub const AdmissionController = struct {
                     );
                 } else {
                     std.log.warn(
-                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} capacity_bytes={d} basis=shared_epoch",
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} capacity_bytes={d} basis=unavailable",
                         .{ incremental_bytes, self.live_pending_bytes, self.live_capacity_bytes },
                     );
                 }
@@ -1434,7 +1460,7 @@ pub const AdmissionController = struct {
             }
             return err;
         };
-        if (starts_new_epoch) self.live_denial_reported = false;
+        self.live_denial_reported = false;
         return reserved;
     }
 
@@ -1455,12 +1481,20 @@ pub const AdmissionController = struct {
         info: ?SystemMemoryInfo,
     ) !usize {
         std.debug.assert(incremental_bytes > 0);
-        if (self.live_pending_bytes == 0) {
-            const memory_info = info orelse return 0;
-            const available = memory_info.available_bytes orelse return 0;
+        if (info) |memory_info| {
+            const available = memory_info.available_bytes orelse {
+                if (self.live_pending_bytes != 0) return error.ResourceTemporarilyUnavailable;
+                return 0;
+            };
             const reserve = liveHostAdmissionReserve(memory_info);
             self.live_epoch = std.math.add(u64, self.live_epoch, 1) catch return error.ResourceTemporarilyUnavailable;
             self.live_capacity_bytes = available -| reserve;
+        } else {
+            // Never replace a measured pending epoch with an untracked grant
+            // after a transient probe failure. Explicit envelopes fail closed
+            // in currentSystemMemoryInfoForLimit even without a host sample.
+            if (self.live_pending_bytes != 0) return error.ResourceTemporarilyUnavailable;
+            return 0;
         }
 
         const next_pending = std.math.add(
@@ -1472,16 +1506,18 @@ pub const AdmissionController = struct {
             return error.ResourceTemporarilyUnavailable;
         };
         if (next_pending > self.live_capacity_bytes) {
+            self.live_reclaim_target_bytes = next_pending - self.live_capacity_bytes;
             if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
             return error.ResourceTemporarilyUnavailable;
         }
         self.live_pending_bytes = next_pending;
+        self.live_reclaim_target_bytes = 0;
         return incremental_bytes;
     }
 
-    /// Construction/import peaks are no longer pending once the session is
-    /// live. Preserve the capacity consumed by resident physical memory until
-    /// the pressure epoch drains; a subsequent epoch re-samples the kernel.
+    /// Construction/import peaks are no longer pending once materialized.
+    /// Retain their charge in this sample; a later probe observes residency.
+    /// Credits returned after that probe cannot inflate the new capacity.
     fn settleLiveReservation(
         self: *AdmissionController,
         reserved_bytes: usize,
@@ -1657,10 +1693,11 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// sample omits some reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
+    const physical_reserve = available -| (info.physical_capacity_bytes orelse available);
     if (info.live_admission_policy == .explicit_process_envelope)
-        return @min(available, @min(info.total_bytes / 8, mib(512)));
+        return @max(physical_reserve, @min(available, @min(info.total_bytes / 8, mib(512))));
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
-    return switch (info.availability_basis) {
+    return @max(physical_reserve, switch (info.availability_basis) {
         .mem_available => @min(
             node_headroom,
             @min(available, @max(mib(512), available / 2)),
@@ -1678,7 +1715,7 @@ fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
             const capacity = @max(normal_capacity, grace_capacity);
             break :blk available -| capacity;
         },
-    };
+    });
 }
 
 fn checkLiveHostMemoryWithInfo(info: SystemMemoryInfo, incremental_bytes: usize) !void {
@@ -1957,11 +1994,14 @@ fn applyOptionalProcessMemoryLimit(
     provenance: ProcessMemoryLimitProvenance,
 ) ?SystemMemoryInfo {
     if (limit_bytes == 0) return detected;
-    return applyProcessMemoryLimit(detected orelse .{
+    var bounded = applyProcessMemoryLimit(detected orelse .{
         .total_bytes = limit_bytes,
         .available_bytes = limit_bytes,
         .availability_basis = .mem_available,
     }, limit_bytes, leaf_usage_bytes, provenance);
+    // A synthetic fallback is an operator envelope, not physical evidence.
+    if (detected == null) bounded.physical_capacity_bytes = null;
+    return bounded;
 }
 
 fn applyProcessMemoryLimit(
@@ -2002,6 +2042,13 @@ fn applyProcessMemoryLimit(
         .available_bytes = available,
         .availability_basis = detected.availability_basis,
         .live_admission_policy = live_admission_policy,
+        .physical_capacity_bytes = if (explicit_envelope_applies)
+            if (detected.available_bytes) |physical_available|
+                physical_available -| liveHostAdmissionReserve(detected)
+            else
+                detected.physical_capacity_bytes
+        else
+            detected.physical_capacity_bytes,
     };
 }
 
@@ -3532,7 +3579,9 @@ test "process envelope provenance preserves automatic cgroup pressure policy" {
         LiveAdmissionPolicy.explicit_process_envelope,
         explicit.live_admission_policy,
     );
-    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(explicit));
+    // The explicit reserve is smaller, but the original physical policy still
+    // permits only 2 GiB. Numeric availability alone must not override it.
+    try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(explicit));
 
     // The outer resolver carries the cgroup source and its concrete effective
     // limit when a larger explicit value was clamped by memory.max.
@@ -3543,6 +3592,120 @@ test "process envelope provenance preserves automatic cgroup pressure policy" {
         clamped.live_admission_policy,
     );
     try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(clamped));
+}
+
+test "explicit envelope preserves physical admission headroom" {
+    const physical = SystemMemoryInfo{
+        .total_bytes = gib(2),
+        .available_bytes = mib(270),
+    };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(physical, mib(16)));
+    const explicit = applyProcessMemoryLimit(physical, mib(256), 0, .explicit);
+    // Raw envelope availability (256 MiB) is smaller than physical availability
+    // (270 MiB), but physical capacity after safety headroom is actually zero.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(explicit, mib(16)));
+}
+
+test "live epoch observes new physical pressure" {
+    var controller = AdmissionController{};
+    const healthy = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    const pending = try controller.tryReserveLiveCapacityWithInfo(mib(1), healthy);
+    defer controller.releaseLiveReservation(pending);
+    const pressured = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = mib(512) };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(pressured, mib(16)));
+    // Storage or another cgroup member can consume capacity while an inference
+    // run remains pending. The next request must observe that physical signal.
+    const admitted = controller.tryReserveLiveCapacityWithInfo(mib(16), pressured);
+    if (admitted) |bytes| controller.releaseLiveReservation(bytes) else |_| {}
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitted);
+}
+
+test "live epoch recovers after external reclamation" {
+    var controller = AdmissionController{};
+    const pressured = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(2) };
+    const pending = try controller.tryReserveLiveCapacityWithInfo(mib(1), pressured);
+    defer controller.releaseLiveReservation(pending);
+    const recovered = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    try checkLiveHostMemoryWithInfo(recovered, gib(2));
+    // Freeing storage/cache memory does not drain an overlapping inference run.
+    const admitted = try controller.tryReserveLiveCapacityWithInfo(gib(2), recovered);
+    controller.releaseLiveReservation(admitted);
+}
+
+test "live sampling cannot erase pending reservations on probe failure" {
+    var controller = AdmissionController{};
+    const sample = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    const pending = try controller.tryReserveLiveCapacityWithInfo(mib(1), sample);
+    defer controller.releaseLiveReservation(pending);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityLocked(1, null));
+    try std.testing.expectEqual(mib(1), controller.live_pending_bytes);
+}
+
+test "host reclamation borrows owner lifetime and invokes callbacks outside admission locks" {
+    const Owner = struct {
+        controller: *AdmissionController,
+        references: usize = 0,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn reserve(_: *anyopaque, _: AdmissionAmounts) AdmissionResourceError!usize {
+            return 1;
+        }
+        fn shrink(_: *anyopaque, _: usize, _: AdmissionAmounts) AdmissionResourceError!void {}
+        fn free(_: *anyopaque, _: usize) void {}
+        fn reclaim(raw: *anyopaque, target: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(target >= mib(64));
+            std.debug.assert(self.controller.live_mutex.tryLock());
+            self.controller.live_mutex.unlock();
+            self.controller.configureResourceBudget(null) catch unreachable;
+            std.debug.assert(self.references == 1);
+            return 1;
+        }
+    };
+    var controller = AdmissionController{};
+    var owner = Owner{ .controller = &controller };
+    try controller.configureResourceBudget(.{ .context = &owner, .retain_context = Owner.retain, .release_context = Owner.release, .try_reserve = Owner.reserve, .retain = Owner.shrink, .release = Owner.free, .reclaim_host = Owner.reclaim });
+    try std.testing.expectEqual(@as(usize, 1), controller.reclaimHostCapacity());
+    try std.testing.expectEqual(@as(usize, 0), owner.references);
+}
+
+test "live pressure recovers retired file cache through the owner capability" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_PRESSURE_TEST_FILE") orelse return error.SkipZigTest;
+    const io = std.testing.io;
+    var controller = AdmissionController{};
+    const Owner = struct {
+        fn reserve(_: *anyopaque, _: AdmissionAmounts) AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: AdmissionAmounts) AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+        fn reclaim(_: *anyopaque, target: usize) usize {
+            return @intCast(platform.retired_file_cache.reclaim(target));
+        }
+    };
+    var context: u8 = 0;
+    controller.configureProcessMemoryLimit(mib(1843), .explicit);
+    try controller.configureResourceBudget(.{ .context = &context, .try_reserve = Owner.reserve, .retain = Owner.retain, .release = Owner.release, .reclaim_host = Owner.reclaim });
+    defer controller.deinit();
+    const owner_id = @intFromPtr(&context);
+    defer platform.retired_file_cache.releaseOwner(owner_id);
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        platform.retired_file_cache.retire(owner_id, io, file, (try file.stat(io)).size);
+    }
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(16) }, true));
+    try std.testing.expect(controller.reclaimHostCapacity() > 0);
+    var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(16) }, true);
+    lease.release();
 }
 
 test "explicit envelope reserve scales with budget and preserves allocation boundaries" {
@@ -3560,10 +3723,11 @@ test "explicit envelope reserve scales with budget and preserves allocation boun
         .{ .budget = std.math.maxInt(usize) - 1, .reserve = mib(512) },
     };
     for (cases) |case| {
-        const info = applyProcessMemoryLimit(.{
+        const info = SystemMemoryInfo{
             .total_bytes = case.budget,
             .available_bytes = case.budget,
-        }, case.budget, 0, .explicit);
+            .live_admission_policy = .explicit_process_envelope,
+        };
         try std.testing.expectEqual(case.reserve, liveHostAdmissionReserve(info));
         const capacity = case.budget - case.reserve;
         try checkLiveHostMemoryWithInfo(info, capacity);
@@ -3591,7 +3755,7 @@ test "small explicit envelope admits reported model load and query scratch" {
         try checkLiveHostMemoryWithInfo(info, sample.request);
         var controller = AdmissionController{};
         const reserved = try controller.tryReserveLiveCapacityWithInfo(sample.request, info);
-        try std.testing.expectEqual(sample.available - budget / 8, controller.live_capacity_bytes);
+        try std.testing.expectEqual(gib(2) - (budget - sample.available) - mib(512), controller.live_capacity_bytes);
         controller.releaseLiveReservation(reserved);
     }
 }
@@ -3645,8 +3809,12 @@ test "small explicit envelope shares capacity and retains settled residency" {
 
     _ = controller.settleLiveReservation(first, mib(48));
     try std.testing.expectEqual(mib(48), controller.live_capacity_bytes);
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(mib(32) + 1, info));
-    const third = try controller.tryReserveLiveCapacityWithInfo(mib(32), info);
+    const materialized = applyProcessMemoryLimit(.{
+        .total_bytes = gib(2),
+        .available_bytes = gib(2),
+    }, mib(256), mib(176), .explicit);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(mib(32) + 1, materialized));
+    const third = try controller.tryReserveLiveCapacityWithInfo(mib(32), materialized);
     controller.releaseLiveReservation(third);
     controller.releaseLiveReservation(second);
     try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
@@ -4071,7 +4239,7 @@ test "cpu and gpu admission share one physical host-memory domain" {
     try std.testing.expectEqual(@as(usize, 800), controller.snapshot().backendTotalBytes());
 }
 
-test "live memory admissions share one sampled capacity epoch" {
+test "live memory admissions preserve pending promises across fresh samples" {
     var controller = AdmissionController{};
     const info = SystemMemoryInfo{
         .total_bytes = gib(64),
@@ -4106,11 +4274,10 @@ test "settled live residency remains committed during pressure epoch" {
 
     try std.testing.expectEqual(gib(1), controller.live_pending_bytes);
     try std.testing.expectEqual(gib(8), controller.live_capacity_bytes);
-    try std.testing.expectError(
-        error.ResourceTemporarilyUnavailable,
-        controller.tryReserveLiveCapacityWithInfo(gib(8), info),
-    );
-
+    const materialized = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(18) };
+    const next = try controller.tryReserveLiveCapacityWithInfo(gib(8), materialized);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(1, materialized));
+    controller.releaseLiveReservation(next);
     controller.releaseLiveReservation(gib(1));
     try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);

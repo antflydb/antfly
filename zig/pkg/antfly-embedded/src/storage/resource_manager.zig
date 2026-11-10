@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const retired_file_cache = @import("antfly_platform").retired_file_cache;
 const allocator_residency = @import("antfly_platform").allocator.reclamation;
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
@@ -25,6 +26,33 @@ const dense_perf = @import("dense_perf_experiments.zig");
 pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
 const MiB: u64 = 1024 * 1024;
+
+test "resource manager physical pressure reclaims caches without logical debt" {
+    const Cache = struct {
+        manager: *ResourceManager,
+        bytes: u64 = 400,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(self.bytes, target);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.bytes, self.bytes - released);
+            self.calls += 1;
+            return released;
+        }
+    };
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 } });
+    defer manager.deinit(std.testing.allocator);
+    var cache = Cache{ .manager = &manager, .bytes = 0 };
+    manager.observeUsage(.hbc_node_metadata_cache, &cache.bytes, 400);
+    defer manager.observeUsage(.hbc_node_metadata_cache, &cache.bytes, 0);
+    const id = try manager.registerReclaimer(.hbc_node_metadata_cache, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(id);
+    try std.testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.dense_apply_working_set, 64));
+    try std.testing.expectEqual(@as(usize, 0), cache.calls);
+    try std.testing.expectEqual(@as(u64, 64), manager.reclaimHostMemory(64));
+    try std.testing.expectEqual(@as(u64, 336), cache.bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+}
 
 /// Resource identities churn for the entire process lifetime. std.HashMap
 /// restores insertion capacity on removal, but retains tombstones: absent-key
@@ -1510,8 +1538,22 @@ pub const ResourceManager = struct {
     /// meaningful. Callbacks publish their decreases through accounting APIs;
     /// logical slice relief never substitutes for required host memory relief.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
-        if (additional_bytes == 0) return 0;
-        const targets = self.allocationReclaimDebt(requester, additional_bytes);
+        return self.reclaimCaches(requester, additional_bytes, 0);
+    }
+
+    /// Physical pressure can precede a logical ledger deficit (for example,
+    /// buffered snapshot I/O). Reclaim retired file pages first, then managed
+    /// caches, without treating either counter as proof of physical capacity.
+    pub fn reclaimHostMemory(self: *ResourceManager, target_bytes: u64) u64 {
+        const retired = retired_file_cache.reclaim(target_bytes);
+        if (retired != 0) return retired;
+        return self.reclaimCaches(.dense_apply_working_set, 0, target_bytes);
+    }
+
+    fn reclaimCaches(self: *ResourceManager, requester: Slice, additional_bytes: u64, physical_target: u64) u64 {
+        if (additional_bytes == 0 and physical_target == 0) return 0;
+        var targets = self.allocationReclaimDebt(requester, additional_bytes);
+        targets.total = @max(targets.total, physical_target);
         if (targets.total == 0) return 0;
         var debt = targets;
 
@@ -1600,6 +1642,7 @@ pub const ResourceManager = struct {
                     reclaimed +|= invocation.reclaim(invocation.context, fair_target);
                     self.releaseReclaimerInvocation(invocation);
                     debt = self.allocationReclaimDebt(requester, additional_bytes);
+                    debt.total = @max(debt.total, physical_target -| reclaimed);
                     if (debt.total == 0) break;
                 }
                 if (debt.total == 0 or reclaimed == before_pass or !divided_target) break;
@@ -1954,6 +1997,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        retired_file_cache.releaseOwner(@intFromPtr(self));
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
