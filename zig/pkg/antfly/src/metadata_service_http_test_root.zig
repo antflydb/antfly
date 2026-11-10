@@ -55,3 +55,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test "selected owner readiness transition index discovery" {
     _ = service;
 }
+
+test "catalog projection cancellation and publication discovery" {
+    _ = @import("metadata/catalog_projection_reader.zig");
+}

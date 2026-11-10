@@ -22,7 +22,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 89 combines aggregation budgets with checked DB borrows and policy fences.
 // Older owners must reject their operation identifiers before dispatch.
 // Version 90 also fences certified graph document-key descriptor domains.
-pub const abi_version: u32 = 90;
+// Version 91 fences selected-role merge-readiness projection responses.
+pub const abi_version: u32 = 91;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

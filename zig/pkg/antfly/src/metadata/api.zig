@@ -316,7 +316,8 @@ pub const OwnerReadinessRequest = struct {
     owners: []const Owner,
     pub const Owner = struct { group_id: u64, shard_id: u64, range_id: u64 };
 };
-pub const OwnerTransitionCheck = struct { id: u64, reassignment: bool };
+/// Selected roles only; catalog permission is not runtime reassignment state.
+pub const OwnerTransitionCheck = struct { id: u64, donor: bool = false, receiver: bool = false };
 
 pub const OwnerReadiness = struct {
     // Required on wire: a legacy boolean reply cannot license a capture.

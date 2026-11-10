@@ -5883,8 +5883,8 @@ selected owners' full ranges then requires no catalog-sized allocation or scan;
 only the selected range bounds are copied into owner plans. The generation stays
 retained until initial capture completes.
 
-This changes private coordinator descriptors (kernel ABI 90 / runtime ABI 88).
-Native callback ABI 11 independently fences the graph table descriptor stride
+Private coordinator descriptors use kernel ABI 91 / runtime ABI 88.
+Native callback ABI 12 independently fences the graph table descriptor stride
 behind `Statement.tables`; older callbacks are rejected before payload access.
 The public JSON contract and shard query protocol are unchanged. Privacy-policy
 capture translates native monotonic deadlines into the catalog's clock domain
@@ -5977,9 +5977,9 @@ unsupported or incomplete token replies cannot license cache reuse. Endpoint
 iteration is pinned across failover, independently of concurrent affinity updates.
 
 Selected-owner merge readiness uses a durable covering index of active transition
-IDs and reassignment flags. Accepted ordinary/online admission, update, terminal
+IDs and selected-owner roles. Accepted ordinary/online admission, update, terminal
 publication, and removal maintain membership in the same metadata transaction.
-Derived catalog index version 11 reconstructs it from primary records on migration
+Derived catalog index version 12 reconstructs it from primary records on migration
 and snapshot restore. Foreground readiness refuses an unavailable index rather
 than rebuilding catalog history or treating missing membership as ready; ordinary
 apply/startup/control index maintenance performs reconstruction. Queries only seek
@@ -6035,3 +6035,50 @@ execute under their narrow filter. The authenticated six-node campaign passed
 77 checks; each of three warm reads used one 115-byte routing token without a
 snapshot. A revision change fetched the 11,140-byte ten-table/ten-range snapshot
 once, then subsequent reads returned to token-only validation.
+
+
+### Selected-role readiness and cancellable routing acquisition
+
+Merge catalog permission is no longer interpreted as active identity reassignment.
+Derived catalog index version 12 retains the selected donor/receiver role for
+nonterminal transitions. Selecting both participants deduplicates the transition
+while preserving both roles; selecting only one participant checks only that
+owner's observed runtime reassignment. Queued transitions and online row copying
+remain readable while their original owner namespaces are healthy. Actual
+reassignment, namespace conflicts, and rebuild-required states still fail closed.
+Migration reconstructs the covering index from primary transitions; foreground
+readiness never scans terminal history or reconstructs a missing index.
+
+Routing-generation callbacks carry the complete invocation clock, deadline, and
+cancellation budget. Remote acquisition normalizes the deadline once into its
+HTTP clock, forwards cancellation through token and full/legacy snapshot reads,
+and checks cancellation during cache/refresh lock contention. Canceled requests
+stop endpoint failover and return the canonical cancellation outcome. Metadata
+projection waiters can cancel independently of the shared builder; another
+waiter's shorter deadline or cancellation does not poison a healthy acquisition.
+Standalone generation publication also checks the budget while acquiring its
+metadata lock. Native callback ABI 12 rejects older catalog callback signatures
+before interpreting their arguments. Kernel ABI 91 separately fences the changed selected-role projection response;
+query/failure ABI 88 remains unchanged.
+
+The latest main's privacy-aware text-statistics wrappers retain the original DB
+method signatures. Both wire decoders share strict privacy-version validation.
+Isolated private controls preserve the neutral document-version default through
+forwarding, including graph endpoint cleanup; explicit revision envelopes remain
+independent of control effects and mixed user writes remain rejected.
+
+
+Qualification after merging `origin/main` at `6736eb3842`: the Debug server and
+focused routing, readiness/projection, control-wire, cohort, callback, native-cut,
+and compiled storage-owner gates completed 223/223 build steps. The consumer
+suites passed five remote routing/cancellation/copy tests, six cohort tests,
+eight native capture tests, the compiled readiness ABI regression, and all
+23 control-wire implementation tests plus their two discovery roots, without
+leaks. The direct callback epoch regression rejects ABI 10 and 11, and the six
+Python retry/receipt tests pass. The authenticated eight-owner standalone test
+passed in 28 seconds; the three-metadata/three-data replicated-owner campaign
+passed in 207 seconds, covering graph reads/writes/search, SQL `GRAPH_TABLE`,
+catalog revisions, expression/normalization qualification and durable receipts.
+All qualification used Debug. The merged main's TypeScript formatter hook could
+not run without its pinned dependency installation; only the merge commit
+bypassed that hook. The implementation commit uses the normal staged checks.

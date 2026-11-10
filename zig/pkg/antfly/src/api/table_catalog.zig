@@ -104,7 +104,7 @@ pub const CatalogSource = struct {
         /// Retained, immutable snapshot and indexes. The returned reference is
         /// owned by the caller. Authoritative captures must still cross the
         /// source's read barrier; an eventual cache hit never proves absence.
-        acquire_routing_generation: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) anyerror!*RoutingGeneration = null,
+        acquire_routing_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
         /// Allocation-efficient point projection used by mutation routing.
         /// It returns the same owned wire type with zero or one table.
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -308,7 +308,7 @@ pub const CatalogRouteAuthority = struct {
 };
 
 pub const CatalogRoutingSource = struct {
-    acquire_generation: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) anyerror!*RoutingGeneration = null,
+    acquire_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
     io: ?runtime_io_abi.Borrow = null,
     projection: CatalogProjectionSource,
     authority: CatalogRouteAuthority,
@@ -436,7 +436,7 @@ pub const RoutingSession = struct {
     pub fn initWithBudget(alloc: std.mem.Allocator, base: CatalogSource, budget: RoutingBudget) !RoutingSession {
         try budget.checkpoint();
         if (base.vtable.acquire_routing_generation) |acquire| {
-            const generation = try acquire(base.ptr, budget.deadline_ns, true);
+            const generation = try acquire(base.ptr, budget, true);
             errdefer generation.release();
             try budget.checkpoint();
             return generation.session(alloc, base, true);
@@ -457,7 +457,7 @@ pub const RoutingSession = struct {
         const budget = base.budget(deadline_ns);
         try budget.checkpoint();
         var session = if (base.vtable.acquire_routing_generation) |acquire|
-            (try acquire(base.ptr, deadline_ns, false)).session(alloc, base, false)
+            (try acquire(base.ptr, budget, false)).session(alloc, base, false)
         else blk: {
             const routing = try base.routingSource();
             break :blk try initOwned(alloc, base, try routing.eventualSnapshot(deadline_ns), false, budget);
@@ -2478,7 +2478,7 @@ fn resolveRouteObserved(
     if (routing.acquire_generation) |acquire| {
         const budget = RoutingBudget{ .deadline_ns = deadline_ns, .io = routing.io };
         for ([_]bool{ false, true }) |authoritative| {
-            const generation = acquire(routing.projection.ptr, deadline_ns, authoritative) catch |err| switch (err) {
+            const generation = acquire(routing.projection.ptr, budget, authoritative) catch |err| switch (err) {
                 error.CatalogRoutingSnapshotTimeout => return .timed_out,
                 else => return err,
             };
@@ -2909,15 +2909,15 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
-fn metadataServiceAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+fn metadataServiceAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     if (authoritative) {
-        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation }) catch |err| switch (err) {
             error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
         };
     }
-    return try svc.acquireCatalogRoutingGeneration(deadline_ns);
+    return try svc.acquireCatalogRoutingGenerationWithBudget(budget);
 }
 
 fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -3009,15 +3009,15 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
-fn metadataHttpServiceAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+fn metadataHttpServiceAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     if (authoritative) {
-        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation }) catch |err| switch (err) {
             error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
         };
     }
-    return try svc.acquireCatalogRoutingGeneration(deadline_ns);
+    return try svc.acquireCatalogRoutingGenerationWithBudget(budget);
 }
 
 fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -3109,15 +3109,15 @@ fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Admi
     srv.freeAdminSnapshot(snapshot);
 }
 
-fn metadataServerAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+fn metadataServerAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     if (authoritative) {
-        srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation }) catch |err| switch (err) {
             error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
         };
     }
-    return try srv.svc.acquireCatalogRoutingGeneration(deadline_ns);
+    return try srv.svc.acquireCatalogRoutingGenerationWithBudget(budget);
 }
 
 fn metadataServerRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {

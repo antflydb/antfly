@@ -5816,7 +5816,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "11";
+const derived_catalog_index_version = "12";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -12187,7 +12187,7 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         var result: std.ArrayList(@import("../api.zig").OwnerTransitionCheck) = .empty;
         errdefer result.deinit(alloc);
-        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u64, usize) = .empty;
         defer seen.deinit(alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -12199,10 +12199,15 @@ pub const RaftApplyStore = struct {
             while (row) |kv| : (row = try cursor.next()) {
                 if (!std.mem.startsWith(u8, kv.key, prefix)) break;
                 try budget.checkpoint();
-                if (kv.value.len != 9 or kv.value[8] > 1) return error.InvalidDerivedCatalogIndex;
+                if (kv.value.len != 9 or (kv.value[8] != 1 and kv.value[8] != 2)) return error.InvalidDerivedCatalogIndex;
                 const id = std.mem.readInt(u64, kv.value[0..8], .little);
                 const slot = try seen.getOrPut(alloc, id);
-                if (!slot.found_existing) try result.append(alloc, .{ .id = id, .reassignment = kv.value[8] == 1 });
+                if (!slot.found_existing) {
+                    slot.value_ptr.* = result.items.len;
+                    try result.append(alloc, .{ .id = id });
+                }
+                const check = &result.items[slot.value_ptr.*];
+                if (kv.value[8] == 1) check.donor = true else check.receiver = true;
             }
         }
         try budget.checkpoint();
@@ -12212,8 +12217,10 @@ pub const RaftApplyStore = struct {
     fn putOwnerMergeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord) !void {
         var value: [9]u8 = undefined;
         std.mem.writeInt(u64, value[0..8], record.transition_id, .little);
-        value[8] = @intFromBool(record.allow_doc_identity_reassignment);
-        for ([_]u64{ record.donor_group_id, record.receiver_group_id }) |owner| {
+        // Cover the selected owner's role, not the catalog's permission flag.
+        // Online copies reconstruct target identities without raw reassignment.
+        for ([_]u64{ record.donor_group_id, record.receiver_group_id }, 0..) |owner, role| {
+            value[8] = @intCast(role + 1);
             var buf: [192]u8 = undefined;
             const key = try std.fmt.bufPrint(&buf, "\x00\x00__metadata_derived__:owner_merge:{d}:{d}:{d}", .{ group_id, owner, record.transition_id });
             if (transitionPhaseTerminal(record.phase)) try txn.delete(key) else try txn.put(key, &value);
@@ -44986,8 +44993,16 @@ test "selected owner readiness durable transition index rebuilds and retires act
         const encoded = try encodeMergeTransitionRecord(a, active);
         defer a.free(encoded);
         try txn.put(try mergeTransitionKeyForGroup(&key, 21, active.transition_id), encoded);
-        // Upgrade a legacy marker and derive membership from primary records.
-        try txn.put(try derivedCatalogIndexVersionKey(&key, 21), "10");
+        // Version 11 covered permission, not role. Rebuild both old owner
+        // entries even though the donor's old true byte happens to equal role 1.
+        var old_value: [9]u8 = undefined;
+        std.mem.writeInt(u64, old_value[0..8], active.transition_id, .little);
+        old_value[8] = 1;
+        for ([_]u64{ active.donor_group_id, active.receiver_group_id }) |owner| {
+            const old_key = try std.fmt.bufPrint(&key, "\x00\x00__metadata_derived__:owner_merge:{d}:{d}:{d}", .{ 21, owner, active.transition_id });
+            try txn.put(old_key, &old_value);
+        }
+        try txn.put(try derivedCatalogIndexVersionKey(&key, 21), "11");
         try std.testing.expect(try store.ensureDerivedCatalogIndexesTxn(&txn, 21));
         try txn.commit();
     }
@@ -44996,7 +45011,14 @@ test "selected owner readiness durable transition index rebuilds and retires act
         defer a.free(checks);
         try std.testing.expectEqual(@as(usize, 1), checks.len);
         try std.testing.expectEqual(@as(u64, 9), checks[0].id);
-        try std.testing.expect(checks[0].reassignment);
+        try std.testing.expect(checks[0].donor and checks[0].receiver);
+        for (request.owners, 0..) |owner, role| {
+            const one = try store.ownerReadinessTransitions(a, 21, .{ .table_id = 7, .owners = &.{owner} }, .{});
+            defer a.free(one);
+            try std.testing.expectEqual(@as(usize, 1), one.len);
+            try std.testing.expectEqual(role == 0, one[0].donor);
+            try std.testing.expectEqual(role == 1, one[0].receiver);
+        }
     }
     // Indexed reads must not decode even a poisoned unrelated history record.
     {

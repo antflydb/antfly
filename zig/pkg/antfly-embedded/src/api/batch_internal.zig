@@ -1093,6 +1093,7 @@ fn parseBatchRequestWithOptions(
         break :sync_level db_mod.types.SyncLevel.propose;
     };
 
+    const graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false;
     const document_version_scheme: db_mod.types.DocumentVersionScheme = scheme: {
         // Isolated control commands never assign ordinary document versions.
         // Preserve their neutral request default across forwarding and native
@@ -1102,7 +1103,7 @@ fn parseBatchRequestWithOptions(
         const isolated_control = activate_range_tracking or relational_topology != null or relational_generation_gc != null or
             row_policy_publication != null or artifact_catalog != null or group_source != null or
             resolver_review != null or artifact_publication != null or artifact_publication_transport != null or
-            leann_record_index != null or merge_proof_adoption != null;
+            leann_record_index != null or merge_proof_adoption != null or graph_endpoint_cleanup;
         const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner or isolated_control) .admit_current else .legacy;
         if (!allow_internal or !document_versions_envelope) return error.InvalidBatchRequest;
         const version = try parseInternalU64(value);
@@ -1696,7 +1697,7 @@ fn parseBatchRequestWithOptions(
             .deletes = deletes,
             .transforms = transforms,
             .graph_endpoint_cleanup_planned = if (root.get("_graph_endpoint_cleanup_planned")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
-            .graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
+            .graph_endpoint_cleanup = graph_endpoint_cleanup,
             .graph_writes = graph_writes,
             .graph_deletes = graph_deletes,
             .graph_endpoint_cleanup_guards = if (graph_endpoint_cleanup_guards) |guards| guards.value else &.{},
@@ -3567,7 +3568,8 @@ test "time series document revision wire discriminates legacy replay and epoch a
         try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, bytes));
         var decoded = try parseInternalBatchRequest(a, bytes);
         defer decoded.deinit(a);
-        try std.testing.expectEqual(scheme, decoded.req.document_version_scheme);
+        // Unmarked private controls normalize legacy/admission policy to neutral.
+        try std.testing.expectEqual(if (scheme == .revision_v1) scheme else .admit_current, decoded.req.document_version_scheme);
         try std.testing.expectEqual(@as(u64, 0), decoded.req.timestamp_ns);
     }
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "{\"_timestamp_ns\":\"1\",\"_document_version_scheme\":1}"));
@@ -3659,7 +3661,8 @@ test "distributed txn private control wire keeps document revision metadata inde
         try std.testing.expectError(error.InvalidBatchRequest, @import("batch.zig").parseBatchRequest(a, bytes));
         var decoded = try parseInternalBatchRequest(a, bytes);
         defer decoded.deinit(a);
-        try std.testing.expectEqual(if (scheme == .admit_current) db_mod.types.DocumentVersionScheme.legacy else scheme, decoded.req.document_version_scheme);
+        // Unmarked private controls normalize legacy/admission policy to neutral.
+        try std.testing.expectEqual(if (scheme == .revision_v1) scheme else .admit_current, decoded.req.document_version_scheme);
         if (scheme == .revision_v1 and (request.row_policy_publication != null or request.merge_proof_adoption != null)) {
             // These controls historically forbid an authored timestamp. Only
             // the revision envelope's mandatory zero field is structural.

@@ -254,19 +254,21 @@ fn BoundaryImpl(comptime VTable: type) type {
 }
 
 test "graph descriptor epoch rejects legacy callbacks before dereferencing payloads" {
-    try std.testing.expect(native_abi.abi_version > 10);
+    try std.testing.expect(native_abi.abi_version > 11);
     const Table = struct { keys: ?[]const []const u8, name: []const u8 };
     const Statement = struct { tables: []const Table };
     const Callback = *const fn (*const Statement) anyerror!void;
     const TestBoundary = BoundaryImpl(struct { open_cypher_statement: Callback });
     const Args = std.meta.ArgsTuple(@typeInfo(Callback).pointer.child);
-    var legacy = native_abi.CallContract.of("open_cypher_statement", Callback, Args, void);
-    legacy.version = 10;
-    legacy.function.version = 10;
-    legacy.arguments.version = 10;
-    legacy.output.version = 10;
-    const status = TestBoundary.dispatchLocal(&legacy, @ptrFromInt(1), @ptrFromInt(1), null);
-    try std.testing.expectEqual(error.UnsupportedVersion, error_abi.errorFromStatus(status));
+    for ([_]u32{ 10, 11 }) |version| {
+        var legacy = native_abi.CallContract.of("open_cypher_statement", Callback, Args, void);
+        legacy.version = version;
+        legacy.function.version = version;
+        legacy.arguments.version = version;
+        legacy.output.version = version;
+        const status = TestBoundary.dispatchLocal(&legacy, @ptrFromInt(1), @ptrFromInt(1), null);
+        try std.testing.expectEqual(error.UnsupportedVersion, error_abi.errorFromStatus(status));
+    }
 }
 
 test "boundary dispatcher preserves local calls and maps cross-unit calls" {

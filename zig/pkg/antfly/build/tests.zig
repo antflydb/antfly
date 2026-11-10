@@ -379,7 +379,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const cypher_owner_readiness = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"selected owner readiness"} });
     const cypher_owner_readiness_step = b.step("cypher-owner-readiness-test", "Verify compact selected-owner report and namespace readiness");
     cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_readiness).step);
-    const cypher_owner_transitions = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"selected owner readiness transition index"} });
+    const cypher_owner_transitions = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "selected owner readiness transition index", "catalog projection" } });
     cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_transitions).step);
     const cypher_metadata_frames = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],

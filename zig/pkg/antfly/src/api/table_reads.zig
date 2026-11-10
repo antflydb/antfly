@@ -17702,7 +17702,7 @@ fn consumerTests() type {
                 acquisitions: usize = 0,
                 readiness_calls: usize = 0,
                 admitted: std.ArrayList(u64) = .empty,
-                fn acquire(raw: *anyopaque, _: ?u64, _: bool) !*table_catalog.RoutingGeneration {
+                fn acquire(raw: *anyopaque, _: table_catalog.RoutingBudget, _: bool) !*table_catalog.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.acquisitions += 1;
                     self.current.retain();
@@ -17925,7 +17925,7 @@ fn consumerTests() type {
                 acquisitions: usize = 0,
                 admissions: usize = 0,
                 resolutions: usize = 0,
-                fn acquire(raw: *anyopaque, _: ?u64, _: bool) !*table_catalog.RoutingGeneration {
+                fn acquire(raw: *anyopaque, _: table_catalog.RoutingBudget, _: bool) !*table_catalog.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.acquisitions += 1;
                     self.generation.retain();

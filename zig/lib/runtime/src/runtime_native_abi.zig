@@ -22,10 +22,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Graph statement table descriptors include certified key domains. The
-// callback's shallow contract cannot detect a stride change behind a slice;
-// reject older callers/providers before interpreting those descriptors.
-pub const abi_version: u32 = 11;
+// Routing-generation callbacks now carry the complete cancellation/clock budget.
+// Reject older callers before interpreting callback arguments; shallow contracts
+// cannot detect the changed function signature behind catalog vtables.
+pub const abi_version: u32 = 12;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {
