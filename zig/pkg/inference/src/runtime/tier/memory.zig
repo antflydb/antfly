@@ -826,6 +826,10 @@ const HostMaterialization = struct {
     pending: usize,
     resident: usize = 0,
     active: bool = true,
+    pooled: bool = false,
+    reduction_generation: u64 = 0,
+    clipping_generation: u64 = 0,
+    materializing: usize = 0,
     threadlocal var current: ?*HostMaterialization = null;
 
     fn retain(self: *@This()) void {
@@ -837,6 +841,7 @@ const HostMaterialization = struct {
     }
     fn update(self: *@This()) void {
         const pending = self.capacity -| self.resident;
+        if (pending == self.pending) return;
         spinLockAdmission(&self.controller.live_mutex);
         defer self.controller.live_mutex.unlock();
         if (pending > self.pending) self.controller.live_pending_bytes += pending - self.pending else self.controller.live_pending_bytes -= self.pending - pending;
@@ -844,10 +849,17 @@ const HostMaterialization = struct {
     }
     fn materialize(self: *@This(), bytes: []u8, initialized: bool) MaterializedHostAllocation {
         spinLockAdmission(&self.mutex);
-        if (!self.active or bytes.len == 0) {
+        if (!self.active or self.capacity == 0 or bytes.len == 0) {
             self.mutex.unlock();
             return .{};
         }
+        const creditable = if (self.pooled) @min(bytes.len, self.pending -| self.materializing) else bytes.len;
+        if (creditable == 0) {
+            self.mutex.unlock();
+            return .{};
+        }
+        if (self.pooled) self.materializing += creditable;
+        const generation = self.reduction_generation;
         self.retain();
         self.mutex.unlock();
         // Allocation alone is not residency: an untouched mmap or the shared
@@ -857,22 +869,48 @@ const HostMaterialization = struct {
         // memory actually allocated, never to a speculative peak estimate.
         const page_size = std.heap.pageSize();
         var offset: usize = 0;
-        while (offset < bytes.len) {
+        while (offset < creditable) {
             const byte: *volatile u8 = &bytes[offset];
             if (initialized) byte.* = byte.* else byte.* = 0;
             const address = @intFromPtr(bytes.ptr) + offset;
             offset += page_size - address % page_size;
         }
         spinLockAdmission(&self.mutex);
-        if (!self.active) {
+        if (self.pooled) self.materializing -= creditable;
+        if (!self.active or generation != self.reduction_generation) {
             self.mutex.unlock();
             self.release();
             return .{};
         }
-        self.resident += bytes.len;
+        const credited = if (self.pooled) @min(creditable, self.pending) else creditable;
+        self.resident += credited;
         self.update();
+        const clipping_generation = self.clipping_generation;
         self.mutex.unlock();
-        return .{ .owner = self, .bytes = bytes.len };
+        if (credited == 0) {
+            self.release();
+            return .{};
+        }
+        return .{ .owner = self, .bytes = credited, .clipping_generation = clipping_generation };
+    }
+    fn reduceCapacity(self: *@This(), bytes: usize) void {
+        self.capacity -= bytes;
+        if (self.pooled and bytes != 0) {
+            if (self.resident > self.capacity) {
+                self.resident = self.capacity;
+                self.clipping_generation +%= 1;
+            }
+            self.reduction_generation +%= 1;
+        }
+        self.update();
+    }
+    fn uncredit(self: *@This(), bytes: usize) usize {
+        // A pool reduction may already have retired part of this credit.
+        if (!self.pooled) std.debug.assert(bytes <= self.resident);
+        const removed = @min(self.resident, bytes);
+        self.resident -= removed;
+        self.update();
+        return removed;
     }
     fn finish(self: *@This()) usize {
         spinLockAdmission(&self.mutex);
@@ -883,42 +921,93 @@ const HostMaterialization = struct {
     }
 };
 
+/// A request-local allocator can draw from multiple admissions. Account for
+/// its pages against their combined capacity so an allocation can span leases
+/// without needing per-buffer lists of reservation owners.
+pub const HostMaterializationPool = struct {
+    owner: ?*HostMaterialization = null,
+
+    pub fn adopt(self: *@This(), lease: *AdmissionLease) !void {
+        if (lease.live_reserved_bytes == 0) return;
+        std.debug.assert(lease.host_materialization == null);
+        const controller = lease.controller.?;
+        const owner = self.owner orelse blk: {
+            const allocated = try platform.allocator.concurrentFallback().create(HostMaterialization);
+            allocated.* = .{ .controller = controller, .capacity = 0, .pending = 0, .pooled = true };
+            self.owner = allocated;
+            break :blk allocated;
+        };
+        if (owner.controller != controller) return error.InvalidAdmissionLeaseReduction;
+        spinLockAdmission(&owner.mutex);
+        defer owner.mutex.unlock();
+        // The controller has already charged this lease's entire promise.
+        owner.capacity += lease.live_reserved_bytes;
+        owner.pending += lease.live_reserved_bytes;
+        owner.retain();
+        lease.host_materialization = owner;
+    }
+
+    pub fn materialize(self: *@This(), bytes: []u8) MaterializedHostAllocation {
+        const owner = self.owner orelse return .{};
+        return owner.materialize(bytes, false);
+    }
+
+    pub fn deinit(self: *@This()) void {
+        const owner = self.owner orelse return;
+        const pending = owner.finish();
+        std.debug.assert(pending == 0 and owner.capacity == 0);
+        owner.release();
+        self.owner = null;
+    }
+};
+
 /// Exactly one token per owned allocation, shared by all tensor aliases.
 /// Release before returning the buffer to its allocator: any future execution
 /// growth must regain its promise before a concurrent admission can spend it.
 pub const MaterializedHostAllocation = struct {
     owner: ?*HostMaterialization = null,
     bytes: usize = 0,
-    pub fn prepareShrink(self: *@This(), bytes: usize) usize {
+    clipping_generation: u64 = 0,
+    pub const Shrink = struct {
+        bytes: usize = 0,
+        credit: usize = 0,
+        reduction_generation: u64 = 0,
+    };
+
+    pub fn prepareShrink(self: *@This(), bytes: usize) Shrink {
         const count = @min(bytes, self.bytes);
-        const owner = self.owner orelse return 0;
+        if (count == 0) return .{};
+        const owner = self.owner orelse return .{};
         spinLockAdmission(&owner.mutex);
-        if (owner.active) {
-            owner.resident -= count;
-            owner.update();
-        }
+        const shrink: Shrink = .{
+            .bytes = count,
+            .credit = if (owner.active) owner.uncredit(count) else 0,
+            .reduction_generation = owner.reduction_generation,
+        };
         owner.mutex.unlock();
         self.bytes -= count;
-        return count;
+        return shrink;
     }
-    pub fn rollbackShrink(self: *@This(), bytes: usize) void {
+    pub fn rollbackShrink(self: *@This(), shrink: Shrink) void {
+        if (shrink.bytes == 0) return;
         const owner = self.owner orelse return;
         spinLockAdmission(&owner.mutex);
-        if (owner.active) {
-            owner.resident += bytes;
+        // A pool reduction may retire this token's credit or consume the
+        // returned promise while backing resize is in flight.
+        if (owner.active and self.clipping_generation == owner.clipping_generation and
+            owner.reduction_generation == shrink.reduction_generation)
+        {
+            owner.resident += if (owner.pooled) @min(shrink.credit, owner.pending -| owner.materializing) else shrink.credit;
             owner.update();
         }
         owner.mutex.unlock();
-        self.bytes += bytes;
+        self.bytes += shrink.bytes;
     }
 
     pub fn release(self: *@This()) void {
         const owner = self.owner orelse return;
         spinLockAdmission(&owner.mutex);
-        if (owner.active) {
-            owner.resident -= self.bytes;
-            owner.update();
-        }
+        if (owner.active) _ = owner.uncredit(self.bytes);
         owner.mutex.unlock();
         owner.release();
         self.* = .{};
@@ -949,12 +1038,34 @@ pub fn materializeUninitializedHostAllocation(bytes: []u8) MaterializedHostAlloc
 
 pub const HostAllocationScope = struct {
     threadlocal var depth: usize = 0;
+    threadlocal var claimed_by_pool: bool = false;
     outermost: bool,
     pub fn begin() HostAllocationScope {
         const result = HostAllocationScope{ .outermost = depth == 0 };
+        if (result.outermost) claimed_by_pool = false;
         depth += 1;
         return result;
     }
+    /// The first admitted allocator owns the full backing allocation. Outer
+    /// transparent trackers and nested backing allocators defer to that pool.
+    pub fn claimForPool(_: HostAllocationScope) bool {
+        if (claimed_by_pool) return false;
+        claimed_by_pool = true;
+        return true;
+    }
+    fn tracksExecution(self: HostAllocationScope) bool {
+        return self.outermost and !claimed_by_pool;
+    }
+    pub fn preserveClaim() Claim {
+        return .{ .previous = claimed_by_pool };
+    }
+    pub const Claim = struct {
+        previous: bool,
+
+        pub fn restore(self: Claim) void {
+            claimed_by_pool = self.previous;
+        }
+    };
     pub fn deinit(_: *HostAllocationScope) void {
         depth -= 1;
     }
@@ -1002,10 +1113,9 @@ pub const HostAllocator = struct {
         const self: *HostAllocator = @ptrCast(@alignCast(raw));
         var allocation = HostAllocationScope.begin();
         defer allocation.deinit();
-        const outermost = allocation.outermost;
         // Never hold this map across backing callbacks or a page fault.
         const ptr = self.backing.rawAlloc(len, alignment, ra) orelse return null;
-        var token = if (outermost) materializeUninitializedHostAllocation(ptr[0..len]) else MaterializedHostAllocation{};
+        var token = if (allocation.tracksExecution()) materializeUninitializedHostAllocation(ptr[0..len]) else MaterializedHostAllocation{};
         spinLockAdmission(&self.mutex);
         self.allocations.ensureUnusedCapacity(self.metadata_allocator, self.pending_changes + 1) catch {
             self.mutex.unlock();
@@ -1024,7 +1134,6 @@ pub const HostAllocator = struct {
         const self: *HostAllocator = @ptrCast(@alignCast(raw));
         var allocation = HostAllocationScope.begin();
         defer allocation.deinit();
-        const outermost = allocation.outermost;
         spinLockAdmission(&self.mutex);
         const known = self.allocations.get(@intFromPtr(bytes.ptr));
         var token = known orelse MaterializedHostAllocation{};
@@ -1041,8 +1150,7 @@ pub const HostAllocator = struct {
         self.pending_changes += 1;
         _ = self.remove(bytes.ptr);
         self.mutex.unlock();
-        const reduction = @min(token.bytes, bytes.len -| len);
-        _ = token.prepareShrink(reduction);
+        const reduction = token.prepareShrink(bytes.len -| len);
         const resized = if (may_move)
             self.backing.rawRemap(bytes, alignment, len, ra)
         else if (self.backing.rawResize(bytes, alignment, len, ra)) bytes.ptr else null;
@@ -1055,7 +1163,7 @@ pub const HostAllocator = struct {
             return null;
         };
         if (len > bytes.len) {
-            const extra = if (outermost) materializeUninitializedHostAllocation(ptr[bytes.len..len]) else MaterializedHostAllocation{};
+            const extra = if (allocation.tracksExecution()) materializeUninitializedHostAllocation(ptr[bytes.len..len]) else MaterializedHostAllocation{};
             if (token.owner) |owner| {
                 if (extra.owner) |added| {
                     std.debug.assert(added == owner);
@@ -1100,13 +1208,6 @@ pub const HostExecutionScope = struct {
         HostMaterialization.current = owner;
         return .{ .owner = owner, .previous = previous };
     }
-    /// Do not attribute a backing wrapper's allocation to a second lease.
-    pub fn pause() HostExecutionScope {
-        const previous = HostMaterialization.current;
-        HostMaterialization.current = null;
-        return .{ .owner = null, .previous = previous };
-    }
-
     pub fn deinit(self: *HostExecutionScope) void {
         HostMaterialization.current = self.previous;
         if (self.owner) |owner| owner.release();
@@ -1135,7 +1236,12 @@ pub const AdmissionLease = struct {
 
     fn finishMaterialization(self: *AdmissionLease) void {
         const owner = self.host_materialization orelse return;
-        self.live_reserved_bytes = owner.finish();
+        if (owner.pooled) {
+            spinLockAdmission(&owner.mutex);
+            owner.reduceCapacity(self.live_reserved_bytes);
+            owner.mutex.unlock();
+            self.live_reserved_bytes = 0;
+        } else self.live_reserved_bytes = owner.finish();
         self.host_materialization = null;
         owner.release();
     }
@@ -1149,27 +1255,14 @@ pub const AdmissionLease = struct {
         return self.host_materialization.?;
     }
 
-    /// Independently owned, newly allocated bytes. Optional attribution may
-    /// decline on metadata OOM; the original promise remains conservative.
-    pub fn hostMaterializationPending(self: *const AdmissionLease) usize {
-        if (self.host_materialization) |owner| {
-            spinLockAdmission(&owner.mutex);
-            defer owner.mutex.unlock();
-            return owner.pending;
-        }
-        return self.live_reserved_bytes;
-    }
-
-    pub fn materializeAllocation(self: *AdmissionLease, bytes: []u8) MaterializedHostAllocation {
-        if (self.controller == null or self.live_reserved_bytes == 0) return .{};
-        const owner = self.ensureMaterialization() catch return .{};
-        return owner.materialize(bytes, false);
-    }
-
     /// Return unused capacity while preserving any still-unallocated promise.
     /// Unlike retain(), this is not a declaration that construction finished.
     pub fn reduce(self: *AdmissionLease, retained: AdmissionAmounts) !void {
         if (self.live_settled_bytes != 0) return self.retain(retained);
+        return self.reducePending(retained);
+    }
+
+    fn reducePending(self: *AdmissionLease, retained: AdmissionAmounts) !void {
         const controller = self.controller orelse return error.AdmissionLeaseReleased;
         const backend = self.retain_backend_class orelse return error.InvalidAdmissionLeaseReduction;
         const released = subtractAdmissionAmounts(self.amounts, retained) orelse return error.InvalidAdmissionLeaseReduction;
@@ -1178,9 +1271,9 @@ pub const AdmissionLease = struct {
         try controller.retainExternalLease(self.external_lease, retained);
         if (self.host_materialization) |owner| {
             spinLockAdmission(&owner.mutex);
-            owner.capacity = @min(owner.capacity, kept_live);
-            owner.update();
-            self.live_reserved_bytes = owner.capacity;
+            const remaining = @min(self.live_reserved_bytes, kept_live);
+            owner.reduceCapacity(self.live_reserved_bytes - remaining);
+            self.live_reserved_bytes = remaining;
             owner.mutex.unlock();
         } else {
             const returned = @min(released_live, self.live_reserved_bytes);
@@ -1196,6 +1289,9 @@ pub const AdmissionLease = struct {
     /// construction/import phase. This never acquires new capacity, so the
     /// transition cannot fail because of concurrent admissions.
     pub fn retain(self: *AdmissionLease, retained: AdmissionAmounts) !void {
+        // Other allocations can still draw from this request's pool. Keep
+        // accounting for its remaining capacity until the lease is released.
+        if (self.host_materialization) |owner| if (owner.pooled) return self.reducePending(retained);
         const controller = self.controller orelse return error.AdmissionLeaseReleased;
         const backend_class = self.retain_backend_class orelse
             return error.InvalidAdmissionLeaseReduction;
@@ -5775,4 +5871,51 @@ test "memory materialization allocator preserves concurrent reallocations and ne
         thread.* = try std.Thread.spawn(.{}, Runner.run, .{owner.allocator()});
         count += 1;
     }
+}
+
+test "memory pooled scratch preserves new promises after earlier excess residency" {
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    var pool: HostMaterializationPool = .{};
+    defer pool.deinit();
+    var prepaid = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 * 1024 }, false);
+    defer prepaid.release();
+    prepaid.live_reserved_bytes = prepaid.amounts.host_scratch_bytes;
+    controller.live_pending_bytes = prepaid.live_reserved_bytes;
+    try pool.adopt(&prepaid);
+
+    const first = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(first);
+    var first_token = pool.materialize(first);
+    defer first_token.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    var overflow = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 * 1024 }, false);
+    defer overflow.release();
+    overflow.live_reserved_bytes = overflow.amounts.host_scratch_bytes;
+    controller.live_pending_bytes += overflow.live_reserved_bytes;
+    try pool.adopt(&overflow);
+    try std.testing.expectEqual(overflow.live_reserved_bytes, controller.live_pending_bytes);
+
+    // A failed shrink restores only the amount returned by the token.
+    const shrink = first_token.prepareShrink(first.len);
+    first_token.rollbackShrink(shrink);
+    try std.testing.expectEqual(overflow.live_reserved_bytes, controller.live_pending_bytes);
+
+    const second = try std.testing.allocator.alloc(u8, overflow.live_reserved_bytes);
+    defer std.testing.allocator.free(second);
+    var second_token = pool.materialize(second);
+    defer second_token.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+
+    // Clipping earlier credit must not consume a subsequent reservation.
+    try prepaid.reduce(.{ .host_scratch_bytes = 32 * 1024 });
+    var more = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 * 1024 }, false);
+    defer more.release();
+    more.live_reserved_bytes = more.amounts.host_scratch_bytes;
+    controller.live_pending_bytes += more.live_reserved_bytes;
+    try pool.adopt(&more);
+    try std.testing.expectEqual(more.live_reserved_bytes, controller.live_pending_bytes);
+    const clipped_shrink = first_token.prepareShrink(first.len);
+    first_token.rollbackShrink(clipped_shrink);
+    try std.testing.expect(controller.live_pending_bytes >= more.live_reserved_bytes);
 }

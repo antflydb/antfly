@@ -14423,7 +14423,7 @@ const PreparedDocumentSourceCache = struct {
         defer scope.deinit();
         const guard = @import("antfly_platform").allocator.reclamation.Guard;
         if (!guard.allowed()) return 0;
-        guard.enter(&self.allocator_mutex);
+        guard.enterReclamation(&self.allocator_mutex);
         defer guard.leave();
         const before = if (physical) self.budgeted.?.live_bytes else self.budgeted.?.reservation.bytes;
         var reclaimed = self.budgeted.?.releaseUnusedCredit();

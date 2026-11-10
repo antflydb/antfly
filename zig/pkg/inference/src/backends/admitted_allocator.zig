@@ -37,6 +37,7 @@ pub const AdmittedAllocator = struct {
     admission_error: ?anyerror = null,
     blocks: ?*Header = null,
     reservations: ?*Reservation = null,
+    materialization: memory.HostMaterializationPool = .{},
 
     const quantum = 64 * 1024;
     const Header = struct { prev: ?*Header, next: ?*Header, bytes: usize, alignment: std.mem.Alignment, materialization: memory.MaterializedHostAllocation = .{} };
@@ -103,6 +104,8 @@ pub const AdmittedAllocator = struct {
         // The execution lease covers this node too. Allocate it now so cleanup
         // can transfer retained outputs without allocation or reacquisition.
         const node = try self.backing.create(Reservation);
+        errdefer self.backing.destroy(node);
+        if (permit.lease) |*lease| try self.materialization.adopt(lease);
         self.metadata_bytes += @sizeOf(Reservation);
         self.prepaid_host_bytes = amounts.host_scratch_bytes;
         return .{ .permit = permit, .owner = self, .reservation = node };
@@ -123,7 +126,13 @@ pub const AdmittedAllocator = struct {
             if (lease) |*active| active.release();
             if (self.rollback_admission) |rollback| rollback(self.admission_context.?, amount);
         }
-        const reservation = try self.backing.create(Reservation);
+        const reservation = blk: {
+            const claim = memory.HostAllocationScope.preserveClaim();
+            defer claim.restore();
+            break :blk try self.backing.create(Reservation);
+        };
+        errdefer self.backing.destroy(reservation);
+        if (lease) |*active| try self.materialization.adopt(active);
         reservation.* = .{ .next = self.reservations, .lease = lease, .bytes = amount };
         self.reservations = reservation;
         self.metadata_bytes += @sizeOf(Reservation);
@@ -174,21 +183,10 @@ pub const AdmittedAllocator = struct {
             self.backing.destroy(reservation);
             if (lease) |*active| active.release();
         }
+        self.materialization.deinit();
         self.live_bytes = 0;
         self.reserved_bytes = 0;
         self.metadata_bytes = 0;
-    }
-
-    fn materializeAllocation(self: *@This(), bytes: []u8) memory.MaterializedHostAllocation {
-        // Attribute to the newest chunk with unused live credit. At most the
-        // old chunk's rounded quantum remains conservative on a boundary.
-        var next = self.reservations;
-        while (next) |node| : (next = node.next) {
-            if (node.lease) |*lease| if (lease.live_reserved_bytes != 0) {
-                if (lease.hostMaterializationPending() != 0) return lease.materializeAllocation(bytes);
-            };
-        }
-        return .{};
     }
 
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
@@ -201,16 +199,13 @@ pub const AdmittedAllocator = struct {
         };
         var allocation = memory.HostAllocationScope.begin();
         defer allocation.deinit();
-        const base = blk: {
-            var suspended = memory.HostExecutionScope.pause();
-            defer suspended.deinit();
-            break :blk self.backing.rawAlloc(bytes, alignment.max(.of(Header)), ra) orelse return null;
-        };
+        const tracks_pool = self.materialization.owner != null and allocation.claimForPool();
+        const base = self.backing.rawAlloc(bytes, alignment.max(.of(Header)), ra) orelse return null;
         const header: *Header = @ptrCast(@alignCast(base));
-        const materialization = if (!allocation.outermost) memory.MaterializedHostAllocation{} else if (memory.hostExecutionActive())
-            memory.materializeUninitializedHostAllocation(base[0..bytes])
+        const materialization = if (tracks_pool)
+            self.materialization.materialize(base[0..bytes])
         else
-            self.materializeAllocation(base[0..bytes]);
+            memory.MaterializedHostAllocation{};
         header.* = .{ .prev = null, .next = self.blocks, .bytes = bytes, .alignment = alignment.max(.of(Header)), .materialization = materialization };
         if (self.blocks) |old| old.prev = header;
         self.blocks = header;
@@ -447,20 +442,21 @@ test "admission prepaid workspace grows only its deficit and rolls back failed s
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }
 
+const MaterializationTestOwner = struct {
+    controller: memory.AdmissionController = .{},
+    fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var lease = try self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+        lease.live_reserved_bytes = bytes;
+        self.controller.live_pending_bytes += bytes;
+        return lease;
+    }
+};
+
 test "memory chunk admission materializes preprocessing and preserves unused credit after trim" {
-    const Owner = struct {
-        controller: memory.AdmissionController = .{},
-        fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            var lease = try self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
-            lease.live_reserved_bytes = bytes;
-            self.controller.live_pending_bytes += bytes;
-            return lease;
-        }
-    };
-    var owner = Owner{};
+    var owner = MaterializationTestOwner{};
     defer owner.controller.deinit();
-    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &owner, .admit = Owner.admit };
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &owner, .admit = MaterializationTestOwner.admit };
     defer admitted.deinit();
     const a = admitted.allocator();
     var bytes = try a.alloc(u8, 8192);
@@ -479,4 +475,38 @@ test "memory chunk admission materializes preprocessing and preserves unused cre
     bytes = &.{};
     try admitted.trim();
     try std.testing.expectEqual(@as(usize, 0), owner.controller.live_pending_bytes);
+}
+
+test "memory prepaid execution and overflow chunks materialize one backing allocation" {
+    for ([_]bool{ false, true }) |wrapped| {
+        var owner = MaterializationTestOwner{};
+        defer owner.controller.deinit();
+        var admitted = AdmittedAllocator{
+            .backing = std.testing.allocator,
+            .admission_context = &owner,
+            .admit = MaterializationTestOwner.admit,
+        };
+        defer admitted.deinit();
+        var prepaid = try MaterializationTestOwner.admit(&owner, 64 * 1024);
+        defer prepaid.release();
+        try admitted.materialization.adopt(&prepaid);
+        admitted.prepaid_host_bytes = prepaid.amounts.host_scratch_bytes;
+        var execution = try memory.HostExecutionScope.begin(&prepaid);
+        defer execution.deinit();
+
+        const tracker = if (wrapped) try memory.HostAllocator.create(admitted.allocator()) else null;
+        defer if (tracker) |value| value.deinit();
+        const allocator = if (tracker) |value| value.allocator() else admitted.allocator();
+        const payload = try allocator.alloc(u8, 128 * 1024);
+        var payload_live = true;
+        defer if (payload_live) allocator.free(payload);
+        try std.testing.expectEqual(admitted.metadata_bytes, owner.controller.live_pending_bytes);
+        // No duplicate attribution to the current run by the outer tracker.
+        const total = admitted.prepaid_host_bytes + admitted.reserved_bytes;
+        allocator.free(payload);
+        payload_live = false;
+        try std.testing.expectEqual(total, owner.controller.live_pending_bytes);
+        try admitted.trim();
+        try std.testing.expectEqual(admitted.prepaid_host_bytes, owner.controller.live_pending_bytes);
+    }
 }

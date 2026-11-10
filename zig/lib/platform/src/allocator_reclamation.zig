@@ -19,7 +19,9 @@ const std = @import("std");
 pub const Guard = struct {
     threadlocal var depth: usize = 0;
     threadlocal var locks: [128]?*std.atomic.Mutex = @splat(null);
-    threadlocal var reclamation_depth: usize = 0;
+    threadlocal var reclamation_count: usize = 0;
+    const Ownership = enum { ordinary, reclamation, lendable };
+    threadlocal var ownership: [locks.len]Ownership = @splat(.ordinary);
     pub fn active() bool {
         return depth != 0;
     }
@@ -31,20 +33,60 @@ pub const Guard = struct {
         return false;
     }
     pub fn enter(mutex: *std.atomic.Mutex) void {
-        if (depth < locks.len) locks[depth] = mutex;
+        push(mutex, .ordinary);
+    }
+    /// Record a mutex explicitly acquired for teardown by a reclamation scope.
+    pub fn enterReclamation(mutex: *std.atomic.Mutex) void {
+        std.debug.assert(allowed());
+        push(mutex, .reclamation);
+    }
+    /// A stateless synchronizing adapter may lend its held lock to an
+    /// audited reclaimer. The reclaimer must still check the entire free path.
+    pub fn enterLendable(mutex: *std.atomic.Mutex) void {
+        push(mutex, .lendable);
+    }
+    fn push(mutex: *std.atomic.Mutex, kind: Ownership) void {
+        if (allowed()) {
+            locks[depth] = mutex;
+            ownership[depth] = kind;
+            if (kind == .reclamation) reclamation_count += 1;
+        }
         depth += 1;
     }
     pub fn leave() void {
         depth -= 1;
-    }
-    pub fn beginReclaim() void {
-        reclamation_depth += 1;
-    }
-    pub fn endReclaim() void {
-        reclamation_depth -= 1;
+        if (depth < locks.len and ownership[depth] == .reclamation) reclamation_count -= 1;
     }
     pub fn reuse(mutex: *std.atomic.Mutex) bool {
-        return reclamation_depth != 0 and held(mutex);
+        if (reclamation_count == 0) return false;
+        return contains(mutex, .reclamation);
+    }
+    fn contains(mutex: *std.atomic.Mutex, kind: Ownership) bool {
+        const count = @min(depth, locks.len);
+        for (locks[0..count], ownership[0..count]) |locked, owned| {
+            if (locked == mutex and owned == kind) return true;
+        }
+        return false;
+    }
+};
+
+/// A checked lock receipt. Only audited stateless wrappers may lend a lock,
+/// and only callers that understand that wrapper's backing may borrow it.
+pub const ReclamationLock = struct {
+    mutex: *std.atomic.Mutex,
+    acquired: bool,
+
+    pub fn tryAcquire(mutex: *std.atomic.Mutex, allow_borrow: bool) ?ReclamationLock {
+        if (!Guard.allowed()) return null;
+        const borrow = allow_borrow and Guard.contains(mutex, .lendable);
+        if (!borrow and (Guard.held(mutex) or !mutex.tryLock())) return null;
+        Guard.enterReclamation(mutex);
+        return .{ .mutex = mutex, .acquired = !borrow };
+    }
+
+    pub fn deinit(self: ReclamationLock) void {
+        Guard.leave();
+        if (self.acquired) self.mutex.unlock();
     }
 };
 

@@ -59,7 +59,7 @@ test "resource manager physical pressure reclaims caches without logical debt" {
 /// Scope only live owners: when destroying a budget-owning object, acquire
 /// its backing chain, not the mutex embedded in the object being destroyed.
 pub const ReclamationScope = struct {
-    locks: [32]*std.atomic.Mutex = undefined,
+    locks: [32]allocator_residency.ReclamationLock = undefined,
     count: usize = 0,
     budgets: [32]*BudgetedAllocator = undefined,
     budget_count: usize = 0,
@@ -77,7 +77,6 @@ pub const ReclamationScope = struct {
                 return null;
             }
         }
-        allocator_residency.Guard.beginReclaim();
         result.active = true;
         return result;
     }
@@ -86,15 +85,23 @@ pub const ReclamationScope = struct {
     /// pressure callback by acquiring a mutex their normal callers never use.
     pub fn supported(allocator: std.mem.Allocator) bool {
         var current = allocator;
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        const arena_vtable = arena.allocator().vtable;
         for (0..32) |_| {
-            if (current.vtable.alloc == BudgetedAllocator.alloc or current.vtable == arena_vtable) return false;
+            if (current.vtable.alloc == BudgetedAllocator.alloc) return false;
             if (budgetOwner(current)) |owner| {
                 current = owner.backing;
             } else if (allocator_residency.Quota.owner(current)) |owner| {
                 current = owner.backing;
-            } else return true;
+            } else return supportedBacking(current);
+        }
+        return false;
+    }
+
+    fn supportedBacking(allocator: std.mem.Allocator) bool {
+        if (allocator.vtable == std.heap.page_allocator.vtable) return true;
+        if (allocator.vtable == @import("antfly_platform").allocator.concurrentFallback().vtable) return true;
+        if (comptime builtin.link_libc) if (allocator.vtable == std.heap.c_allocator.vtable) return true;
+        if (comptime builtin.is_test) {
+            return allocator.vtable == std.testing.allocator.vtable and allocator.ptr == std.testing.allocator.ptr;
         }
         return false;
     }
@@ -110,12 +117,12 @@ pub const ReclamationScope = struct {
     }
 
     fn acquireChain(self: *ReclamationScope, allocator: std.mem.Allocator) bool {
-        if (!supported(allocator)) return false;
         var current = allocator;
         for (0..32) |_| {
             var mutex: *std.atomic.Mutex = undefined;
             var backing: std.mem.Allocator = undefined;
             var budget: ?*BudgetedAllocator = null;
+            if (current.vtable.alloc == BudgetedAllocator.alloc) return false;
             if (budgetOwner(current)) |owner| {
                 mutex = &owner.allocator_mutex;
                 backing = owner.backing;
@@ -123,19 +130,8 @@ pub const ReclamationScope = struct {
             } else if (allocator_residency.Quota.owner(current)) |owner| {
                 mutex = &owner.mutex;
                 backing = owner.backing;
-            } else return true; // Unknown allocators retain their own contract.
-            var owned = false;
-            for (self.locks[0..self.count]) |held| if (held == mutex) {
-                owned = true;
-                break;
-            };
-            if (!owned and !allocator_residency.Guard.reuse(mutex)) {
-                if (self.count == self.locks.len or !allocator_residency.Guard.allowed() or
-                    allocator_residency.Guard.held(mutex) or !mutex.tryLock()) return false;
-                self.locks[self.count] = mutex;
-                self.count += 1;
-                allocator_residency.Guard.enter(mutex);
-            }
+            } else return supportedBacking(current);
+            if (!self.tryLock(mutex)) return false;
             if (budget) |owner| {
                 const tracked = for (self.budgets[0..self.budget_count]) |known| {
                     if (known == owner) break true;
@@ -165,22 +161,17 @@ pub const ReclamationScope = struct {
 
     /// Extend a live scope with an owner/accounting lock before mutation.
     pub fn tryLock(self: *ReclamationScope, mutex: *std.atomic.Mutex) bool {
-        for (self.locks[0..self.count]) |held| if (held == mutex) return true;
         if (allocator_residency.Guard.reuse(mutex)) return true;
-        if (self.count == self.locks.len or !allocator_residency.Guard.allowed() or
-            allocator_residency.Guard.held(mutex) or !mutex.tryLock()) return false;
-        self.locks[self.count] = mutex;
+        if (self.count == self.locks.len) return false;
+        self.locks[self.count] = allocator_residency.ReclamationLock.tryAcquire(mutex, false) orelse return false;
         self.count += 1;
-        allocator_residency.Guard.enter(mutex);
         return true;
     }
 
     pub fn deinit(self: *ReclamationScope) void {
-        if (self.active) allocator_residency.Guard.endReclaim();
         while (self.count != 0) {
             self.count -= 1;
-            allocator_residency.Guard.leave();
-            self.locks[self.count].unlock();
+            self.locks[self.count].deinit();
         }
         self.active = false;
     }
@@ -7181,12 +7172,34 @@ test "resource manager physical pressure never reuses an ordinary in-progress al
     var budget = BudgetedAllocator.init(&manager, .lsm_block_table_cache, std.testing.allocator, 1);
     defer budget.deinit();
     try std.testing.expect(budget.allocator_mutex.tryLock());
-    allocator_residency.Guard.enter(&budget.allocator_mutex);
-    try std.testing.expect(ReclamationScope.tryAcquire(budget.threadSafeAllocator()) == null);
-    allocator_residency.Guard.leave();
-    budget.allocator_mutex.unlock();
-    var scope = ReclamationScope.tryAcquire(budget.threadSafeAllocator()).?;
-    scope.deinit();
+    {
+        defer budget.allocator_mutex.unlock();
+        allocator_residency.Guard.enter(&budget.allocator_mutex);
+        defer allocator_residency.Guard.leave();
+        try std.testing.expect(ReclamationScope.tryAcquire(budget.threadSafeAllocator()) == null);
+        var outer = ReclamationScope.tryAcquire(std.heap.page_allocator).?;
+        defer outer.deinit();
+        try std.testing.expect(ReclamationScope.tryAcquire(budget.threadSafeAllocator()) == null);
+        try std.testing.expect(!outer.tryLock(&budget.allocator_mutex));
+    }
+    var outer = ReclamationScope.tryAcquire(budget.threadSafeAllocator()).?;
+    defer outer.deinit();
+    var inner = ReclamationScope.tryAcquire(budget.threadSafeAllocator()).?;
+    inner.deinit();
+    try std.testing.expect(!budget.allocator_mutex.tryLock());
+}
+
+test "resource manager physical pressure declines opaque allocator chains" {
+    var bytes: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+    try std.testing.expect(!ReclamationScope.supported(fixed.allocator()));
+    var quota = allocator_residency.Quota.init(fixed.allocator(), bytes.len);
+    defer quota.deinit();
+    try std.testing.expect(!ReclamationScope.supported(quota.allocator()));
+    try std.testing.expect(ReclamationScope.tryAcquire(quota.allocator()) == null);
+    // A rejected backing must unwind the parent lock.
+    try std.testing.expect(quota.mutex.tryLock());
+    quota.mutex.unlock();
 }
 
 test "resource manager physical pressure skips callbacks without explicit foreign-thread authority" {

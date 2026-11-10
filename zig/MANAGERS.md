@@ -353,10 +353,12 @@ writable host pages. The native compute allocator attributes real allocations
 before kernels run, without preallocating the estimated peak or probing procfs
 per allocation. Its pointer-transparent map preserves legacy allocator layout,
 handles resize/remap rollback and keeps allocator state alive through escaped
-buffers. Layered adapters attribute a backing allocation once. Unknown/device
-producers remain conservative. Chunk-admitted preprocessing records ownership
-on allocation too; reducing unused capacity preserves the remaining promise,
-whereas completing construction settles it. Buffer release restores future
+buffers. Dense aliases keep the allocator that owns their shared payload.
+Prepaid execution and overflow chunks for one request share a materialization
+pool, so a buffer spanning their capacity needs one accounting token. Layered
+adapters attribute a backing allocation once. Unknown/device producers remain
+conservative. Reducing unused capacity preserves the remaining promise.
+Buffer release restores future
 execution promises before the backing free. Late frees after lease completion
 never dereference the old admission controller. Page commitment never holds an
 admission/accounting lock while faulting pages.
@@ -387,8 +389,11 @@ Managed NativeFile page and link caches use stable heap owners so callbacks
 survive file moves. Registered reclaimers preserve pinned views and their
 charges, release empty map storage, and drain before cache teardown. Reclamation
 pre-acquires known nested budget/quota allocator chains with try-locks before
-detaching storage; a busy chain is skipped without partial eviction. Guarded
-frees reuse those locks. This includes metadata/workspace, native chunk, scratch,
+detaching storage. Busy chains and unrecognized backing allocators decline
+reclamation. Guarded frees reuse only mutexes explicitly acquired for
+reclamation. SQL and graph caches can also borrow locks explicitly offered by
+stateless synchronizing wrappers when the entire free path is audited. This
+includes metadata/workspace, native chunk, scratch,
 document-preparation, vocabulary and retained-frame caches. Physical dispatch
 requires an explicitly registered callback; logical callbacks never inherit
 foreign-thread authority. HBC callbacks pre-acquire accounting and generation

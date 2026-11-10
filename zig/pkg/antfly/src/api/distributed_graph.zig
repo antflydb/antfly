@@ -5223,15 +5223,14 @@ const TraversalReadCache = struct {
         if (self.tracked) |tracked| self.reservation.resize(tracked.live_bytes) catch unreachable;
     }
     const FreeLocks = struct {
-        held: [32]*std.atomic.Mutex = undefined,
+        held: [32]graph_reclamation.ReclamationLock = undefined,
         count: usize = 0,
-        fn take(self: *@This(), mutex: *std.atomic.Mutex) bool {
+        fn take(self: *@This(), mutex: *std.atomic.Mutex, allow_borrow: bool) bool {
             const Guard = graph_reclamation.Guard;
-            if (Guard.held(mutex)) return true;
-            if (self.count == self.held.len or !Guard.allowed() or !mutex.tryLock()) return false;
-            self.held[self.count] = mutex;
+            if (Guard.reuse(mutex)) return true;
+            if (self.count == self.held.len) return false;
+            self.held[self.count] = graph_reclamation.ReclamationLock.tryAcquire(mutex, allow_borrow) orelse return false;
             self.count += 1;
-            Guard.enter(mutex);
             return true;
         }
         fn acquire(self: *@This(), backing: std.mem.Allocator) bool {
@@ -5239,14 +5238,14 @@ const TraversalReadCache = struct {
             for (0..32) |_| {
                 if (graph_memory_budget.parentAllocator(current)) |parent| {
                     const budget: *graph_memory_budget = @ptrCast(@alignCast(current.ptr));
-                    if (!self.take(&budget.mutex)) return false;
+                    if (!self.take(&budget.mutex, false)) return false;
                     current = parent;
                 } else if (graph_reclamation.Quota.owner(current)) |quota| {
-                    if (!self.take(&quota.mutex)) return false;
+                    if (!self.take(&quota.mutex, false)) return false;
                     current = quota.backing;
                 } else if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(current)) |parent| {
                     const owner: *@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator = @ptrCast(@alignCast(current.ptr));
-                    if (!self.take(owner.shared_mutex orelse &owner.mutex)) return false;
+                    if (!self.take(owner.shared_mutex orelse &owner.mutex, true)) return false;
                     current = parent;
                 } else return graph_memory_budget.reusableHeadroom(current) != null;
             }
@@ -5255,8 +5254,7 @@ const TraversalReadCache = struct {
         fn deinit(self: *@This()) void {
             while (self.count > 0) {
                 self.count -= 1;
-                graph_reclamation.Guard.leave();
-                self.held[self.count].unlock();
+                self.held[self.count].deinit();
             }
         }
     };
@@ -5268,8 +5266,6 @@ const TraversalReadCache = struct {
         var locks = FreeLocks{};
         defer locks.deinit();
         if (!locks.acquire(tracked.backing)) return false;
-        graph_reclamation.Guard.beginReclaim();
-        defer graph_reclamation.Guard.endReclaim();
         for (&self.entries, 0..) |*entry, i| if (entry.*) |*value| {
             if (self.active == value) continue;
             self.evict(i);

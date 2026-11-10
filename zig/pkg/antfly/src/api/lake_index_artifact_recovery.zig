@@ -45,12 +45,8 @@ pub const Reads = struct {
     fn reclaim(raw: *anyopaque) bool {
         const self: *Reads = @ptrCast(@alignCast(raw));
         const quota = self.quota orelse return false;
-        if (!residency.Guard.allowed() or !quota.mutex.tryLock()) return false;
-        defer quota.mutex.unlock();
-        residency.Guard.enter(&quota.mutex);
-        defer residency.Guard.leave();
-        residency.Guard.beginReclaim();
-        defer residency.Guard.endReclaim();
+        const quota_lock = residency.ReclamationLock.tryAcquire(&quota.mutex, false) orelse return false;
+        defer quota_lock.deinit();
         const before = quota.live_bytes;
         const cache = &self.written.?;
         _ = cache.reclaim(256 * 1024);
