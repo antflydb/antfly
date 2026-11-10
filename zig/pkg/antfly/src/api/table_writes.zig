@@ -57245,6 +57245,7 @@ fn implementationTests() type {
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
 
@@ -57265,7 +57266,9 @@ fn implementationTests() type {
             }
 
             {
-                var db = try write_cache.getOrOpenLockedMode(path, Catalog.iface(), 7001, 0, "docs", .writer_no_replay);
+                // Startup catch-up must not open a foreground bulk session,
+                // which intentionally defers native posting publication.
+                var db = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .startup_catch_up, null, null);
                 defer db.deinit(alloc);
                 // Add real retained replay debt to an already published native
                 // generation, without relying on a race with startup workers.
@@ -57274,18 +57277,29 @@ fn implementationTests() type {
                 defer db_mod.types.freeDBStats(alloc, before);
                 try std.testing.expectEqual(@as(usize, 1), before.indexes.len);
                 try std.testing.expect(before.indexes[0].replay_catch_up_required);
+                // Cache the pending state explicitly so stale complete-state
+                // observations cannot accidentally satisfy the final check.
+                try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, db.db);
+                var pending = (try snapshot_cache.snapshot(alloc, "docs")).?;
+                defer pending.deinit(alloc);
+                try std.testing.expect(pending.items[0].stats.indexes[0].replay_catch_up_required);
             }
 
+            const resident_owner = write_cache.entries.items[0];
             const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
             try std.testing.expect(!result.busy);
             try std.testing.expect(result.had_debt);
             try std.testing.expect(result.cleared_debt);
-            try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+            // Live catch-up refreshes observations on the owning writer; it
+            // must not evict that warm owner just to invalidate stale status.
+            try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+            try std.testing.expect(write_cache.entries.items[0] == resident_owner);
 
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
             try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+            try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].doc_count);
             try std.testing.expectEqual(@as(u64, statuses.items[0].stats.indexes[0].replay_target_sequence), statuses.items[0].stats.indexes[0].replay_applied_sequence);
             try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
         }
