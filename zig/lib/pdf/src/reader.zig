@@ -34664,8 +34664,10 @@ test "document PDF annotation coverage is bounded and prevents incomplete native
     // Exercise ordinary allocator remaps, then enumerate failures with stable
     // allocate/copy/free growth: SafeAllocator remapping depends on address
     // layout and otherwise changes the allocation count between iterations.
-    try Case.check(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    try Case.check(checked.allocator());
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), Case.check, .{});
 }
 
 test "document text bounds use transformed font metrics and leave unsupported geometry unknown" {
@@ -35210,7 +35212,9 @@ test "reader semantic column ordering is invariant under uniform scaling" {
 }
 
 test "reader empty vector semantic spans preserve column ordering and layout capacity" {
-    const alloc = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const alloc = checked.allocator();
     const expected = "Left prose words one\nLeft prose words two\nLeft prose words three\n" ++
         "Right prose words one\nRight prose words two\nRight prose words three\n";
     for ([_]usize{ 0, 1, 2050 }) |empty_count| {
@@ -36951,7 +36955,9 @@ fn exerciseQuotaRecoveryAllocations(a: Allocator, sample: []const u8, policy: Te
 }
 
 test "reader property metadata recovered quotas preserve caller OOM through both APIs" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildQuotaRecoveryTestPdfAlloc(a, 4);
     defer a.free(sample);
     inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| inline for (.{ false, true }) |analysis_api| {
@@ -37329,7 +37335,9 @@ fn exerciseInheritedPropertySourceAllocations(a: Allocator, sample: []const u8, 
 }
 
 test "reader inherited property source ownership survives every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{ .private_bytes = 256, .location = .parent, .payload = .literal });
     defer a.free(sample);
     inline for (.{ false, true }) |analysis_api| {
@@ -37741,7 +37749,9 @@ test "reader optional frame pressure preserves both selected replacements and ba
 }
 
 test "reader optional frame pressure preserves ownership through every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildMetadataFramePressureTestPdfAlloc(a);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseMetadataFramePressureAllocations, .{sample});
@@ -37886,7 +37896,9 @@ test "reader indirect lengths preserve endstream data and full payload boundarie
 }
 
 test "reader indirect length ownership survives every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildObjectStreamFixtureAlloc(a, .{
         .objects = &.{"<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private (before\nendstream\nafter) >>"},
         .content = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
@@ -38075,7 +38087,9 @@ test "reader ordinary stream lengths may be stored in object streams" {
 }
 
 test "reader compressed ordinary lengths preserve ownership through allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, true);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompressedOrdinaryLength, .{ sample, false });
@@ -38222,7 +38236,9 @@ test "reader damaged image lengths preserve native text without relaxing payload
 }
 
 test "reader damaged image header recovery preserves allocation failures" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_][]const u8{ "99 0 R", "-1" }) |length| {
         const sample = try buildDamagedTextImageTestPdfAlloc(a, length);
         defer a.free(sample);
@@ -38349,7 +38365,9 @@ test "reader native image inspection never decodes compressed length containers"
 }
 
 test "reader native image header projection preserves allocation failures" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_]bool{ false, true }) |subtype_first| {
         const sample = try buildNativeImageLengthContainerTestPdfAlloc(a, subtype_first);
         defer a.free(sample);
@@ -38885,7 +38903,9 @@ fn exerciseNativeSharedContainerAllocations(a: Allocator, sample: []const u8) !v
 }
 
 test "reader shared required frames preserve native ownership through allocation failures" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 9, 2048);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNativeSharedContainerAllocations, .{sample});
@@ -39130,14 +39150,18 @@ fn exerciseNestedFrameOwnership(a: Allocator, sample: []const u8, encrypted: boo
 }
 
 test "reader LRU frame ownership survives every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildNestedFontContainerTestAlloc(a, 2, 2048);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNestedFrameOwnership, .{ sample, false });
 }
 
 test "reader encrypted LRU frames preserve source keys and allocator ownership" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildNestedFontContainerTestAlloc(a, 2, 2048);
     defer a.free(sample);
     {
@@ -39233,7 +39257,9 @@ fn exerciseSelectiveColorTableOwnership(a: Allocator, sample: []const u8) !void 
 }
 
 test "reader shared Form color tables preserve ownership through allocation failures" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const sample = try buildSelectiveColorTableTestPdfAlloc(a, 16, true);
     defer a.free(sample);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseSelectiveColorTableOwnership, .{sample});
@@ -39407,7 +39433,9 @@ fn exerciseColorFrontierAllocations(a: Allocator, sample: []const u8) !void {
 }
 
 test "reader color dependency frontiers preserve ownership at every allocation failure" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_]bool{ false, true }) |compressed| {
         const sample = try buildColorFrontierTestPdfAlloc(a, 4, 3, 16, compressed);
         defer a.free(sample);
