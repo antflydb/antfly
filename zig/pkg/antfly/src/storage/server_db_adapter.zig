@@ -29,7 +29,7 @@ const requiresDurableLifecycleReplication = @import("antfly_local_sources").stor
 /// the stable storage errors unchanged on ordinary request paths.
 pub fn normalizeOrderedApplyError(err: anyerror) anyerror {
     return switch (err) {
-        error.WriterLocked, error.GraphMaintenanceInProgress => error.RaftApplyWriterUnavailable,
+        error.WriterLocked, error.GraphMaintenanceInProgress, error.StorageOwnerAdmissionPending => error.RaftApplyWriterUnavailable,
         else => err,
     };
 }

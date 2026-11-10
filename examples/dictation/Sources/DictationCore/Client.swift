@@ -7,7 +7,7 @@ public actor AntflyClient {
   let origin: URL
   let token: String
   private let basicPassword: String?
-  private let inferenceGate: InferenceGate
+  let inferenceGate: InferenceGate
   let session: URLSession
   public init(
     server: String, token: String = "", basicPassword: String? = nil, session: URLSession? = nil,
@@ -34,7 +34,7 @@ public actor AntflyClient {
     settings.timeoutIntervalForResource = 300
     self.session = session ?? URLSession(configuration: settings)
   }
-  private func request(_ path: String, method: String = "POST", body: Data? = nil) -> URLRequest {
+  func request(_ path: String, method: String = "POST", body: Data? = nil) -> URLRequest {
     var request = URLRequest(url: origin.appendingPathComponent(path))
     request.httpMethod = method
     request.httpBody = body
@@ -76,9 +76,36 @@ public actor AntflyClient {
   }
   public func dictate(
     audio: Data, preset: Preset, dictionary: [String],
+    formatting: VoiceFormatting.Options? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in },
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
+    if let formatting, formatting.commands || formatting.pressEnter {
+      let began = ProcessInfo.processInfo.systemUptime
+      var recognition = preset
+      recognition.cleanupModel = ""
+      var raw = try await dictate(
+        audio: audio, preset: recognition, dictionary: dictionary,
+        events: events, progress: progress)
+      if !preset.runsCleanup {
+        let plan = VoiceFormatting.Plan(raw.raw, options: formatting)
+        let restored =
+          raw.text == raw.raw || plan.hasProtectedSpans || plan.pressEnter
+          ? plan.render() : try plan.restore(raw.text)
+        raw.text = restored.text
+        raw.formatting = restored
+        return raw
+      }
+      let cleanupBegan = ProcessInfo.processInfo.systemUptime
+      var result = try await cleanupText(
+        raw.raw, preset: preset, dictionary: dictionary,
+        formatting: formatting, events: events)
+      result.timing = DictationTiming(
+        recognition: raw.timing?.recognition ?? cleanupBegan - began,
+        cleanup: preset.runsCleanup ? ProcessInfo.processInfo.systemUptime - cleanupBegan : 0,
+        total: ProcessInfo.processInfo.systemUptime - began)
+      return result
+    }
     var body = dictationBody(preset: preset, dictionary: dictionary)
     body["audio"] = "attachment:0"
     var upload = request(
@@ -89,10 +116,75 @@ public actor AntflyClient {
   }
   public func cleanupText(
     _ text: String, preset: Preset, dictionary: [String],
+    formatting: VoiceFormatting.Options? = nil, context: CleanupContext? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in }
   ) async throws -> DictationResult {
     guard text.utf8.count <= 65536 else {
       throw DictationError.invalid("Transcript exceeds the cleanup limit.")
+    }
+    if let formatting = formatting
+      ?? context.map({ _ in VoiceFormatting.Options(commands: false, pressEnter: false) })
+    {
+      let context = context ?? CleanupContext()
+      let plan = VoiceFormatting.Plan(text, options: formatting, namespace: context.namespace)
+      var result: DictationResult
+      if !preset.runsCleanup || !plan.hasCleanupText {
+        result = DictationResult(raw: text, text: plan.render().text)
+        result.formatting = plan.render()
+        return result
+      }
+      do {
+        let cleanupStarted = ProcessInfo.processInfo.systemUptime
+        await events(DictationProgress(phase: .cleaning, raw: text))
+        var protectedPreset = preset
+        var combinedInstructions = preset.outputMode == .rewrite ? preset.instructions : ""
+        if !plan.instructions.isEmpty {
+          if !combinedInstructions.isEmpty { combinedInstructions += "\n" }
+          combinedInstructions += plan.instructions
+        }
+        let portable = !preset.usesNamedTranscriber || combinedInstructions.utf8.count > 4096
+        if !plan.instructions.isEmpty && !portable {
+          protectedPreset.style = preset.requestStyle
+          protectedPreset.instructions = combinedInstructions
+          protectedPreset.mode = .rewrite
+        }
+        let requiresWhole =
+          preset.outputMode == .rewrite || preset.processingStrategy == .wholeUtterance
+        guard !requiresWhole || plan.input.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes
+        else {
+          throw DictationError.invalid(
+            "This transcript exceeds the whole-utterance cleanup capacity. Use Clean with Automatic processing, shorten the recording, or insert the original transcript."
+          )
+        }
+        let effectivePreset = protectedPreset
+        let cleaned = try await context.process(plan) { window in
+          let leading = String(window.prefix(while: { $0.isWhitespace }))
+          let trailing = String(window.reversed().prefix(while: { $0.isWhitespace }).reversed())
+          let content = window.trimmingCharacters(in: .whitespacesAndNewlines)
+          let chunk: String
+          if portable {
+            chunk = try await self.portableCleanup(
+              content, preset: preset, dictionary: dictionary,
+              protectedInstructions: plan.instructions)
+          } else {
+            chunk = try await self.cleanupText(
+              content, preset: effectivePreset, dictionary: dictionary,
+              events: { event in await events(DictationProgress(phase: event.phase, raw: text)) }
+            ).text
+          }
+          return leading + chunk + trailing
+        }
+        result = DictationResult(raw: text, text: cleaned)
+        let restored = try plan.restore(result.text)
+        result.raw = text
+        result.text = restored.text
+        result.formatting = restored
+        let elapsed = ProcessInfo.processInfo.systemUptime - cleanupStarted
+        result.timing = DictationTiming(cleanup: elapsed, total: elapsed)
+        return result
+      } catch is CancellationError { throw CancellationError() } catch {
+        throw DictationError.cleanupFailed(raw: text, message: error.localizedDescription)
+      }
     }
     if !preset.runsCleanup || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       return DictationResult(raw: text, text: text)
@@ -100,6 +192,9 @@ public actor AntflyClient {
     var body = dictationBody(preset: preset, dictionary: dictionary)
     body["audio"] = ""
     body["transcript_text"] = text
+    // Do not let the server's prose-based heuristic under-budget opaque
+    // formatting markers; the caller sizes batches against this output cap.
+    body["max_tokens"] = VoiceFormatting.Plan.cleanupTokenBudget(for: text)
     do {
       let result = try await consumeDictation(
         request("ai/v1/dictate", body: encode(body)), cleanup: true, events: events,

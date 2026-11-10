@@ -214,10 +214,15 @@ pub const Config = struct {
         navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {
             retention_ms: u64 = 300_000,
+            /// Per-shard disposable local cursor cache.
             max_native_cuts: usize = 64,
             max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
-            /// Speculative durable native snapshots. Null enables warming only
-            /// for serverless; on-demand cursor capture is always available.
+            /// Store-wide durable bindings and conservative inventory bytes.
+            max_durable_native_cuts: usize = 4096,
+            max_durable_native_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            /// One optional local checkpoint; never a speculative durable upload.
+            max_native_warm_bytes: u64 = 256 * 1024 * 1024,
+            /// Explicit opt-in only. Serverless immutable reads use their own pins.
             background_warming: ?bool = null,
         } = .{},
         text_cache: struct {
@@ -237,7 +242,8 @@ pub const Config = struct {
         } = .{},
 
         pub fn nativeSnapshotWarmingEnabled(self: LakeIndexConfig, deployment: DeploymentMode) bool {
-            return self.query_cursors.background_warming orelse (deployment == .serverless);
+            _ = deployment;
+            return self.query_cursors.background_warming orelse false;
         }
     };
 
@@ -3994,6 +4000,7 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     if (text.admission_window_segments == 0 or text.admission_window_segments > 64 or text.admission_window_bytes == 0 or text.admission_window_bytes > 32 * 1024 * 1024) return error.InvalidConfig;
     const cursors = parsed.value.query_cursors;
     if (cursors.retention_ms < 1000 or cursors.retention_ms > std.time.ms_per_hour or cursors.max_native_cuts == 0 or cursors.max_native_cuts > 4096 or cursors.max_native_retained_bytes == 0 or cursors.max_native_retained_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
+    if (cursors.max_durable_native_cuts == 0 or cursors.max_durable_native_cuts > 4096 or cursors.max_durable_native_bytes == 0 or cursors.max_durable_native_bytes > 1024 * 1024 * 1024 * 1024 or cursors.max_native_warm_bytes == 0 or cursors.max_native_warm_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
     const gc = parsed.value.artifact_gc;
     if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
     return parsed.value;
@@ -4005,7 +4012,7 @@ test "external lake native snapshot warming defaults by deployment and accepts e
     defer defaults.deinit();
     try std.testing.expect(defaults.lake_indexes.query_cursors.background_warming == null);
     inline for (std.meta.tags(DeploymentMode)) |deployment| {
-        try std.testing.expectEqual(deployment == .serverless, defaults.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+        try std.testing.expect(!defaults.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
     }
     for ([_]bool{ false, true }) |enabled| {
         const bytes = try std.json.Stringify.valueAlloc(a, .{ .lake_indexes = .{ .query_cursors = .{ .background_warming = enabled } } }, .{});
@@ -4078,6 +4085,10 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":3600001}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_cuts\":4097}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_bytes\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_native_warm_bytes\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
 }

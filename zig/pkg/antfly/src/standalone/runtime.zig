@@ -12885,6 +12885,9 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
             // The background driver can advance the same durable intent
             // between work selection and its revision-fenced acknowledgement.
             // Retry from fresh work, exactly as the production driver does.
+            // Prepared-owner lease admission can also yield to concurrent
+            // maintenance without changing this durable publication decision.
+            error.StorageOwnerAdmissionPending,
             error.ForeignKeyParentSchemaPending,
             error.GenerationAdmissionPending,
             error.IndexBuildPending,

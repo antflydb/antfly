@@ -3110,6 +3110,9 @@ pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut_contract.zig").ReadLease = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
+    native_query_cleanup: @import("native_query_warming.zig").Owner = .{},
+    // Allocate directory iterator buffers only while this owner is sweeping.
+    native_query_collector: ?*@import("native_query_cut_gc.zig").Collector = null,
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -6120,6 +6123,12 @@ pub const DB = struct {
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
         self.native_query_warming.stop(self.backend_runtime);
+        self.native_query_cleanup.stop(self.backend_runtime);
+        if (self.native_query_collector) |collector| {
+            collector.deinit(self.backend_runtime.filesystemIo().?);
+            self.alloc.destroy(collector);
+            self.native_query_collector = null;
+        }
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.clearGraphReplacementManager();
@@ -21292,7 +21301,7 @@ pub const DB = struct {
             const storage = self.primary_lsm_storage orelse native.storage();
             if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
         };
-        try self.admitQueryCut(io, request.id, token);
+        if (publish) try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
         const existed = try snapshotPathExists(io, root);
@@ -21300,7 +21309,7 @@ pub const DB = struct {
         // usable cursors. The parent guard excludes readers of this new root.
         errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
         profile.next("snapshot");
-        _ = self.snapshotInternal(request.id, true, token, self.snapshotMaintenanceDeadline(deadline), null, false, request) catch |err| {
+        if (!(publish and !existed and try self.cloneWarmQueryCut(io, root, request, token))) _ = self.snapshotInternal(request.id, true, token, self.snapshotMaintenanceDeadline(deadline), null, false, request) catch |err| {
             try token.check();
             return switch (err) {
                 error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported, error.BackupSealBackendUnsupported => error.UnsupportedQueryRequest,
@@ -21309,92 +21318,153 @@ pub const DB = struct {
                 else => err,
             };
         };
+        if (!publish) {
+            // This marker is local ownership metadata, outside the immutable
+            // file inventory. Promotion never copies it into a cursor binding.
+            const backup = @import("native_backup.zig");
+            const marker = try std.fs.path.join(self.alloc, &.{ root, ".local-warm" });
+            defer self.alloc.free(marker);
+            _ = try backup.writeFileDurable(io, marker, "1");
+            try fs_paths.syncDirPortable(io, root);
+        }
         profile.next("repository_publication");
-        try self.admitQueryCut(io, request.id, token);
+        if (publish) try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
                 self.rememberNativeQueryCut(request, proof);
             }
         };
     }
+    fn collectNativeQueryCaches(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+        const self: *DB = @ptrCast(@alignCast(raw));
+        const io = self.backend_runtime.filesystemIo() orelse return true;
+        if (self.native_query_collector == null) {
+            const path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins", .{self.core.path});
+            defer self.alloc.free(path);
+            std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return true,
+                else => return err,
+            };
+            const collector = try self.alloc.create(@import("native_query_cut_gc.zig").Collector);
+            collector.* = .{ .a = self.alloc };
+            self.native_query_collector = collector;
+        }
+        const collector = self.native_query_collector.?;
+        const complete = try collector.step(io, self.core.path, @import("native_query_cut.zig").nowMs(), 64, cancellation);
+        if (complete) {
+            collector.deinit(io);
+            self.alloc.destroy(collector);
+            self.native_query_collector = null;
+        }
+        return complete;
+    }
+    /// One local speculative slot, independently budgeted and never uploaded.
+    /// A foreground capture promotes its immutable files into its own binding.
     fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
         const self: *DB = @ptrCast(@alignCast(raw));
         const cut = @import("native_query_cut.zig");
+        const warming = @import("native_query_warming.zig");
         const repository = self.backend_runtime.query_cut_repository orelse return true;
         const io = self.backend_runtime.filesystemIo() orelse return true;
         const now = cut.nowMs();
-        const state_path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins/.warming.json", .{self.core.path});
-        defer self.alloc.free(state_path);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const state_path = try std.fmt.allocPrint(a, "{s}.query-pins/.warming.json", .{self.core.path});
+        var state = try warming.readState(a, io, state_path);
+        {
+            var guard = try cut.lock(a, io, self.core.path, cancellation);
+            defer guard.deinit();
+            if (state) |value| {
+                const old_root = try cut.pathAlloc(a, self.core.path, value.request.id);
+                reuse: {
+                    if (value.local_only and value.complete) {
+                        const current = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
+                        if (value.source_digest) |previous| if (std.mem.eql(u8, &previous, &current)) {
+                            if (value.bytes > repository.warming_max_bytes) {
+                                try cut.discardStatement(a, io, self.core.path, value.request.id);
+                                return true;
+                            }
+                            if (try snapshotPathExists(io, old_root)) {
+                                if (value.request.expires_ms <= now +| 60_000) {
+                                    var renewed = value;
+                                    renewed.request.expires_ms = now +| warming.ttl_ms;
+                                    cut.renewWarm(a, io, old_root, value.request, renewed.request, self.core.identity_namespace, cancellation) catch |err| switch (err) {
+                                        error.FileNotFound, error.CatalogGenerationChanged => break :reuse,
+                                        else => return err,
+                                    };
+                                    try warming.writeState(a, io, state_path, renewed);
+                                }
+                                return true;
+                            }
+                        };
+                    }
+                }
+                // Old durable warm roots are caches too. Never remove one
+                // behind an active lease, including during legacy recovery.
+                cut.discardStatement(a, io, self.core.path, value.request.id) catch |err| switch (err) {
+                    error.QueryCandidateBudgetExceeded => return false,
+                    else => return err,
+                };
+                state = null;
+            }
+        }
+        // A deterministic private slot also bounds interrupted captures whose
+        // hint write never committed. Foreground IDs remain random bindings.
+        var slot_digest: [32]u8 = undefined;
+        const slot = try std.json.Stringify.valueAlloc(a, .{ "native-local-warm-v1", self.core.path, self.core.identity_namespace }, .{});
+        std.crypto.hash.Blake3.hash(slot, &slot_digest, .{});
+        const id = std.fmt.bytesToHex(slot_digest, .lower);
+        {
+            var guard = try cut.lock(a, io, self.core.path, cancellation);
+            defer guard.deinit();
+            try cut.discardStatement(a, io, self.core.path, &id);
+        }
+        const request: cut.Request = .{ .id = &id, .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| warming.ttl_ms, .create = true, .timeout_ms = 2000 };
+        try self.captureQueryCutInternal(request, cancellation, false);
+        var guard = try cut.lock(a, io, self.core.path, cancellation);
+        defer guard.deinit();
+        const root = try cut.pathAlloc(a, self.core.path, request.id);
+        errdefer cut.discardStatement(a, io, self.core.path, request.id) catch {};
+        const bytes = try @import("native_backup.zig").readFileAlloc(a, io, try std.fs.path.join(a, &.{ root, "query-cut.json" }), @import("native_backup.zig").max_manifest_bytes);
+        const manifest = try std.json.parseFromSliceLeaky(cut.Manifest, a, bytes, .{});
+        var size: u64 = 0;
+        for (manifest.files) |file| size = std.math.add(u64, size, file.size) catch return error.QueryCandidateBudgetExceeded;
+        const digest = try cut.validateWithSourceProof(a, io, root, request, self.core.identity_namespace, cancellation);
+        try warming.writeState(a, io, state_path, .{ .local_only = true, .request = request, .sequence = manifest.sequence, .complete = true, .source_digest = digest, .bytes = size });
+        if (size > repository.warming_max_bytes) try cut.discardStatement(a, io, self.core.path, request.id);
+        return true;
+    }
+    /// Called with the query-pin guard held. The warm hint must match the
+    /// current fenced source and selected indexes before any file is promoted.
+    fn cloneWarmQueryCut(self: *DB, io: std.Io, root: []const u8, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
+        // The local slot contains every managed projection, so it also
+        // satisfies a foreground request selecting a subset of those indexes.
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const warming = @import("native_query_warming.zig");
-        var state = try warming.readState(a, io, state_path);
-        const sequence = self.core.nextDerivedSequence();
-        if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
-            state = null;
+        const cut = @import("native_query_cut.zig");
+        const state_path = try std.fmt.allocPrint(a, "{s}.query-pins/.warming.json", .{self.core.path});
+        const state = (try warming.readState(a, io, state_path)) orelse return false;
+        if (!state.local_only or !state.complete or state.request.table_id != request.table_id or state.request.expires_ms <= cut.nowMs()) return false;
+        const digest = state.source_digest orelse return false;
+        const current = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
+        if (!std.mem.eql(u8, &digest, &current)) return false;
+        const source = try cut.pathAlloc(a, self.core.path, state.request.id);
+        if (!try snapshotPathExists(io, source)) return false;
+        cut.clone(a, io, source, root, state.request, request, self.core.identity_namespace, cancellation) catch |err| switch (err) {
+            error.FileNotFound, error.CatalogGenerationChanged => {
+                cut.discardStatement(a, io, self.core.path, state.request.id) catch |cleanup_err| switch (cleanup_err) {
+                    error.QueryCandidateBudgetExceeded => return false,
+                    else => return cleanup_err,
+                };
+                std.Io.Dir.cwd().deleteFile(io, state_path) catch {};
+                return false;
+            },
+            else => return err,
         };
-        if (state) |value| if (value.complete and value.sequence == sequence) {
-            if (value.source_digest) |previous| {
-                // The query-pin guard also owns initialization of the local
-                // digest epoch; foreground captures use the same guard.
-                const renewal: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 2 * std.time.ns_per_s };
-                var guard = try cut.lock(self.alloc, io, self.core.path, renewal.token());
-                defer guard.deinit();
-                const current = (try self.nativeQueryReuseDigest(renewal.token())) orelse return false;
-                if (std.mem.eql(u8, &previous, &current)) {
-                    if (value.request.expires_ms > now +| 120_000) return true;
-                    var nonce: [32]u8 = undefined;
-                    try io.randomSecure(&nonce);
-                    const id = std.fmt.bytesToHex(nonce, .lower);
-                    const request: cut.Request = .{ .id = &id, .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 };
-                    if (try self.tryReuseNativeQueryCut(io, request, renewal.token())) {
-                        state.?.request = request;
-                        state.?.next_ms = now +| 60_000;
-                        try warming.writeState(a, io, state_path, state.?);
-                        return true;
-                    }
-                    // Never recapture an unchanged corpus on an expired
-                    // optional hint alone. Foreground capture can re-establish
-                    // a missing proof; a later tick can renew that live basis.
-                    return true;
-                }
-            } else if (value.next_ms > now) return true;
-        };
-        if (state == null or state.?.complete or state.?.request.expires_ms <= now +| 15000) {
-            // Keep one private warm cut; it never consumes all foreground cut
-            // capacity. Completed cuts are discarded after publishing hints.
-            if (state) |value| {
-                var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
-                defer guard.deinit();
-                try std.Io.Dir.cwd().deleteTree(io, try cut.pathAlloc(a, self.core.path, value.request.id));
-            }
-            var nonce: [32]u8 = undefined;
-            try io.randomSecure(&nonce);
-            const id = std.fmt.bytesToHex(nonce, .lower);
-            state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
-            // The parent directory is created by capture; persist only once
-            // the coherent local generation is sealed.
-            try self.captureQueryCutInternal(state.?.request, cancellation, false);
-            try warming.writeState(a, io, state_path, state.?);
-        }
-        const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
-        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
-        const warmed = try repository.warmReusable(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
-        const completed = warmed.complete;
-        if (completed) {
-            // Preserve the digest of the captured cut, not a later live read:
-            // writes may have resumed while publication was in progress.
-            state.?.source_digest = try cut.validateWithSourceProof(a, io, root, state.?.request, self.core.identity_namespace, control.token());
-            state.?.complete = true;
-            state.?.next_ms = now +| 60000;
-            try warming.writeState(a, io, state_path, state.?);
-            var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
-            defer guard.deinit();
-            if (warmed.proof) |proof| self.rememberNativeQueryCut(state.?.request, proof);
-            try std.Io.Dir.cwd().deleteTree(io, root);
-        }
-        return completed;
+        return true;
     }
 
     fn copyQueryCutRowPolicyAuthority(self: *const DB, readonly: *DB) !void {
@@ -34825,9 +34895,11 @@ pub const DB = struct {
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         if (comptime !builtin.is_test and (builtin.single_threaded or builtin.os.tag == .freestanding)) return;
         if (!builtin.is_test and (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer)) return;
+        if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm)
+            self.native_query_cleanup.start(.{ .name = "native query cache cleanup", .ptr = self, .runtime = self.backend_runtime, .turn = collectNativeQueryCaches });
         if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm and
             self.core.identity_namespace.table_id != 0 and self.backend_runtime.query_cut_repository != null and
-            self.backend_runtime.query_cut_repository.?.vtable.warm != null and self.backend_runtime.query_cut_repository.?.limits.max_cuts > 1)
+            self.backend_runtime.query_cut_repository.?.warming_enabled)
             self.native_query_warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
         self.quarantine_recovery.start(.{
             .ptr = self,
@@ -74812,7 +74884,7 @@ test "db native checkpoint discovery probes a repository once before capture" {
     try std.testing.expectEqual(@as(usize, 2), fixture.publications);
 }
 
-test "db native checkpoint warming skips unchanged expired cuts and resumes on content changes" {
+test "db native checkpoint warming keeps one local slot and promotes only requested cursors" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const cut = @import("native_query_cut.zig");
@@ -74824,12 +74896,11 @@ test "db native checkpoint warming skips unchanged expired cuts and resumes on c
         fn unexpected(_: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
             return error.TestUnexpectedResult;
         }
-        fn warm(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: types.CancellationToken, _: u64) !bool {
+        fn publish(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: types.CancellationToken) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var receiver = try executor.receive();
             try cut.validate(std.testing.allocator, receiver.io(), root, request, namespace, cancellation);
             self.calls += 1;
-            return true;
         }
     };
     var fixture: Fixture = .{};
@@ -74861,37 +74932,68 @@ test "db native checkpoint warming skips unchanged expired cuts and resumes on c
     defer db.close();
     const previous_repository = db.backend_runtime.query_cut_repository;
     defer db.backend_runtime.query_cut_repository = previous_repository;
-    db.backend_runtime.query_cut_repository = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.unexpected, .recover = Fixture.unexpected, .warm = Fixture.warm } };
+    db.backend_runtime.query_cut_repository = .{ .warming_enabled = true, .ptr = &fixture, .vtable = &.{ .publish = Fixture.publish, .recover = Fixture.unexpected } };
+    db.backend_runtime.query_cut_repository.?.limits.max_cuts = 1;
     try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\",\"embedding\":[1,0]}" }}, .sync_level = .full_index });
     try db.runUntilIdle();
     try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var state = (try warming.readState(arena.allocator(), io, state_path)).?;
-    try std.testing.expect(state.source_digest != null);
-    const sequence = db.core.nextDerivedSequence();
-    // Simulate many elapsed ticks and expiry without wall-clock sleeps. A cut
-    // is optional warming, so expiry alone must never force a new snapshot.
-    state.next_ms = 0;
-    state.request.expires_ms = 1;
-    try warming.writeState(a, io, state_path, state);
+    const scratch = arena.allocator();
+    const first = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expect(first.local_only and first.complete and first.source_digest != null);
+    const warm_root = try cut.pathAlloc(scratch, path, first.request.id);
+    try std.Io.Dir.cwd().access(io, warm_root, .{});
     for (0..8) |_| try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    const same = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expectEqualStrings(first.request.id, same.request.id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    // Renew unchanged expired local metadata without publishing anything. A
+    // torn hint/manifest renewal is disposable and must self-heal on retry.
+    var expired = same;
+    expired.request.expires_ms = 1;
+    try cut.renewWarm(a, io, warm_root, same.request, expired.request, db.core.identity_namespace, .none);
+    try warming.writeState(a, io, state_path, expired);
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    const renewed = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expect(renewed.request.expires_ms > cut.nowMs());
+    try warming.writeState(a, io, state_path, expired); // manifest is newer
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    // Foreground promotion creates an independent authority with the requested
+    // expiry, without any speculative provider publication.
+    const request: cut.Request = .{ .id = &@as([64]u8, @splat('f')), .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    var reader = try db.openQueryCut(request, .none);
+    defer reader.close();
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
-    // Same-watermark changes must invalidate warming as they invalidate query
-    // reuse. Checking only the source sequence would miss this revision.
-    _ = db.core.store.query_generation_revision.fetchAdd(1, .acq_rel);
-    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    const promoted_root = try cut.pathAlloc(scratch, path, request.id);
+    const backup = @import("native_backup.zig");
+    const old_bytes = try backup.readFileAlloc(scratch, io, try std.fs.path.join(scratch, &.{ warm_root, "query-cut.json" }), backup.max_manifest_bytes);
+    const new_bytes = try backup.readFileAlloc(scratch, io, try std.fs.path.join(scratch, &.{ promoted_root, "query-cut.json" }), backup.max_manifest_bytes);
+    const old_manifest = try std.json.parseFromSliceLeaky(cut.Manifest, scratch, old_bytes, .{});
+    const new_manifest = try std.json.parseFromSliceLeaky(cut.Manifest, scratch, new_bytes, .{});
+    try std.testing.expectEqual(request.expires_ms, new_manifest.request.expires_ms);
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(scratch, old_manifest.files, .{}), try std.json.Stringify.valueAlloc(scratch, new_manifest.files, .{}));
+    // Changes replace the optional slot without invalidating an issued reader.
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"updated\",\"embedding\":[0,1]}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
     try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
-    // A different owner epoch also invalidates a persisted completed hint.
+    const replaced = (try warming.readState(scratch, io, state_path)).?;
+    try std.testing.expectEqualStrings(first.request.id, replaced.request.id);
+    try std.testing.expect(replaced.sequence != first.sequence);
+    const original = (try reader.get(a, "doc")).?;
+    defer a.free(original);
+    try std.testing.expect(std.mem.indexOf(u8, original, "original") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    // Reopening an owner invalidates its optional digest, and a tiny optional
+    // budget cannot evict the foreground generation or publish remote bytes.
     db.local_execution.native_query_reuse_epoch_ready = false;
+    db.backend_runtime.query_cut_repository.?.warming_max_bytes = 1;
     try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
-    try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+    try std.Io.Dir.cwd().access(io, promoted_root, .{});
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 test "db index catalog barrier disables published dense fast path" {

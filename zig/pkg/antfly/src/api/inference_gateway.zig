@@ -1275,6 +1275,28 @@ fn generationAdapterSupportsImages(provider: generating.Provider) bool {
     };
 }
 
+test "httpx inference gateway rejects oversized Apple generation overrides before invocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = generating.GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
+    for ([_]i64{ 0, @as(i64, std.math.maxInt(i32)) + 1, @as(i64, 1) << 60, std.math.maxInt(i64) }) |budget| {
+        const request_json = try std.fmt.allocPrint(a, "{{\"model\":\"generators/apple\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"max_tokens\":{d}}}", .{budget});
+        const request = try std.json.parseFromSliceLeaky(Json, a, request_json, .{});
+        if (budget == 0) {
+            try std.testing.expectError(error.InvalidInferenceRequest, prepareGeneration(a, cfg, request, "generate"));
+        } else {
+            try std.testing.expectError(error.InvalidGeneratorConfig, prepareGeneration(a, cfg, request, "generate"));
+        }
+    }
+    for ([_]i64{ 1, std.math.maxInt(i32) }) |budget| {
+        const request_json = try std.fmt.allocPrint(a, "{{\"model\":\"generators/apple\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"max_tokens\":{d}}}", .{budget});
+        const request = try std.json.parseFromSliceLeaky(Json, a, request_json, .{});
+        const prepared = try prepareGeneration(a, cfg, request, "generate");
+        try std.testing.expectEqual(budget, prepared.config.max_tokens);
+    }
+}
+
 test "httpx inference gateway image admission is independent of streaming and model names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
