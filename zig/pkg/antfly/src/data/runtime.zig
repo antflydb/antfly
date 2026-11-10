@@ -48056,7 +48056,10 @@ fn implementationTests() type {
             server.data_raft = null;
             try server.runGraphEndpointCleanupRound();
             const version = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
+            // Main's neutral cleanup semantics require the newer decoder even
+            // when the generation-planned command shape itself predates it.
+            const cleanup = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
+            try std.testing.expectEqual(cleanup, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
             try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"hub"} }));
         }
 

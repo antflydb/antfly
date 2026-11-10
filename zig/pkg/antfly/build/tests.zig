@@ -2873,7 +2873,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const leann_replication_runtime_tests = b.addTest(.{
         .root_module = data_implementation_module,
-        .filters = &.{ "leann replication round", "leann dense artifact format admission", "raft proposal preserves isolated catalog admission", "raft proposal preserves guarded graph cleanup", "raft cleanup protocol preflight" },
+        .filters = &.{ "leann replication round", "leann dense artifact format admission", "raft proposal preserves isolated catalog admission", "raft proposal preserves guarded graph cleanup", "raft cleanup protocol preflight", "graph endpoint cleanup routing worker requires" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const leann_replication_consumer_tests = @import("linked_tests.zig").add(b, .{
