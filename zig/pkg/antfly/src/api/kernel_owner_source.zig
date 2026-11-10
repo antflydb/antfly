@@ -5344,19 +5344,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return summary;
     }
 
+    /// Prepared-owner admission is shared by native and replicated callers.
+    /// Contention and publication fencing yield without prescribing a Raft retry.
     fn acquirePreparedOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !Lease {
         const generation = self.visibleRootGeneration(group_id);
-        if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
+        if (!self.mutex.tryLock()) return error.StorageOwnerAdmissionPending;
         defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.retired or entry.closing or entry.generation != generation or
-                !tryReserveEntryLeaseLocked(entry, .shared)) return error.RaftApplyWriterUnavailable;
+                !tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageOwnerAdmissionPending;
             entry.resident = true;
             entry.transient_retirement_pending = false;
             return .{ .source = self, .entry = entry, .exclusive = false };
         }
-        return error.RaftApplyWriterUnavailable;
+        return error.StorageOwnerAdmissionPending;
     }
 
     fn replicatedBatchGroupLocal(
@@ -5923,7 +5925,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or entry.restore_bootstrap_json.len == 0) continue;
-            if (entry.retired or entry.closing or entry.generation != generation or !tryReserveEntryLeaseLocked(entry, .shared)) return error.RaftApplyWriterUnavailable;
+            if (entry.retired or entry.closing or entry.generation != generation or !tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageOwnerAdmissionPending;
             return .{ .source = self, .entry = entry };
         }
         return null;
@@ -7855,6 +7857,20 @@ const PublicationWaitTest = struct {
     }
 };
 
+test "prepared owner lease admission reports storage contention without Raft" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, ".zig-cache/tmp/unopened-owner-admission", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expectError(error.StorageOwnerAdmissionPending, source.acquirePreparedOwner(1, "docs"));
+    }
+    // A not-yet-prepared owner yields the same admission contract without
+    // opening a database or requiring a Raft runtime on the calling thread.
+    try std.testing.expectError(error.StorageOwnerAdmissionPending, source.acquirePreparedOwner(1, "docs"));
+}
+
 test "publication drains existing readers status and maintenance before reopening admission" {
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
@@ -7907,7 +7923,7 @@ test "publication drains existing readers status and maintenance before reopenin
         // With no Entry remaining, the independent gate still excludes open
         // and prepared apply until the publisher completes commit/rollback.
         try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptor(1, "docs", path, descriptor));
-        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.acquirePreparedOwner(1, "docs"));
+        try std.testing.expectError(error.StorageOwnerAdmissionPending, source.acquirePreparedOwner(1, "docs"));
         try std.testing.expectError(error.StorageBusy, source.snapshotSource().beginPublication(.{
             .io = wait.io(&vtable),
             .group_id = 1,

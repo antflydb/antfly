@@ -5592,7 +5592,7 @@ pub const ApiHttpServer = struct {
         };
         self.advanceFkGenerationPublicationBackgroundOnce() catch |err| switch (err) {
             error.UnsupportedOperation,
-            error.RaftApplyWriterUnavailable,
+            error.StorageOwnerAdmissionPending,
             error.GenerationPublicationChanged,
             error.InvalidGenerationPublication,
             error.MetadataMutationOutcomeUnknown,
@@ -5605,7 +5605,7 @@ pub const ApiHttpServer = struct {
         };
         self.advanceFkInitialCreateBackgroundOnce() catch |err| switch (err) {
             error.UnsupportedOperation,
-            error.RaftApplyWriterUnavailable,
+            error.StorageOwnerAdmissionPending,
             error.GenerationAdmissionPending,
             error.TopologyChanged,
             error.InitialChildPublicationChanged,
@@ -23574,7 +23574,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
-            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
+            error.StorageBusy, error.StorageOwnerAdmissionPending, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
