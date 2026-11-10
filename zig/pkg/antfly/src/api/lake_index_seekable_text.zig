@@ -92,6 +92,7 @@ pub const Read = struct {
     context: local.serverless_query_lake_read_context.Context,
     cancellation: Cancellation,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
+    allow_pack_read_ahead: bool = true,
     fn check(self: Read) !void {
         try self.context.ensureActive();
         if (self.cache) |cached| try cached.context.ensureActive();
@@ -1406,7 +1407,19 @@ const Owner = struct {
             if (self.cancelled.load(.acquire)) return error.Canceled;
             // Required broad reads coalesce ranges themselves; speculative
             // per-page GETs would duplicate that provider request.
-            try self.owner.read(self.capability.*, offset, out);
+            var capability = self.capability.*;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            for (self.offsets, self.lengths) |pending_offset, length| if (pending_offset) |position| {
+                if (out.len != 0 and position < offset +| out.len and offset < position +| length) {
+                    // Reuse the bounded physical flight already in progress.
+                    // A whole-pack read-ahead here would issue a second,
+                    // larger GET for the same header/payload dependency.
+                    capability.allow_pack_read_ahead = false;
+                    break;
+                }
+            };
+            self.mutex.unlock();
+            try self.owner.read(capability, offset, out);
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             if (out.len != 0) {
@@ -1616,7 +1629,7 @@ const Owner = struct {
                         if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
                         length += @intCast(following.ref.byte_len);
                     }
-                    group = .{ .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
+                    group = .{ .planned = !capability.allow_pack_read_ahead, .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
                 };
             }
             var piece_cache = capability.cache;
@@ -1988,7 +2001,8 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     const owner: *Owner = @ptrCast(@alignCast(physical.ranges.ptr));
     var cache = local.serverless_query_lake_serving_cache.Cache.init(std.heap.page_allocator);
     defer cache.deinit();
-    var capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } }, .context = .{ .io = std.testing.io }, .cancellation = .none };
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    var capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io, .trace = &trace } }, .context = .{ .io = std.testing.io, .trace = &trace }, .cancellation = .none };
     var source = try Owner.bind(owner, a, &capability);
     var open = true;
     defer if (open) source.close();
@@ -2026,6 +2040,10 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
             var out: [1]u8 = undefined;
             try input.readInto(block_bytes * 3, &out);
             try std.testing.expectEqual(@as(u8, 3), out[0]);
+            // A cold dependency covered by pending speculation must remain a
+            // bounded range read, never an overlapping whole-pack GET.
+            try input.readInto(block_bytes * 8, &out);
+            try std.testing.expectEqual(@as(u8, 8), out[0]);
         }
     };
     var gated: Gated = .{};
@@ -2034,6 +2052,7 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     query.offsets[0] = 0;
     query.lengths[0] = pack_bytes;
     try gated.started.wait(std.testing.io);
+    const before_required_bytes = cache.stats.provider_bytes;
     var required = try std.testing.io.concurrent(Gated.required, .{ &gated, &source });
     var required_open = true;
     defer {
@@ -2048,7 +2067,12 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     try completed;
     try ready;
     try std.testing.expect(remained_speculative);
+    try std.testing.expectEqual(@as(u64, block_bytes), cache.stats.provider_bytes - before_required_bytes);
     query.drain(false);
+    // Keep the failure fixture on its original required-range path; the
+    // transfer-amplification assertion above deliberately enabled read-ahead.
+    capability.cache.?.context.trace = null;
+    capability.context.trace = null;
     // Speculative failures remain invisible until that block is required.
     const Denied = struct {
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {

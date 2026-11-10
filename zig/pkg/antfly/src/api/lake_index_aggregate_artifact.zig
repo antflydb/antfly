@@ -183,6 +183,7 @@ pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cance
         const digest = try stores.sha256DigestFromChecksum(ref.checksum);
         var lease = try cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
         errdefer lease.deinit();
+        if (cache.locator) |hook| try hook.record(hook.ptr, ref);
         if (cache.capture) |capture| try capture.record(capture.ptr, ref.artifact_id, digest, lease.bytes());
         return lease;
     }
@@ -3239,4 +3240,12 @@ test "external lake independent source opening capture records physical selector
     try std.testing.expectEqual(@as(usize, 2), captured.physical);
     try std.testing.expectEqual(@as(usize, 2), captured.synthetic);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.provider_reads);
+    var leased = cached;
+    leased.capture = null;
+    for (0..2) |_| {
+        var held = try readArtifactLease(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, leased);
+        held.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 4), captured.physical);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
 }

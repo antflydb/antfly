@@ -4192,6 +4192,8 @@ pub const ApiHttpServer = struct {
     lake_retained_payloads: @import("lake_retained_cut.zig").Cache = .{ .max_entries = 512, .budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 } },
     lake_recent_text: @import("lake_recent_text_cache.zig").Cache = .{},
     lake_wal_cuts: @import("lake_wal_cut_cache.zig").Cache = .{},
+    lake_scheduled_maintenance_mutex: std.atomic.Mutex = .unlocked,
+    lake_scheduled_maintenance_tables: [32]?u64 = @splat(null),
     lake_wal_collectors: @import("lake_wal_collectors.zig").Registry = .{},
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
@@ -17478,6 +17480,7 @@ pub const ApiHttpServer = struct {
         }) catch |err| {
             std.log.debug("native lake serving cut recovery deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
+        const writable = if (schema.external_base_source) |source| source.binding.write_policy == .iceberg_writer else false;
         var ingested = false;
         if (schema.external_base_source) |source_binding| {
             if (source_binding.binding.write_policy == .iceberg_writer and self.cfg.node_config != null) {
@@ -17498,12 +17501,6 @@ pub const ApiHttpServer = struct {
                     if (err != error.ExternalLakeIndexNotPublished and err != error.IndexRebuilding) std.log.warn("native lake recent vector work deferred table={s} err={s}", .{ table.name, @errorName(err) });
                 };
                 ingested = try @import("../serverless/lake_ingestion.zig").drain(std.heap.smp_allocator, source_binding.binding, ingest_options, context);
-                // Maintenance failures never block draining or publication.
-                const maintained = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, self, table, source_binding.binding, ingest_options, context) catch |err| failed: {
-                    std.log.warn("native lake maintenance deferred table={s} err={s}", .{ table.name, @errorName(err) });
-                    break :failed false;
-                };
-                ingested = ingested or maintained;
             }
         }
         const has_rows = if (schema.relational_indexes) |indexes| indexes.value.len != 0 else false;
@@ -17511,6 +17508,7 @@ pub const ApiHttpServer = struct {
             var state = try local.metadata_lake_index_catalog.parse(std.heap.page_allocator, table.lake_index_catalog_json);
             defer state.deinit();
             if (state.value.pending == null and state.value.published == null and state.value.failure == null) {
+                if (writable) self.scheduleLakeMaintenance(table.table_id);
                 if (ingested) return error.LakeIndexBuildInProgress;
                 return;
             }
@@ -17519,6 +17517,7 @@ pub const ApiHttpServer = struct {
             var replacement = table;
             replacement.lake_index_catalog_json = cleared;
             _ = try self.source.replaceTableDefinitionStamped(table, replacement);
+            if (writable) self.scheduleLakeMaintenance(table.table_id);
             return;
         }
         const config = self.cfg.node_config;
@@ -17562,14 +17561,9 @@ pub const ApiHttpServer = struct {
         var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
         try self.retainLakeQueryStore(a, &store, table.table_id, .{ .deadline_ns = context.deadline_ns, .cancellation = cancel });
-        @import("lake_recent_vectors.zig").collect(&store, table.table_id, context) catch |err| {
-            std.log.warn("native recent vector collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
-        };
-        var retained_artifacts = store.artifactStore();
-        @import("lake_retained_cut.zig").collect(&retained_artifacts, 0, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch {};
-        @import("lake_retained_cut.zig").collect(&retained_artifacts, table.table_id, store.identity, platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch |err| {
-            std.log.warn("native retained search cut collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
-        };
+        // Retained cuts and recent-vector jobs belong to the bounded durable
+        // query collector. Never scan their namespaces under publication's
+        // serialized installation worker.
         const options = try @import("lake_source_owner.zig").options(a, self, table, .{ .deadline_ns = context.deadline_ns, .cancellation = .{ .ptr = self, .is_cancelled_fn = cancel.is_cancelled_fn } });
         try self.prepareLakeCache();
         const source_options = options.lakeOptions();
@@ -17601,7 +17595,103 @@ pub const ApiHttpServer = struct {
         @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
             std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
+        if (writable) self.scheduleLakeMaintenance(table.table_id);
         if (ingested) return error.LakeIndexBuildInProgress;
+    }
+
+    /// Maintenance has independent admission and durable provider-side CAS
+    /// ownership. Its I/O must never occupy the publication reconciler.
+    const LakeScheduledMaintenanceWork = struct {
+        server: *ApiHttpServer,
+        table_id: u64,
+        slot: usize,
+        released: bool = false,
+        fn release(self: *@This()) void {
+            if (self.released) return;
+            self.released = true;
+            platform_sync.lockYielding(&self.server.lake_scheduled_maintenance_mutex);
+            defer self.server.lake_scheduled_maintenance_mutex.unlock();
+            std.debug.assert(self.server.lake_scheduled_maintenance_tables[self.slot] == self.table_id);
+            self.server.lake_scheduled_maintenance_tables[self.slot] = null;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));
+            return server.index_installation_closing.load(.acquire);
+        }
+        fn run(raw: *anyopaque) !void {
+            const work: *@This() = @ptrCast(@alignCast(raw));
+            const server = work.server;
+            if (!server.mutationBackgroundExecutionPermitted() or canceled(server)) return;
+            const local = @import("antfly_local_sources");
+            const request: local.api_operation.RequestContext = .{
+                .deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s,
+                .cancellation = .{ .ptr = server, .is_cancelled_fn = canceled },
+            };
+            var snapshot = (try server.source.linearizableSnapshot(request)) orelse return;
+            defer server.source.freeAdminSnapshot(&snapshot);
+            // Resolve by incarnation, not a borrowed name that DROP/CREATE can
+            // reuse while this job waits in the cleanup queue.
+            const table = for (snapshot.tables) |*candidate| {
+                if (candidate.table_id == work.table_id) break candidate;
+            } else return;
+            var schema = try schema_mod.parseValidatedTableSchema(std.heap.smp_allocator, table.schema_json);
+            defer schema.deinit(std.heap.smp_allocator);
+            const source = schema.external_base_source orelse return;
+            if (source.binding.write_policy != .iceberg_writer or server.cfg.node_config == null) return;
+            const options = try @import("lake_source_owner.zig").options(std.heap.smp_allocator, server, table.*, request);
+            const context: local.serverless_query_lake_read_context.Context = .{
+                .io = server.embedding_provider_runtime.io,
+                .deadline_ns = request.deadline_ns,
+                .cancellation = .{ .ptr = server, .is_cancelled_fn = canceled },
+            };
+            const changed = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, server, table.*, source.binding, options, context) catch |err| {
+                if (err != error.Canceled and err != error.DeadlineExceeded)
+                    std.log.warn("native lake maintenance deferred table={s} err={s}", .{ table.name, @errorName(err) });
+                return;
+            };
+            // Release admission before enqueueing the next publication pass;
+            // otherwise a fast reconciler can drop the maintenance continuation
+            // while this completed job still holds its in-flight bit.
+            work.release();
+            // Supersede a publication pass that may still be completing;
+            // a coalesced read-side hint could be removed by its old generation.
+            if (changed and !canceled(server)) try server.notifyLakeCommit(table.name);
+        }
+        fn deinit(raw: *anyopaque) void {
+            const work: *@This() = @ptrCast(@alignCast(raw));
+            work.release();
+            std.heap.page_allocator.destroy(work);
+        }
+    };
+    fn scheduleLakeMaintenance(self: *ApiHttpServer, table_id: u64) void {
+        if (self.cfg.node_config == null or self.index_installation_closing.load(.acquire) or !self.mutationBackgroundExecutionPermitted()) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.lake_gc_owner_id == 0) return;
+        platform_sync.lockYielding(&self.lake_scheduled_maintenance_mutex);
+        var free: ?usize = null;
+        for (self.lake_scheduled_maintenance_tables, 0..) |table, i| {
+            if (table == table_id) {
+                self.lake_scheduled_maintenance_mutex.unlock();
+                return;
+            }
+            if (table == null and free == null) free = i;
+        }
+        const slot = free orelse {
+            self.lake_scheduled_maintenance_mutex.unlock();
+            return;
+        };
+        const work = std.heap.page_allocator.create(LakeScheduledMaintenanceWork) catch {
+            self.lake_scheduled_maintenance_mutex.unlock();
+            return;
+        };
+        self.lake_scheduled_maintenance_tables[slot] = table_id;
+        self.lake_scheduled_maintenance_mutex.unlock();
+        work.* = .{ .server = self, .table_id = table_id, .slot = slot };
+        // Share the existing cleanup owner: server shutdown closes this owner
+        // and joins/deinitializes all of its admitted work before freeing us.
+        runtime.durable_jobs.submit(.{ .owner_id = self.lake_gc_owner_id, .class = .cleanup, .ptr = work, .run = LakeScheduledMaintenanceWork.run, .deinit = LakeScheduledMaintenanceWork.deinit }) catch {
+            LakeScheduledMaintenanceWork.deinit(work);
+        };
     }
 
     fn completeIndexInstallation(self: *ApiHttpServer, generation: u64) void {
@@ -60730,6 +60820,62 @@ test "resolver curation HTTP routing carries deadlines and in-flight cancellatio
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
 
+test "external lake scheduled maintenance runs outside publication and coalesces ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        entered: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try request.ensureActive();
+            try std.testing.expect(request.deadline_ns != null);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            self.entered.set(std.testing.io);
+            try self.proceed.wait(std.testing.io);
+            // A table dropped while queued is a no-op under fresh authority.
+            return null;
+        }
+    };
+    var fixture: Fixture = .{};
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var server = ApiHttpServer.init(a, .{ .backend_runtime = &runtime, .node_config = &config, .deployment_mode = .standalone, .lake_artifact_gc_enabled = false }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .linearizable_snapshot = Fixture.snapshot } }, null, null);
+    defer server.deinit();
+    defer fixture.proceed.set(io);
+    // A parked cleanup worker must neither acquire nor retain publication's
+    // installation mutex, and repeated triggers share one admitted owner.
+    platform_sync.lockYielding(&server.index_installation_apply_mutex);
+    {
+        defer server.index_installation_apply_mutex.unlock();
+        server.scheduleLakeMaintenance(7);
+        try fixture.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+        server.scheduleLakeMaintenance(7);
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+    }
+    fixture.proceed.set(io);
+    runtime.durable_jobs.drainOwner(server.lake_gc_owner_id);
+    for (server.lake_scheduled_maintenance_tables) |table| try std.testing.expect(table == null);
+    // A completed job releases before issuing its continuation. Its eventual
+    // deinit cannot clear a slot subsequently claimed by another generation.
+    server.lake_scheduled_maintenance_tables[0] = 7;
+    var completed: ApiHttpServer.LakeScheduledMaintenanceWork = .{ .server = &server, .table_id = 7, .slot = 0 };
+    completed.release();
+    server.lake_scheduled_maintenance_tables[0] = 8;
+    completed.release();
+    try std.testing.expectEqual(@as(?u64, 8), server.lake_scheduled_maintenance_tables[0]);
+    server.lake_scheduled_maintenance_tables[0] = null;
+    runtime.durable_jobs.closeOwner(server.lake_gc_owner_id);
+    server.scheduleLakeMaintenance(9);
+    for (server.lake_scheduled_maintenance_tables) |table| try std.testing.expect(table == null);
+}
+
 test "external lake read refresh hints coalesce without superseding active publication work" {
     const a = std.testing.allocator;
     var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
@@ -60764,6 +60910,8 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
     try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
+    server.completeIndexInstallation(generation);
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
 }
 
 test "native memory background selection isolates revoked execution bindings and runs retention cleanup" {

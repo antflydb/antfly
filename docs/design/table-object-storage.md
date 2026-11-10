@@ -541,3 +541,22 @@ engine rather than opening a local DB with different durability semantics.
 See [Native Iceberg catalog authorities](lake-catalogs.md) for managed object-store
 and external REST configuration, durable commit recovery and the boundary between
 Iceberg commits and searchable index publication.
+
+Publication reconciliation does not scan retained-query/recent-vector namespaces;
+the bounded durable query collector owns those categories. Scheduled lake
+maintenance runs after publication on the cleanup executor, with at most 32
+admitted table incarnations per node and one local job per table. Jobs resolve
+fresh table identity, retain the provider scheduler's CAS lease, and requeue
+publication when maintenance changes data or leaves resumable work. Shutdown
+joins the same cleanup owner. Interrupted scheduler completion attempts a
+revision-conditional lease release under an independent two-second deadline;
+CAS conflicts preserve a successor's ownership and transport failures fall back
+to normal lease expiry. Every claim carries a fresh nonce, so identical requests
+claimed in the same millisecond cannot recreate an ETag revision. Collector
+reader grace remains mandatory.
+
+Leased immutable reads capture the same physical selectors as allocated reads.
+When a demand range overlaps this query's pending prefetch, it uses the existing
+bounded physical-flight path instead of initiating speculative whole-pack I/O.
+Warm units still return without joining unrelated speculative work; each decoded
+member retains its own integrity and request-authority checks.

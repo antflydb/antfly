@@ -1232,3 +1232,37 @@ Lite remains `e35df9fdd37c19ddab8aebeafd37f4a0b197d9eed640dbb6e5a32c4184031e9d`.
 All 1,734 versioned objects from the two scoped prefixes were deleted with zero
 remaining, and private credential files were removed. Subsequent source-wave,
 locator-capture and posting-lookahead changes are not measured by these results.
+
+### Source-wave candidate (390239b3f9, November 9)
+
+The optimized build passed 98/98 steps and the 141-function export boundary;
+148 broader tests passed without failures, skips or leaks. Stored-source GCS
+qualification passed with a 3.27 s empty-cache query and 1.70 s restart query.
+The composed trace recorded 22 artifact GETs and five map GETs; archive ranking
+still took 1.67 s and preparation 0.79 s. Source calls now overlap: their summed
+4.16 s exceeds the 3.27 s composed wall time.
+
+The first Parquet run reached a published-visibility timeout. An unchanged-binary
+reproduction passed, including concurrent publication and retained pagination:
+3.88 s empty-cache, 1.07 s restart, 6.93 ms warm median. This does not establish
+that the intermittent publication problem is resolved. The HN regression then
+exposed a restart maintenance failure: an interrupted scheduler claim retained
+its 120 s lease before the collector's separate 60 s reader grace could begin.
+The three scoped GCS attempts deleted 2,600 object versions with zero remaining.
+
+The next fixes target these observed gaps, before another optimized build:
+
+1. Keep retention scans and scheduled maintenance outside publication's worker;
+   run maintenance with independent bounded admission, fresh incarnation checks
+   and existing provider-side CAS ownership. Release interrupted claims with a
+   short conditional cleanup so orderly restart does not strand their leases.
+   Fresh claim nonces also prevent ETag ABA on identical same-millisecond claims.
+2. Capture physical selectors on leased artifact reads as well as allocated
+   reads; retain authoritative map fallback for dependencies without selectors.
+3. Reuse bounded prefetch flights on overlapping demand reads instead of issuing
+   a second whole-pack read. Verify transferred bytes, cancellation and cache-hit
+   behavior, rather than assuming fewer calls means less work.
+4. Qualify the finished candidate against the original GCS paths and HN restart,
+   publication, maintenance and cursor checks. Keep existing timeouts and reader
+   protection. Sub-second cold latency remains unproven; broader archive/payload
+   layout work depends on the resulting trace.

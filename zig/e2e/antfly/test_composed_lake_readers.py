@@ -405,7 +405,10 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                             value.get("code") == "index_rebuilding"
                             and value.get("retryable") is True
                         ), value
-                assert time.monotonic() < deadline, value
+                assert time.monotonic() < deadline, (
+                    f"Query readiness deadline exceeded: {value}\n"
+                    + server.debug_logs()
+                )
                 time.sleep(0.1)
 
         for name, source in (
