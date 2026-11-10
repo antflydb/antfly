@@ -719,3 +719,11 @@ quantization reports `ArtifactRepairRequired` rather than treating a dequantized
 copy as the original vector. Reprocess the embedding producer from its source
 to recreate full artifacts before completing that consumer's backfill. Adding
 a full-vector consumer before elision continues to prevent quantization.
+
+Recovery validates dimensions and finite components before admitting vectors.
+The query's cancellation is composed with the chunk provider's existing control
+on a borrowed invocation-local copy; durable routing, deadlines, and credentials
+remain intact. Parent source sets are indexed across batches, while temporary
+worker chunk state is released after each parent is cloned. Split cleanup pages
+through current and legacy reverse mappings, removes moved document and ordinal
+associations, and remains retryable after graph keys have already been pruned.

@@ -18325,9 +18325,66 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Reverse mappings survive primary range pruning. Use them as the
+    /// retry handle even when range adoption has already removed graph keys.
+    fn pruneLeannSplitMappings(self: *IndexManager, store: *docstore_mod.DocStore, entry: *DenseIndex, split_key: []const u8) !void {
+        var current = try denseMetadataPrefixAlloc(self.alloc, entry.config.name, "vector");
+        defer current.deinit(self.alloc);
+        const legacy = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata__:dense:{s}:vector:", .{entry.config.name});
+        defer self.alloc.free(legacy);
+        const keep = LeannSplitLeft{ .split_key = split_key };
+        for ([_][]const u8{ current.items, legacy }, 0..) |prefix, format| {
+            var after: ?[]u8 = null;
+            defer if (after) |key| self.alloc.free(key);
+            while (true) {
+                const page = try store.scanPrefixPage(self.alloc, prefix, after, 128);
+                defer docstore_mod.DocStore.freeResults(self.alloc, page);
+                if (page.len == 0) break;
+                const next = try self.alloc.dupe(u8, page[page.len - 1].key);
+                errdefer self.alloc.free(next);
+                const has_moved = for (page) |row| {
+                    if (!keep.keep(row.value)) break true;
+                } else false;
+                if (!has_moved) {
+                    if (after) |key| self.alloc.free(key);
+                    after = next;
+                    continue;
+                }
+                const Removed = struct { id: u64, ordinal: ?doc_identity.DocOrdinal };
+                var removed = std.ArrayListUnmanaged(Removed).empty;
+                defer removed.deinit(self.alloc);
+                try removed.ensureTotalCapacity(self.alloc, page.len);
+                var batch = try store.beginWriteBatch();
+                errdefer batch.abort();
+                const txn = batch.asTxn();
+                for (page) |row| {
+                    if (keep.keep(row.value)) continue;
+                    const suffix = row.key[prefix.len..];
+                    const id = if (format == 0) blk: {
+                        if (suffix.len != 8) return error.Corrupted;
+                        break :blk std.mem.readInt(u64, suffix[0..8], .big);
+                    } else try std.fmt.parseInt(u64, suffix, 10);
+                    const ordinal = (try self.lookupDenseVectorOrdinalTxn(txn, entry.config.name, id)) orelse
+                        entry.vector_ordinals.get(id) orelse
+                        try doc_identity.lookupOrdinalTxn(self.alloc, txn, row.value);
+                    try self.clearDenseVectorMappingTxnWithOrdinal(txn, entry.config.name, row.value, id, ordinal);
+                    removed.appendAssumeCapacity(.{ .id = id, .ordinal = ordinal });
+                }
+                try batch.commit();
+                for (removed.items) |item| {
+                    _ = entry.vector_ordinals.remove(item.id);
+                    if (item.ordinal) |ordinal| _ = entry.ordinal_vector_ids.remove(ordinal);
+                }
+                if (after) |key| self.alloc.free(key);
+                after = next;
+            }
+        }
+    }
+
     pub fn pruneDenseSplitRange(self: *IndexManager, store: *docstore_mod.DocStore, split_key: []const u8) !void {
         for (self.dense_indexes.items) |*entry| {
             if (entry.index.leann) |leann_store| {
+                try self.pruneLeannSplitMappings(store, entry, split_key);
                 const left = LeannSplitLeft{ .split_key = split_key };
                 _ = try leann_store.dropKeysWhere(&left, LeannSplitLeft.keep);
                 continue;
@@ -52824,6 +52881,7 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         try std.testing.expect((try entry.index.leann.?.nativeBackupPath()) != null);
     }
 
+    var split_removed_id: u64 = undefined;
     // Reopen: the graph and key map come back from the LEANN file.
     {
         var manager = try IndexManager.init(alloc, path);
@@ -52845,7 +52903,57 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
 
         // A local split keeps only the parent's side (doc:0000..doc:0149,
         // less the deleted doc:0123) and still finds what remains.
+        const moved_id = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[220])).?;
+        split_removed_id = moved_id;
+        const legacy_id = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[221])).?;
+        var long_parent: [1024]u8 = @splat('z');
+        long_parent[100] = 0;
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, &long_parent, "chunks", 0);
+        defer alloc.free(chunk);
+        const orphan_id: u64 = 999999;
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", orphan_id)) == null);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try manager.writeDenseVectorMappingTxnWithOrdinal(&txn, "leann_idx", keys[220], moved_id, null, 777);
+            try manager.writeDenseVectorMappingTxnWithOrdinal(&txn, "leann_idx", keys[221], legacy_id, null, 778);
+            try manager.writeDenseVectorMappingTxnWithOrdinal(&txn, "leann_idx", chunk, orphan_id, null, 779);
+            const old_doc = try legacyDenseDocMappingKey(alloc, "leann_idx", keys[221]);
+            defer alloc.free(old_doc);
+            const old_reverse = try legacyDenseVectorIdMappingKey(alloc, "leann_idx", legacy_id);
+            defer alloc.free(old_reverse);
+            var value: [8]u8 = undefined;
+            std.mem.writeInt(u64, &value, legacy_id, .little);
+            try txn.put(old_doc, &value);
+            try txn.put(old_reverse, keys[221]);
+            const current_reverse = try denseVectorIdMappingKey(alloc, "leann_idx", legacy_id);
+            defer alloc.free(current_reverse);
+            try txn.delete(current_reverse);
+            try txn.commit();
+        }
+        try entry.ordinal_vector_ids.put(alloc, 777, moved_id);
+        try entry.vector_ordinals.put(alloc, moved_id, 777);
+        try entry.ordinal_vector_ids.put(alloc, 778, legacy_id);
+        try entry.vector_ordinals.put(alloc, legacy_id, 778);
+        try entry.ordinal_vector_ids.put(alloc, 779, orphan_id);
+        try entry.vector_ordinals.put(alloc, orphan_id, 779);
+        // Range adoption may already have removed graph keys before retry.
+        const left = IndexManager.LeannSplitLeft{ .split_key = "doc:0150" };
+        _ = try entry.index.leann.?.dropKeysWhere(&left, IndexManager.LeannSplitLeft.keep);
         try manager.pruneDenseSplitRange(&store, "doc:0150");
+        try manager.pruneDenseSplitRange(&store, "doc:0150"); // retry is harmless
+        for ([_]u64{ moved_id, legacy_id, orphan_id }, [_]u32{ 777, 778, 779 }) |id, ordinal| {
+            const key = try denseVectorOrdinalMappingKey(alloc, "leann_idx", id);
+            defer alloc.free(key);
+            try std.testing.expectError(error.NotFound, store.get(alloc, key));
+            try std.testing.expect(!entry.vector_ordinals.contains(id));
+            try std.testing.expect(!entry.ordinal_vector_ids.contains(ordinal));
+        }
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", keys[220])) == null);
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", keys[221])) == null);
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", chunk)) == null);
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", legacy_id)) == null);
+        try manager.syncAll(true);
         try std.testing.expectEqual(@as(u64, 149), entry.index.stats().active_count);
         var after = try entry.index.searchWithRequest(.{ .query = &vectors[220], .k = 10 });
         defer after.deinit();
@@ -52855,6 +52963,19 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
             defer if (kept) |d| alloc.free(d);
             if (kept) |d| try std.testing.expect(std.mem.order(u8, d, "doc:0150") == .lt);
         }
+    }
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "doc:0150" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", split_removed_id)) == null);
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", 999999)) == null);
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", keys[220])) == null);
+        const kept = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[7])).?;
+        const doc = (try manager.lookupDenseDocKey(&store, "leann_idx", kept)).?;
+        defer alloc.free(doc);
+        try std.testing.expectEqualStrings(keys[7], doc);
     }
 }
 
