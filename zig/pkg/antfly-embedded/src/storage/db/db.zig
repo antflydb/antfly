@@ -78152,6 +78152,7 @@ test "db enrichment status changes notify only after atomic publication" {
             runtime.store.vtable = &vtable;
             defer runtime.store.vtable = original_vtable;
             try std.testing.expectError(error.InputOutput, runtime.markAppliedThrough(1));
+            try std.testing.expectError(error.InputOutput, runtime.resumeFrom(0, 0));
             try std.testing.expectEqual(@as(u64, 0), runtime.applied_sequence);
             try std.testing.expect(runtime.worker_failed);
             try std.testing.expectEqual(@as(u64, 0), try enrichment_state.loadAppliedSequence(alloc, runtime.store, "generated"));
