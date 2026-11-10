@@ -2447,6 +2447,8 @@ const LocalStandaloneMetadata = struct {
         pub fn retainedSource(self: @This(), id: u64) !?system_catalog.retained_datasets.Source {
             const table = self.owner.manager.tables.get(id) orelse return null;
             if (table.read_schema_json.len != 0 or table.storage_migration != null) return error.RetainedDatasetSourceNotReady;
+            for (self.owner.systemCatalogState().policy_publications) |publication| if (publication.table_id == id and
+                (publication.phase != .disabled or @import("../system_catalog/storage.zig").policyPublicationNeedsWork(publication))) return error.RowPolicyUnsupported;
             return try system_catalog.retained_datasets.Source.fromTable(self.alloc, table, self.owner.metadata_incarnation orelse return error.InvalidMetadataIncarnation);
         }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {

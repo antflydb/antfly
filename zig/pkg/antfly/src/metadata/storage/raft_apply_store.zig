@@ -12824,6 +12824,7 @@ pub const RaftApplyStore = struct {
         if (request.table_id == 0) return error.InvalidRowPolicyPublication;
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
+        if (try self.retainedSourcePresentTxn(&txn, group_id, request.table_id)) return error.RetainedDatasetSourceInUse;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -12954,6 +12955,7 @@ pub const RaftApplyStore = struct {
         if (previous.revision == parsed.value.expected_revision) {
             switch (parsed.value.change) {
                 .begin => |publication| {
+                    if (try self.retainedSourcePresentTxn(txn, group_id, publication.table_id)) return error.RowPolicyCatalogChanged;
                     if (try backupCohortLocksTableTxn(txn, group_id, publication.table_id) or
                         try restoreStagingLocksTableTxn(txn, group_id, publication.table_id) or
                         try self.fkGenerationTableLockedTxn(txn, group_id, publication.table_id)) return error.RowPolicyCatalogChanged;
@@ -14569,6 +14571,9 @@ pub const RaftApplyStore = struct {
             };
             const table = try decodeTableRecord(self.view.alloc, raw);
             if (table.table_id != id) return error.InvalidCatalogRecord;
+            var policy = try system_catalog_storage.loadPolicyPublication(self.view.alloc, self.view.txn, self.view.group_id, id);
+            defer if (policy) |*value| value.deinit();
+            if (policy) |value| if (value.value.phase != .disabled or system_catalog_storage.policyPublicationNeedsWork(value.value)) return error.RowPolicyUnsupported;
             const fence = try self.store.loadTableTransitionFenceTxn(self.view.txn, self.view.group_id, id);
             if (fence.active() or fence.range_membership.count == 0 or table.read_schema_json.len != 0 or
                 try restoreStagingLocksTableTxn(self.view.txn, self.view.group_id, id) or
@@ -45277,6 +45282,12 @@ test "system catalog retained dependency and maintenance indexes survive restart
     try std.testing.expectError(error.RetainedDatasetSourceInUse, store.captureTableDropProjection(a, group, table.name));
     try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requirePolicyTopologyMutationAllowed(group, table.table_id));
     try std.testing.expectError(error.RetainedDatasetSourceInUse, store.captureTableRestoreAdmission(a, group, table));
+    const policy_revision = (try store.systemCatalogMeta(a, group)).revision;
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.sqlPolicyBeginCommandJson(a, group, .{ .table_id = table.table_id, .enable = true, .expected_revision = policy_revision }));
+    const begin: sql_policies.PublicationCommand = .{ .expected_revision = policy_revision, .change = .{ .begin = .{ .table_id = table.table_id, .schema_version = 0, .schema_digest = @splat(1), .generation = 1, .catalog_epoch = policy_revision + 1, .phase = .pending_install, .required_owners = &.{.{ .group_id = 71, .descriptor_digest = @splat(2) }}, .acknowledged_owners = &.{} } } };
+    const begin_bytes = try std.json.Stringify.valueAlloc(a, begin, .{});
+    defer a.free(begin_bytes);
+    try std.testing.expectError(error.RowPolicyCatalogChanged, store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = begin_bytes }));
     {
         var txn = try store.store.beginWriteTxn();
         defer txn.abort();

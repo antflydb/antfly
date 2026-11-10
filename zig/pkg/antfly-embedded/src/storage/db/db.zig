@@ -8201,6 +8201,9 @@ pub const DB = struct {
             return already;
         }
         diagnostic_stage = "catalog_fences";
+        // Serialize both directions of admission under the native apply fence:
+        // policy installation must not race an unrestricted summary producer.
+        if (phase != .disabled and try self.core.store.retainedSeriesActive()) return error.RowPolicyTopologyUnsupported;
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();

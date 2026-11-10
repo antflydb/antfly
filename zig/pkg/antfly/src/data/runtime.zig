@@ -1357,6 +1357,8 @@ const RaftTableApplyStateMachine = struct {
         InitialChildProvisionAlreadyCommitted,
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
+        RetainedSeriesSourceClosed,
+        RetainedSeriesSourceRevoked,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
@@ -1468,6 +1470,12 @@ const RaftTableApplyStateMachine = struct {
                 if (control == .resolve and control.resolve.status == .committed) return null;
             };
             if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) {
+                // These checks are prepare-time obligations. Dropping a
+                // committed decision on a late lifecycle rejection would lose
+                // source writes while the coordinator reports success.
+                inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+                    if (err == @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field)) return null;
+                }
                 inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
                     if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
                 }
@@ -57876,4 +57884,17 @@ test "retained series lifecycle protocol dominates document revision negotiation
     req.expiration_deletes = &.{"expired"};
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     try std.testing.expect(p.batch_protocol_version >= p.batch_retained_series_protocol_version);
+}
+
+test "retained series lifecycle rejections round trip and never discard a committed resolution" {
+    const Failure = RaftTableApplyStateMachine.ExpectedApplyFailure;
+    const Rejection = @import("antfly_local_sources").storage_retained_series_control.Rejection;
+    const committed: antfly.db.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 } } };
+    inline for (@typeInfo(Rejection).error_set.error_names.?) |name| {
+        const reason = @field(Rejection, name);
+        const failure = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
+        try std.testing.expectEqual(reason, failure.toError());
+        try std.testing.expect(Failure.forRequest(reason, .{}) != null);
+        try std.testing.expect(Failure.forRequest(reason, committed) == null);
+    }
 }
