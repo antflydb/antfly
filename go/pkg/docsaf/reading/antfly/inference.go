@@ -26,7 +26,9 @@ import (
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
-const DefaultMaxTokens = 256
+// DefaultMaxTokens leaves the output budget unspecified so the selected model
+// resolves its own default. Positive config or request values override it.
+const DefaultMaxTokens = 0
 
 // Result includes extracted text and the model that produced it.
 type Result struct {
@@ -42,10 +44,12 @@ type ModelReader interface {
 
 // AntflyConfig configures Antfly-backed reading adapters.
 type AntflyConfig struct {
-	BaseURL          string
-	HTTPClient       *http.Client
-	Client           *inferenceclient.InferenceClient
-	Models           []string
+	BaseURL    string
+	HTTPClient *http.Client
+	Client     *inferenceclient.InferenceClient
+	Models     []string
+	// DefaultMaxTokens overrides the server's model-specific output budget.
+	// Zero leaves max_tokens omitted; ReadOptions.MaxTokens takes precedence.
 	DefaultMaxTokens int
 	RenderDPI        float64
 }

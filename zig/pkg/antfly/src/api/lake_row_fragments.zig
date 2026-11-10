@@ -29,7 +29,7 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const commitments = @import("lake_row_input_commitment.zig");
 const max_rows = 8192;
 const max_fragments = 16384;
-const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, incremental: bool = false, order_tag: ?[]const u8 = null };
+const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, order_tag: ?[]const u8 = null };
 
 pub const Build = struct {
     a: A,
@@ -341,7 +341,6 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
         if (std.meta.eql(space.ordering_cohort, key_recipe)) self.prior_ordering_keys = space.ordering_keys;
     }
     var ordering_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
-    ordering_edits.private_pages.phase = self.store.io_phase;
     defer ordering_edits.deinit();
     self.ordering_edits = &ordering_edits;
     defer self.ordering_edits = null;
@@ -860,7 +859,7 @@ fn readFragments(a: A, out: A, pages: *Pages, nav: navigation.Root) ![]Fragment 
         defer arena.deinit();
         const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
         const prefix = try parseName(file.file_id);
-        const version = if (std.mem.startsWith(u8, file.version_id, "iv1-") or std.mem.startsWith(u8, file.version_id, "iv2-") or std.mem.startsWith(u8, file.version_id, "iv3-") or std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-")) file.version_id[4..] else file.version_id;
+        const version = if (std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-")) file.version_id[4..] else file.version_id;
         if (version.len != 64) return error.InvalidLogicalRowIdentity;
         var digest: [32]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, version) catch return error.InvalidLogicalRowIdentity;
@@ -890,7 +889,6 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
     defer manager.deinit();
     var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
     defer edits.deinit();
-    edits.private_pages.phase = self.store.io_phase;
     const views = try out.alloc(Provider.FragmentView, recipes.len);
     const owners = try a.alloc(usize, recipes.len);
     defer a.free(owners);
@@ -966,18 +964,18 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
             const space = prior.spaceForIndex(prior_name);
             if (space.navigation) |ref| {
                 old = try navigation.load(out, self.store, ref, self.token, null);
-                // Legacy global versions lack the input-specific domain marker.
+                // Global coordinate versions have no input-specific domain marker.
                 var records = try tree.Cursor.init(a, pages.store(), old.?.files, "", null);
                 defer records.deinit();
                 while (try records.next()) |record| {
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
                     const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
-                    if (!std.mem.startsWith(u8, file.version_id, "iv1-") and !std.mem.startsWith(u8, file.version_id, "iv2-") and !std.mem.startsWith(u8, file.version_id, "iv3-") and !std.mem.startsWith(u8, file.version_id, "iv4-") and !std.mem.startsWith(u8, file.version_id, "iv5-")) continue;
+                    if (!std.mem.startsWith(u8, file.version_id, "iv4-") and !std.mem.startsWith(u8, file.version_id, "iv5-")) continue;
                     const prefix = try parseName(file.file_id);
                     var digest: [32]u8 = undefined;
                     _ = std.fmt.hexToBytes(&digest, file.version_id[4..]) catch return error.InvalidLogicalRowIdentity;
-                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest, .incremental = std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-") });
+                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest });
                 }
             }
         };
@@ -994,9 +992,8 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
         const files = try out.dupe(local.serverless_external_source_types.FileEntry, self.source.inventory.files);
         for (self.fragments, files, dirty[i], 0..) |fragment, *file, changed, file_ordinal| {
             const cached = versions.get(fragment.name);
-            const reusable = cached != null and cached.?.incremental and prior_commitments != null and cached.?.count == fragment.count;
-            // XOR-era inputs cannot seed row mutations: rebuild their native
-            // fragment before trusting the new collision-resistant version.
+            const reusable = cached != null and prior_commitments != null and cached.?.count == fragment.count;
+            // New recipes or absent commitment state need a complete fragment.
             if (!reusable) row_changes[file_ordinal] = null;
             const digest = if (!changed and reusable) cached.?.digest else hash: {
                 const key = commitments.key(recipe.digest, fragment.prefix, fragment.bits);
@@ -1303,7 +1300,6 @@ const Spool = struct {
         self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
         var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
         defer edits.deinit();
-        edits.private_pages.phase = store.io_phase;
         var read_bytes: u64 = 0;
         var write_bytes: u64 = 0;
         var pages = self.owner.pageStore(&read_bytes, &write_bytes);
@@ -1391,7 +1387,6 @@ const Spool = struct {
         // physical-to-logical sort, or source payload reread is needed.
         var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
         defer edits.deinit();
-        edits.private_pages.phase = store.io_phase;
         // Verification already certified the complete capture ID census. Join
         // only selected radix ranges, coalescing adjacent dirty leaves.
         var first: usize = 0;
@@ -1860,7 +1855,10 @@ test "external lake logical fragments retain boundaries and isolate append remov
 }
 
 test "external lake logical fragments split oversized radix leaves without physical reads" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-split");
     defer directory.cleanup();
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
@@ -2097,7 +2095,7 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
             defer parsed.deinit(a);
             const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
             defer local.storage_schema.freeSchema(a, runtime);
-            try captured.?.configureOrdering(runtime, &store);
+            try captured.?.configureOrdering(runtime);
         }
         const opening = provider.provider();
         const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
@@ -2253,23 +2251,6 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         try std.testing.expect(indexSpace(native, "unused").ordering_keys == null);
         var prior = root;
         prior.native_space = native.space;
-        // Recreate the released JSON cache as the predecessor, then verify
-        // unchanged entries and new binary entries coexist through refresh.
-        var legacy_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
-        defer legacy_edits.deinit();
-        {
-            var prior_keys = try tree.Cursor.init(a, pages.store(), native.space.ordering_keys, "", null);
-            defer prior_keys.deinit();
-            while (try prior_keys.next()) |record| {
-                const codec = @import("lake_ordering_keys.zig");
-                const decoded = try codec.decodeIntoArena(selection_arena.allocator(), record.value);
-                const legacy = try selection_arena.allocator().alloc(@import("lake_index_sort_bounds.zig").Bound.Value, decoded.keys.len);
-                for (legacy, decoded.keys) |*key, value| key.* = try @import("lake_index_sort_bounds.zig").Bound.Value.from(selection_arena.allocator(), value);
-                const legacy_record = try std.json.Stringify.valueAlloc(selection_arena.allocator(), .{ .version = decoded.version, .keys = legacy }, .{});
-                try legacy_edits.addRecord(record.key, legacy_record);
-            }
-        }
-        prior.native_space.?.ordering_keys = try legacy_edits.finish(null);
         for (0..4) |step| {
             const active_recipes = try selection_arena.allocator().dupe(@import("lake_row_input_recipes.zig").Recipe, recipes);
             if (step >= 2) active_recipes[1].digest = @splat(10);
@@ -2439,12 +2420,9 @@ test "external lake borrowed fragment leases report complete retained ownership"
 }
 
 test "external lake Merkle fragment commitments reject algebraically cancelling row updates" {
-    try cancellingUpdatesScenario(false);
+    try cancellingUpdatesScenario();
 }
-test "external lake Merkle migration rebuilds legacy fragments before row deltas" {
-    try cancellingUpdatesScenario(true);
-}
-fn cancellingUpdatesScenario(legacy: bool) !void {
+fn cancellingUpdatesScenario() !void {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("logical-input-census");
     defer directory.cleanup();
@@ -2550,28 +2528,13 @@ fn cancellingUpdatesScenario(legacy: bool) !void {
             for (next.provider.fragment_views[0].changed_rows) |rows_| if (rows_) |values| {
                 detected_rows += values.len;
             };
-            try std.testing.expectEqual(if (legacy) @as(usize, 0) else changed, detected_rows);
-            try std.testing.expectEqual(if (legacy) next.fragments.len else @as(usize, 1), changed_fragments);
-            if (legacy) {
-                for (next.provider.fragment_views[0].changed_rows) |rows_| try std.testing.expect(rows_ == null);
-                try std.testing.expectEqual(@as(u64, ids.len), next.input_rows_hashed);
-            } else try std.testing.expect(next.input_rows_hashed <= changed * 2);
+            try std.testing.expectEqual(changed, detected_rows);
+            try std.testing.expectEqual(@as(usize, 1), changed_fragments);
+            try std.testing.expect(next.input_rows_hashed <= changed * 2);
         }
         root.native_space = next.space;
         const bindings = try metadata.allocator().alloc(identity.ReusedIndex, 1);
         bindings[0] = .{ .name = "text", .space = indexSpace(next, "text") };
-        if (legacy and step == 0) {
-            const old_files = try metadata.allocator().dupe(local.serverless_external_source_types.FileEntry, next.provider.fragment_views[0].files);
-            for (old_files) |*file| file.version_id = try std.fmt.allocPrint(metadata.allocator(), "iv2-{s}", .{file.version_id[4..]});
-            var old_source = next.source;
-            old_source.inventory.files = old_files;
-            var old_provider = next.provider;
-            old_provider.source = &old_source;
-            old_provider.native_delta = null;
-            const old_navigation = try navigation.build(a, metadata.allocator(), &store, &old_provider, null, .none);
-            bindings[0].space.navigation = old_navigation.ref;
-            root.native_space.?.input_commitments = null;
-        }
         root.reused = bindings;
         root.artifacts = @splat(7);
         try root.reseal(a);

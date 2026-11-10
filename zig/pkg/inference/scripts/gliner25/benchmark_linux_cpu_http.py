@@ -25,12 +25,16 @@ This produces HTTP evidence, not automatic hardware/release qualification.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
+import os
 import sys
 import time
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -77,7 +81,8 @@ def require_equal(expected, actual, tolerance, path="output"):
         raise ValueError(f"{path}: value differs")
 
 
-def request(base, case, timeout):
+def receive(base, case, timeout):
+    """Capture transport bytes/timestamps only; never parse or validate here."""
     path = case["path"]
     if not path.startswith("/") or path.startswith("//"):
         raise ValueError("case path must be an absolute API path")
@@ -89,14 +94,65 @@ def request(base, case, timeout):
         method="POST",
     )
     start = time.perf_counter_ns()
-    with urlopen(req, timeout=timeout) as response:
-        raw = response.read(16 * 1024 * 1024 + 1)
-        if response.status != 200 or len(raw) > 16 * 1024 * 1024:
-            raise ValueError("unsuccessful or oversized response")
-    duration = time.perf_counter_ns() - start
-    output = strict_json(raw)
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            raw = response.read(16 * 1024 * 1024 + 1)
+            if response.status != 200 or len(raw) > 16 * 1024 * 1024:
+                raise ValueError("unsuccessful or oversized response")
+    except HTTPError as error:
+        with error:
+            detail = error.read(4096).decode("utf-8", errors="replace")
+        raise ValueError(f"{req.full_url}: HTTP {error.code}: {detail}") from error
+    completed = time.perf_counter_ns()
+    duration = completed - start
+    return {
+        "duration_ns": duration,
+        "response_completed_ns": completed,
+        "raw": raw,
+    }
+
+
+def validate(sample, case):
+    output = strict_json(sample["raw"])
     require_equal(case["expected"], output, case["confidence_tolerance"])
-    return {"duration_ns": duration, "output": output}
+    return {
+        "duration_ns": sample["duration_ns"],
+        "response_completed_ns": sample["response_completed_ns"],
+        "output": output,
+    }
+
+
+def request(base, case, timeout):
+    return validate(receive(base, case, timeout), case)
+
+
+def request_round(base, case, timeout, concurrency):
+    """Capture the entire burst before parsing or validating any response."""
+    if concurrency == 1:
+        return request(base, case, timeout)
+    start = 0
+
+    def release():
+        nonlocal start
+        start = time.perf_counter_ns()
+
+    ready = threading.Barrier(concurrency + 1, action=release, timeout=timeout)
+
+    def client():
+        ready.wait()
+        return receive(base, case, timeout)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending = [pool.submit(client) for _ in range(concurrency)]
+        ready.wait()
+        samples = [future.result() for future in pending]
+        duration = max(sample["response_completed_ns"] for sample in samples) - start
+    # No worker can compete with a pending response's timestamp for Python
+    # execution time. Still finish every oracle check before starting a new arm.
+    return {
+        "duration_ns": duration,
+        "requests": [validate(sample, case) for sample in samples],
+    }
 
 
 def main():
@@ -109,11 +165,13 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--pairs", type=int, default=20)
     p.add_argument("--timeout", type=float, default=300)
+    p.add_argument("--concurrency", type=int, default=1)
     args = p.parse_args()
     if (
         not 0 <= args.warmup <= 10
         or not 2 <= args.pairs <= 100
         or not 0 < args.timeout <= 300
+        or not 1 <= args.concurrency <= 32
     ):
         p.error("invalid sampling or timeout limits")
     arms = {"baseline": args.baseline, "candidate": args.candidate}
@@ -155,6 +213,15 @@ def main():
         "arms": arms,
         "warmup": args.warmup,
         "pairs": args.pairs,
+        "concurrency": args.concurrency,
+        "round_scope": "single_request"
+        if args.concurrency == 1
+        else "synchronized_burst",
+        "timing": {
+            "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+            "burst": "barrier release through last response-body read; includes client dispatch and payload encoding",
+            "validation": "all response bodies and timestamps captured before any JSON parsing or oracle comparison",
+        },
         "performance_release_qualified": False,
         "samples": [],
         "comparisons": {},
@@ -163,14 +230,21 @@ def main():
         for case in cases:
             for _ in range(args.warmup):
                 for url in arms.values():
-                    request(url, case, args.timeout)
+                    request_round(url, case, args.timeout, args.concurrency)
             pairs = []
             reference_pairs = []
             for pair in range(args.pairs):
                 order = list(arms) if pair % 2 == 0 else list(reversed(arms))
-                row = {"case_id": case["id"], "pair": pair, "order": order}
+                row = {
+                    "case_id": case["id"],
+                    "pair": pair,
+                    "order": order,
+                    "host_load_average": list(os.getloadavg()),
+                }
                 for arm in order:
-                    row[arm] = request(arms[arm], case, args.timeout)
+                    row[arm] = request_round(
+                        arms[arm], case, args.timeout, args.concurrency
+                    )
                 report["samples"].append(row)
                 pairs.append(
                     (row["candidate"]["duration_ns"], row["baseline"]["duration_ns"])
@@ -193,6 +267,27 @@ def main():
                 summary["candidate_over_reference"] = (
                     paired_benchmark.paired_log_ratio_ci(reference_pairs, samples=2000)
                 )
+            if args.concurrency > 1:
+                summary["client_latency_ns"] = {
+                    arm: paired_benchmark.distribution(
+                        sample["duration_ns"]
+                        for row in report["samples"]
+                        if row["case_id"] == case["id"]
+                        for sample in row[arm]["requests"]
+                    )
+                    for arm in arms
+                }
+                summary["requests_per_second"] = {
+                    arm: args.pairs
+                    * args.concurrency
+                    * 1e9
+                    / sum(
+                        row[arm]["duration_ns"]
+                        for row in report["samples"]
+                        if row["case_id"] == case["id"]
+                    )
+                    for arm in arms
+                }
             report["comparisons"][case["id"]] = summary
         if (
             artifacts != {path: sha256(path) for path in artifacts}

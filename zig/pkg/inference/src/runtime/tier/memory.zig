@@ -248,6 +248,10 @@ pub fn maxCompositeLimits(a: Limits, b: Limits) Limits {
 pub const SharedAdmissionLimits = struct {
     host_limit_bytes: usize = 0,
     unified_limit_bytes: usize = 0,
+    /// Explicit invocation quotas span host/device allocations even when the
+    /// physical pools and automatic workload policies are independent.
+    kv_limit_bytes: usize = 0,
+    scratch_limit_bytes: usize = 0,
 };
 
 pub const SystemMemoryInfo = struct {
@@ -650,18 +654,59 @@ pub const AdmissionAmounts = struct {
         return std.math.add(usize, self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 
-    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+    pub const LimitExceeded = struct {
+        limit: enum { host, backend, combined, scratch, kv },
+        requested_bytes: usize,
+        limit_bytes: usize,
+    };
+
+    /// Return the first constraint that prevents this request fitting alone.
+    /// Keep validation and operator diagnostics on the same checked arithmetic.
+    pub fn firstLimitExceeded(self: @This(), limits: Limits) !?LimitExceeded {
         const host = try self.hostTotalBytesChecked();
         const device = try self.backendTotalBytesChecked();
         const combined = try std.math.add(usize, host, device);
         const scratch = try self.scratchTotalBytesChecked();
         const kv = try self.kvTotalBytesChecked();
-        inline for (.{ .{ host, limits.host_limit_bytes }, .{ device, limits.backend_limit_bytes }, .{ combined, limits.combined_limit_bytes }, .{ scratch, limits.scratch_limit_bytes }, .{ kv, limits.kv_limit_bytes } }) |pair| {
-            if (pair[1] != 0 and pair[0] > pair[1]) return false;
+        inline for (.{
+            .{ .host, host, limits.host_limit_bytes },
+            .{ .backend, device, limits.backend_limit_bytes },
+            .{ .combined, combined, limits.combined_limit_bytes },
+            .{ .scratch, scratch, limits.scratch_limit_bytes },
+            .{ .kv, kv, limits.kv_limit_bytes },
+        }) |entry| {
+            if (entry[2] != 0 and entry[1] > entry[2]) return .{
+                .limit = entry[0],
+                .requested_bytes = entry[1],
+                .limit_bytes = entry[2],
+            };
         }
-        return true;
+        return null;
+    }
+
+    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+        return (try self.firstLimitExceeded(limits)) == null;
     }
 };
+
+test "admission amounts identify the blocking budget even when scratch fits" {
+    const amounts = AdmissionAmounts{ .host_scratch_bytes = 40, .backend_scratch_bytes = 50, .backend_kv_bytes = 10 };
+    const cases = [_]struct { limits: Limits, expected: AdmissionAmounts.LimitExceeded }{
+        .{ .limits = .{ .host_limit_bytes = 39 }, .expected = .{ .limit = .host, .requested_bytes = 40, .limit_bytes = 39 } },
+        .{ .limits = .{ .backend_limit_bytes = 59 }, .expected = .{ .limit = .backend, .requested_bytes = 60, .limit_bytes = 59 } },
+        .{ .limits = .{ .combined_limit_bytes = 99, .scratch_limit_bytes = 100 }, .expected = .{ .limit = .combined, .requested_bytes = 100, .limit_bytes = 99 } },
+        .{ .limits = .{ .scratch_limit_bytes = 89 }, .expected = .{ .limit = .scratch, .requested_bytes = 90, .limit_bytes = 89 } },
+        .{ .limits = .{ .kv_limit_bytes = 9 }, .expected = .{ .limit = .kv, .requested_bytes = 10, .limit_bytes = 9 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, (try amounts.firstLimitExceeded(case.limits)).?);
+        try std.testing.expect(!try amounts.fitsLimits(case.limits));
+    }
+    try std.testing.expect(try amounts.fitsLimits(.{}));
+    try std.testing.expect(try amounts.fitsLimits(.{ .host_limit_bytes = 40, .backend_limit_bytes = 60, .combined_limit_bytes = 100, .scratch_limit_bytes = 90, .kv_limit_bytes = 10 }));
+    const overflow = AdmissionAmounts{ .host_scratch_bytes = std.math.maxInt(usize), .backend_scratch_bytes = 1 };
+    try std.testing.expectError(error.Overflow, overflow.firstLimitExceeded(.{}));
+}
 
 /// Optional process-owner bridge for coordinating inference admission with a
 /// broader resource manager. The inference runtime remains independent of the
@@ -743,6 +788,8 @@ pub const ReservedGenerationWorkspace = struct {
 pub const AdmissionPressure = union(enum) {
     shared_host,
     shared_unified,
+    shared_kv,
+    shared_scratch,
     domain_host: BackendClass,
     domain_backend: BackendClass,
     domain_combined: BackendClass,
@@ -821,6 +868,39 @@ pub const AdmissionLease = struct {
     }
 };
 
+/// Unmaterialized host headroom shared by a sequence of small allocations.
+/// Policy accounting is separate: only actual allocations consume policy bytes.
+pub const LiveReservation = struct {
+    controller: *AdmissionController,
+    remaining: usize,
+    tracked: bool,
+
+    pub const Residency = struct {
+        controller: ?*AdmissionController = null,
+        epoch: u64 = 0,
+        bytes: usize = 0,
+
+        pub fn release(self: *@This()) void {
+            if (self.controller) |controller| controller.releaseSettledResidency(self.epoch, self.bytes);
+            self.* = .{};
+        }
+    };
+
+    /// Call only after physical allocation, without a fallible step between
+    /// allocation and transfer. Remaining credit stays pending in this epoch.
+    pub fn materialize(self: *@This(), bytes: usize) Residency {
+        std.debug.assert(bytes <= self.remaining);
+        self.remaining -= bytes;
+        if (!self.tracked) return .{};
+        return .{ .controller = self.controller, .epoch = self.controller.settleLiveReservation(bytes, bytes), .bytes = bytes };
+    }
+
+    pub fn release(self: *@This()) void {
+        if (self.tracked) self.controller.releaseLiveReservation(self.remaining);
+        self.remaining = 0;
+    }
+};
+
 pub const AdmissionController = struct {
     mutex: std.atomic.Mutex = .unlocked,
     /// Serializes reservations against one sampled live-memory capacity. While
@@ -886,6 +966,26 @@ pub const AdmissionController = struct {
         defer self.mutex.unlock();
         std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
         self.shared_limits = shared_limits;
+    }
+
+    /// Device discovery can happen after CPU/tokenizer leases already exist.
+    /// Enabling/tightening a physical shared cap preserves all outstanding
+    /// ownership and makes subsequent admission account for those leases.
+    pub fn tightenUnifiedLimit(self: *AdmissionController, bytes: usize) void {
+        if (bytes == 0) return;
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.shared_limits.unified_limit_bytes = if (self.shared_limits.unified_limit_bytes == 0)
+            bytes
+        else
+            @min(self.shared_limits.unified_limit_bytes, bytes);
+    }
+
+    pub fn tightenInvocationQuotas(self: *AdmissionController, limits: Limits) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.shared_limits.kv_limit_bytes = intersectAdmissionLimit(self.shared_limits.kv_limit_bytes, limits.kv_limit_bytes);
+        self.shared_limits.scratch_limit_bytes = intersectAdmissionLimit(self.shared_limits.scratch_limit_bytes, limits.scratch_limit_bytes);
     }
 
     pub fn configureProcessMemoryLimit(
@@ -974,7 +1074,8 @@ pub const AdmissionController = struct {
 
     /// Atomically acquire one or more CPU/GPU resource domains. Requests in the
     /// same domain are merged under the strictest non-zero limit, while requests
-    /// in different domains are checked independently. Aggregate bytes continue
+    /// in different domains retain separate limits plus invocation-wide quotas.
+    /// Aggregate bytes continue
     /// to be reserved once against the process-owner resource budget.
     pub fn tryAcquireRequests(
         self: *AdmissionController,
@@ -1015,8 +1116,19 @@ pub const AdmissionController = struct {
 
         const request_host = amounts.hostTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_backend = amounts.backendTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_kv = amounts.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_scratch = amounts.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
+
+        // Check every intrinsic limit before considering contention. An
+        // occupied host pool must not hide an impossible scratch/KV/backend
+        // request and cause needless eviction and retries.
+        for (0..backend_class_count) |index| {
+            if (!active_backends[index]) continue;
+            if ((amounts_by_backend[index].firstLimitExceeded(limits_by_backend[index]) catch
+                return error.ResourceLimitExceeded) != null) return error.ResourceLimitExceeded;
+        }
 
         // Publish a provisional reservation while holding only the in-memory
         // accounting lock. The potentially blocking OS/cgroup probe runs after
@@ -1026,6 +1138,13 @@ pub const AdmissionController = struct {
             spinLockAdmission(&self.mutex);
             defer self.mutex.unlock();
 
+            // Shared limits can tighten concurrently; inspect them only under
+            // the accounting lock, before testing aggregate occupancy.
+            try checkAdmissionLimit(request_host, request_host, self.shared_limits.host_limit_bytes);
+            try checkAdmissionLimit(request_combined, request_combined, self.shared_limits.unified_limit_bytes);
+            try checkAdmissionLimit(request_kv, request_kv, self.shared_limits.kv_limit_bytes);
+            try checkAdmissionLimit(request_scratch, request_scratch, self.shared_limits.scratch_limit_bytes);
+
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;
             const next_global_host = next.hostTotalBytesChecked() catch
@@ -1034,8 +1153,10 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             _ = std.math.add(usize, next_global_host, next_global_backend) catch
                 return error.ResourceLimitExceeded;
-            _ = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
-            _ = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            const next_shared_kv = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            const next_shared_scratch = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            try checkAdmissionLimitWithPressure(request_kv, next_shared_kv, self.shared_limits.kv_limit_bytes, .shared_kv, pressure);
+            try checkAdmissionLimitWithPressure(request_scratch, next_shared_scratch, self.shared_limits.scratch_limit_bytes, .shared_scratch, pressure);
 
             // CPU work and CUDA staging/cache allocations consume the same host
             // RAM. Enforce that physical domain before backend-local policies so
@@ -1047,7 +1168,7 @@ pub const AdmissionController = struct {
                 .shared_host,
                 pressure,
             );
-            if (builtin.os.tag == .macos) {
+            if (self.shared_limits.unified_limit_bytes != 0) {
                 try checkAdmissionLimitWithPressure(
                     request_combined,
                     std.math.add(
@@ -1185,6 +1306,12 @@ pub const AdmissionController = struct {
         };
     }
 
+    pub fn sharedLimitsSnapshot(self: *AdmissionController) SharedAdmissionLimits {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        return self.shared_limits;
+    }
+
     pub fn snapshot(self: *AdmissionController) AdmissionAmounts {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
@@ -1253,6 +1380,11 @@ pub const AdmissionController = struct {
                 &self.admitted_by_backend[index],
                 amounts_by_backend[index],
             );
+    }
+
+    /// Reserve physical capacity once, then materialize it in bounded pieces.
+    pub fn reserveLiveCapacity(self: *AdmissionController, bytes: usize) !LiveReservation {
+        return .{ .controller = self, .remaining = bytes, .tracked = try self.tryReserveLiveCapacity(bytes) != 0 };
     }
 
     fn tryReserveLiveCapacity(
@@ -1598,6 +1730,77 @@ pub fn defaultLimitsForBackendWithProcessLimit(
         });
     }
     return staticLimitsForBackend(backend);
+}
+
+/// Discrete device capacity is not host RAM. Keep a finite driver/context
+/// reserve and leave host page cache/staging inside the process envelope.
+pub fn limitsForDiscreteDevice(host: Limits, device_bytes: usize, process_limit: usize) Limits {
+    if (device_bytes == 0) return host;
+    return discreteDeviceLimitsForCapacity(defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes, device_bytes);
+}
+
+fn discreteDeviceLimitsForCapacity(physical_host: usize, device_bytes: usize) Limits {
+    const reserve = @min(@max(device_bytes / 10, mib(512)), device_bytes / 2);
+    const device_limit = device_bytes -| @min(reserve, device_bytes);
+    return .{
+        .host_limit_bytes = physical_host,
+        .backend_limit_bytes = device_limit,
+        .combined_limit_bytes = physical_host +| device_limit,
+        .kv_limit_bytes = @min(gib(3), device_limit / 4),
+        .scratch_limit_bytes = @min(gib(2), device_limit / 8),
+    };
+}
+
+/// Model tuning floors and operator overrides cannot create physical memory.
+/// Apply this after either kind of workload-policy adjustment.
+pub fn clampDiscreteDeviceLimits(limits: Limits, device_bytes: usize, process_limit: usize) Limits {
+    if (device_bytes == 0) return limits;
+    const physical = limitsForDiscreteDevice(limits, device_bytes, process_limit);
+    var out = limits;
+    out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, physical.host_limit_bytes);
+    out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, physical.backend_limit_bytes);
+    out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, out.host_limit_bytes +| out.backend_limit_bytes);
+    // KV and scratch account for both host and device allocations. Physical
+    // residency is bounded independently above; a small VRAM policy must not
+    // turn an admitted host staging buffer into a permanent size failure.
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.combined_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.combined_limit_bytes);
+    return out;
+}
+
+/// Integrated CUDA and unified-memory accelerators share one physical pool.
+pub fn clampUnifiedDeviceLimits(limits: Limits, shared_bytes: usize) Limits {
+    var out = limits;
+    out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, shared_bytes);
+    out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, shared_bytes);
+    out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, shared_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.combined_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.combined_limit_bytes);
+    return out;
+}
+
+test "discrete device budgets retain a shared envelope for integrated CUDA" {
+    const discrete = discreteDeviceLimitsForCapacity(gib(14), gib(24));
+    const unified = clampUnifiedDeviceLimits(discrete, gib(14));
+    try std.testing.expectEqual(gib(14), unified.combined_limit_bytes);
+    try std.testing.expect(unified.backend_limit_bytes <= gib(14));
+    try std.testing.expectEqual(discrete.host_limit_bytes, unified.host_limit_bytes);
+    try std.testing.expect(discrete.combined_limit_bytes > unified.combined_limit_bytes);
+    try std.testing.expect(discreteDeviceLimitsForCapacity(gib(1), 1).backend_limit_bytes > 0);
+}
+
+test "discrete device budgets use VRAM independently of host allocation" {
+    const small = discreteDeviceLimitsForCapacity(gib(14), gib(24));
+    const large = discreteDeviceLimitsForCapacity(gib(28), gib(24));
+    try std.testing.expectEqual(small.backend_limit_bytes, large.backend_limit_bytes);
+    try std.testing.expect(small.backend_limit_bytes > 20_426_896_206);
+    try std.testing.expect(small.backend_limit_bytes < gib(24));
+    try std.testing.expect(small.host_limit_bytes < large.host_limit_bytes);
+    const clamped = clampDiscreteDeviceLimits(.{ .host_limit_bytes = gib(100), .backend_limit_bytes = gib(100), .combined_limit_bytes = gib(200), .kv_limit_bytes = gib(100), .scratch_limit_bytes = gib(100) }, gib(24), gib(14));
+    try std.testing.expectEqual(defaultSharedAdmissionLimitsWithProcessLimit(gib(14)).host_limit_bytes, clamped.host_limit_bytes);
+    try std.testing.expectEqual(small.backend_limit_bytes, clamped.backend_limit_bytes);
+    const tighter = applyLimitOverrides(small, .{ .backend_limit_bytes = gib(4) });
+    try std.testing.expectEqual(gib(4), clampDiscreteDeviceLimits(tighter, gib(24), gib(14)).backend_limit_bytes);
 }
 
 /// Derive one stable physical-memory policy for the process. Backend-local
@@ -2634,6 +2837,28 @@ pub const GenerationKvCapacityPolicy = enum {
     split_swa_ring,
 };
 
+fn recurrentStateProduct(values: []const usize) EstimateError!usize {
+    return checkedProduct(values) catch error.ResourceLimitExceeded;
+}
+
+/// Persistent CUDA recurrent histories are page-owned, not shared decoder
+/// workspace. Serial generation and reader cohorts use this same envelope.
+pub fn gptRecurrentBackendStateBytes(backend: kv_pool.BackendKind, config: gpt_mod.Config) EstimateError!usize {
+    if (backend != .cuda or !config.qwen35_device_only_state or !config.isQwen35()) return 0;
+    const key_dim = try recurrentStateProduct(&.{ config.qwen35_linear_num_key_heads, config.qwen35_linear_key_head_dim });
+    const value_dim = try recurrentStateProduct(&.{ config.qwen35_linear_num_value_heads, config.qwen35_linear_value_head_dim });
+    const conv_dim = std.math.add(usize, try recurrentStateProduct(&.{ key_dim, 2 }), value_dim) catch return error.ResourceLimitExceeded;
+    const conv = try recurrentStateProduct(&.{ conv_dim, config.qwen35_linear_conv_kernel_dim, @sizeOf(f32) });
+    const recurrent = try recurrentStateProduct(&.{ config.qwen35_linear_num_value_heads, config.qwen35_linear_key_head_dim, config.qwen35_linear_value_head_dim, @sizeOf(f32) });
+    const side_weights = std.math.add(usize, try recurrentStateProduct(&.{ config.qwen35_linear_num_value_heads, 2 }), value_dim) catch return error.ResourceLimitExceeded;
+    const per_layer = std.math.add(usize, try recurrentStateProduct(&.{ conv, 3 }), std.math.add(usize, recurrent, try recurrentStateProduct(&.{ side_weights, @sizeOf(f32) })) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    var total: usize = 0;
+    for (0..config.num_hidden_layers) |layer| if (config.layerUsesQwen35LinearAttention(layer)) {
+        total = std.math.add(usize, total, per_layer) catch return error.ResourceLimitExceeded;
+    };
+    return total;
+}
+
 pub fn estimateGptGeneration(
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
@@ -2756,7 +2981,7 @@ pub fn estimateGptGenerationForKvPolicy(
     const scratch_bytes = std.math.add(
         usize,
         base_scratch_bytes,
-        cuda_deferred_activation_scratch,
+        std.math.add(usize, cuda_deferred_activation_scratch, try gptRecurrentBackendStateBytes(backend, config)) catch return error.ResourceLimitExceeded,
     ) catch return error.ResourceLimitExceeded;
 
     return .{
@@ -2784,19 +3009,31 @@ pub const GptGenerationBudgetComponent = struct {
     /// bounds constrain chunk selection independently of the process envelope.
     /// Null means ordinary admission; zero capacity provides no workspace.
     workspace_capacity: ?AdmissionAmounts = null,
+    /// Host graph preparation for a managed executable owns page geometry,
+    /// while the executable's own admission owns the actual KV storage.
+    backend_owns_kv: bool = false,
+    /// A persisted prefill executable has one exact prompt shape; reducing
+    /// chunk rows would select a different executable, not a smaller workspace.
+    fixed_prefill_shape: bool = false,
 
-    fn reserveEstimate(self: @This(), budget: *RunBudget, estimate: Estimate) !void {
+    pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
+        var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
+        if (self.backend == .native and self.backend_owns_kv) result.kv_bytes = 0;
+        return result;
+    }
+
+    fn reserveEstimate(self: @This(), budget: *RunBudget, estimated: Estimate) !void {
         if (self.workspace_capacity) |capacity| {
-            if (estimate.kv_tier == .backend and estimate.kv_bytes > capacity.backend_kv_bytes) {
-                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimate.kv_bytes }, 0, estimate.kv_bytes, capacity.backend_kv_bytes);
+            if (estimated.kv_tier == .backend and estimated.kv_bytes > capacity.backend_kv_bytes) {
+                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimated.kv_bytes }, 0, estimated.kv_bytes, capacity.backend_kv_bytes);
                 return error.MemoryBudgetExceeded;
             }
-            if (estimate.scratch_tier == .backend and estimate.scratch_bytes > capacity.backend_scratch_bytes) {
-                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimate.scratch_bytes }, 0, estimate.scratch_bytes, capacity.backend_scratch_bytes);
+            if (estimated.scratch_tier == .backend and estimated.scratch_bytes > capacity.backend_scratch_bytes) {
+                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimated.scratch_bytes }, 0, estimated.scratch_bytes, capacity.backend_scratch_bytes);
                 return error.MemoryBudgetExceeded;
             }
         }
-        try budget.reserveEstimate(estimate);
+        try budget.reserveEstimate(estimated);
     }
 };
 
@@ -2836,20 +3073,14 @@ pub fn reserveGptGenerationPrefill(
     chunk_ceiling: usize,
 ) !GptGenerationPrefillAdmission {
     const scratch_before = budget.scratchTotalBytes();
-    var chunk = @max(chunk_ceiling, 1);
+    var fixed_shape = false;
+    for (components) |component| fixed_shape = fixed_shape or component.fixed_prefill_shape;
+    var chunk = if (fixed_shape) @max(prompt_tokens, 1) else @max(chunk_ceiling, 1);
     while (true) {
         var trial = budget.*;
         var failed = false;
         for (components) |component| {
-            component.reserveEstimate(&trial, try estimateGptGenerationForKvPolicy(
-                component.backend,
-                component.kv_dtype,
-                component.config,
-                prompt_tokens,
-                max_tokens,
-                chunk,
-                component.kv_capacity_policy,
-            )) catch |err| {
+            component.reserveEstimate(&trial, try component.estimate(prompt_tokens, max_tokens, chunk)) catch |err| {
                 if (err != error.MemoryBudgetExceeded) return err;
                 failed = true;
                 break;
@@ -2863,7 +3094,7 @@ pub fn reserveGptGenerationPrefill(
                 .max_scratch_bytes = selected_scratch,
             };
         }
-        if (chunk <= 32) {
+        if (chunk <= 32 or fixed_shape) {
             const denial_count = trial.denials;
             const last_denial = trial.last_denial;
             budget.denials = denial_count;
@@ -3885,9 +4116,19 @@ test "settled live residency remains committed during pressure epoch" {
     try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
 }
 
-test "metal backend bytes share the unified system-memory domain" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+test "unified device discovery preserves existing leases and never loosens capacity" {
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 1000 });
+    var gpu = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 100, .combined_limit_bytes = 100 }, .{ .backend_weight_bytes = 60 }, false);
+    defer gpu.release();
+    controller.tightenUnifiedLimit(80);
+    controller.tightenUnifiedLimit(200);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{ .host_limit_bytes = 100, .combined_limit_bytes = 100 }, .{ .host_weight_bytes = 21 }, false));
+    var cpu = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = 100, .combined_limit_bytes = 100 }, .{ .host_weight_bytes = 20 }, false);
+    defer cpu.release();
+}
 
+test "unified device and CPU bytes share one system-memory domain" {
     var controller = AdmissionController{};
     controller.configureSharedLimits(.{
         .host_limit_bytes = 1000,
@@ -4623,5 +4864,167 @@ test "embeddinggemma2 live retained admission cannot credit a later kernel sampl
     try std.testing.expect(controller.live_epoch != old_epoch);
     const capacity = controller.live_capacity_bytes;
     lease.release();
+    try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "physical memory clamping bounds unspecified unlimited domains" {
+    const limits = clampDiscreteDeviceLimits(.{}, gib(24), gib(16));
+    try std.testing.expect(limits.backend_limit_bytes > 0 and limits.backend_limit_bytes < gib(24));
+    try std.testing.expect(limits.host_limit_bytes > 0);
+    try std.testing.expect(limits.combined_limit_bytes > 0);
+    var controller = AdmissionController{};
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = gib(25) }, false));
+    const unified = clampUnifiedDeviceLimits(.{}, gib(16));
+    try std.testing.expectEqual(gib(16), unified.combined_limit_bytes);
+    const tighter = clampDiscreteDeviceLimits(.{ .backend_limit_bytes = gib(4) }, gib(24), gib(16));
+    try std.testing.expectEqual(gib(4), tighter.backend_limit_bytes);
+}
+
+test "LightOnOCR3 automatic CUDA recurrent state has serial admission and rollback" {
+    var cfg = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../../models/testdata/lightonocr3/config-4b.json"));
+    const host_state = try estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
+    cfg.qwen35_device_only_state = true;
+    const device_state = try estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
+    const retained = try gptRecurrentBackendStateBytes(.cuda, cfg);
+    try std.testing.expect(retained > 0);
+    try std.testing.expectEqual(host_state.scratch_bytes + retained, device_state.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), try gptRecurrentBackendStateBytes(.native, cfg));
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = host_state.scratch_bytes });
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.reserveEstimate(device_state));
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+    budget.limits.scratch_limit_bytes = device_state.scratch_bytes;
+    try budget.reserveEstimate(device_state);
+    budget.releaseEstimate(device_state);
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+}
+
+test "LightOnOCR3 physical CUDA clamping preserves host scratch and KV within combined limits" {
+    const requested = Limits{ .host_limit_bytes = mib(64), .backend_limit_bytes = mib(16), .combined_limit_bytes = mib(80), .kv_limit_bytes = mib(64), .scratch_limit_bytes = mib(64) };
+    const discrete = clampDiscreteDeviceLimits(requested, gib(24), gib(2));
+    const unified = clampUnifiedDeviceLimits(discrete, mib(80));
+    for ([_]Limits{ discrete, unified }) |limits| {
+        try std.testing.expectEqual(mib(64), limits.scratch_limit_bytes);
+        try std.testing.expectEqual(mib(64), limits.kv_limit_bytes);
+        var controller = AdmissionController{};
+        defer controller.deinit();
+        var scratch = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = mib(48), .backend_scratch_bytes = mib(8) }, false);
+        scratch.release();
+        var kv = try controller.tryAcquire(.gpu, limits, .{ .host_kv_bytes = mib(48), .backend_kv_bytes = mib(8) }, false);
+        kv.release();
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = mib(17) }, false));
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    }
+    const tighter = clampUnifiedDeviceLimits(discrete, mib(40));
+    try std.testing.expectEqual(mib(40), tighter.scratch_limit_bytes);
+    try std.testing.expectEqual(mib(40), tighter.kv_limit_bytes);
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, tighter, .{ .host_scratch_bytes = mib(33), .backend_scratch_bytes = mib(8) }, false));
+    var explicit = requested;
+    explicit.scratch_limit_bytes = mib(32);
+    try std.testing.expectEqual(mib(32), clampDiscreteDeviceLimits(explicit, gib(24), gib(2)).scratch_limit_bytes);
+}
+
+test "permanent admission limits win over unrelated host contention" {
+    var controller = AdmissionController{ .shared_limits = .{ .host_limit_bytes = 100 } };
+    var held = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 80 }, false);
+    defer held.release();
+    const cases = [_]AdmissionRequest{
+        .{ .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 20 }, .amounts = .{ .host_scratch_bytes = 30 } },
+        .{ .backend_class = .cpu, .limits = .{ .kv_limit_bytes = 20 }, .amounts = .{ .host_kv_bytes = 30 } },
+        .{ .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 20 }, .amounts = .{ .host_scratch_bytes = 30, .backend_scratch_bytes = 30 } },
+        .{ .backend_class = .gpu, .limits = .{ .combined_limit_bytes = 40 }, .amounts = .{ .host_scratch_bytes = 30, .backend_scratch_bytes = 30 } },
+    };
+    for (cases) |request| {
+        var pressure: ?AdmissionPressure = null;
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequestsWithPressure(&.{request}, false, &pressure));
+        try std.testing.expect(pressure == null);
+        try std.testing.expectEqual(@as(usize, 80), controller.snapshot().hostTotalBytes());
+    }
+    // The first component would contend, but another component cannot fit
+    // even alone. Atomic multi-domain requests must report that permanent
+    // cause without reserving either component.
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{
+        .{ .backend_class = .cpu, .limits = .{}, .amounts = .{ .host_scratch_bytes = 30 } },
+        .{ .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 20 }, .amounts = .{ .backend_scratch_bytes = 30 } },
+    }, false));
+    try std.testing.expectEqual(@as(usize, 80), controller.snapshot().hostTotalBytes());
+    // A feasible request still reports temporary contention and recovers.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false));
+    held.release();
+    var recovered = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false);
+    recovered.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "shared invocation quotas aggregate CPU and GPU KV and scratch atomically" {
+    inline for (.{ true, false }) |kv| {
+        var controller = AdmissionController{};
+        controller.tightenInvocationQuotas(if (kv) .{ .kv_limit_bytes = 8 } else .{ .scratch_limit_bytes = 8 });
+        // A later, wider consumer cannot relax the invocation's policy.
+        controller.tightenInvocationQuotas(.{ .kv_limit_bytes = 80, .scratch_limit_bytes = 80 });
+        const cpu = if (kv) AdmissionAmounts{ .host_kv_bytes = 6 } else AdmissionAmounts{ .host_scratch_bytes = 6 };
+        const gpu = if (kv) AdmissionAmounts{ .backend_kv_bytes = 6 } else AdmissionAmounts{ .backend_scratch_bytes = 6 };
+        var first = try controller.tryAcquire(.cpu, .{}, cpu, false);
+        defer first.release();
+        var pressure: ?AdmissionPressure = null;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquireWithPressure(.gpu, .{}, gpu, false, &pressure));
+        try std.testing.expectEqualDeep(cpu, controller.snapshot());
+        try std.testing.expectEqual(if (kv) AdmissionPressure.shared_kv else AdmissionPressure.shared_scratch, pressure.?);
+        first.release();
+        var second = try controller.tryAcquire(.gpu, .{}, gpu, false);
+        second.release();
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{
+            .{ .backend_class = .cpu, .limits = .{}, .amounts = cpu },
+            .{ .backend_class = .gpu, .limits = .{}, .amounts = gpu },
+        }, false));
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
+test "generation budget preserves managed prefill shape and external KV ownership" {
+    const cfg = gpt_mod.Config{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 8, .vocab_size = 1, .position_encoding = .rope };
+    const component = GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f32, .config = cfg, .backend_owns_kv = true, .fixed_prefill_shape = true };
+    const expected = try component.estimate(200, 8, 200);
+    try std.testing.expectEqual(@as(usize, 0), expected.kv_bytes);
+    var roomy = RunBudget.init(.{});
+    const admitted = try reserveGptGenerationPrefill(&roomy, &.{component}, 200, 8, 32);
+    try std.testing.expectEqual(@as(usize, 200), admitted.max_chunk_rows);
+    try std.testing.expectEqual(expected.scratch_bytes, admitted.max_scratch_bytes);
+    var tight = RunBudget.init(.{ .scratch_limit_bytes = expected.scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationPrefill(&tight, &.{component}, 200, 8, 32));
+    try std.testing.expectEqual(@as(usize, 0), tight.scratchTotalBytes());
+}
+
+test "managed PJRT metadata residency cannot refund a newer pressure epoch" {
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    const info = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    const anchor = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    var reservation = try controller.reserveLiveCapacity(64 * 1024);
+    var first = reservation.materialize(1024);
+    var second = reservation.materialize(1024);
+    first.release();
+    reservation.release();
+    try std.testing.expectEqual(anchor, controller.live_pending_bytes);
+    const epoch = controller.live_epoch;
+    controller.releaseLiveReservation(anchor);
+    const next = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    defer controller.releaseLiveReservation(next);
+    try std.testing.expect(controller.live_epoch != epoch);
+    const capacity = controller.live_capacity_bytes;
+    second.release();
+    second.release();
+    try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+    // An unavailable physical probe preserves the controller's existing
+    // fail-open contract without manufacturing pending reservations to refund.
+    var untracked = LiveReservation{ .controller = &controller, .remaining = 1024, .tracked = false };
+    var resident = untracked.materialize(512);
+    untracked.release();
+    resident.release();
+    try std.testing.expectEqual(next, controller.live_pending_bytes);
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
 }

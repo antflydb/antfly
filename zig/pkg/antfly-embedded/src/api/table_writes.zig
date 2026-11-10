@@ -1310,11 +1310,7 @@ pub fn transactionWritesToBatchWrites(
 pub fn transactionWritesAsBatchWrites(
     writes: []const db_mod.types.TransactionWrite,
 ) []const db_mod.types.BatchWrite {
-    comptime {
-        std.debug.assert(@sizeOf(db_mod.types.TransactionWrite) == @sizeOf(db_mod.types.BatchWrite));
-        std.debug.assert(@alignOf(db_mod.types.TransactionWrite) == @alignOf(db_mod.types.BatchWrite));
-    }
-    return @ptrCast(writes);
+    return writes;
 }
 
 pub const validateTableBatchAgainstLocalSchema = physical_local_write.validateTableBatchAgainstLocalSchema;

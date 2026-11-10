@@ -14,59 +14,23 @@
 // limitations under the License.
 
 const std = @import("std");
-pub const work_control = @import("work_control.zig");
+pub const work_control = @import("image_work_control");
 
-pub const Resample = enum(u32) {
-    nearest = 0,
-    lanczos = 1,
-    bilinear = 2,
-    bicubic = 3,
-    /// Pillow's antialiased, quantized two-pass BICUBIC implementation. This
-    /// is distinct from the legacy bicubic sampler used by existing model
-    /// configurations so parity-sensitive callers must opt in explicitly.
-    pillow_bicubic = 4,
-    /// Torchvision uint8 antialiased bicubic, with adaptive int16 coefficients.
-    torchvision_bicubic = 5,
-};
+pub const Resample = @import("image_values").Resample;
+pub const PixelFormat = @import("image_values").PixelFormat;
+pub const ImageU8 = @import("image_values").ImageU8;
 
-pub const PixelFormat = enum(u8) {
-    rgb8 = 3,
-    rgba8 = 4,
-};
+/// Execution semantics are independent of checkpoint bytes. Every model
+/// accepting image/video input includes this recipe in its resolution revision.
+pub const execution_recipe = "antfly-image-processing-sampling-boundaries-v1";
 
-pub const ImageU8 = struct {
-    data: []const u8,
-    width: u32,
-    height: u32,
-    format: PixelFormat,
-    /// Zero selects the tightly packed width*channels layout. A non-zero
-    /// stride permits borrowing renderer-owned rows without repacking them.
-    row_stride_bytes: usize = 0,
-
-    pub fn channels(self: ImageU8) usize {
-        return @backingInt(self.format);
-    }
-
-    pub fn rowStride(self: ImageU8) !usize {
-        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
-            return error.InvalidImageBuffer;
-        const stride = if (self.row_stride_bytes == 0) packed_row else self.row_stride_bytes;
-        if (stride < packed_row) return error.InvalidImageBuffer;
-        return stride;
-    }
-
-    pub fn validate(self: ImageU8) !void {
-        if (self.width == 0 or self.height == 0) return error.InvalidImageBuffer;
-        const stride = try self.rowStride();
-        const last_row_offset = std.math.mul(usize, self.height - 1, stride) catch
-            return error.InvalidImageBuffer;
-        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
-            return error.InvalidImageBuffer;
-        const required = std.math.add(usize, last_row_offset, packed_row) catch
-            return error.InvalidImageBuffer;
-        if (self.data.len < required) return error.InvalidImageBuffer;
-    }
-};
+pub fn executionRevision(artifacts: [32]u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(execution_recipe);
+    hash.update(&.{0});
+    hash.update(&artifacts);
+    return hash.finalResult();
+}
 
 /// Convert a decoded RGB/RGBA image into normalized CHW f32 layout.
 pub fn preprocessDecoded(
@@ -219,7 +183,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
         return;
     }
 
-    if (resample == .pillow_bicubic or resample == .torchvision_bicubic) {
+    if (resample == .pillow_bicubic or resample == .torchvision_bicubic or resample == .pillow_bilinear) {
         try preprocessDecodedRectPillowBicubic(
             allocator,
             resolved_img,
@@ -229,16 +193,16 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
             mean,
             std_dev,
             rescale_factor,
-            resample == .torchvision_bicubic,
+            resample,
         );
         return;
     }
 
     for (0..th) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..tw) |x| {
             for (0..3) |ch| {
-                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
+                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample, tw, th);
                 result[ch * th * tw + y * tw + x] = normalizeSample(val, mean[ch], std_dev[ch], rescale_factor);
             }
         }
@@ -323,10 +287,12 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     }
 
     for (0..th) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..cw) |x| {
             for (0..3) |ch| {
-                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
+                // Sampling covers the resized content; tw is only the padded
+                // destination stride and must not change source coordinates.
+                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample, cw, th);
                 result[ch * th * tw + y * tw + x] = normalizeSample(val, mean[ch], std_dev[ch], rescale_factor);
             }
         }
@@ -357,7 +323,7 @@ fn preprocessDecodedRectKeepAspectPadRightBilinearSimd(
         const plane = result[ch * th * tw .. (ch + 1) * th * tw];
 
         for (0..th) |y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             const row_offset = y * tw;
             var x: usize = 0;
             while (x + lanes <= content_width) : (x += lanes) {
@@ -396,7 +362,7 @@ fn preprocessDecodedRectBilinearSimd(
         const plane = result[ch * th * tw .. (ch + 1) * th * tw];
 
         for (0..th) |y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             const row_offset = y * tw;
             var x: usize = 0;
             while (x + lanes <= tw) : (x += lanes) {
@@ -440,8 +406,8 @@ fn preprocessDecodedRectBilinearInterleaved(
     };
 
     for (0..th) |y| {
-        try @import("work_control.zig").check();
-        const src_y = (@as(f32, @floatFromInt(y)) + 0.5) * scale_y - 0.5;
+        try @import("image_work_control").check();
+        const src_y = std.math.clamp((@as(f32, @floatFromInt(y)) + 0.5) * scale_y - 0.5, 0, @as(f32, @floatFromInt(img.height - 1)));
         const y0 = clampIndex(@intFromFloat(@floor(src_y)), img.height);
         const y1 = clampIndex(@as(i32, @intCast(y0)) + 1, img.height);
         const fy = src_y - @as(f32, @floatFromInt(y0));
@@ -452,7 +418,7 @@ fn preprocessDecodedRectBilinearInterleaved(
         const dst_row = y * tw;
 
         for (0..tw) |x| {
-            const src_x = (@as(f32, @floatFromInt(x)) + 0.5) * scale_x - 0.5;
+            const src_x = std.math.clamp((@as(f32, @floatFromInt(x)) + 0.5) * scale_x - 0.5, 0, @as(f32, @floatFromInt(img.width - 1)));
             const x0 = clampIndex(@intFromFloat(@floor(src_x)), img.width);
             const x1 = clampIndex(@as(i32, @intCast(x0)) + 1, img.width);
             const fx = src_x - @as(f32, @floatFromInt(x0));
@@ -485,7 +451,7 @@ fn solidRgb(img: ImageU8) !?[3]u8 {
 
     const rgb = [3]u8{ img.data[0], img.data[1], img.data[2] };
     for (0..@as(usize, img.height)) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..@as(usize, img.width)) |x| {
             if (x == 0 and y == 0) continue;
             const idx = y * stride + x * channels;
@@ -526,9 +492,9 @@ fn sampleBilinear4(
     const base_x: f32 = @floatFromInt(dst_x);
     const dst_xs = VecF{ base_x, base_x + 1.0, base_x + 2.0, base_x + 3.0 };
     const half: VecF = @splat(0.5);
-    const src_x = (dst_xs + half) * @as(VecF, @splat(scale_x)) - half;
+    const src_x = @min(@max((dst_xs + half) * @as(VecF, @splat(scale_x)) - half, @as(VecF, @splat(0))), @as(VecF, @splat(@floatFromInt(img.width - 1))));
 
-    const src_y = (@as(f32, @floatFromInt(dst_y)) + 0.5) * scale_y - 0.5;
+    const src_y = std.math.clamp((@as(f32, @floatFromInt(dst_y)) + 0.5) * scale_y - 0.5, 0, @as(f32, @floatFromInt(img.height - 1)));
     const y0 = clampIndex(@intFromFloat(@floor(src_y)), img.height);
     const y1 = clampIndex(@as(i32, @intCast(y0)) + 1, img.height);
     const fy: VecF = @splat(src_y - @as(f32, @floatFromInt(y0)));
@@ -576,6 +542,12 @@ fn pixelAt(img: ImageU8, x: u32, y: u32, ch: usize) f32 {
     return @floatFromInt(img.data[idx]);
 }
 
+fn nearestIndex(target: usize, source_size: u32, target_size: usize) u32 {
+    // Pixel-center mapping, computed exactly rather than via f32 scale.
+    // The product plus half a source pixel fits u64 for u32 dimensions.
+    return @intCast(@min((@as(u64, target) * source_size + source_size / 2) / target_size, source_size - 1));
+}
+
 fn sampleResized(
     img: ImageU8,
     dst_x: usize,
@@ -584,8 +556,11 @@ fn sampleResized(
     scale_x: f32,
     scale_y: f32,
     resample: Resample,
+    target_width: usize,
+    target_height: usize,
 ) f32 {
     return switch (resample) {
+        .nearest => pixelAt(img, nearestIndex(dst_x, img.width, target_width), nearestIndex(dst_y, img.height, target_height), ch),
         .bicubic => sampleBicubic(img, dst_x, dst_y, ch, scale_x, scale_y),
         else => sampleBilinear(img, dst_x, dst_y, ch, scale_x, scale_y),
     };
@@ -599,8 +574,8 @@ fn sampleBilinear(
     scale_x: f32,
     scale_y: f32,
 ) f32 {
-    const src_x = (@as(f32, @floatFromInt(dst_x)) + 0.5) * scale_x - 0.5;
-    const src_y = (@as(f32, @floatFromInt(dst_y)) + 0.5) * scale_y - 0.5;
+    const src_x = std.math.clamp((@as(f32, @floatFromInt(dst_x)) + 0.5) * scale_x - 0.5, 0, @as(f32, @floatFromInt(img.width - 1)));
+    const src_y = std.math.clamp((@as(f32, @floatFromInt(dst_y)) + 0.5) * scale_y - 0.5, 0, @as(f32, @floatFromInt(img.height - 1)));
     const x0 = clampIndex(@intFromFloat(@floor(src_x)), img.width);
     const y0 = clampIndex(@intFromFloat(@floor(src_y)), img.height);
     const x1 = clampIndex(@as(i32, @intCast(x0)) + 1, img.width);
@@ -660,75 +635,119 @@ pub const BicubicAxis = struct {
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
-pub fn buildPillowBicubicAxis(
-    allocator: std.mem.Allocator,
+pub fn buildPillowBicubicAxis(allocator: std.mem.Allocator, source_size: usize, target_size: usize, torchvision: bool) !BicubicAxis {
+    return buildPillowAxis(allocator, source_size, target_size, if (torchvision) .torchvision_bicubic else .pillow_bicubic);
+}
+
+const PillowAxisGeometry = struct {
     source_size: usize,
     target_size: usize,
-    torchvision: bool,
-) !BicubicAxis {
-    if (source_size == 0 or target_size == 0) return error.InvalidImageDimensions;
+    scale: f64,
+    filter_scale: f64,
+    support: f64,
+
+    fn init(source_size: usize, target_size: usize, resample: Resample) !@This() {
+        if (source_size == 0 or target_size == 0 or source_size > std.math.maxInt(u32) or target_size > std.math.maxInt(u32)) return error.InvalidImageDimensions;
+        const scale = @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(target_size));
+        const filter_scale = @max(scale, 1.0);
+        return .{ .source_size = source_size, .target_size = target_size, .scale = scale, .filter_scale = filter_scale, .support = (if (resample == .pillow_bilinear) @as(f64, 1) else 2) * filter_scale };
+    }
+
+    fn range(self: @This(), target: usize) struct { first: usize, last: usize } {
+        const center = (@as(f64, @floatFromInt(target)) + 0.5) * self.scale;
+        const first = @max(@as(i64, 0), @as(i64, @intFromFloat(center - self.support + 0.5)));
+        const last = @min(@as(i64, @intCast(self.source_size)), @as(i64, @intFromFloat(center + self.support + 0.5)));
+        return .{ .first = @intCast(first), .last = @intCast(last) };
+    }
+
+    fn layout(self: @This()) !struct { count: usize, max_taps: usize } {
+        var count: usize = 0;
+        var max_taps: usize = 0;
+        for (0..self.target_size) |target| {
+            if (target & 255 == 0) try work_control.check();
+            const r = self.range(target);
+            if (r.last <= r.first) return error.InvalidImageDimensions;
+            const taps = r.last - r.first;
+            count = try std.math.add(usize, count, taps);
+            max_taps = @max(max_taps, taps);
+        }
+        return .{ .count = count, .max_taps = max_taps };
+    }
+};
+
+fn buildPillowAxis(allocator: std.mem.Allocator, source_size: usize, target_size: usize, resample: Resample) !BicubicAxis {
+    const geometry = try PillowAxisGeometry.init(source_size, target_size, resample);
+    const layout = try geometry.layout();
+    const torchvision = resample == .torchvision_bicubic;
     const starts = try allocator.alloc(usize, target_size);
     errdefer allocator.free(starts);
     const offsets = try allocator.alloc(usize, target_size + 1);
     errdefer allocator.free(offsets);
-    var float_weights = std.ArrayListUnmanaged(f64).empty;
-    defer float_weights.deinit(allocator);
-    var weights = std.ArrayListUnmanaged(i32).empty;
-    errdefer weights.deinit(allocator);
-
-    const scale = @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(target_size));
-    const filter_scale = @max(scale, 1.0);
-    const support = 2.0 * filter_scale;
+    const weights = try allocator.alloc(i32, layout.count);
+    errdefer allocator.free(weights);
+    // Pillow has fixed precision, so only a single row's f64 coefficients
+    // is needed. Torchvision selects one precision for the complete axis.
+    const floats = try allocator.alloc(f64, if (torchvision) layout.count else layout.max_taps);
+    defer allocator.free(floats);
+    var cursor: usize = 0;
     for (0..target_size) |target| {
-        if (target & 63 == 0) try @import("work_control.zig").check();
-        const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
-        var first: isize = @intFromFloat(center - support + 0.5);
-        var last: isize = @intFromFloat(center + support + 0.5);
-        first = @max(first, 0);
-        last = @min(last, @as(isize, @intCast(source_size)));
-        if (last <= first) return error.InvalidImageDimensions;
-        starts[target] = @intCast(first);
-        offsets[target] = float_weights.items.len;
-        const float_start = float_weights.items.len;
-        var total: f64 = 0.0;
-        var source = first;
-        while (source < last) : (source += 1) {
-            const distance = (@as(f64, @floatFromInt(source)) - center + 0.5) / filter_scale;
-            const weight = cubicWeightF64(distance);
-            try float_weights.append(allocator, weight);
-            total += weight;
+        if (target & 63 == 0) try work_control.check();
+        const r = geometry.range(target);
+        const center = (@as(f64, @floatFromInt(target)) + 0.5) * geometry.scale;
+        const row = floats[if (torchvision) cursor else 0..][0 .. r.last - r.first];
+        starts[target] = r.first;
+        offsets[target] = cursor;
+        var total: f64 = 0;
+        for (row, r.first..) |*weight, source| {
+            const distance = (@as(f64, @floatFromInt(source)) - center + 0.5) / geometry.filter_scale;
+            weight.* = if (resample == .pillow_bilinear) @max(0, 1 - @abs(distance)) else cubicWeightF64(distance);
+            total += weight.*;
         }
-        if (total == 0.0 or !std.math.isFinite(total)) return error.InvalidImageDimensions;
-        for (float_weights.items[float_start..]) |*weight| weight.* /= total;
+        if (total == 0 or !std.math.isFinite(total)) return error.InvalidImageDimensions;
+        for (row) |*weight| weight.* /= total;
+        if (!torchvision) for (row, weights[cursor..][0..row.len]) |weight, *encoded| {
+            encoded.* = quantizePillowWeight(weight, pillow_precision_bits);
+        };
+        cursor += row.len;
     }
-    offsets[target_size] = float_weights.items.len;
+    offsets[target_size] = cursor;
     var precision: u6 = pillow_precision_bits;
     if (torchvision) {
-        // PyTorch 2.10 UpSampleKernel.cpp compute_index_ranges_int16_weights:
-        // select the largest fixed-point scale whose coefficients fit int16.
         var maximum: f64 = 0;
-        for (float_weights.items) |weight| maximum = @max(maximum, weight);
+        for (floats) |weight| maximum = @max(maximum, weight);
         precision = 0;
         while (precision < 22) : (precision += 1) {
             const next: i64 = @intFromFloat(0.5 + maximum * @as(f64, @floatFromInt(@as(u64, 1) << (precision + 1))));
             if (next >= 1 << 15) break;
         }
+        for (floats, weights) |weight, *encoded| encoded.* = quantizePillowWeight(weight, precision);
     }
-    for (float_weights.items) |weight| {
-        const scaled = weight * @as(f64, @floatFromInt(@as(u64, 1) << precision));
-        const rounded = if (scaled < 0.0) scaled - 0.5 else scaled + 0.5;
-        try weights.append(allocator, @intFromFloat(rounded));
-    }
-    return .{
-        .allocator = allocator,
-        .starts = starts,
-        .offsets = offsets,
-        .weights = try weights.toOwnedSlice(allocator),
-        .precision_bits = precision,
-    };
+    return .{ .allocator = allocator, .starts = starts, .offsets = offsets, .weights = weights, .precision_bits = precision };
+}
+
+/// Conservative peak owned by preprocessing, excluding source decoding. Uses
+/// the same geometry as execution, including quantized axes and row-window
+/// storage. Callers add decoder and retained-batch storage before admission.
+pub fn preprocessingWorkingBytes(source_width: u32, source_height: u32, target_width: u32, target_height: u32, resample: Resample) !usize {
+    if (source_width == 0 or source_height == 0 or target_width == 0 or target_height == 0) return error.InvalidImageDimensions;
+    const output = try std.math.mul(usize, try std.math.mul(usize, target_width, target_height), 3 * @sizeOf(f32));
+    if (resample != .pillow_bicubic and resample != .torchvision_bicubic and resample != .pillow_bilinear) return output;
+    const x = try (try PillowAxisGeometry.init(source_width, target_width, resample)).layout();
+    const y = try (try PillowAxisGeometry.init(source_height, target_height, resample)).layout();
+    const indices = try std.math.mul(usize, try std.math.add(usize, try std.math.add(usize, target_width, target_height), 1), 2 * @sizeOf(usize));
+    const weights = try std.math.mul(usize, try std.math.add(usize, x.count, y.count), @sizeOf(i32));
+    const floats = try std.math.mul(usize, if (resample == .torchvision_bicubic) @max(x.count, y.count) else @max(x.max_taps, y.max_taps), @sizeOf(f64));
+    const rows = try std.math.ceilPowerOfTwo(usize, y.max_taps);
+    const window = try std.math.mul(usize, try std.math.mul(usize, rows, target_width), 3);
+    return try std.math.add(usize, try std.math.add(usize, output, 8 * @alignOf(usize)), try std.math.add(usize, indices, try std.math.add(usize, weights, try std.math.add(usize, floats, window))));
 }
 
 const pillow_precision_bits = 22;
+
+fn quantizePillowWeight(weight: f64, precision: u6) i32 {
+    const scaled = weight * @as(f64, @floatFromInt(@as(u64, 1) << precision));
+    return @intFromFloat(if (scaled < 0.0) scaled - 0.5 else scaled + 0.5);
+}
 
 fn clipPillowAccumulator(value: i64, precision_bits: u6) u8 {
     return @intCast(std.math.clamp(value >> precision_bits, 0, 255));
@@ -747,46 +766,52 @@ fn pillowWeightsFitI32(weights: []const i32, precision_bits: u6) bool {
 }
 
 fn pillowHorizontal(img: ImageU8, axis: BicubicAxis, horizontal: []u8, target_width: usize, comptime allow_simd: bool) !void {
-    var vector_safe = allow_simd;
-    if (allow_simd) for (0..target_width) |x| {
-        if (!pillowWeightsFitI32(axis.weights[axis.offsets[x]..axis.offsets[x + 1]], axis.precision_bits)) {
-            vector_safe = false;
-            break;
-        }
-    };
+    const vector_safe = pillowHorizontalVectorSafe(axis, target_width, allow_simd);
     for (0..img.height) |source_y| {
-        try @import("work_control.zig").check();
-        for (0..target_width) |target_x| {
-            const start = axis.starts[target_x];
-            const begin = axis.offsets[target_x];
-            const end = axis.offsets[target_x + 1];
-            if (vector_safe) {
-                const row = img.data[source_y * img.row_stride_bytes ..][0 .. @as(usize, img.width) * img.channels()];
-                var accum: @Vector(4, i32) = @splat(@as(i32, 1) << @intCast(axis.precision_bits - 1));
-                for (axis.weights[begin..end], 0..) |weight, offset| {
-                    const source = (start + offset) * img.channels();
-                    // Packed RGB has only three bytes at the last pixel.
-                    // Never read row padding to fill the discarded fourth lane.
-                    const bytes: @Vector(4, u8) = if (row.len - source >= 4)
-                        row[source..][0..4].*
-                    else
-                        .{ row[source], row[source + 1], row[source + 2], 0 };
-                    accum += @as(@Vector(4, i32), @intCast(bytes)) * @as(@Vector(4, i32), @splat(weight));
-                }
-                const clipped = @min(
-                    @max(accum >> @as(@Vector(4, u5), @splat(@intCast(axis.precision_bits))), @as(@Vector(4, i32), @splat(0))),
-                    @as(@Vector(4, i32), @splat(255)),
-                );
-                inline for (0..3) |channel| horizontal[(source_y * target_width + target_x) * 3 + channel] = @intCast(clipped[channel]);
-                continue;
+        try pillowHorizontalRow(img, axis, horizontal[source_y * target_width * 3 ..][0 .. target_width * 3], target_width, source_y, vector_safe);
+    }
+}
+
+fn pillowHorizontalVectorSafe(axis: BicubicAxis, target_width: usize, allow_simd: bool) bool {
+    if (!allow_simd) return false;
+    for (0..target_width) |x| {
+        if (!pillowWeightsFitI32(axis.weights[axis.offsets[x]..axis.offsets[x + 1]], axis.precision_bits)) return false;
+    }
+    return true;
+}
+
+fn pillowHorizontalRow(img: ImageU8, axis: BicubicAxis, horizontal: []u8, target_width: usize, source_y: usize, vector_safe: bool) !void {
+    try @import("image_work_control").check();
+    for (0..target_width) |target_x| {
+        const start = axis.starts[target_x];
+        const begin = axis.offsets[target_x];
+        const end = axis.offsets[target_x + 1];
+        if (vector_safe) {
+            const row = img.data[source_y * img.row_stride_bytes ..][0 .. @as(usize, img.width) * img.channels()];
+            var accum: @Vector(4, i32) = @splat(@as(i32, 1) << @intCast(axis.precision_bits - 1));
+            for (axis.weights[begin..end], 0..) |weight, offset| {
+                const source = (start + offset) * img.channels();
+                // Packed RGB has only three bytes at the last pixel.
+                // Never read row padding to fill the discarded fourth lane.
+                const bytes: @Vector(4, u8) = if (row.len - source >= 4)
+                    row[source..][0..4].*
+                else
+                    .{ row[source], row[source + 1], row[source + 2], 0 };
+                accum += @as(@Vector(4, i32), @intCast(bytes)) * @as(@Vector(4, i32), @splat(weight));
             }
-            for (0..3) |channel| {
-                var value: i64 = @as(i64, 1) << (axis.precision_bits - 1);
-                for (axis.weights[begin..end], 0..) |weight, offset| {
-                    value += @as(i64, @intFromFloat(pixelAt(img, @intCast(start + offset), @intCast(source_y), channel))) * weight;
-                }
-                horizontal[(source_y * target_width + target_x) * 3 + channel] = clipPillowAccumulator(value, axis.precision_bits);
+            const clipped = @min(
+                @max(accum >> @as(@Vector(4, u5), @splat(@intCast(axis.precision_bits))), @as(@Vector(4, i32), @splat(0))),
+                @as(@Vector(4, i32), @splat(255)),
+            );
+            inline for (0..3) |channel| horizontal[target_x * 3 + channel] = @intCast(clipped[channel]);
+            continue;
+        }
+        for (0..3) |channel| {
+            var value: i64 = @as(i64, 1) << (axis.precision_bits - 1);
+            for (axis.weights[begin..end], 0..) |weight, offset| {
+                value += @as(i64, @intFromFloat(pixelAt(img, @intCast(start + offset), @intCast(source_y), channel))) * weight;
             }
+            horizontal[target_x * 3 + channel] = clipPillowAccumulator(value, axis.precision_bits);
         }
     }
 }
@@ -803,29 +828,35 @@ fn preprocessDecodedRectPillowBicubic(
     mean: [3]f32,
     std_dev: [3]f32,
     rescale_factor: f32,
-    torchvision: bool,
+    resample: Resample,
 ) !void {
-    var horizontal_axis = try buildPillowBicubicAxis(allocator, img.width, target_width, torchvision);
+    var horizontal_axis = try buildPillowAxis(allocator, img.width, target_width, resample);
     defer horizontal_axis.deinit();
-    var vertical_axis = try buildPillowBicubicAxis(allocator, img.height, target_height, torchvision);
+    var vertical_axis = try buildPillowAxis(allocator, img.height, target_height, resample);
     defer vertical_axis.deinit();
 
-    const horizontal_pixels = std.math.mul(usize, target_width, img.height) catch
-        return error.InvalidImageDimensions;
-    const horizontal_len = std.math.mul(usize, horizontal_pixels, 3) catch
-        return error.InvalidImageDimensions;
-    const horizontal = try allocator.alloc(u8, horizontal_len);
+    var max_rows: usize = 1;
+    for (0..target_height) |y| max_rows = @max(max_rows, vertical_axis.offsets[y + 1] - vertical_axis.offsets[y]);
+    const ring_rows = try std.math.ceilPowerOfTwo(usize, max_rows);
+    const row_mask = ring_rows - 1;
+    const row_bytes = try std.math.mul(usize, target_width, 3);
+    const horizontal = try allocator.alloc(u8, try std.math.mul(usize, ring_rows, row_bytes));
     defer allocator.free(horizontal);
-    try pillowHorizontal(img, horizontal_axis, horizontal, target_width, true);
+    const horizontal_vector_safe = pillowHorizontalVectorSafe(horizontal_axis, target_width, true);
+    var computed_through: usize = 0;
 
-    const row_bytes = target_width * 3;
     const Vec = @Vector(8, i32);
     for (0..target_height) |target_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const start = vertical_axis.starts[target_y];
         const begin = vertical_axis.offsets[target_y];
         const end = vertical_axis.offsets[target_y + 1];
         const weights = vertical_axis.weights[begin..end];
+        computed_through = @max(computed_through, start);
+        while (computed_through < start + weights.len) : (computed_through += 1) {
+            const row_offset = (computed_through & row_mask) * row_bytes;
+            try pillowHorizontalRow(img, horizontal_axis, horizontal[row_offset..][0..row_bytes], target_width, computed_through, horizontal_vector_safe);
+        }
         // Bound every partial accumulator before narrowing to SIMD i32.
         // The wider scalar path preserves the existing behavior when a
         // coefficient set cannot safely use the faster representation.
@@ -843,7 +874,7 @@ fn preprocessDecodedRectPillowBicubic(
             while (byte_x + 8 <= row_bytes) : (byte_x += 8) {
                 var accum: Vec = @splat(@as(i32, 1) << @intCast(vertical_axis.precision_bits - 1));
                 for (weights, 0..) |weight, offset| {
-                    const source = (start + offset) * row_bytes + byte_x;
+                    const source = ((start + offset) & row_mask) * row_bytes + byte_x;
                     const bytes: @Vector(8, u8) = horizontal[source..][0..8].*;
                     const values: Vec = @intCast(bytes);
                     accum += values * @as(Vec, @splat(weight));
@@ -863,7 +894,7 @@ fn preprocessDecodedRectPillowBicubic(
         }
         while (byte_x < row_bytes) : (byte_x += 1) {
             var value: i64 = @as(i64, 1) << (vertical_axis.precision_bits - 1);
-            for (weights, 0..) |weight, offset| value += @as(i64, horizontal[(start + offset) * row_bytes + byte_x]) * weight;
+            for (weights, 0..) |weight, offset| value += @as(i64, horizontal[((start + offset) & row_mask) * row_bytes + byte_x]) * weight;
             const channel = byte_x % 3;
             const x = byte_x / 3;
             const sample: f32 = @floatFromInt(clipPillowAccumulator(value, vertical_axis.precision_bits));
@@ -1068,6 +1099,37 @@ test "preprocess decoded keep aspect pads remaining width" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[5], 1e-6);
 }
 
+test "nearest aspect-fit sampling preserves the full crop independently of padding" {
+    const a = std.testing.allocator;
+    const means = [3]f32{ 0.1, 0.2, 0.3 };
+    const stds = [3]f32{ 0.5, 0.25, 0.75 };
+    const pad = [3]f32{ 250, 240, 230 };
+    const cases = [_]struct { width: u32, height: u32, source_x: []const usize, source_y: []const usize }{
+        .{ .width = 6, .height = 2, .source_x = &.{ 0, 1, 2, 3 }, .source_y = &.{ 0, 1 } },
+        .{ .width = 10, .height = 4, .source_x = &.{ 0, 0, 1, 1, 2, 2, 3, 3 }, .source_y = &.{ 0, 0, 1, 1 } },
+        .{ .width = 5, .height = 1, .source_x = &.{ 1, 3 }, .source_y = &.{1} },
+        .{ .width = 3, .height = 2, .source_x = &.{ 0, 2, 3 }, .source_y = &.{ 0, 1 } },
+    };
+    for ([_]PixelFormat{ .rgb8, .rgba8 }) |format| {
+        const channels: usize = @backingInt(format);
+        const stride = 4 * channels + 5;
+        var pixels: [42]u8 = @splat(255);
+        for (0..2) |y| for (0..4) |x| for (0..3) |ch| {
+            pixels[y * stride + x * channels + ch] = @intCast(10 + y * 80 + x * 15 + ch * 3);
+        };
+        const img = ImageU8{ .data = pixels[0 .. stride + 4 * channels], .width = 4, .height = 2, .format = format, .row_stride_bytes = stride };
+        for (cases) |case| {
+            const out = try preprocessDecodedRectKeepAspectPadRightScaledWithResample(a, img, case.width, case.height, means, stds, 0.01, .nearest, pad);
+            defer a.free(out);
+            for (0..3) |ch| for (case.source_y, 0..) |source_y, y| for (0..case.width) |x| {
+                const sample: f32 = if (x < case.source_x.len) @floatFromInt(pixels[source_y * stride + case.source_x[x] * channels + ch]) else pad[ch];
+                const expected = (sample * 0.01 - means[ch]) / stds[ch];
+                try std.testing.expectApproxEqAbs(expected, out[ch * case.width * case.height + y * case.width + x], 1e-6);
+            };
+        }
+    }
+}
+
 test "preprocess decoded rect scaled applies explicit rescale factor" {
     const alloc = std.testing.allocator;
     const rgb = [_]u8{ 128, 64, 32 };
@@ -1165,9 +1227,9 @@ test "embeddinggemma2 torchvision bicubic matches pinned uint8 pixels" {
     try std.testing.expectEqualSlices(f32, &expected, actual);
 }
 
-test "torchvision bicubic upsampling preserves padded RGBA pixels and allocation cleanup" {
+test "quantized Pillow and torchvision resizing releases every allocation on failure" {
     const Case = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(a: std.mem.Allocator, resample: Resample) !void {
             var pixels: [2 * 16]u8 = @splat(255);
             for (0..2) |y| for (0..3) |x| for (0..3) |c| {
                 pixels[y * 16 + x * 4 + c] = @intCast((x * 37 + y * 83 + c * 59) % 256);
@@ -1178,7 +1240,7 @@ test "torchvision bicubic upsampling preserves padded RGBA pixels and allocation
                 .height = 2,
                 .format = .rgba8,
                 .row_stride_bytes = 16,
-            }, 5, 4, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .torchvision_bicubic);
+            }, 5, 4, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, resample);
             defer a.free(actual);
             // PyTorch 2.10.0 F.interpolate on the RGB uint8 channels, size=(4, 5),
             // bicubic, align_corners=False, antialias=True. Includes clipped
@@ -1189,10 +1251,10 @@ test "torchvision bicubic upsampling preserves padded RGBA pixels and allocation
                 122, 136, 162, 188, 202, 146, 160, 186, 212, 226, 108, 121, 148, 188, 212,
                 132, 149, 172, 164, 155, 181, 204, 221, 114, 42,  205, 232, 245, 90,  0,
             };
-            try std.testing.expectEqualSlices(f32, &expected, actual);
+            if (resample == .torchvision_bicubic) try std.testing.expectEqualSlices(f32, &expected, actual);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    for ([_]Resample{ .torchvision_bicubic, .pillow_bicubic, .pillow_bilinear }) |resample| try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{resample});
 }
 
 test "Pillow horizontal SIMD matches wide scalar for packed and padded RGB RGBA" {
@@ -1242,4 +1304,55 @@ test "Pillow horizontal unsafe coefficients retain wide scalar accumulation" {
     try pillowHorizontal(image, axis, &vector, 1, true);
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, &scalar);
     try std.testing.expectEqualSlices(u8, &scalar, &vector);
+}
+
+test "model resampling matches pinned Pillow pixels including boundaries and reduction" {
+    const a = std.testing.allocator;
+    for (@import("resampling_reference_cases.zig").cases) |fixture| {
+        const rgb = try a.alloc(u8, fixture.width * fixture.height * 3);
+        defer a.free(rgb);
+        for (0..fixture.height) |y| for (0..fixture.width) |x| {
+            const offset = (y * fixture.width + x) * 3;
+            rgb[offset..][0..3].* = .{ @intCast((x * 71 + y * 29) % 256), @intCast((x * 13 + y * 83) % 256), @intCast((x * 109 + y * 17) % 256) };
+        };
+        const sampler: Resample = switch (fixture.resample) {
+            0 => .nearest,
+            2 => .pillow_bilinear,
+            3 => .pillow_bicubic,
+            else => unreachable,
+        };
+        // Non-default normalization catches rescale and channel/layout mistakes.
+        const means = [3]f32{ 0.1, 0.2, 0.3 };
+        const stds = [3]f32{ 0.5, 0.25, 0.75 };
+        const out = try preprocessDecodedRectScaledWithResample(a, .{ .data = rgb, .width = fixture.width, .height = fixture.height, .format = .rgb8 }, fixture.target_width, fixture.target_height, means, stds, 0.01, sampler);
+        defer a.free(out);
+        const plane = fixture.target_width * fixture.target_height;
+        for (0..plane) |pixel| for (0..3) |channel| {
+            const expected = normalizeSample(@floatFromInt(fixture.rgb[pixel * 3 + channel]), means[channel], stds[channel], 0.01);
+            try std.testing.expectApproxEqAbs(expected, out[channel * plane + pixel], 1e-6);
+        };
+    }
+}
+
+test "bilinear magnification clamps boundaries before calculating weights" {
+    const a = std.testing.allocator;
+    const out = try preprocessDecodedRectScaledWithResample(a, .{ .data = &.{ 0, 0, 0, 255, 255, 255 }, .width = 2, .height = 1, .format = .rgb8 }, 4, 1, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .bilinear);
+    defer a.free(out);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 63.75, 191.25, 255 }, out[0..4]);
+}
+
+test "Pillow row window fits geometry-derived admission for tall narrow images" {
+    const a = std.testing.allocator;
+    const pixels = try a.alloc(u8, 3_000_000);
+    defer a.free(pixels);
+    @memset(pixels, 255);
+    pixels[0] = 0; // Avoid the solid-image shortcut.
+    const planned = try preprocessingWorkingBytes(1, 1_000_000, 28, 35840, .pillow_bicubic);
+    try std.testing.expect(planned < 32 * 1024 * 1024);
+    const storage = try a.alloc(u8, planned);
+    defer a.free(storage);
+    var bounded = std.heap.FixedBufferAllocator.init(storage);
+    const out = try preprocessDecodedRectScaledWithResample(bounded.allocator(), .{ .data = pixels, .width = 1, .height = 1_000_000, .format = .rgb8 }, 28, 35840, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .pillow_bicubic);
+    try std.testing.expectEqual(@as(usize, 28 * 35840 * 3), out.len);
+    try std.testing.expect(out[out.len - 1] == 255);
 }

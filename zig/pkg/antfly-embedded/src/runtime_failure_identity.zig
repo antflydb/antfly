@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const abi = @import("runtime_failure_abi");
+pub const Status = abi.Status;
 
 const Mapping = struct {
     status: abi.Status,
@@ -30,6 +31,15 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .storage_owner_admission_pending, .err = error.StorageOwnerAdmissionPending },
+    .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
+    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
+    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
+    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
+    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
+    .{ .status = .ambiguous_gcs_connection, .err = error.AmbiguousGcsConnection },
+    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
+    .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
     .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
     .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
@@ -804,6 +814,70 @@ const mappings = [_]Mapping{
     .{ .status = .enrichment_worker_failed, .err = error.EnrichmentWorkerFailed },
     .{ .status = .commit_visibility_not_satisfied, .err = error.CommitVisibilityNotSatisfied },
     .{ .status = .commit_propagation_incomplete, .err = error.CommitPropagationIncomplete },
+    .{ .status = .cypher_aggregate_scope, .err = error.CypherAggregateScope },
+    .{ .status = .cypher_aggregate_wildcard, .err = error.CypherAggregateWildcard },
+    .{ .status = .cypher_ambiguous_search_table, .err = error.CypherAmbiguousSearchTable },
+    .{ .status = .cypher_anchor_budget_exceeded, .err = error.CypherAnchorBudgetExceeded },
+    .{ .status = .cypher_create_requires_label, .err = error.CypherCreateRequiresLabel },
+    .{ .status = .cypher_deleted_entity, .err = error.CypherDeletedEntity },
+    .{ .status = .cypher_derived_relationship_mutation, .err = error.CypherDerivedRelationshipMutation },
+    .{ .status = .cypher_division_by_zero, .err = error.CypherDivisionByZero },
+    .{ .status = .cypher_duplicate_identity, .err = error.CypherDuplicateIdentity },
+    .{ .status = .cypher_edge_budget_exceeded, .err = error.CypherEdgeBudgetExceeded },
+    .{ .status = .cypher_exists_mutation, .err = error.CypherExistsMutation },
+    .{ .status = .cypher_function_arity, .err = error.CypherFunctionArity },
+    .{ .status = .cypher_invalid_assignment, .err = error.CypherInvalidAssignment },
+    .{ .status = .cypher_invalid_backend_cursor, .err = error.CypherInvalidBackendCursor },
+    .{ .status = .cypher_invalid_backend_page, .err = error.CypherInvalidBackendPage },
+    .{ .status = .cypher_invalid_backend_relationship, .err = error.CypherInvalidBackendRelationship },
+    .{ .status = .cypher_invalid_create_relationship, .err = error.CypherInvalidCreateRelationship },
+    .{ .status = .cypher_invalid_document, .err = error.CypherInvalidDocument },
+    .{ .status = .cypher_invalid_grouping, .err = error.CypherInvalidGrouping },
+    .{ .status = .cypher_invalid_owner, .err = error.CypherInvalidOwner },
+    .{ .status = .cypher_invalid_range, .err = error.CypherInvalidRange },
+    .{ .status = .cypher_invalid_relationship_metadata, .err = error.CypherInvalidRelationshipMetadata },
+    .{ .status = .cypher_invalid_search_limit, .err = error.CypherInvalidSearchLimit },
+    .{ .status = .cypher_invalid_search_result, .err = error.CypherInvalidSearchResult },
+    .{ .status = .cypher_invalid_shortest_path, .err = error.CypherInvalidShortestPath },
+    .{ .status = .cypher_invalid_substring, .err = error.CypherInvalidSubstring },
+    .{ .status = .cypher_label_predicate_violation, .err = error.CypherLabelPredicateViolation },
+    .{ .status = .cypher_legacy_id_unavailable, .err = error.CypherLegacyIdUnavailable },
+    .{ .status = .cypher_limit_exceeded, .err = error.CypherLimitExceeded },
+    .{ .status = .cypher_memory_budget_exceeded, .err = error.CypherMemoryBudgetExceeded },
+    .{ .status = .cypher_mutations_unavailable, .err = error.CypherMutationsUnavailable },
+    .{ .status = .cypher_node_has_relationships, .err = error.CypherNodeHasRelationships },
+    .{ .status = .cypher_numeric_overflow, .err = error.CypherNumericOverflow },
+    .{ .status = .cypher_observations_unavailable, .err = error.CypherObservationsUnavailable },
+    .{ .status = .cypher_overlapping_owners, .err = error.CypherOverlappingOwners },
+    .{ .status = .cypher_owner_budget_exceeded, .err = error.CypherOwnerBudgetExceeded },
+    .{ .status = .cypher_path_budget_exceeded, .err = error.CypherPathBudgetExceeded },
+    .{ .status = .cypher_query_requires_return, .err = error.CypherQueryRequiresReturn },
+    .{ .status = .cypher_recursion_budget_exceeded, .err = error.CypherRecursionBudgetExceeded },
+    .{ .status = .cypher_regex_unavailable, .err = error.CypherRegexUnavailable },
+    .{ .status = .cypher_invalid_regex, .err = error.CypherInvalidRegex },
+    .{ .status = .cypher_relationship_endpoint_mismatch, .err = error.CypherRelationshipEndpointMismatch },
+    .{ .status = .cypher_remove_requires_property, .err = error.CypherRemoveRequiresProperty },
+    .{ .status = .cypher_request_too_large, .err = error.CypherRequestTooLarge },
+    .{ .status = .cypher_response_too_large, .err = error.CypherResponseTooLarge },
+    .{ .status = .cypher_return_must_be_last, .err = error.CypherReturnMustBeLast },
+    .{ .status = .cypher_return_predicate, .err = error.CypherReturnPredicate },
+    .{ .status = .cypher_row_policy_unsupported, .err = error.CypherRowPolicyUnsupported },
+    .{ .status = .cypher_search_after_write, .err = error.CypherSearchAfterWrite },
+    .{ .status = .cypher_search_preparation_required, .err = error.CypherSearchPreparationRequired },
+    .{ .status = .cypher_search_table_outside_graph, .err = error.CypherSearchTableOutsideGraph },
+    .{ .status = .cypher_search_unavailable, .err = error.CypherSearchUnavailable },
+    .{ .status = .cypher_snapshot_not_ready, .err = error.CypherSnapshotNotReady },
+    .{ .status = .cypher_snapshot_required, .err = error.CypherSnapshotRequired },
+    .{ .status = .cypher_state_budget_exceeded, .err = error.CypherStateBudgetExceeded },
+    .{ .status = .cypher_transaction_already_active, .err = error.CypherTransactionAlreadyActive },
+    .{ .status = .cypher_transaction_conflict, .err = error.CypherTransactionConflict },
+    .{ .status = .cypher_transaction_required, .err = error.CypherTransactionRequired },
+    .{ .status = .cypher_type_mismatch, .err = error.CypherTypeMismatch },
+    .{ .status = .cypher_union_column_mismatch, .err = error.CypherUnionColumnMismatch },
+    .{ .status = .cypher_value_depth_exceeded, .err = error.CypherValueDepthExceeded },
+    .{ .status = .cypher_variable_conflict, .err = error.CypherVariableConflict },
+    .{ .status = .cypher_variable_type_conflict, .err = error.CypherVariableTypeConflict },
+    .{ .status = .cypher_write_union_unsupported, .err = error.CypherWriteUnionUnsupported },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -1083,6 +1157,15 @@ test "index readiness survives the local query and storage owner boundary" {
     }
 }
 
+test "hierarchy cursor conflicts survive local query and storage owner boundaries" {
+    for ([_]abi.FailureBoundary{ .local_query, .storage_owner }) |boundary| {
+        const failure = failureFromError(error.HierarchyCursorStale, boundary, abi.abi_version, 4);
+        try std.testing.expectEqual(abi.Status.hierarchy_cursor_stale, failure.status);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(error.HierarchyCursorStale, statusToError(failure.status));
+    }
+}
+
 test "committed visibility outcomes survive the storage owner boundary" {
     for ([_]anyerror{
         error.EnrichmentRetryInProgress,
@@ -1129,4 +1212,50 @@ test "logical value exact sort rejection survives both compiled query boundaries
         try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
         try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
     }
+}
+
+test "document job failures retain distinct semantic identities at the compiled boundary" {
+    // Later boundary revisions retain these released error identities.
+    try std.testing.expect(abi.abi_version >= 68);
+    try std.testing.expectEqual(@as(u32, 839), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
+    try std.testing.expectEqual(@as(u32, 840), @backingInt(statusFromError(error.TooManyActiveJobs)));
+    try std.testing.expectEqual(@as(u32, 842), @backingInt(statusFromError(error.ReadTransientFailure)));
+    try std.testing.expectEqual(@as(u32, 847), @backingInt(statusFromError(error.InvalidConnectionCredentials)));
+    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
+    try std.testing.expectEqual(@as(u32, 849), @backingInt(statusFromError(error.CypherAggregateScope)));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
+    try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
+}
+
+test "reader failures and scoped GCS failures retain exact storage boundary identity" {
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(expected, statusToError(failure.status));
+    }
+}
+
+test "privacy committed Raft contention survives the active storage owner ABI" {
+    for ([_]anyerror{ error.WriterLocked, error.RaftApplyWriterUnavailable }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expect(value != .internal);
+        try std.testing.expectError(err, statusToError(value));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(value, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+    try std.testing.expect(statusFromError(error.WriterLocked) != statusFromError(error.RaftApplyWriterUnavailable));
+    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
+}
+
+test "storage owner lease admission retains its independent stable identity" {
+    const err = error.StorageOwnerAdmissionPending;
+    const value = statusFromError(err);
+    try std.testing.expectEqual(@as(u32, 913), @backingInt(value));
+    try std.testing.expectError(err, statusToError(value));
+    try std.testing.expect(value != statusFromError(error.RaftApplyWriterUnavailable));
+    const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(value, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
 }

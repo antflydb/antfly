@@ -41,13 +41,26 @@ pub const CacheBudget = struct {
     lease: ?memory.AdmissionLease = null,
     bytes: usize = 0,
     failure: ?anyerror = null,
+    /// A running model's scratch can already fill an automatic cap, which would
+    /// refuse a large clip's surfaces indefinitely. Physical limits still hold.
+    grow_automatic_scratch: bool = false,
+
+    /// True when the retained reservation holds the shared scratch over its cap.
+    pub fn exceedsScratchCap(self: *const CacheBudget) bool {
+        const admission = self.admission orelse return false;
+        if (self.bytes == 0 or admission.limits.scratch_limit_bytes == 0) return false;
+        return admission.controller.snapshot().scratchTotalBytes() > admission.limits.scratch_limit_bytes;
+    }
 
     pub fn reserve(self: *CacheBudget, physical: *Physical, bytes: usize) !void {
         if (self.bytes != 0 or bytes == 0) return error.InvalidVideoCacheReservation;
         try physical.reserve(bytes);
         errdefer physical.release(bytes);
         const lease = if (self.admission) |admission|
-            try admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory)
+            try admission.controller.tryAcquire(.gpu, if (self.grow_automatic_scratch)
+                try memory.withAutomaticScratchFloor(admission.limits, 0, admission.controller.snapshot().scratchTotalBytes(), bytes)
+            else
+                admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory)
         else
             null;
         self.physical = physical;
@@ -64,6 +77,22 @@ pub const CacheBudget = struct {
         self.bytes = 0;
     }
 };
+
+test "NVDEC surfaces can outgrow an automatic scratch cap and report it" {
+    var controller = memory.AdmissionController{};
+    var physical = Physical{ .limit = 4096 };
+    const limits: memory.Limits = .{ .scratch_limit_bytes = 1024 };
+    var run = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = 1000 }, false);
+    defer run.release();
+    var budget = CacheBudget{ .admission = .{ .controller = &controller, .limits = limits, .check_live_memory = false } };
+    defer budget.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.reserve(&physical, 512));
+    budget.grow_automatic_scratch = true;
+    try budget.reserve(&physical, 512);
+    try std.testing.expect(budget.exceedsScratchCap());
+    budget.release();
+    try std.testing.expect(!budget.exceedsScratchCap());
+}
 
 test "embeddinggemma2 NVDEC retained admission shares limits and rolls back failed reservations" {
     var controller = memory.AdmissionController{};

@@ -182,12 +182,58 @@ describe("durable SQL connection client", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("reads a matching transaction outcome without replay or redirects", async () => {
+    const id = "0".repeat(32);
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ transaction_id: id, disposition: "committed" }))
+      );
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    expect(await client.getSQLTransactionOutcome(id)).toEqual({
+      transaction_id: id,
+      disposition: "committed",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][1]).toMatchObject({
+      method: "GET",
+      body: undefined,
+      redirect: "error",
+      credentials: "omit",
+    });
+  });
+
+  it("rejects mismatched transaction receipts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ transaction_id: "1".repeat(32), disposition: "committed" }))
+        )
+    );
+    await expect(
+      new AntflyClient({ baseUrl: "http://localhost:8080" }).getSQLTransactionOutcome(
+        "0".repeat(32)
+      )
+    ).rejects.toThrow("Invalid SQL transaction outcome");
+  });
+
+  it("accepts legacy empty-array connection-close acknowledgments", async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response("[]"));
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    await expect(client.closeSQLConnection(connection.connection_id)).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects invalid IDs and malformed acknowledgments", async () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ ...connection, owner_node_id: 0 })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ ...connection, connection_id: "bad" })))
-      .mockResolvedValueOnce(new Response("[]"));
+      .mockResolvedValueOnce(new Response("[1]"));
     vi.stubGlobal("fetch", fetch);
     const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
     await expect(client.closeSQLConnection("a/b?c")).rejects.toThrow("connection ID");

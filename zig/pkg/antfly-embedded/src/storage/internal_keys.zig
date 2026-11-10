@@ -164,6 +164,7 @@ pub const GlobalReplayKind = enum(u8) {
     shared_pdf_attempt = 0x43,
     promoted_keys_state = 0x44,
     graph_expiration = 0x54,
+    outcome_receipt = 0x55,
 };
 
 pub fn globalReplayPrefix(comptime kind: GlobalReplayKind) [3]u8 {
@@ -191,6 +192,9 @@ pub const replication_applied_lsn_key = globalReplayPrefix(.replication_applied)
 /// value stores term/index and is committed in the same primary batch as the
 /// document effects so restart replay cannot repeat non-idempotent transforms.
 pub const ordered_document_applied_entry_key = globalReplayPrefix(.ordered_document_applied);
+/// Exported-write outcome markers: `prefix ++ writer_id` holds the sequence of
+/// that writer's last applied call. See `db/apply_receipts.zig`.
+pub const outcome_receipt_prefix = globalReplayPrefix(.outcome_receipt);
 pub const artifact_presence_key = globalReplayPrefix(.artifact_presence);
 pub const asset_artifact_source_index_kind: u8 = @backingInt(GlobalReplayKind.asset_source_index);
 pub const document_child_range_outbox_kind: u8 = @backingInt(GlobalReplayKind.child_range_outbox);
@@ -260,6 +264,16 @@ pub const identity_visibility_manifest_key = [_]u8{ identity_namespace, 0xff, 0x
 pub fn isInternalMetadataKey(key: []const u8) bool {
     if (key.len == 0) return false;
     return key[0] == replay_namespace or key[0] == identity_namespace;
+}
+
+/// Physical DB records other than authored primary/relational rows. This also
+/// recognizes the reserved textual families used by transaction receipts,
+/// columnar state and older metadata protocols.
+pub fn isControlRecordKey(key: []const u8) bool {
+    return isInternalMetadataKey(key) or
+        (isInternalUserKey(key) and !isStoredDocumentRowKey(key)) or
+        std.mem.startsWith(u8, key, "\x00\x00__") or
+        std.mem.startsWith(u8, key, "\x00antfly/");
 }
 
 pub fn isInternalUserKey(key: []const u8) bool {
@@ -346,6 +360,109 @@ pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
         return null;
     }
     return null;
+}
+
+/// Versioned publication witnesses hash only an oversized document prefix.
+/// Keeping the artifact suffix preserves per-document prefix retirement. This
+/// threshold is part of the v2 key format; small existing keys stay unchanged.
+pub const inline_document_metadata_prefix_bytes: usize = 64 * 1024;
+pub fn documentMetadataDigestPrefixLen(key: []const u8) ?usize {
+    if (key.len <= inline_document_metadata_prefix_bytes or key[0] != user_namespace) return null;
+    const end = (findComponentTerminator(key, 1) orelse return null) + 2;
+    return if (end > inline_document_metadata_prefix_bytes) end else null;
+}
+pub fn documentMetadataKeyAlloc(a: Allocator, legacy: []const u8, compact: []const u8, artifact: []const u8) ![]u8 {
+    const end = documentMetadataDigestPrefixLen(artifact) orelse return std.mem.concat(a, u8, &.{ legacy, artifact });
+    var digest: [32]u8 = undefined;
+    Sha256.hash(artifact[0..end], &digest, .{});
+    return std.mem.concat(a, u8, &.{ compact, &digest, artifact[end..] });
+}
+/// New witnesses are authoritative when present. Only absence permits the
+/// legacy lookup; cancellation, read failures and stale proofs never do.
+pub fn readDocumentMetadata(a: Allocator, read: anytype, legacy: []const u8, compact: []const u8, artifact: []const u8) ![]const u8 {
+    const selected = try documentMetadataKeyAlloc(a, legacy, compact, artifact);
+    defer a.free(selected);
+    return read.get(selected) catch |err| {
+        if (err != error.NotFound or documentMetadataDigestPrefixLen(artifact) == null) return err;
+        const old = try std.mem.concat(a, u8, &.{ legacy, artifact });
+        defer a.free(old);
+        return read.get(old);
+    };
+}
+
+test "document publication metadata bounds opaque IDs and preserves prefix retirement" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'z');
+    document[17] = 0;
+    document[18] = 0xff;
+    const prefix = try documentExactPrefixAlloc(a, document);
+    defer a.free(prefix);
+    const first = try artifactNamedPrefixAlloc(a, document, "asset", "first");
+    defer a.free(first);
+    const second = try artifactNamedPrefixAlloc(a, document, "asset", "second");
+    defer a.free(second);
+    const root = try documentMetadataKeyAlloc(a, "old:", "v2:", prefix);
+    defer a.free(root);
+    const left = try documentMetadataKeyAlloc(a, "old:", "v2:", first);
+    defer a.free(left);
+    const right = try documentMetadataKeyAlloc(a, "old:", "v2:", second);
+    defer a.free(right);
+    try std.testing.expectEqual(@as(usize, 3 + 32), root.len);
+    try std.testing.expect(left.len < 128 and right.len < 128);
+    try std.testing.expect(std.mem.startsWith(u8, left, root));
+    try std.testing.expect(std.mem.startsWith(u8, right, root));
+    try std.testing.expect(!std.mem.eql(u8, left, right));
+    document[document.len - 1] = 'x';
+    const neighbor = try artifactNamedPrefixAlloc(a, document, "asset", "first");
+    defer a.free(neighbor);
+    const neighbor_key = try documentMetadataKeyAlloc(a, "old:", "v2:", neighbor);
+    defer a.free(neighbor_key);
+    try std.testing.expect(!std.mem.startsWith(u8, neighbor_key, root));
+    const small = try documentMetadataKeyAlloc(a, "old:", "v2:", "small");
+    defer a.free(small);
+    try std.testing.expectEqualStrings("old:small", small);
+}
+
+test "document publication metadata reads prefer compact proofs and preserve legacy failures" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'x');
+    const artifact = try artifactNamedPrefixAlloc(a, document, "asset", "proof");
+    defer a.free(artifact);
+    const compact = try documentMetadataKeyAlloc(a, "legacy:", "v2:", artifact);
+    defer a.free(compact);
+    const legacy = try std.mem.concat(a, u8, &.{ "legacy:", artifact });
+    defer a.free(legacy);
+    const Fake = struct {
+        compact: []const u8,
+        legacy: []const u8,
+        value: ?[]const u8 = null,
+        failure: ?anyerror = null,
+        legacy_reads: usize = 0,
+        pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, selected, self.compact)) {
+                if (self.failure) |err| return err;
+                return self.value orelse error.NotFound;
+            }
+            if (!std.mem.eql(u8, selected, self.legacy)) return error.TestUnexpectedResult;
+            self.legacy_reads += 1;
+            return "legacy proof";
+        }
+    };
+    var fake = Fake{ .compact = compact, .legacy = legacy };
+    try std.testing.expectEqualStrings("legacy proof", try readDocumentMetadata(a, &fake, "legacy:", "v2:", artifact));
+    try std.testing.expectEqual(@as(usize, 1), fake.legacy_reads);
+    fake.value = "stale compact proof";
+    try std.testing.expectEqualStrings("stale compact proof", try readDocumentMetadata(a, &fake, "legacy:", "v2:", artifact));
+    try std.testing.expectEqual(@as(usize, 1), fake.legacy_reads);
+    inline for (.{ error.Canceled, error.ReadTransientFailure }) |failure| {
+        fake.failure = failure;
+        try std.testing.expectError(failure, readDocumentMetadata(a, &fake, "legacy:", "v2:", artifact));
+        try std.testing.expectEqual(@as(usize, 1), fake.legacy_reads);
+    }
 }
 
 /// Exclusive cut after one document's complete physical key family. The
@@ -1288,6 +1405,16 @@ pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     try appendEncodedComponent(&list, alloc, index_name);
     return try list.toOwnedSlice(alloc);
+}
+
+/// Reserved selector in the secondary issue namespace; it cannot alias an
+/// ArtifactRepairKind. The primary key keeps different kinds disjoint.
+pub fn artifactRepairEnrichmentFailurePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return artifactRepairIssueKindIndexPrefixAlloc(alloc, "enrichment_failed", index_name);
+}
+
+pub fn artifactRepairEnrichmentFailureKeyAlloc(alloc: Allocator, index_name: []const u8, primary_key: []const u8) ![]u8 {
+    return artifactRepairIssueKindKeyAlloc(alloc, "enrichment_failed", index_name, primary_key);
 }
 
 pub fn artifactRepairIssueKeyAlloc(
@@ -3616,6 +3743,32 @@ pub fn graphArtifactHasRelationshipId(key: []const u8) bool {
 /// Durable endpoint cleanup is owner-local control state. Source snapshots
 /// must drain it before copying a range; native whole-store recovery retains it.
 pub const graph_endpoint_cleanup_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup:v1:";
+
+/// Committed LEANN records awaiting (or retained for) ordered application:
+/// prefix, u16 big-endian index-name length, index name, u64 big-endian Raft
+/// index. Keys of one index sort in log order.
+pub const leann_record_prefix = "\x00\x00__metadata__:leann_record:v1:";
+
+pub fn leannRecordKeyAlloc(alloc: std.mem.Allocator, index_name: []const u8, raft_index: u64) ![]u8 {
+    if (index_name.len > std.math.maxInt(u16)) return error.InvalidIndexName;
+    const out = try alloc.alloc(u8, leann_record_prefix.len + 2 + index_name.len + 8);
+    @memcpy(out[0..leann_record_prefix.len], leann_record_prefix);
+    std.mem.writeInt(u16, out[leann_record_prefix.len..][0..2], @intCast(index_name.len), .big);
+    @memcpy(out[leann_record_prefix.len + 2 ..][0..index_name.len], index_name);
+    std.mem.writeInt(u64, out[out.len - 8 ..][0..8], raft_index, .big);
+    return out;
+}
+
+/// Range bounds covering every record of one index.
+pub fn leannRecordIndexPrefixAlloc(alloc: std.mem.Allocator, index_name: []const u8) ![]u8 {
+    const full = try leannRecordKeyAlloc(alloc, index_name, 0);
+    return alloc.realloc(full, full.len - 8);
+}
+
+pub fn leannRecordRaftIndex(key: []const u8) ?u64 {
+    if (key.len < leann_record_prefix.len + 10 or !std.mem.startsWith(u8, key, leann_record_prefix)) return null;
+    return std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big);
+}
 pub fn graphEndpointCleanupKeyAlloc(alloc: Allocator, endpoint: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(endpoint, &digest, .{});

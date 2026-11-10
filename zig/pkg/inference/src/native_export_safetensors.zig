@@ -195,18 +195,7 @@ fn writeSafetensorsControlled(allocator: std.mem.Allocator, access: tensor_acces
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
-    try writer.writeByte('"');
-    for (value) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => try writer.writeByte(c),
-        }
-    }
-    try writer.writeByte('"');
+    try std.json.Stringify.encodeJsonString(value, .{}, writer);
 }
 
 fn safetensorsDType(dtype: tensor_mod.DType) []const u8 {
@@ -351,3 +340,14 @@ const MockAccess = struct {
         };
     }
 };
+
+test "safetensors header JSON strings round-trip control characters" {
+    const a = std.testing.allocator;
+    const raw = "nul\x00bell\x07esc\x1bquote\"slash\\";
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeJsonString(&out.writer, raw);
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(raw, parsed.value);
+}

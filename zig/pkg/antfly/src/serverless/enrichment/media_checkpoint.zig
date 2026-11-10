@@ -243,6 +243,6 @@ test "model aware media serverless checkpoint expansion bounds transient source 
         try std.testing.expectEqual(@as(usize, 0), document.object.get("chunk_embeddings").?.array.items.len);
         try std.testing.expect(!document.object.get("_enrichment").?.object.contains("chunk_embeddings_checkpoint"));
     }
-    try std.testing.expect(!bounded.limit_exceeded);
-    try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
+    try std.testing.expect(!bounded.limitExceeded());
+    try std.testing.expectEqual(@as(usize, 0), bounded.liveBytes());
 }

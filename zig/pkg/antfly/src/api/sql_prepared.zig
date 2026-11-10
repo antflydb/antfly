@@ -28,10 +28,12 @@ const key = "\x00sql-prepared-v1";
 pub const max_resources = 128;
 pub const max_statement_bytes = 64 << 10;
 pub const max_record_bytes = 4 << 20;
-const max_resource_bytes = 512 << 10;
+pub const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
+    kind: enum { table, graph } = .table,
+    graph_pattern_hash: u64 = 0,
     database: []const u8,
     namespace: []const u8,
     name: []const u8,
@@ -42,12 +44,13 @@ pub const Binding = struct {
 
     pub fn from(table: catalog.Table) !Binding {
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-        return .{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision };
+        return .{ .kind = if (table.graph != null) .graph else .table, .graph_pattern_hash = if (table.graph) |graph| std.hash.Wyhash.hash(0x67726170685f7371, graph.definition.query.source) else 0, .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision };
     }
 
     pub fn verify(bindings: []const Binding, table: catalog.Table) !void {
         const current = try from(table);
         for (bindings) |entry| {
+            if (entry.kind != current.kind or entry.graph_pattern_hash != current.graph_pattern_hash) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
             if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
             return;
@@ -137,7 +140,7 @@ pub fn loadForConnection(store: *transactions.DurableSessionStore, alloc: std.me
     };
 }
 
-fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
+pub fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
     if (id.len != 32) return error.SqlPreparedNotFound;
     var result: [key.len + 1 + 32]u8 = undefined;
     @memcpy(result[0..key.len], key);
@@ -182,6 +185,9 @@ pub fn closeForConnection(store: *transactions.DurableSessionStore, id: []const 
 }
 
 fn access(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
+    const mutation = store.mutationMutex();
+    @import("antfly_platform").sync.lockYielding(mutation);
+    defer mutation.unlock();
     if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
     return switch (store.backend) {
         .docstore => |backend| blk: {

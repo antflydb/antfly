@@ -180,7 +180,10 @@ test "external lake predicate blocks validate extents without decoding row IDs" 
 }
 
 test "external lake predicate spill preserves file capacity for fused ordered consumers" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };

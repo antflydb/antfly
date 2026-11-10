@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
 pub const document_runs = @import("antfly_document_runs");
 pub const document_failure = @import("document_failure.zig");
 const httpx = @import("httpx");
@@ -41,6 +42,28 @@ fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
         error.ReadRequestFailed;
 }
 
+fn readAntflyHttpError(alloc: Allocator, status: u16, capability_stale: bool, body: []const u8) anyerror {
+    if (status == 400) {
+        if (document_failure.recognized(alloc, body)) |failure| {
+            if (failure.cause) |cause|
+                if (cause == error.ReadOutputTruncated) return error.ReadOutputTruncated;
+        }
+    }
+    return readHttpStatusError(status, capability_stale);
+}
+
+test "reader preserves native OCR truncation across HTTP without accepting arbitrary errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"error\":\"OUTPUT_TRUNCATED\"}", "{\"error\":\"ReadOutputTruncated\"}" }) |body| {
+        try std.testing.expectEqual(error.ReadOutputTruncated, readAntflyHttpError(a, 400, false, body));
+        try std.testing.expectEqual(error.ReadTransientFailure, readAntflyHttpError(a, 503, false, body));
+    }
+    for ([_][]const u8{ "invalid", "{}", "{\"error\":\"private error\"}", "{\"error\":\"OUTPUT_TRUNCATED\",\"error\":\"Timeout\"}" }) |body|
+        try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, body));
+    try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, &@as([4097]u8, @splat(' '))));
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, readAntflyHttpError(a, 409, true, "{}"));
+}
+
 test "reader classifies retryable HTTP statuses" {
     try std.testing.expect(readHttpStatusError(429, false) == error.ReadTransientFailure);
     try std.testing.expect(readHttpStatusError(503, false) == error.ReadTransientFailure);
@@ -51,6 +74,7 @@ test "reader classifies retryable HTTP statuses" {
 
 pub const Provider = config.Provider;
 pub const Config = config.Config;
+pub const max_output_tokens = config.max_output_tokens;
 pub const apple = @import("apple.zig");
 
 /// Validated, borrowed MIME essence shared by transport and source adapters.
@@ -58,6 +82,18 @@ pub const apple = @import("apple.zig");
 /// the actual image format at the source boundary.
 pub fn mediaTypeEssence(value: []const u8) ![]const u8 {
     return data_uri.mediaTypeEssence(value);
+}
+
+/// Normalize all audio transports to a source URL. Complete URLs are borrowed;
+/// a bare base64 recording is wrapped using the caller's invocation arena.
+pub fn audioSourceUrl(a: Allocator, value: []const u8) ![]const u8 {
+    if (value.len == 0) return error.InvalidDocumentSource;
+    const remote = std.ascii.startsWithIgnoreCase(value, "https://") or
+        std.ascii.startsWithIgnoreCase(value, "http://") or
+        std.ascii.startsWithIgnoreCase(value, "s3://");
+    const url = if (data_uri.hasScheme(value) or remote) value else try std.fmt.allocPrint(a, "data:application/octet-stream;base64,{s}", .{value});
+    if (try data_uri.parse(url)) |parsed| _ = try parsed.decodedSize();
+    return url;
 }
 
 pub const InlineContentTrust = enum {
@@ -76,6 +112,9 @@ pub const DocumentSource = struct {
     include_hidden: bool = false,
 };
 pub const Request = struct {
+    /// Base64 or data URI audio (including audio tracks in video containers).
+    audio: ?[]const u8 = null,
+    audio_options: ?inference_api.AudioReadOptions = null,
     images: []const []const u8 = &.{},
     documents: []const DocumentSource = &.{},
     prompt: ?[]const u8 = null,
@@ -204,6 +243,9 @@ pub const BatchExecution = struct {
     requested_items: usize = 0,
     native_batches: usize = 0,
     native_items: usize = 0,
+    /// Actual successful decoder-step width, including peers in other requests.
+    /// Zero means unobserved; it must never be inferred from request cardinality.
+    max_native_step_items: usize = 0,
     serial_items: usize = 0,
     fallback_items: usize = 0,
     fallback_reason: ?[]const u8 = null,
@@ -258,6 +300,7 @@ pub const Reader = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        accepts_audio: bool = false,
         accepts_documents: bool = false,
         read: *const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result,
         read_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult = null,
@@ -265,11 +308,15 @@ pub const Reader = struct {
     };
 
     pub fn read(self: Reader, alloc: Allocator, req: Request) ![]Result {
+        if (req.audio != null and !self.vtable.accepts_audio) return error.UnsupportedAudioInput;
+        if (req.audio != null and (req.images.len > 0 or req.documents.len > 0)) return error.InvalidDocumentSource;
         if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         return try self.vtable.read(self.ptr, alloc, req);
     }
 
     pub fn readReported(self: Reader, alloc: Allocator, req: Request) !BatchResult {
+        if (req.audio != null and !self.vtable.accepts_audio) return error.UnsupportedAudioInput;
+        if (req.audio != null and (req.images.len > 0 or req.documents.len > 0)) return error.InvalidDocumentSource;
         if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         if (self.vtable.read_reported) |reported| return try reported(self.ptr, alloc, req);
         const items = try self.read(alloc, req);
@@ -600,7 +647,7 @@ const AntflyReaderState = struct {
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
         }
-        return .{ .ptr = state, .vtable = &.{ .accepts_documents = true, .read = read, .read_reported = readReported, .deinit = deinit } };
+        return .{ .ptr = state, .vtable = &.{ .accepts_audio = true, .accepts_documents = true, .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
     pub fn deinit(ptr: *anyopaque) void {
@@ -626,9 +673,16 @@ const AntflyReaderState = struct {
 
     fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
-        if (req.documents.len > 0) {
-            if (req.images.len > 0) return error.InvalidDocumentSource;
-            const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = self.model, .documents = req.documents, .prompt = req.prompt, .max_tokens = req.max_tokens }, .{ .emit_null_optional_fields = false });
+        if (req.documents.len > 0 or req.audio != null) {
+            if (req.images.len > 0 or (req.documents.len > 0 and req.audio != null)) return error.InvalidDocumentSource;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{
+                .model = self.model,
+                .documents = if (req.documents.len > 0) @as(?[]const DocumentSource, req.documents) else null,
+                .audio = req.audio,
+                .audio_options = req.audio_options,
+                .prompt = req.prompt orelse self.prompt,
+                .max_tokens = req.max_tokens orelse self.max_tokens,
+            }, .{ .emit_null_optional_fields = false });
             defer alloc.free(body);
             const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
             defer alloc.free(url);
@@ -650,9 +704,11 @@ const AntflyReaderState = struct {
                 headers[count] = .{ "X-Antfly-Capability-Revision", v };
                 count += 1;
             }
-            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
+            const wire_timer = pipeline_metrics.start(.reader_http);
+            defer wire_timer.finish();
+            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
-            if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
+            if (!response.ok()) return readAntflyHttpError(alloc, response.status.code, responseCapabilityStale(response), response.body orelse "");
             return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
         }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
@@ -688,15 +744,18 @@ const AntflyReaderState = struct {
             header_count += 1;
         }
         const headers = header_buf[0..header_count];
+        const wire_timer = pipeline_metrics.start(.reader_http);
+        defer wire_timer.finish();
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers,
             .timeout_ms = self.timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
         return decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
     }
@@ -752,15 +811,18 @@ const AntflyReaderState = struct {
         }
         header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
+        const wire_timer = pipeline_metrics.start(.reader_http);
+        defer wire_timer.finish();
         var resp = try self.http.post(url, .{
             .borrowed_body_segments = body.segments,
             .headers = header_buf[0..header_count],
             .timeout_ms = self.timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
         var batch = try decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
         errdefer batch.deinit(alloc);
@@ -786,6 +848,7 @@ fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count:
         .requested_items = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport,
         .native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport,
         .native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport,
+        .max_native_step_items = std.math.cast(usize, report.max_native_step_items orelse 0) orelse return error.InvalidReadExecutionReport,
         .serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport,
         .fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport,
         .fallback_reason = if (report.fallback_items > 0) "remote_reader_fallback" else null,
@@ -802,12 +865,14 @@ test "reader wire execution is observed, validated, and backward compatible" {
         .requested_items = 2,
         .native_batches = 1,
         .native_items = 2,
+        .max_native_step_items = 4,
         .serial_items = 0,
         .rejected_items = 0,
         .fallback_items = 0,
     }, 2);
     try std.testing.expectEqual(@as(usize, 2), native.native_items);
     try std.testing.expectEqual(@as(usize, 1), native.native_batches);
+    try std.testing.expectEqual(@as(usize, 4), native.max_native_step_items);
 
     const mixed = try batchExecutionFromWire(.{
         .requested_items = 2,
@@ -1274,12 +1339,12 @@ test "antfly reader sends batched images and request max tokens" {
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
 
-    const reader = try initReader(alloc, &client, .{
+    const reader = try initReaderWithOptions(alloc, &client, .{
         .provider = .antfly,
         .api_url = server.baseUrl(),
         .model = "reader",
         .max_tokens = 16,
-    });
+    }, .{ .timeout_ms = 120_000 });
     defer reader.deinit();
 
     var results: ?[]Result = null;
@@ -1543,6 +1608,8 @@ fn expectAntflyReaderBearer(req: httpx.testing_mod.RequestInfo) !void {
 
 fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
+    const remaining = try std.fmt.parseInt(u64, req.header("X-Antfly-Inference-Timeout-Ms") orelse return error.MissingHeader, 10);
+    try std.testing.expect(remaining > 30_000 and remaining <= 120_000);
 
     var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, std.testing.allocator, req.body, .{
         .ignore_unknown_fields = true,
@@ -1638,13 +1705,13 @@ fn decodeReadBatch(a: Allocator, json: []const u8, expected_images: ?usize) !Bat
         };
     }
     var usage: ?inference_api.GenerateUsage = null;
-    if (parsed.value.object.get("usage")) |value| {
+    if (parsed.value.object.get("usage")) |value| if (value != .null) {
         var decoded = try std.json.parseFromValue(inference_api.GenerateUsage, a, value, .{ .ignore_unknown_fields = true });
         defer decoded.deinit();
         const counts = decoded.value;
         if (counts.prompt_tokens < 0 or counts.completion_tokens < 0 or counts.total_tokens < 0) return error.InvalidReadExecutionReport;
         usage = counts;
-    }
+    };
     var execution = try batchExecutionFromWire(null, out.len);
     if (parsed.value.object.get("execution")) |value| if (value != .null) {
         var decoded = try std.json.parseFromValue(inference_api.BatchExecutionReport, a, value, .{ .ignore_unknown_fields = true });
@@ -1871,3 +1938,70 @@ pub const document_rpc = @import("document_rpc.zig");
 pub const testing = document_runs.testing;
 
 pub const document_stream = @import("document_stream.zig");
+
+test "antfly audio reader preserves truncated completion and measured usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Case = struct {
+        fn inspect(request: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("data:video/mp4;base64,AAAA", parsed.value.object.get("audio").?.string);
+            try std.testing.expect(!parsed.value.object.contains("images"));
+            try std.testing.expect(!parsed.value.object.contains("documents"));
+        }
+        fn run(alloc: Allocator, reader: Reader, result: *?BatchResult, failure: *?anyerror) std.Io.Cancelable!void {
+            result.* = reader.readReported(alloc, .{ .audio = "data:video/mp4;base64,AAAA" }) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/read", .assert_request = Case.inspect, .respond = .{
+        .body = "{\"object\":\"list\",\"model\":\"gemma4\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"partial speech\",\"origin\":\"transcription\",\"status\":\"truncated\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}",
+    } }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const reader = try initReader(a, &client, .{ .provider = .antfly, .model = "gemma4", .api_url = server.baseUrl() });
+    defer reader.deinit();
+    var result: ?BatchResult = null;
+    defer if (result) |*value| value.deinit(a);
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Case.run, .{ a, reader, &result, &failure });
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), result.?.items.len);
+    try std.testing.expectEqual(Completion.length, result.?.items[0].completion);
+    try std.testing.expectEqual(@as(i64, 15), result.?.usage.?.total_tokens);
+    try std.testing.expectError(error.ReadOutputTruncated, requireComplete(result.?.items));
+}
+
+test "audio source URL schemes ignore case while signed paths and queries stay borrowed" {
+    var scratch: [256]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    for ([_][]const u8{
+        "https://example.com/Clip.WAV?token=AbCd", "HTTPS://example.com/Clip.WAV?token=AbCd",
+        "http://example.com/Clip.WAV",             "Http://example.com/Clip.WAV",
+        "s3://bucket/Clip.WAV?versionId=AbCd",     "S3://bucket/Clip.WAV?versionId=AbCd",
+        "DATA:Audio/Wav;base64,AA==",
+    }) |url| {
+        const normalized = try audioSourceUrl(bounded.allocator(), url);
+        try std.testing.expectEqualStrings(url, normalized);
+        try std.testing.expect(normalized.ptr == url.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    const wrapped = try audioSourceUrl(bounded.allocator(), "AA==");
+    try std.testing.expectEqualStrings("data:application/octet-stream;base64,AA==", wrapped);
+    try std.testing.expectError(error.InvalidDocumentSource, audioSourceUrl(bounded.allocator(), ""));
+    try std.testing.expectError(error.InvalidBase64, audioSourceUrl(bounded.allocator(), "not audio"));
+}
+
+test {
+    _ = pipeline_metrics;
+}

@@ -39,6 +39,10 @@ pub const Item = struct {
     /// Validated physical header for a decoded page, keyed by immutable object
     /// version, exact range and interpretation. Consumer quotas are not cached.
     parquet_page_header: ?@import("lake_parquet_page.zig").ParsedHeader = null,
+    /// Typed Parquet payloads use individually reclaimable allocations. Codec
+    /// scratch and vector growth must not survive in a monotonic cache arena.
+    owned_columns: ?@import("lake_parquet_rowgroup.zig").OwnedColumns = null,
+    owned_dictionary: bool = false,
     /// Close extension resources while its immutable dependencies are pinned.
     extension_deinit: ?*const fn (*anyopaque) void = null,
     // Snapshot-local canonical row-ID ordering and totals, computed once.
@@ -68,6 +72,8 @@ pub const Item = struct {
         const parent = self.dependency;
         const a = self.budget.backing;
         if (self.extension_deinit) |close| close(self.payload.extension);
+        if (self.owned_columns) |*columns| columns.deinit(self.budget.allocator());
+        if (self.owned_dictionary) self.payload.dictionary.deinit(self.budget.allocator());
         for (self.dependencies) |item| cache.releaseLocked(item);
         for (self.foreign_dependencies) |lease| {
             std.debug.assert(lease.cache != cache);
@@ -112,6 +118,7 @@ pub const Cache = struct {
     bytes: usize = 0,
     tick: u64 = 0,
     hits: u64 = 0,
+    eviction_epoch: std.atomic.Value(u64) = .init(0),
     flights: std.AutoHashMapUnmanaged([32]u8, *Flight) = .empty,
     loading_bytes: usize = 0,
     max_loading_bytes: usize = 64 * 1024 * 1024,
@@ -192,7 +199,7 @@ pub const Cache = struct {
                 // Consumer allocation/materialization policy is deliberately
                 // absent from physical page keys. Retry with this reader's
                 // loader instead of inheriting another reader's smaller cap.
-                if (failure == error.Canceled or failure == error.DeadlineExceeded or failure == error.OutOfMemory or failure == error.SqlMemoryLimitExceeded or failure == error.ParquetRowGroupTooLarge) continue;
+                if (failure == error.Canceled or failure == error.DeadlineExceeded or failure == error.OutOfMemory or failure == error.SqlMemoryLimitExceeded or failure == error.ParquetRowGroupTooLarge or failure == error.ParquetPageTooLarge) continue;
                 return failure;
             }
             if (self.exclusive_loading or (!exclusive and self.exclusive_waiters != 0) or (exclusive and self.flights.count() != 0) or self.flights.count() >= self.max_loaders) {
@@ -335,6 +342,35 @@ pub const Cache = struct {
         self.hits += 1;
         return .{ .cache = self, .item = item };
     }
+    /// Retirement removes residency while existing leases keep their buffers.
+    pub fn discard(self: *Cache, key: [32]u8) void {
+        self.lock();
+        defer self.mutex.unlock();
+        const removed = self.entries.fetchRemove(key) orelse return;
+        _ = self.eviction_epoch.fetchAdd(1, .monotonic);
+        self.bytes -= removed.value.footprint();
+        removed.value.cached = false;
+        if (removed.value.refs == 0) removed.value.destroy(self);
+    }
+    /// Pressure reclamation never waits for queries or discards pinned values.
+    pub fn reclaim(self: *Cache, target: u64) u64 {
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        var freed: u64 = 0;
+        while (freed < target) {
+            var it = self.entries.iterator();
+            const key = while (it.next()) |entry| {
+                if (entry.value_ptr.*.refs == 0) break entry.key_ptr.*;
+            } else break;
+            const removed = self.entries.fetchRemove(key).?;
+            const size = removed.value.footprint();
+            self.bytes -= size;
+            removed.value.cached = false;
+            removed.value.destroy(self);
+            freed +|= size;
+        }
+        return freed;
+    }
     pub fn create(self: *Cache, limit: usize) !Lease {
         const item = try self.a.create(Item);
         item.* = .{ .budget = .{ .backing = self.a, .limit = limit }, .arena = undefined };
@@ -361,6 +397,7 @@ pub const Cache = struct {
                 }
             }
             const removed = self.entries.fetchRemove(oldest orelse return).?;
+            _ = self.eviction_epoch.fetchAdd(1, .monotonic);
             self.bytes -= removed.value.footprint();
             removed.value.cached = false;
             removed.value.destroy(self);
@@ -372,6 +409,24 @@ pub const Cache = struct {
         self.bytes += size;
     }
 };
+
+test "external lake native retired decoded residency preserves outstanding leases" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{ .a = a };
+    defer cache.deinit();
+    const key: [32]u8 = @splat(1);
+    const lease = try cache.create(4096);
+    defer lease.release();
+    const bytes = try lease.item.arena.allocator().dupe(u8, "pinned");
+    cache.publish(key, lease);
+    try std.testing.expect(cache.bytes != 0);
+    cache.discard(key);
+    try std.testing.expect(cache.lookup(key) == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expect(!lease.item.cached);
+    // The leased arena is still usable until the last reader releases it.
+    try std.testing.expectEqualStrings("pinned", bytes);
+}
 
 test "external lake decoded leases preserve pinned buffers under bounded eviction" {
     var cache: Cache = .{ .a = std.testing.allocator, .max_entries = 1 };

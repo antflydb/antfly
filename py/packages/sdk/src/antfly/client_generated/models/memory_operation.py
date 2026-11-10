@@ -32,6 +32,11 @@ class MemoryOperation:
         attempts (int):
         error_code (None | str):
         next_retry_at (int | None):
+        evidence_ids (list[str] | Unset):
+        duplicate_ids (list[str] | Unset):
+        near_duplicate_ids (list[str] | Unset):
+        proposal_ids (list[str] | Unset):
+        review_cursor (None | str | Unset):
         evaluation_id (None | str | Unset):
         branch (str | Unset):
         intake_screening (MemoryIntakeScreeningReport | Unset):
@@ -51,6 +56,11 @@ class MemoryOperation:
     attempts: int
     error_code: None | str
     next_retry_at: int | None
+    evidence_ids: list[str] | Unset = UNSET
+    duplicate_ids: list[str] | Unset = UNSET
+    near_duplicate_ids: list[str] | Unset = UNSET
+    proposal_ids: list[str] | Unset = UNSET
+    review_cursor: None | str | Unset = UNSET
     evaluation_id: None | str | Unset = UNSET
     branch: str | Unset = UNSET
     intake_screening: MemoryIntakeScreeningReport | Unset = UNSET
@@ -84,6 +94,28 @@ class MemoryOperation:
 
         next_retry_at: int | None
         next_retry_at = self.next_retry_at
+
+        evidence_ids: list[str] | Unset = UNSET
+        if not isinstance(self.evidence_ids, Unset):
+            evidence_ids = self.evidence_ids
+
+        duplicate_ids: list[str] | Unset = UNSET
+        if not isinstance(self.duplicate_ids, Unset):
+            duplicate_ids = self.duplicate_ids
+
+        near_duplicate_ids: list[str] | Unset = UNSET
+        if not isinstance(self.near_duplicate_ids, Unset):
+            near_duplicate_ids = self.near_duplicate_ids
+
+        proposal_ids: list[str] | Unset = UNSET
+        if not isinstance(self.proposal_ids, Unset):
+            proposal_ids = self.proposal_ids
+
+        review_cursor: None | str | Unset
+        if isinstance(self.review_cursor, Unset):
+            review_cursor = UNSET
+        else:
+            review_cursor = self.review_cursor
 
         evaluation_id: None | str | Unset
         if isinstance(self.evaluation_id, Unset):
@@ -122,6 +154,16 @@ class MemoryOperation:
                 "next_retry_at": next_retry_at,
             }
         )
+        if evidence_ids is not UNSET:
+            field_dict["evidence_ids"] = evidence_ids
+        if duplicate_ids is not UNSET:
+            field_dict["duplicate_ids"] = duplicate_ids
+        if near_duplicate_ids is not UNSET:
+            field_dict["near_duplicate_ids"] = near_duplicate_ids
+        if proposal_ids is not UNSET:
+            field_dict["proposal_ids"] = proposal_ids
+        if review_cursor is not UNSET:
+            field_dict["review_cursor"] = review_cursor
         if evaluation_id is not UNSET:
             field_dict["evaluation_id"] = evaluation_id
         if branch is not UNSET:
@@ -174,6 +216,23 @@ class MemoryOperation:
 
         next_retry_at = _parse_next_retry_at(d.pop("next_retry_at"))
 
+        evidence_ids = cast(list[str], d.pop("evidence_ids", UNSET))
+
+        duplicate_ids = cast(list[str], d.pop("duplicate_ids", UNSET))
+
+        near_duplicate_ids = cast(list[str], d.pop("near_duplicate_ids", UNSET))
+
+        proposal_ids = cast(list[str], d.pop("proposal_ids", UNSET))
+
+        def _parse_review_cursor(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        review_cursor = _parse_review_cursor(d.pop("review_cursor", UNSET))
+
         def _parse_evaluation_id(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -215,6 +274,11 @@ class MemoryOperation:
             attempts=attempts,
             error_code=error_code,
             next_retry_at=next_retry_at,
+            evidence_ids=evidence_ids,
+            duplicate_ids=duplicate_ids,
+            near_duplicate_ids=near_duplicate_ids,
+            proposal_ids=proposal_ids,
+            review_cursor=review_cursor,
             evaluation_id=evaluation_id,
             branch=branch,
             intake_screening=intake_screening,

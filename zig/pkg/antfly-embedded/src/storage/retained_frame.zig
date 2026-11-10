@@ -26,6 +26,13 @@ pub const max_chunks: u32 = max_logical_bytes / chunk_bytes;
 const magic = "RFV5";
 const descriptor_domain = "antfly:retained-frame:REF5:";
 const header_bytes = 92;
+pub fn frameMagic(vectors: bool, graph: bool, sources: bool) []const u8 {
+    return if (sources) (if (graph) "RF6G" else if (vectors) "RF64" else "RF63") else if (graph) "REFG" else if (vectors) "REF4" else "REF3";
+}
+pub fn hasSources(frame_magic: []const u8) bool {
+    return std.mem.eql(u8, frame_magic, "RF63") or std.mem.eql(u8, frame_magic, "RF64") or std.mem.eql(u8, frame_magic, "RF6G");
+}
+pub const source_flag: u32 = 1 << 31;
 
 fn descriptorDigest(raw: []const u8) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -47,6 +54,7 @@ pub const Source = struct {
 };
 
 pub const Descriptor = struct {
+    ttl_sources: bool = false,
     sequence: u64,
     total: u32,
     direct_vectors: bool,
@@ -73,7 +81,7 @@ pub const Descriptor = struct {
         std.mem.writeInt(u32, out[12..16], self.total, .little);
         std.mem.writeInt(u32, out[16..20], @intCast(self.effect_offsets.len), .little);
         std.mem.writeInt(u32, out[20..24], count, .little);
-        std.mem.writeInt(u32, out[24..28], @as(u32, @intFromBool(self.direct_vectors)) | (@as(u32, @intFromBool(self.graph_artifacts)) << 1), .little);
+        std.mem.writeInt(u32, out[24..28], @as(u32, @intFromBool(self.direct_vectors)) | (@as(u32, @intFromBool(self.graph_artifacts)) << 1) | (@as(u32, @intFromBool(self.ttl_sources)) << 2), .little);
         @memcpy(out[28..60], &self.logical_digest);
         @memcpy(out[60..92], &self.payload_checksum);
         var pos: usize = header_bytes;
@@ -105,6 +113,7 @@ pub fn descriptorLength(total: u32, effects: u32) !usize {
 }
 
 pub const View = struct {
+    ttl_sources: bool = false,
     descriptor: []const u8,
     source: Source,
     sequence: u64,
@@ -146,7 +155,7 @@ pub const View = struct {
         const effects = std.mem.readInt(u32, raw[16..20], .little);
         const chunks = std.mem.readInt(u32, raw[20..24], .little);
         const flags = std.mem.readInt(u32, raw[24..28], .little);
-        if (flags > 3 or (flags & 2 != 0 and flags & 1 == 0) or chunks != try chunkCount(total) or raw.len != try encodedLength(chunks, effects))
+        if (flags > 7 or (flags & 2 != 0 and flags & 1 == 0) or chunks != try chunkCount(total) or raw.len != try encodedLength(chunks, effects))
             return error.RetainedEffectsCorrupt;
         const digest = descriptorDigest(raw[0 .. raw.len - 32]);
         if (!std.mem.eql(u8, &digest, raw[raw.len - 32 ..])) return error.RetainedEffectsCorrupt;
@@ -159,6 +168,7 @@ pub const View = struct {
             .chunk_count = chunks,
             .direct_vectors = flags & 1 != 0,
             .graph_artifacts = flags & 2 != 0,
+            .ttl_sources = flags & 4 != 0,
             .logical_digest = raw[28..60].*,
             .descriptor_digest = digest,
             .payload_checksum = raw[60..92].*,
@@ -176,7 +186,7 @@ pub const View = struct {
     pub fn validateEnvelope(self: View, cache: *ChunkCache) !void {
         var header: [16]u8 = undefined;
         if (try self.readAt(0, &header, cache) != header.len or
-            (!std.mem.eql(u8, header[0..4], if (self.graph_artifacts) "REFG" else if (self.direct_vectors) "REF4" else "REF3")) or
+            (!std.mem.eql(u8, header[0..4], frameMagic(self.direct_vectors, self.graph_artifacts, self.ttl_sources))) or
             std.mem.readInt(u64, header[4..12], .little) != self.sequence or
             std.mem.readInt(u32, header[12..16], .little) != self.effect_count) return error.RetainedEffectsCorrupt;
         var trailer: [32]u8 = undefined;
@@ -237,6 +247,7 @@ pub const View = struct {
     }
 
     pub const EffectHeader = struct {
+        ttl_source: ?[16]u8 = null,
         key_offset: u32,
         key_len: u32,
         value_offset: u32,
@@ -258,11 +269,17 @@ pub const View = struct {
         const key_len = std.mem.readInt(u32, header[0..4], .little);
         const raw_value_len = std.mem.readInt(u32, header[4..8], .little);
         const timestamp = std.mem.readInt(u64, header[8..16], .little);
-        const value_len: ?u32 = if (raw_value_len == std.math.maxInt(u32)) null else raw_value_len;
-        const required = @as(u64, 16) + key_len + (value_len orelse 0);
-        if (key_len == 0 or required != end - start or (value_len == null and timestamp != 0))
+        const source_present = self.ttl_sources and raw_value_len != std.math.maxInt(u32) and raw_value_len & source_flag != 0;
+        const value_len: ?u32 = if (raw_value_len == std.math.maxInt(u32)) null else if (self.ttl_sources) raw_value_len & ~source_flag else raw_value_len;
+        const header_len: u32 = if (source_present) 32 else 16;
+        var source_bytes: [16]u8 = undefined;
+        if (source_present and try self.readAt(start + 16, &source_bytes, cache) != 16) return error.RetainedEffectsCorrupt;
+        const required = @as(u64, header_len) + key_len + (value_len orelse 0);
+        // Only source-aware frames may carry a tombstone revision. The
+        // consumer validates that its decoded key belongs to a document.
+        if (key_len == 0 or required != end - start or (value_len == null and timestamp != 0 and !self.ttl_sources))
             return error.RetainedEffectsCorrupt;
-        return .{ .key_offset = start + 16, .key_len = key_len, .value_offset = start + 16 + key_len, .value_len = value_len, .timestamp = timestamp, .next_offset = end };
+        return .{ .key_offset = start + header_len, .key_len = key_len, .value_offset = start + header_len + key_len, .value_len = value_len, .timestamp = timestamp, .next_offset = end, .ttl_source = if (source_present) source_bytes else null };
     }
 };
 

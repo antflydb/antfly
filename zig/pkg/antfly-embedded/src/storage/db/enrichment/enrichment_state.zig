@@ -64,6 +64,9 @@ pub const RuntimeStatus = struct {
     /// Failures attributed to retry_failure_fingerprint. Kept separate from
     /// the no-progress supervisor count so per-request isolation remains fair.
     retry_failure_count: u32 = 0,
+    /// Admission waits for the same fingerprint survive worker/process restart
+    /// without spending the provider-failure budget.
+    admission_wait_count: u32 = 0,
     /// Inclusive source-sequence interval containing terminal request debt
     /// observed since the last applied boundary. Synchronous barriers use it
     /// to return committed_repair_required for the affected write range.
@@ -164,7 +167,7 @@ pub fn clearReplayCursor(store: anytype, scope: []const u8) !void {
 }
 
 fn encodeReplayCursor(alloc: Allocator, cursor: ReplayCursor) ![]u8 {
-    if (cursor.doc_key.len == 0 or cursor.doc_key.len > std.math.maxInt(u32))
+    if (cursor.doc_key.len > std.math.maxInt(u32))
         return error.InvalidEnrichmentState;
     const body_len = replay_cursor_magic.len + 4 + 8 + 8 + 4 + cursor.doc_key.len;
     const raw = try alloc.alloc(u8, body_len + 4);
@@ -193,7 +196,7 @@ fn decodeReplayCursor(alloc: Allocator, raw: []const u8) !ReplayCursor {
     const base_applied_sequence = readCheckpointInt(raw, &pos, u64);
     const sequence = readCheckpointInt(raw, &pos, u64);
     const key_len: usize = readCheckpointInt(raw, &pos, u32);
-    if (key_len == 0 or key_len != body_len - pos) return error.InvalidEnrichmentState;
+    if (key_len != body_len - pos) return error.InvalidEnrichmentState;
     return .{
         .base_applied_sequence = base_applied_sequence,
         .sequence = sequence,
@@ -317,6 +320,15 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
         null;
     var status = try decodeRuntimeStatus(raw, retry_count_raw);
     status.output_counts = output_counts;
+    // Separate, hash-bound sidecar keeps older status/aux records readable on
+    // rollback. An older writer changes the primary hash, invalidating it.
+    const admission_key = try std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":admission" });
+    defer alloc.free(admission_key);
+    const admission = txn.get(admission_key) catch |err| if (err == error.NotFound) null else return err;
+    if (admission) |bytes| {
+        if (bytes.len == 12 and std.mem.readInt(u64, bytes[0..8], .little) == std.hash.Wyhash.hash(0x454e525354415455, raw))
+            status.admission_wait_count = std.mem.readInt(u32, bytes[8..12], .little);
+    }
     const detail_key = try std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":error" });
     defer alloc.free(detail_key);
     const detail = txn.get(detail_key) catch |err| switch (err) {
@@ -396,10 +408,18 @@ fn encodeRuntimeAuxSidecar(runtime_status: []const u8, status: RuntimeStatus) [r
 }
 
 pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatus) !void {
-    const key = try runtimeStatusKey(std.heap.page_allocator, scope);
-    defer std.heap.page_allocator.free(key);
-    const retry_count_key = try runtimeRetryCountKey(std.heap.page_allocator, scope);
-    defer std.heap.page_allocator.free(retry_count_key);
+    // Status is saved on the indexing hot path. Keep the four ordinary keys
+    // on the stack; unusually long scopes share a single arena lifetime.
+    var key_buffer: [1024]u8 = undefined;
+    var fixed_keys = std.heap.FixedBufferAllocator.init(&key_buffer);
+    var heap_keys = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer heap_keys.deinit();
+    const key_overhead = 3 * runtime_status_prefix.len + runtime_retry_count_prefix.len + ":admission".len + ":error".len;
+    const key_alloc = if (scope.len <= (key_buffer.len - key_overhead) / 4) fixed_keys.allocator() else heap_keys.allocator();
+    const key = try runtimeStatusKey(key_alloc, scope);
+    defer key_alloc.free(key);
+    const retry_count_key = try runtimeRetryCountKey(key_alloc, scope);
+    defer key_alloc.free(retry_count_key);
     var buf = encodeRuntimeStatus(status);
     var retry_count_buf = encodeRuntimeAuxSidecar(&buf, status);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
@@ -408,8 +428,14 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.put(retry_count_key, &retry_count_buf);
-    const detail_key = try std.mem.concat(std.heap.page_allocator, u8, &.{ runtime_status_prefix, scope, ":error" });
-    defer std.heap.page_allocator.free(detail_key);
+    const admission_key = try std.mem.concat(key_alloc, u8, &.{ runtime_status_prefix, scope, ":admission" });
+    defer key_alloc.free(admission_key);
+    var admission: [12]u8 = undefined;
+    std.mem.writeInt(u64, admission[0..8], std.hash.Wyhash.hash(0x454e525354415455, &buf), .little);
+    std.mem.writeInt(u32, admission[8..12], status.admission_wait_count, .little);
+    try txn.put(admission_key, &admission);
+    const detail_key = try std.mem.concat(key_alloc, u8, &.{ runtime_status_prefix, scope, ":error" });
+    defer key_alloc.free(detail_key);
     var detail: [264]u8 = undefined;
     std.mem.writeInt(u64, detail[0..8], std.hash.Wyhash.hash(0x454e525354415455, &buf), .little);
     const code = status.last_error_code.slice();
@@ -692,4 +718,471 @@ test "enrichment runtime status reads transient extended development record" {
     const loaded = try decodeRuntimeStatus(&raw, null);
     try std.testing.expectEqual(@as(u32, 5), loaded.consecutive_retry_count);
     try std.testing.expectEqual(@as(u32, 2), loaded.retry_failure_count);
+}
+
+test "admission wait budget survives reopen and ignores stale rollback sidecars" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer store.deinit();
+    const status: RuntimeStatus = .{
+        .target_sequence = 10,
+        .retry_failure_fingerprint = 42,
+        .retry_failure_count = 0,
+        .admission_wait_count = 15,
+        .retrying = true,
+    };
+    try saveRuntimeStatus(store, "admission-test", status);
+    const loaded = try loadRuntimeStatus(std.testing.allocator, store, "admission-test");
+    try std.testing.expectEqual(@as(u32, 15), loaded.admission_wait_count);
+    try std.testing.expectEqual(@as(u32, 0), loaded.retry_failure_count);
+    // Simulate an older writer replacing only the legacy primary record.
+    const key = try runtimeStatusKey(std.testing.allocator, "admission-test");
+    defer std.testing.allocator.free(key);
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    var newer = status;
+    newer.retry_failure_fingerprint = 43;
+    const raw = encodeRuntimeStatus(newer);
+    try txn.put(key, &raw);
+    try txn.commit();
+    const rolled_back = try loadRuntimeStatus(std.testing.allocator, store, "admission-test");
+    try std.testing.expectEqual(@as(u32, 0), rolled_back.admission_wait_count);
+    // Long scopes use the heap fallback without truncating any sidecar key.
+    const long_scope = @as([1024]u8, @splat('x'));
+    try saveRuntimeStatus(store, &long_scope, status);
+    const long_loaded = try loadRuntimeStatus(std.testing.allocator, store, &long_scope);
+    try std.testing.expectEqual(@as(u32, 15), long_loaded.admission_wait_count);
+}
+
+test "admission wait budget survives disk close and WAL replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    // Reconstruct both backend and runtime store between every attempt. This
+    // exercises durable sidecars rather than reopening an in-memory view.
+    for (0..17) |attempt| {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer store.deinit();
+        var status = try loadRuntimeStatus(alloc, store, "admission-test");
+        try std.testing.expectEqual(@as(u32, @intCast(attempt)), status.admission_wait_count);
+        try std.testing.expectEqual(@as(u32, 0), status.retry_failure_count);
+        status.target_sequence = 10;
+        status.retry_failure_fingerprint = 42;
+        status.admission_wait_count += 1;
+        status.retrying = true;
+        try saveRuntimeStatus(store, "admission-test", status);
+    }
+}
+
+pub const scoped_retries = @import("scoped_retries.zig");
+const scoped_retry_key = "\x00\x00__metadata__:enrichment_scoped_retries:v1";
+
+pub fn loadScopedRetries(alloc: Allocator, store: anytype) !scoped_retries.State {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(scoped_retry_key) catch |err| if (err == error.NotFound) return .{} else return err;
+    if (!scoped_retries.State.isHeader(raw)) return scoped_retries.State.decode(alloc, raw);
+    var header = try scoped_retries.State.decodeHeader(alloc, raw);
+    errdefer header.state.deinit(alloc);
+    for (header.slots[0..header.count]) |slot| {
+        const bytes = try txn.get(&scopedRetryTicketKey(slot));
+        var ticket = try scoped_retries.State.decodeTicket(alloc, bytes, slot);
+        errdefer ticket.deinit(alloc);
+        try header.state.tickets.append(alloc, ticket);
+    }
+    header.state.markPersisted();
+    return header.state;
+}
+
+fn saveScopedRetries(store: anytype, raw: []const u8) !void {
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(scoped_retry_key, raw);
+    try txn.commit();
+}
+
+const scoped_retry_ticket_prefix = "\x00\x00__metadata__:enrichment_scoped_retry_ticket:v2:";
+fn scopedRetryTicketKey(slot: u8) [scoped_retry_ticket_prefix.len + 1]u8 {
+    var key: [scoped_retry_ticket_prefix.len + 1]u8 = undefined;
+    @memcpy(key[0..scoped_retry_ticket_prefix.len], scoped_retry_ticket_prefix);
+    key[scoped_retry_ticket_prefix.len] = slot;
+    return key;
+}
+const scoped_retry_document_prefix = "\x00\x00__metadata__:enrichment_scoped_retry_document:v1:";
+fn scopedRetryDocumentKey(digest: [32]u8) [scoped_retry_document_prefix.len + 32]u8 {
+    return scoped_retry_document_prefix.* ++ digest;
+}
+pub fn loadScopedRetryDocument(a: Allocator, store: anytype, digest: [32]u8) ![]u8 {
+    var runtime = try initRuntimeStore(a, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(&scopedRetryDocumentKey(digest)) catch |err|
+        return if (err == error.NotFound) error.InvalidEnrichmentState else err;
+    return a.dupe(u8, raw);
+}
+
+/// One ownership-fenced transaction publishes the manifest, changed rows and
+/// retirements. A failed transaction leaves every dirty bit/old slot intact.
+pub fn saveScopedRetryState(a: Allocator, store: anytype, state: *scoped_retries.State, guard: anytype) !void {
+    const prepared = try state.preparePersistence(a, false);
+    defer prepared.deinit(a);
+    var runtime = try initRuntimeStore(a, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try guard.validate(&txn);
+    for (prepared.documents) |document| try txn.put(&scopedRetryDocumentKey(document.digest), document.bytes);
+    for (prepared.rows) |row| try txn.put(&scopedRetryTicketKey(row.slot), row.bytes);
+    for (prepared.removed[0..prepared.removed_len]) |slot| txn.delete(&scopedRetryTicketKey(slot)) catch |err| if (err != error.NotFound) {
+        return err;
+    };
+    for (prepared.removed_documents[0..prepared.removed_document_count]) |digest|
+        txn.delete(&scopedRetryDocumentKey(digest)) catch |err| if (err != error.NotFound) return err;
+    try txn.put(scoped_retry_key, prepared.header);
+    try txn.commit();
+    state.markPersisted();
+    state.releasePersistedDocuments(a);
+}
+
+test "durable enrichment scoped retry references oversized IDs atomically and reclaims unreferenced keys" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-key-references" });
+    defer store.deinit();
+    const Guard = struct {
+        canceled: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const key = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(key);
+    @memset(key, 'x');
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = key, .sequence = 7 }, 10, .{ .fingerprint = 1 }, null);
+    try state.setScanDocument(a, .{ .doc_key = key, .sequence = 7 });
+    {
+        const plan = try state.preparePersistence(a, false);
+        defer plan.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), plan.documents.len);
+        try std.testing.expect(plan.header.len + plan.rows[0].bytes.len < 512);
+    }
+    try std.testing.expectError(error.Canceled, saveScopedRetryState(a, &store, &state, Guard{ .canceled = true }));
+    try std.testing.expectEqual(@as(usize, 1), state.pending_documents.items.len);
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryDocument(a, &store, digest));
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    try std.testing.expectEqual(@as(usize, 0), state.pending_documents.items.len);
+    var restored = try loadScopedRetries(a, &store);
+    defer restored.deinit(a);
+    const Reader = struct {
+        store: *@TypeOf(store),
+        reads: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, id: [32]u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return loadScopedRetryDocument(allocator, self.store, id);
+        }
+    };
+    var reader = Reader{ .store = &store };
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &reader, .get = Reader.get };
+    try std.testing.expectEqual(@as(usize, 0), restored.pending_documents.items.len);
+    const cursor = try restored.scanDocumentAllocWithReferences(a, resolver);
+    defer a.free(cursor);
+    try std.testing.expectEqualSlices(u8, key, cursor);
+    const due = try restored.dueWithReferences(a, 10, resolver, 1);
+    defer due.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+    try std.testing.expectEqualSlices(u8, key, due.groups[0].doc_key);
+    try std.testing.expectEqual(@as(usize, 2), reader.reads);
+    restored.retire(a, due.tokens);
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    // The cursor still protects the same deduplicated key after ticket retirement.
+    const retained = try loadScopedRetryDocument(a, &store, digest);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(u8, key, retained);
+    restored.clearScanDocument(a);
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryDocument(a, &store, digest));
+}
+
+test "durable enrichment scoped retry flushes large identities before exceeding the staging budget" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-key-bounded-flush" });
+    defer store.deinit();
+    const Guard = struct {
+        canceled: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    const Publisher = struct {
+        state: *scoped_retries.State,
+        store: *@TypeOf(store),
+        canceled: bool = false,
+        calls: usize = 0,
+        pub fn save(self: *@This()) !void {
+            self.calls += 1;
+            try saveScopedRetryState(std.testing.allocator, self.store, self.state, Guard{ .canceled = self.canceled });
+        }
+    };
+    var publisher = Publisher{ .state = &state, .store = &store };
+    const first = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(first);
+    @memset(first, 'a');
+    const second = try a.dupe(u8, first);
+    defer a.free(second);
+    second[0] = 'b';
+    const limit = first.len * 2 - 1;
+    try state.parkBounded(a, .{ .doc_key = first, .sequence = 1 }, 10, .{ .fingerprint = 1 }, null, null, null, limit, &publisher);
+    // Repeated identities do not force another publication or retain a copy.
+    try state.parkBounded(a, .{ .doc_key = first, .sequence = 1 }, 10, .{ .fingerprint = 1 }, null, null, null, limit, &publisher);
+    try std.testing.expectEqual(@as(usize, 0), publisher.calls);
+    publisher.canceled = true;
+    try std.testing.expectError(error.Canceled, state.parkBounded(a, .{ .doc_key = second, .sequence = 2 }, 10, .{ .fingerprint = 2 }, null, null, null, limit, &publisher));
+    try std.testing.expectEqual(@as(usize, 1), state.tickets.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_documents.items.len);
+    publisher.canceled = false;
+    try state.parkBounded(a, .{ .doc_key = second, .sequence = 2 }, 10, .{ .fingerprint = 2 }, null, null, null, limit, &publisher);
+    try std.testing.expectEqual(@as(usize, 2), publisher.calls);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_documents.items.len);
+    try std.testing.expectEqualSlices(u8, second, state.pending_documents.items[0].bytes);
+    var restored = try loadScopedRetries(a, &store);
+    defer restored.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), restored.tickets.items.len);
+    try publisher.save();
+    var final = try loadScopedRetries(a, &store);
+    defer final.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), final.tickets.items.len);
+}
+
+test "durable enrichment scoped retry references cannot alias inline IDs and reject corrupted keys" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-key-identity" });
+    defer store.deinit();
+    const Guard = struct {
+        pub fn validate(_: @This(), _: anytype) !void {}
+    };
+    const key = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(key);
+    @memset(key, 'z');
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = key, .sequence = 7 }, 10, .{ .fingerprint = 1 }, null);
+    try state.park(a, .{ .doc_key = &digest, .sequence = 7 }, 10, .{ .fingerprint = 2 }, null);
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    const Reader = struct {
+        store: *@TypeOf(store),
+        reads: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, id: [32]u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return loadScopedRetryDocument(allocator, self.store, id);
+        }
+    };
+    var reader = Reader{ .store = &store };
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &reader, .get = Reader.get };
+    {
+        const due = try state.dueWithReferences(a, 10, resolver, 1);
+        defer due.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+        try std.testing.expectEqualSlices(u8, key, due.groups[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 1), reader.reads);
+        state.retire(a, due.tokens);
+    }
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryDocument(a, &store, digest));
+    {
+        const due = try state.dueWithReferences(a, 10, resolver, 1);
+        defer due.deinit(a);
+        try std.testing.expectEqualSlices(u8, &digest, due.groups[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 1), reader.reads);
+    }
+    try state.park(a, .{ .doc_key = key, .sequence = 8 }, 10, .{ .fingerprint = 3 }, null);
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(&scopedRetryDocumentKey(digest), "corrupt");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidEnrichmentState, state.dueWithReferences(a, 10, resolver, 0));
+}
+
+test "durable enrichment scoped retry persists incremental records and migrates legacy clocks" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-migration" });
+    defer store.deinit();
+    const Guard = struct {
+        pub fn validate(_: @This(), _: anytype) !void {}
+    };
+    const old =
+        \\{"version":1,"scanned_sequence":100,"tickets":[{"document":"ZG9j","sequence":2,"source_digest":null,"deadline_ms":3601000,"revision":1,"budgets":[{"fingerprint":17,"logical_fingerprint":7,"failures":2,"waits":3,"deadline_ms":3601000,"revision":1}]}]}
+    ;
+    try saveScopedRetries(store, old);
+    var migrated = try loadScopedRetries(a, store);
+    defer migrated.deinit(a);
+    try saveScopedRetryState(a, store, &migrated, Guard{});
+    var restored = try loadScopedRetries(a, store);
+    defer restored.deinit(a);
+    try std.testing.expectEqual(@as(u64, 3_601_000), restored.deadline());
+    try std.testing.expectEqual(@as(u32, 2), restored.prior(17).failures);
+    try std.testing.expectEqual(@as(u32, 3), restored.prior(17).waits);
+    try std.testing.expectEqual(@as(u64, 1), restored.appliedThrough(100));
+    const unchanged = try restored.preparePersistence(a, false);
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.rows.len);
+    const due = try restored.due(a, 3_601_000);
+    defer due.deinit(a);
+    const old_slot = restored.tickets.items[0].slot;
+    restored.retire(a, due.tokens);
+    try saveScopedRetryState(a, store, &restored, Guard{});
+    var handle = try initRuntimeStore(a, store);
+    defer handle.deinit();
+    {
+        var read = try handle.store.beginProbe();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&scopedRetryTicketKey(old_slot)));
+    }
+    // Reuse a retired slot. A rejected transaction cannot clear dirty state
+    // or expose a manifest that references an unwritten ticket.
+    try restored.park(a, .{ .doc_key = "replacement", .sequence = 101 }, 9_000_000, .{ .fingerprint = 19, .failures = 1 }, null);
+    try std.testing.expectEqual(old_slot, restored.tickets.items[0].slot);
+    const Reject = struct {
+        pub fn validate(_: @This(), _: anytype) !void {
+            return error.FenceLost;
+        }
+    };
+    try std.testing.expectError(error.FenceLost, saveScopedRetryState(a, store, &restored, Reject{}));
+    try std.testing.expect(restored.tickets.items[0].dirty);
+    var still_empty = try loadScopedRetries(a, store);
+    defer still_empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), still_empty.tickets.items.len);
+    try saveScopedRetryState(a, store, &restored, Guard{});
+    var reused = try loadScopedRetries(a, store);
+    defer reused.deinit(a);
+    try std.testing.expectEqual(@as(u64, 9_000_000), reused.deadline());
+    try std.testing.expectEqual(@as(u32, 1), reused.prior(19).failures);
+}
+
+test "privacy replay cursor preserves an empty document identifier" {
+    const a = std.testing.allocator;
+    const raw = try encodeReplayCursor(a, .{ .base_applied_sequence = 1, .sequence = 2, .doc_key = @constCast("") });
+    defer a.free(raw);
+    var decoded = try decodeReplayCursor(a, raw);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("", decoded.doc_key);
+    try std.testing.expectEqual(@as(u64, 2), decoded.sequence);
+}
+
+test "durable enrichment scoped retry drains configuration replans across bounded pages and restart" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-replan-pages" });
+    defer store.deinit();
+    const Guard = struct {
+        canceled: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const Reader = struct {
+        fn get(_: *anyopaque, _: Allocator, _: [32]u8) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var marker: u8 = 0;
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &marker, .get = Reader.get };
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    // A full queue prevents fresh discovery from masking missed replans.
+    const future = 3_600_000;
+    for (0..scoped_retries.max_documents) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "doc-{d}", .{i});
+        try state.park(a, .{ .doc_key = key, .sequence = i + 1 }, future, .{ .fingerprint = i + 1, .logical_fingerprint = i + 1, .failures = 2, .waits = 3 }, null);
+    }
+    state.config_hash = 2;
+    state.beginReplan();
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    var visited: std.StaticBitSet(scoped_retries.max_documents) = .empty;
+    for (0..scoped_retries.max_documents) |page| {
+        // Reload every page: the new configuration hash and pending work must
+        // survive independently of the original config_changed stack frame.
+        var restored = try loadScopedRetries(a, &store);
+        defer restored.deinit(a);
+        try std.testing.expectEqual(@as(u64, 2), restored.config_hash);
+        try std.testing.expectEqual(@as(u64, 0), restored.deadline());
+        const due = try restored.dueWithReferences(a, 0, resolver, 1);
+        defer due.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+        try std.testing.expectEqual(@as(usize, 0), due.tokens.len);
+        const index: usize = @intCast(due.groups[0].sequence - 1);
+        try std.testing.expect(!visited.isSet(index));
+        visited.set(index);
+        restored.completeReplan(due);
+        // Even an immediately due producer in a completed page cannot starve
+        // the rest of the finite replan inventory.
+        restored.tickets.items[index].deadline_ms = 0;
+        restored.tickets.items[index].budgets.items[0].deadline_ms = 0;
+        restored.tickets.items[index].dirty = true;
+        if (page == 0) {
+            try std.testing.expectError(error.Canceled, saveScopedRetryState(a, &store, &restored, Guard{ .canceled = true }));
+            var unchanged = try loadScopedRetries(a, &store);
+            defer unchanged.deinit(a);
+            try std.testing.expectEqual(@as(usize, scoped_retries.max_documents), unchanged.pending_replan.count());
+        }
+        try saveScopedRetryState(a, &store, &restored, Guard{});
+    }
+    try std.testing.expectEqual(@as(usize, scoped_retries.max_documents), visited.count());
+    var final = try loadScopedRetries(a, &store);
+    defer final.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), final.pending_replan.count());
+    for (final.tickets.items) |*ticket| {
+        ticket.deadline_ms = future;
+        ticket.budgets.items[0].deadline_ms = future;
+    }
+    try std.testing.expectEqual(@as(u64, future), final.deadline());
+    for (final.tickets.items) |ticket| {
+        try std.testing.expectEqual(@as(u32, 2), ticket.budgets.items[0].failures);
+        try std.testing.expectEqual(@as(u32, 3), ticket.budgets.items[0].waits);
+    }
+    const waiting = try final.dueWithReferences(a, 0, resolver, 1);
+    defer waiting.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), waiting.groups.len);
+    // A later change must rearm all slots, including completed earlier pages.
+    final.beginReplan();
+    final.removeTicket(a, 0);
+    try std.testing.expectEqual(@as(usize, scoped_retries.max_documents - 1), final.pending_replan.count());
+    try final.park(a, .{ .doc_key = "new", .sequence = 1000 }, future, .{ .fingerprint = 1000 }, null);
+    try std.testing.expect(!final.pending_replan.isSet(final.tickets.items[final.tickets.items.len - 1].slot));
 }

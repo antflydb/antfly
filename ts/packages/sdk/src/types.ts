@@ -6,6 +6,35 @@
 import type { components, operations } from "./public-api.js";
 import type { components as QueryComponents } from "./query.js";
 
+export type GraphQueryRequest = Omit<
+  components["schemas"]["GraphQueryRequest"],
+  "parameters" | "typed_parameters"
+> & {
+  parameters?: Record<string, import("./graph-wire.js").GraphData>;
+  typed_parameters?: import("./graph-wire.js").GraphValue;
+};
+export type GraphQueryResult = Omit<components["schemas"]["GraphQueryResult"], "rows" | "stats"> & {
+  rows: import("./graph-wire.js").GraphValue[][];
+  stats: {
+    scanned_anchors?: number;
+    explored_edges?: number;
+    intermediate_states?: number;
+    mutations?: number;
+    search_calls?: number;
+    search_candidates?: number;
+    search_approximate?: boolean;
+    memory_bytes?: number;
+  };
+};
+
+export type GraphWriteReceipt = components["schemas"]["GraphWriteReceipt"];
+export type GraphWriteStatus = components["schemas"]["TransactionSessionStatus"];
+export type GraphQueryStats = components["schemas"]["GraphQueryStats"];
+export type GraphCatalogEntry = components["schemas"]["GraphCatalogEntry"];
+export type GraphDefinition = components["schemas"]["GraphDefinition"];
+export type GraphLabelMapping = components["schemas"]["GraphLabelMapping"];
+export type GraphRelationshipMapping = components["schemas"]["GraphRelationshipMapping"];
+
 // Antfly Query type for type-safe query construction
 export type AntflyQuery = QueryComponents["schemas"]["Query"];
 
@@ -553,6 +582,10 @@ export interface AntflyConfig {
   auth?: AntflyAuth;
 }
 
+export type AgentContextManagement = components["schemas"]["AgentContextManagement"];
+export type AgentContextEvent = components["schemas"]["AgentContextEvent"];
+export type AgentContextDiagnostics = components["schemas"]["AgentContextDiagnostics"];
+
 // Retrieval Agent types
 export type RetrievalNavigationConfig = components["schemas"]["RetrievalNavigationConfig"];
 export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest"];
@@ -563,6 +596,7 @@ export type SSEToolMode = components["schemas"]["SSEToolMode"];
 
 // Retrieval Agent streaming callbacks for structured SSE events
 export interface RetrievalAgentStreamCallbacks {
+  onContextManagement?: (event: AgentContextEvent) => void;
   onClassification?: (data: ClassificationTransformationResult) => void;
   onReasoning?: (chunk: string) => void;
   onHit?: (hit: QueryHit) => void;
@@ -627,6 +661,7 @@ export interface ResearchSectionProgress {
 
 // Research Agent streaming callbacks for structured SSE events
 export interface ResearchAgentStreamCallbacks {
+  onContextManagement?: (event: AgentContextEvent) => void;
   onStepStarted?: (step: SSEStepStarted) => void;
   onPlan?: (plan: ResearchPlanProgress) => void;
   onSubQuestionStarted?: (event: ResearchSubQuestionStartedProgress) => void;
@@ -785,3 +820,15 @@ export type ResolverWait = components["schemas"]["ResolverWait"];
 
 export type EntityConsumerProgressPage = components["schemas"]["EntityConsumerProgressPage"];
 export type EntityNamespaceOutcome = components["schemas"]["EntityNamespaceOutcome"];
+
+// Table privacy policies and inspection contracts.
+export type PrivacyProducer = components["schemas"]["PrivacyProducer"];
+export type PrivacyCategory = components["schemas"]["PrivacyCategory"];
+export type PrivacyPolicy = components["schemas"]["PrivacyPolicy"];
+export type PrivacyFinding = components["schemas"]["PrivacyFinding"];
+export type PrivacyStatus = components["schemas"]["PrivacyStatus"];
+export type PrivacyPreviewRequest = components["schemas"]["PrivacyPreviewRequest"];
+export type PrivacyPreview = components["schemas"]["PrivacyPreview"];
+export type PrivacyScanRequest = components["schemas"]["PrivacyScanRequest"];
+export type PrivacyScan = components["schemas"]["PrivacyScan"];
+export type PrivacyFindingsPage = components["schemas"]["PrivacyFindingsPage"];

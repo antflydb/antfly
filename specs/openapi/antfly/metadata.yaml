@@ -55,6 +55,9 @@ servers:
   - url: /db/v1
     description: Main API server
 tags:
+  - name: table_privacy
+    x-displayName: Table Privacy
+    description: Table policies, bounded previews, durable inspection scans and source-bound findings. Privacy inspection and configuration require table administration permission.
   - name: resolver_curation
     description: Durable resolver identity correction, suppression, review and replay.
   - name: getting_started
@@ -1251,6 +1254,28 @@ components:
       schema:
         type: string
   schemas:
+    PrivacyProducer:
+      $ref: "privacy.yaml#/components/schemas/PrivacyProducer"
+    PrivacyCategory:
+      $ref: "privacy.yaml#/components/schemas/PrivacyCategory"
+    PrivacyPolicy:
+      $ref: "privacy.yaml#/components/schemas/PrivacyPolicy"
+    PrivacyFinding:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFinding"
+    PrivacyStatus:
+      $ref: "privacy.yaml#/components/schemas/PrivacyStatus"
+    PrivacyPreviewRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyPreviewRequest"
+    PrivacyPreview:
+      $ref: "privacy.yaml#/components/schemas/PrivacyPreview"
+    PrivacyScanRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"
+    PrivacyScan:
+      $ref: "privacy.yaml#/components/schemas/PrivacyScan"
+    PrivacyFindingsRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"
+    PrivacyFindingsPage:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"
     LakeCatalogCreateRequest:
       type: object
       additionalProperties: false
@@ -3779,6 +3804,36 @@ components:
           description: Effective repair limit.
         result:
           $ref: "#/components/schemas/TableRepairRunResult"
+        remaining_failures:
+          type: array
+          description: Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes.
+          items:
+            $ref: "#/components/schemas/RepairRemainingFailure"
+        remaining_failures_truncated:
+          type: boolean
+          description: Whether more repair issues exist than the summary scanned.
+    RepairRemainingFailure:
+      type: object
+      description: A group of documents whose repair still fails with the same error.
+      required: [error_code, count, attempts, transient, hint]
+      properties:
+        error_code:
+          type: string
+          description: Error recorded for the documents, for example `ModelNotFound`.
+        count:
+          type: integer
+          format: uint64
+          description: Number of documents in this group.
+        attempts:
+          type: integer
+          format: uint64
+          description: Highest repair attempt count among the group's documents.
+        transient:
+          type: boolean
+          description: Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds.
+        hint:
+          type: string
+          description: What to do next.
     TableRepairJobStartRequest:
       type: object
       description: Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
@@ -3868,8 +3923,13 @@ components:
           description: Table being repaired.
         phase:
           type: string
-          enum: [queued, running, succeeded, failed, cancelled]
-          description: Lifecycle phase of the repair job.
+          enum: [queued, running, succeeded, completed_with_failures, failed, cancelled]
+          description: |
+            Lifecycle phase of the repair job. `completed_with_failures` means every
+            pass ran but some documents still fail; `remaining_failures` says why
+            and what to do, and running repair again retries them. `failed` means
+            the job itself could not run, for example an invalid request or a
+            stale control fence.
         repair_status:
           type: string
           enum: [in_progress, complete, debt_remaining, stopped]
@@ -3924,6 +3984,14 @@ components:
           type: integer
           format: uint64
           description: Unix epoch milliseconds when the job is eligible for cleanup.
+        remaining_failures:
+          type: array
+          description: Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues.
+          items:
+            $ref: "#/components/schemas/RepairRemainingFailure"
+        remaining_failures_truncated:
+          type: boolean
+          description: Whether more repair issues exist than the summary scanned.
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -5006,6 +5074,10 @@ components:
           items:
             type: string
           description: Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
+        exclude_null:
+          type: boolean
+          default: false
+          description: Exclude explicit nulls from terms grouping keys (including array elements). Missing fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use the same non-null dimension model.
         size:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -5027,6 +5099,21 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Fixed interval for histogram aggregations
+        date_bounds:
+          type: object
+          additionalProperties: false
+          required: [start, end]
+          description: Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets per histogram and 100000 generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are supported with these bounds.
+          properties:
+            start: {type: string, format: date-time}
+            end: {type: string, format: date-time}
+        fixed_interval:
+          type: string
+          description: Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
+        bucket_origin:
+          type: string
+          format: date-time
+          description: RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries and reject this field.
         calendar_interval:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -5129,7 +5216,7 @@ components:
       properties:
         value:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
@@ -5142,7 +5229,7 @@ components:
             (false). Absent for non-cardinality aggregations.
         relative_error:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: >-
@@ -5154,43 +5241,43 @@ components:
           description: Document count for stats aggregations
         min:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Minimum value for stats aggregations
         max:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Maximum value for stats aggregations
         sum:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Sum for stats aggregations
         sum_of_squares:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Sum of squares for stats aggregations
         avg:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Average for stats aggregations
         std_deviation:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Standard deviation for stats aggregations
         variance:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Variance for stats aggregations
@@ -7989,6 +8076,115 @@ components:
             documents and/or generated response. Requires steps.generation for
             generation-quality evaluators (faithfulness, completeness, etc.).
 
+    AgentContextEvent:
+      type: object
+      required: [diagnostics, counting_method, latency_ms]
+      properties:
+        counting_method:
+          type: string
+        latency_ms:
+          type: integer
+          format: int64
+        summary_provider:
+          type: string
+        summary_model:
+          type: string
+        diagnostics:
+          $ref: "#/components/schemas/AgentContextDiagnostics"
+    AgentContextDiagnostics:
+      type: object
+      description: Summary usage is separate from destination generation usage; retries are always zero.
+      properties:
+        contract_version:
+          type: integer
+          format: int64
+        original_input_tokens:
+          type: integer
+          format: int64
+        effective_input_tokens:
+          type: integer
+          format: int64
+        retained_messages:
+          type: integer
+          format: int64
+        compacted_messages:
+          type: integer
+          format: int64
+        batches:
+          type: integer
+          format: int64
+        retries:
+          type: integer
+          format: int64
+        summary_input_tokens:
+          type: integer
+          format: int64
+        summary_output_tokens:
+          type: integer
+          format: int64
+
+    AgentContextManagement:
+      type: object
+      description: |
+        Opt-in conversation/evidence preparation before agent model calls. The
+        summarizer uses the same GeneratorConfig, secrets and provider dispatch
+        as generation; omitted summarizer inherits the effective generator
+        (the first link when a chain is configured). Summary calls have no
+        fallback or retries and consume the agent's model-call budget.
+        A remote summarizer receives the selected conversation and tool evidence.
+        Input accounting conservatively charges serialized UTF-8 bytes plus
+        framing and tool schemas. Configure windows supported by both models.
+        Failure returns a typed error without replacing authoritative history.
+        Derived memory is request-local; continuations supply authoritative
+        history/research_state and are prepared again. This does not alter KV caches.
+      required: [context_window_tokens]
+      properties:
+        mode:
+          type: string
+          enum: [inspect, reject, window, compact]
+          default: compact
+          description: Inspect only reports; reject fails oversized prompts; window drops eligible exchanges; compact summarizes them.
+        context_window_tokens:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          description: Destination model capacity including reserved generation output.
+        target_input_tokens:
+          type: integer
+          minimum: 1
+          description: Compaction threshold and final input ceiling; defaults to context_window_tokens minus reserved_output_tokens.
+        reserved_output_tokens:
+          type: integer
+          minimum: 1
+          default: 4000
+          description: Must cover every destination generator's configured output limit.
+        keep_recent_turns:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          minimum: 0
+          maximum: 4096
+          default: 2
+          description: Prior completed user turns retained verbatim. Current question, most recent exchange and open tool transactions are always retained.
+        summarizer:
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+        summarizer_context_window_tokens:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          default: 8192
+          description: Independent summary capacity, including instructions, schema, prior memory, one complete exchange and summary output.
+        summary_output_tokens:
+          type: integer
+          minimum: 1
+          maximum: 32768
+          default: 1024
+        max_summary_batches:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 8
+          description: Maximum summary calls per preparation. No automatic retries or provider fallback.
+
     RetrievalAgentRequest:
       type: object
       description: |
@@ -8012,6 +8208,8 @@ components:
         - query
         - queries
       properties:
+        context_management:
+          $ref: "#/components/schemas/AgentContextManagement"
         query:
           type: string
           description: User's natural language query
@@ -8156,6 +8354,11 @@ components:
         - hits
         - status
       properties:
+        context_management:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentContextEvent"
+          description: Per-model-call preparation diagnostics, also emitted as context_management SSE events.
         id:
           type: string
           description: Unique response ID for logging and tracing
@@ -8828,6 +9031,8 @@ components:
         - query
         - queries
       properties:
+        context_management:
+          $ref: "#/components/schemas/AgentContextManagement"
         query:
           type: string
           description: The research question.
@@ -8902,6 +9107,11 @@ components:
         - status
         - research_state
       properties:
+        context_management:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentContextEvent"
+          description: Per-model-call preparation diagnostics, also emitted as context_management SSE events.
         id:
           type: string
           description: Unique response ID.
@@ -9286,7 +9496,14 @@ components:
     HierarchyChildParent:
       type: object
       additionalProperties: false
-      required: [level, id]
+      required: [level]
+      not:
+        anyOf:
+          - required: [id, ids]
+          - not:
+              anyOf:
+                - required: [id]
+                - required: [ids]
       properties:
         level:
           type: string
@@ -9294,20 +9511,56 @@ components:
         id:
           type: string
           minLength: 1
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Bounded source selection for member traversal; unit traversal requires id.
 
     HierarchyChildren:
       type: object
       additionalProperties: false
       required: [parent, level]
+      not:
+        anyOf:
+          - required: [artifact]
+            properties:
+              level:
+                enum: [unit]
+          - properties:
+              level:
+                enum: [unit]
+              parent:
+                not:
+                  required: [id]
+          - properties:
+              level:
+                enum: [member]
+            not:
+              required: [artifact]
       properties:
         parent:
           $ref: "#/components/schemas/HierarchyChildParent"
         level:
           type: string
-          enum: [unit]
+          enum: [unit, member]
           description: |
             Child level to enumerate. Unit traversal reads the versioned extraction
             hierarchy rather than a relevance index, so empty and failed units are included.
+            Member traversal requires artifact and seeks that producer's native storage
+            prefixes within the selected source or parent.ids batch (up to 100).
+            One global cursor orders the selected members; it includes generic assets and chunks.
+            Scalar member payloads are returned as {"$": value} in _source so
+            every query hit retains an object-shaped projection. Continuation
+            requires the remote_snapshot returned with the first page.
+        artifact:
+          type: string
+          minLength: 1
+          description: Producer name; required for member traversal and omitted for unit traversal.
 
     HierarchyChildrenOrderBy:
       type: array
@@ -9361,7 +9614,9 @@ components:
 
         `children` is a separate sequential-browsing operation. It enumerates every unit
         in the selected source revision, including units with no searchable chunk, and uses
-        the top-level `_sort`/`search_after` cursor contract.
+        the top-level `_sort`/`search_after` cursor contract. For member traversal,
+        `filter_query` applies to source parents before any artifact enumeration;
+        it never filters member payloads or changes the member pagination order.
 
         Ancestor and nested-match field projections are always explicit to keep response
         size predictable. The presence of this object selects the canonical contract:
@@ -9570,12 +9825,17 @@ components:
                     required: [group_by]
               - not:
                   required: [fields]
-          - description: Hierarchy child traversal requires an explicit top-level field projection.
+          - description: Unit child traversal requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
                 properties:
                   hierarchy:
                     required: [children]
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum: [unit]
               - not:
                   required: [fields]
           - description: Hierarchy child traversal requires its revision-bound ascending position order.
@@ -9629,7 +9889,18 @@ components:
                   - required: [order_by]
                   - required: [search_after]
                   - required: [search_before]
-          - description: Relevance, filtering, backward/offset pagination, and result transforms do not apply to sequential child traversal.
+          - description: Unit traversal has no public source-filter admission contract.
+            allOf:
+              - required: [filter_query, hierarchy]
+                properties:
+                  hierarchy:
+                    required: [children]
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum: [unit]
+          - description: Relevance, backward/offset pagination, and result transforms do not apply to sequential child traversal.
             allOf:
               - required: [hierarchy]
                 properties:
@@ -9639,7 +9910,6 @@ components:
                   - required: [query]
                   - required: [full_text_search]
                   - required: [full_text_index]
-                  - required: [filter_query]
                   - required: [exclusion_query]
                   - required: [semantic_search]
                   - required: [embedding_template]
@@ -9904,6 +10174,21 @@ components:
             When omitted, Antfly uses the balanced default effort (`0.5`) unless
             lower-level vector search overrides are provided internally.
           example: 0.5
+        select:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: "#/components/schemas/ProjectionExpression"
+          x-zig-type: std.json.Value
+          x-go-type-skip-optional-pointer: false
+          description: Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+        params:
+          type: object
+          additionalProperties: true
+          x-zig-type: std.json.Value
+          x-go-type-skip-optional-pointer: false
+          description: Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
         fields:
           x-go-type-skip-optional-pointer: false
           type: array
@@ -10311,6 +10596,150 @@ components:
           type: string
           default: deleted
           description: Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+    GraphWireValue:
+      type: object
+      additionalProperties: false
+      required: [type, value]
+      description: Version 1 graph value. INTEGER payloads are signed decimal strings. Map payloads contain typed values, keeping user keys distinct from type tags. Entity identities are opaque table-qualified handles.
+      properties:
+        type:
+          type: string
+          enum: ["null", boolean, integer, number, string, list, map, node, relationship, path]
+        value:
+          description: Type-specific payload; nested collections and entity properties contain GraphWireValue values.
+    GraphQueryLimits:
+      type: object
+      additionalProperties: false
+      properties:
+        memory_bytes: {type: integer, minimum: 0}
+        scanned_anchors: {type: integer, minimum: 0}
+        explored_edges: {type: integer, minimum: 0}
+        intermediate_states: {type: integer, minimum: 0}
+        path_depth: {type: integer, minimum: 0}
+        recursion_depth: {type: integer, minimum: 0}
+    GraphQueryRequest:
+      type: object
+      additionalProperties: false
+      required: [query]
+      properties:
+        query: {type: string, minLength: 1, maxLength: 1048576}
+        write_request_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Client-generated native transaction ID for write recovery after cancellation or a lost response. Reusing an admitted ID is rejected; inspect its transaction status instead of replaying the statement.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: Ordinary JSON parameters. Mutually exclusive with typed_parameters.
+        typed_parameters:
+          $ref: '#/components/schemas/GraphWireValue'
+          description: A map GraphWireValue containing lossless data parameters; graph entity parameters are rejected. Mutually exclusive with parameters.
+        limits:
+          $ref: '#/components/schemas/GraphQueryLimits'
+    GraphQueryResult:
+      type: object
+      required: [wire_version, columns, rows, plan, stats, graph_incarnation, graph_revision, complete]
+      properties:
+        wire_version: {type: integer, enum: [1]}
+        columns:
+          type: array
+          items: {type: string}
+        rows:
+          type: array
+          items:
+            type: array
+            items: {$ref: '#/components/schemas/GraphWireValue'}
+        plan:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        stats:
+          $ref: '#/components/schemas/GraphQueryStats'
+        commit:
+          $ref: '#/components/schemas/GraphWriteReceipt'
+        read_only: {type: boolean, description: Whether the compiled statement has no mutation clauses; EXPLAIN also reports the underlying statement capability.}
+        graph_incarnation: {type: string}
+        graph_revision: {type: string}
+        complete: {type: boolean}
+    GraphQueryStats:
+      type: object
+      additionalProperties: false
+      properties:
+        scanned_anchors: {type: integer, minimum: 0}
+        explored_edges: {type: integer, minimum: 0}
+        intermediate_states: {type: integer, minimum: 0}
+        mutations: {type: integer, minimum: 0}
+        memory_bytes: {type: integer, minimum: 0}
+        search_calls: {type: integer, minimum: 0}
+        search_candidates: {type: integer, minimum: 0}
+        search_approximate: {type: boolean}
+    GraphWriteReceipt:
+      type: object
+      required: [transaction_id, status]
+      properties:
+        transaction_id: {type: string, description: Native durable transaction identity; never replay a statement after an ambiguous write response.}
+        status:
+          type: string
+          enum: [committed, committed_pending, committed_repair_required, aborted, unknown]
+        outcome:
+          type: object
+          nullable: true
+          additionalProperties: true
+    GraphCatalogEntry:
+      type: object
+      required: [graph_id, name, revision, definition]
+      properties:
+        graph_id: {type: string, description: Opaque decimal catalog identity}
+        revision: {type: string, pattern: '^[1-9][0-9]*$', description: Lossless decimal definition revision used for conditional updates}
+        name: {type: string}
+        definition: {$ref: '#/components/schemas/GraphDefinition'}
+    GraphDefinitionUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, definition]
+      properties:
+        expected_revision: {type: string, pattern: '^[1-9][0-9]*$'}
+        definition: {$ref: '#/components/schemas/GraphDefinition'}
+    GraphDefinition:
+      type: object
+      additionalProperties: false
+      required: [labels]
+      properties:
+        labels:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: {$ref: '#/components/schemas/GraphLabelMapping'}
+        relationships:
+          type: array
+          maxItems: 64
+          items: {$ref: '#/components/schemas/GraphRelationshipMapping'}
+    GraphLabelMapping:
+      type: object
+      additionalProperties: false
+      required: [name, table]
+      properties:
+        name: {type: string, minLength: 1}
+        table:
+          description: A literal default.public table name or an explicitly scoped table target. Bindings retain the physical table incarnation through renames.
+          oneOf:
+            - {type: string, minLength: 1}
+            - {$ref: '#/components/schemas/CatalogTableTarget'}
+        where:
+          type: object
+          additionalProperties: true
+          description: Equality predicates defining this label over stored document properties.
+    GraphRelationshipMapping:
+      type: object
+      additionalProperties: false
+      required: [name, index, source_label, target_label, stored_type]
+      properties:
+        name: {type: string, minLength: 1}
+        index: {type: string, minLength: 1}
+        source_label: {type: string, minLength: 1}
+        target_label: {type: string, minLength: 1}
+        stored_type: {type: string, minLength: 1}
     SavedQuerySource:
       type: object
       required: [source_id, name, source]
@@ -10494,6 +10923,10 @@ components:
         Detailed execution profiling for a query. Present in the response
         when the request sets `profile: true`.
       properties:
+        aggregation_execution:
+          type: string
+          description: Aggregation execution path, such as materialized_temporal or scan. Present when the executor reports it.
+
         value_verification:
           type: object
           description: Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
@@ -10980,6 +11413,12 @@ components:
           x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
+        revision:
+          type: string
+          description: Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+        derivation_revision:
+          type: string
+          description: Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
         source:
           $ref: "#/components/schemas/HierarchyArtifactSource"
 
@@ -11187,6 +11626,81 @@ components:
           type: integer
           format: int64
           description: Published graph metric score generation used for this hit.
+    ProjectionExpression:
+      type: object
+      x-zig-type: std.json.Value
+      x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: |
+        Exactly one expression node: literal, field, ref, param, call with args,
+        case with optional else, cast, or a binary operator. Pure expressions
+        lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider
+        calls remain in evaluate, never execute implicitly in select.
+        value_identity(field) returns an opaque identity for a present logical
+        value (including JSON null); missing has no identity. is_missing(field)
+        distinguishes missing from present null. Identity reads require the same
+        authorization and retained source revision as value reads. Metadata may
+        accelerate them; unsupported/old metadata falls back to ordinary reads.
+        Untaken CASE branches do not load fields or evaluate erroring calls.
+        Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
+        is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
+        Expressions are limited to depth 64 including referenced aliases, and
+        8192 nodes per request. Alias dependencies are acyclic; each alias is a
+        requested output and is evaluated once per row.
+      properties:
+        literal:
+          x-go-type: json.RawMessage
+        field:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: Logical source path. Dots traverse objects; numeric array components select an original index (items.1.name), and named components traverse arrays collecting present values (items.name). Nested user keys such as metadata._type are allowed. Internal root fields are reserved except _id.
+        ref: {type: string, minLength: 1, maxLength: 1024}
+        param: {type: string, minLength: 1, maxLength: 1024}
+        call:
+          type: string
+          description: Public pure SQL scalar function name, including value_identity and is_missing. Internal and provider-backed functions are forbidden.
+        args:
+          type: array
+          maxItems: 64
+          items: {$ref: "#/components/schemas/ProjectionExpression"}
+        case:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: object
+            additionalProperties: false
+            required: [when, then]
+            properties:
+              when: {$ref: "#/components/schemas/ProjectionExpression"}
+              then: {$ref: "#/components/schemas/ProjectionExpression"}
+        else:
+          $ref: "#/components/schemas/ProjectionExpression"
+          x-go-type-skip-optional-pointer: false
+        cast:
+          type: object
+          x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          required: [type, expression]
+          properties:
+            type: {type: string, enum: [string, integer, number, boolean, json, datetime]}
+            expression: {$ref: "#/components/schemas/ProjectionExpression"}
+        eq: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        neq: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        lt: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        lte: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        gt: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        gte: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        is_distinct_from: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        is_not_distinct_from: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        and: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        or: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        add: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        subtract: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        multiply: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        divide: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        concat: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
     QueryHit:
       type: object
       description: A single query result hit
@@ -11200,6 +11714,7 @@ components:
 
         _computed:
           type: object
+          x-zig-type: raw_json_object
           additionalProperties: true
           description: Named query-time computed values, separate from stored source.
         _id:
@@ -11408,6 +11923,9 @@ components:
         remote_snapshot:
           type: string
           description: Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
+        live_read:
+          type: boolean
+          description: True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
         evaluation:
           type: object
           additionalProperties: true
@@ -12292,6 +12810,522 @@ components:
               - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
+  /tables/{tableName}/privacy:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getTablePrivacy
+      summary: Read table privacy policy and coverage
+      responses:
+        "200":
+          description: Read table privacy policy and coverage
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    put:
+      tags: [table_privacy]
+      operationId: putTablePrivacy
+      summary: Apply table privacy policy
+      parameters:
+        - name: If-Match
+          in: header
+          schema: {type: string}
+          description: Required exact ETag when replacing an existing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPolicy"}
+      responses:
+        "202":
+          description: Apply table privacy policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/preview:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: previewTablePrivacy
+      summary: Inspect a bounded sample without saving the policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreviewRequest"}
+      responses:
+        "200":
+          description: Inspect a bounded sample without saving the policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreview"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/scans:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: startTablePrivacyScan
+      summary: Start a durable privacy rescan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"}
+      responses:
+        "202":
+          description: Start a durable privacy rescan
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Sixteen scans are active; retry after one finishes. Active scans are never evicted to admit a later request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/scans/{scanId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: scanId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getTablePrivacyScan
+      summary: Read privacy scan progress
+      responses:
+        "200":
+          description: Read privacy scan progress
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/findings:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: listTablePrivacyFindings
+      summary: List current privacy findings
+      parameters:
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: document
+          in: query
+          schema: {type: string}
+        - name: field
+          in: query
+          schema: {type: string}
+        - name: category
+          in: query
+          schema: {type: string}
+        - name: policy_version
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: queryTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
   /tables/{tableName}/lake/catalog:
     parameters:
       - name: tableName
@@ -12370,7 +13404,7 @@ paths:
       operationId: ingestLakeChanges
       tags: [table_management]
       summary: ingestLakeChanges
-      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
       requestBody:
         required: true
         content:
@@ -12777,7 +13811,7 @@ paths:
           description: Requires the connection capability `models.<operation>`.
           schema:
             type: string
-            enum: [embed, generate, rerank, chunk, extract, rewrite, read, transcribe]
+            enum: [embed, generate, rerank, chunk, extract, rewrite, read, dictate]
       requestBody:
         required: true
         content:
@@ -13257,6 +14291,34 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /transactions/{transaction_id}/status:
+    get:
+      summary: Inspect your transaction receipt
+      description: |
+        Returns outcome and lease metadata for a transaction bound to the
+        authenticated principal. This endpoint never returns staged documents,
+        table names, keys, read snapshots, or execution plans. The creator can
+        inspect the outcome after table permissions are revoked or a table is
+        dropped. A missing, expired, or other principal's receipt returns 404;
+        absence does not establish that a mutation aborted or permit replay.
+      tags:
+        - data_operations
+      operationId: getTransactionStatus
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "200":
+          description: Principal-bound transaction status without row data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionSessionStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /transactions/{transaction_id}/stage:
@@ -16931,6 +17993,136 @@ paths:
           description: Source dropped
         "404":
           $ref: '#/components/responses/NotFound'
+
+  /graphs:
+    get:
+      summary: List graphs
+      tags: [table_management]
+      operationId: listGraphs
+      responses:
+        "200":
+          description: Immutable graph definitions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GraphCatalogEntry'
+  /graphs/{graphName}:
+    parameters:
+      - name: graphName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+    get:
+      summary: Get graph
+      tags: [table_management]
+      operationId: getGraph
+      responses:
+        "200":
+          description: Graph definition and immutable incarnation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphCatalogEntry'
+        "404":
+          $ref: '#/components/responses/NotFound'
+    post:
+      summary: Create graph
+      description: Creates a graph mapping over existing tables and graph indexes. Reads require permission on the graph and every input table. Definition updates use conditional revisions; existing cursors retain their captured definition.
+      tags: [table_management]
+      operationId: createGraph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphDefinition'
+      responses:
+        "201":
+          description: Graph created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphCatalogEntry'
+        "202":
+          description: Committed with visibility pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "409":
+          description: Graph already exists
+    put:
+      summary: Update graph definition
+      description: Atomically replaces mappings when expected_revision matches. Requires graph administration and read permission on every new input table. The graph incarnation is preserved and the definition revision advances; stale prepared plans must be prepared again.
+      tags: [table_management]
+      operationId: updateGraph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GraphDefinitionUpdate'}
+      responses:
+        "200":
+          description: Graph definition updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GraphCatalogEntry'}
+        "202":
+          description: Committed with visibility pending
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CatalogMutationVisibilityPending'}
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "403":
+          description: Graph administration or mapped-table read permission denied
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Expected definition revision or dependency incarnation changed
+    delete:
+      summary: Drop graph
+      tags: [table_management]
+      operationId: dropGraph
+      responses:
+        "204":
+          description: Graph dropped
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /graphs/{graphName}/query:
+    parameters:
+      - name: graphName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+    post:
+      summary: Execute Cypher against a named graph
+      description: Executes an authenticated statement under the graph definition and each underlying table's permissions and row policies. Resource budgets fail explicitly. EXPLAIN binds without reading rows. Results use the lossless version 1 graph wire format.
+      tags: [query_operations]
+      operationId: executeGraphQuery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GraphQueryRequest'}
+      responses:
+        "200":
+          description: Complete graph query result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GraphQueryResult'}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {description: Authentication required}
+        "403": {description: Graph or underlying table access denied}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {description: "Catalog or policy generation changed, or a write conflicted"}
+        "429": {description: Query capacity or resource budget exhausted}
+        "503": {description: Required owner unavailable}
 
   /tablespaces:
     get:
@@ -21000,3 +22192,564 @@ paths:
           description: Revision or terminal decision conflict
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getNamespaceTablePrivacy
+      summary: Read table privacy policy and coverage
+      responses:
+        "200":
+          description: Read table privacy policy and coverage
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    put:
+      tags: [table_privacy]
+      operationId: putNamespaceTablePrivacy
+      summary: Apply table privacy policy
+      parameters:
+        - name: If-Match
+          in: header
+          schema: {type: string}
+          description: Required exact ETag when replacing an existing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPolicy"}
+      responses:
+        "202":
+          description: Apply table privacy policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: previewNamespaceTablePrivacy
+      summary: Inspect a bounded sample without saving the policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreviewRequest"}
+      responses:
+        "200":
+          description: Inspect a bounded sample without saving the policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreview"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: startNamespaceTablePrivacyScan
+      summary: Start a durable privacy rescan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"}
+      responses:
+        "202":
+          description: Start a durable privacy rescan
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Sixteen scans are active; retry after one finishes. Active scans are never evicted to admit a later request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: scanId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getNamespaceTablePrivacyScan
+      summary: Read privacy scan progress
+      responses:
+        "200":
+          description: Read privacy scan progress
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: listNamespaceTablePrivacyFindings
+      summary: List current privacy findings
+      parameters:
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: document
+          in: query
+          schema: {type: string}
+        - name: field
+          in: query
+          schema: {type: string}
+        - name: category
+          in: query
+          schema: {type: string}
+        - name: policy_version
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: queryNamespaceTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}

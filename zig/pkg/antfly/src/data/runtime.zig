@@ -896,6 +896,7 @@ fn publicApiHttpxConfig(
         .host = cfg.bind_host,
         .port = cfg.bind_port,
         .max_body_size = cfg.max_request_bytes,
+        .max_route_body_size = @import("antfly_public_limits").max_route_body_bytes,
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
@@ -1264,6 +1265,9 @@ const RaftTableApplyStateMachine = struct {
         ArtifactCatalogEpochChanged,
         ArtifactCatalogScopeChanged,
         RowPolicyTopologyUnsupported,
+        RowPolicyDenied,
+        RowPolicyAuthenticationRequired,
+        RowPolicyCatalogChanged,
         OnlineMergeArtifactTailsUnsupported,
         OnlineSourceScopeChanged,
         InvalidSourceSnapshot,
@@ -1350,6 +1354,9 @@ const RaftTableApplyStateMachine = struct {
                 error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
                 error.ArtifactCatalogScopeChanged => .ArtifactCatalogScopeChanged,
                 error.RowPolicyTopologyUnsupported => .RowPolicyTopologyUnsupported,
+                error.RowPolicyDenied => .RowPolicyDenied,
+                error.RowPolicyAuthenticationRequired => .RowPolicyAuthenticationRequired,
+                error.RowPolicyCatalogChanged => .RowPolicyCatalogChanged,
                 error.OnlineMergeArtifactTailsUnsupported => .OnlineMergeArtifactTailsUnsupported,
                 error.InvalidMergePage => .InvalidMergePage,
                 error.MergePageSequenceGap => .MergePageSequenceGap,
@@ -1399,6 +1406,9 @@ const RaftTableApplyStateMachine = struct {
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
                 .ArtifactCatalogScopeChanged => error.ArtifactCatalogScopeChanged,
                 .RowPolicyTopologyUnsupported => error.RowPolicyTopologyUnsupported,
+                .RowPolicyDenied => error.RowPolicyDenied,
+                .RowPolicyAuthenticationRequired => error.RowPolicyAuthenticationRequired,
+                .RowPolicyCatalogChanged => error.RowPolicyCatalogChanged,
                 .OnlineMergeArtifactTailsUnsupported => error.OnlineMergeArtifactTailsUnsupported,
                 .InvalidMergePage => error.InvalidMergePage,
                 .MergePageSequenceGap => error.MergePageSequenceGap,
@@ -1428,6 +1438,11 @@ const RaftTableApplyStateMachine = struct {
             // during prepare, before the coordinator commits its decision.
             if (err == error.RetainedEffectsFull or err == error.GenerationRetired) if (req.transaction) |control| {
                 if (control == .resolve and control.resolve.status == .committed) return null;
+            };
+            if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) {
+                inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+                    if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
+                }
             };
             return fromError(err);
         }
@@ -2184,7 +2199,7 @@ const RaftTableApplyStateMachine = struct {
     }
 
     fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
-        return err == error.RaftApplyWriterUnavailable;
+        return err == error.RaftApplyWriterUnavailable or err == error.StorageOwnerAdmissionPending;
     }
 
     fn applyReady(
@@ -2237,7 +2252,7 @@ const RaftTableApplyStateMachine = struct {
                         // publishing the same typed outcome to the proposer.
                         if (batchRequiresDocumentDbApply(decoded.batch.req)) {
                             self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null) catch |err| switch (err) {
-                                error.RaftApplyWriterUnavailable, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+                                error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
                                 else => return err,
                             };
                         }
@@ -2280,6 +2295,7 @@ const RaftTableApplyStateMachine = struct {
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
+                            err == error.StorageOwnerAdmissionPending or
                             err == error.ArtifactCatalogDrift or
                             err == error.RetainedEffectsFull or
                             err == error.RowPolicyReadersActive or
@@ -2785,6 +2801,16 @@ pub const HealthSource = struct {
         try writeAsyncIndexingMetrics(writer, async_indexing_stats, replay_not_visible_skipped_by_index);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+        const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+        var pipeline_snapshot = pipeline_metrics.snapshot();
+        if (comptime linked_storage) if (self.data_server.kernel_owner_source) |owner| {
+            var response = try owner.context.pipelineMetricsJson();
+            defer response.deinit();
+            const parsed = try std.json.parseFromSlice(pipeline_metrics.Snapshot, self.data_server.alloc, response.bytes(), .{});
+            defer parsed.deinit();
+            try pipeline_snapshot.merge(parsed.value);
+        };
+        try pipeline_snapshot.writePrometheus(writer);
     }
 
     fn writeHotStandbyMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
@@ -3890,6 +3916,7 @@ const DataRaftProtocolCapabilityCacheEntry = struct {
 };
 
 const DataRaftProtocolActivationEntry = struct {
+    revision_probe_after_ns: std.atomic.Value(u64) = .init(0),
     /// One reference belongs to the map; every request retains its own so an
     /// exact-placement cleanup can unlink the entry without racing readers.
     ref_count: std.atomic.Value(usize) = .init(1),
@@ -5502,6 +5529,8 @@ pub const DataServer = struct {
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    leann_replication_running: std.atomic.Value(bool) = .init(false),
+    leann_replication_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     group_source_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     group_source_running: std.atomic.Value(bool) = .init(false),
     group_source_worker: ?@import("antfly_local_sources").storage_db_group_source_worker.Worker = null,
@@ -6265,13 +6294,19 @@ pub const DataServer = struct {
         owner_source.row_policy_authority_secret = self.api_server_cfg.trusted_principal_secret;
         owner_source.row_policy_authority_issuer = self.api_server_cfg.trusted_principal_issuer;
         _ = owner_source.withRuntimeStatusCache(&self.provisioned_storage.runtime_status_cache);
+        owner_source.runtime_status_change_hook = self.localChangeHook();
         _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
-        _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
+        // This dispatcher publishes through Data-Raft. Native standalone
+        // owners use their local producer/coverage protocol; installing the
+        // dispatcher there fences local production behind an unavailable
+        // replicated authority, even for an empty index.
+        if (owner_source.online_source_authority == .raft)
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|
@@ -6667,6 +6702,87 @@ pub const DataServer = struct {
         var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, server.alloc, response.json, .{});
         defer status.deinit();
         if (status.value.pending) try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+    }
+
+    const LeannReplicationJob = struct {
+        server: *DataServer,
+        table: []const u8,
+        group_id: u64,
+    };
+
+    /// Leader-only LEANN replication: on a group this node leads, asks the
+    /// local DB to plan the next record of each replicated LEANN index and
+    /// proposes it. Every replica (this one included) applies committed
+    /// records in log order; see storage/leann_replicated.zig. Dispatch
+    /// only, like graph endpoint cleanup.
+    fn runLeannReplicationRound(self: *DataServer) !void {
+        const raft = self.data_raft orelse return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        if (self.leann_replication_running.swap(true, .acq_rel)) return;
+        var scheduled = false;
+        defer if (!scheduled) self.leann_replication_running.store(false, .release);
+        const catalog = self.write_source.catalog;
+        const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const visit = (try self.leann_replication_sweep.next(self.alloc, catalog, deadline)) orelse return;
+            lockAtomic(&self.data_raft_mutex);
+            const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
+            self.data_raft_mutex.unlock();
+            if (!leader) continue;
+            const table = visit.table orelse continue;
+            const job = try self.alloc.create(LeannReplicationJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runLeannReplicationJob, .deinit = deinitLeannReplicationJob });
+            scheduled = true;
+            return;
+        }
+    }
+    fn deinitLeannReplicationJob(ptr: *anyopaque) void {
+        const job: *LeannReplicationJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.destroy(job);
+        server.leann_replication_running.store(false, .release);
+    }
+    fn runLeannReplicationJob(ptr: *anyopaque) !void {
+        const job: *LeannReplicationJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (server.hotStandbyWriteGate()) |gate| try gate.check();
+        // Keep planning until nothing is pending (each committed record
+        // applies before the next plan), within a budget, so `full_index`
+        // writers waiting on graph coverage are not paced by control rounds.
+        const budget_end = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+        for (0..leann_replication_max_plans_per_job) |_| {
+            if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+            if (!try runLeannReplicationPlan(server, job)) return;
+            if (platform_time.monotonicNs() >= budget_end) return;
+        }
+    }
+    const leann_replication_max_plans_per_job = 256;
+    /// Plans and proposes one round of records. Returns false when nothing
+    /// was pending.
+    fn runLeannReplicationPlan(server: *DataServer, job: *LeannReplicationJob) !bool {
+        var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"leann_plan\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return false;
+        defer response.deinit(server.alloc);
+        var plan = try std.json.parseFromSlice(antfly.db.types.LeannPlanStatus, server.alloc, response.json, .{});
+        defer plan.deinit();
+        if (plan.value.proposals.len == 0) return false;
+        const decoder = std.base64.standard.Decoder;
+        for (plan.value.proposals) |proposal| for (proposal.records_base64) |encoded| {
+            if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+            const record = try server.alloc.alloc(u8, try decoder.calcSizeForSlice(encoded));
+            defer server.alloc.free(record);
+            try decoder.decode(record, encoded);
+            // Records of one proposal (generation chunks, then the record)
+            // must commit in order, so each waits for the previous one.
+            try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, .{ .leann_record = .{ .index_name = proposal.index_name, .record = record }, .sync_level = .write }, .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+        };
+        return true;
     }
 
     fn runInitialFkRetirementRound(self: *DataServer) !void {
@@ -7068,8 +7184,13 @@ pub const DataServer = struct {
         const io = runtime.io() orelse return error.ArtifactCatalogDrift;
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
         if (self.group_leadership_source) |leadership| if (!leadership.isLocalLeader(group_id)) return error.NotLeader;
+        if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command)) {
+            var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, command);
+            defer catalog.deinit();
+            if (!std.mem.eql(u8, &catalog.value.namespace, &namespace)) return error.IdentityNamespaceMismatch;
+        }
         const recovery = try @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint.decode(command);
-        const class: artifact_publication_dispatch.Queue.Class = if (recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
+        const class: artifact_publication_dispatch.Queue.Class = if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command) or recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
         const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
         errdefer self.artifact_publication_queue.release(io, proposal);
         const job = try self.alloc.create(ArtifactPublicationJob);
@@ -7090,6 +7211,14 @@ pub const DataServer = struct {
     };
 
     fn runArtifactPublicationJob(ptr: *anyopaque) !void {
+        return runArtifactPublicationJobInner(ptr) catch |err| {
+            const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
+            std.log.debug("artifact publication proposal deferred group_id={d} chunk={d} error={s}", .{ job.proposal.group_id, job.next_chunk, @errorName(err) });
+            return err;
+        };
+    }
+
+    fn runArtifactPublicationJobInner(ptr: *anyopaque) !void {
         const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
         const self = job.server;
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
@@ -7121,9 +7250,35 @@ pub const DataServer = struct {
         // Until the native publication apply path is installed, do not
         // substitute a Raft-shaped receipt for a standalone owner's clock.
         if (self.data_raft == null) return error.ArtifactCatalogDrift;
+        // A privacy producer can request catalog admission, but only this
+        // routed Raft owner may publish the catalog and activate its epoch.
+        // Both commands retain ordinary ordered apply validation and receipts.
+        if (std.mem.startsWith(u8, job.proposal.command, "ACP1")) {
+            const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+            var parsed = try std.json.parseFromSlice(inventory.Command, self.alloc, job.proposal.command[4..], .{});
+            defer parsed.deinit();
+            const catalog = parsed.value;
+            try catalog.validate();
+            if (!std.mem.eql(u8, &catalog.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+            activation.publication_digest = activation.digest();
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            return;
+        }
         if (try transport.RecoveryHint.decode(job.proposal.command)) |hint| {
             if (!std.mem.eql(u8, &hint.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            return;
+        }
+        if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(job.proposal.command)) {
+            var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, job.proposal.command);
+            defer catalog.deinit();
+            if (!std.mem.eql(u8, &catalog.value.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog.value, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.value.namespace, .authority_epoch = catalog.value.binding.epoch, .catalog_digest = catalog.value.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+            activation.publication_digest = activation.digest();
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
             return;
         }
         const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
@@ -7148,7 +7303,7 @@ pub const DataServer = struct {
                 const offset = ordinal * codec.chunk_bytes;
                 hashes[ordinal] = transport.chunkDigest(ordinal, job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)]);
             }
-            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = command.mode != .publish };
+            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = transport.usesReservedControl(command.mode, job.proposal.command.len) };
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = begin, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
             job.upload_root = begin.proposedManifest().root();
             job.publication_digest = command.publication_digest;
@@ -9126,11 +9281,18 @@ pub const DataServer = struct {
 
     fn syncInferenceRuntimeConfig(self: *DataServer) void {
         const inference_api_url = self.configuredInferenceAPIURL();
+        // The default endpoint's credential travels with it: background
+        // enrichment must authenticate exactly like create-time probes and
+        // query embedding, which read the same node-level key.
+        const inference_api_key = self.api_server_cfg.inference_api_key;
         _ = self.read_source.withDecisionRegistry(if (self.api_server_cfg.node_config) |config| &config.registry else null);
         _ = self.read_source.withInferenceAPIURL(inference_api_url);
+        _ = self.read_source.withInferenceAPIKey(inference_api_key);
         _ = self.write_source.withInferenceAPIURL(inference_api_url);
+        _ = self.write_source.withInferenceAPIKey(inference_api_key);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
+            _ = apply_sm.write_source.withInferenceAPIKey(inference_api_key);
         }
     }
 
@@ -9393,7 +9555,7 @@ pub const DataServer = struct {
 
     fn handleRaftProgressError(err: anyerror) !void {
         switch (err) {
-            error.RaftApplyWriterUnavailable => return,
+            error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending => return,
             else => return err,
         }
     }
@@ -9414,6 +9576,9 @@ pub const DataServer = struct {
         };
         self.runGraphEndpointCleanupRound() catch |err| {
             std.log.warn("graph endpoint cleanup deferred err={s}", .{@errorName(err)});
+        };
+        self.runLeannReplicationRound() catch |err| {
+            std.log.warn("leann replication deferred err={s}", .{@errorName(err)});
         };
         self.runInitialFkRetirementRound() catch |err| {
             std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
@@ -9765,6 +9930,7 @@ pub const DataServer = struct {
         self.group_source_sweep.deinit();
         if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
+        self.leann_replication_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
         if (self.native_query_repository) |repository| {
@@ -9834,6 +10000,7 @@ pub const DataServer = struct {
                 const repository = try self.alloc.create(Repository);
                 errdefer self.alloc.destroy(repository);
                 repository.* = try Repository.init(self.alloc, self.api_server_cfg.node_config, self.api_server_cfg.secret_store, self.api_server_cfg.deployment_mode, self.api_server_cfg.native_lake_artifact_base_dir);
+                repository.attachResources(&self.provisioned_storage.resource_manager);
                 self.native_query_repository = repository;
                 ptr.query_cut_repository = repository.capability();
             };
@@ -11841,15 +12008,22 @@ pub const DataServer = struct {
         // immutable metadata decision itself. The canonical bytes then travel
         // in the data Raft entry: follower apply must never depend on metadata
         // IO, its current availability, or a different metadata read cut.
-        const snapshot = try fetchRowPolicyInstallSnapshot(self, scratch, request);
+        const snapshot = fetchRowPolicyInstallSnapshot(self, scratch, request) catch |err| {
+            std.log.warn("row policy owner snapshot failed table_id={} err={s}", .{ request.table_id, @errorName(err) });
+            return err;
+        };
         var bundle_digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(snapshot, &bundle_digest, .{});
         const read_source = self.read_source.source();
         const Probe = struct {
+            var receipt_mismatch_logs: std.atomic.Value(usize) = .init(0);
             fn run(source: @TypeOf(read_source), a: std.mem.Allocator, group: u64, name: []const u8, req: antfly.public_api.row_policy_install.Request, expected_digest: [32]u8) !?Receipt {
                 var response = (source.lookupGroupLocal(a, group, name, "", .{ .row_policy_receipt = .{ .generation = req.expected_generation, .phase = req.expected_phase } }, .read_index) catch |err| switch (err) {
                     error.RowPolicyReceiptNotFound, error.NotFound => return null,
-                    else => return err,
+                    else => {
+                        std.log.warn("row policy owner receipt probe failed table_id={} err={s}", .{ req.table_id, @errorName(err) });
+                        return err;
+                    },
                 }) orelse return null;
                 defer response.deinit(a);
                 const receipt = try std.json.parseFromSliceLeaky(Receipt, a, response.json, .{});
@@ -11858,7 +12032,11 @@ pub const DataServer = struct {
                     !std.mem.eql(u8, &receipt.descriptor_digest, &req.expected_descriptor_digest) or
                     !std.mem.eql(u8, &receipt.bundle_digest, &expected_digest) or
                     receipt.applied_term == 0 or receipt.applied_index == 0)
+                {
+                    if (receipt_mismatch_logs.fetchAdd(1, .monotonic) < 4)
+                        std.log.warn("row policy owner receipt mismatch table_id={} group={} phase={s} received_phase={s} generation={} received_generation={} bundle_matches={} descriptor_matches={}", .{ req.table_id, group, @tagName(req.expected_phase), @tagName(receipt.phase), req.expected_generation, receipt.generation, std.mem.eql(u8, &receipt.bundle_digest, &expected_digest), std.mem.eql(u8, &receipt.descriptor_digest, &req.expected_descriptor_digest) });
                     return error.RowPolicyCatalogChanged;
+                }
                 return receipt;
             }
         };
@@ -11904,10 +12082,13 @@ pub const DataServer = struct {
                 .disabled => 6,
             };
             const index = try std.math.add(u64, try std.math.mul(u64, request.expected_generation, 8), phase_ordinal);
-            _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, .{
+            _ = (self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, .{
                 .row_policy_publication = request,
                 .row_policy_install_bundle = snapshot,
-            }, false, .{ .term = 1, .index = index })) orelse return error.RowPolicyUnsupported;
+            }, false, .{ .term = 1, .index = index }) catch |err| {
+                std.log.warn("row policy owner phase apply failed table_id={} err={s}", .{ request.table_id, @errorName(err) });
+                return err;
+            }) orelse return error.RowPolicyUnsupported;
         }
         return (try Await.run(read_source, scratch, group_id, table_name, request, bundle_digest)) orelse error.RowPolicyReceiptNotFound;
     }
@@ -12474,7 +12655,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12496,7 +12677,32 @@ pub const DataServer = struct {
         return legacy_req;
     }
 
+    fn preferredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest, minimum: u16, active: u16, probe_after_ns: u64, now_ns: u64) u16 {
+        // Establish a command's mandatory floor first. An optional v27 probe
+        // must not reject a v23 command that a mixed v26/v27 group can admit.
+        // Once the floor is active, later writes can negotiate the revision
+        // upgrade without probing both protocols on every mixed-group write.
+        if (batchMutatesDocuments(req) and (active >= minimum or minimum <= data_raft_batch.timestamp_protocol_version) and now_ns >= probe_after_ns)
+            return @max(minimum, @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version);
+        return minimum;
+    }
+
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+        // Keep proposal admission and the encoded envelope in lockstep as
+        // the private document-version effect language evolves.
+        if (@import("antfly_local_sources").api_internal_batch.requiresDocumentVersionsEnvelope(req)) return revisions;
+        const execution = @import("../common/data_raft_protocol.zig").batch_execution_identity_protocol_version;
+        if (req.group_source) |command| if (command.action == .activate_catalog) return execution;
+        if (req.artifact_publication) |command| if (command.execution_identity != null) return execution;
+        if (req.artifact_catalog) |command| if (command.binding.effect_protocol >= 17) return execution;
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+
+        if (req.leann_record != null) return @import("../common/data_raft_protocol.zig").batch_leann_record_protocol_version;
         if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.artifact_catalog) |command| if (command.binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.online_source) |command| if (command == .admit) {
@@ -12507,7 +12713,7 @@ pub const DataServer = struct {
         if (req.resolver_review != null) return @import("../common/data_raft_protocol.zig").batch_resolver_review_protocol_version;
         if (req.group_source != null) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-        if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
+        if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
@@ -13059,7 +13265,8 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const required_protocol_version = requiredRaftBatchProtocolVersion(req);
+        const minimum_protocol_version = requiredRaftBatchProtocolVersion(req);
+        var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
@@ -13092,6 +13299,7 @@ pub const DataServer = struct {
         var last_placement_target_node_id: ?u64 = null;
         var failed_known_leader_node_id: ?u64 = null;
         while (true) {
+            required_protocol_version = minimum_protocol_version;
             try ensureDataRaftBatchRouteActive(route);
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             var storage_owner_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.LoadedDescriptor = null;
@@ -13121,6 +13329,7 @@ pub const DataServer = struct {
                     }
                 }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
+                required_protocol_version = preferredRaftBatchProtocolVersion(req, minimum_protocol_version, activation_entry.protocol_version.load(.acquire), activation_entry.revision_probe_after_ns.load(.acquire), self.dataRaftMonotonicNs());
                 protocol_activation_entry = activation_entry;
                 if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
@@ -13160,6 +13369,7 @@ pub const DataServer = struct {
                             else => return err,
                         }
                     };
+                    activation_entry.protocol_version.store(@max(durable_version, activation_entry.protocol_version.load(.acquire)), .release);
                     if (durable_version >= required_protocol_version) {
                         activation_entry.protocol_version.store(durable_version, .release);
                         activation_entry.pending_term.store(0, .release);
@@ -13197,6 +13407,8 @@ pub const DataServer = struct {
                             deadline_ns,
                             route.cancellation,
                         );
+                        if (required_protocol_version > minimum_protocol_version and protocol_preflight.activatable_version < required_protocol_version)
+                            activation_entry.revision_probe_after_ns.store(self.dataRaftMonotonicNs() +| std.time.ns_per_s, .release);
                     }
                 }
                 try ensureDataRaftBatchRouteActive(route);
@@ -13328,16 +13540,16 @@ pub const DataServer = struct {
                                 protocol_activation_entry.?.pending_term.store(status.hard.current_term, .release);
                             }
                         }
-                        if (active_protocol_version < required_protocol_version) {
+                        if (active_protocol_version < minimum_protocol_version) {
                             // Bulk ACKs have a compatible single-command path.
                             // This is a feature rejection before ACK admission,
                             // never a classification of an accepted write.
                             if (req.transaction) |transaction| if (transaction == .acknowledge_many) return error.UnsupportedOperation;
-                            if (required_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
+                            if (minimum_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
-                            if (required_protocol_version >= data_raft_batch.split_delta_predecessor_protocol_version)
+                            if (minimum_protocol_version >= data_raft_batch.split_delta_predecessor_protocol_version)
                                 return error.RaftBatchSplitDeltaProtocolUnavailable;
-                            if (required_protocol_version >= data_raft_batch.merge_transition_protocol_version)
+                            if (minimum_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
                         proposal_req = raftBatchRequestForProtocol(
@@ -13345,6 +13557,7 @@ pub const DataServer = struct {
                             active_protocol_version >= data_raft_batch.timestamp_protocol_version,
                             self.dataRaftRealtimeNs(),
                         );
+                        proposal_req.document_version_scheme = if (active_protocol_version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version) .revision_v1 else .legacy;
                         const proposal_term = status.hard.current_term;
                         const encoded = if (comptime linked_storage)
                             try data_raft_batch.encodeWithStorageOwnerDescriptor(
@@ -13637,7 +13850,7 @@ pub const DataServer = struct {
                                     self.api_server_cfg.internal_service_secret,
                                     self.api_server_cfg.internal_service_issuer,
                                 );
-                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     try self.sleepDataRaftBatchLeaderRetry();
@@ -13860,7 +14073,7 @@ pub const DataServer = struct {
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
         );
-        const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
+        const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
         const encoded_route_fence = if (route.write_route_fence) |fence|
@@ -15623,7 +15836,7 @@ pub const DataServer = struct {
                         if (!try onlineMergePeerEligible(try client.fetchDataRaftBatchProtocolVersion(remote.base_uri, 10000, null)))
                             return error.GuardedMergeCopyReceiptUnsupported;
                     }
-                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, "", null, null, false);
+                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, "", null, null, false, false, null);
                     defer response.deinit(alloc);
                     return std.json.parseFromSlice(T, alloc, response.body, .{ .allocate = .alloc_always });
                 },
@@ -23481,6 +23694,7 @@ pub const DataServer = struct {
         if (status.stats.async_indexing.dense_catch_up.active) return true;
         if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
+            for (index.source_replay) |source| if (!source.producer_complete) return true;
             if (index.dense_vector_projection_pending) return true;
             if (index.dense_native_storage_phase == .native_building or
                 index.dense_native_storage_phase == .native_validating) return true;
@@ -24263,6 +24477,10 @@ pub const DataServer = struct {
                 storage_kernel_context = context;
                 try storage_kernel_context.?.configureRemoteContent(cfg.api_server_cfg.remote_content);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
+                try storage_kernel_context.?.configureInferenceDefaults(
+                    if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null,
+                    cfg.api_server_cfg.inference_api_key,
+                );
                 if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
                     const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
                     defer alloc.free(retained_setup);
@@ -24404,7 +24622,7 @@ pub const DataServer = struct {
         errdefer provisioned_storage.deinit();
         if (cfg.capacity_source) |source| try provisioned_storage.installCapacitySource(source);
 
-        const server = DataServer{
+        var server = DataServer{
             .alloc = alloc,
             .remote_metadata = remote_metadata,
             .data_raft = data_raft,
@@ -24444,6 +24662,8 @@ pub const DataServer = struct {
             .owned_backend_runtime = owned_backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
+        // Raft data groups replicate LEANN graphs from the leader.
+        server.write_source.leann_replication = data_raft != null;
         owned_backend_runtime = null;
         storage_kernel_context = null;
         return server;
@@ -24459,6 +24679,12 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
             const classified = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
             try std.testing.expectEqual(reason, classified.toError());
+        }
+        inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+            const reason = @field(@import("../api/relational_row_errors.zig").PolicyError, field);
+            const classified = Failure.forRequest(reason, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } } }) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+            try std.testing.expect(Failure.forRequest(reason, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 } } }) == null);
         }
         inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
             try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));
@@ -24677,7 +24903,7 @@ fn onlineMergeRaftBatchRequiresArtifactBarrier(req: antfly.db.types.BatchRequest
 
 fn onlineMergePeerEligible(version: u16) !bool {
     if (version == 0) return error.GroupLeaderUnavailable;
-    return version >= data_raft_batch.artifact_catalog_protocol_version;
+    return version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
 }
 
 fn onlineMergeRaftBatchHasArtifactBarrier(req: antfly.db.types.BatchRequest) bool {
@@ -26283,6 +26509,7 @@ const RemoteMetadataSource = struct {
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = remoteLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = remotePrivacyPolicyBinding,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .wait_for_routing_change = remoteWaitForRoutingChange,
                 .await_route = remoteAwaitRoute,
@@ -26300,6 +26527,8 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .table_record = remoteTableRecord,
+                .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
@@ -26318,6 +26547,7 @@ const RemoteMetadataSource = struct {
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
+                .privacy_mutation = remotePrivacyMutation,
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .replace_table_definition_stamped = remoteReplaceTableDefinitionStamped,
                 .get_lake_index_lifecycle = remoteGetLakeIndexLifecycle,
@@ -26489,8 +26719,23 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
-        const deadline_ns = self.awakeNs() +|
+        return self.withMetadataMutationApiClientControlled(T, callFn, ctx, null);
+    }
+
+    fn withMetadataMutationApiClientControlled(
+        self: *RemoteMetadataSource,
+        comptime T: type,
+        comptime callFn: anytype,
+        ctx: anytype,
+        request: ?antfly.public_api.operation.RequestContext,
+    ) !T {
+        var deadline_ns = self.awakeNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        var signal = if (request) |control| antfly.raft.transport.http_common.RequestCancellation.fromToken(control.cancellation) else antfly.raft.transport.http_common.RequestCancellation{};
+        if (request) |control| {
+            const normalized = try control.platformDeadline();
+            if (normalized.deadline_ns) |deadline| deadline_ns = @min(deadline_ns, self.awakeNs() +| (deadline -| @import("antfly_platform").time.monotonicNs()));
+        }
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var replay_proof_error: anyerror = error.NotLeader;
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
@@ -26502,6 +26747,7 @@ const RemoteMetadataSource = struct {
         // make it skip an endpoint or probe the same endpoint twice.
         const start_index = self.metadataApiIndexForAttempt(0);
         for (0..self.base_uris.len) |attempt| {
+            if (request) |control| try control.ensureActive();
             const now_ns = self.awakeNs();
             if (now_ns >= deadline_ns)
                 return replay_proof_error;
@@ -26512,6 +26758,7 @@ const RemoteMetadataSource = struct {
             const discovery_budget = antfly.metadata_http_client.RequestBudget{
                 .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline_ns, self.base_uris.len - attempt + 1),
                 .io = self.io,
+                .cancellation = if (request != null) &signal else null,
             };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -26557,6 +26804,7 @@ const RemoteMetadataSource = struct {
             return result;
         }
         for (endpoint_discovery.fallbacks()) |index| {
+            if (request) |control| try control.ensureActive();
             if (self.awakeNs() >= deadline_ns)
                 return replay_proof_error;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -27251,6 +27499,34 @@ const RemoteMetadataSource = struct {
     fn remoteTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.remoteTableRoutingSnapshotWithMode(table_name, deadline_ns, false);
+    }
+
+    fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = deadline, .io = self.io } else null;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline, self.base_uris.len - attempt), .io = self.io } else null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var client = self.metadataClient(arena.allocator());
+            var parsed = client.fetchPrivacyPolicyBinding(self.base_uris[index], table_name, budget) catch |err| {
+                last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            defer parsed.deinit();
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            self.acceptMetadataIdentityWithBudget(parsed.value.metadata_group_id, parsed.value.metadata_incarnation, budget) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataReadSuccess(index);
+            return parsed.value;
+        }
+        ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+        return last_err;
     }
 
     fn remoteLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -28059,6 +28335,14 @@ const RemoteMetadataSource = struct {
         return input.isMutation();
     }
 
+    fn remoteTableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
+        const bytes = try remoteSystemCatalog(ptr, a, .{}, .{ .table_record_read = name });
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(?antfly.metadata.TableRecord, a, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return if (parsed.value) |table| try antfly.metadata.table_manager.cloneTable(a, table) else null;
+    }
+
     fn remoteGetLakeIndexLifecycle(ptr: *anyopaque, a: std.mem.Allocator, table_id: u64, request: antfly.public_api.operation.RequestContext) ![]u8 {
         return remoteSystemCatalog(ptr, a, request, .{ .lake_index_lifecycle_read = table_id });
     }
@@ -28098,7 +28382,7 @@ const RemoteMetadataSource = struct {
                     if (now >= deadline) return error.DeadlineExceeded;
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
-                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded, ctx.request.setting_admin);
+                const bytes = try client.forwardSystemCatalogObserved(base_uri, ctx.input, bounded, ctx.request.setting_admin, ctx.request.sql_completion_submission);
                 defer client.alloc.free(bytes);
                 return ctx.alloc.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown;
             }
@@ -28127,6 +28411,18 @@ const RemoteMetadataSource = struct {
             }
         }.call, .{ .table_name = table_name, .body = body });
         self.invalidateCache();
+    }
+
+    fn remotePrivacyMutation(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: antfly.public_api.operation.RequestContext) !@import("../api/privacy.zig").Response {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        defer self.invalidateCache();
+        return self.withMetadataMutationApiClientControlled(@import("../api/privacy.zig").Response, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: antfly.public_api.raft_mutation_forwarding.Context, ctx: anytype) !@import("../api/privacy.zig").Response {
+                var result = try client.forwardPrivacyMutation(base_uri, ctx.table, ctx.body, ctx.if_match, ctx.scan, ctx.request);
+                defer result.deinit(client.alloc);
+                return result.cloneMutation(ctx.a);
+            }
+        }.call, .{ .a = a, .table = table, .body = body, .if_match = if_match, .scan = scan, .request = request }, request);
     }
 
     fn remoteReplaceTableDefinition(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
@@ -31058,15 +31354,6 @@ pub fn runFromIterator(
         cli.raft_tick_ms,
         cli.control_tick_ms,
     ) catch return error.InvalidArguments;
-    const process_memory_resolution = process_memory_budget.resolveSystemDetailed(
-        cli.process_memory_budget_mb,
-        init.environ_map.get(process_memory_budget.canonical_env),
-        null,
-    ) catch |err| {
-        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
-        return err;
-    };
-    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -31087,6 +31374,17 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    const process_memory_resolution = process_memory_budget.resolveSystemWithConfig(
+        cli.process_memory_budget_mb,
+        init.environ_map.get(process_memory_budget.canonical_env),
+        null,
+        if (loaded_config) |cfg| cfg.resources.memory.max_bytes else 0,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
+
     antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
         std.log.err("data startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
         return err;
@@ -31223,6 +31521,7 @@ pub fn runFromIterator(
         process_storage_kernel_context = context;
         try process_storage_kernel_context.?.configureRemoteContent(remote_content);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| try process_storage_kernel_context.?.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
         if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
             const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
             defer alloc.free(retained_setup);
@@ -31313,10 +31612,10 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
-            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
-            .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
-            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
-            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.query.admission.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .graph_execution_limits = if (loaded_config) |*cfg| cfg.resources.query.request_limits.graph else .{},
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.write.admission.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.inference.admission.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
@@ -32522,6 +32821,20 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         ) !antfly.common.http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const snapshot = self.snapshot orelse return .{ .status = 503 };
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_privacy_policy_binding)) {
+                const input = try std.json.parseFromSlice(antfly.metadata_api.CatalogTableRoutingSnapshotRequest, response_alloc, request.body, .{});
+                defer input.deinit();
+                const table = antfly.public_api.tables.findTableByName(snapshot, input.value.table_name) orelse return .{ .status = 404 };
+                // Ordinary integrity preflight uses the production compact
+                // privacy fence before opening a routed group. The fixture
+                // must serve that authority, even for a table without policy.
+                return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.PrivacyPolicyBinding{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = snapshot.status.metadata_epoch,
+                    .policy_version = try @import("antfly_local_sources").privacy_catalog.policyBinding(response_alloc, table.indexes_json),
+                }, .{}) };
+            }
             // This fixture owns metadata directly. Serve the same compact
             // read contract as production instead of relying on data caches
             // to stand in for the catalog authority.
@@ -32544,6 +32857,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                         defer response_alloc.free(tables);
                         for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
                         break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                    },
+                    .table_record_read => |name| blk: {
+                        const table = antfly.public_api.tables.findTableByName(snapshot, name);
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, if (table) |value| @as(?antfly.metadata.TableRecord, value.*) else null, .{});
                     },
                     .query_definition => |name| blk: {
                         const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse return .{ .status = 404 };
@@ -34208,6 +34525,46 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "time series document revision protocol dominates older envelope features" {
+            const p = @import("../common/data_raft_protocol.zig");
+            var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            req.document_version_scheme = .legacy;
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            // A copy can carry only a floor, with no signed TTL source or
+            // current-write marker. It still requires every applying replica
+            // to understand the versioned envelope before proposal.
+            req.merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
+            req.merge_page = .{ .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .pin_digest = @splat(7), .applied_index = 1 }, .sequence = 1, .phase = .rows, .next = "row", .exhausted = true, .digest = @splat(0), .timestamps = &.{1}, .document_version_floor = 1 };
+            req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            req.merge_page.?.document_version_floor = 0;
+            req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            req = .{ .restore_staging = .{ .import_page = .{
+                .expected = @splat(1),
+                .next = "progress",
+                .scope = @splat(2),
+                .timestamps = &.{},
+                .document_timestamps = .{ .version_floor = 0 },
+            } } };
+            // Even an empty source must explicitly preserve timestamp absence.
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            req.restore_staging.?.import_page.document_timestamps = null;
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+        }
+
+        test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
+            const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{}" }} };
+            const next = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+            try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 0, 0, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 0, 100));
+            try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 200, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 0, 0, 0, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, data_raft_batch.timestamp_protocol_version, 0, 0, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, next, 0, 200, 100));
+        }
+
         test "system catalog runtime observation targets its group and preserves errors" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const Fake = struct {
@@ -41962,11 +42319,12 @@ fn consumerTests() type {
             }
         }
 
-        test "online merge admission distinguishes unsupported peers and fences leader authority" {
+        test "time series online merge admission distinguishes unsupported peers and fences leader authority" {
             try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergePeerEligible(0));
             try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.source_pin_protocol_version - 1));
             try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.artifact_catalog_protocol_version - 1));
-            try std.testing.expect(try onlineMergePeerEligible(data_raft_batch.artifact_catalog_protocol_version));
+            try std.testing.expect(!try onlineMergePeerEligible(@import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version - 1));
+            try std.testing.expect(try onlineMergePeerEligible(@import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version));
             try validateOnlineMergeAdmissionAuthority(9, 9, 17, 17);
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(0, 0, 17, 17));
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 10, 17, 17));
@@ -41999,6 +42357,34 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 0), legacy.timestamp_ns);
             const negotiated = DataServer.raftBatchRequestForProtocol(explicit, true, 456);
             try std.testing.expectEqual(@as(u64, 123), negotiated.timestamp_ns);
+
+            // Policy phases are isolated control entries. A timestamp adjunct
+            // makes their strict decoder reject the committed Raft command.
+            for ([_]@import("antfly_local_sources").system_catalog_policies.Publication.Phase{ .pending_install, .serving_install, .active, .pending_disable, .serving_disable, .disabled }) |phase| {
+                const policy_request: antfly.db.types.BatchRequest = .{ .row_policy_publication = .{
+                    .table_id = 7,
+                    .owner_group_id = 11,
+                    .expected_generation = 3,
+                    .expected_catalog_epoch = 19,
+                    .expected_phase = phase,
+                    .expected_descriptor_digest = @splat(9),
+                }, .row_policy_install_bundle = "{\"table_id\":7}" };
+                for ([_]bool{ false, true }) |timestamp_protocol| {
+                    const proposal = DataServer.raftBatchRequestForProtocol(policy_request, timestamp_protocol, 999);
+                    try std.testing.expectEqual(@as(u64, 0), proposal.timestamp_ns);
+                    const policy_encoded = try data_raft_batch.encode(alloc, "docs", proposal);
+                    defer alloc.free(policy_encoded);
+                    var policy_decoded = try data_raft_batch.decode(alloc, policy_encoded);
+                    defer policy_decoded.deinit(alloc);
+                    try std.testing.expectEqualDeep(policy_request.row_policy_publication.?, policy_decoded.batch.req.row_policy_publication.?);
+                    try std.testing.expectEqualStrings(policy_request.row_policy_install_bundle, policy_decoded.batch.req.row_policy_install_bundle);
+                    const forwarded = try data_raft_batch.encode(alloc, "docs", policy_decoded.batch.req);
+                    defer alloc.free(forwarded);
+                    var forwarded_decoded = try data_raft_batch.decode(alloc, forwarded);
+                    defer forwarded_decoded.deinit(alloc);
+                    try std.testing.expectEqualDeep(policy_request.row_policy_publication.?, forwarded_decoded.batch.req.row_policy_publication.?);
+                }
+            }
 
             const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
             var page_request: antfly.db.types.BatchRequest = .{
@@ -42087,7 +42473,7 @@ fn consumerTests() type {
             }));
         }
 
-        test "raft batch protocol preflight fingerprint fences every applying replica set" {
+        test "time series raft batch protocol preflight fingerprint fences every applying replica set" {
             var voters = [_]u64{ 1, 2, 3 };
             var outgoing = [_]u64{ 1, 2, 4 };
             var learners = [_]u64{5};
@@ -42105,7 +42491,7 @@ fn consumerTests() type {
             try std.testing.expect(fingerprint != DataServer.dataRaftConfStateFingerprint(base));
         }
 
-        test "raft batch protocol plan resolves only current group applying peers" {
+        test "time series raft batch protocol plan resolves only current group applying peers" {
             const alloc = std.testing.allocator;
             var resolver = antfly.raft.MemoryPeerResolver.init(alloc);
             defer resolver.deinit();
@@ -42147,7 +42533,7 @@ fn consumerTests() type {
             try std.testing.expect(!incomplete.routes_complete);
         }
 
-        test "raft batch protocol cache reuses only short lived negative evidence" {
+        test "time series raft batch protocol cache reuses only short lived negative evidence" {
             const alloc = std.testing.allocator;
             var server: DataServer = undefined;
             server.alloc = alloc;
@@ -42188,7 +42574,7 @@ fn consumerTests() type {
             second.probe_mutex.unlock();
         }
 
-        test "raft batch protocol activation is reusable only in its accepted leader term" {
+        test "time series raft batch protocol activation is reusable only in its accepted leader term" {
             var entry: DataRaftProtocolActivationEntry = .{};
             try std.testing.expect(!DataServer.dataRaftProtocolUsable(
                 &entry,
@@ -45761,6 +46147,144 @@ fn consumerTests() type {
             );
         }
 
+        test "privacy remote mutation forwarding retains response metadata through the status source" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                status: u16 = 202,
+                probes: usize = 0,
+                mutations: usize = 0,
+                scan: bool = false,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, "/metadata/v1/runtime-topology")) {
+                        self.probes += 1;
+                        try std.testing.expectEqual(.GET, request.method);
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataRuntimeTopology{
+                            .metadata_group_id = 9,
+                            .metadata_incarnation = @splat('1'),
+                            .metadata_raft_local_node_id = 1,
+                            .metadata_raft_leader_id = 1,
+                            .metadata_raft_role = "leader",
+                        }, .{}) };
+                    }
+                    self.mutations += 1;
+                    try std.testing.expectEqual(if (self.scan) antfly.common.http.Method.POST else .PUT, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, if (self.scan) "/privacy/scans" else "/privacy"));
+                    try std.testing.expectEqualStrings("{}", request.body);
+                    const headers = try alloc.alloc(antfly.common.http.Header, if (self.status == 202) 1 else 3);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "ETag"), .value = try alloc.dupe(u8, "upstream-etag") };
+                    if (self.status != 202) {
+                        headers[1] = .{ .name = try alloc.dupe(u8, "X-Antfly-Raft-Mutation-Outcome"), .value = try alloc.dupe(u8, "unknown-v1") };
+                        headers[2] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "1") };
+                    }
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, "{\"code\":\"upstream\"}"), .headers = headers };
+                }
+            };
+            var fake: Fake = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            var expected_calls: usize = 0;
+            for ([_]u16{ 202, 409, 503 }) |status| for ([_]bool{ false, true }) |scan| {
+                fake.status = status;
+                fake.scan = scan;
+                var response = (try source.statusSource().forwardPrivacyMutation(a, "docs", "{}", if (scan) null else "etag", scan, .{})).?;
+                defer response.deinit(a);
+                expected_calls += 1;
+                try std.testing.expectEqual(expected_calls, fake.mutations);
+                try std.testing.expectEqual(expected_calls, fake.probes);
+                try std.testing.expectEqual(status, response.response.status);
+                try std.testing.expect(response.response.json);
+                try std.testing.expectEqualStrings("{\"code\":\"upstream\"}", response.response.body);
+                try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
+                try std.testing.expectEqual(if (status == 202) null else @as(?u32, 1), response.response.retry_after_seconds);
+                try std.testing.expectEqual(if (status == 202) null else @as(?@import("../api/public_table_http.zig").MetadataMutationOutcome, .unknown), response.response.metadata_mutation_outcome);
+                // Exercise the real status-source/discovery handoff rather
+                // than just a standalone response clone. Both caller-buffer
+                // failures happen after one accepted/ambiguous upstream reply.
+                for (0..2) |index| {
+                    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+                    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.statusSource().forwardPrivacyMutation(fail.allocator(), "docs", "{}", if (scan) null else "etag", scan, .{}));
+                    expected_calls += 1;
+                    try std.testing.expectEqual(expected_calls, fake.mutations);
+                    try std.testing.expectEqual(expected_calls, fake.probes);
+                    try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
+                }
+            };
+        }
+
+        test "privacy remote read bindings pin metadata identity and never fall back to full catalogs" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                calls: usize = 0,
+                reject_first: bool = true,
+                wrong_identity: bool = false,
+                malformed: bool = false,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/privacy-policy-binding"));
+                    try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+                    if (self.reject_first and std.mem.startsWith(u8, request.uri, "http://old")) return .{ .status = 404, .body = try alloc.dupe(u8, "unsupported") };
+                    if (self.malformed) return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.PrivacyPolicyBinding{ .metadata_group_id = 9, .metadata_incarnation = @splat(if (self.wrong_identity) @as(u8, '2') else '1'), .catalog_revision = 7, .policy_version = @splat('a') }, .{}) };
+                }
+            };
+            var fake: Fake = .{};
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://old", "http://new" }, &.{ executor, executor }, std.testing.io);
+            defer source.deinit();
+            const capture = source.catalogSource().vtable.privacy_policy_binding.?;
+            const result = try capture(&source, "docs", null);
+            try std.testing.expectEqual(@as([64]u8, @splat('a')), result.policy_version);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            fake.wrong_identity = true;
+            fake.reject_first = false;
+            try std.testing.expectError(error.MetadataIncarnationMismatch, capture(&source, "docs", null));
+            fake.wrong_identity = false;
+            fake.malformed = true;
+            try std.testing.expectError(error.MissingField, capture(&source, "docs", null));
+            fake.malformed = false;
+            const calls = fake.calls;
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, capture(&source, "docs", 1));
+            try std.testing.expectEqual(calls, fake.calls);
+        }
+
+        test "privacy remote table reads observe progress without invalidating semantic caches" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+                    var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, alloc, request.body, .{});
+                    defer call.deinit();
+                    try std.testing.expect(call.value == .table_record_read);
+                    try std.testing.expectEqualStrings("private", call.value.table_record_read);
+                    self.calls += 1;
+                    const description = try std.fmt.allocPrint(alloc, "progress-{d}", .{self.calls});
+                    defer alloc.free(description);
+                    const body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata.TableRecord{ .table_id = 1, .name = "private", .description = description }, .{});
+                    const headers = try alloc.alloc(antfly.common.http.Header, 2);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try alloc.dupe(u8, "9") };
+                    headers[1] = .{ .name = try alloc.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try alloc.dupe(u8, "11111111111111111111111111111111") };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            var fake = Fake{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            try source.acceptMetadataIdentity(9, "11111111111111111111111111111111".*);
+            const generation = source.snapshot_invalidation_generation;
+            const first = (try source.statusSource().tableRecord(a, "private")).?;
+            defer antfly.metadata.table_manager.freeTable(a, first);
+            const second = (try source.statusSource().tableRecord(a, "private")).?;
+            defer antfly.metadata.table_manager.freeTable(a, second);
+            try std.testing.expectEqualStrings("progress-1", first.description);
+            try std.testing.expectEqualStrings("progress-2", second.description);
+            try std.testing.expectEqual(generation, source.snapshot_invalidation_generation);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        }
+
         test "remote metadata status source advertises exact table drop cleanup" {
             var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
             defer backend_runtime.deinit();
@@ -46870,6 +47394,14 @@ fn implementationTests() type {
             const version = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
             try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
             try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"hub"} }));
+        }
+
+        test "leann replication round requires an attached Raft owner and its protocol version" {
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            try server.runLeannReplicationRound();
+            const version = @import("../common/data_raft_protocol.zig").batch_leann_record_protocol_version;
+            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .leann_record = .{ .index_name = "idx", .record = "L" } }));
         }
 
         test "data runtime native FK retirement preserves source ownership and exact cold path" {
@@ -49104,7 +49636,7 @@ fn implementationTests() type {
             );
             try std.testing.expectEqual(@as(u64, 3), apply_sm.writer_unavailable_retries_total.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 2), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
-            for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable }) |admission_error| {
+            for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.StorageOwnerAdmissionPending }) |admission_error| {
                 apply_sm.test_faults.storage_admission_once = .{ .index = 2, .err = admission_error };
                 try std.testing.expectError(
                     error.RaftApplyWriterUnavailable,
@@ -49115,13 +49647,15 @@ fn implementationTests() type {
                 try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = group_id, .index = 2 }).?.outcome);
                 try std.testing.expect(apply_sm.stateMachine().isApplyRetryable(group_id, error.RaftApplyWriterUnavailable));
             }
+            try std.testing.expect(apply_sm.stateMachine().isApplyRetryable(group_id, error.StorageOwnerAdmissionPending));
             try DataServer.handleRaftProgressError(error.RaftApplyWriterUnavailable);
+            try DataServer.handleRaftProgressError(error.StorageOwnerAdmissionPending);
             try std.testing.expectError(error.OutOfMemory, DataServer.handleRaftProgressError(error.OutOfMemory));
 
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &extended_entries, &.{});
             try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-            try std.testing.expectEqual(@as(usize, 8), apply_sm.test_faults.document_apply_attempts);
+            try std.testing.expectEqual(@as(usize, 9), apply_sm.test_faults.document_apply_attempts);
             try std.testing.expectEqual(@as(usize, 3), apply_sm.test_faults.document_apply_successes);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 2).?);
@@ -49157,7 +49691,7 @@ fn implementationTests() type {
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &shifted_entries, &.{});
             try std.testing.expectEqual(@as(u64, 5), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-            try std.testing.expectEqual(@as(usize, 10), apply_sm.test_faults.document_apply_attempts);
+            try std.testing.expectEqual(@as(usize, 11), apply_sm.test_faults.document_apply_attempts);
             try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_successes);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);
@@ -56646,10 +57180,21 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 
 test "grouped source protocol dominates coexisting graph envelope features" {
     const protocol = @import("../common/data_raft_protocol.zig");
-    const request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+    var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
         .namespace = @splat(1),
         .catalogs = .{},
         .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
     }, .graph_endpoint_cleanup = true };
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = 17;
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.group_source.?.action = .activate_catalog;
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", request);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
 }

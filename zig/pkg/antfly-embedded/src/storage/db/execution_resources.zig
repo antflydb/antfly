@@ -175,6 +175,7 @@ pub const ReplayPublication = struct {
 };
 
 pub const AsyncContext = struct {
+    apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
@@ -632,7 +633,9 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    apply_exclusive_held: bool = false,
     alloc: Allocator,
+    ordered_artifact_publication_required: bool = false,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
@@ -1018,6 +1021,22 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+/// One synchronous prepared attempt's irreversible disposition. It is separate
+/// from the caller's cumulative progress marker: optimistic preparation may
+/// retry, while a committed attempt must propagate every later error unchanged.
+pub const PreparedCommitDisposition = struct {
+    pub const State = enum(u8) { preparing, primary_committed };
+    state: State = .preparing,
+
+    pub fn markPrimaryCommitted(self: *@This()) void {
+        self.state = .primary_committed;
+    }
+
+    pub fn permitsPreparationRetry(self: @This(), err: anyerror) bool {
+        return self.state == .preparing and (err == error.PreparedGenerationChanged or err == error.PreparedReadSetChanged);
+    }
+};
+
 pub const BatchExecutionOptions = struct {
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1029,6 +1048,8 @@ pub const BatchExecutionOptions = struct {
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
+    restore_ttl_sources: ?*const std.StringHashMapUnmanaged(i128) = null,
+    restore_document_version_floor: u64 = 0,
     preserve_logical_values: bool = false,
     restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
@@ -1039,6 +1060,12 @@ pub const BatchExecutionOptions = struct {
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
     wait_for_sync_level: bool = true,
     visibility_completion: ?*BatchVisibilityCompletion = null,
+    /// Internal progress marker; set only after the primary store accepts the
+    /// write. Visibility admission errors must not invite replay of transforms.
+    primary_committed: ?*bool = null,
+    /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
+    /// retained by asynchronous publication or shared across retries.
+    prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -1053,6 +1080,9 @@ pub const BatchExecutionOptions = struct {
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
+    /// Outcome-receipt marker committed with the primary write. Internal
+    /// metadata: unlike `extra_store_writes`, it never forces a replay record.
+    outcome_marker_write: ?docstore_mod.KVPair = null,
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
@@ -1116,6 +1146,7 @@ pub const LocalExecutionState = struct {
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_offline_candidate: bool = false,
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
+    producer_catalog_generation: AtomicU64 = .init(0),
     /// Planning and visibility observations have one shared owner.
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
@@ -1779,7 +1810,10 @@ pub const PrecomputedGeneratedBatch = struct {
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
     coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
 
-    pub fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
+    // Batch cleanup is shared by many fallible preparation exits. Keep its
+    // allocation walks out of those exits; each batch pays one call while LLVM
+    // optimizes one cleanup body instead of copies throughout the commit CFG.
+    pub noinline fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
         for (self.artifact_writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));
@@ -2148,6 +2182,13 @@ pub const ArtifactRepairCompletionState = struct {
     epoch: u64 = 0,
     completed_sequence: u64 = 0,
     pending_issues: u64 = 0,
+    /// Operator-submitted replay, observed without executing providers under
+    /// the managed request's group-operation guard. Survives owner restart.
+    queued_sequence: u64 = 0,
+    queued_job_id: u64 = 0,
+    /// A terminally unhealthy artifact reached index publication. In
+    /// particular, partial OCR can publish chunks without failing replay.
+    failed_sequence: u64 = 0,
 };
 
 pub const ManagedIndexBatchApplicability = enum {

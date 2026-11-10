@@ -30,6 +30,10 @@ components:
           type: string
           enum: [unknown, unsupported, supported]
           default: unknown
+        video:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
     RuntimeTaskBinding:
       type: object
       additionalProperties: false
@@ -69,9 +73,11 @@ components:
           enum: [antfly, jev, openai, cloudflare]
         decision_method:
           type: string
-          enum: [typed, embedding_similarity, generated]
+          enum: [typed, embedding_similarity, generated, cascade]
           default: typed
-          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+          description: Execution contract. With provider antfly, typed invokes the Decisions endpoint; remote named deciders may return validated typed or generated answers, including upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
+        cascade:
+          $ref: '#/components/schemas/DeciderCascade'
         generator:
           $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig'
           description: Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.
@@ -154,6 +160,77 @@ components:
           minimum: 1
           maximum: 256
           default: 32
+    DeciderCascade:
+      type: object
+      additionalProperties: false
+      required: [stages]
+      description: >-
+        Required with decision_method=cascade, which allows no transport, model or
+        rate-limit fields of its own. The first stage answers every input. Each later
+        stage runs only for inputs whose previous answer falls inside its probability
+        band, and all escalating inputs share one call. The final answer is the last
+        answering stage's. Escalation applies to successful answers only; it is not
+        failover. Probabilities are not calibrated across models, so set bands per
+        model on labelled data.
+      properties:
+        stages:
+          type: array
+          minItems: 2
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/DeciderCascadeStage'
+        budget:
+          type: object
+          additionalProperties: false
+          properties:
+            max_model_calls:
+              type: integer
+              minimum: 1
+              maximum: 8
+              description: Stage invocations allowed per request. Defaults to the stage count and cannot be lower.
+            deadline_ms:
+              type: integer
+              minimum: 1
+              maximum: 600000
+              description: Narrows the caller's deadline for the whole cascade. Checked before each stage and enforced by stage transports.
+    DeciderCascadeStage:
+      type: object
+      additionalProperties: false
+      required: [name, decider]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,64}$'
+          description: Unique within the cascade; reported in traces.
+        decider:
+          $ref: '#/components/schemas/DeciderConfig'
+          description: Inline typed or generated decider. Cascades and embedding_similarity deciders cannot be stages.
+        when:
+          type: object
+          additionalProperties: false
+          required: [probability_between]
+          description: Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
+          properties:
+            question:
+              type: string
+              description: Measure this question only. Omitted, any question in the band escalates.
+            choice:
+              type: string
+              description: For choice questions, measure this value's probability. Omitted, the selected value's probability.
+            probability_between:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items: { type: number, minimum: 0, maximum: 1 }
+              description: Lower and upper bound, lower strictly below upper. Inputs must have measured probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its producing stage under on_failure instead of driving the band.
+        require_agreement:
+          type: boolean
+          description: Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
+        on_failure:
+          type: string
+          enum: [fail, keep_previous]
+          default: fail
+          description: Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
     SecretsConfig:
       type: object
       additionalProperties: false
@@ -292,10 +369,8 @@ components:
           description: "Port for the health/metrics server. Defaults to 4200."
           default: 4200
           example: 4200
-        admission:
-          $ref: "#/components/schemas/AdmissionConfig"
-        graph_execution:
-          $ref: "#/components/schemas/GraphExecutionConfig"
+        resources:
+          $ref: "../shared/resources.yaml#/components/schemas/ResourcesConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
         pgwire:
@@ -1129,68 +1204,6 @@ components:
         publication_name:
           type: string
           description: Provider publication or stream grouping name when applicable.
-    AdmissionConfig:
-      type: object
-      additionalProperties: false
-      description: Node-local foreground database request admission settings.
-      properties:
-        query:
-          $ref: "#/components/schemas/QueryAdmissionConfig"
-        write:
-          $ref: "#/components/schemas/WriteAdmissionConfig"
-        inference:
-          $ref: "#/components/schemas/InferenceAdmissionConfig"
-
-    GraphExecutionConfig:
-      type: object
-      additionalProperties: false
-      description: >-
-        Operator-owned ceilings shared by all named graph operations in one
-        admitted query. Public requests cannot raise these values. Explored
-        work, scanned anchors, and exact-distinct capacity are request-consumptive;
-        intermediate and retained-state ceilings bound simultaneously live state.
-      properties:
-        max_explored_nodes:
-          type: integer
-          minimum: 1
-          default: 100000
-          description: Cumulative node expansions across every named operation and path spur in one request.
-        max_explored_edges:
-          type: integer
-          minimum: 1
-          default: 1000000
-          description: Cumulative edge expansions across every named operation and path spur in one request.
-        max_explored_edge_bytes:
-          type: integer
-          minimum: 1
-          default: 67108864
-          description: Cumulative owned bytes of materialized edges read while executing one request.
-        max_scanned_anchors:
-          type: integer
-          minimum: 1
-          default: 1000000
-          description: Cumulative source anchors scanned by exact MATCH operations in one request.
-        max_intermediate_states:
-          type: integer
-          minimum: 1
-          default: 100000
-          description: Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
-        max_retained_state_bytes:
-          type: integer
-          minimum: 1
-          default: 67108864
-          description: Maximum simultaneously retained bytes of admitted graph execution state.
-        max_distinct_identities:
-          type: integer
-          minimum: 1
-          default: 100000
-          description: Cumulative exact-distinct identities admitted across all named aggregates in one request.
-        max_distinct_state_bytes:
-          type: integer
-          minimum: 1
-          default: 16777216
-          description: Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
-
     McpConfig:
       type: object
       additionalProperties: false
@@ -1226,92 +1239,6 @@ components:
           maximum: 86400
           default: 3600
           description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
-
-    QueryAdmissionConfig:
-      type: object
-      additionalProperties: false
-      properties:
-        max_concurrent_requests:
-          type: integer
-          minimum: 0
-          maximum: 4294967295
-          default: 32
-          example: 32
-          x-go-type-skip-optional-pointer: false
-          description: |
-            Maximum concurrent query, search, and retrieval requests in this
-            process. The default is 32. The budget is shared by REST, MCP,
-            retrieval-agent, A2A, and direct API-kernel execution. Full-text,
-            vector, hybrid, graph, aggregation, federated searches, and document
-            scans consume it. Point lookups and operational/control-plane reads
-            remain outside it. Excess HTTP work is rejected immediately with
-            HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
-            response. Excess work is not queued. Set to 0 to disable query
-            admission. This budget is independent of transport safeguards,
-            write admission, and
-            admission.inference.max_concurrent_requests.
-
-    WriteAdmissionConfig:
-      type: object
-      additionalProperties: false
-      properties:
-        max_concurrent_requests:
-          type: integer
-          minimum: 0
-          maximum: 4294967295
-          default: 16
-          example: 16
-          x-go-type-skip-optional-pointer: false
-          description: |
-            Maximum concurrent foreground data mutations in this process. The
-            default is 16. Table batch writes, cross-table batches, linear merges,
-            and transaction commits consume this budget. Schema, index, backup,
-            restore, repair, and other administrative operations use dedicated
-            control or background-maintenance paths. Set to 0 to disable write
-            admission.
-
-            Excess HTTP work in either foreground class is rejected immediately
-            with HTTP 429 and Retry-After: 1; asynchronous protocols use their
-            native failure response. Excess work is not queued. Both budgets are
-            independent of transport safeguards and
-            admission.inference.max_concurrent_requests.
-
-    InferenceAdmissionConfig:
-      type: object
-      additionalProperties: false
-      properties:
-        max_concurrent_requests:
-          type: integer
-          minimum: 0
-          maximum: 4294967295
-          default: 32
-          example: 32
-          x-go-type-skip-optional-pointer: false
-          description: |
-            Maximum concurrent inference requests admitted by this process.
-            The budget covers embedded inference routes, direct providers, and
-            public connection inference forwarding. Remote forwarding holds a
-            slot for the full upstream request. The runtime-reserved
-            `local-inference` connection dispatches in process and is admitted
-            once by the destination inference route; configured URLs remain
-            remote boundaries even when they alias the local listener.
-            Embedded standalone uses one shared coordinator for all of those
-            surfaces; API-only runtimes use the same setting as a local forwarding
-            gate. For embedded inference, this value also sizes the weighted work
-            budget: each request consumes one request slot and at least one unit,
-            while request body size, generation workload, and image byte/count
-            reservations can consume more than one unit. The request count can
-            therefore never exceed this value, while expensive requests may
-            exhaust weighted capacity sooner. Read and
-            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
-            per unit and at least one unit per two images. A positive capacity also
-            clamps each such request's downloaded-image ceiling to 16 MiB times
-            this value. When a request or weighted-work ceiling is exhausted, new HTTP requests are
-            rejected immediately with 503 Service Unavailable and Retry-After: 1;
-            they are not retained
-            in an in-process queue. Set to 0 to disable request admission and,
-            for embedded inference, weighted-unit accounting and the
-            capacity-derived clamp. The default is 32.
 
     MetadataInfo:
       type: object

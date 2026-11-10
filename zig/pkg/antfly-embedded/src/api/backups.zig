@@ -1591,63 +1591,15 @@ pub fn gcsConfigForConnection(
     network_io: ?std.Io,
     filesystem_io: ?std.Io,
 ) !object_storage.Gcs.JsonApiConfig {
-    var cfg = switch (external.gcs_credentials.source) {
-        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
-            alloc,
-            external.gcs_credentials.scope,
-            network_io,
-            filesystem_io,
-        ),
-        .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
-            alloc,
-            external.gcs_credentials.bearer_token orelse return error.InvalidConnectionCredentials,
-            external.project_id,
-        ),
-        .service_account => blk: {
-            var account = if (external.gcs_credentials.service_account_json) |raw|
-                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
-            else
-                try google_auth.serviceAccountFromFileAllocWithIo(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials, filesystem_io);
-            var account_owned = true;
-            errdefer if (account_owned) account.deinit(alloc);
-            const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
-            defer if (account_project_id) |value| alloc.free(value);
-            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
-                alloc,
-                account,
-                external.gcs_credentials.scope orelse google_auth.default_scope,
-            );
-            account_owned = false;
-            errdefer auth_cfg.deinit(alloc);
-            const source = try alloc.create(google_auth.CachedTokenSource);
-            errdefer alloc.destroy(source);
-            source.* = try google_auth.CachedTokenSource.initWithAuthorities(
-                alloc,
-                auth_cfg,
-                network_io,
-                filesystem_io,
-            );
-            var value = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
-            value.auth = .{ .google_token_source = source };
-            if (external.project_id orelse account_project_id) |project_id| value.project_id = try alloc.dupe(u8, project_id);
-            break :blk value;
-        },
-    };
-    errdefer cfg.deinit(alloc);
-    cfg.io = network_io;
-    if (external.endpoint) |endpoint| {
-        alloc.free(cfg.endpoint);
-        cfg.endpoint = try alloc.dupe(u8, endpoint);
-    }
-    if (external.upload_endpoint) |endpoint| {
-        alloc.free(cfg.upload_endpoint);
-        cfg.upload_endpoint = try alloc.dupe(u8, endpoint);
-    }
-    if (external.project_id) |project_id| {
-        if (cfg.project_id) |previous| alloc.free(previous);
-        cfg.project_id = try alloc.dupe(u8, project_id);
-    }
-    return cfg;
+    return object_storage.Gcs.clientConfigForCredentialsAlloc(
+        alloc,
+        external.gcs_credentials,
+        external.project_id,
+        external.endpoint,
+        external.upload_endpoint,
+        network_io,
+        filesystem_io,
+    );
 }
 
 pub const S3SecretOverrides = struct {
@@ -2663,13 +2615,15 @@ pub fn localArtifactStatsEqual(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    try tables_api.validateStoredIndexesJson(alloc, manifest.indexes_json);
+    const indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    errdefer alloc.free(indexes);
+    try tables_api.validateStoredIndexesJson(alloc, indexes);
     return .{
         // Supported backup manifests contain primary-owned artifacts. Restore
         // must preserve that authority instead of applying fresh-table policy.
         .storage = .{ .dense_embeddings = .primary_lsm },
         .description = if (manifest.description.len > 0) try alloc.dupe(u8, manifest.description) else null,
-        .indexes_json = try alloc.dupe(u8, manifest.indexes_json),
+        .indexes_json = indexes,
         .schema_json = if (manifest.schema_json.len > 0) try alloc.dupe(u8, manifest.schema_json) else null,
         .replication_sources_json = if (manifest.replication_sources_json.len > 0) try alloc.dupe(u8, manifest.replication_sources_json) else null,
     };

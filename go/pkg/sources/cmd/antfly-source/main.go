@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// antfly-source performs one durable sync; run it from cron/systemd/Kubernetes
-// for unattended self-hosted ingestion. It does not require Colony or Cloud CLI.
+// antfly-source runs durable one-shot ingestion or its optional source companion.
+// It does not require Colony or Cloud CLI.
 package main
 
 import (
@@ -38,13 +38,25 @@ func main() {
 	}
 }
 func run() error {
+	if len(os.Args) >= 2 && os.Args[1] == "search" {
+		return searchCommand(os.Args[2:])
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "processing" {
+		return processingCommand(os.Args[2:])
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "serve" {
+		return serve(os.Args[2:])
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "migrate-local" {
+		return migrateLocal(os.Args[2:])
+	}
 	flags := flag.NewFlagSet("antfly-source sync", flag.ContinueOnError)
 	profile := flags.String("config", "", "source profile JSON")
 	state := flags.String("state-dir", "", "private durable state directory")
 	catalog := flags.String("catalog-out", "", "portable search catalog path")
 	restart := flags.Bool("restart", false, "discard a failed pinned selection and enumerate afresh (retain ownership)")
 	if len(os.Args) < 2 || os.Args[1] != "sync" {
-		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]")
+		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]; or antfly-source serve --config FILE --state-dir DIR --public-url URL; or antfly-source migrate-local --source ID --from-connection NAME --to-connection NAME --to-bucket BUCKET [--server URL | (--config FILE --state-dir DIR --public-url URL)] [--from-prefix PREFIX] [--to-prefix PREFIX] [--dry-run]")
 	}
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		return err
@@ -52,29 +64,38 @@ func run() error {
 	if flags.NArg() != 0 || *profile == "" || *state == "" {
 		return fmt.Errorf("config and state-dir are required")
 	}
-	file, err := os.Open(*profile)
+	configuration, err := loadProfile(*profile)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
-	if err != nil {
-		return err
-	}
-	if len(data) > 1<<20 {
-		return fmt.Errorf("source profile exceeds 1 MiB")
-	}
-	var configuration sources.Profile
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&configuration); err != nil {
-		return fmt.Errorf("invalid source profile: %w", err)
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		return fmt.Errorf("source profile must contain exactly one JSON value")
-	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	runner := sources.Runner{Profile: configuration, StateDir: *state, CatalogPath: *catalog, Restart: *restart}
 	return runner.Sync(ctx)
+}
+
+func loadProfile(path string) (sources.Profile, error) {
+	var configuration sources.Profile
+	file, err := os.Open(path)
+	if err != nil {
+		return configuration, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+	if err != nil {
+		return configuration, err
+	}
+	if len(data) > 1<<20 {
+		return configuration, fmt.Errorf("source profile exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&configuration); err != nil {
+		return configuration, fmt.Errorf("invalid source profile: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return configuration, fmt.Errorf("source profile must contain exactly one JSON value")
+	}
+	return configuration, nil
 }

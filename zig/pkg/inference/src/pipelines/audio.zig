@@ -28,6 +28,7 @@ pub const PcmAudio = generic.PcmAudio;
 pub const PcmAudioInterleaved = generic.PcmAudioInterleaved;
 pub const EncodedFormat = generic.EncodedFormat;
 pub const DecodeOptions = generic.DecodeOptions;
+pub const EncodedClip = generic.EncodedClip;
 pub const decodeWav = generic.decodeWav;
 pub const detectFormat = generic.detectFormat;
 pub const detectFormatFromMime = generic.detectFormatFromMime;
@@ -44,6 +45,18 @@ pub const downmixToMono = generic.downmixToMono;
 pub const resample = generic.resample;
 pub const copyOrResample = generic.copyOrResample;
 pub const logMelSpectrogramWithConfig = generic.logMelSpectrogramWithConfig;
+
+/// Only exact decoded zero establishes silence; quiet nonzero samples must
+/// remain available to recognition. Reject non-finite PCM at this boundary.
+pub fn digitalSilence(samples: []const f32) !bool {
+    if (samples.len == 0) return false;
+    var silent = true;
+    for (samples) |sample| {
+        if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+        if (sample != 0) silent = false;
+    }
+    return silent;
+}
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
 pub const WHISPER_N_FFT: u32 = 400;
@@ -62,6 +75,8 @@ pub const WHISPER_CONFIG = AudioConfig{
     .n_mels = WHISPER_N_MELS,
     .chunk_length_s = WHISPER_CHUNK_LENGTH,
     .normalization = .whisper,
+    .mel_scale = .slaney,
+    .center = true,
 };
 
 pub const CLAP_CONFIG = AudioConfig{
@@ -177,7 +192,7 @@ pub fn whisperLogMelBlas(allocator: std.mem.Allocator, samples: []const f32, sec
     const max_frames = @as(usize, seconds) * WHISPER_SAMPLE_RATE / hop;
     const min_samples = @as(usize, seconds) * WHISPER_SAMPLE_RATE;
     const padded_len = @max(samples.len, min_samples);
-    const frames = @min((padded_len - n_fft) / hop + 1, max_frames);
+    const frames = @min(padded_len / hop, max_frames);
     if (frames == 0 or frames > std.math.maxInt(c_int) / 2) return error.UnsupportedAudioFormat;
 
     // Windowed frames [frames, n_fft].
@@ -187,7 +202,7 @@ pub fn whisperLogMelBlas(allocator: std.mem.Allocator, samples: []const f32, sec
         const start = f * hop;
         const row = frame_matrix[f * n_fft ..][0..n_fft];
         for (0..n_fft) |i| {
-            const idx = start + i;
+            const idx = generic.reflectSampleIndex(@as(isize, @intCast(start + i)) - @as(isize, n_fft / 2), padded_len);
             const sample: f32 = if (idx < samples.len) samples[idx] else 0;
             const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_fft));
             row[i] = sample * 0.5 * (1.0 - @cos(2.0 * std.math.pi * t));
@@ -239,7 +254,7 @@ pub fn whisperLogMelBlas(allocator: std.mem.Allocator, samples: []const f32, sec
     }
 
     // Mel energies [frames, n_mels] = power x filters^T.
-    const filters = try generic.melFilterbankWithRange(allocator, @intCast(n_mels), @intCast(n_fft), WHISPER_SAMPLE_RATE, 0, 0);
+    const filters = try generic.melFilterbankWithScale(allocator, @intCast(n_mels), @intCast(n_fft), WHISPER_SAMPLE_RATE, 0, 0, .slaney);
     defer allocator.free(filters);
     const mel = try allocator.alloc(f32, frames * n_mels);
     defer allocator.free(mel);
@@ -275,9 +290,19 @@ pub fn whisperLogMelBlas(allocator: std.mem.Allocator, samples: []const f32, sec
         if (v.* > max_val) max_val = v.*;
     }
     const floor_val = max_val - 8.0;
-    const offset_val = max_val - 4.0;
+    const offset_val: f32 = -4.0;
     for (output) |*v| v.* = (@max(v.*, floor_val) - offset_val) * 0.25;
     return output;
+}
+
+test "Whisper BLAS features match independent centered Slaney reference at two amplitudes" {
+    if (!blas_available) return error.SkipZigTest;
+    const Extract = struct {
+        fn run(alloc: std.mem.Allocator, samples: []const f32, bins: u32) ![]f32 {
+            return whisperLogMelBlas(alloc, samples, 1, bins);
+        }
+    };
+    try generic.whisper_reference_test.check(Extract.run);
 }
 
 test "blas log-mel matches the fft path" {

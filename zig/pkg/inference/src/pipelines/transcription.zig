@@ -41,6 +41,9 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 pub const TranscribeConfig = struct {
     vocab_size: usize = 51865,
     max_length: usize = 448,
+    /// Per audio item, including all windows, temperature retries, timestamps
+    /// and EOS. Exhaustion returns a retained prefix marked truncated.
+    max_output_tokens: ?usize = null,
     language: ?[]const u8 = null,
     sample_rate: usize = 16000,
     n_mels: usize = 80,
@@ -81,9 +84,10 @@ pub const TranscribeConfig = struct {
 
 pub const AudioContext = enum { full, dynamic };
 
-/// Phrase timed by Whisper timestamp tokens, relative to the window start.
+/// Text with measured phrase clocks or coarse recognition-window bounds.
 pub const TimedSegment = struct {
     text: []const u8,
+    granularity: whisper_timestamps.Granularity = .window,
     start_ms: u64,
     end_ms: u64,
 };
@@ -131,6 +135,9 @@ pub const TranscribeResult = struct {
     temperature: f32 = 0,
     /// True when the window was judged silence; `text` is empty then.
     silent: bool = false,
+    truncated: bool = false,
+    /// Every generated token, including EOS, timestamps and discarded retries.
+    output_tokens: usize = 0,
 
     pub fn deinit(self: *TranscribeResult) void {
         self.allocator.free(self.text);
@@ -155,6 +162,7 @@ pub const TranscriptionPipeline = struct {
     tokenizer: tokenizer_mod.Tokenizer,
     config: TranscribeConfig,
     execution_control: ?InferenceExecutionControl = null,
+    output_token_budget: @import("transcription_budget.zig").OutputTokenBudget = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -169,6 +177,7 @@ pub const TranscriptionPipeline = struct {
             .decoder = decoder,
             .tokenizer = tokenizer,
             .config = config,
+            .output_token_budget = .{ .remaining = config.max_output_tokens },
         };
     }
 
@@ -246,6 +255,8 @@ pub const TranscriptionPipeline = struct {
         sample_rate: u32,
         prompt_prefix: []const i32,
     ) !TranscribeResult {
+        try self.output_token_budget.check();
+        const consumed_before = self.output_token_budget.consumed;
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         var timing = Timing{};
@@ -305,7 +316,7 @@ pub const TranscriptionPipeline = struct {
         var chosen: ?Attempt = null;
         defer if (chosen) |*attempt| attempt.deinit(allocator);
         for (temperatures, 0..) |temperature, attempt_index| {
-            if (attempt_index > 0 and !self.config.temperature_fallback) break;
+            if (attempt_index > 0 and (!self.config.temperature_fallback or self.output_token_budget.remaining == 0)) break;
             var attempt = try self.decodeAttempt(encoder_outputs[0], enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
             errdefer attempt.deinit(allocator);
             const needs_fallback = attempt.compression_ratio > self.config.compression_ratio_threshold or
@@ -314,7 +325,13 @@ pub const TranscriptionPipeline = struct {
             chosen = attempt;
             if (!needs_fallback) break;
         }
-        var attempt = chosen.?;
+        return self.finishWindow(&chosen.?, windowDurationMs(samples.len, sample_rate, context_seconds), timing, self.output_token_budget.consumed - consumed_before);
+    }
+
+    /// Materialize owned, valid UTF-8 text before window stitching and byte
+    /// offsets are computed. Token IDs and usage retain all generated work.
+    fn finishWindow(self: *TranscriptionPipeline, attempt: *const Attempt, window_ms: u64, timing: Timing, output_tokens: usize) !TranscribeResult {
+        const allocator = self.allocator;
         // Whisper treats a window as silence when the no-speech token was
         // likely at the first step and the decode was unconfident anyway.
         const silent = attempt.no_speech_prob > self.config.no_speech_threshold and
@@ -336,7 +353,7 @@ pub const TranscriptionPipeline = struct {
             if (self.config.timestamps and rules.isTimestamp(token)) continue;
             try text_tokens.append(allocator, token);
         };
-        const text = try self.tokenizer.decode(allocator, text_tokens.items);
+        const text = try self.tokenizer.decodeText(allocator, text_tokens.items);
         errdefer allocator.free(text);
 
         var segments = std.ArrayListUnmanaged(TimedSegment).empty;
@@ -345,33 +362,38 @@ pub const TranscriptionPipeline = struct {
             segments.deinit(allocator);
         }
         if (self.config.timestamps and !silent) {
-            const window_ms = windowDurationMs(samples.len, sample_rate, @as(usize, context_seconds));
             const token_segments = try whisper_timestamps.parseSegments(allocator, rules, attempt.generated.items, window_ms);
             defer allocator.free(token_segments);
             for (token_segments) |segment| {
-                const raw = try self.tokenizer.decode(allocator, attempt.generated.items[segment.token_start..segment.token_end]);
+                const raw = try self.tokenizer.decodeText(allocator, attempt.generated.items[segment.token_start..segment.token_end]);
                 defer allocator.free(raw);
                 const trimmed = std.mem.trim(u8, raw, " \t\r\n");
                 if (trimmed.len == 0) continue;
-                try segments.append(allocator, .{
+                try segments.ensureUnusedCapacity(allocator, 1);
+                segments.appendAssumeCapacity(.{
                     .text = try allocator.dupe(u8, trimmed),
+                    .granularity = segment.granularity,
                     .start_ms = segment.start_ms,
                     .end_ms = segment.end_ms,
                 });
             }
         }
+        const tokens = try text_tokens.toOwnedSlice(allocator);
+        errdefer allocator.free(tokens);
         return .{
             .text = text,
             .language = language,
             .allocator = allocator,
             .timing = timing,
             .segments = try segments.toOwnedSlice(allocator),
-            .tokens = try text_tokens.toOwnedSlice(allocator),
+            .tokens = tokens,
             .no_speech_prob = attempt.no_speech_prob,
             .avg_logprob = attempt.avg_logprob,
             .compression_ratio = attempt.compression_ratio,
             .temperature = attempt.temperature,
             .silent = silent,
+            .truncated = !attempt.completed and (!silent or self.output_token_budget.remaining == 0),
+            .output_tokens = output_tokens,
         };
     }
 
@@ -394,6 +416,7 @@ pub const TranscriptionPipeline = struct {
 
     /// One full decode of the window at `temperature` (0 = greedy).
     const Attempt = struct {
+        completed: bool = false,
         generated: std.ArrayListUnmanaged(i32),
         detected_language: ?[]const u8,
         no_speech_prob: f32,
@@ -416,6 +439,7 @@ pub const TranscriptionPipeline = struct {
         seed: usize,
         timing: *Timing,
     ) !Attempt {
+        try self.output_token_budget.check();
         const allocator = self.allocator;
         const max_len = self.config.max_length;
         if (max_len == 0) return error.InvalidTranscriptionMaxLength;
@@ -473,6 +497,7 @@ pub const TranscriptionPipeline = struct {
         const rules_active = self.config.timestamps and rules.timestamp_begin >= 0 and
             @as(usize, @intCast(rules.timestamp_begin)) < self.config.vocab_size;
 
+        var completed = false;
         while (dec_len < max_len) {
             if (forced_index < forced.len and forced[forced_index].position + offset == dec_len) {
                 if (forced[forced_index].token_id) |token_id| {
@@ -484,6 +509,7 @@ pub const TranscriptionPipeline = struct {
             }
 
             const generated_position = dec_len;
+            if (generated_position >= prompt_end and self.output_token_budget.remaining == 0) break;
             if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
             const step_started = platform.time.monotonicNs();
             const dynamic_language_slot = forced_index < forced.len and
@@ -622,7 +648,13 @@ pub const TranscriptionPipeline = struct {
             // Prompt slots are control tokens. Do not terminate before the
             // artifact-defined prompt is complete even if a malformed model
             // predicts EOS for a dynamic slot.
-            if (best_token == self.config.eos_token_id and generated_position >= prompt_end) break;
+            if (generated_position >= prompt_end) {
+                try self.output_token_budget.consume();
+                if (best_token == self.config.eos_token_id) {
+                    completed = true;
+                    break;
+                }
+            }
 
             dec_ids[dec_len] = best_token;
             dec_len += 1;
@@ -636,8 +668,11 @@ pub const TranscriptionPipeline = struct {
             // itself while the host runs one step ahead. Anything the
             // backend declines leaves the loop on the synchronous path.
             if (native_decoder) |*decoder| {
-                if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len) {
-                    if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) break;
+                if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len and self.output_token_budget.remaining != 0) {
+                    if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
+                        completed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -648,6 +683,7 @@ pub const TranscriptionPipeline = struct {
         defer allocator.free(text);
         return .{
             .generated = generated,
+            .completed = completed,
             .detected_language = detected_language,
             .no_speech_prob = no_speech_prob,
             .avg_logprob = avg_logprob,
@@ -676,7 +712,7 @@ pub const TranscriptionPipeline = struct {
         timing: *Timing,
     ) !bool {
         const allocator = self.allocator;
-        const max_len = self.config.max_length;
+        const max_len = try self.output_token_budget.decodeEnd(dec_len.*, self.config.max_length);
         const trace = platform.env.getenvBool("TERMITE_WHISPER_TRACE_PIPELINE");
         if (!decoder.setPipelined(true)) {
             if (trace) std.debug.print("whisper_pipeline: declined (backend cannot pipeline)\n", .{});
@@ -758,6 +794,7 @@ pub const TranscriptionPipeline = struct {
             step_started = now;
             const token: i32 = @intCast(whisper_timestamps.statsId(&stats, whisper_timestamps.stats_choice_token) orelse 0);
             logprob_sum.* += stats[whisper_timestamps.stats_choice_logprob];
+            try self.output_token_budget.consume();
             if (token == self.config.eos_token_id) {
                 // The encoded lookahead, if any, predicted past the end.
                 if (lookahead) decoder.discard();
@@ -770,7 +807,7 @@ pub const TranscriptionPipeline = struct {
                 // Either the length limit or a backend that could not
                 // encode the lookahead; the cache is consistent with
                 // `dec_len` either way.
-                return dec_len.* >= max_len;
+                return false;
             }
             try decoder.submit();
             slot = 1 - slot;
@@ -919,4 +956,124 @@ test "Whisper decoder prompts reject unsorted and out of bounds entries" {
     try std.testing.expectError(error.InvalidWhisperDecoderPrompt, validateForcedDecoderIds(&.{
         .{ .position = 8, .token_id = 10 },
     }, 8));
+}
+
+test "exhausted transcription fails before touching model resources" {
+    var pipeline = TranscriptionPipeline.init(std.testing.allocator, undefined, undefined, undefined, .{ .max_output_tokens = 1 });
+    try pipeline.output_token_budget.consume();
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
+}
+
+const utf8_test_tokenizer =
+    \\{"model":{"type":"BPE","vocab":{"ok":0,"Ã":1,"©":2,"ä":3,"¸":4,"ĸ":5,"ð":6,"Ł":7,"ĺ":8,"Ģ":9},"merges":[]},"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false},"decoder":{"type":"ByteLevel"}}
+;
+
+fn checkUtf8Window(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, ids: []const i32, expected: []const u8, timestamps: bool, completed: bool) !void {
+    var pipeline = TranscriptionPipeline.init(allocator, undefined, undefined, tokenizer, .{
+        .timestamps = timestamps,
+        .decode = .{ .timestamp_begin_id = 100 },
+    });
+    var generated = std.ArrayListUnmanaged(i32).empty;
+    defer generated.deinit(allocator);
+    if (timestamps) try generated.append(allocator, 100);
+    try generated.appendSlice(allocator, ids);
+    pipeline.output_token_budget = .{ .remaining = 0, .consumed = generated.items.len };
+    const attempt = TranscriptionPipeline.Attempt{
+        .completed = completed,
+        .generated = generated,
+        .detected_language = "ja",
+        .no_speech_prob = 0,
+        .avg_logprob = 0,
+        .compression_ratio = 1,
+        .temperature = 0,
+    };
+    var result = try pipeline.finishWindow(&attempt, 1000, .{}, generated.items.len);
+    defer result.deinit();
+    try std.testing.expectEqualStrings(expected, result.text);
+    try std.testing.expectEqualSlices(i32, ids, result.tokens);
+    try std.testing.expectEqual(generated.items.len, result.output_tokens);
+    try std.testing.expectEqual(!completed, result.truncated);
+    if (timestamps and expected.len > 0) {
+        try std.testing.expectEqual(@as(usize, 1), result.segments.len);
+        try std.testing.expectEqualStrings(expected, result.segments[0].text);
+        try std.testing.expectEqual(whisper_timestamps.Granularity.window, result.segments[0].granularity);
+        try std.testing.expectEqual(@as(u64, 0), result.segments[0].start_ms);
+        try std.testing.expectEqual(@as(u64, 1000), result.segments[0].end_ms);
+    } else try std.testing.expectEqual(@as(usize, 0), result.segments.len);
+
+    // The wire type must remain a JSON string, even at a byte-token cutoff.
+    // Keep wire assertions outside the result-ownership allocation sweep:
+    // JSON's arena growth can depend on the backing allocator's remaps.
+    const wire_allocator = std.testing.allocator;
+    const json = try std.json.Stringify.valueAlloc(wire_allocator, .{ .text = result.text, .segments = result.segments }, .{});
+    defer wire_allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, wire_allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, parsed.value.object.get("text").?.string);
+    if (result.segments.len > 0) {
+        const segment = parsed.value.object.get("segments").?.array.items[0].object;
+        try std.testing.expectEqualStrings(expected, segment.get("text").?.string);
+        try std.testing.expectEqualStrings("window", segment.get("granularity").?.string);
+    }
+}
+
+fn checkTimestampEvidence(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer) !void {
+    var pipeline = TranscriptionPipeline.init(allocator, undefined, undefined, tokenizer, .{ .timestamps = true, .decode = .{ .timestamp_begin_id = 100 } });
+    var generated = std.ArrayListUnmanaged(i32).empty;
+    defer generated.deinit(allocator);
+    // One bracketed phrase followed by an unfinished, nonzero-start tail.
+    try generated.appendSlice(allocator, &.{ 100, 0, 150, 175, 1, 2 });
+    pipeline.output_token_budget = .{ .remaining = 0, .consumed = generated.items.len };
+    const attempt = TranscriptionPipeline.Attempt{ .generated = generated, .detected_language = null, .no_speech_prob = 0, .avg_logprob = 0, .compression_ratio = 1, .temperature = 0 };
+    var result = try pipeline.finishWindow(&attempt, 30000, .{}, generated.items.len);
+    defer result.deinit();
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqualStrings("oké", result.text);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2 }, result.tokens);
+    try std.testing.expectEqual(@as(usize, 6), result.output_tokens);
+    try std.testing.expectEqual(@as(usize, 2), result.segments.len);
+    try std.testing.expectEqualStrings("ok", result.segments[0].text);
+    try std.testing.expectEqual(whisper_timestamps.Granularity.phrase, result.segments[0].granularity);
+    try std.testing.expectEqual(@as(u64, 0), result.segments[0].start_ms);
+    try std.testing.expectEqual(@as(u64, 1000), result.segments[0].end_ms);
+    try std.testing.expectEqualStrings("é", result.segments[1].text);
+    try std.testing.expectEqual(whisper_timestamps.Granularity.window, result.segments[1].granularity);
+    try std.testing.expectEqual(@as(u64, 0), result.segments[1].start_ms);
+    try std.testing.expectEqual(@as(u64, 30000), result.segments[1].end_ms);
+}
+
+test "Whisper preserves mixed phrase and window evidence through every allocation failure" {
+    var hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(std.testing.allocator, utf8_test_tokenizer);
+    defer hf.deinitSelf();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkTimestampEvidence, .{hf.tokenizer()});
+}
+
+test "Whisper output cutoffs preserve UTF-8 strings for text and timed segments" {
+    const a = std.testing.allocator;
+    var hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(a, utf8_test_tokenizer);
+    defer hf.deinitSelf();
+    const tokenizer = hf.tokenizer();
+    const ids = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const prefixes = [_][]const u8{ "", "ok", "ok", "oké", "oké", "oké", "oké世", "oké世", "oké世", "oké世", "oké世😀" };
+    for ([_]bool{ false, true }) |timestamps| {
+        for (prefixes, 0..) |expected, end| {
+            try checkUtf8Window(a, tokenizer, ids[0..end], expected, timestamps, false);
+        }
+        try checkUtf8Window(a, tokenizer, &ids, "oké世😀", timestamps, true);
+        try checkUtf8Window(a, tokenizer, &.{1}, "", timestamps, false);
+        // Resynchronize after invalid interior pieces without dropping the
+        // following ASCII text or changing completion evidence.
+        try checkUtf8Window(a, tokenizer, &.{ 1, 0, 2, 3, 0 }, "okok", timestamps, true);
+    }
+    // Incremental decoding must still preserve byte pieces across calls.
+    const raw = try tokenizer.decode(a, &.{1});
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(u8, &.{0xc3}, raw);
+}
+
+test "Whisper UTF-8 result materialization releases every failed allocation" {
+    var hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(std.testing.allocator, utf8_test_tokenizer);
+    defer hf.deinitSelf();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkUtf8Window, .{ hf.tokenizer(), @as([]const i32, &.{ 0, 1, 2, 3 }), @as([]const u8, "oké"), true, false });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkUtf8Window, .{ hf.tokenizer(), @as([]const i32, &.{1}), @as([]const u8, ""), true, false });
 }

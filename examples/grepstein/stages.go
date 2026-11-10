@@ -171,9 +171,23 @@ func datasetsCmd(args []string) error {
 
 func corpusPageCitation(original string, metadata map[string]any, page float64) (string, int) {
 	start := float64(1)
-	if v, ok := metadata["page_start"].(float64); ok && v > 0 {
+	if v, ok := corpusMetadataNumber(metadata["page_start"]); ok && v > 0 {
 		start = v
 	}
 	number := int(start + page - 1)
 	return strings.Split(original, "#")[0] + fmt.Sprintf("#page=%d", number), number
+}
+
+// Prepared manifests preserve JSON numbers; server responses use float64.
+// Page counts and offsets are small enough to convert after decoding locators.
+func corpusMetadataNumber(value any) (float64, bool) {
+	switch n := value.(type) {
+	case json.Number:
+		v, err := n.Float64()
+		return v, err == nil
+	case float64:
+		return n, true
+	default:
+		return 0, false
+	}
 }

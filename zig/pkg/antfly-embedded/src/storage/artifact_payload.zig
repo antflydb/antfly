@@ -164,7 +164,12 @@ pub const Metadata = struct {
         const header = try codec.decodeHeader(value);
         return .{
             .header = header,
-            .dense_dimensions = if (header.kind == .dense_embedding) try codec.decodeDenseEmbeddingDims(value) else null,
+            .dense_dimensions = if (header.kind != .dense_embedding)
+                null
+            else if (header.flags.vector_elided)
+                (try codec.elidedDenseEmbedding(value)).?.dims
+            else
+                try codec.decodeDenseEmbeddingDims(value),
             .reference = null,
         };
     }
@@ -395,7 +400,9 @@ pub const Session = struct {
         self.reference_mutated = true;
         if (isReference(value)) return error.PhysicalVectorReferenceNotWritable;
         const header = codec.decodeHeader(value) catch return value;
-        if (header.kind != .dense_embedding) return value;
+        // Elided stubs (transient LEANN vectors) hold no vector: keep them
+        // inline instead of preparing a payload.
+        if (header.kind != .dense_embedding or header.flags.vector_elided) return value;
         const reference = try Reference.forArtifact(key, value);
         const alloc = self.arena.allocator();
         const borrowed: Prepared = .{ .reference = reference, .artifact = &.{} };

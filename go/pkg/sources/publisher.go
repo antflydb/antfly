@@ -50,6 +50,9 @@ func ValidateEndpoint(raw string) error {
 	return fmt.Errorf("Antfly endpoint requires HTTPS or loopback HTTP")
 }
 func (p *Publisher) call(ctx context.Context, method, path string, body any) ([]byte, error) {
+	if method == http.MethodGet {
+		return p.callRead(ctx, method, path, body)
+	}
 	return p.callContentType(ctx, method, path, body, "application/json")
 }
 func (p *Publisher) callContentType(ctx context.Context, method, path string, body any, contentType string) ([]byte, error) {
@@ -72,6 +75,9 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 	request.Header.Set("Content-Type", contentType)
+	if scope, ok := ctx.Value(searchScopeKey{}).(*searchScope); ok {
+		scope.headers(request.Header)
+	}
 	if p.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+p.Token)
 	}
@@ -93,12 +99,20 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, fmt.Errorf("Antfly response exceeds budget")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, &PublishHTTPError{Status: response.StatusCode}
+		return nil, &PublishHTTPError{Status: response.StatusCode, RetryAt: providerRetryAt(response.Header.Get("Retry-After"), time.Now())}
+	}
+	if scope, ok := ctx.Value(searchScopeKey{}).(*searchScope); ok {
+		if err := scope.observe(response.Header); err != nil {
+			return nil, err
+		}
 	}
 	return data, nil
 }
 
-type PublishHTTPError struct{ Status int }
+type PublishHTTPError struct {
+	Status  int
+	RetryAt time.Time
+}
 
 func (e *PublishHTTPError) Error() string {
 	return fmt.Sprintf("Antfly publication returned HTTP %d", e.Status)
@@ -112,11 +126,13 @@ func (p *Publisher) EnsureTable(ctx context.Context, table string) error {
 	if status, ok := err.(*PublishHTTPError); !ok || status.Status != 404 {
 		return err
 	}
-	_, err = p.call(ctx, "POST", tablePath(table), map[string]any{"num_shards": 1})
+	_, err = p.call(ctx, "POST", tablePath(table), SourceTableConfig())
 	return err
 }
 func (p *Publisher) Batch(ctx context.Context, table string, inserts map[string]any, deletes []string) error {
-	body, err := p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": inserts, "deletes": deletes, "sync_level": "write"})
+	// Catalog publication and retirement use live queries on Lite. An index
+	// barrier makes their subsequent presence/absence checks authoritative.
+	body, err := p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": inserts, "deletes": deletes, "sync_level": "full_index"})
 	if err != nil {
 		return err
 	}
@@ -143,22 +159,30 @@ func (p *Publisher) ReadyAbsent(ctx context.Context, table string, ids []string)
 	return WaitForAbsent(ctx, p.Query, table, ids)
 }
 
-// WaitForAbsent verifies retirement through fresh ordinary table-query snapshots.
+// WaitForAbsent verifies retirement through ordinary table queries. Callers must
+// commit deletions at full_index before accepting an empty live result on Lite.
 func WaitForAbsent(ctx context.Context, query func(context.Context, string, []byte) ([]byte, error), table string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > 1000 {
+		return fmt.Errorf("canonical absence batch exceeds 1000 records")
+	}
+
 	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		body, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": ids}, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		body, _ := json.Marshal(map[string]any{"query": documentIDsQuery(ids), "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 		data, err := query(wait, table, body)
 		if err != nil {
 			return err
 		}
 		var result struct {
 			Responses []struct {
-				Status   int             `json:"status"`
-				Error    json.RawMessage `json:"error"`
-				Snapshot string          `json:"remote_snapshot"`
-				Hits     struct {
+				Status int             `json:"status"`
+				Error  json.RawMessage `json:"error"`
+				queryFreshness
+				Hits struct {
 					Hits []json.RawMessage `json:"hits"`
 				} `json:"hits"`
 			} `json:"responses"`
@@ -166,7 +190,7 @@ func WaitForAbsent(ctx context.Context, query func(context.Context, string, []by
 		if err := json.Unmarshal(data, &result); err != nil {
 			return err
 		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 			return fmt.Errorf("Antfly did not provide successful deletion snapshot readiness")
 		}
 		if len(result.Responses[0].Hits.Hits) == 0 {

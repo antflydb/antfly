@@ -26,8 +26,10 @@ const manifest_mod = @import("../manifest/mod.zig");
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const runtime_lifecycle = @import("../../common/runtime_lifecycle.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
+const wal_collection = @import("../wal/collector.zig");
 
 pub const RuntimeConfig = struct {
+    sql_execution_gc: ?@import("../sql/collector.zig").Collector = null,
     tick_interval_ms: u64 = 25,
     role: api_mod.RuntimeRole = .combined,
     publish_enabled: bool = true,
@@ -38,6 +40,7 @@ pub const RuntimeConfig = struct {
 };
 
 pub const RuntimeRunStats = struct {
+    sql_execution_gc_steps: usize = 0,
     published_namespaces: usize = 0,
     publish_budget_rejected_namespaces: usize = 0,
     publish_head_conflicts: usize = 0,
@@ -48,6 +51,10 @@ pub const RuntimeRunStats = struct {
     deleted_versions: usize = 0,
     deleted_artifacts: usize = 0,
     wal_records_removed: u64 = 0,
+    wal_collection_steps: usize = 0,
+    wal_collection_deferred: usize = 0,
+    wal_collection_marked_pages: usize = 0,
+    wal_collection_deleted_objects: usize = 0,
     enriched_namespaces: usize = 0,
     enriched_documents: usize = 0,
     enrichment_wal_appends: usize = 0,
@@ -65,6 +72,7 @@ pub const RuntimeWorkKind = enum {
     enrichment_round,
     compaction_round,
     prune_round,
+    wal_collection,
 };
 
 /// Optional production-neutral operation-cost boundary. Native runtimes leave
@@ -88,6 +96,9 @@ pub const ManagedRuntime = struct {
     compactor: ?build_mod.Compactor = null,
     enricher: ?enrichment_mod.SparseEnricher = null,
     pruner: build_mod.Pruner,
+    wal_collector: ?*wal_collection.Collector = null,
+    wal_collection_cursor: usize = 0,
+    sql_gc_schedule: @import("../sql/collector.zig").Schedule = .{},
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
@@ -212,6 +223,23 @@ pub const ManagedRuntime = struct {
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
+        if (self.cfg.sql_execution_gc) |collector| {
+            const Bridge = struct {
+                fn canceled(raw: *const anyopaque) bool {
+                    const value: *maintenance_cancellation.GraphBridge = @ptrCast(@alignCast(@constCast(raw)));
+                    return value.token().isCancelled();
+                }
+            };
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            stats.sql_execution_gc_steps = self.sql_gc_schedule.runAt(arena.allocator(), collector, .{ .io = self.io, .cancellation = .{ .ptr = &bridge, .is_cancelled_fn = Bridge.canceled } }, platform_time.awakeNs(self.io) / std.time.ns_per_ms) catch |err| switch (err) {
+                error.Canceled, error.Cancelled => return err,
+                else => blk: {
+                    std.log.warn("distributed SQL expiry collection deferred: {s}", .{@errorName(err)});
+                    break :blk 0;
+                },
+            };
+        }
         if (self.cfg.publish_enabled) {
             try self.chargeWork(.publish_round, 1);
             const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
@@ -225,6 +253,15 @@ pub const ManagedRuntime = struct {
 
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
+
+        // Offer a reserved collection step before per-namespace enrichment and
+        // pruning. Advance only on offered slots, avoiding tick/interval aliasing
+        // that would repeatedly select the same subset of tenants.
+        if (self.wal_collector) |collector| if (namespaces.len != 0 and collector.isDue()) {
+            const index = self.wal_collection_cursor % namespaces.len;
+            self.wal_collection_cursor = (index + 1) % namespaces.len;
+            if (collector.namespaceDue(namespaces[index].name)) try self.collectWal(namespaces[index].name, pass, &stats);
+        };
 
         for (namespaces) |namespace| {
             try cancellation.check();
@@ -314,10 +351,57 @@ pub const ManagedRuntime = struct {
                 stats.deleted_versions += result.deleted_versions;
                 stats.deleted_artifacts += result.deleted_artifacts;
                 stats.wal_records_removed += result.wal_records_removed;
+                if (result.wal_records_removed != 0) if (self.wal_collector) |collector| collector.wake(namespace.name);
             }
         }
         self.recordStats(stats);
         return stats;
+    }
+
+    fn collectWal(self: *ManagedRuntime, namespace: []const u8, pass: maintenance_cancellation.Token, stats: *RuntimeRunStats) !void {
+        const collector = self.wal_collector orelse return;
+        try pass.check();
+        var held: ?build_mod.work_lease.HeldLease = null;
+        if (self.work_lease_provider) |provider| {
+            held = try build_mod.work_lease.acquireHeld(provider, self.io, namespace, self.work_lease_owner_id orelse return error.MissingLeaseOwner, self.work_lease_ttl_ns);
+            if (held == null) {
+                stats.work_lease_conflicts += 1;
+                stats.wal_collection_deferred += 1;
+                collector.deferWork();
+                return;
+            }
+            if (held.?.acquisition.took_over) stats.work_lease_takeovers += 1;
+        }
+        defer if (held) |*lease| {
+            _ = lease.release() catch {};
+        };
+        var bridge = maintenance_cancellation.GraphBridge{ .maintenance = if (held) |*lease| lease.cancellation(pass) else pass };
+        const ObjectsBridge = struct {
+            fn canceled(raw: *const anyopaque) bool {
+                const value: *maintenance_cancellation.GraphBridge = @ptrCast(@alignCast(@constCast(raw)));
+                return value.token().isCancelled();
+            }
+        };
+        try self.chargeWork(.wal_collection, 1);
+        const result = collector.step(namespace, .{ .ptr = &bridge, .is_cancelled_fn = ObjectsBridge.canceled }) catch |err| switch (err) {
+            error.ImmutableLogFenced, error.CollectionSuperseded, error.CollectionBusy, error.CollectionConflict, error.CollectionStepExpired, error.WalSnapshotExpired, error.WalCommitContended, error.PreconditionFailed => {
+                stats.wal_collection_deferred += 1;
+                return;
+            },
+            error.Canceled => {
+                if (bridge.failure) |failure| if (failure == error.WorkLeaseLost) {
+                    stats.work_lease_conflicts += 1;
+                    stats.wal_collection_deferred += 1;
+                    return;
+                };
+                return err;
+            },
+            else => return err,
+        };
+        stats.wal_collection_steps += 1;
+        stats.wal_collection_deferred += @intFromBool(result.phase == .deferred);
+        stats.wal_collection_marked_pages += result.marked_pages;
+        stats.wal_collection_deleted_objects += result.deleted_objects;
     }
 
     /// Runs only the request-visible background materialization stage for one
@@ -529,6 +613,7 @@ pub const ManagedRuntime = struct {
     fn recordStats(self: *ManagedRuntime, stats: RuntimeRunStats) void {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
+        self.cumulative_stats.sql_execution_gc_steps += stats.sql_execution_gc_steps;
         self.cumulative_stats.published_namespaces += stats.published_namespaces;
         self.cumulative_stats.publish_budget_rejected_namespaces += stats.publish_budget_rejected_namespaces;
         self.cumulative_stats.publish_head_conflicts += stats.publish_head_conflicts;
@@ -539,6 +624,10 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.deleted_versions += stats.deleted_versions;
         self.cumulative_stats.deleted_artifacts += stats.deleted_artifacts;
         self.cumulative_stats.wal_records_removed += stats.wal_records_removed;
+        self.cumulative_stats.wal_collection_steps += stats.wal_collection_steps;
+        self.cumulative_stats.wal_collection_deferred += stats.wal_collection_deferred;
+        self.cumulative_stats.wal_collection_marked_pages += stats.wal_collection_marked_pages;
+        self.cumulative_stats.wal_collection_deleted_objects += stats.wal_collection_deleted_objects;
         self.cumulative_stats.enriched_namespaces += stats.enriched_namespaces;
         self.cumulative_stats.enriched_documents += stats.enriched_documents;
         self.cumulative_stats.enrichment_wal_appends += stats.enrichment_wal_appends;
@@ -551,6 +640,14 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.work_lease_takeovers += stats.work_lease_takeovers;
     }
 
+    fn nextMaintenanceDelayMs(self: *ManagedRuntime) u64 {
+        lockAtomic(&self.run_mu);
+        defer self.run_mu.unlock();
+        if (self.cfg.sql_execution_gc != null and !self.cfg.publish_enabled and !self.cfg.compaction_enabled and !self.cfg.prune_enabled and !self.cfg.enrichment_enabled and self.wal_collector == null) {
+            return self.sql_gc_schedule.waitMs(platform_time.awakeNs(self.io) / std.time.ns_per_ms);
+        }
+        return self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms);
+    }
     fn runLoop(self: *ManagedRuntime) void {
         defer self.run_finished.set(self.io);
         while (!self.stop_requested.load(.monotonic)) {
@@ -562,7 +659,7 @@ pub const ManagedRuntime = struct {
                 return;
             };
             self.stop_wake.waitTimeout(self.io, .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),
+                .raw = .fromMilliseconds(@intCast(self.nextMaintenanceDelayMs())),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => continue,

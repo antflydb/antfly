@@ -1,0 +1,31 @@
+{
+  "reviewed_head": "58853ade600805ce40e487a932e171e29d67f1d1",
+  "attribution": "Both defects were present on main before this PR.",
+  "findings": [
+    {
+      "issue": "All-unique compact relative layout frees full_to_unique before a fallible lookup; errdefer frees it again when lookup fails.",
+      "before": "Allocation-failure enumeration with a seven-token compact layout aborts with double free of a104-byte mapping.",
+      "fix": "Retain mapping ownership through the last fallible lookup, then free it before the successful return."
+    },
+    {
+      "issue": "forwardFromHiddenRange leaks its current hidden tensor when later work fails.",
+      "before": "Native300-token one-layer allocation-failure enumeration reports MemoryLeakDetected at failure index4/105;5104 bytes remain allocated.",
+      "fix": "An errdefer follows the current hidden tensor across layer replacement until its successful explicit free."
+    }
+  ],
+  "runtime_source_sha256": "594c176d3c6f1192aea704a2bb9c9d69d7750ffcaa53763d49d719dc719f9033",
+  "performance_scope": "These cleanup changes have not undergone a new optimized HTTP run. Earlier source-pinned capacity and timing evidence is retained; overall performance qualification remains partial.",
+  "validation": {
+    "build": "Debug, native CPU",
+    "selected": 2,
+    "passed": 2,
+    "skipped": 0,
+    "leaks": 0,
+    "coverage": [
+      "Every allocation-failure point through duplicate and all-unique relative layouts.",
+      "Every allocation-failure point through partial encoder replay and a complete native encoder layer.",
+      "Existing padded encoder cleanup regression."
+    ],
+    "python_checks_passed_unchanged": 8
+  }
+}

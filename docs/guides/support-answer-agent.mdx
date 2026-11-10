@@ -16,33 +16,35 @@ order: 1
 One call answers a customer's question from your help articles. It retrieves the closest articles, reranks them, drops the weak ones, and writes the answer with a local model:
 
 ```bash
-antfly agents retrieval --table help \
+antfly agents retrieval --table help_center \
   --semantic-search "Can I get my money back if I cancel?" \
   --indexes "title_content" \
   --fields "title,content" \
   --limit 20 \
   --reranker '{"provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
                "field": "content", "candidate_count": 50}' \
-  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
-  --generator '{"provider": "ollama", "model": "gemma3:4b-it-qat"}' \
+  --pruner '{"min_absolute_score": 0.1, "min_score_ratio": 0.5, "max_score_gap_percent": 50}' \
+  --generator '{"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF"}' \
   --no-streaming --generate
 ```
 
 ```json
 {
-  "generation": "Refunds are available within 14 days of an annual renewal; monthly plans are not refundable (refund-policy). You can cancel any time from Settings > Billing (cancel-plan).",
+  "generation": "Whether you can get your money back depends on your plan type and timing. Refunds are available within 14 days of an annual renewal, but monthly plans are not refundable [refund-policy]. You can cancel your plan at any time through Settings > Billing, but the plan will remain active until the end of the current cycle [cancel-plan].",
   "hits": [
     {
-      "_id": "refund-policy",
+      "_id": "cancel-plan",
+      "_score": 0.7255,
       "_source": {
-        "title": "Refund policy",
+        "title": "Canceling your plan",
         "content": "..."
       }
     },
     {
-      "_id": "cancel-plan",
+      "_id": "refund-policy",
+      "_score": 0.4026,
       "_source": {
-        "title": "Canceling your plan",
+        "title": "Refund policy",
         "content": "..."
       }
     }
@@ -52,23 +54,23 @@ antfly agents retrieval --table help \
 
 ## Before You Start
 
-Antfly running in standalone mode with the embedding and reranking models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), and Ollama with a small model pulled:
+Antfly running in standalone mode with the embedding, reranking, and generation models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there):
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
-antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
-ollama pull gemma3:4b-it-qat
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
 ## Build It
 
-### 1. Create the Help Table
+### 1. Create the Help Center Table
 
 One embeddings index over title and content. The embedder and chunker run on Antfly Inference, inside the same process:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/db/v1/tables/help \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/help_center \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -77,7 +79,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/help \
         "template": "{{title}} {{content}}",
         "embedder": {
           "provider": "antfly",
-          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+          "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -96,7 +98,7 @@ Every table gets a full-text index by default, so this one embeddings index is a
 ### 2. Load Your Help Articles
 
 ```bash
-curl -X POST http://127.0.0.1:8080/db/v1/tables/help/batch \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/help_center/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {
@@ -119,7 +121,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/help/batch \
 Each article is chunked and embedded in the background. Wait for the index before querying it; re-insert an article under the same key to update it.
 
 ```bash
-antfly index wait --table help --index title_content --until complete --timeout 10m
+antfly index wait --table help_center --index title_content --until complete --timeout 10m
 ```
 
 ### 3. Retrieve, Rerank, Prune, Answer
@@ -134,7 +136,7 @@ One request to the retrieval agent runs the whole pipeline:
 
   <TabsContent value="cli">
 ```bash
-antfly agents retrieval --table help \
+antfly agents retrieval --table help_center \
   --semantic-search "Can I get my money back if I cancel?" \
   --indexes "title_content" \
   --fields "title,content" \
@@ -145,10 +147,10 @@ antfly agents retrieval --table help \
     "field": "content",
     "candidate_count": 50
   }' \
-  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
+  --pruner '{"min_absolute_score": 0.1, "min_score_ratio": 0.5, "max_score_gap_percent": 50}' \
   --generator '{
-    "provider": "ollama",
-    "model": "gemma3:4b-it-qat"
+    "provider": "antfly",
+    "model": "ggml-org/gemma-4-E4B-it-GGUF"
   }' \
   --no-streaming --generate
 ```
@@ -161,7 +163,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -d '{
     "query": "Can I get my money back if I cancel?",
     "queries": [{
-      "table": "help",
+      "table": "help_center",
       "semantic_search": "Can I get my money back if I cancel?",
       "indexes": ["title_content"],
       "fields": ["title", "content"],
@@ -172,11 +174,11 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
         "field": "content",
         "candidate_count": 50
       },
-      "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+      "pruner": {"min_absolute_score": 0.1, "min_score_ratio": 0.5, "max_score_gap_percent": 50}
     }],
     "generator": {
-      "provider": "ollama",
-      "model": "gemma3:4b-it-qat"
+      "provider": "antfly",
+      "model": "ggml-org/gemma-4-E4B-it-GGUF"
     },
     "stream": false,
     "steps": {
@@ -189,7 +191,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 The response carries `generation`, the answer in markdown with the article ids it drew on, and `hits`, the articles that survived pruning. Render the answer, link the hits as sources. Streaming is the default: drop `"stream": false` (or `--no-streaming`) and the answer arrives as server-sent events instead of one JSON body.
 
-The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, OpenRouter, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
+The generator here is Gemma 4 on Antfly Inference, on the same machine. Gemini, Vertex, OpenAI, OpenRouter, and Ollama work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
 
 ## Tradeoffs
 
@@ -199,8 +201,11 @@ Retrieval always returns the closest matches it has. When a customer asks about 
 
 The pruner is what stops that:
 
-- `min_score_ratio: 0.6` drops anything scoring under 60% of the best match. If the best match is itself weak, everything goes, `hits` comes back empty, and your code can hand the conversation to a person instead of answering.
-- `max_score_gap_percent: 40` finds the elbow where relevance falls off and cuts there.
+- `min_absolute_score: 0.1` drops anything the reranker scores below 0.1. When the question is off-topic, even the best match falls under it, `hits` comes back empty, and your code can hand the conversation to a person instead of answering. "How do I change my profile picture?" scores 0.0006 against these articles.
+- `min_score_ratio: 0.5` drops anything scoring under half the best match, so a weak article never rides along with a strong one.
+- `max_score_gap_percent: 50` finds the elbow where relevance falls off and cuts there.
+
+The two relative limits never drop the best hit on their own; the absolute floor is what lets the agent say nothing.
 
 Let the reranker see more than the model does. A `candidate_count` of 50 with a strict pruner beats a `limit` of 3 with no pruner, because the reranker scores a wide window and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
 
@@ -213,7 +218,7 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome, for example "Build a support answer agent over my help table with reranking and pruning, following the Antfly skill", and use this page to judge the result.
+Then prompt it with the outcome, for example "Build a support answer agent over my help_center table with reranking and pruning, following the Antfly skill", and use this page to judge the result.
 
 ## Next Steps
 

@@ -89,8 +89,100 @@ if (deleted.deleted !== 1) throw new Error("delete failed");
 const stats = api.stats();
 if (typeof stats.doc_count !== "number") throw new Error("stats failed");
 
+// Repeated large analyzed fields exercise contribution reuse in the actual
+// single-threaded wasm32 runtime, including its wide diagnostic counters.
+const body = "portablecounter ".repeat(700);
+api.putMany({ "cache:a": { body }, "cache:b": { body } });
+api.runUntilIdle();
+const reusedSearch = api.search({
+    full_text_search: { match: { field: "body", text: "portablecounter" } },
+    limit: 10,
+});
+if (api.searchTotalHits(reusedSearch) !== 2) throw new Error("repeated analyzed field search failed");
+const preservedSearch = api.search({
+    full_text_search: { match: { field: "title", text: "hosted" } },
+    limit: 10,
+});
+if (api.searchHits(preservedSearch).map((hit) => hit._id).join(",") !== "doc:a") {
+    throw new Error("text compaction lost published postings or restored deleted postings");
+}
+
 api.close();
 if (api.exports.antfly_embedded_smoke_run() !== 0) {
     throw new Error("hosted text index did not survive close/reopen");
 }
+api.open();
+api.putMany({ a: { id: "a", meta: null }, b: { id: "b" } });
+api.addIndex({ name: "links", kind: "graph", config_json: "{}" });
+api.graphCatalog({ action: "put", name: "knowledge", definition: {
+    labels: [{ name: "Document", table: "docs" }],
+    relationships: [{ name: "KNOWS", index: "links", source_label: "Document", target_label: "Document", stored_type: "knows" }],
+} });
+for (const control of ["_edges", "_embeddings"]) {
+    try { api.cypher("knowledge", {query: `CREATE (:Document {${control}:{}})`}); throw new Error("WASM accepted a native ingestion control as a node property"); }
+    catch (error) { if (error.diagnostic?.code !== "CypherInvalidPropertyValue") throw error; }
+}
+const graphWrite = { query: "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:KNOWS {since:2020}]->(b) RETURN r.since", write_request_id: "00112233445566778899aabbccddeeff" };
+const committed = api.cypher("knowledge", graphWrite);
+if (committed.commit.status !== "committed") throw new Error("WASM graph write did not commit");
+const graphRows = api.cypher("knowledge", { query: "MATCH (a)-[r:KNOWS]->(b) RETURN a.id,r.since,b.id" }).rows;
+if (JSON.stringify(graphRows) !== JSON.stringify([[{type:"string",value:"a"},{type:"integer",value:"2020"},{type:"string",value:"b"}]])) throw new Error("WASM graph values lost identity or integer precision");
+try { api.cypher("knowledge", graphWrite); throw new Error("WASM duplicate graph write was accepted"); }
+catch (error) { if (error.diagnostic?.code !== "CypherWriteRequestAlreadyUsed") throw error; }
+if (api.graphWriteStatus(graphWrite.write_request_id).disposition !== "committed") throw new Error("WASM graph receipt unavailable");
+const exact = api.cypher("knowledge", { query:"RETURN $minimum,$maximum", typed_parameters:{type:"map",value:{minimum:{type:"integer",value:"-9223372036854775808"},maximum:{type:"integer",value:"9223372036854775807"}}} });
+if (exact.rows[0][0].value !== "-9223372036854775808" || exact.rows[0][1].value !== "9223372036854775807") throw new Error("WASM graph parameter precision lost");
+try {
+    api.cypher("knowledge", { query: "CREATE (n:Document {id:'aborted'}) RETURN 1/0", write_request_id: "ffeeddccbbaa99887766554433221100" });
+    throw new Error("WASM failed graph write was accepted");
+} catch (error) {
+    if (error.diagnostic?.code !== "CypherDivisionByZero" || error.diagnostic?.write_outcome !== "not_started") throw error;
+}
+if (api.cypher("knowledge", { query: "MATCH (n:Document {id:'aborted'}) RETURN n" }).rows.length !== 0) throw new Error("WASM failed graph write published a row");
+for (const query of [
+    "RETURN reduce(a=[],x IN range(1,10000)|[a]) AS nested",
+    "CREATE (n:Document {id:'depth_rollback'}) WITH n,reduce(a=[],x IN range(1,10000)|[a]) AS a RETURN a",
+]) {
+    try { api.cypher("knowledge", { query }); throw new Error("WASM accepted an excessive value depth"); }
+    catch (error) { if (error.diagnostic?.code !== "CypherValueDepthExceeded") throw error; }
+}
+if (api.cypher("knowledge", { query: "MATCH (n:Document {id:'depth_rollback'}) RETURN n" }).rows.length !== 0) throw new Error("WASM depth failure published a row");
+const shared = api.cypher("knowledge", { query: "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a=a" });
+if (shared.rows[0][0].value !== true || shared.stats.intermediate_states >= 1000) throw new Error("WASM shared value comparison expanded its contents");
+for (const [query, count] of [
+    ["UNWIND range(1,1000) AS x RETURN x,count(*)", 1000],
+    ["UNWIND range(9223372036854774800,9223372036854775799) AS x RETURN x,count(*)", 1000],
+    ["UNWIND range(1,1000) AS x RETURN x UNION RETURN 0 AS x", 1001],
+]) {
+    const result = api.cypher("knowledge", { query });
+    if (result.rows.length !== count || result.stats.intermediate_states >= 30000) throw new Error("WASM deduplication exceeded linear work");
+}
+const repeatedText = "x".repeat(400000);
+const cachedText = api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+size(ltrim($s)))", parameters:{s:repeatedText}, limits:{intermediate_states:30000}});
+if (cachedText.rows[0][0].value !== "400000000") throw new Error("WASM cached Unicode analysis changed its result");
+// An invariant predicate can be evaluated once by the reducer certificate.
+const cachedSearch = api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",parameters:{s:repeatedText},limits:{intermediate_states:30000}});
+if (cachedSearch.rows[0][0].value !== "0") throw new Error("WASM invariant string search changed its result");
+try {
+    api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS toString(i) THEN 1 ELSE 0 END)",parameters:{s:repeatedText},limits:{intermediate_states:30000}});
+    throw new Error("WASM string search bypassed work limits");
+} catch (error) { if (error.diagnostic?.code !== "CypherStateBudgetExceeded") throw error; }
+// Oversized indexes remain correct on wasm32, where usize is narrower than INTEGER.
+const wideSubstring = api.cypher("knowledge", {query:"RETURN substring('ÉΣ',9223372036854775807),substring('ÉΣ',0,9223372036854775807)"});
+if (wideSubstring.rows[0][0].value !== "" || wideSubstring.rows[0][1].value !== "ÉΣ") throw new Error("WASM substring narrowed a graph INTEGER");
+const bulkWrite = api.cypher("knowledge", {query:"UNWIND range(1,256) AS x CREATE (n:Document {id:'bulk'+toString(x)}) RETURN count(*)"});
+if (bulkWrite.rows[0][0].value !== "256" || bulkWrite.stats.intermediate_states > 15000) throw new Error("WASM bulk create planning exceeded linear work");
+const bulkDelete = api.cypher("knowledge", {query:"MATCH (n:Document) WHERE n.id STARTS WITH 'bulk' DELETE n RETURN count(n)"});
+if (bulkDelete.rows[0][0].value !== "256") throw new Error("WASM bulk delete lost rows");
+for (const query of [
+    "CALL { CALL { MATCH ()-[r:KNOWS]->() SET r.since=2026 } }",
+    "CALL { MATCH ()-[r:KNOWS]->() REMOVE r.since }",
+    "CALL { MATCH ()-[r:KNOWS]->() DELETE r }",
+]) {
+    const result = api.cypher("knowledge", { query });
+    if (result.read_only || result.columns.length || result.rows.length || result.commit?.status !== "committed") throw new Error("WASM standalone unit CALL did not commit an empty result");
+    const source = api.lookup("a")._source;
+    if (!Object.hasOwn(source, "meta") || source.meta !== null) throw new Error("WASM edge-only mutation changed its source document");
+}
+api.close();
 console.log("antfly embedded shared smoke passed: ok");

@@ -18,18 +18,19 @@ const std = @import("std");
 const httpx = @import("httpx");
 const sources = @import("antfly_local_sources");
 const registry = sources.common_provider_registry;
-const gateway = registry.gateway;
-const tasks = registry.tasks;
+const gateway = @import("antfly_local_sources").common_inference_gateway;
+const tasks = @import("antfly_local_sources").common_inference_tasks;
 const Json = std.json.Value;
 const payloads = @import("inference_payload.zig");
+pub const source_media = @import("inference_source.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
-pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/transcribe", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
+pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
 
 pub fn taskForOperation(operation: []const u8) ?gateway.Task {
     const Pair = struct { []const u8, gateway.Task };
-    for ([_]Pair{ .{ "generate", .generate }, .{ "chat/completions", .generate }, .{ "embeddings", .embed }, .{ "embed", .embed }, .{ "decisions", .decide }, .{ "decide", .decide }, .{ "rerank", .rerank }, .{ "chunk", .chunk }, .{ "read", .read }, .{ "extract", .extract }, .{ "rewrite", .rewrite }, .{ "transcribe", .transcribe }, .{ "dictate", .transcribe }, .{ "synthesize", .synthesize }, .{ "predict", .predict } }) |pair| if (std.mem.eql(u8, pair[0], operation)) return pair[1];
+    for ([_]Pair{ .{ "generate", .generate }, .{ "chat/completions", .generate }, .{ "embeddings", .embed }, .{ "embed", .embed }, .{ "decisions", .decide }, .{ "decide", .decide }, .{ "rerank", .rerank }, .{ "chunk", .chunk }, .{ "read", .read }, .{ "extract", .extract }, .{ "rewrite", .rewrite }, .{ "dictate", .transcribe }, .{ "synthesize", .synthesize }, .{ "predict", .predict } }) |pair| if (std.mem.eql(u8, pair[0], operation)) return pair[1];
     return null;
 }
 
@@ -66,9 +67,12 @@ pub fn isPredictorDiscoveryPath(path: []const u8) bool {
 // headers and of whether its response goes to a socket or a batch envelope.
 const ExecutionOptions = struct {
     response_delivery: enum { direct, buffered } = .direct,
+    // A composite dictation holds one admission lease across recognition and cleanup.
+    admission_held: bool = false,
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
+    source_port: ?source_media.Port = null,
     authorization: ?[]const u8 = null,
     attempt_observer: ?httpx.AttemptObserver = null,
 };
@@ -277,7 +281,7 @@ pub fn view(server: anytype) !gateway.View {
 }
 
 pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
-    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled for this deployment" } });
+    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled on this deployment; set public_inference.enabled in the server config" } });
 }
 
 const InvocationState = struct {
@@ -369,8 +373,11 @@ pub fn execute(server: anytype, ctx: *httpx.Context, task: gateway.Task) !httpx.
 
 /// The registered handler supplies operation identity; URI spelling never selects an adapter.
 pub fn executeOperation(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8) !httpx.Response {
+    return executeOperationWithSources(server, ctx, task, operation, null);
+}
+pub fn executeOperationWithSources(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 * 1024 * 1024 };
-    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation }) catch |err| {
+    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation, .source_port = port }) catch |err| {
         if (err == error.InferenceResponseCommitted) return err;
         if (budget.exhausted) return error.InferenceRequestTooLarge;
         return err;
@@ -378,15 +385,28 @@ pub fn executeOperation(server: anytype, ctx: *httpx.Context, task: gateway.Task
 }
 
 fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, backing: std.mem.Allocator, options: ExecutionOptions) !httpx.Response {
-    // All parsing and adapter allocations share request lifetime and a bounded
-    // transport body. No executor retains these values after the call.
+    defer if (options.source_port) |port| if (port.reset) |reset| reset(port.ptr);
+    // Parsing and source metadata stay bounded independently of binary media.
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
-    const a = arena.allocator();
-    const payload = try payloads.Payload.parse(a, ctx);
+    const metadata_allocator = arena.allocator();
+    const payload = try payloads.Payload.parse(metadata_allocator, ctx);
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
+    try source_media.resolve(metadata_allocator, request, execution.source_port, &execution.attachments);
+    // Hosted adapters may produce multiple base64 and JSON copies. Their actual
+    // allocation capacity shares admission with fetches and native framing.
+    var media_budget = source_media.allocationBudget(ctx.allocator);
+    var execution_arena = std.heap.ArenaAllocator.init(if (execution.attachments != null) media_budget.allocator() else backing);
+    defer execution_arena.deinit();
+    return executePrepared(server, ctx, task, execution_arena.allocator(), request, execution) catch |err| {
+        if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+        return err;
+    };
+}
+
+fn executePrepared(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, execution: ExecutionOptions) !httpx.Response {
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -513,6 +533,16 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         const cfg = connection.inference orelse return error.InvalidInferenceRequest;
         if (!std.mem.eql(u8, cfg.provider, "antfly")) return executeVendorConnection(server, ctx, task, a, request, named, target, connection, fallback, observation, execution_options);
     };
+    if (task == .read) if (try tasks.planReading(a, named, target, request)) |plan| {
+        if (plan.local_only and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
+        const encoded = try std.json.Stringify.valueAlloc(a, plan.request, .{});
+        var read_options = execution_options;
+        // Named adapters expose complete reading envelopes. Raw/connection
+        // requests retain the caller's existing response transport, including
+        // an installed streaming delegate for framed media.
+        if (target == .configured) read_options.response_delivery = .buffered;
+        return forward(server, ctx, plan.connection orelse if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "read", encoded, fallback, observation, read_options);
+    };
     if (target == .local and target.local.explicit and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
     if (target != .configured) {
         const destination = if (target == .connection) target.connection.connection else if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
@@ -536,7 +566,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             .rewrite => "rewrite",
             .rerank => "rerank",
             .chunk => "chunk",
-            .transcribe => execution_options.operation orelse "transcribe",
+            .transcribe => execution_options.operation orelse "dictate",
             .synthesize => "synthesize",
             .predict => "ml/predict",
         }, encoded, fallback, observation, execution_options);
@@ -563,21 +593,14 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, false, observation, execution_options);
         return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "chunk", encoded, false, observation, execution_options);
     }
-    if (task == .read) {
-        const cfg = try named.readers.?.getConfig(target.configured.name);
-        if (cfg.provider == .antfly) {
-            const encoded = try tasks.readingBody(a, cfg, request);
-            // Reads are completed JSON results. Keep the full document envelope
-            // available to ordinary and batch callers, including artifact handles.
-            var read_options = execution_options;
-            read_options.response_delivery = .buffered;
-            return forward(server, ctx, try std.fmt.allocPrint(a, "readers/{s}", .{target.configured.name}), "read", encoded, fallback, observation, read_options);
-        }
-    }
     if (task == .transcribe) {
         const cfg = try named.transcribers.?.getConfig(target.configured.name);
-        if (cfg.provider == .antfly) {
-            const operation = execution_options.operation orelse "transcribe";
+        const cleanup_name = configuredCleanupName(request);
+        // Raw runtime cleanup models retain their existing forwarding path.
+        // Named cleanup generators use the same orchestration as Apple, so
+        // Whisper can also clean up through Apple or a hosted generator.
+        if (cfg.provider == .antfly and !request.object.contains("transcript_text") and (cleanup_name == null or !named.contains(.generate, cleanup_name.?))) {
+            const operation = execution_options.operation orelse "dictate";
             const encoded = try tasks.transcriptionBody(a, cfg, request);
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
         }
@@ -603,8 +626,10 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, execution_options.operation orelse "generate", body, fallback, observation, execution_options);
         }
     }
-    if (execution_options.attachments) |attachments| request = try inlineTaskAttachments(a, task, request, attachments);
-    const caller_owns_admission = if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name);
+    if (task != .transcribe) {
+        if (execution_options.attachments) |attachments| request = try inlineTaskAttachments(a, task, request, attachments);
+    }
+    const caller_owns_admission = task != .transcribe and (if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name));
     if (caller_owns_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (caller_owns_admission) server.releaseInference();
     var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
@@ -740,25 +765,53 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(.{ .object = "list", .model = model, .data = data });
         },
         .read => {
-            try only(request, &.{ "model", "images", "prompt", "max_tokens" });
-            const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
-            if (images != .array or images.array.items.len == 0) return error.InvalidInferenceRequest;
-            const urls = try a.alloc([]const u8, images.array.items.len);
-            for (images.array.items, urls) |v, *out| out.* = try string(if (v == .object) v.object.get("url") orelse return error.InvalidInferenceRequest else v);
-            var result = try executor.read(a, name, .{
+            try only(request, &.{ "model", "images", "audio", "audio_options", "prompt", "max_tokens", "retain_artifact" });
+            // Generated clients serialize the default false. Hosted adapters
+            // cannot promise a local document artifact when retention is on.
+            if (request.object.get("retain_artifact")) |value| {
+                if (value != .bool) return error.InvalidInferenceRequest;
+                if (value.bool) return error.UnsupportedInferenceFeature;
+            }
+            const audio = if (request.object.get("audio")) |value| try string(value) else null;
+            const images = request.object.get("images");
+            if ((audio != null) == (images != null)) return error.InvalidInferenceRequest;
+            if (audio) |value| if (value.len == 0) return error.InvalidInferenceRequest;
+            const urls = if (images) |value| blk: {
+                if (value != .array or value.array.items.len == 0) return error.InvalidInferenceRequest;
+                const urls = try a.alloc([]const u8, value.array.items.len);
+                for (value.array.items, urls) |v, *out| out.* = try string(if (v == .object) v.object.get("url") orelse return error.InvalidInferenceRequest else v);
+                break :blk urls;
+            } else &.{};
+            var result = try executor.read(a, try target.idAlloc(a), .{
+                .audio = audio,
+                .audio_options = if (request.object.get("audio_options")) |value| (if (value == .null) null else std.json.parseFromValueLeaky(@import("inference_api").AudioReadOptions, a, value, .{}) catch return error.InvalidInferenceRequest) else null,
                 .images = urls,
                 .prompt = if (request.object.get("prompt")) |v| try string(v) else null,
                 .max_tokens = if (request.object.get("max_tokens")) |v| try integer(v) else null,
             });
             defer result.deinit(a);
-            const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, fields: ?Json, regions: ?Json };
-            const data = try a.alloc(Item, result.items.len);
-            for (result.items, data, 0..) |item, *out, i| out.* = .{
-                .index = i,
-                .text = item.text,
-                .fields = if (item.fields_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
-                .regions = if (item.regions_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
-            };
+            const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, status: []const u8, origin: ?[]const u8, fields: ?Json, regions: ?Json };
+            const data = try a.alloc(Json, result.items.len);
+            for (result.items, data, 0..) |item, *out, i| {
+                // A reading adapter's complete row carries source identity,
+                // temporal evidence and provenance in addition to its text.
+                if (item.document_json) |json| {
+                    out.* = try std.json.parseFromSliceLeaky(Json, a, json, .{});
+                    continue;
+                }
+                out.* = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, Item{
+                    .index = i,
+                    .text = item.text,
+                    .status = switch (item.completion) {
+                        .complete => "complete",
+                        .length => "truncated",
+                        .unresolved => "unresolved",
+                    },
+                    .origin = if (audio != null) "transcription" else null,
+                    .fields = if (item.fields_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
+                    .regions = if (item.regions_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
+                }, .{}), .{});
+            }
             return ctx.json(.{ .object = "list", .model = model, .data = data, .usage = result.usage, .execution = result.execution });
         },
         .rerank => {
@@ -804,31 +857,112 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(.{ .object = "list", .model = model, .data = data });
         },
         .transcribe => {
-            const dictation = std.mem.eql(u8, execution_options.operation orelse "transcribe", "dictate");
-            try only(request, &.{ "model", "audio", "language", "diarization", "url", "timestamps" });
-            const audio_url = if (request.object.get("url")) |value| try string(value) else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{try string(request.object.get("audio") orelse return error.InvalidInferenceRequest)});
-            const result = executor.transcribe(a, name, .{
-                .url = audio_url,
-                .language = if (request.object.get("language")) |value| try string(value) else null,
-                .diarization = if (request.object.get("diarization")) |value| if (value == .bool) value.bool else return error.InvalidInferenceRequest else null,
-                .timestamps = if (request.object.get("timestamps")) |value| if (value == .bool) value.bool else return error.InvalidInferenceRequest else null,
-            }) catch |err| return switch (err) {
-                error.UnsupportedTranscriptionOptions => error.UnsupportedInferenceFeature,
-                else => err,
+            const Api = @import("inference_api");
+            const body = std.json.parseFromValue(Api.DictateRequest, a, request, .{}) catch |err| return payloads.requestParseError(err);
+            const value = body.value;
+            const cleanup = generating.dictation;
+            const options = cleanup.Options{
+                .style = if (value.style) |style| cleanup.Style.parse(@tagName(style)).? else .clean,
+                .dictionary = value.dictionary orelse &.{},
+                .context = value.context,
+                .instructions = value.instructions,
+                .language = value.language,
             };
-            var speakers: std.ArrayList([]const u8) = .empty;
-            if (result.speakers) |values| for (values) |speaker| {
-                if (speaker.label orelse speaker.id) |label| try speakers.append(a, label);
+            cleanup.validate(options) catch return error.InvalidInferenceRequest;
+            if (value.max_tokens) |tokens| if (tokens < 1 or tokens > 8192) return error.InvalidInferenceRequest;
+            // These are Whisper decoding options, not portable provider hints.
+            const transcription_cfg = try named.transcribers.?.getConfig(name);
+            if (transcription_cfg.provider != .antfly and (value.transcript_prompt != null or value.vad != null or value.audio_context != null)) return error.UnsupportedInferenceFeature;
+            const cleanup_name = configuredCleanupName(request) orelse "";
+            const run_cleanup = cleanup_name.len > 0 and cleanup.needsCleanup(options);
+            if (run_cleanup) _ = try executor.generatorConfig(a, cleanup_name);
+            const attachment = try dictationAttachment(value.audio, execution_options.attachments);
+            const transcript = if (value.transcript_text) |text| blk: {
+                if (value.audio.len != 0 or execution_options.attachments != null or text.len > 65536 or
+                    value.transcript_prompt != null or value.vad != null or value.audio_context != null)
+                    return error.InvalidInferenceRequest;
+                break :blk try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{
+                    .text = text,
+                    .duration_ms = @as(u64, 0),
+                    .segments = @as([]const struct {}, &.{}),
+                }, .{}), .{});
+            } else if (transcription_cfg.provider == .antfly) blk: {
+                const recognized = try nativeDictationTranscript(server, ctx, a, request, named, name, observation, execution_options);
+                switch (recognized) {
+                    .transcript => |value_| break :blk value_,
+                    .failure => |upstream| {
+                        var response = upstream;
+                        defer response.deinit();
+                        _ = ctx.status(response.status.code);
+                        if (response.header("retry-after")) |retry| try ctx.setHeader("retry-after", retry);
+                        try ctx.setHeader("content-type", response.contentType() orelse "application/json");
+                        _ = ctx.response.body(response.body orelse "");
+                        return ctx.response.build();
+                    },
+                }
+            } else blk: {
+                if (!server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+                defer server.releaseInference();
+                var result = try executor.transcribeWithAudio(a, name, .{
+                    .url = if (attachment != null) value.audio else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{value.audio}),
+                    .language = value.language,
+                    .timestamps = value.timestamps,
+                }, if (attachment) |item| item.data else null);
+                defer @import("antfly_transcribing").deinitResponse(a, &result);
+                const encoded = try std.json.Stringify.valueAlloc(a, .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments }, .{ .emit_null_optional_fields = false });
+                break :blk try std.json.parseFromSliceLeaky(Json, a, encoded, .{ .allocate = .alloc_always });
             };
-            if (dictation) return ctx.json(.{
+            const transcript_text = transcript.object.get("text") orelse return error.InvalidInferenceResponse;
+            if (transcript_text != .string) return error.InvalidInferenceResponse;
+            const raw = transcript_text.string;
+            const id = try std.fmt.allocPrint(a, "dictation-{d}", .{@import("antfly_platform").time.monotonicNs()});
+            var writer: ?httpx.StreamWriter = null;
+            if (value.stream orelse false) {
+                try ctx.setHeader("content-type", "text/event-stream");
+                try ctx.setHeader("cache-control", "no-cache");
+                writer = try ctx.streamResponse(200);
+                try dictationEvent(a, &writer.?, .{ .type = "dictation.transcript", .id = id, .model = model, .transcript = transcript });
+            }
+            defer if (writer) |*stream| stream.close() catch {};
+            var text = raw;
+            var usage: @FieldType(generating.GenerateResult, "usage") = null;
+            if (run_cleanup and std.mem.trim(u8, raw, " \t\r\n").len > 0) {
+                const messages = [_]generating.ChatMessage{
+                    .{ .role = .system, .content = .{ .text = try cleanup.buildSystemPrompt(a, options) } },
+                    .{ .role = .user, .content = .{ .text = try cleanup.buildUserPrompt(a, raw) } },
+                };
+                var generated = admittedDictationCleanup(server, named, a, executor, cleanup_name, &messages, value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len)) catch |err| {
+                    if (writer) |*stream| {
+                        try dictationEvent(a, stream, .{ .type = "error", .id = id, .@"error" = @errorName(err), .message = "Dictation cleanup failed; raw transcript is available." });
+                        try stream.writeEvent(null, "[DONE]");
+                        return ctx.response.build();
+                    }
+                    return err;
+                };
+                defer generated.deinit();
+                text = try a.dupe(u8, generated.content);
+                usage = generated.usage;
+            }
+            try executor.context.check();
+            const api_usage = if (usage) |u| .{ .prompt_tokens = u.input_tokens, .completion_tokens = u.output_tokens, .total_tokens = u.total_tokens orelse u.input_tokens +| u.output_tokens } else null;
+            if (writer) |*stream| {
+                // Provider generation can be buffered; a delta may contain the
+                // entire result. The transcript is delivered before cleanup.
+                try dictationEvent(a, stream, .{ .type = "dictation.delta", .id = id, .delta = text });
+                try dictationEvent(a, stream, .{ .type = "dictation.completed", .id = id, .model = model, .text = text, .usage = api_usage });
+                try stream.writeEvent(null, "[DONE]");
+                return ctx.response.build();
+            }
+            return ctx.openApiJson(.{
                 .object = "dictation",
-                .id = try std.fmt.allocPrint(a, "dictation-{d}", .{@import("antfly_platform").time.monotonicNs()}),
+                .id = id,
                 .created = @divTrunc(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s),
                 .model = model,
-                .text = result.text orelse "",
-                .transcript = .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments },
+                .cleanup_model = if (run_cleanup) cleanup_name else null,
+                .text = text,
+                .transcript = transcript,
+                .usage = api_usage,
             });
-            return ctx.json(.{ .object = "list", .model = model, .data = .{.{ .object = "transcription", .index = @as(usize, 0), .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments, .speakers = if (speakers.items.len > 0) speakers.items else null }} });
         },
         .rewrite => {
             const inputs = request.object.get("inputs") orelse return error.InvalidInferenceRequest;
@@ -996,7 +1130,7 @@ fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.T
     defer config.deinit();
     const capability_key = try std.fmt.allocPrint(a, "{s}/{s}", .{ task.namespace(), name });
     try config.registry.inference_capabilities.put(a, capability_key, original.capabilities(target));
-    const named = gateway.View{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+    const named = gateway.View{ .providers = if (task == .transcribe) original.providers else &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
     return executeResolvedImpl(server, ctx, task, a, request, named, .{ .configured = .{ .task = task, .name = name } }, null, fallback, observation, execution_options);
 }
 
@@ -1038,9 +1172,10 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
                             if (mime != .string or !std.ascii.eqlIgnoreCase(mime.string, attachment.mime_type)) return error.InvalidInferenceRequest;
                             data.* = .{ .string = try payloads.base64(self.a, attachment.data) };
                         }
-                        if (self.chat) {
-                            const mime = object.get("mime_type") orelse return error.InvalidInferenceRequest;
-                            if (mime != .string or data.* != .string or !std.mem.startsWith(u8, mime.string, "image/")) return error.UnsupportedInferenceFeature;
+                        // Hosted chat adapters read audio and video as inline media parts.
+                        const mime = object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                        if (mime != .string or data.* != .string) return error.InvalidInferenceRequest;
+                        if (self.chat and std.mem.startsWith(u8, mime.string, "image/")) {
                             var image: Json = .{ .object = .empty };
                             try image.object.put(self.a, "url", .{ .string = try std.fmt.allocPrint(self.a, "data:{s};base64,{s}", .{ mime.string, data.string }) });
                             value.* = .{ .object = .empty };
@@ -1072,11 +1207,16 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
     switch (task) {
         .generate, .embed, .rerank, .decide => try state.media(&adapted),
         .read => {
-            const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
-            if (images != .array) return error.InvalidInferenceRequest;
-            for (images.array.items) |*image| {
-                const url = if (image.* == .object) image.object.getPtr("url") orelse return error.InvalidInferenceRequest else image;
-                if (try state.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(a, attachment) };
+            if (adapted.object.getPtr("audio")) |audio| {
+                if (request.object.contains("images") or request.object.contains("documents")) return error.InvalidInferenceRequest;
+                if (try state.take(audio.*)) |attachment| audio.* = .{ .string = try payloads.dataUri(a, attachment) };
+            } else {
+                const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
+                if (images != .array) return error.InvalidInferenceRequest;
+                for (images.array.items) |*image| {
+                    const url = if (image.* == .object) image.object.getPtr("url") orelse return error.InvalidInferenceRequest else image;
+                    if (try state.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(a, attachment) };
+                }
             }
         },
         .transcribe => {
@@ -1119,7 +1259,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
     // native-only options select it instead of chat-completions forwarding.
     if (requirements.images and !generationAdapterSupportsImages(cfg.provider)) return error.UnsupportedInferenceFeature;
     if (requirements.streaming and !cfg.supportsStreamingChat()) return error.UnsupportedInferenceFeature;
-    if (!rich_adapter and requirements.audio) return error.UnsupportedInferenceFeature;
+    if (!rich_adapter and (requirements.audio or requirements.video)) return error.UnsupportedInferenceFeature;
     if (!rich_adapter and requirements.structured_output and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     const messages = try tasks.chatMessages(a, request);
     const options = try generationOptions(a, request);
@@ -1133,6 +1273,28 @@ fn generationAdapterSupportsImages(provider: generating.Provider) bool {
         .cloudflare, .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock, .anthropic => true,
         .apple, .mock, .chatgpt => false,
     };
+}
+
+test "httpx inference gateway rejects oversized Apple generation overrides before invocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = generating.GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
+    for ([_]i64{ 0, @as(i64, std.math.maxInt(i32)) + 1, @as(i64, 1) << 60, std.math.maxInt(i64) }) |budget| {
+        const request_json = try std.fmt.allocPrint(a, "{{\"model\":\"generators/apple\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"max_tokens\":{d}}}", .{budget});
+        const request = try std.json.parseFromSliceLeaky(Json, a, request_json, .{});
+        if (budget == 0) {
+            try std.testing.expectError(error.InvalidInferenceRequest, prepareGeneration(a, cfg, request, "generate"));
+        } else {
+            try std.testing.expectError(error.InvalidGeneratorConfig, prepareGeneration(a, cfg, request, "generate"));
+        }
+    }
+    for ([_]i64{ 1, std.math.maxInt(i32) }) |budget| {
+        const request_json = try std.fmt.allocPrint(a, "{{\"model\":\"generators/apple\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"max_tokens\":{d}}}", .{budget});
+        const request = try std.json.parseFromSliceLeaky(Json, a, request_json, .{});
+        const prepared = try prepareGeneration(a, cfg, request, "generate");
+        try std.testing.expectEqual(budget, prepared.config.max_tokens);
+    }
 }
 
 test "httpx inference gateway image admission is independent of streaming and model names" {
@@ -1167,13 +1329,21 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
     if (links.len == 0 or links.len > 8) return error.InvalidInferenceRequest;
     const configs = try a.alloc(generating.GeneratorConfig, links.len);
     const original = try std.json.Stringify.valueAlloc(a, request, .{});
+    // Retry storage must refund the same admission layers as the invocation,
+    // rather than accumulating failed providers' base64 and JSON in its arena.
+    const scratch = sources.sql_memory_budget.reclaimingAllocator(a);
     // Qualify every link through the same request adapter used for execution.
     // Each receives its own JSON tree because body adaptation mutates objects.
     for (links, configs) |link, *cfg| {
+        var preflight = std.heap.ArenaAllocator.init(scratch);
+        defer preflight.deinit();
+        const p = preflight.allocator();
         const qualified: gateway.Target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } };
-        const candidate = try std.json.parseFromSliceLeaky(Json, a, original, .{});
-        const prepared = try prepareGeneration(a, link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?), candidate, options.operation orelse "generate");
-        cfg.* = prepared.config;
+        const candidate = try std.json.parseFromSliceLeaky(Json, p, original, .{});
+        // Store only registry-owned configuration. Request-derived options are
+        // recreated by each attempt and cannot outlive preflight's arena.
+        cfg.* = link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?);
+        const prepared = try prepareGeneration(p, cfg.*, candidate, options.operation orelse "generate");
         try named.capabilities(qualified).require(prepared.requirements);
         if (cfg.provider != .cloudflare and cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     }
@@ -1208,9 +1378,12 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
                 if (link.retry) |retry| backoff_ms = @intFromFloat(@min(@as(f32, @floatFromInt(retry.max_backoff_ms)), @as(f32, @floatFromInt(backoff_ms)) * retry.backoff_multiplier));
             }
             try attempts.begin(@import("antfly_platform").time.monotonicNs());
-            const candidate = try std.json.parseFromSliceLeaky(Json, a, original, .{});
+            var attempt_arena = std.heap.ArenaAllocator.init(scratch);
+            defer attempt_arena.deinit();
+            const attempt_allocator = attempt_arena.allocator();
+            const candidate = try std.json.parseFromSliceLeaky(Json, attempt_allocator, original, .{});
             const target: gateway.Target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } };
-            return executeResolved(server, ctx, .generate, a, candidate, named, target, cfg, true, budget - attempts.remaining, options) catch |err| {
+            return executeResolved(server, ctx, .generate, attempt_allocator, candidate, named, target, cfg, true, budget - attempts.remaining, options) catch |err| {
                 if (err == error.InferenceResponseCommitted) return err;
                 failure = err;
                 // Invalid requests, credentials, refusals and malformed output
@@ -1224,6 +1397,9 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
 }
 
 pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    return batchWithSources(server, ctx, null);
+}
+pub fn batchWithSources(server: anytype, ctx: *httpx.Context, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -1253,16 +1429,23 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
     const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
-    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx) };
+    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx), .source_port = port };
     for (items.array.items, results, 0..) |item, *result, index| {
         result.* = .{ .custom_id = item.object.get("custom_id").?.string, .index = index };
         if (ctx.isCancellationRequested()) return error.Canceled;
         if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         var item_request = try httpx.Request.init(a, .POST, "http://gateway/ai/v1/generate");
         defer item_request.deinit();
-        item_request.body = try item_payloads[index].encode(a);
+        var media_budget = source_media.allocationBudget(ctx.allocator);
+        const item_allocator = if (item_payloads[index].attachments != null) media_budget.allocator() else a;
+        const item_body = item_payloads[index].encode(item_allocator) catch |err| {
+            if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+            return err;
+        };
+        defer if (item_payloads[index].attachments != null) item_allocator.free(item_body);
+        item_request.body = item_body;
         try item_request.headers.set("content-type", item_payloads[index].contentType());
-        var item_context = httpx.Context.init(a, ctx.io, &item_request);
+        var item_context = httpx.Context.init(ctx.allocator, ctx.io, &item_request);
         defer item_context.deinit();
         item_context.application_deadline_ns = deadline;
         if (invocationState(ctx)) |state| try item_context.setData(invocation_state_key, state, null);
@@ -1405,6 +1588,17 @@ pub fn localModels(a: std.mem.Allocator, server: anytype, task: gateway.Task) ![
     const bytes = try list(provider.ptr, a);
     const root = try std.json.parseFromSliceLeaky(Json, a, bytes, .{});
     if (root != .object) return error.ModelInventoryUnavailable;
+    if (task == .read) {
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        for ([_][]const u8{ "readers", "transcribers", "generators" }) |category| if (root.object.get(category)) |group| {
+            if (group != .object) return error.ModelInventoryUnavailable;
+            for (group.object.keys()) |name| try names.put(a, name, {});
+        };
+        const out = try a.alloc([]const u8, names.count());
+        var it = names.keyIterator();
+        for (out) |*name| name.* = (it.next() orelse unreachable).*;
+        return out;
+    }
     const group = root.object.get(task.namespace()) orelse return &.{};
     if (group != .object) return error.ModelInventoryUnavailable;
     return group.object.keys();
@@ -1417,23 +1611,8 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
     const a = arena.allocator();
-    var root: Json = .{ .object = .empty };
-    if (server.publicInferenceEnabled()) if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
-        const bytes = list(provider.ptr, a) catch null;
-        if (bytes) |value| root = std.json.parseFromSliceLeaky(Json, a, value, .{}) catch .{ .object = .empty };
-    };
-    if (root != .object) root = .{ .object = .empty };
-    if (!root.object.contains("allow_downloads")) try root.object.put(a, "allow_downloads", .{ .bool = false });
-    if (!root.object.contains("backends")) try root.object.put(a, "backends", .{ .object = .empty });
-    inline for (.{ "chunkers", "rerankers", "embedders", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers" }) |category| {
-        if (!root.object.contains(category)) try root.object.put(a, category, .{ .object = .empty });
-    }
-    try root.object.put(a, "public_inference_enabled", .{ .bool = server.publicInferenceEnabled() });
-    if (!server.publicInferenceEnabled()) {
-        try root.object.put(a, "object", .{ .string = "list" });
-        try root.object.put(a, "data", .{ .array = std.array_list.Managed(Json).init(a) });
-        return ctx.json(root);
-    }
+    var root = try localModelCatalog(a, server);
+    if (!server.publicInferenceEnabled()) return ctx.json(root);
     const named = try view(server);
     var data: Json = root.object.get("data") orelse .{ .array = std.array_list.Managed(Json).init(a) };
     if (data != .array) data = .{ .array = std.array_list.Managed(Json).init(a) };
@@ -1445,7 +1624,28 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     }
     for (try named.catalog(a)) |target| {
         const id = try target.idAlloc(a);
-        const item = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, try named.describe(a, target), .{}), .{});
+        var item = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, try named.describe(a, target), .{}), .{});
+        if (target.configured.task == .transcribe) {
+            const cfg = try named.transcribers.?.getConfig(target.configured.name);
+            var facts = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{
+                .recorded_clips = true,
+                .cleanup = true,
+                .live_preview = cfg.provider == .antfly,
+                .stable_segments = cfg.provider == .antfly,
+                .text_cleanup = true,
+                .recognition_hints = cfg.provider == .antfly,
+                .executor = @tagName(cfg.provider),
+            }, .{}), .{});
+            if (cfg.provider == .apple) {
+                const native = @import("antfly_transcribing").apple_native;
+                const availability: ?[]u8 = native.invoke(a, .availability, "{}", "", 64 << 10, .{ .timeout_ms = 2000 }) catch |err| blk: {
+                    try facts.object.put(a, "readiness_error", .{ .string = @errorName(err) });
+                    break :blk null;
+                };
+                if (availability) |bytes| try facts.object.put(a, "native_status", try std.json.parseFromSliceLeaky(Json, a, bytes, .{}));
+            }
+            try item.object.put(a, "dictation", facts);
+        }
         try putCatalogItem(a, &seen, &data, item);
         const category = if (target.configured.chain) "chains" else target.configured.task.namespace();
         var group = root.object.get(category) orelse Json{ .object = .empty };
@@ -1481,6 +1681,25 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
                     var tasks_list = std.array_list.Managed(Json).init(a);
                     try tasks_list.append(.{ .string = @tagName(task) });
                     try item.object.put(a, "tasks", .{ .array = tasks_list });
+                    if (task == .transcribe) {
+                        if (server.cfg.node_config) |config| if (config.connections.get(id)) |configured| {
+                            if (configured.inference) |settings| {
+                                // Hosted connections use gateway orchestration;
+                                // Antfly connections forward to a runtime whose
+                                // cleanup model contract is independent.
+                                const hosted = !std.mem.eql(u8, settings.provider, "antfly");
+                                try item.object.put(a, "dictation", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{
+                                    .recorded_clips = true,
+                                    .cleanup = true,
+                                    .live_preview = false,
+                                    .stable_segments = false,
+                                    .text_cleanup = hosted,
+                                    .recognition_hints = false,
+                                    .executor = settings.provider,
+                                }, .{}), .{}));
+                            }
+                        };
+                    }
                 }
                 try item.object.put(a, "availability", connection.object.get("status") orelse .{ .string = "unknown" });
                 try item.object.put(a, "freshness", listed.object.get("freshness") orelse .{ .string = "cached" });
@@ -1499,6 +1718,59 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     try root.object.put(a, "object", .{ .string = "list" });
     try root.object.put(a, "data", data);
     return ctx.json(root);
+}
+
+/// The node's own installed-model catalog. It reads only the local inference
+/// provider, so it never probes connections or remote upstreams. While public
+/// execution is disabled it is the complete response, with every entry marked
+/// `invocable: false`; when enabled, callers extend it with aliases and
+/// connections.
+fn localModelCatalog(a: std.mem.Allocator, server: anytype) !Json {
+    var root: Json = .{ .object = .empty };
+    if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
+        const bytes = list(provider.ptr, a) catch |err| blk: {
+            // The catalog degrades to empty, so say why instead of failing silently.
+            std.log.warn("model catalog listing failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (bytes) |value| root = std.json.parseFromSliceLeaky(Json, a, value, .{}) catch .{ .object = .empty };
+    };
+    if (root != .object) root = .{ .object = .empty };
+    if (!root.object.contains("allow_downloads")) try root.object.put(a, "allow_downloads", .{ .bool = false });
+    if (!root.object.contains("backends")) try root.object.put(a, "backends", .{ .object = .empty });
+    inline for (local_catalog_categories) |category| {
+        if (!root.object.contains(category)) try root.object.put(a, category, .{ .object = .empty });
+    }
+    try root.object.put(a, "public_inference_enabled", .{ .bool = server.publicInferenceEnabled() });
+    if (!server.publicInferenceEnabled()) {
+        try markLocalCatalogNotInvocable(a, &root);
+        try root.object.put(a, "object", .{ .string = "list" });
+        const data = root.object.get("data");
+        if (data == null or data.? != .array)
+            try root.object.put(a, "data", .{ .array = std.array_list.Managed(Json).init(a) });
+    }
+    return root;
+}
+
+const local_catalog_categories = .{ "chunkers", "rerankers", "embedders", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers" };
+
+/// Mark a local catalog listed while public execution is disabled. Entries keep
+/// their compatibility and error; `invocable: false` says public calls will 403.
+fn markLocalCatalogNotInvocable(a: std.mem.Allocator, root: *Json) !void {
+    // Local predictors come from this node's ML directory, not connection
+    // transports, and are equally not invocable while disabled.
+    inline for (local_catalog_categories ++ .{"predictors"}) |category| {
+        if (root.object.getPtr(category)) |group| if (group.* == .object) {
+            for (group.object.values()) |*entry| if (entry.* == .object) {
+                try entry.object.put(a, "invocable", .{ .bool = false });
+            };
+        };
+    }
+    if (root.object.getPtr("data")) |data| if (data.* == .array) {
+        for (data.array.items) |*entry| if (entry.* == .object) {
+            try entry.object.put(a, "invocable", .{ .bool = false });
+        };
+    };
 }
 
 fn connectionCatalogCapabilities(named: gateway.View, category: []const u8, connection: []const u8, model: []const u8) gateway.Capabilities {
@@ -1547,8 +1819,9 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     const connections = @import("connections.zig");
     observation.connection = connection;
     const owner = try server.inferenceConnectionAdmissionOwner(connection, operation);
-    if (owner == .caller and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
-    defer if (owner == .caller) server.releaseInference();
+    const acquire_admission = owner == .caller and !options.admission_held;
+    if (acquire_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+    defer if (acquire_admission) server.releaseInference();
     const cancellation = httpx.CancellationToken.fromCallback(ctx, struct {
         fn cancelled(raw: *const anyopaque) bool {
             const context: *const httpx.Context = @ptrCast(@alignCast(raw));
@@ -1558,8 +1831,12 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var transport = bridge.Outbound{ .context = ctx };
     const observed = observation.stream(transport.stream());
     var guard = tasks.FallbackSink{ .downstream = observed };
-    const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
-    defer if (options.attachments != null) ctx.allocator.free(encoded);
+    var media_budget = source_media.allocationBudget(ctx.allocator);
+    const encoded = payloads.encodeMetadata(media_budget.allocator(), body, options.attachments) catch |err| {
+        if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+        return err;
+    };
+    defer if (options.attachments != null) media_budget.allocator().free(encoded);
     var owned_client: ?httpx.Client = null;
     defer if (owned_client) |*client| client.deinit();
     const client: ?*httpx.Client = if (owner == .target) null else if (std.mem.eql(u8, operation, "read"))
@@ -1613,8 +1890,12 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     try headers.append(a, .{ "X-Antfly-Inference-Attempts-Remaining", "1" });
     try headers.append(a, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header });
     if (authorization) |value| try headers.append(a, .{ "Authorization", value });
-    const encoded = try payloads.encodeMetadata(a, body, execution_options.attachments);
-    defer if (execution_options.attachments != null) a.free(encoded);
+    var media_budget = source_media.allocationBudget(a);
+    const encoded = payloads.encodeMetadata(media_budget.allocator(), body, execution_options.attachments) catch |err| {
+        if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+        return err;
+    };
+    defer if (execution_options.attachments != null) media_budget.allocator().free(encoded);
     try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{
         .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
@@ -1712,6 +1993,50 @@ fn ownsLocalAdmission(server: anytype, named: gateway.View, task: gateway.Task, 
         },
         else => false,
     };
+}
+
+test "httpx inference gateway lists local models without public execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The fake exposes only the local provider: no connection, alias, or
+    // predictor transport members exist to probe, so the catalog is local-only.
+    const Provider = struct {
+        ptr: *anyopaque,
+        list_models_json: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
+        fn list(_: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+            return alloc.dupe(u8,
+                \\{"generators":{"acme/demo":{"compatibility":"compatible"}},
+                \\ "extractors":{"acme/broken":{"compatibility":"incompatible","error":{"code":"MissingGlinerSpanEncoderConfig","message":"unreadable"}}},
+                \\ "predictors":{"risk":{"task":"predict","num_features":2,"num_outputs":1}},
+                \\ "object":"list","data":[{"id":"acme/demo","object":"model"}]}
+            );
+        }
+    };
+    const Server = struct {
+        enabled: bool,
+        antfly_provider: ?Provider,
+        fn publicInferenceEnabled(self: *@This()) bool {
+            return self.enabled;
+        }
+    };
+    var token: u8 = 0;
+    var server: Server = .{ .enabled = false, .antfly_provider = .{ .ptr = &token, .list_models_json = Provider.list } };
+    const disabled = try localModelCatalog(a, &server);
+    try std.testing.expect(!disabled.object.get("public_inference_enabled").?.bool);
+    const demo = disabled.object.get("generators").?.object.get("acme/demo").?.object;
+    try std.testing.expect(!demo.get("invocable").?.bool);
+    try std.testing.expectEqualStrings("compatible", demo.get("compatibility").?.string);
+    const broken = disabled.object.get("extractors").?.object.get("acme/broken").?.object;
+    try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+    try std.testing.expect(!broken.get("invocable").?.bool);
+    try std.testing.expect(!disabled.object.get("data").?.array.items[0].object.get("invocable").?.bool);
+    try std.testing.expect(!disabled.object.get("predictors").?.object.get("risk").?.object.get("invocable").?.bool);
+
+    server.enabled = true;
+    const enabled = try localModelCatalog(a, &server);
+    try std.testing.expect(enabled.object.get("public_inference_enabled").?.bool);
+    try std.testing.expect(!enabled.object.get("generators").?.object.get("acme/demo").?.object.contains("invocable"));
 }
 
 test "httpx inference gateway physical catalogs preserve task ambiguity" {
@@ -1889,13 +2214,37 @@ test "httpx inference gateway framed typed adapters inline only media references
     const image_part = batch_inputs[1].object.get("input").?.array.items[0].object.get("content").?.array.items[0];
     try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", image_part.object.get("image_url").?.string);
     const audio = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
-    const adapted_audio = try inlineTaskAttachments(a, .transcribe, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
+    const audio_read = try inlineTaskAttachments(a, .read, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
+    try std.testing.expectEqualStrings("data:audio/flac;base64,YXVkaW8=", audio_read.object.get("audio").?.string);
+    const dictation = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
+    const adapted_audio = try inlineTaskAttachments(a, .transcribe, dictation, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
     try std.testing.expect(!adapted_audio.object.contains("audio"));
     try std.testing.expectEqualStrings("data:audio/flac;base64,YXVkaW8=", adapted_audio.object.get("url").?.string);
     const invalid = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"attachment:1\"}]}", .{});
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, invalid, attachments));
     const unused = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"https://example.com/image\"}]}", .{});
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, unused, attachments));
+}
+
+test "httpx inference gateway hosted media expansion uses shared admission beyond metadata size" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 49 * 1024 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 1);
+    // The source metadata itself is tiny. Its valid hosted representation is
+    // larger than the metadata parser's 64 MiB allocator, even before JSON.
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    const request = try std.json.parseFromSliceLeaky(Json, metadata.allocator(),
+        \\{"model":"generators/audio","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"attachment:0"}]}]}
+    , .{});
+    var budget = source_media.allocationBudget(a);
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    const adapted = try inlineTaskAttachments(arena.allocator(), .generate, request, &.{.{ .mime_type = "audio/wav", .data = bytes }});
+    const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), adapted, .{});
+    try std.testing.expect(encoded.len > 64 * 1024 * 1024);
+    try std.testing.expect(!budget.isLocallyExhausted());
 }
 
 test "httpx inference gateway physical decision catalogs apply connection image budgets by task" {
@@ -1963,4 +2312,93 @@ test "httpx inference gateway timeout outcomes distinguish admission send proof 
         const submitted = failure.get("upstream_submitted").?;
         if (phase == 1) try std.testing.expect(submitted == .null) else try std.testing.expectEqual(phase == 2, submitted.bool);
     }
+}
+
+test "httpx inference gateway exposes one read operation and no one-shot transcribe route" {
+    try std.testing.expectEqual(gateway.Task.read, taskForOperation("read").?);
+    try std.testing.expect(taskForOperation("transcribe") == null);
+    try std.testing.expect(!ownsPath("/ai/v1/transcribe"));
+    try std.testing.expect(ownsPath("/ai/v1/read"));
+    try std.testing.expect(ownsPath("/ai/v1/dictate"));
+    try std.testing.expect(ownsPath("/ai/v1/transcription/sessions"));
+}
+
+fn dictationEvent(a: std.mem.Allocator, writer: *httpx.StreamWriter, event: anytype) !void {
+    const encoded = try std.json.Stringify.valueAlloc(a, event, .{ .emit_null_optional_fields = false });
+    defer a.free(encoded);
+    try writer.writeEvent(null, encoded);
+}
+
+fn configuredCleanupName(request: Json) ?[]const u8 {
+    const value = request.object.get("cleanup_model") orelse return null;
+    if (value != .string) return null;
+    const name = std.mem.trim(u8, value.string, " \t\r\n");
+    return if (std.mem.startsWith(u8, name, "generators/")) name["generators/".len..] else name;
+}
+
+/// Buffer only the recognition stage. The nested request shares cancellation,
+/// deadline, credential resolution and attempt accounting with the outer call.
+const NativeDictationResult = union(enum) { transcript: Json, failure: httpx.Response };
+fn nativeDictationTranscript(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, name: []const u8, observation: *tasks.Observation, options: ExecutionOptions) !NativeDictationResult {
+    var raw = request;
+    raw.object = try request.object.clone(a);
+    _ = raw.object.swapRemove("cleanup_model");
+    try raw.object.put(a, "stream", .{ .bool = false });
+    const cfg = try named.transcribers.?.getConfig(name);
+    const encoded = try tasks.transcriptionBody(a, cfg, raw);
+    var nested_request = try httpx.Request.init(a, .POST, "http://gateway/ai/v1/dictate");
+    defer nested_request.deinit();
+    var nested = httpx.Context.init(ctx.allocator, ctx.io, &nested_request);
+    defer nested.deinit();
+    nested.application_deadline_ns = ctx.application_deadline_ns;
+    if (invocationState(ctx)) |state| try nested.setData(invocation_state_key, state, null);
+    nested.cancellation_probe = .{ .ptr = ctx, .is_cancelled = struct {
+        fn cancelled(ptr: ?*const anyopaque) bool {
+            const outer: *const httpx.Context = @ptrCast(@alignCast(ptr.?));
+            return outer.isCancellationRequested();
+        }
+    }.cancelled };
+    var buffered = options;
+    buffered.response_delivery = .buffered;
+    buffered.admission_held = false;
+    // Keep recognition audio borrowed in its original binary envelope.
+    // The forwarding transport accounts for media separately from metadata.
+    buffered.attachments = options.attachments;
+    var response = try forward(server, &nested, try std.fmt.allocPrint(a, "transcribers/{s}", .{name}), "dictate", encoded, false, observation, buffered);
+    if (response.status.code < 200 or response.status.code >= 300) return .{ .failure = response };
+    defer response.deinit();
+    const value = try std.json.parseFromSliceLeaky(Json, a, response.body orelse return error.InvalidInferenceResponse, .{ .allocate = .alloc_always });
+    if (value != .object) return error.InvalidInferenceResponse;
+    const transcript = value.object.get("transcript") orelse return error.InvalidInferenceResponse;
+    if (transcript != .object) return error.InvalidInferenceResponse;
+    return .{ .transcript = transcript };
+}
+
+fn dictationAttachment(audio: []const u8, attachments: ?[]const httpx.attachment_envelope.Attachment) !?httpx.attachment_envelope.Attachment {
+    const index = try payloads.attachmentIndex(audio);
+    if (attachments) |items| {
+        if (items.len != 1 or index == null or index.? != 0) return error.InvalidInferenceRequest;
+        if (!std.mem.startsWith(u8, items[0].mime_type, "audio/")) return error.InvalidInferenceMedia;
+        return items[0];
+    }
+    if (index != null) return error.InvalidInferenceRequest;
+    return null;
+}
+
+/// Composite stages run sequentially and must never reserve a gateway slot
+/// while an embedded invocation reserves that same resource again.
+fn admittedDictationCleanup(server: anytype, named: gateway.View, a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {
+    const acquire = !try ownsLocalAdmission(server, named, .generate, name);
+    if (acquire and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+    defer if (acquire) server.releaseInference();
+    return generateDictationCleanup(a, executor, name, messages, max_tokens);
+}
+
+fn generateDictationCleanup(a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {
+    var result = try executor.generate(a, name, messages, .{ .max_tokens = max_tokens, .require_completion = true });
+    errdefer result.deinit();
+    const normalized = try generating.dictation.normalizeCleanupOutput(result.allocator, result);
+    result.allocator.free(result.content);
+    result.content = normalized;
+    return result;
 }

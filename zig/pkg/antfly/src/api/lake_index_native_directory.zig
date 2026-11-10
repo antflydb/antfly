@@ -49,7 +49,7 @@ pub const Access = struct {
         if (self.navigation != null) result.decoded_page = .{ .ptr = self, .read = acquirePage };
         return result;
     }
-    fn acquirePage(raw: *anyopaque, a: A, ref: tree.Ref) !tree.Page {
+    fn acquirePage(raw: *anyopaque, a: A, ref: tree.Ref) !tree.NavigationPage {
         const self: *Access = @ptrCast(@alignCast(raw));
         try self.token.check();
         if (self.cached) |cached| try cached.context.ensureActive();
@@ -74,7 +74,7 @@ pub fn key(ordinal: usize) [8]u8 {
 /// No request authority is retained: callers check their live context first.
 pub const Navigation = struct {
     const Cache = local.serverless_query_lake_decoded_cache.Cache;
-    const DecodedPage = struct { page: tree.Page };
+    const DecodedPage = struct { page: tree.NavigationPage };
     allocator: A = std.heap.page_allocator,
     mutex: std.atomic.Mutex = .unlocked,
     pages: ?*Cache = null,
@@ -111,7 +111,7 @@ pub const Navigation = struct {
         }
         return self.pages.?;
     }
-    fn acquirePage(self: *Navigation, a: A, access: *Access, ref: tree.Ref) !tree.Page {
+    fn acquirePage(self: *Navigation, a: A, access: *Access, ref: tree.Ref) !tree.NavigationPage {
         const Check = struct {
             token: Token,
             parent: local.serverless_query_lake_read_context.Context,
@@ -152,7 +152,7 @@ pub const Navigation = struct {
                     if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
                     return err;
                 };
-                page.* = .{ .page = tree.readPage(out, loader.access.backing(), loader.ref) catch |err| {
+                page.* = .{ .page = tree.readNavigationPage(out, loader.access.backing(), loader.ref) catch |err| {
                     if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
                     return err;
                 } };
@@ -177,7 +177,7 @@ pub const Navigation = struct {
             // Optional cache pressure must not prevent an admitted required read.
             if (err != error.SqlMemoryLimitExceeded) return err;
             try Check.check(&check);
-            return tree.readPage(a, underlying.backing(), ref);
+            return tree.readNavigationPage(a, underlying.backing(), ref);
         };
         errdefer lease.release();
         try Check.check(&check);

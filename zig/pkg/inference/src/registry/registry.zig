@@ -29,6 +29,7 @@ const gliner_boundary = @import("../models/gliner_boundary.zig");
 const gliner_qualification = @import("../models/gliner_boundary_qualification.zig");
 const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
 const decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const specialty_qualification = @import("../models/gliner_specialty_qualification.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const c_file = @import("../util/c_file.zig");
@@ -61,11 +62,15 @@ pub const ModelEntry = struct {
     path: []const u8,
     variant: []const u8,
     gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown,
+    /// Set when this candidate's manifest could not be read. The entry stays
+    /// listed so one malformed directory never hides the others.
+    load_error: ?anyerror = null,
 };
 
 const DiscoverKindMode = enum {
     manifest,
     path,
+    installations,
 };
 
 test {
@@ -138,6 +143,10 @@ test "friendly alias refs parse as public model refs" {
         if (!std.mem.eql(u8, entry.alias, "bge-m3")) try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
         if (std.mem.eql(u8, entry.alias, "bge-m3")) {
             try std.testing.expectEqualStrings("auto", ref.variant);
+        } else if (std.mem.eql(u8, entry.alias, "lightonocr3-0.8b")) {
+            try std.testing.expectEqualStrings("safetensors@" ++ lightonocr3.revision, ref.variant);
+        } else if (std.mem.eql(u8, entry.alias, "lightonocr3-4b")) {
+            try std.testing.expectEqualStrings("safetensors@" ++ lightonocr3.revision_4b, ref.variant);
         } else {
             try std.testing.expectEqualStrings("gguf", ref.variant);
         }
@@ -299,10 +308,9 @@ pub fn modelInstallDirAlloc(
 }
 
 /// Return the stable Hub request name recorded by a validated managed-model
-/// receipt. Install-directory leaves include a variant hash and are an internal
-/// cache detail; callers should publish `owner/name` for automatic selection or
-/// `owner/name:variant` for an explicit variant so every advertised value is
-/// stable, unique, and accepted by model-resolution endpoints.
+/// receipt. Install-directory leaves are an internal cache detail. A known
+/// resolved revision makes the canonical key immutable; variant-less and
+/// unpinned selectors are published separately only when unambiguous.
 pub fn managedModelRequestNameAlloc(
     allocator: std.mem.Allocator,
     io: Io,
@@ -321,15 +329,85 @@ pub fn managedModelRequestNameAlloc(
     {
         return null;
     }
-    if (std.mem.eql(u8, source.variant, "auto")) {
-        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
-    }
-    return try std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}:{s}",
-        .{ source.owner, source.name, source.variant },
-    );
+    const selection = try download.parseVariantRevision(source.variant);
+    const base = if (std.mem.eql(u8, selection.variant, "auto"))
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{ source.owner, source.name, selection.variant });
+    errdefer allocator.free(base);
+    // Separate revisions must not share one descriptor merely because their
+    // public unpinned selector has the same spelling.
+    if (source.resolved_revision) |revision| if (immutableHubRevision(revision)) {
+        const pinned = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision });
+        allocator.free(base);
+        return pinned;
+    };
+    return base;
 }
+
+/// Candidate public selectors from a validated installation receipt. Callers
+/// must reject names shared by different installations before advertising them.
+/// The immutable revision comes from the resolved commit, never a moving ref.
+/// All returned memory belongs to allocator (normally a request arena).
+pub const ManagedSelection = struct {
+    names: []const []const u8 = &.{},
+    publication: ?[32]u8 = null,
+    rejected: bool = false,
+};
+pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
+    return (try managedModelSelectionAlloc(allocator, io, model_dir)).names;
+}
+pub fn managedModelSelectionAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) !ManagedSelection {
+    var receipt = (managed_receipt.loadValidated(allocator, io, model_dir) catch |err| {
+        // Candidate-local publication failures must not hide healthy models.
+        // Allocation and operational I/O failures remain actionable.
+        if (manifest_mod.isListingCandidateRejection(err)) return .{ .rejected = true };
+        return err;
+    }) orelse return .{};
+    defer receipt.deinit();
+    const publication = receipt.publication_generation;
+    if (receipt.parsed.value.version != 2) return .{ .publication = publication };
+    const source = receipt.parsed.value.source orelse return .{ .publication = publication };
+    if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return .{ .rejected = true };
+    const selection = download.parseVariantRevision(source.variant) catch return .{ .rejected = true };
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    const base = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
+    try names.append(allocator, base);
+    const qualified = if (std.mem.eql(u8, selection.variant, "auto")) base else try std.fmt.allocPrint(allocator, "{s}:{s}", .{ base, selection.variant });
+    if (qualified.ptr != base.ptr) try names.append(allocator, qualified);
+    if (source.resolved_revision) |revision| {
+        if (immutableHubRevision(revision)) {
+            try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ qualified, revision }));
+            if (!std.mem.eql(u8, base, qualified)) try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision }));
+        }
+    }
+    return .{ .names = try names.toOwnedSlice(allocator), .publication = publication };
+}
+fn immutableHubRevision(revision: []const u8) bool {
+    if (revision.len != 40) return false;
+    for (revision) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+/// Resolve a receipt-backed selector within the requested installation scope.
+/// Both native HTTP execution and direct extractor APIs use this authority.
+/// Exact legacy paths/defaults are handled by callers before this scan.
+pub fn resolveInstalledModelSelector(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8, task: ?[]const u8) !?[]u8 {
+    var inventory = try @import("selection.zig").Inventory.loadStable(allocator, io, models_dir);
+    defer inventory.deinit();
+    const selected = (try inventory.lookup(requested, task)) orelse return null;
+    return try allocator.dupe(u8, selected);
+}
+
+pub fn modelInTaskScope(models_dir: []const u8, path: []const u8, task_type: ?[]const u8) bool {
+    const task = task_type orelse return true;
+    const root = std.mem.trimEnd(u8, models_dir, "/");
+    if (!std.mem.startsWith(u8, path, root) or (path.len > root.len and path[root.len] != '/')) return false;
+    const relative = std.mem.trimStart(u8, path[root.len..], "/");
+    const first = relative[0 .. std.mem.indexOfScalar(u8, relative, '/') orelse relative.len];
+    return !isLegacyTaskDir(first) or std.mem.eql(u8, first, task);
+}
+
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
     models_dir: []const u8,
@@ -353,6 +431,12 @@ pub const ModelRegistry = struct {
     /// every manifest twice on listing-style paths.
     pub fn discoverShallow(self: *ModelRegistry, io: Io) ![]ModelEntry {
         return self.discoverWithKindMode(io, .path);
+    }
+
+    /// Enumerate installation paths using literal storage names. Public
+    /// selector ownership is derived separately, without parsing architecture.
+    pub fn discoverInstallations(self: *ModelRegistry, io: Io) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .installations);
     }
 
     fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
@@ -604,12 +688,25 @@ pub const ModelRegistry = struct {
             else
                 false;
             if (cached) {
+                var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+                defer publication.deinit();
+                try publication.recoverDestination();
                 try download.finishVerifiedManagedInstall(self.allocator, io, dest);
+                try publication.finish();
                 return;
             }
         }
 
-        var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
+        var transaction = blk: {
+            // begin() can restore a backup after an interrupted publication.
+            var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+            defer publication.deinit();
+            try publication.recoverDestination();
+            try publication.finish();
+            var pending = try download.ManagedModelTransaction.beginWithLease(self.allocator, io, dest, try publication.writeLease());
+            errdefer pending.deinit(io);
+            break :blk pending;
+        };
         defer transaction.deinit(io);
 
         if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
@@ -737,7 +834,10 @@ pub const ModelRegistry = struct {
                 try io.checkCancel();
             }
         }
-        try transaction.commit(io);
+        var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+        defer publication.deinit();
+        try publication.commit(&transaction);
+        try publication.finish();
     }
 
     /// Companion MTP assistant ref for a Gemma4 QAT gguf model
@@ -778,17 +878,26 @@ pub const ModelRegistry = struct {
         };
 
         var gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown;
+        var load_error: ?anyerror = null;
         const kind = switch (kind_mode) {
             .manifest => blk: {
-                var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
+                var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch |err| {
+                    // Candidate-local failures describe this model only; keep
+                    // listing the rest. Resource failures still abort the scan.
+                    if (!manifest_mod.isListingCandidateRejection(err)) return err;
+                    load_error = err;
+                    if (kind_hint) |hint| break :blk hint;
+                    if (containsAsciiIgnoreCase(model_path, "gliner")) break :blk .extractor;
+                    break :blk inferModelKindFromPath(model_path);
+                };
                 defer manifest.deinit();
                 gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
-            .path => kind_hint orelse inferModelKindFromPath(model_path),
+            .path, .installations => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
-        const owned_name = managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
+        const owned_name = if (kind_mode == .installations) try self.allocator.dupe(u8, display_name) else managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         } orelse try self.allocator.dupe(u8, display_name);
@@ -801,6 +910,7 @@ pub const ModelRegistry = struct {
             .path = owned_path,
             .variant = "f32",
             .gliner_architecture = gliner_architecture,
+            .load_error = load_error,
         });
     }
 
@@ -814,7 +924,7 @@ pub const ModelRegistry = struct {
         var existing = try manifest_mod.loadFromManagedPlanDir(self.allocator, dest_dir);
         defer existing.deinit();
         if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null and
-            !isGlinerDecisionCandidate(&existing))
+            !isGlinerDecisionCandidate(&existing) and existing.gliner_specialty_profile == null)
         {
             if (!existing.laya_declared or !existing.hasCapability("typed_decisions") or existing.hasTask("decide")) return;
 
@@ -1083,7 +1193,7 @@ test "registry resolves unknown directory entry kinds" {
     );
 }
 
-fn isLegacyTaskDir(name: []const u8) bool {
+pub fn isLegacyTaskDir(name: []const u8) bool {
     return std.mem.eql(u8, name, "embedders") or
         std.mem.eql(u8, name, "chunkers") or
         std.mem.eql(u8, name, "rerankers") or
@@ -1204,7 +1314,7 @@ fn boundaryIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.
     return boundary_bundle.Identity{
         .backbone = config.backbone,
         .precision = .fp32,
-        .weight = boundary_bundle.Digest.of(reader.file_bytes),
+        .weight = boundary_bundle.Digest.ofMapped(reader.file_bytes),
         .sidecars = sidecars,
     };
 }
@@ -1282,8 +1392,8 @@ test "boundary typed decisions require exact multi-Decide identity independent o
 /// The published Decide contract is granted only to the reviewed checkpoint
 /// bytes. Repository/path spelling is intentionally irrelevant: local copies
 /// of the same immutable artifact qualify, while changed weights fail closed.
-fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
-    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return null;
+fn spanIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
+    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or (!manifest.gliner_span_declared and manifest.gliner_specialty_profile == null)) return null;
     var weight: decide_qualification.Digest = undefined;
     var companion: ?decide_qualification.Digest = null;
     var inventory: decide_qualification.TensorInventory = undefined;
@@ -1310,7 +1420,7 @@ fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.Mo
             all_f32 = false;
             break;
         };
-        weight = decide_qualification.Digest.of(reader.file_bytes);
+        weight = decide_qualification.Digest.ofMapped(reader.file_bytes);
         inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 };
     }
     const identity = decide_qualification.Identity{
@@ -1347,6 +1457,11 @@ fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.Mo
             .special_tokens_map = manifest.gliner_span_special_tokens_digest,
         },
     };
+    return identity;
+}
+
+fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
+    const identity = spanIdentity(allocator, manifest) orelse return null;
     if (decide_qualification.qualifiedVariant(identity) == null) return null;
     return identity;
 }
@@ -1366,6 +1481,17 @@ fn isKnownDecideStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8
     defer plan.deinit();
     const source = plan.parsed.value.source orelse return false;
     return isKnownDecideSource(source);
+}
+
+fn isKnownSpecialtyStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8) !bool {
+    var plan = try managed_receipt.loadValidatedPlan(allocator, std.Options.debug_io, dest_dir);
+    defer plan.deinit();
+    const source = plan.parsed.value.source orelse return false;
+    for (specialty_qualification.artifacts) |artifact| {
+        const name = artifact.repository["fastino/".len..];
+        if (std.ascii.eqlIgnoreCase(source.owner, "fastino") and std.ascii.eqlIgnoreCase(source.name, name)) return true;
+    }
+    return false;
 }
 
 fn isGlinerDecisionCandidate(manifest: *const manifest_mod.ModelManifest) bool {
@@ -1453,7 +1579,10 @@ fn appendManifestTasks(
         .classifier => if (!manifest.laya_declared) try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
-        .transcriber => try appendUniqueOwnedString(allocator, tasks, "transcribe"),
+        .transcriber => {
+            try appendUniqueOwnedString(allocator, tasks, "transcribe");
+            try appendUniqueOwnedString(allocator, tasks, "read");
+        },
     }
 
     try appendSupplementalTasks(allocator, manifest, tasks, qualified_boundary);
@@ -1853,7 +1982,7 @@ fn synthesizePulledModelManifestJsonFromPlan(
 
 const PulledManifestSource = enum { published, staging_plan };
 
-fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@import("../models/gliner_boundary_bundle.zig").Identity, decide_identity: ?decide_qualification.Identity) ![]u8 {
+fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@import("../models/gliner_boundary_bundle.zig").Identity, boundary_config: ?gliner_boundary.Config, decide_identity: ?decide_qualification.Identity) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1868,6 +1997,12 @@ fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@i
     };
     return try std.json.Stringify.valueAlloc(allocator, .{
         .profiles = profiles.items,
+        .boundary_profiles_role = if (boundary_identity != null) @as(?[]const u8, "measured_coverage") else null,
+        .boundary_runtime = if (boundary_identity != null and boundary_config != null) .{
+            .max_body_words = boundary_config.?.max_len,
+            .default_max_sequence_tokens = @import("../extractors/gliner_boundary_qualification.zig").sequenceLimit(&boundary_config.?, (@import("../architectures/gliner/boundary_engine.zig").Limits{}).max_sequence_tokens),
+            .geometry_admission = "exact_model_backend_and_request_budgets",
+        } else null,
         .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
         .span_extraction_status = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @as(?[]const u8, "parity_only_no_nonempty_eval") else null else null,
         .span_windows = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @import("../models/gliner_span_window_limits.zig").qualified else null else null,
@@ -1877,13 +2012,20 @@ fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@i
 
 test "qualified limits JSON shares serving geometry and window bounds" {
     const a = std.testing.allocator;
-    const raw = try qualifiedLimitsJsonAlloc(a, gliner_qualification.fastino_gliner25_base_v1, decide_qualification.pinned_fp32_identity);
+    var boundary_config = std.mem.zeroes(gliner_boundary.Config);
+    boundary_config.max_len = 4096;
+    boundary_config.encoder.family = .deberta;
+    const raw = try qualifiedLimitsJsonAlloc(a, gliner_qualification.fastino_gliner25_base_v1, boundary_config, decide_qualification.pinned_fp32_identity);
     defer a.free(raw);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expect(root.get("runtime_revalidates_artifact").?.bool);
     try std.testing.expect(root.get("profiles").?.array.items.len > 0);
+    try std.testing.expectEqualStrings("measured_coverage", root.get("boundary_profiles_role").?.string);
+    const boundary_runtime = root.get("boundary_runtime").?.object;
+    try std.testing.expectEqual(@as(i64, 4096), boundary_runtime.get("max_body_words").?.integer);
+    try std.testing.expectEqual(@as(i64, 16384), boundary_runtime.get("default_max_sequence_tokens").?.integer);
     const published = root.get("decide").?.object;
     const enforced = (try decide_qualification.requestLimits(decide_qualification.pinned_fp32_identity)).?;
     try std.testing.expectEqual(@as(i64, @intCast(enforced.sequence_tokens)), published.get("sequence_tokens").?.integer);
@@ -1895,7 +2037,7 @@ test "qualified limits JSON shares serving geometry and window bounds" {
     try std.testing.expectEqual(@as(i64, @intCast(bounds.max_request_tokens)), windows.get("max_request_tokens").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_bytes)), windows.get("max_document_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_words)), windows.get("max_document_words").?.integer);
-    const absent = try qualifiedLimitsJsonAlloc(a, null, null);
+    const absent = try qualifiedLimitsJsonAlloc(a, null, null, null);
     defer a.free(absent);
     const none = try std.json.parseFromSlice(std.json.Value, a, absent, .{});
     defer none.deinit();
@@ -1922,7 +2064,14 @@ fn synthesizePulledModelManifestJsonInternal(
     // where the artifact was just staged to disk.
     const boundary_identity = boundaryIdentity(allocator, &manifest);
     const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
-    const decide_identity = decideIdentity(allocator, &manifest);
+    const span_identity = spanIdentity(allocator, &manifest);
+    const specialty_profile: ?specialty_qualification.Profile = if (manifest.gliner_specialty_profile != null) blk: {
+        const identity = span_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
+        break :blk try specialty_qualification.require(identity);
+    } else null;
+    if (specialty_profile == null and source == .staging_plan and try isKnownSpecialtyStagingSource(allocator, dest_dir))
+        return error.UnsupportedGlinerSpecialtyArtifact;
+    const decide_identity = if (span_identity) |identity| if (decide_qualification.qualifiedVariant(identity) != null) identity else null else null;
     const qualified_decide = decide_identity != null;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
@@ -2007,6 +2156,11 @@ fn synthesizePulledModelManifestJsonInternal(
         for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
         for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
     }
+    if (specialty_profile) |profile| {
+        const allowed_capability = if (profile == .pii) "named_entity_recognition" else "classification";
+        for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest;
+        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, allowed_capability)) return error.InvalidModelManifest;
+    }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
     // Reserved public capability: neither an alias nor a caller-supplied CSV
     // may publish it for a merely similar boundary artifact.
@@ -2036,13 +2190,22 @@ fn synthesizePulledModelManifestJsonInternal(
         try body.appendSlice(allocator, ",\"inputs\":");
         try appendJsonStringArray(&body, allocator, inputs.items);
     }
-    if (qualified_decide)
+    if (specialty_profile) |profile| {
+        try body.appendSlice(allocator, ",\"gliner_specialty_profile\":");
+        try appendJsonString(&body, allocator, @tagName(profile));
+    }
+    if (qualified_decide or specialty_profile == .gliguard)
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (qualified_boundary or qualified_decide) {
-        const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, decide_identity);
+        const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, manifest.gliner_boundary_config, decide_identity);
         defer allocator.free(limits);
         try body.appendSlice(allocator, ",\"qualified_limits\":");
         try body.appendSlice(allocator, limits);
+    }
+    if (specialty_profile != null) {
+        try body.appendSlice(allocator, ",\"qualified_limits\":{\"specialty\":{\"sequence_tokens\":512,\"physical_batch_items\":");
+        try body.appendSlice(allocator, "8");
+        try body.appendSlice(allocator, "}}");
     }
     if (sparse_3d_output_layout) |layout| {
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
@@ -2171,6 +2334,49 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("monkt/paddleocr-onnx", models[0].name);
+}
+
+test "discovery keeps listing when one model directory is malformed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // ONNX-only span bundle: valid. Adding safetensors without encoder
+    // geometry makes the manifest unreadable.
+    try tmp.dir.createDirPath(io, "acme/good-gliner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/good-gliner/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/good-gliner/model.onnx", .data = "" });
+    try tmp.dir.createDirPath(io, "acme/bad-gliner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/bad-gliner/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/bad-gliner/model.onnx", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/bad-gliner/model.safetensors", .data = "" });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+    var reg = ModelRegistry.init(allocator, models_dir);
+    const models = try reg.discover(io);
+    defer {
+        for (models) |model| {
+            allocator.free(model.name);
+            allocator.free(model.path);
+        }
+        allocator.free(models);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    var saw_good = false;
+    var saw_bad = false;
+    for (models) |model| {
+        if (std.mem.eql(u8, model.name, "acme/good-gliner")) {
+            saw_good = true;
+            try std.testing.expect(model.load_error == null);
+        } else if (std.mem.eql(u8, model.name, "acme/bad-gliner")) {
+            saw_bad = true;
+            try std.testing.expectEqual(@as(?anyerror, error.MissingGlinerSpanEncoderConfig), model.load_error);
+            try std.testing.expectEqual(ModelKind.extractor, model.kind);
+        }
+    }
+    try std.testing.expect(saw_good and saw_bad);
 }
 
 test "shallow discovery cleans up every allocation failure" {
@@ -2727,11 +2933,10 @@ fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8
 
 /// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
-/// prefixed with "requested-" and returns the shortest deterministic match.
+/// prefixed with "requested-" and accepts only a single matching directory.
 /// Managed variant directories are deliberately excluded: their suffix is an
 /// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
-/// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
 /// directory iteration failures remain actionable to callers.
 pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) !?[]const u8 {
@@ -2765,13 +2970,11 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
         if (std.mem.startsWith(u8, entry.name, prefix) and
             !isManagedVariantInstallLeaf(requested_name, entry.name))
         {
-            if (best_name == null or entry.name.len < best_name.?.len or
-                (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
-            {
-                const new_best = try allocator.dupe(u8, entry.name);
-                if (best_name) |old| allocator.free(old);
-                best_name = new_best;
-            }
+            const candidate = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
+            defer allocator.free(candidate);
+            if (!isModelDir(io, candidate)) continue;
+            if (best_name != null) return error.AmbiguousModelIdentifier;
+            best_name = try allocator.dupe(u8, entry.name);
         }
     }
 
@@ -2872,6 +3075,7 @@ test "resolveVariant retains legacy suffix resolution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4_0/model.gguf", .data = "weights" });
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
@@ -3047,4 +3251,173 @@ test "gliner boundary Transformers wrapper pull manifest qualifies the unchanged
     const unreviewed = try synthesizePulledModelManifestJson(a, directory, null, null);
     defer a.free(unreviewed);
     try std.testing.expect(std.mem.indexOf(u8, unreviewed, "\"tasks\":[\"extract\"]") == null);
+}
+
+test "specialty managed pull requalifies existing task manifests before publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "encoder_config");
+        var artifacts: std.ArrayList(managed_receipt.ArtifactReceipt) = .empty;
+        defer artifacts.deinit(a);
+        inline for (.{ "config.json", "encoder_config/config.json", "tokenizer_config.json" }) |name| {
+            const bytes = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/" ++ name);
+            defer a.free(bytes);
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+            try artifacts.append(a, .{ .path = name, .size = bytes.len });
+        }
+        const artifact = specialty_qualification.artifacts[@backingInt(profile)];
+        const tokenizer = try std.json.Stringify.valueAlloc(a, .{ .added_tokens = .{
+            .{ .id = artifact.markers.p, .content = "[P]" },
+            .{ .id = artifact.markers.c, .content = "[C]" },
+            .{ .id = artifact.markers.e, .content = "[E]" },
+            .{ .id = artifact.markers.r, .content = "[R]" },
+            .{ .id = artifact.markers.l, .content = "[L]" },
+            .{ .id = artifact.markers.sep_struct, .content = "[SEP_STRUCT]" },
+            .{ .id = artifact.markers.sep_text, .content = "[SEP_TEXT]" },
+        } }, .{});
+        defer a.free(tokenizer);
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+        try artifacts.append(a, .{ .path = "tokenizer.json", .size = tokenizer.len });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+        try artifacts.append(a, .{ .path = "model.safetensors", .size = 0 });
+        const manifest_json = try std.json.Stringify.valueAlloc(a, .{
+            .type = "extractor",
+            .tasks = .{"extract"},
+            .inputs = .{"text"},
+            .capabilities = .{if (profile == .pii) "named_entity_recognition" else "classification"},
+            .gliner_specialty_profile = @tagName(profile),
+        }, .{});
+        defer a.free(manifest_json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = manifest_json });
+        try artifacts.append(a, .{ .path = "model_manifest.json", .size = manifest_json.len });
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        try download.beginManagedDownload(a, io, path);
+        const plan = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "fastino", .name = artifact.repository["fastino/".len..], .variant = "auto", .requested_revision = artifact.revision, .resolved_revision = artifact.revision, .selected_format = "safetensors" },
+            .artifacts = artifacts.items,
+        }, .{});
+        defer a.free(plan);
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.plan_filename, .data = plan });
+        var registry = ModelRegistry.init(a, path);
+        defer registry.deinit();
+        // An existing Antfly task manifest cannot bypass authentication of
+        // the staged weights/tokenizer. Neither fixture is a pinned artifact.
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, registry.writePulledModelManifest(io, path, null, null));
+        try std.testing.expectEqual(download.ManagedDownloadState.incomplete, download.managedDownloadState(a, io, path));
+    }
+}
+
+test "resolveVariant rejects multiple legacy suffixes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4");
+    try tmp.dir.createDirPath(io, "models/owner/model-q8");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q8/model.gguf", .data = "weights" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    try std.testing.expectError(error.AmbiguousModelIdentifier, resolveVariant(a, io, root, "owner/model"));
+}
+
+test "resolveVariant ignores empty and incomplete legacy candidates" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4/model.gguf", .data = "weights" });
+    try tmp.dir.createDirPath(io, "models/owner/model-z");
+    try tmp.dir.createDirPath(io, "models/owner/model-incomplete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-incomplete/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-incomplete/.antfly-download-in-progress", .data = "pending" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const path = (try resolveVariant(a, io, root, "owner/model")).?;
+    defer a.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "model-q4"));
+}
+
+test "model selection registry pull publishes catalog generations and recovers cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local_http = @import("httpx");
+    const publication = @import("catalog_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = @embedFile("testdata/hub_snapshot_server.py") });
+    const address = local_http.socket.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try local_http.TcpListener.init(address, io);
+    const port = listener.getLocalAddress().ip4.port;
+    listener.deinit();
+    var port_buf: [16]u8 = undefined;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", try std.fmt.bufPrint(&port_buf, "{d}", .{port}), "onnx-only" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    try io.sleep(std.Io.Duration.fromMilliseconds(200), .awake);
+    const temporary = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(temporary);
+    const root = try std.fs.path.join(a, &.{ temporary, "models" });
+    defer a.free(root);
+    const base_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{port});
+    defer a.free(base_url);
+    var registry = ModelRegistry.init(a, root);
+    defer registry.deinit();
+    try registry.pullWithProgress(io, "owner/model:onnx", .{ .base_url = base_url }, null, null, .auto, .{});
+    const first = try publication.read(a, io, root);
+    try std.testing.expectEqual(.publication, first.kind);
+    var cache = @import("selection.zig").Cache.init(a);
+    defer cache.deinit();
+    const pin = "owner/model:onnx@0123456789abcdef0123456789abcdef01234567";
+    const selected = (try cache.resolveSelection(a, io, root, pin, null)).?;
+    defer a.free(selected.path);
+    const cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, registry.pullWithProgress(io, "owner/model:onnx", .{ .base_url = base_url }, null, null, .auto, .{ .cancelled = &cancelled }));
+    try std.testing.expectEqual(.publication, (try publication.read(a, io, root)).kind);
+    const preserved = (try cache.resolveSelection(a, io, root, pin, null)).?;
+    defer a.free(preserved.path);
+    try std.testing.expectEqual(selected.publication, preserved.publication);
+}
+
+test "model selection unrelated failed pull recovers the journaled publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/acme/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/first/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/first/.antfly-download-complete.json", .data =
+        \\{"version":2,"source":{"owner":"acme","name":"first","variant":"gguf","resolved_revision":"0123456789abcdef0123456789abcdef01234567"},"artifacts":[{"path":"model.gguf","size":7}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const publication = @import("catalog_publication.zig");
+    var interrupted = try publication.Publication.begin(a, io, root, "acme/first");
+    // Simulate process death between the two publication renames.
+    try std.Io.Dir.rename(tmp.dir, "models/acme/first", tmp.dir, "models/acme/.first.antfly-download-backup", io);
+    interrupted.deinit();
+    try std.testing.expectError(error.ModelArtifactsChanging, publication.read(a, io, root));
+    var registry = ModelRegistry.init(a, root);
+    defer registry.deinit();
+    // Recovery must precede B's network operation; even its failure must leave
+    // A restored, rather than turning the interrupted publication into a 404.
+    registry.pullWithProgress(io, "other/model:onnx", .{ .base_url = "http://127.0.0.1:1" }, null, null, .auto, .{}) catch {};
+    try std.testing.expectEqual(.publication, (try publication.read(a, io, root)).kind);
+    var cache = @import("selection.zig").Cache.init(a);
+    defer cache.deinit();
+    const selected = (try cache.resolveSelection(a, io, root, "acme/first:gguf@0123456789abcdef0123456789abcdef01234567", null)).?;
+    defer a.free(selected.path);
+    try std.testing.expect(std.mem.endsWith(u8, selected.path, "/acme/first"));
 }

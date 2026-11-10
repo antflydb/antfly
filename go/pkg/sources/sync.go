@@ -26,18 +26,102 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const ScopedMergeContentType = "application/vnd.antfly.scoped-merge.v1+json"
 
 // RecordKey separates the provider's identity from the destination key. Every
 // provider belonging to one logical source shares a single exclusive key range.
+//
+// This is the legacy, namespace-less formula: sha256(providerID), where
+// providerID is the connector's own acquisition identity (item.ID), which
+// embeds the connector's location (URL/bucket/path) and is unrelated to the
+// bytes it names. A source with no identity.namespace set keeps this formula
+// forever, byte for byte, so nothing persisted before namespaces existed is
+// affected. See IdentityKey for the namespace-scoped formula.
 func RecordKey(sourceID, providerID string) (string, error) {
 	if !canonicalID(sourceID) || !ownedID(providerID, "job/"+sourceID) {
 		return "", fmt.Errorf("invalid source record identity")
 	}
 	digest := sha256.Sum256([]byte(providerID))
 	return RecordPrefix(sourceID) + hex.EncodeToString(digest[:]), nil
+}
+
+// IdentityKey computes a source row's key. With no namespace, it is exactly
+// RecordKey(sourceID, providerID) -- including its validation -- so adopting
+// this function changes nothing for a source that has not set
+// identity.namespace. With a namespace, the key is
+// sha256(namespace + "/" + relativeKey) instead: identity follows the row's
+// position under the source's own root, not the provider's acquisition
+// identity, so a connection or provider change that preserves the namespace
+// and relative key keeps the same row instead of re-keying it.
+//
+// Setting namespace to a source's current provider-ID prefix (i.e.
+// namespace = strings.TrimSuffix(providerID, "/"+relativeKey)) reconstructs
+// providerID byte for byte when concatenated back with relativeKey, by
+// construction; it does not by itself reproduce RecordKey's legacy digest,
+// because the two formulas hash different strings (the full providerID vs.
+// namespace+"/"+relativeKey) -- UNLESS the adopted namespace is exactly that
+// prefix, in which case namespace+"/"+relativeKey IS providerID again, byte
+// for byte, and the two formulas hash the identical string and so produce
+// the identical key. See LegacyNamespace, which derives that exact prefix.
+// A namespace adopted as anything else re-keys every row exactly once;
+// only a brand new source (given an opaque namespace at creation before
+// any row exists) never has rows to re-key in the first place.
+// An empty relative key is valid for a bucket object whose name exactly equals
+// its prefix. Publication requires explicit relative_key metadata for that case.
+func IdentityKey(sourceID, namespace, relativeKey, providerID string) (string, error) {
+	if namespace == "" {
+		return RecordKey(sourceID, providerID)
+	}
+	if !canonicalID(sourceID) || !utf8.ValidString(relativeKey) || strings.ContainsRune(relativeKey, 0) || !utf8.ValidString(namespace) || strings.ContainsRune(namespace, 0) {
+		return "", fmt.Errorf("invalid source record identity")
+	}
+	digest := sha256.Sum256([]byte(namespace + "/" + relativeKey))
+	return RecordPrefix(sourceID) + hex.EncodeToString(digest[:]), nil
+}
+
+// LegacyNamespace derives the one namespace that reproduces sourceID's
+// current (pre-identity.namespace) row keys for every given item:
+// strings.TrimSuffix(item.ID, "/"+relativeKey), where relativeKey is
+// relativeKeyFor(sourceID, item). That value is determined entirely by the
+// connection and config that produced these items (the provider scheme, the
+// "job/<sourceID>" acquisition namespace, and any bucket/prefix), never by
+// an individual item, so it must be identical across every item given here;
+// a general, connector-independent way to find it, since it only has to
+// read what each connector already put in item.ID and item.RelativeKey, not
+// re-derive either from scratch.
+//
+// Adopting this exact namespace makes IdentityKey(sourceID, namespace,
+// relativeKey, _) equal RecordKey(sourceID, providerID) for every one of
+// these items (see IdentityKey), so a source that sets it keeps every
+// existing row's key, even if its connection or config changes in the same
+// request. Items that disagree on this prefix return an error rather than
+// silently picking one, since adopting the wrong one re-keys every row that
+// disagreed with it, and no items given at all is also an error -- the
+// caller decides what an empty inventory means for its own purpose (for
+// example, nothing to re-key at all).
+func LegacyNamespace(sourceID string, items []Item) (string, error) {
+	if len(items) == 0 {
+		return "", fmt.Errorf("no items to derive a legacy namespace from")
+	}
+	namespace := ""
+	for i, item := range items {
+		relativeKey := relativeKeyFor(sourceID, item)
+		suffix := "/" + relativeKey
+		if !strings.HasSuffix(item.ID, suffix) {
+			return "", fmt.Errorf("item %q does not end with its relative key %q; cannot derive a legacy namespace", item.ID, relativeKey)
+		}
+		candidate := strings.TrimSuffix(item.ID, suffix)
+		switch {
+		case i == 0:
+			namespace = candidate
+		case candidate != namespace:
+			return "", fmt.Errorf("items disagree on their legacy namespace prefix (%q vs %q); refusing to adopt either", namespace, candidate)
+		}
+	}
+	return namespace, nil
 }
 func RecordPrefix(sourceID string) string { return "source://job/" + sourceID + "/records/" }
 func recordRange(sourceID string) KeyRange {
@@ -76,25 +160,49 @@ type SyncClient interface {
 	Batch(context.Context, string, map[string]any, []string) error
 }
 
+// SyncMergeValidator optionally enforces application policy against the exact
+// serialized request before dispatch. Implementations must be read-only and
+// must never dispatch writes. Rejection leaves that page unverified while
+// allowing other pages to proceed. Any Merge error still fences the writer.
+type SyncMergeValidator interface {
+	ValidateMerge(context.Context, string, []byte) error
+}
+
 // SyncWriter performs non-destructive writes first. Finish reconciles missing
 // records only after every item in a complete pinned inventory is query-visible.
 // Runtimes must serialize writers for the same source; different source ranges
 // may share a table. No fallback to legacy/unbounded LinearMerge is permitted.
 type SyncWriter struct {
-	client                  SyncClient
-	table, sourceID         string
-	bounds                  KeyRange
-	inventory, verified     map[string]bool
-	authoritative, finished bool
+	client                          SyncClient
+	table, sourceID, namespace      string
+	bounds                          KeyRange
+	inventory, verified             map[string]bool
+	authoritative, finished, failed bool
 }
 
+// NewSyncWriter pins a namespace-less (legacy) inventory: every key is
+// RecordKey(sourceID, id), byte for byte. Equivalent to
+// NewSyncWriterWithIdentity with an empty namespace and items that carry no
+// relative key, since IdentityKey only consults relativeKey when a namespace
+// is set.
 func NewSyncWriter(client SyncClient, table, sourceID string, providerIDs []string, authoritative bool) (*SyncWriter, error) {
-	if client == nil || table == "" || !canonicalID(sourceID) || len(providerIDs) > maxCollaborationSourceObjects {
+	items := make([]Item, len(providerIDs))
+	for i, id := range providerIDs {
+		items[i] = Item{ID: id}
+	}
+	return NewSyncWriterWithIdentity(client, table, sourceID, "", items, authoritative)
+}
+
+// NewSyncWriterWithIdentity pins an inventory keyed by IdentityKey(sourceID,
+// namespace, item.RelativeKey (or its native-ID fallback), item.ID). With an
+// empty namespace this is exactly NewSyncWriter.
+func NewSyncWriterWithIdentity(client SyncClient, table, sourceID, namespace string, items []Item, authoritative bool) (*SyncWriter, error) {
+	if client == nil || table == "" || !canonicalID(sourceID) || len(items) > maxCollaborationSourceObjects {
 		return nil, fmt.Errorf("invalid source sync configuration")
 	}
-	w := &SyncWriter{client: client, table: table, sourceID: sourceID, bounds: recordRange(sourceID), inventory: map[string]bool{}, verified: map[string]bool{}, authoritative: authoritative}
-	for _, id := range providerIDs {
-		key, err := RecordKey(sourceID, id)
+	w := &SyncWriter{client: client, table: table, sourceID: sourceID, namespace: namespace, bounds: recordRange(sourceID), inventory: map[string]bool{}, verified: map[string]bool{}, authoritative: authoritative}
+	for _, item := range items {
+		key, err := IdentityKey(sourceID, namespace, relativeKeyFor(sourceID, item), item.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -106,23 +214,39 @@ func NewSyncWriter(client SyncClient, table, sourceID string, providerIDs []stri
 	return w, nil
 }
 
-// Upsert stabilizes indexing time when the complete normalized projection is
-// unchanged, then uses scoped LinearMerge's content hashes to avoid rewrites.
+// Upsert verifies unchanged rows against a fresh complete normalized projection.
+// Only changed rows are submitted to scoped LinearMerge.
 // documents is updated with the exact projection verified by the shared barrier.
+// Skipped includes fresh query proofs; read-only no-ops have no merge cursor/range.
+// Invalid input closes the writer so earlier proofs cannot authorize cleanup.
 func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) (MergeResult, error) {
-	if w.finished || len(documents) == 0 || len(documents) > 1000 {
+	if w.finished || w.failed || len(documents) == 0 || len(documents) > 1000 {
+		w.failed = true
 		return MergeResult{}, fmt.Errorf("invalid source merge page")
 	}
 	ids := make([]string, 0, len(documents))
 	for id, doc := range documents {
-		key, err := RecordKey(w.sourceID, configString(doc.Metadata, "identity"))
-		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID || doc.Version != 1 || configString(doc.Metadata, "sha256") == "" {
+		if _, present := doc.Metadata["relative_key"].(string); w.namespace != "" && !present {
+			w.failed = true
+			return MergeResult{}, fmt.Errorf("record is missing its relative key")
+		}
+		key, err := IdentityKey(w.sourceID, w.namespace, configString(doc.Metadata, "relative_key"), configString(doc.Metadata, "identity"))
+		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID {
+			w.failed = true
 			return MergeResult{}, fmt.Errorf("record outside pinned source inventory")
 		}
+		if err := validateDocumentContent(doc); err != nil {
+			w.failed = true
+			return MergeResult{}, err
+		}
+
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	body, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": ids}, "fields": QueryDocumentFields(), "limit": len(ids), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+	for _, id := range ids {
+		delete(w.verified, id)
+	}
+	body, _ := json.Marshal(map[string]any{"query": documentIDsQuery(ids), "fields": sourceRowFields(), "limit": len(ids), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 	raw, err := w.client.Query(ctx, w.table, body)
 	if err != nil {
 		return MergeResult{}, err
@@ -132,13 +256,14 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		return MergeResult{}, err
 	}
 	seen := map[string]bool{}
+	unchanged := map[string]bool{}
 	for _, hit := range hits {
 		doc, ok := documents[hit.ID]
 		if !ok || seen[hit.ID] {
 			return MergeResult{}, fmt.Errorf("unexpected source metadata identity")
 		}
 		seen[hit.ID] = true
-		before, after := hit.Source.Grep, doc
+		before, after := hit.Source.Document, doc
 		before.IndexedAt, after.IndexedAt = 0, 0
 		a, err := projectionDigest(before)
 		if err != nil {
@@ -148,27 +273,44 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		if err != nil {
 			return MergeResult{}, err
 		}
-		if a == b {
-			doc.IndexedAt = hit.Source.Grep.IndexedAt
+		if a == b && sourceRowMatches(hit, w.sourceID) {
+			doc.IndexedAt = hit.Source.Document.IndexedAt
 			documents[hit.ID] = doc
+			unchanged[hit.ID] = true
 		}
 	}
-	rows := make(map[string]any, len(documents))
-	for id, doc := range documents {
-		rows[id] = map[string]any{"id": id, "source_id": w.sourceID, "doc_type": "source_item", "grep": doc}
+	rows := make(map[string]any, len(documents)-len(unchanged))
+	changed := map[string]Document{}
+	changedIDs := []string{}
+	for _, id := range ids {
+		if unchanged[id] {
+			continue
+		}
+		doc := documents[id]
+		changed[id] = doc
+		changedIDs = append(changedIDs, id)
+		rows[id], err = SourceRow(id, w.sourceID, w.namespace, doc)
+		if err != nil {
+			return MergeResult{}, err
+		}
 	}
-	// Truncating the fixed-length hex key gives a narrow lower bound. Deletes
-	// are disabled, so partial or out-of-order pages never remove gap records.
-	cursor := ids[0][:len(ids[0])-1]
-	result, err := w.merge(ctx, ScopedMergePage{KeyRange: w.bounds, Records: rows, LastMergedID: cursor, SyncLevel: "write"}, ids[len(ids)-1], len(ids))
-	if err != nil {
-		return result, err
-	}
-	if result.Deleted != 0 {
-		return result, fmt.Errorf("non-destructive source merge reported deletions")
-	}
-	if err := WaitForDocuments(ctx, w.client.Query, w.table, documents); err != nil {
-		return result, err
+	result := MergeResult{Status: "success", Skipped: len(unchanged)}
+	if len(changedIDs) > 0 {
+		// Deletes are disabled: excluding unchanged rows cannot remove gap records.
+		cursor := changedIDs[0][:len(changedIDs[0])-1]
+		result, err = w.merge(ctx, ScopedMergePage{KeyRange: w.bounds, Records: rows, LastMergedID: cursor, SyncLevel: "write"}, changedIDs[len(changedIDs)-1], len(changedIDs))
+		if err != nil {
+			return result, err
+		}
+		if result.Deleted != 0 {
+			w.failed = true
+			return result, fmt.Errorf("non-destructive source merge reported deletions")
+		}
+		if err := waitForDocuments(ctx, w.client.Query, w.table, changed, true); err != nil {
+			w.failed = true
+			return result, err
+		}
+		result.Skipped += len(unchanged)
 	}
 	for id := range documents {
 		w.verified[id] = true
@@ -179,8 +321,8 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 // Finish never removes missing rows for partial inventories or repairs. A full
 // run retains only already verified IDs, avoiding a second upload of all text.
 func (w *SyncWriter) Finish(ctx context.Context) (MergeResult, error) {
-	if w.finished {
-		return MergeResult{}, fmt.Errorf("source sync already finished")
+	if w.finished || w.failed {
+		return MergeResult{}, fmt.Errorf("source sync writer is finished or failed; resume the durable source run")
 	}
 	if !w.authoritative {
 		return MergeResult{}, nil
@@ -193,21 +335,40 @@ func (w *SyncWriter) Finish(ctx context.Context) (MergeResult, error) {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	page := ScopedMergePage{KeyRange: w.bounds, Records: map[string]any{}, RetainIDs: ids, LastMergedID: w.bounds.From, DeleteMissing: true, SyncLevel: "write"}
+	// A fresh absence proof avoids replaying an already committed cleanup when
+	// a prior run lost its acknowledgement. Retained snapshots let no-op syncs
+	// avoid a merge; live reads require primary-store reconciliation below.
+	clean, retained, err := w.rangeIsClean(ctx, ids)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if clean && retained {
+		if err := w.verifyRetainedIDs(ctx, ids); err != nil {
+			return MergeResult{}, err
+		}
+		w.finished = true
+		return MergeResult{Status: "success", Skipped: len(ids)}, nil
+	}
+	// Lite cannot prove absence through a lagging live index. Reconcile against
+	// primary storage even when its query is empty, and wait for index visibility
+	// before using a subsequent live read to confirm the cleanup.
+	page := ScopedMergePage{KeyRange: w.bounds, Records: map[string]any{}, RetainIDs: ids, LastMergedID: w.bounds.From, DeleteMissing: true, SyncLevel: "full_index"}
 	result, err := w.merge(ctx, page, w.bounds.To, len(ids))
 	if err != nil {
 		return result, err
 	}
 	if result.Upserted != 0 || result.Skipped != len(ids) {
+		w.failed = true
 		return result, fmt.Errorf("source reconciliation did not retain every verified record")
 	}
 	if err := w.waitForCleanRange(ctx, ids); err != nil {
+		w.failed = true
 		return result, err
 	}
 	w.finished = true
 	return result, nil
 }
-func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo string, count int) (MergeResult, error) {
+func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo string, count int) (result MergeResult, err error) {
 	body, err := json.Marshal(ScopedMergeRequest{ScopedMerge: page})
 	if err != nil {
 		return MergeResult{}, err
@@ -215,11 +376,26 @@ func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo
 	if len(body) > 64<<20 {
 		return MergeResult{}, fmt.Errorf("source merge page exceeds 64 MiB")
 	}
+	// A caller-owned policy may reject an exact serialized request before any
+	// mutation is dispatched. Failed items remain unverified and cannot authorize
+	// reconciliation, but independent siblings can still be written safely.
+	if validator, ok := w.client.(SyncMergeValidator); ok {
+		if err := validator.ValidateMerge(ctx, w.table, body); err != nil {
+			return MergeResult{}, err
+		}
+	}
+	// A lost/invalid acknowledgement cannot authorize another mutation or cleanup
+	// on this writer. Recover with a new inventory writer and fresh visibility.
+	defer func() {
+		if err != nil {
+			w.failed = true
+		}
+	}()
+
 	raw, err := w.client.Merge(ctx, w.table, body)
 	if err != nil {
 		return MergeResult{}, err
 	}
-	var result MergeResult
 	if err := decodeSyncJSON(raw, &result); err != nil {
 		return result, err
 	}
@@ -236,7 +412,10 @@ func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo
 type syncHit struct {
 	ID     string `json:"_id"`
 	Source struct {
-		Grep Document `json:"grep"`
+		ID       string   `json:"id"`
+		SourceID string   `json:"source_id"`
+		DocType  string   `json:"doc_type"`
+		Document Document `json:"-"`
 	} `json:"_source"`
 }
 
@@ -255,34 +434,37 @@ func decodeSyncJSON(raw []byte, target any) error {
 	return nil
 }
 func decodeSyncHits(raw []byte) ([]syncHit, error) {
+	hits, _, err := decodeSyncPage(raw)
+	return hits, err
+}
+
+func decodeSyncPage(raw []byte) ([]syncHit, queryFreshness, error) {
 	var result struct {
 		Responses []struct {
-			Status   int             `json:"status"`
-			Error    json.RawMessage `json:"error"`
-			Snapshot string          `json:"remote_snapshot"`
-			Hits     struct {
+			Status int             `json:"status"`
+			Error  json.RawMessage `json:"error"`
+			queryFreshness
+			Hits struct {
 				Hits []syncHit `json:"hits"`
 			} `json:"hits"`
 		} `json:"responses"`
 	}
 	if err := decodeSyncJSON(raw, &result); err != nil {
-		return nil, err
+		return nil, queryFreshness{}, err
 	}
-	if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
-		return nil, fmt.Errorf("source sync requires a successful fresh snapshot")
+	if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		return nil, queryFreshness{}, fmt.Errorf("source sync requires a successful query with an explicit read source")
 	}
-	return result.Responses[0].Hits.Hits, nil
+	return result.Responses[0].Hits.Hits, result.Responses[0].queryFreshness, nil
 }
-func (w *SyncWriter) waitForCleanRange(ctx context.Context, ids []string) error {
-	query := map[string]any{"match_all": map[string]any{}}
-	if len(ids) > 0 {
-		query = map[string]any{"bool": map[string]any{"must_not": []any{map[string]any{"ids": ids}}}}
-	}
-	body, _ := json.Marshal(map[string]any{"filter_prefix": RecordPrefix(w.sourceID), "query": query, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
-	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	for {
-		raw, err := w.client.Query(wait, w.table, body)
+
+// A no-op cleanup still needs the retained-ID existence guard ordinarily
+// supplied atomically by scoped merge. Recheck bounded batches before finishing.
+func (w *SyncWriter) verifyRetainedIDs(ctx context.Context, ids []string) error {
+	for start := 0; start < len(ids); start += 1000 {
+		keys := ids[start:min(start+1000, len(ids))]
+		body, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "fields": []string{"_id"}, "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		raw, err := w.client.Query(ctx, w.table, body)
 		if err != nil {
 			return err
 		}
@@ -290,13 +472,54 @@ func (w *SyncWriter) waitForCleanRange(ctx context.Context, ids []string) error 
 		if err != nil {
 			return err
 		}
-		if len(hits) == 0 {
-			return nil
+		expected := make(map[string]bool, len(keys))
+		for _, id := range keys {
+			expected[id] = true
 		}
 		for _, hit := range hits {
-			if !strings.HasPrefix(hit.ID, RecordPrefix(w.sourceID)) {
-				return fmt.Errorf("source range query returned foreign identity")
+			if !expected[hit.ID] {
+				return fmt.Errorf("unexpected retained source identity")
 			}
+			delete(expected, hit.ID)
+		}
+		if len(expected) > 0 {
+			return fmt.Errorf("verified source records are no longer query-visible; refusing completion")
+		}
+	}
+	return nil
+}
+
+func (w *SyncWriter) rangeIsClean(ctx context.Context, ids []string) (clean, retained bool, err error) {
+	query := map[string]any{"match_all": map[string]any{}}
+	if len(ids) > 0 {
+		query = map[string]any{"bool": map[string]any{"must_not": []any{documentIDsQuery(ids)}}}
+	}
+	body, _ := json.Marshal(map[string]any{"filter_prefix": RecordPrefix(w.sourceID), "query": query, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+	raw, err := w.client.Query(ctx, w.table, body)
+	if err != nil {
+		return false, false, err
+	}
+	hits, freshness, err := decodeSyncPage(raw)
+	if err != nil {
+		return false, false, err
+	}
+	for _, hit := range hits {
+		if !strings.HasPrefix(hit.ID, RecordPrefix(w.sourceID)) {
+			return false, false, fmt.Errorf("source range query returned foreign identity")
+		}
+	}
+	return len(hits) == 0, freshness.Snapshot != "", nil
+}
+func (w *SyncWriter) waitForCleanRange(ctx context.Context, ids []string) error {
+	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		clean, _, err := w.rangeIsClean(wait, ids)
+		if err != nil {
+			return err
+		}
+		if clean {
+			return nil
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {

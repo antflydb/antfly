@@ -19,6 +19,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,42 @@ def workflow_step():
 
 
 class ReleaseScopeTests(unittest.TestCase):
+    def test_promotion_restores_sealed_scopes_without_bulk_reuploads(self):
+        workflow = (ROOT / ".github/workflows/antfly-release.yml").read_text()
+        prepare = workflow.split("\n  publish-cli-pypi:", 1)[0]
+        for artifact in (
+            "antfly-cli-snapshot",
+            "antfly-release-runtime-archives",
+            "antfly-release-payload",
+        ):
+            self.assertNotIn(
+                "name: " + artifact + "\n",
+                prepare[
+                    prepare.index(
+                        "      - name: Materialize and verify typed bundle scopes"
+                    ) :
+                ],
+            )
+        preflight = workflow.split("\n  preflight-publication:", 1)[1].split(
+            "\n  begin-release-channel:", 1
+        )[0]
+        download = preflight.split(
+            "      - uses: ./.github/actions/restore-release-scope", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn("scope: cli", download)
+        for npm, pypi in ((False, False), (True, False), (False, True), (True, True)):
+            expression = re.search(r"if: \$\{\{ (.*?) \}\}", download)[1]
+            for registry, enabled in (("npm", npm), ("pypi", pypi)):
+                expression = expression.replace(
+                    f"needs.prepare-release-promotion.outputs.publish_{registry}",
+                    repr(str(enabled).lower()),
+                )
+            self.assertEqual(
+                eval(expression.replace("||", " or "), {"__builtins__": {}}, {}),
+                npm or pypi,
+            )
+        self.assertIn("name: antfly-release-ledger", prepare)
+
     def test_real_workflow_step_supports_npm_only_and_legacy_wheel_snapshots(self):
         for legacy in (False, True):
             with (

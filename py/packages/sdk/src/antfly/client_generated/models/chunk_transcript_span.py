@@ -18,8 +18,8 @@ class ChunkTranscriptSpan:
         text (str):
         start_ns (int):
         end_ns (int):
-        speaker_index (int | Unset): Speaker index local to this output sub-window; global identities require
-            diarization stitching.
+        speaker_index (int | Unset): Source-scoped when the output carries speaker_scope=source. Older receipts without
+            that marker use sub-window-local numbering.
     """
 
     text: str

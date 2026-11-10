@@ -30,6 +30,7 @@ const CatalogRecordVersion = 1
 // CatalogRecord contains only portable search metadata. Credentials, provider
 // selectors, reader session identities and job checkpoints never belong here.
 type CatalogRecord struct {
+	AcquisitionID     string      `json:"acquisition_id,omitempty"`
 	Version           int         `json:"version"`
 	DocType           string      `json:"doc_type"`
 	Source            Binding     `json:"source"`
@@ -48,16 +49,38 @@ func NewCatalogRecord(binding Binding, provider, revision string, permissions Pe
 	}
 	binding.PublishedRevision = revision
 	binding.AccessID = "" // Cloud proofs are derived from current authenticated policy.
-	return CatalogRecord{Version: CatalogRecordVersion, DocType: "source_catalog", Source: binding, Provider: provider, DocumentVersion: 1, PublishedRevision: revision, Permissions: permissions}
+	version := binding.DocumentVersion
+	if version == 0 {
+		version = 1
+	}
+	return CatalogRecord{Version: CatalogRecordVersion, DocType: "source_catalog", Source: binding, Provider: provider, DocumentVersion: version, PublishedRevision: revision, Permissions: permissions}
 }
 func (r CatalogRecord) Validate() error {
 	switch r.Provider {
-	case ProviderS3, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
+	case ProviderS3, ProviderLocal, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
 	default:
 		return fmt.Errorf("unsupported catalog provider")
 	}
-	if r.Version != CatalogRecordVersion || r.DocType != "source_catalog" || !canonicalID(r.Source.ID) || r.Source.Table == "" || r.Source.DocumentField != "grep" || r.DocumentVersion != 1 || r.Provider == "" || r.Source.AccessID != "" {
+	if r.Version != CatalogRecordVersion || r.DocType != "source_catalog" || !canonicalID(r.Source.ID) || r.Source.Table == "" || (r.DocumentVersion < 3 && r.Source.DocumentField != "grep") || (r.DocumentVersion != 1 && r.DocumentVersion != 2 && r.DocumentVersion != SourceRecordVersion) || r.Provider == "" || r.Source.AccessID != "" {
 		return fmt.Errorf("invalid source catalog record")
+	}
+	if r.DocumentVersion == SourceRecordVersion {
+		if r.Source.DocumentVersion != SourceRecordVersion || r.Source.Fields == nil || r.Source.Fields.Permissions == "" || r.Source.Fields.URI == "" || r.Source.Fields.Path == "" || r.Source.Fields.Revision == "" || r.Source.Fields.IndexedAt == "" {
+			return fmt.Errorf("source catalog requires explicit identity and permission fields")
+		}
+		if err := r.Source.Fields.Validate(); err != nil {
+			return err
+		}
+		if err := ValidateSearchBindings(r.Source.SearchVersion, r.Source.Streams, r.Source.Artifacts); err != nil {
+			return err
+		}
+	}
+
+	if r.DocumentVersion == 2 && (r.Source.Publication != "media" || r.Source.DocumentVersion != 2) {
+		return fmt.Errorf("media catalog version requires explicit media publication")
+	}
+	if r.DocumentVersion == 1 && r.Source.Publication == "media" {
+		return fmt.Errorf("text catalog cannot advertise media documents")
 	}
 	var actual, expected any
 	if json.Unmarshal(r.Source.Filter, &actual) != nil || json.Unmarshal(SourceFilter(r.Source.ID), &expected) != nil || !reflect.DeepEqual(actual, expected) {
@@ -144,17 +167,17 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 	totalBytes := 0
 	for start := 0; start < len(ids); start += 100 {
 		keys := ids[start:min(start+100, len(ids))]
-		query, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": keys}, "limit": len(keys), "fields": []string{"version", "doc_type", "source", "provider", "document_version", "published_revision", "permissions"}, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "limit": len(keys), "fields": []string{"acquisition_id", "version", "doc_type", "source", "provider", "document_version", "published_revision", "permissions"}, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 		data, err := s.Client.Query(ctx, s.table(), query)
 		if err != nil {
 			return nil, err
 		}
 		var result struct {
 			Responses []struct {
-				Status   int             `json:"status"`
-				Error    json.RawMessage `json:"error"`
-				Snapshot string          `json:"remote_snapshot"`
-				Hits     struct {
+				Status int             `json:"status"`
+				Error  json.RawMessage `json:"error"`
+				queryFreshness
+				Hits struct {
 					Hits []struct {
 						ID     string        `json:"_id"`
 						Source CatalogRecord `json:"_source"`
@@ -169,7 +192,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 		if err := json.Unmarshal(data, &result); err != nil {
 			return nil, err
 		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 			return nil, fmt.Errorf("catalog query requires a successful snapshot")
 		}
 		allowed := map[string]bool{}
@@ -192,7 +215,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 	return out, nil
 }
 func (p *Publisher) Query(ctx context.Context, table string, body []byte) ([]byte, error) {
-	return p.call(ctx, "POST", tablePath(table)+"/query", json.RawMessage(body))
+	return p.callRead(ctx, "POST", tablePath(table)+"/query", json.RawMessage(body))
 }
 
 // Retire hides only catalog entries owned by the caller's durable source profile;

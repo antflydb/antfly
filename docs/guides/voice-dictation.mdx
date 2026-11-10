@@ -1,7 +1,7 @@
 ---
 title: Build Voice Dictation
-order: 9
 description: A push-to-talk dictation endpoint that returns clean written text, and a streaming session that returns transcript segments while the user is still speaking
+order: 8
 ---
 
 <Questions>
@@ -11,6 +11,36 @@ description: A push-to-talk dictation endpoint that returns clean written text, 
 - Which model cleans up filler words and punctuation?
 - How do I send microphone audio to Antfly in chunks?
 </Questions>
+
+## Install the macOS example
+
+[Download Antfly Dictation v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip)
+is available now. Unzip it, move **Antfly Dictation.app**
+to Applications, and open it. Allow microphone and Accessibility access for the
+Fn/Globe shortcut and automatic paste. **On this Mac** uses the included Antfly
+runtime; ready Apple Speech is selected automatically, with Whisper Tiny available
+as a download. Use **Check for Updates…** for subsequent app releases.
+
+See the [example setup and configuration](https://github.com/antflydb/antfly/tree/main/examples/dictation).
+
+The desktop example handles “new line” and “new paragraph” locally, including
+without a cleanup generator. Settings → Voice formatting controls spoken breaks
+and spaces between separate insertions. A trailing “press enter” command is a
+separate opt-in: it can submit a message and requires a confirmed paste into the
+original field. See the example README for supported commands and limitations.
+
+With voice formatting enabled, Clean-mode cleanup uses bounded batches that
+account for both formatting markers and the model's output budget. A recent
+editable tail lets a correction retract words from the previous batch or live
+segment. Older text is committed; corrections referring further back need Whole
+utterance processing. Unicode word/grapheme boundaries support text without
+spaces. Portable cleanup requires a request-specific completion token before
+accepting output, including from older Apple runtimes. Rewrite and Whole utterance
+modes preserve a single generation context; oversized inputs are
+rejected before generation with the raw transcript available to insert or copy.
+Enter requires a readable cursor position before any paste is sent. Failed or
+canceled insertion attempts preserve the clipboard payload for the normal
+delivery grace period rather than restoring it while Paste may still be queued.
 
 ## The Result
 
@@ -70,6 +100,113 @@ curl -X POST http://127.0.0.1:8080/ai/v1/dictate \
 ```
 
 For live captions the same models sit behind a session API that returns `partial` and `final` transcript events as audio arrives.
+
+## A consistent push-to-talk experience
+
+The native [dictation example](https://github.com/antflydb/antfly/tree/main/examples/dictation)
+separates the desired output from how the selected backend executes it:
+
+| Preset mode | Result | Cleanup execution |
+| --- | --- | --- |
+| **Verbatim** | The recognizer's text, including its wording | No generative cleanup |
+| **Clean** (default) | Punctuation, filler removal, and dictionary corrections | Final segments are cleaned while speaking when supported |
+| **Rewrite** | Tone, formatting, or custom instructions | One cleanup pass over the complete utterance |
+
+A cleanup generator must be configured for Clean or Rewrite to perform cleanup.
+Without one, settings explicitly show recognition-only operation. Clean ignores
+rewrite instructions and tone; switching back to Rewrite preserves those settings.
+Existing presets infer their mode from style/instructions until explicitly changed.
+
+New settings use Fn/Globe to record, with a Control + Option preset for keyboards
+without Fn. **Set up shortcut & paste access** applies and saves the selected shortcut, guiding you to Accessibility
+if needed and completing when you return with permission granted. It preserves
+other saved/unsaved settings and credentials; Cancel setup keeps the previous binding.
+**Keyboard settings** opens the Globe-key action preferences without changing them.
+Click modifier buttons or use Record shortcut to customize; numeric
+key codes are not required. Shortcut selection pauses dictation, Escape cancels,
+and Save applies the choice. Fn/modifier-only global shortcuts need Accessibility
+access; the app does not change macOS keyboard preferences. Existing saved shortcuts
+are preserved; Reset to Fn explicitly adopts the new default.
+
+Hold the shortcut to record, or use press-to-toggle. A nonactivating overlay shows
+**Listening**, then the actual remaining stage (**Transcribing** or **Cleaning**).
+It never moves focus away from the captured text field. Provisional recognition
+and completed cleanup segments are previews; the app sends one paste only after
+recognition and cleanup finish successfully. A focus change leaves the result
+available to copy. Silence returns to idle without inserting text.
+
+Under **Processing & models**, choose:
+
+- **Automatic:** use stable-session recognition where advertised. Clean overlaps
+  cleanup with recognition; Rewrite waits for the complete transcript. If session
+  setup or recognition fails, the recorded clip can use the same transcriber on
+  release, with an explicit explanation. This never changes providers.
+- **Incremental:** require stable-session support. Unsupported backends and Rewrite
+  are rejected before recording. Recognition failures do not silently select a
+  different processing strategy.
+- **Whole utterance:** cleanup waits for the entire transcript. Recognition can
+  still run while speaking when stable sessions are available.
+
+Named Antfly/Whisper transcribers advertise `stable_segments` and `text_cleanup`.
+The current Apple Speech adapter advertises `text_cleanup` but not stable sessions:
+it recognizes the recorded file after release, followed by optional cleanup.
+Unknown capabilities use recorded-clip processing. Legacy live preview remains
+available for older Whisper servers, but does not count as authoritative session
+recognition and still requires the final clip pass.
+
+### Compose recognition and cleanup without repeating recognition
+
+`stream: true` on `/ai/v1/dictate` controls **response delivery**. Incremental
+execution uses transcription sessions plus text-only cleanup requests:
+
+1. Create a transcription session; append microphone audio sequentially. Preserve
+   each event's sequence and time range. Display `partial` hypotheses, but clean
+   only `final` events. A partial's `stable_text` can change and is not final.
+2. Submit finalized text to the same named-transcriber dictation cleanup path:
+
+   ```json
+   {
+     "model": "transcribers/whisper",
+     "audio": "",
+     "transcript_text": "um ant fly is ready",
+     "cleanup_model": "generators/cleanup",
+     "style": "clean",
+     "dictionary": ["Antfly"],
+     "stream": true
+   }
+   ```
+
+   `audio` must be empty; attachments and recognition hints are forbidden with
+   `transcript_text`. This route does not invoke recognition. It accepts at most
+   65,536 UTF-8 bytes, including an empty transcript, which skips cleanup. Raw
+   runtime model requests do not support this option; check advertised capabilities.
+3. On release, stop capture, finish the in-flight append, and commit the remaining
+   audio. Wait for cleanup of all final segments, then assemble the result. Do not
+   transcribe the complete recording again or run a second whole-utterance cleanup
+   in incremental mode. Coalesce pending finalized segments to bound model calls.
+4. Delete the session on completion, failure, or cancellation. Ignore late callbacks
+   from an old recording. Replayed events must not duplicate cleaned text; conflicting
+   final segments must fail rather than revise text already considered final.
+
+The example uses bounded binary AFATT001 uploads for both final WAV and live PCM
+chunks. One FIFO request gate per recording client serializes recognition and
+cleanup network requests, so a server configured for one inference invocation can
+still make progress while microphone capture continues independently. Enable **Allow parallel recognition and cleanup** for a server with at least two
+inference slots; the client then allows two concurrent requests. Leave it off for
+a single-slot server. Buffered
+Apple cleanup emits complete text for each cleaned batch; it does not provide
+provisional generation tokens. This is distinct from overlapping the pipeline.
+
+Cleanup failures preserve the full final raw transcript. Offer **Insert original**,
+**Copy original**, and **Retry cleanup**. Retrying cleanup sends text, not audio, and
+uses corrected settings with automatic insertion disabled. Never substitute partial
+cleanup for a completed result. Failed recognition retains the recording for an
+explicit retry; its provisional transcript is not treated as complete speech.
+
+The Transcript tab exposes recognition-request, cleanup-request, session, and
+release-to-result durations. Request durations include transport and queueing and
+can overlap; they should not be added to estimate session duration. History sync
+runs separately and never delays the next recording.
 
 ## Before You Start
 
@@ -236,41 +373,18 @@ The server decodes as chunks arrive and writes events while the upload is still 
 
 ## Tradeoffs
 
-The decision is how much decoder time to spend on partials. Sessions default to `audio_context: "dynamic"`, which trims the Whisper encoder to the audio actually buffered plus one second instead of the full 30 s window, so a partial over a short open segment costs a fraction of a full pass. Dictation defaults to `"full"`, the window the model was trained on, which is the safer choice for one-shot accuracy; set `audio_context` explicitly on either endpoint to override. The decoder keeps its self-attention cache and the projected encoder keys resident on the device and runs each token as one Metal command submission, so whisper-tiny finishes a short clip in about a quarter of a second on an M-series laptop (see the timing table below). `partial_interval_ms` (default 2000) is the amount of new audio that triggers the next partial; lowering it to 1000 gives smoother captions when the decoder keeps pace and falls behind otherwise, where each append then waits on the previous decode. Set `emit_partials: false` when only finals matter; the session then costs one decode per utterance. The other knob is endpointing. The energy default of 0.012 RMS suits a close microphone in a quiet room; a laptop microphone in an open office may need `"vad": {"threshold": 0.02}` so keyboard noise does not hold a segment open, and a soft speaker may need it lowered. If a session returns partials but never a final, the room noise is above the threshold; raise it, switch to the Silero model, and only then consider shortening `min_silence_ms`.
+The decision is how much decoder time to spend on partials. Sessions default to `audio_context: "dynamic"`, which trims the Whisper encoder to the audio actually buffered plus one second instead of the full 30 s window, so a partial over a short open segment costs a fraction of a full pass. Dictation defaults to `"full"`, the window the model was trained on, which is the safer choice for one-shot accuracy; set `audio_context` explicitly on either endpoint to override. On an M-series laptop, whisper-tiny on Metal transcribes a 2.5 s clip in under 100 ms on a warm server. `partial_interval_ms` (default 2000) is the amount of new audio that triggers the next partial; lowering it to 1000 gives smoother captions when the decoder keeps pace and falls behind otherwise, where each append then waits on the previous decode. Set `emit_partials: false` when only finals matter; the session then costs one decode per utterance. The other knob is endpointing. The energy default of 0.012 RMS suits a close microphone in a quiet room; a laptop microphone in an open office may need `"vad": {"threshold": 0.02}` so keyboard noise does not hold a segment open, and a soft speaker may need it lowered. If a session returns partials but never a final, the room noise is above the threshold; raise it, switch to the Silero model, and only then consider shortening `min_silence_ms`.
 
-Measured on an M-series laptop with a ReleaseFast build, the 2.5 s "quick brown fox" clip breaks down like this by stage on a warm server (milliseconds, whisper-tiny, 12 decoded tokens; the first request on a fresh process also pays a one-time weight upload of roughly 40 ms):
-
-| Encoder / decoder | Mel | Encoder | Prompt block | Decode | Total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Metal / Metal (default) | 5 | 35 | 21 | 28 | 89 |
-| CPU / CPU | 5 | 915 | 8 | 30 | 958 |
-
-The mel spectrogram runs as two dense matrix products on the system BLAS (the windowed frames against the DFT basis, then the power spectrum against the filterbank), which replaced a per-frame transform that took 60 ms. The encoder is one Metal frame: the two convolutions run as an im2col unfold plus a matrix multiply, the non-causal attention over 1500 positions uses the flash kernel, and the residual adds are folded into the layer norms. The decoder keeps its self-attention cache and the projected encoder keys resident on the device and runs each token as one command buffer on one compute encoder: Q, K and V are projected from one dispatch straight into the cache rows, every residual add is fused into the following layer norm, cross-attention over the 1500 encoder positions runs as a split-K kernel (also per query row for the prompt block), and the token itself is chosen on the device by a kernel that applies the suppression lists and the timestamp grammar and returns sixteen floats instead of the 51,865-float row. A decode token is about 1.8 ms of GPU time and about 2.2 ms of wall time; the remainder is command-buffer submission and completion latency. An encode-ahead mode (`TERMITE_WHISPER_ENABLE_PIPELINED_DECODE=1`) lets the device choose each token, keep the timestamp grammar and embed the chosen token itself, so the host encodes the next step while the current one runs; it produces the same transcripts but no measurable speedup, because the runtime keeps one command buffer in flight and the host encode was never on the critical path, so it stays off by default. All of it keeps the transcript bit-for-bit identical to the CPU path. The CLI exposes both placements for measurement (`antfly inference transcribe --backend metal --decoder-backend native`); the server keeps everything on one session. Set `TERMITE_SERVER_GENERATE_TIMING=1` to log the breakdown for every `/dictate` request, `TERMITE_WHISPER_METAL_PROFILE=1` to print per-op GPU time for the encoder and each decoder step, `TERMITE_METAL_TRACE_FRAME=all` for per-frame encoder and blit counts, and `TERMITE_METAL_TRACE_ENCODERS=1` to name every encoder transition.
-
-A ready-made q8_0 bundle of large-v3-turbo is published as `antflydb/whisper-large-v3-turbo` (`antfly inference pull antflydb/whisper-large-v3-turbo:gguf:Q8_0 --tasks transcribe`). Any other checkpoint can be quantized with the export command, which writes a GGUF bundle the server discovers like any other model directory (copy the source directory's `model_manifest.json` next to `model.gguf`):
+Measured on an M-series laptop with a ReleaseFast build, the 2.5 s "quick brown fox" clip breaks down like this by stage on a warm server (milliseconds, whisper-tiny, For larger checkpoints, use a q8_0 bundle: it matches the full-precision transcript and is smaller and faster. A ready-made bundle of large-v3-turbo is published as `antflydb/whisper-large-v3-turbo` (`antfly inference pull antflydb/whisper-large-v3-turbo:gguf:Q8_0 --tasks transcribe`). Any other checkpoint can be exported, which writes a GGUF bundle the server discovers like any other model directory (copy the source directory's `model_manifest.json` next to `model.gguf`):
 
 ```bash
 antfly inference export ~/.antfly/inference/models/openai/whisper-large-v3-turbo --target gguf --format q8_0 \
   --output ~/.antfly/inference/models/openai/whisper-large-v3-turbo-q8_0/model.gguf
 ```
 
-Whisper applies its own policy under the requested format: position tables stay dense, the token table (also the tied output head) and the whole encoder never go below q8_0, and the decoder layers take the format you asked for. A 4-bit token table breaks language detection on the small checkpoints, and q4_0 across all 32 encoder layers of large-v3-turbo produces nonsense while q8_0 is both exact and the fastest quantized encoder on Metal. `--quantize-include` and `--quantize-exclude` still apply on top. Quantized steps run on the same single-encoder, zero-blit decode path as f32, so the gains land where the bytes are: model size, the encoder, and the prompt block. Decode is bound by kernel dispatch rather than weight bandwidth at these sizes, so the per-token cost barely moves. Measured on the same laptop and clip (Metal, warm CLI run, the tied f16 `large-v3-turbo` checkpoint as published):
+Stage timings, quantization measurements, and profiling switches are in the [Whisper runtime notes](../design/audio/whisper-runtime.md).
 
-| Checkpoint | Weights | Size | Encoder | Prompt block | Decode per token | Transcript |
-|------------|---------|------|---------|--------------|------------------|------------|
-| tiny | f32 | 144 MB | 62 ms | 28 ms | 2.2 ms | reference |
-| tiny | q8_0 | 42 MB | 47 ms | 10 ms | 2.5 ms | identical |
-| tiny | q4_0 | 39 MB | 45 ms | 9 ms | 2.2 ms | drops a word |
-| small | f32 | 922 MB | 290 ms | 86 ms | 9.6 ms | reference |
-| small | q8_0 | 257 MB | 106 ms | 28 ms | 9.0 ms | identical |
-| small | q4_0 | 203 MB | 115 ms | 29 ms | 8.9 ms | identical |
-| large-v3-turbo | f16 | 1543 MB | 600 ms | 52 ms | 6.0 ms | reference |
-| large-v3-turbo | q8_0 | 829 MB | 406 ms | 14 ms | 5.4 ms | identical |
-| large-v3-turbo | q4_0 | 779 MB | 415 ms | 14 ms | 5.4 ms | identical |
-
-q8_0 is the format to reach for: it is exact on every clip, and the f16 checkpoints run their decoder on the unfused path (the fused Q/K/V projection only takes f32 or quantized weights), so exporting large-v3-turbo to q8_0 also makes its prompt block four times faster. The q4_1, q5_0 and q4_k encoders are correct but two to three times slower than q8_0 because they lack the fast multi-row kernels, which is the other reason for the q8_0 floor. large-v3 and large-v3-turbo take 128 mel bins instead of 80; the front end reads that from the checkpoint config.
-
-For the cleanup pass, the generator adds one prompt prefill of the rule set plus about as many output tokens as the transcript, so the cost grows with what was said, not with the clip length. If it is too slow for a keystroke-to-paste flow on your hardware, use `style: "verbatim"` for short utterances and cleanup only for clips over a few seconds. Whisper and the generator both stay resident between requests; on a host with little free memory the runtime's automatic budget can refuse to run one while the other is loaded, and the fix is to set `--process-memory-budget-mb` to the memory the process may use, and the per-tier `--inference-host-budget-mb`, `--inference-backend-budget-mb`, and `--inference-combined-budget-mb` on `antfly standalone` (`--host-budget-mb`, `--backend-budget-mb`, and `--combined-budget-mb` on `antfly inference run`) to what the machine can spare. There are no config-file keys for these budgets.
+ot with the clip length. If it is too slow for a keystroke-to-paste flow on your hardware, use `style: "verbatim"` for short utterances and cleanup only for clips over a few seconds. Whisper and the generator both stay resident between requests; on a host with little free memory the runtime's automatic budget can refuse to run one while the other is loaded, and the fix is to set `--process-memory-budget-mb` to the memory the process may use, and the per-tier `--inference-host-budget-mb`, `--inference-backend-budget-mb`, and `--inference-combined-budget-mb` on `antfly standalone` (`--host-budget-mb`, `--backend-budget-mb`, and `--combined-budget-mb` on `antfly inference run`) to what the machine can spare. There are no config-file keys for these budgets.
 
 ## Use Agent Skills
 
@@ -289,3 +403,106 @@ Then prompt it with the outcome, for example "Add push-to-talk dictation to my E
 - [Local Model Compatibility](/docs/guides/supported-models) to pick a larger Whisper checkpoint or a different cleanup generator.
 - [Index Recorded Calls and Podcasts](/docs/guides/transcription) to transcribe recordings at write time and search them with timestamps.
 - [Multimodal Search](/docs/guides/multimodal) to index the transcripts you collect so they are searchable next to everything else.
+
+The desktop app saves connection and preset settings even when shortcut permission
+is pending; shortcut activation has its own visible status. Discovery requests are
+debounced and superseded requests are canceled. The parallel-processing setting
+controls actual client admission (one or two inference requests), and HTTP failures
+include bounded server diagnostics. Discovered hosted transcribers support shared
+named cleanup, while runtime connections keep their raw-model contract.
+
+Retained history records its original server and table. Deletion cancels matching
+queued uploads across all destinations before remote deletion; remote failures keep
+local entries available for retry. Successful live sessions avoid full-clip WAV
+encoding, and clip encoding runs off the UI actor with cancellation support.
+
+
+### Result delivery and optional work
+
+Recorded recognition and cleanup reserve inference admission per stage. A sequential
+recorded Whisper request with hosted or native cleanup works with one inference slot;
+two slots are required only to overlap recognition and cleanup requests.
+
+The desktop app delivers completed text without awaiting session disposal, optional
+audio archival, or clipboard restoration. Session DELETE uses a three-second request
+timeout and the server session TTL remains the fallback. Audio archival has independent
+error reporting and checks both recording generation and retention changes before publishing.
+Clipboard snapshots are read off the UI thread with limits on retained bytes, items, and
+formats. Overlapping pastes share the original clipboard snapshot; a user copy prevents
+restoration. Focus is revalidated immediately before insertion.
+
+History deletion waits for dispatched uploads even when retention is disabled during
+the wait. An unavailable outbox prevents successful remote deletion, preserving the local
+records for retry. Disabling retention retires an unavailable queue before removing its
+files, preventing later queue recovery from uploading discarded transcripts.
+
+
+History persistence also runs outside result delivery. The desktop app immediately
+returns to idle, then an ordered writer saves the latest bounded local snapshot and
+enqueues remote uploads. Local history is limited to 500 entries and a conservative
+16 MiB JSON budget; queued upload work is bounded separately. Normal application
+termination drains local persistence without waiting for remote synchronization.
+
+Saving retention off invalidates earlier history producers, including manual uploads
+and startup migration, and drains them before purging pending jobs. Unreadable or
+missing settings preserve existing retained data and pause uploads until settings
+are restored or explicitly saved. Settings validation and persistence share a 1 MiB
+limit, so accepted settings can always be loaded again. Recovery insertion uses the
+same owned cancellation task as normal delivery and checks recording generation
+immediately before sending the paste.
+
+
+Deletion retry plans are persisted separately from retained transcripts and upload
+jobs. The bounded journal contains document IDs, destinations, and acknowledgments;
+it contains no transcript text or credentials. Pending upload jobs are discarded only
+after the complete plan is durable. Startup removes matching queued uploads before dispatch.
+Acknowledged destinations stay acknowledged on retry, and a plan is removed only
+when every destination and local archive cleanup have committed. Final cleanup is
+ordered with ordinary history writes; revision fencing tracks actual commits,
+so a failed newer snapshot cannot suppress an older cleanup. The History tab
+shows pending deletion count and supports retry after restart or a local clear,
+without adding newer transcripts to the old deletion request.
+If deletion metadata is corrupt, uploads remain paused while local retention stays usable.
+
+Graceful quit waits for explicit local clears, completed audio archives, and owned
+clipboard restoration as well as transcript persistence. Ordinary paste delivery
+never waits for the restoration timer, and user clipboard changes retain ownership.
+Audio retention admits one active writer and only the newest pending clip, so a
+write that cannot observe cancellation does not accumulate parallel staging work. Completed audio has ownership separate from the active
+recording generation; active recording cancellation and retention changes still
+prevent later publication. A canceled clip permanently loses publication eligibility;
+canceling a newer queued clip cannot restore it. Both native and TypeScript stream clients treat
+completion as terminal for transcript and delta events, rejecting late mutations
+and duplicate completions rather than accepting unvalidated text.
+
+### Desktop app updates
+
+Official macOS releases support signed Sparkle updates, automatic-check and
+download preferences, and beta opt-in. Install the signed app in Applications.
+An update restart waits for dictation and setup to finish, then drains owned
+clipboard restoration and local persistence. Development builds have updating
+disabled. App updates preserve Application Support and Keychain data and do not
+replace user data or downloaded models. The bundled engine updates with the app;
+external Antfly servers are updated separately.
+
+See the [release setup guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/UPDATES.md)
+for organization signing, notarization, release qualification, and the separate
+managed-local-runtime installation and release activation.
+
+## Downloaded macOS app
+
+Official Apple Silicon Antfly Dictation builds require macOS 15+ and include a pinned, released Antfly engine. New installs
+start it automatically; Settings offers an explicit Whisper Tiny download.
+The bundled rc.13 runtime includes the native Apple bridge. Automatic local
+presets prefer Apple speech on macOS 26+ when the server reports it ready and
+otherwise use Whisper; explicit model choices are preserved. Existing external-server settings
+are preserved. The app and compatible engine update together using signed
+Sparkle feeds and immutable downloads on `releases.antfly.io/antfly-dictation`.
+Models and user data remain in Application Support; server credentials stay in
+Keychain. External Antfly servers remain supported and are updated separately.
+Unzip the signed app and move it into `/Applications` or `~/Applications` before
+launching. Grant microphone and Accessibility access; bundled mode requires no
+server address or bearer token. Download Whisper Tiny if Apple speech is not ready.
+The first signed Dictation app release must be published before a public app
+download URL is available. See the [example installation guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/README.md#install-the-macos-app)
+and [release guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/UPDATES.md) for installation, packaging, and recovery.

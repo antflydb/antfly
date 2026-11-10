@@ -28,8 +28,9 @@ export enum ErrorCode {
   TxnNotFound = 5,
   Busy = 6,
   /**
-   * The operation crossed its publication point, but crash durability could
-   * not be confirmed. Inspect the destination; do not retry automatically.
+   * The operation may have taken effect: it was published but crash
+   * durability could not be confirmed, or a failure left it unknown whether
+   * it applied. Inspect the affected data; do not retry automatically.
    */
   OutcomeUnknown = 7,
   /**
@@ -38,8 +39,9 @@ export enum ErrorCode {
    */
   Unsupported = 8,
   /**
-   * A bounded drain such as runUntilIdle detected a managed index making no
-   * forward progress and gave up.
+   * Derived work stalled or failed. A batch may already have committed its
+   * primary write: inspect the error detail and pending-work diagnostics.
+   * Do not replay a batch reported as committed.
    */
   Stalled = 9,
   /**
@@ -76,7 +78,7 @@ const ERROR_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
   [ErrorCode.Busy]:
     "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
   [ErrorCode.OutcomeUnknown]:
-    "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+    "the operation may have taken effect, but whether it applied or became durable could not be confirmed; inspect the affected data and do not retry automatically",
   [ErrorCode.Unsupported]:
     "the operation requires a capability that is not supported by this platform or filesystem",
   [ErrorCode.Stalled]:
@@ -170,9 +172,17 @@ export class BusyError extends AntflyError {
 }
 
 export class OutcomeUnknownError extends AntflyError {
-  constructor(message?: string) {
+  /**
+   * The receipt the database issued for an autocommit SQL write that ended
+   * with an unknown outcome, if any. Resolve it later with
+   * `Database.outcomeReceiptStatus()`.
+   */
+  readonly outcomeReceipt?: string;
+
+  constructor(message?: string, outcomeReceipt?: string) {
     super(ErrorCode.OutcomeUnknown, message);
     this.name = "OutcomeUnknownError";
+    if (outcomeReceipt !== undefined) this.outcomeReceipt = outcomeReceipt;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }

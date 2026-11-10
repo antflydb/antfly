@@ -87,5 +87,61 @@
     "size_bytes": 81447,
     "source": "https://github.com/tree-sitter/tree-sitter-rust/tree/77a3747266f4d621d0757825e6b11edcbf991ca5",
     "kind": "Upstream grammar conformance fixtures; normalized named syntax trees with compiler-backed ambiguity choices"
+  },
+  "zig/lib/audio/src/testdata/whisper/16000-128-1.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "0f41d167429d1d3b84e6d39340615b9fb3d100514b525b812c7e42421105fc4e",
+    "size_bytes": 51200,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/16000-128-16.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "a6c25715f966846a0a7d936aed7e16e974dce52bc11a917aa30ea1bef321d458",
+    "size_bytes": 51200,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/16000-80-1.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "a775a1b115951235b9fab380dd2840bba95d0377a02c1bfd5a02baad4983dfb0",
+    "size_bytes": 32000,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/16000-80-16.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "625e4e3cc3a795c21e41556223b11da2d7fc360d95daf889b9571e669d66464c",
+    "size_bytes": 32000,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/733-128-1.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "5fd9e8c94c6d68a4d0b3792fe93c34d68f2fea6ae2f8a2ca1bc6c9d4c0bd1cfa",
+    "size_bytes": 51200,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/733-128-16.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "76be1d7dbae4e46be19e7206143a315e22afa4b8e7dd6adc738a1bcec55adbb2",
+    "size_bytes": 51200,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/733-80-1.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "456aa240b497f3478e90d3db2be1465278c4825cc9bc8ee91e1bd56ad0357a3e",
+    "size_bytes": 32000,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
+  },
+  "zig/lib/audio/src/testdata/whisper/733-80-16.f32": {
+    "kind": "first-party test fixture",
+    "license": "Apache-2.0",
+    "sha256": "dc527b8b105b64f2e4743d017a30476757831984e56f2071ad003fcb2e1498f1",
+    "size_bytes": 32000,
+    "source": "Synthetic quantized PCM transformed with Transformers 5.5.0 WhisperFeatureExtractor; regenerate with zig/lib/audio/scripts/generate_whisper_reference.py"
   }
 }

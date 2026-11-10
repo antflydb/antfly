@@ -1,0 +1,951 @@
+{
+  "status": "exploratory; not merge qualification",
+  "base_commit": "88f3e96409",
+  "importer": {
+    "sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "optimization": "original unoptimized Rust binary; unchanged across all measurements",
+    "codex_busy_retry_edits": "excluded; owned by another task"
+  },
+  "environment": {
+    "native_optimization": "Debug for prototypes and matched Debug baseline; historical baselines ReleaseFast",
+    "shared_host": true,
+    "confounds": [
+      "Other build and qualification tasks are active.",
+      "Background scheduling changes index state and output file size.",
+      "One small import is not a production throughput or long-soak qualification."
+    ]
+  },
+  "confirmed_costs": [
+    {
+      "finding": "Reader epoch publication repeats filesystem namespace validation and marker create/unlink for short logical read transactions.",
+      "evidence": "Baseline stack samples show these calls during table/index reconstruction; first import used about 50 seconds of system CPU with ReleaseFast native code.",
+      "proper_fix": "Share immutable protection for identical inode, binding, canonical path, checkpoint and scope during a held admission lease. Rotate anchors when checkpoints advance, release idle anchors on lease close/yield, and retain independent references for escaped readers. Unsafe aliases retain inode locks.",
+      "prototype": "implemented, under qualification; no format or public ABI change"
+    },
+    {
+      "finding": "SQL DDL recovery eagerly opens all available tables after recovery state is invalidated by replacement runtimes.",
+      "evidence": "Owner.refresh only inherits clean recovery flags for its recognized maintenance snapshot; sql_ddl.recover calls tables.loadAvailable before examining per-table durable work. Samples show SQL waiting on the owner gate during this path.",
+      "proper_fix": "Persist a recovery work catalog and generation atomically with the mutations that create/advance/finish SQL commit, FK, DDL retirement and activation work. Discover pending table identities without opening every index. Budget recovery per turn. Empty work is a checkpoint-bound durable fact, not a copied Boolean.",
+      "required_tests": [
+        "Crash at each job/catalog publication boundary.",
+        "Foreign-process create/alter/drop and pending activation observed after reopen.",
+        "Read-only opens do not skip required recovery.",
+        "No clean flag is inherited across unrecognized schema generations."
+      ]
+    },
+    {
+      "finding": "Runtime invalidation is coupled to physical checkpoint movement.",
+      "evidence": "runtimeMetadataUnchanged requires the previous checkpoint still be retained and checks primary roots before separately validating loaded index inputs.",
+      "proper_fix": "Use durable logical generations for table identity, schema, primary data and index manifests; adopt allocator bookkeeping independently. Refresh only affected namespaces and immutable inputs. Capture heavy opens outside admission, then validate exact generation/inode/binding under admission before adoption.",
+      "required_tests": [
+        "Same page number reused for a different generation cannot validate an old runtime.",
+        "Foreign writer changes and generation replacement are detected.",
+        "Borrowed cursors and detached tasks retain their original immutable inputs.",
+        "Failed speculative opens release leases and cannot publish partial runtime state."
+      ]
+    },
+    {
+      "finding": "Small bounded replay batches can multiply per-batch open/publication costs; causal contribution is not yet measured.",
+      "proper_fix": "After fixed costs are removed, tune replay with byte, memory, elapsed-time and retirement-pressure bounds. Batch compatible publications without extending an old snapshot across unrelated work. Keep fair foreground admission and per-table progress.",
+      "status": "hypothesis requiring matched experiment, not a confirmed regression attribution"
+    }
+  ],
+  "storage_accounting": {
+    "confirmed": "Native live_bytes sums logical key and value lengths; new record headers and hashes are excluded.",
+    "measurement_caveat": "lite compact drains maintenance, forces text-index compaction and syncs indexes before vacuum. Its logical payload is not a read-only measurement of the imported state.",
+    "next_steps": [
+      "Compare read-only live accounting before and after maintenance on the same imported database.",
+      "Attribute bytes and counts by documents, metadata, and index artifacts; use aggregate lengths and hashes, not private payloads.",
+      "Compare all revisions at equivalent index catch-up/merge state."
+    ],
+    "unresolved": "The reported approximately 430 MB extra logical payload and 301 records are not yet attributed."
+  },
+  "registration_microbenchmark": {
+    "optimization": "Debug",
+    "iterations_per_case": 2000,
+    "alternating_order_rounds": 4,
+    "raw_results": [
+      {
+        "round": 0,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 860657208
+      },
+      {
+        "round": 0,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 34704583
+      },
+      {
+        "round": 1,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 31597459
+      },
+      {
+        "round": 1,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 674224083
+      },
+      {
+        "round": 2,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 922667917
+      },
+      {
+        "round": 2,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 31703792
+      },
+      {
+        "round": 3,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 30940208
+      },
+      {
+        "round": 3,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 885782959
+      }
+    ],
+    "median_nanoseconds": {
+      "False": 873220083.5,
+      "True": 31650625.5
+    },
+    "isolated_speedup": 27.589346804536294,
+    "limitation": "Same checkpoint only; isolates registration cost, not whole-import speedup. Each case verifies no remaining epoch frontier.",
+    "allocator": "arena-backed exploratory harness; use the reproducible C-allocator benchmark below for current results"
+  },
+  "validation": {
+    "reader_tests": {
+      "passed": 19,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "hard links",
+        "symlinks",
+        "namespace replacement",
+        "long filenames",
+        "escaped snapshots after path lease close",
+        "exact checkpoint rotation",
+        "scope separation",
+        "allocation failure cleanup"
+      ]
+    },
+    "capi_smoke": "passed",
+    "export_boundary": 134,
+    "pending": [
+      "full frozen sequence",
+      "bounded active-write reclamation",
+      "optimized confirmation",
+      "long active-write storage soak; 30-second plateau is insufficient",
+      "original importer concurrent frozen imports; synthetic four-process churn is covered"
+    ],
+    "prototype_small_import_readonly_check": {
+      "valid": true,
+      "file_size": 57126912,
+      "valid_prefix_size": 57126912,
+      "tail_bytes": 0,
+      "record_count": 77402,
+      "live_file_count": 77396,
+      "live_bytes": 25735691,
+      "compact_size": 40296448,
+      "reclaimable_bytes": 16830464,
+      "issue": null
+    },
+    "full_control_readonly_check": {
+      "valid": true,
+      "file_size": 7365242880,
+      "valid_prefix_size": 7365242880,
+      "tail_bytes": 0,
+      "record_count": 5974016,
+      "live_file_count": 5967462,
+      "live_bytes": 2394838234,
+      "compact_size": 3523117056,
+      "reclaimable_bytes": 3842125824,
+      "issue": null
+    },
+    "full_control_readonly_check_exit_code": 0,
+    "completed_paired_debug_orders": 2,
+    "prototype_churn_catchup_after_reopen": {
+      "seconds": 1.9193899579695426,
+      "indexes": [
+        {
+          "name": "full_text_index_v0",
+          "kind": "full_text",
+          "replay_applied_sequence": 1973,
+          "replay_target_sequence": 1973,
+          "replay_catch_up_required": false,
+          "catch_up_active": false,
+          "catch_up_phase": "idle",
+          "doc_count": 640,
+          "term_count": 14,
+          "edge_count": 0,
+          "graph_counts_pending": false,
+          "node_count": 0,
+          "repair_degraded": false,
+          "repair_issue_count": 0,
+          "repair_summary_ready": true,
+          "repair_issue_count_estimated": false,
+          "coverage_produced_count": 0,
+          "coverage_skipped_count": 0,
+          "coverage_terminal_failed_count": 0,
+          "coverage_summary_ready": true
+        }
+      ],
+      "integrity": {
+        "valid": true,
+        "file_size": 17973248,
+        "valid_prefix_size": 17973248,
+        "tail_bytes": 0,
+        "record_count": 6468,
+        "live_file_count": 6455,
+        "live_bytes": 1399316,
+        "compact_size": 2600960,
+        "reclaimable_bytes": 15372288,
+        "issue": null
+      },
+      "search_canary_hits": 5
+    },
+    "full_frozen_sequence_progress": {
+      "207cd9ca3b": {
+        "finished_imports": 15,
+        "sum_import_seconds": 1078.9314862910003,
+        "all_finished_imports_succeeded": true,
+        "sequence_complete": true
+      },
+      "f91c9c0e46": {
+        "finished_imports": 15,
+        "sum_import_seconds": 1761.0721687909988,
+        "all_finished_imports_succeeded": true,
+        "sequence_complete": true
+      },
+      "15a0088a5a": {
+        "finished_imports": 7,
+        "sum_import_seconds": 1052.4457278760005,
+        "all_finished_imports_succeeded": true,
+        "sequence_complete": false,
+        "running_import_ordinal": 7
+      }
+    },
+    "capi_proof_admission": {
+      "passed": 20,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "exit_code": 0
+    },
+    "sdk_sql_catalog_concurrency": {
+      "passed": 204,
+      "failed": 0,
+      "initial_run": "203 passed; one loopback mock-server test could not bind in sandbox",
+      "loopback_rerun": "1 passed with loopback permission; unchanged library and sources"
+    }
+  },
+  "sdk_changes": "No SDK or public ABI changes required by the registration prototype. Do not use longer Busy retries as evidence that native admission costs were fixed.",
+  "small_import_measurements": [
+    {
+      "run": "first-thread",
+      "artifact": "207cd9ca3b",
+      "seconds": 7.4667629159999995,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 3.213288,
+      "child_system_seconds": 1.5148739999999998,
+      "max_rss": null,
+      "file_bytes_before_status": 54206464,
+      "load": [
+        9.52587890625,
+        9.10205078125,
+        7.7275390625
+      ]
+    },
+    {
+      "run": "first-thread",
+      "artifact": "f91c9c0e46",
+      "seconds": 7.6759695830000005,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 3.6183170000000002,
+      "child_system_seconds": 1.951858,
+      "max_rss": null,
+      "file_bytes_before_status": 54263808,
+      "load": [
+        9.69091796875,
+        9.1484375,
+        7.759765625
+      ]
+    },
+    {
+      "run": "first-thread",
+      "artifact": "15a0088a5a",
+      "seconds": 67.820281666,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 6.097523,
+      "child_system_seconds": 50.065825000000004,
+      "max_rss": null,
+      "file_bytes_before_status": 54333440,
+      "load": [
+        12.62939453125,
+        10.24072265625,
+        8.28564453125
+      ]
+    },
+    {
+      "run": "debug-first-thread",
+      "artifact": "15a0088a5a-debug",
+      "seconds": 109.378661583,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 33.49225,
+      "child_system_seconds": 57.887944,
+      "max_rss": 311279616,
+      "file_bytes_before_status": 54927360,
+      "load": [
+        18.06103515625,
+        13.1923828125,
+        10.71533203125
+      ]
+    },
+    {
+      "run": "scoped-first-thread",
+      "artifact": "scoped-epochs-debug",
+      "seconds": 90.928695542,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 27.192082,
+      "child_system_seconds": 22.176766,
+      "max_rss": 326467584,
+      "file_bytes_before_status": 57040896,
+      "load": [
+        18.5771484375,
+        16.6201171875,
+        14.271484375
+      ]
+    },
+    {
+      "run": "admission-paired-first-thread",
+      "artifact": "admission-epochs-debug",
+      "seconds": 40.274806292,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 25.6873,
+      "child_system_seconds": 4.724505,
+      "max_rss": 304922624,
+      "file_bytes_before_status": 57126912,
+      "load": [
+        14.7412109375,
+        17.0703125,
+        17.513671875
+      ]
+    },
+    {
+      "run": "admission-paired-first-thread",
+      "artifact": "15a0088a5a-debug",
+      "seconds": 171.23910024999998,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 37.173309,
+      "child_system_seconds": 75.191848,
+      "max_rss": 319897600,
+      "file_bytes_before_status": 54644736,
+      "load": [
+        18.18896484375,
+        17.2646484375,
+        17.4658203125
+      ]
+    },
+    {
+      "run": "admission-reverse-first-thread",
+      "artifact": "15a0088a5a-debug",
+      "seconds": 158.521067458,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 34.714883,
+      "child_system_seconds": 71.320933,
+      "max_rss": 314490880,
+      "file_bytes_before_status": 54300672,
+      "load": [
+        13.5205078125,
+        15.3935546875,
+        16.591796875
+      ]
+    },
+    {
+      "run": "admission-reverse-first-thread",
+      "artifact": "admission-epochs-debug",
+      "seconds": 44.09887766600002,
+      "exit_code": 0,
+      "imported_summary": [
+        "1",
+        "0",
+        "0"
+      ],
+      "child_user_seconds": 25.486891,
+      "child_system_seconds": 4.562658,
+      "max_rss": 289325056,
+      "file_bytes_before_status": 55013376,
+      "load": [
+        15.0166015625,
+        15.42431640625,
+        16.52880859375
+      ]
+    }
+  ],
+  "prototype_artifact": {
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "8e3ef88b8e40301aa5443399388ecd234702240a8a474046342634ddecc3b1c0",
+    "zig/pkg/antfly-embedded/src/capi/tables.zig": "613a12d9d3dbdb68bfcda8591496d925649a94c27665576fbb84231463e9d76c",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "8186afec7c17df07e90fdc1d0f780c20b6ebe18b76bd27c40742e372cd8043e1",
+    "zig/pkg/antfly-embedded/src/storage/lite/reader_coordinator.zig": "606013daea1f4a6265f6606a1d40a847a11a2d98bab2321ffed2c59e4ba2fb71",
+    "library_sha256": "5ff7278727c8fd5d91e77b97255ecd1ac7a6fe334cdc9eb234e6ef8e1a79b821"
+  },
+  "registration_microbenchmark_reproducible": {
+    "source": "zig/pkg/antfly-embedded/src/storage/lite/reader_registration_bench.zig",
+    "source_sha256": "b05f4812c56006f56b3bb5337452568c03899ed443c9fee76d5b7c4f221fc966",
+    "allocator": "std.heap.c_allocator, matching C API admission",
+    "optimization": "Debug",
+    "raw_results": [
+      {
+        "round": 0,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 877364292
+      },
+      {
+        "round": 0,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 39914375
+      },
+      {
+        "round": 1,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 39439792
+      },
+      {
+        "round": 1,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 860865041
+      },
+      {
+        "round": 2,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 689564167
+      },
+      {
+        "round": 2,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 35086625
+      },
+      {
+        "round": 3,
+        "batched": true,
+        "iterations": 2000,
+        "nanoseconds": 31883084
+      },
+      {
+        "round": 3,
+        "batched": false,
+        "iterations": 2000,
+        "nanoseconds": 1175952833
+      }
+    ],
+    "median_nanoseconds": {
+      "False": 869114666.5,
+      "True": 37263208.5
+    },
+    "isolated_speedup": 23.323667002534147,
+    "same_checkpoint_only": true
+  },
+  "prototype_source_after_build": {
+    "change": "comments and removal of an unrelated blank line only; compiled production behavior unchanged",
+    "sha256": {
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "b16b7b398561bee9e0eec1d8acf229c835bbd47c6a2b251873a22d7350bf7fa9",
+      "zig/pkg/antfly-embedded/src/capi/tables.zig": "9664bab321e657729737725d092ed7289624619dd41154d2a8bc9417fa210817",
+      "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "8186afec7c17df07e90fdc1d0f780c20b6ebe18b76bd27c40742e372cd8043e1",
+      "zig/pkg/antfly-embedded/src/storage/lite/reader_coordinator.zig": "22d69d1eacca8fa1b6bdcda96d553df6a3f5b97b0aebe85a63d91e277882639f"
+    }
+  },
+  "implementation_order": [
+    {
+      "phase": 1,
+      "change": "Admission-scoped immutable epoch registration",
+      "complexity_target": "Marker publication follows distinct protected checkpoints/scopes and escaping readers, rather than every short read. No idle anchors survive admission yield.",
+      "acceptance": [
+        "Original importer unchanged; paired native Debug baseline/candidate in both orders.",
+        "Kernel/namespace safety regressions pass.",
+        "Matched indexed churn verifies every acknowledged latest value, index catch-up, integrity and reopen."
+      ]
+    },
+    {
+      "phase": 2,
+      "change": "Durable recovery agenda and namespace generation identities",
+      "complexity_target": "Ordinary admission has no work proportional to all tables or all indexes. Recovery enumerates pending identities and opens only affected runtimes.",
+      "compatibility": "If older writers cannot maintain the new durable generation/agenda contract, change the unreleased format/protocol and reject those writers. Do not silently trust counters that older code does not update.",
+      "acceptance": [
+        "Unrelated-table count scaling: adding idle tables must not induce a full-open scan per ordinary write.",
+        "Crash/reopen and foreign DDL tests validate agenda completeness.",
+        "All producers of activation, FK, retirement and transaction work publish the agenda atomically through shared storage contracts, not only SQL wrappers."
+      ]
+    },
+    {
+      "phase": 3,
+      "change": "Speculative immutable input opens and precise runtime adoption",
+      "complexity_target": "Heavy index initialization runs outside the owner gate; bounded adoption validates durable logical generations and inode identity. Unchanged immutable inputs retain their caches.",
+      "acceptance": [
+        "Cursor, schema mutation, shutdown and detached worker lifecycle draining remains correct.",
+        "Foreign publication during speculative open discards stale work safely.",
+        "No borrowed mutable allocator state is shared with retired readers."
+      ]
+    },
+    {
+      "phase": 4,
+      "change": "Adaptive replay/service scheduling after fixed costs are removed",
+      "complexity_target": "Memory, elapsed time and retirement pressure bound each turn while checkpoint/open work is amortized; foreground and reclamation retain progress.",
+      "acceptance": [
+        "Measure foreground p50/p95/p99 and success rates as well as background throughput.",
+        "File/retirement backlog must plateau while writers remain active, with an explicit retained-snapshot case and bounded drain afterward.",
+        "Post-commit visibility failures remain distinct from pre-commit retryable refusal."
+      ]
+    }
+  ],
+  "measurement_contract": {
+    "unchanged_importer": true,
+    "debug_comparisons": "Both native libraries use Debug for paired prototypes. Use optimized matched runs for final performance qualification.",
+    "source_input": "Same frozen input manifest and thread ordering; preserve full exit status and import summary.",
+    "required_counters": [
+      "per-process user/system CPU",
+      "foreground admission latency histogram",
+      "allocator full loads/digest rebuilds/proof walks",
+      "reader-marker creations/reuses and active frontiers",
+      "oldest reader and artifact-lease ages",
+      "pending/reusable/appended pages",
+      "table/runtime/index opens and generation adoption counts",
+      "recovery agenda jobs scanned/completed",
+      "logical bytes split by documents, metadata and index artifacts"
+    ],
+    "current_gap": "Not all diagnostic counters exist yet; profile samples and aggregate byte accounting do not substitute for causal attribution."
+  },
+  "four_process_churn_smoke": [
+    {
+      "artifact": "admission-epochs-debug",
+      "status": "ok",
+      "successful_calls": 1965,
+      "successful_calls_per_second": 65.28476031468146,
+      "busy_calls": 0,
+      "success_p50_ns": 47585042,
+      "success_p95_ns": 118659958,
+      "success_p99_ns": 185701250,
+      "peak_file_bytes": 17973248,
+      "file_bytes": 17973248,
+      "elapsed_seconds": 30.098908084037248,
+      "concurrency": 4,
+      "no_sync": false,
+      "workload": "churn",
+      "library_sha256": "5ff7278727c8fd5d91e77b97255ecd1ac7a6fe334cdc9eb234e6ef8e1a79b821",
+      "per_worker_successful_calls": [
+        477,
+        544,
+        472,
+        472
+      ],
+      "workers_with_stalled_windows": 0,
+      "workers_without_success": 0,
+      "file_size_samples": [
+        {
+          "elapsed_seconds": 5.41971530765295e-07,
+          "file_bytes": 1474560
+        },
+        {
+          "elapsed_seconds": 1.0101255829795264,
+          "file_bytes": 7102464
+        },
+        {
+          "elapsed_seconds": 2.0196702079847455,
+          "file_bytes": 12894208
+        },
+        {
+          "elapsed_seconds": 3.029796292015817,
+          "file_bytes": 12894208
+        },
+        {
+          "elapsed_seconds": 4.037059666996356,
+          "file_bytes": 12894208
+        },
+        {
+          "elapsed_seconds": 5.037910457991529,
+          "file_bytes": 13430784
+        },
+        {
+          "elapsed_seconds": 6.0479842919739895,
+          "file_bytes": 13430784
+        },
+        {
+          "elapsed_seconds": 7.050860667019151,
+          "file_bytes": 14471168
+        },
+        {
+          "elapsed_seconds": 8.060927417012863,
+          "file_bytes": 14471168
+        },
+        {
+          "elapsed_seconds": 9.068901999969967,
+          "file_bytes": 14471168
+        },
+        {
+          "elapsed_seconds": 10.073949999990873,
+          "file_bytes": 15622144
+        },
+        {
+          "elapsed_seconds": 11.083760500012431,
+          "file_bytes": 15740928
+        },
+        {
+          "elapsed_seconds": 12.091707708023023,
+          "file_bytes": 15740928
+        },
+        {
+          "elapsed_seconds": 13.093344457971398,
+          "file_bytes": 15740928
+        },
+        {
+          "elapsed_seconds": 14.101525041973218,
+          "file_bytes": 16019456
+        },
+        {
+          "elapsed_seconds": 15.107024082972202,
+          "file_bytes": 16019456
+        },
+        {
+          "elapsed_seconds": 16.115032457979396,
+          "file_bytes": 16019456
+        },
+        {
+          "elapsed_seconds": 17.125141124997754,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 18.127642832987476,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 19.12924037501216,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 20.13372020801762,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 21.134699125017505,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 22.144774042011704,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 23.150828166981228,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 24.158118124993052,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 25.166129457997158,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 26.17051712499233,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 27.18059612502111,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 28.19068800000241,
+          "file_bytes": 17973248
+        },
+        {
+          "elapsed_seconds": 29.200776708021294,
+          "file_bytes": 17973248
+        }
+      ],
+      "allocator_proof_walks": 1,
+      "allocator_proof_failures": 0,
+      "latest_acknowledged_values_checked": 512,
+      "integrity": {
+        "compact_size": 2736128,
+        "file_size": 17973248,
+        "issue": null,
+        "live_bytes": 1471432,
+        "live_file_count": 7577,
+        "reclaimable_bytes": 15237120,
+        "record_count": 7637,
+        "tail_bytes": 0,
+        "valid": true,
+        "valid_prefix_size": 17973248
+      },
+      "initial_index_state": [
+        {
+          "catch_up_active": false,
+          "catch_up_phase": "idle",
+          "coverage_produced_count": 0,
+          "coverage_skipped_count": 0,
+          "coverage_summary_ready": true,
+          "coverage_terminal_failed_count": 0,
+          "doc_count": 640,
+          "edge_count": 0,
+          "graph_counts_pending": false,
+          "kind": "full_text",
+          "name": "full_text_index_v0",
+          "node_count": 0,
+          "repair_degraded": false,
+          "repair_issue_count": 0,
+          "repair_issue_count_estimated": false,
+          "repair_summary_ready": true,
+          "replay_applied_sequence": 1748,
+          "replay_catch_up_required": true,
+          "replay_target_sequence": 1973,
+          "term_count": 14
+        }
+      ]
+    },
+    {
+      "artifact": "15a0088a5a-debug",
+      "status": "ok",
+      "successful_calls": 357,
+      "successful_calls_per_second": 11.784329052349317,
+      "busy_calls": 0,
+      "success_p50_ns": 296698417,
+      "success_p95_ns": 633230917,
+      "success_p99_ns": 716497958,
+      "peak_file_bytes": 13262848,
+      "file_bytes": 13262848,
+      "elapsed_seconds": 30.294469749962445,
+      "concurrency": 4,
+      "no_sync": false,
+      "workload": "churn",
+      "library_sha256": "ccb427ce5df85f96b4ea89af1f7f9c87f6d392cfe46b8e06f5efeef0517d0cab",
+      "per_worker_successful_calls": [
+        79,
+        76,
+        101,
+        101
+      ],
+      "workers_with_stalled_windows": 0,
+      "workers_without_success": 0,
+      "file_size_samples": [
+        {
+          "elapsed_seconds": 1.2497184798121452e-07,
+          "file_bytes": 1474560
+        },
+        {
+          "elapsed_seconds": 1.009190207987558,
+          "file_bytes": 1748992
+        },
+        {
+          "elapsed_seconds": 2.0119302079547197,
+          "file_bytes": 2490368
+        },
+        {
+          "elapsed_seconds": 3.018706791976001,
+          "file_bytes": 3375104
+        },
+        {
+          "elapsed_seconds": 4.028800332976971,
+          "file_bytes": 4321280
+        },
+        {
+          "elapsed_seconds": 5.038406332954764,
+          "file_bytes": 4911104
+        },
+        {
+          "elapsed_seconds": 6.043710166995879,
+          "file_bytes": 5795840
+        },
+        {
+          "elapsed_seconds": 7.047292749979533,
+          "file_bytes": 6561792
+        },
+        {
+          "elapsed_seconds": 8.051341666956432,
+          "file_bytes": 7376896
+        },
+        {
+          "elapsed_seconds": 9.060934041975997,
+          "file_bytes": 8491008
+        },
+        {
+          "elapsed_seconds": 10.06960699998308,
+          "file_bytes": 9113600
+        },
+        {
+          "elapsed_seconds": 11.070873707998544,
+          "file_bytes": 10166272
+        },
+        {
+          "elapsed_seconds": 12.080968957976438,
+          "file_bytes": 11243520
+        },
+        {
+          "elapsed_seconds": 13.082104542001616,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 14.091262832982466,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 15.100495374994352,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 16.108690166962333,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 17.11795445799362,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 18.128127791977022,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 19.13232724997215,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 20.14042024995433,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 21.14414729195414,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 22.15308933297638,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 23.15868904197123,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 24.160597416979726,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 25.164048666949384,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 26.1643406249932,
+          "file_bytes": 12255232
+        },
+        {
+          "elapsed_seconds": 27.17438083299203,
+          "file_bytes": 12734464
+        },
+        {
+          "elapsed_seconds": 28.181070291961078,
+          "file_bytes": 13262848
+        },
+        {
+          "elapsed_seconds": 29.185531416966114,
+          "file_bytes": 13262848
+        },
+        {
+          "elapsed_seconds": 30.195898666977882,
+          "file_bytes": 13262848
+        }
+      ],
+      "allocator_proof_walks": 0,
+      "allocator_proof_failures": 0,
+      "latest_acknowledged_values_checked": 357,
+      "integrity": {
+        "compact_size": 2244608,
+        "file_size": 13262848,
+        "issue": null,
+        "live_bytes": 1170279,
+        "live_file_count": 5526,
+        "reclaimable_bytes": 11018240,
+        "record_count": 5557,
+        "tail_bytes": 0,
+        "valid": true,
+        "valid_prefix_size": 13262848
+      },
+      "initial_index_state": [
+        {
+          "catch_up_active": false,
+          "catch_up_phase": "idle",
+          "coverage_produced_count": 0,
+          "coverage_skipped_count": 0,
+          "coverage_summary_ready": true,
+          "coverage_terminal_failed_count": 0,
+          "doc_count": 327,
+          "edge_count": 0,
+          "graph_counts_pending": false,
+          "kind": "full_text",
+          "name": "full_text_index_v0",
+          "node_count": 0,
+          "repair_degraded": false,
+          "repair_issue_count": 0,
+          "repair_issue_count_estimated": false,
+          "repair_summary_ready": true,
+          "replay_applied_sequence": 207,
+          "replay_catch_up_required": true,
+          "replay_target_sequence": 365,
+          "term_count": 8
+        }
+      ]
+    }
+  ]
+}

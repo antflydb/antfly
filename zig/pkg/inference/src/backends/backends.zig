@@ -37,6 +37,8 @@ pub const SessionPool = session_pool.SessionPool;
 pub const imported_onnx_session = @import("imported_onnx_session.zig");
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
 
+pub const ModelSource = @import("../models/model_source.zig").ModelSource;
+
 const session_factory = @import("../architectures/session_factory.zig");
 
 pub const BackendType = enum {
@@ -128,6 +130,47 @@ pub const BackendType = enum {
     }
 };
 
+const memory_policy = @import("../runtime/tier/memory.zig");
+var cuda_memory_bytes = std.atomic.Value(usize).init(0);
+var cuda_unified_memory = std.atomic.Value(bool).init(false);
+
+pub fn cudaDeviceMemoryBytes(backend: BackendType) usize {
+    if (!build_options.enable_cuda) return 0;
+    if (backend != .cuda) return 0;
+    const cached = cuda_memory_bytes.load(.acquire);
+    if (cached != 0) return cached;
+    var driver = @import("../ops/cuda/driver.zig").CudaDriver.open() catch return 0;
+    defer driver.deinit();
+    const capacity = driver.defaultDeviceMemory() catch return 0;
+    const bytes = capacity.total_bytes;
+    cuda_unified_memory.store(capacity.unified, .release);
+    cuda_memory_bytes.store(bytes, .release);
+    std.log.info("CUDA admission device capacity_bytes={d} unified={}", .{ bytes, capacity.unified });
+    return bytes;
+}
+
+pub fn cudaUsesUnifiedMemory() bool {
+    return cuda_memory_bytes.load(.acquire) != 0 and cuda_unified_memory.load(.acquire);
+}
+
+pub fn defaultMemoryLimits(backend: BackendType, process_limit: usize) memory_policy.Limits {
+    const class: memory_policy.BackendClass = if (backend.usesGpuHostedSession()) .gpu else .cpu;
+    const defaults = memory_policy.defaultLimitsForBackendWithProcessLimit(class, process_limit);
+    const bytes = cudaDeviceMemoryBytes(backend);
+    var limits = memory_policy.limitsForDiscreteDevice(defaults, bytes, process_limit);
+    if (bytes != 0 and cuda_unified_memory.load(.acquire))
+        limits = memory_policy.clampUnifiedDeviceLimits(limits, limits.host_limit_bytes);
+    return limits;
+}
+
+pub fn clampPhysicalMemoryLimits(backend: BackendType, limits: memory_policy.Limits, process_limit: usize) memory_policy.Limits {
+    const bytes = cudaDeviceMemoryBytes(backend);
+    var out = memory_policy.clampDiscreteDeviceLimits(limits, bytes, process_limit);
+    if (bytes != 0 and cuda_unified_memory.load(.acquire))
+        out = memory_policy.clampUnifiedDeviceLimits(out, memory_policy.defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes);
+    return out;
+}
+
 /// The backend that determines a session's resource domain and interruption
 /// policy.
 pub const BackendRuntime = struct {
@@ -195,6 +238,7 @@ test "embedded session policy fails before selecting an uninterruptible backend"
 }
 
 const backend_order_capacity = std.meta.fieldNames(BackendType).len;
+pub const BackendOrderBuffer = [backend_order_capacity]BackendType;
 
 const RequiredBackendConfig = struct {
     backend: ?BackendType = null,
@@ -290,13 +334,25 @@ pub const SessionManager = struct {
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
-        var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
-        defer if (manifest) |*m| m.deinit();
+        return self.loadModelSource(ModelSource.fromPath(model_path), shared_backend_ctx);
+    }
+
+    pub fn loadModelSource(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
+        const model_path = source.path;
+        var manifest: ?manifest_mod.ModelManifest = if (source.manifest) |provided| provided.* else manifest_mod.loadFromDir(self.allocator, model_path) catch null;
+        defer if (source.manifest == null) {
+            if (manifest) |*m| m.deinit();
+        };
         var effective_buf: [backend_order_capacity]BackendType = undefined;
+        // Constructors and discovery run in the database's proxy process too.
+        // Enter a device driver only at the execution boundary, after checking
+        // whether this host can isolate uninterruptible native calls.
+        var device_order_buf: [backend_order_capacity]BackendType = undefined;
+        const preferred = try self.executionBackendOrder(&device_order_buf, self.preferred_backends, null);
         const fallback_backends = effectiveBackendOrder(
             self.allocator,
             &effective_buf,
-            self.preferred_backends,
+            preferred,
             if (manifest) |m| m else null,
         );
         var required_buf: [1]BackendType = undefined;
@@ -348,7 +404,7 @@ pub const SessionManager = struct {
             // directly, so this check does not depend on manifest fallback.
             if (self.a4b_inference_request != null and
                 backend == .metal and
-                self.shouldUseImportedOnnxGraphRuntime(model_path))
+                source.kind == .onnx)
             {
                 return error.A4bUnsupportedArtifact;
             }
@@ -372,32 +428,29 @@ pub const SessionManager = struct {
                 first_err = first_err orelse error.ProcessIsolationRequired;
                 continue;
             }
-            const effective_model_path = switch (backend) {
-                .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
-                else => model_path,
-            };
+            const effective_model_path = if (backend == .wasm and source.kind == .directory)
+                (if (manifest) |m| m.onnx_path orelse model_path else model_path)
+            else
+                model_path;
+            const imported_onnx = source.kind == .onnx or (backend == .wasm and source.kind == .directory and manifest != null and manifest.?.onnx_path != null);
+            const external_base = source.external_base_dir orelse if (manifest) |m| if (m.onnx_logical_path) |path| std.fs.path.dirname(path) else null else null;
+            const logical_path = if (backend == .wasm and source.kind == .directory and manifest != null) manifest.?.onnx_logical_path orelse effective_model_path else source.logical_path orelse effective_model_path;
             if (self.kernel_jit.qualified_profile_path != null and
-                !backendAcceptsQualifiedProfile(backend, effective_model_path)) continue;
+                (backend != .metal or imported_onnx)) continue;
             const jit_capable_session = backend.supportsKernelJitSession() and
-                !isOnnxFilePath(effective_model_path);
+                !imported_onnx;
             if (self.kernel_jit.mode.failClosed() and !jit_capable_session) continue;
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
 
             const session = switch (backend) {
-                .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
+                .metal => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
-                        self.allocator,
-                        model_path,
-                        self.kernel_jit,
-                        self.kernel_jit_load_context,
-                        self.a4b_inference_request,
-                    ) catch |err| {
+                    self.createDirectSession(source, .metal) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
@@ -406,26 +459,14 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
+                .cuda => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    (if (self.gliner_cuda_precision) |precision|
-                        (if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
-                            session_factory.createCudaSessionWithGlinerPrecisionForTest(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision)
-                        else
-                            session_factory.createCudaSessionWithGlinerPrecision(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision))
-                    else
-                        session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
-                            self.allocator,
-                            model_path,
-                            self.kernel_jit,
-                            self.kernel_jit_load_context,
-                            self.a4b_inference_request,
-                        )) catch |err| {
+                    self.createDirectSession(source, .cuda) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
                         first_err = first_err orelse err;
@@ -433,20 +474,20 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                .native => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else
-                    session_factory.createNativeSession(self.allocator, model_path) catch |err| {
+                    self.createDirectSession(source, .native) catch |err| {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     },
-                .wasm => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
+                .wasm => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -518,13 +559,35 @@ pub const SessionManager = struct {
         return required == backend;
     }
 
+    fn createDirectSession(self: *SessionManager, source: ModelSource, backend: BackendType) !Session {
+        if (source.manifest) |manifest| return session_factory.createSessionFromManifest(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false);
+        return switch (backend) {
+            .native => session_factory.createNativeSession(self.allocator, source.path),
+            .metal => session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
+            .cuda => if (self.gliner_cuda_precision) |precision|
+                if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
+                    session_factory.createCudaSessionWithGlinerPrecisionForTest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, precision)
+                else
+                    session_factory.createCudaSessionWithGlinerPrecision(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, precision)
+            else
+                session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
+            else => error.UnsupportedBackend,
+        };
+    }
+
     fn createImportedOnnxSession(
         self: *SessionManager,
         model_path: []const u8,
         backend: BackendType,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
+        external_base_dir: ?[]const u8,
+        logical_path: []const u8,
+        external_reader: ?@import("onnx_graph").tensor.ExternalDataReader,
     ) !Session {
         return imported_onnx_session.createSessionWithOptions(self.allocator, model_path, backend, .{
+            .external_base_dir = external_base_dir,
+            .external_reader = external_reader,
+            .logical_path = logical_path,
             .graph_runtime_strategy = self.graph_runtime_strategy,
             .shared_backend_ctx = shared_backend_ctx,
             .io = self.io,
@@ -534,6 +597,25 @@ pub const SessionManager = struct {
     fn shouldUseImportedOnnxGraphRuntime(self: *const SessionManager, model_path: []const u8) bool {
         _ = self;
         return isOnnxFilePath(model_path);
+    }
+
+    pub fn executionBackendOrder(self: *const SessionManager, scratch: *BackendOrderBuffer, preferred: []const BackendType, control: ?execution_control.InferenceExecutionControl) ![]const BackendType {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        if (control) |active| try active.check();
+        // A required or sole backend remains explicit and reports its own load
+        // error. In particular, requiring native must never initialize CUDA.
+        if (self.required_backend != null or preferred.len <= 1 or
+            std.mem.indexOfScalar(BackendType, preferred, .cuda) == null)
+            return preferred;
+        if (!self.uninterruptibleBackendsAllowed()) return backendOrderWithCudaAvailability(scratch, preferred, false);
+        if (comptime !build_options.enable_cuda) return backendOrderWithCudaAvailability(scratch, preferred, false);
+        const known = cuda_probe.load(.acquire);
+        if (known != .unknown) return backendOrderWithCudaAvailability(scratch, preferred, known == .present);
+        var guard: execution_control.UninterruptibleGuard = if (control) |active| try active.enterUninterruptible(.uninterruptible) else .{};
+        defer guard.deinit();
+        const cuda_available = cudaDeviceAvailable();
+        if (control) |active| try active.check();
+        return backendOrderWithCudaAvailability(scratch, preferred, cuda_available);
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
@@ -575,7 +657,53 @@ fn configuredPreferredBackends() []const BackendType {
     if (preferredBackendOverride()) |backend| {
         return preferredBackendsForOverride(backend);
     }
+    return automaticBackends();
+}
+
+/// Compiled candidates only: safe for constructors and proxy-side discovery.
+/// Device availability is resolved under execution's native-call policy.
+pub fn automaticBackends() []const BackendType {
+    if (build_options.enable_cuda) return &.{ .cuda, .metal, .native };
     return &.{ .metal, .native };
+}
+
+fn backendOrderWithCudaAvailability(scratch: *[backend_order_capacity]BackendType, preferred: []const BackendType, available: bool) []const BackendType {
+    if (available) return preferred;
+    var count: usize = 0;
+    for (preferred) |backend| {
+        if (backend == .cuda) continue;
+        scratch[count] = backend;
+        count += 1;
+    }
+    return scratch[0..count];
+}
+
+const CudaProbe = enum(u8) { unknown, absent, present };
+var cuda_probe = std.atomic.Value(CudaProbe).init(.unknown);
+var cuda_probe_mutex: std.atomic.Mutex = .unlocked;
+
+fn probeCudaDevice() bool {
+    const context = @import("../ops/cuda/context.zig");
+    _ = context.probeDefault() catch |err| {
+        std.log.info("CUDA is not in the automatic backend order: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
+/// Initializes a device once per process, not on every backend selection.
+/// Only execution hosts that allow uninterruptible native calls may invoke this.
+pub fn cudaDeviceAvailable() bool {
+    if (comptime !build_options.enable_cuda) return false;
+    const known = cuda_probe.load(.acquire);
+    if (known != .unknown) return known == .present;
+    while (!cuda_probe_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer cuda_probe_mutex.unlock();
+    const raced = cuda_probe.load(.acquire);
+    if (raced != .unknown) return raced == .present;
+    const present = probeCudaDevice();
+    cuda_probe.store(if (present) .present else .absent, .release);
+    return present;
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
@@ -713,8 +841,55 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 
-test "auto backend order prefers Metal then native" {
-    if (!build_options.enable_wasm) {
+test "automatic backend candidates do not initialize a device" {
+    const before = cuda_probe.load(.acquire);
+    const order = automaticBackends();
+    _ = SessionManager.init(std.testing.allocator);
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+    if (build_options.enable_cuda) {
+        try std.testing.expectEqual(BackendType.cuda, order[0]);
+        try std.testing.expect(backendOrderSelectsCudaBeforeCpu(order));
+    } else {
+        try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, order);
+    }
+    // Falling back to the CPU stays possible for models CUDA cannot load.
+    try std.testing.expectEqual(BackendType.native, order[order.len - 1]);
+}
+
+test "automatic execution order removes unavailable CUDA before model fallback policy" {
+    var scratch: [backend_order_capacity]BackendType = undefined;
+    const preferred: []const BackendType = &.{ .cuda, .metal, .native };
+    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, backendOrderWithCudaAvailability(&scratch, preferred, false));
+    try std.testing.expectEqualSlices(BackendType, preferred, backendOrderWithCudaAvailability(&scratch, preferred, true));
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = preferred;
+    manager.required_backend = null;
+    manager.required_backend_invalid = false;
+    manager.process_termination_available = false;
+    const before = cuda_probe.load(.acquire);
+    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, try manager.executionBackendOrder(&scratch, preferred, null));
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+}
+
+test "automatic execution order checks cancellation before probing a device" {
+    const Cancelled = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = null;
+    manager.required_backend_invalid = false;
+    const preferred: []const BackendType = &.{ .cuda, .metal, .native };
+    var scratch: BackendOrderBuffer = undefined;
+    const control: execution_control.InferenceExecutionControl = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.cancelled } };
+    const before = cuda_probe.load(.acquire);
+    try std.testing.expectError(error.Cancelled, manager.executionBackendOrder(&scratch, preferred, control));
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+}
+
+test "auto backend order prefers Metal then native without compiled CUDA" {
+    if (!build_options.enable_wasm and !build_options.enable_cuda) {
         try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, configuredPreferredBackends());
     }
 }

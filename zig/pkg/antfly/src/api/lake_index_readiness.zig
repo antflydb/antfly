@@ -33,11 +33,17 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
     if (!eligible and publication.directory == null) return &.{};
-    // A replica attempts bounded navigation warming before reporting an index
-    // queryable. Concurrent checks do not duplicate warm I/O. Failure/timeout
-    // is an optional cache miss and does not weaken the source proof below.
-    @import("lake_index_navigation_warming.zig").warmPublicationWithin(a, server, table, request) catch |err| {
-        if (err == error.NavigationWarmupInProgress) return &.{};
+    // Required cut recovery and optional cache warming have different failure
+    // semantics. A failed active cut must never advertise legacy-index readiness.
+    @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, request) catch {
+        try request.ensureActive();
+        if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| if (owner.enabled) return &.{};
+    };
+    if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| if (owner.enabled) {
+        const cut = owner.current orelse return &.{};
+        if (!cut.canIssue(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(server.cfg.node_config))) return &.{};
+    };
+    @import("lake_index_navigation_warming.zig").warmNavigationWithin(a, server, table, request) catch {
         try request.ensureActive();
     };
     const normalized = try request.platformDeadline();
@@ -97,7 +103,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .sparse_segment and decl.artifact.metadata_version == native.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -116,7 +122,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .vector_segment and decl.artifact.metadata_version == native.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -135,7 +141,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .text_segment and decl.artifact.metadata_version == native_text.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -158,11 +164,11 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             if (name != .string) break false;
             const identity = try recipes.recipeIdentity(sa, recipe);
             const declaration = for (selected.publication().declarations) |decl| {
-                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(sa, decl.name, entry.key_ptr.*, name.string, decl.artifact.metadata_version)) break decl;
+                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(sa, decl.name, entry.key_ptr.*, name.string)) break decl;
             } else break false;
             // A bounded root check proves the reader's contract, not merely a
             // successful upload. Descendant blocks are verified as SQL drains.
-            const reader = artifacts.Reader.openWithCache(a, store.artifactStore(), declaration.artifact, recipe, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const reader = artifacts.Reader.openWithCache(a, store.artifactStore(), declaration.artifact, recipe, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 break false;
@@ -194,7 +200,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             defer tuple.deinit();
             var predicate: ?local.storage_db_relational_index_predicate.Plan = if (index.where.len == 0) null else try local.storage_db_relational_index_predicate.Plan.init(a, runtime, &layout, index.where);
             defer if (predicate) |*plan| plan.deinit();
-            const root = @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;

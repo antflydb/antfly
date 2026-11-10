@@ -1638,6 +1638,7 @@ pub fn applySchemaMutationRecord(
     mode: SchemaMutationMode,
     body: []const u8,
 ) !metadata_table_manager.TableRecord {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     const schema_json = switch (mode) {
         .replace => try parseSchemaUpdateRequest(alloc, body),
         .merge_patch => try mergeSchemaPatchRequest(alloc, table.schema_json, body),
@@ -1665,6 +1666,7 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     return applySchemaRecord(alloc, table, schema_json, false, false, null);
 }
 
@@ -1677,6 +1679,7 @@ pub fn applySchemaUpdateRecordWithIncarnation(
     schema_json: []const u8,
     incarnation: u64,
 ) !metadata_table_manager.TableRecord {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     if (!@import("antfly_local_sources").storage_coverage_identity.isValid(incarnation)) return error.InvalidIndexConfig;
     return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
 }
@@ -4384,7 +4387,7 @@ test "relational declarations bound predicate responses preserve integer datetim
     const config = try @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &columns);
     defer alloc.free(config);
     try std.testing.expectEqual(@as(u32, 3), columns.cache.count());
-    try std.testing.expectEqualStrings("9007199254740993", definition.where.?[0].value.?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", definition.where.?[0].value.value.number_string);
     const updated = try @import("relational_index_mutation.zig").create(alloc, table, "partial", config);
     defer metadata_table_manager.freeTable(alloc, updated);
     try std.testing.expectEqual(@as(u32, 1), try schemaVersion(updated.schema_json));

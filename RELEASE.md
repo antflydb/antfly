@@ -5,6 +5,90 @@ image, and SDKs from tags. The intended long-term shape is that each supported
 OS, architecture, and libc ABI is built once and every downstream channel
 consumes those same archives.
 
+## Independent grep releases
+
+`antfly-grep` uses its own tags, versions and GitHub Releases:
+`antfly-grep/vX.Y.Z` for stable versions and
+`antfly-grep/vX.Y.Z-{alpha,beta,rc}.N` for prereleases. It is not built or bundled
+by Antfly server or embedded-library releases. Historical source commits retain
+their original packaging behavior.
+
+To request a release after these workflows have merged to `main`:
+
+```sh
+git fetch origin main
+git tag -a antfly-grep/v0.1.0-rc.1 origin/main -m 'Antfly Grep 0.1.0-rc.1'
+git push origin refs/tags/antfly-grep/v0.1.0-rc.1
+```
+
+The read-only `grep-release-request.yml` workflow emits a tag request. The
+`grep-release.yml` controller runs from the default branch, validates the actual
+tag event and source ancestry on `main`, and pins all release tools to its own
+commit. Archive builds have only repository read permission and the existing
+bucket-scoped dependency reader; they fetch verified Zig sources from GCS.
+Only the final publication job has repository write permission, behind the
+existing `release-promotion` environment approval.
+
+Each release builds five standalone archives, named
+`antfly-grep_<version>_<OS>_<arch>[_gnu].tar.gz`: Linux x86-64/ARM64 in portable
+musl and glibc 2.28+ variants, plus macOS 15+ ARM64. Every archive is installed
+and executed on its native architecture before publication. Qualification checks
+its independent version, help output, a matching search, a nonmatching search's
+exit status, and installed manpage/completion/schema files. GNU builds support
+optional dynamically loaded local inference; portable musl builds do not.
+
+A complete release contains those five archives, `grep-release.json` (source,
+controller, build identity and per-platform digests), and `SHA256SUMS`. Publication
+requires the exact platform set and verified checksums. Existing release assets
+are verified and never overwritten. Publication reconciles server state after
+upload errors and retries transient failures up to three times, uploading only
+missing files. Only empty, unfinished `starter` assets on a validated draft are
+removed before retry; uploaded assets and published releases are never deleted.
+Permission failures and conflicting digests fail immediately. After retry
+exhaustion, use Re-run failed jobs on the same workflow run. A moved tag, changed
+control policy or different release bytes fail closed. Grep releases explicitly disable GitHub's repository-wide Latest marker,
+so Antfly's existing stable install channel is unaffected. Grep publication does
+not publish Antfly npm/PyPI packages, containers, Homebrew formulas or docs.
+
+Users download from the corresponding namespaced GitHub Release, verify their
+archive's matching entry in `SHA256SUMS` with `sha256sum --check` (or
+`shasum -a 256 --check`; see the grep README for a single-archive example), extract their
+platform archive, and run `./install.sh --prefix "$HOME/.local"`. The installer
+copies only grep and its supporting assets; no Antfly server or libantfly is
+required. Add the selected prefix's `bin` directory to `PATH`.
+
+### Native Apple providers in Mac archives
+
+Source build contract 7 enables Vision OCR, speech transcription, and generation
+as one default macOS capability. The ARM64 Swift bridge and its metadata are
+committed under `zig/lib/apple_native/prebuilt/arm64`. Existing Linux cross-build
+jobs verify its source hash, binary hash, architecture and ABI, then include it
+in both server and embedded archives. No Mac CI builder is needed. `make generate` rebuilds the
+bridge on Apple Silicon Macs; `make apple-bridge-generate` runs only that step.
+Commit the binary
+and metadata together (commands in the Apple provider guide).
+Older source contracts keep their previous packaging behavior.
+
+The CLI and library retain their macOS 15 deployment target. The bridge is lazy
+loaded only on macOS 26+, and actual model/locale/Apple Intelligence readiness
+remains independent of build inclusion. `-Dapple-providers=false` disables OCR,
+transcription and generation together; `-Dapple-ocr` is no longer a separate knob.
+See the [Apple provider guide](docs/guides/providers/apple.mdx).
+
+## Independent dictation app releases
+
+The macOS dictation app has independent `dictation/vX.Y.Z` and
+`dictation/vX.Y.Z-{beta,rc}.N` tags. Its default-branch controller builds a
+Apple Silicon app with a pinned, released ARM64 Antfly runtime, without
+compiling the server or exposing credentials, then uses a protected `dictation-release`
+environment for Developer ID signing, notarization, and signed Sparkle updates.
+Publication consumes the exact signed artifact and advances stable/beta feeds
+on `releases.antfly.io/antfly-dictation` after immutable R2 downloads exist.
+App updates replace the bundled runtime but do not update user-selected external
+servers, model weights, or the repository-wide Latest release. See
+[dictation updates and release setup](examples/dictation/UPDATES.md).
+
+
 ## Release Artifacts
 
 The canonical Zig runtime artifacts are tarballs named:
@@ -310,9 +394,11 @@ in `scripts/release/platforms.json`; channel behavior lives in
 promotion and retention read those policies instead of maintaining independent
 conditionals or platform tables. PyPI publication of the native CLI installer
 is temporarily paused: `publish_pypi` is false for stable and next. The separate
-`embedded-release-publish.yml` workflow publishes `antfly-embedded` independently,
-after its registry setup is complete. CLI wheels are still built and verified as
-release artifacts. Restore those policy flags to resume CLI PyPI publication.
+`embedded-release-publish.yml` workflow publishes embedded npm, PyPI and crates.io
+packages only for stable releases. Prereleases are authenticated but skip the
+publication dispatch, registry preparation and all credential-bearing publish jobs.
+CLI wheels are still built and verified as release artifacts. Restore those
+policy flags to resume CLI PyPI publication.
 To finish a partially published CLI release under
 the updated policy, use the exact-ledger recovery dispatch from `main`; rerunning
 an old workflow retains its original policy. Python
@@ -507,11 +593,16 @@ RC releases publish:
 - GitHub Release artifacts marked prerelease
 - R2 release artifacts
 - the `next` R2 metadata pointer
-- npm CLI packages with dist-tag `next`
 - container tags `<version>` and `next`
 
-RC releases do not update the `latest` R2 channel, Homebrew stable formula, or
-container `latest` tag.
+CLI npm and embedded npm/PyPI/crates.io publication is stable-only. RCs and other
+prereleases retain their built package snapshots and native archives as release
+artifacts, without uploading package versions to those registries. They do not
+update the `latest` R2 channel, Homebrew stable formula, or container `latest` tag.
+Promotion verifies the complete payload for every channel, but only uploads a
+separate CLI snapshot for registry jobs when npm or PyPI publishing is enabled.
+Registry preflight uses the same policy to skip that snapshot download for RCs
+and nightlies, including exact-ledger recovery runs.
 
 Nightly snapshots publish:
 
@@ -522,6 +613,22 @@ Nightlies do not publish to npm, PyPI, or Homebrew and do not create GitHub
 Releases. Their immutable recovery source is R2. npm tarballs and Python wheels
 are still produced and ledger-verified by the common build, but are retained as
 release artifacts rather than published package-registry versions.
+
+## Homebrew Publishing Credentials
+
+The stable formula publisher uses the organization-owned Homebrew publisher
+GitHub App. Install the App only on `antflydb/homebrew-taps` with repository
+Contents read/write access. Share the organization Actions variable
+`HOMEBREW_APP_CLIENT_ID` with `antfly` and `antfly-cloud`. Restrict the organization
+secret `HOMEBREW_APP_PRIVATE_KEY` (the full PEM) to `antfly`; Cloud keeps its copy
+in the protected `antfly-cloud-cli-release` environment so it requires release
+approval. The Antfly release workflow creates a short-lived token restricted to
+the tap immediately before checkout and revokes it when the job ends.
+
+Rotate the App key by generating a replacement, updating Antfly's organization
+secret and Cloud's protected environment secret, and verifying publishing access
+before deleting the old App key. Remove legacy PAT secrets after publishing is
+verified.
 
 ## Object Retention
 
@@ -559,3 +666,68 @@ lifecycle decision.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.
+
+
+## CI transfer storage
+
+R2 remains the durable Antfly release store and channel journal. Promotion jobs
+restore the exact ledger-selected runtime, CLI, or full payload directly from
+its sealed R2 version prefix. They do not upload another full promotion payload,
+runtime subset, or CLI snapshot to Actions. The small ledger and Homebrew formula
+remain Actions handoffs. Restores verify the ledger digest, tag, source commit,
+mirror member set, and each selected file's digest and size. If recovery uses
+GitHub Releases, prepare repairs the immutable R2 mirror from the fully verified
+payload before releasing downstream jobs. Existing conflicting objects fail
+closed; repair never advances a channel alias.
+
+Temporary CLI and Zig-source snapshots and VOPR data use the private
+`antfly-image-artifacts-ci-artifacts` GCS exchange when repository variable
+`CI_ARTIFACT_GCS=true`. GitHub retains a small receipt with producer repository,
+run ID, artifact name, and exact file digests. Consumers validate that identity,
+reject path traversal/collisions, and verify downloaded bytes. Identical files
+share create-only SHA-256 objects within a fourteen-day namespace window.
+Separate release/VOPR service accounts can only read/create their own object
+prefix; neither receives R2 or registry authority. PR VOPR access still requires
+the existing default-branch admission controller. The existing Cloud Build/GAR
+builder federation must also be restricted to trusted publishers before enabling
+source-job OIDC, so staging tokens cannot switch providers to gain publish
+access. Apply and verify that companion IAM change before merging these
+workflows: declaring OIDC permission takes effect even while GCS uploads are
+disabled. GitHub cache writes remain
+restricted by `cache-mode: read` in approved PR runs.
+
+Receipts and ordinary intermediate artifacts expire after fourteen days. Existing
+VOPR replay windows stay at ninety days. GCS short objects expire at thirty days,
+and all objects expire within 120 days, including paths outside known tiers.
+Both tiers include headroom for reuse near the end of
+a fourteen-day namespace window. Native release archives remain Actions handoffs because embedded registry
+preflight deliberately has no OIDC permission: fourteen days for RC/nightly,
+ninety for stable registry retries. Small release identity/ledger records also
+retain ninety days. Embedded publishers verify and consume the original package snapshot
+without uploading another verified copy. Stable embedded registry snapshots
+retain their ninety-day publication/retry window. RC/nightly packaging checks
+still run but do not upload an unused embedded registry snapshot. Historical
+Actions-only inputs remain readable. Published release retention and R2 GC policy are unchanged.
+
+The exchange is provisioned by Colony's `colony-infra-ci` stack. Apply its reviewed
+bucket/WIF/IAM preview before enabling `CI_ARTIFACT_GCS`. Until enabled, upload
+steps retain their original bytes in Actions with explicit retention. Enable the
+variable when no build or VOPR matrix is active; a mixed legacy/receipt matrix
+fails closed. Keep the exchange provisioned while receipts remain live, including
+when disabling new GCS uploads. Approval delays beyond the intermediate retention
+window require rebuilding unpublished inputs or using exact-ledger R2 recovery
+for sealed releases. Never delete active producer inputs during cleanup.
+
+
+After infrastructure approval/apply and enabling the variable during an idle
+window, verify actual federation and object exchange with small probes before
+starting release builds:
+
+```sh
+gh workflow run ci-artifact-exchange-check.yml --ref main
+gh workflow run zig-vopr-soak.yml --ref main -f artifact_probe=true
+```
+
+These probes upload the same small fixture twice and restore it through its
+receipt. They do not compile Antfly, run a campaign, publish a release, or write
+to R2. Both probes must succeed before using the enabled exchange normally.

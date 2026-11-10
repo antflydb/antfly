@@ -233,9 +233,7 @@ def candidate(bucket, image, *, foundation_exists=False):
                 "credentials": {"ref": "hn-history"},
             },
         },
-        "indexes": {
-            "body_text": {"type": "full_text", "field": "body", "store_source": True}
-        },
+        "indexes": {"body_text": {"type": "full_text", "store_source": True}},
     }
     source = {
         "source": {

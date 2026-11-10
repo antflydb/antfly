@@ -47,8 +47,8 @@ pub const Job = union(enum) {
     artifact: Ref,
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
+    cover_directory: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
-    text_root: artifacts.ChunkRef,
     text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
     page: struct { ref: tree.Ref, ordered_rows: bool, native_files: bool = false, native_generation: bool = false, native_chunks: bool = false, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
 };
@@ -110,9 +110,14 @@ pub const Progress = struct {
             .chunk => |chunk| {
                 _ = try self.record(chunk);
             },
+            .cover_directory => |ref| {
+                if (!try self.expand(ref, "cover-directory-v1")) return;
+                try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                const directory = try @import("lake_index_cover_columns.zig").readDirectory(a, collector.store, ref, collector.cancellation());
+                try self.enqueue(.{ .chunk = directory.pack });
+            },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
             .text_directory => |ref| try collector.markTextDirectory(a, ref),
-            .text_root => |ref| try collector.markTextRootAuto(a, ref),
             .text_manifest => |manifest| try collector.markTextManifestMode(a, manifest.ref, manifest.seekable, manifest.maintenance_only),
             .contribution_page => |page| {
                 if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;
@@ -224,7 +229,10 @@ pub const Progress = struct {
                             return;
                         }
                         if (!visitor.ordered) return;
-                        if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
+                        if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| {
+                            try visitor.progress.enqueue(.{ .chunk = cover.block });
+                            if (cover.striped) try visitor.progress.enqueue(.{ .cover_directory = cover.block });
+                        }
                     }
                 };
                 var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .native_files = job_page.native_files, .native_generation = job_page.native_generation, .native_chunks = job_page.native_chunks, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
@@ -438,11 +446,6 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     }
     const cloud_checkpoints = if (collector.store.providerStore()) |object| try object.usesObjectVersions(collector.cancellation()) else false;
     try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = progress.value.deferred_retention or cloud_checkpoints, .vacuum = if (cloud_checkpoints) .{ .domain = domain, .floor = progress.value.floor, .cutoff = progress.value.cutoff, .marks = progress.value.marks } else null } });
-    // Legacy nonce staging predates journal-discoverable pending-v2 files.
-    // Its advisory migration cleanup must never gate collection completion.
-    collector.store.cleanupRetiredScopedTemporaryRange(domain, collector.upload_floor, collector.upload_cutoff, collector.cancellation()) catch |err| {
-        std.log.warn("completed lake GC legacy staging cleanup deferred: {t}", .{err});
-    };
     if (cloud_checkpoints) {
         collector.result.complete = true;
         return collector.result; // mark pages are now durable vacuum evidence
@@ -501,7 +504,7 @@ test "external lake global frontier cloud retirement keeps locked stores and dra
             self.state = try mutation.apply(self.a, self.state);
         }
     };
-    var harness: Harness = .{ .a = ca, .state = .{ .generation = 2, .reader_upload_floor = 1, .namespace = namespace, .dropped = true, .stores = &.{.{ .identity = identity, .locator = .{ .protocol = .gcs, .connection = "cloud", .bucket = "bucket", .prefix = "native", .root = "https://storage.googleapis.com" } }} } };
+    var harness: Harness = .{ .a = ca, .state = .{ .generation = 2, .namespace = namespace, .dropped = true, .stores = &.{.{ .identity = identity, .locator = .{ .protocol = .gcs, .connection = "cloud", .bucket = "bucket", .prefix = "native", .root = "https://storage.googleapis.com" } }} } };
     var collector: gc.Collector = .{ .a = a, .table = 7, .authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate }, .store = store, .identity = identity, .context = .{ .io = std.testing.io }, .token = @splat(1), .options = .{ .dry_run = false } };
     const serial = provider.serial;
     const protected = try collector.run();
@@ -553,10 +556,10 @@ test "external lake global frontier resumable GC retains delete-version and nati
     try file_builder.add(&native.Selection.idKey(state_file.id), try std.json.Stringify.valueAlloc(ca, state_file, .{}));
     const file_directory = (try file_builder.finish()).?;
     const sparse_binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .sparse, .source_kind = .external_iceberg, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "first", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"embedding"} };
-    const sparse_root: @import("lake_index_native_sparse.zig").Root = .{ .version = 3, .binding = sparse_binding, .config_json = "{}", .generation = .{ .domain = domain, .files = &.{} }, .file_directory = file_directory };
+    const sparse_root: @import("lake_index_native_sparse.zig").Root = .{ .binding = sparse_binding, .config_json = "{}", .generation = .{ .domain = domain, .files = &.{} }, .file_directory = file_directory };
     var sparse_ref = try store.put(try std.json.Stringify.valueAlloc(ca, sparse_root, .{}));
     defer sparse_ref.deinit(a);
-    publication.declarations = &.{.{ .name = "sparse", .binding = sparse_binding, .artifact = .{ .kind = .sparse_segment, .metadata_version = 3, .artifact_id = sparse_ref.artifact_id, .checksum = sparse_ref.checksum, .byte_len = sparse_ref.byte_len } }};
+    publication.declarations = &.{.{ .name = "sparse", .binding = sparse_binding, .artifact = .{ .kind = .sparse_segment, .metadata_version = @import("lake_index_native_sparse.zig").metadata_version, .artifact_id = sparse_ref.artifact_id, .checksum = sparse_ref.checksum, .byte_len = sparse_ref.byte_len } }};
     const Harness = struct {
         a: A,
         state: lifecycle.State,

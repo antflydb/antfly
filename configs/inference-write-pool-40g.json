@@ -1,0 +1,42 @@
+{
+  "resources": {
+    "memory": { "max_bytes": 77309411328 },
+    "inference": {
+      "memory": {
+        "max_host_bytes": 34359738368,
+        "max_device_bytes": 40802189312,
+        "max_combined_bytes": 75161927680,
+        "max_kv_bytes": 21474836480,
+        "max_scratch_bytes": 12884901888
+      },
+      "admission": { "max_concurrent_requests": 16, "max_work_units": 1024 },
+      "request_limits": {
+        "max_items_per_request": 8,
+        "max_input_tokens_per_item": 32768,
+        "max_output_tokens_per_item": 1024,
+        "max_decoded_pixels_per_batch": 4000000
+      }
+    }
+  },
+  "inference": {
+    "models_dir": "/models",
+    "ml_dir": "/ml",
+    "max_loaded_models": 4,
+    "keep_alive": "0",
+    "preload": [
+      { "kind": "embedder", "name": "google/embeddinggemma-2", "backend": "cuda" },
+      { "kind": "transcriber", "name": "openai/whisper-small", "backend": "cuda" },
+      { "kind": "extractor", "name": "antflydb/GLiNER2.5", "backend": "cuda" },
+      { "kind": "reader", "name": "lightonai/LightOnOCR-3-0.8B", "backend": "cuda" }
+    ],
+    "kernel_jit": { "mode": "off" },
+    "prompt_cache": { "enabled": false },
+    "generation_batching": {
+      "mode": "on",
+      "max_step_items": 2,
+      "max_step_query_tokens": 512,
+      "max_decode_wait_us": 1000,
+      "max_idle_prefill_chunk_size": 512
+    }
+  }
+}

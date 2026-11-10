@@ -29,6 +29,10 @@ class MediaChunkPolicy:
         tile_width (int | Unset):  Default: 0.
         tile_height (int | Unset):  Default: 0.
         tile_overlap (int | Unset):  Default: 0.
+        audio_speaker_turns (bool | Unset): Split audio chunks at detected speaker transitions, additionally respecting
+            the boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and zero
+            audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis runs even with
+            execute=false because these boundaries depend on audio inference. Default: False.
         audio_pause_ns (int | Unset): Optional minimum silence duration for choosing an earlier boundary; no samples are
             discarded. Default: 0.
         audio_pause_search_ns (int | Unset):  Default: 5000000000.
@@ -46,6 +50,7 @@ class MediaChunkPolicy:
     tile_width: int | Unset = 0
     tile_height: int | Unset = 0
     tile_overlap: int | Unset = 0
+    audio_speaker_turns: bool | Unset = False
     audio_pause_ns: int | Unset = 0
     audio_pause_search_ns: int | Unset = 5000000000
     audio_silence_milli: int | Unset = 10
@@ -73,6 +78,8 @@ class MediaChunkPolicy:
         tile_height = self.tile_height
 
         tile_overlap = self.tile_overlap
+
+        audio_speaker_turns = self.audio_speaker_turns
 
         audio_pause_ns = self.audio_pause_ns
 
@@ -105,6 +112,8 @@ class MediaChunkPolicy:
             field_dict["tile_height"] = tile_height
         if tile_overlap is not UNSET:
             field_dict["tile_overlap"] = tile_overlap
+        if audio_speaker_turns is not UNSET:
+            field_dict["audio_speaker_turns"] = audio_speaker_turns
         if audio_pause_ns is not UNSET:
             field_dict["audio_pause_ns"] = audio_pause_ns
         if audio_pause_search_ns is not UNSET:
@@ -139,6 +148,8 @@ class MediaChunkPolicy:
 
         tile_overlap = d.pop("tile_overlap", UNSET)
 
+        audio_speaker_turns = d.pop("audio_speaker_turns", UNSET)
+
         audio_pause_ns = d.pop("audio_pause_ns", UNSET)
 
         audio_pause_search_ns = d.pop("audio_pause_search_ns", UNSET)
@@ -157,6 +168,7 @@ class MediaChunkPolicy:
             tile_width=tile_width,
             tile_height=tile_height,
             tile_overlap=tile_overlap,
+            audio_speaker_turns=audio_speaker_turns,
             audio_pause_ns=audio_pause_ns,
             audio_pause_search_ns=audio_pause_search_ns,
             audio_silence_milli=audio_silence_milli,

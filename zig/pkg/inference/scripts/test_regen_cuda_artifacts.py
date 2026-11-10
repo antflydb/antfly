@@ -87,6 +87,46 @@ class RegenCudaArtifactsTest(unittest.TestCase):
         )
         self.assertNotIn("nvcc not found", completed.stderr)
 
+    def test_binary_symbols_are_decoded_and_checked_exactly(self) -> None:
+        source = SCRIPT.read_text()
+        function = re.search(
+            r"^check_required_symbols\(\) \{.*?^\}", source, re.MULTILINE | re.DOTALL
+        ).group(0)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            artifact = directory / "compressed.fatbin"
+            artifact.write_bytes(b"compressed payload without readable symbols")
+            tool = directory / "cuobjdump"
+            for output, status in (
+                ("required_kernel", 0),
+                ("required_kernel_suffix", 1),
+            ):
+                with self.subTest(output=output):
+                    tool.write_text(
+                        '#!/bin/sh\n[ "$1" = --dump-elf-symbols ] || exit 2\nprintf "%s\\n" "'
+                        + output
+                        + '"\n'
+                    )
+                    tool.chmod(0o755)
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            "-c",
+                            'set -euo pipefail\ncuobjdump="$1"\ntmp_symbols="$2"\nrequired_symbols=(required_kernel)\n'
+                            + function
+                            + '\ncheck_required_symbols "$3"',
+                            "test",
+                            str(tool),
+                            str(directory / "symbols"),
+                            str(artifact),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(status, result.returncode, result.stderr)
+                    if status:
+                        self.assertIn("missing symbol required_kernel", result.stderr)
+
     def test_default_zig_resolution_prefers_the_repo_pinned_toolchain(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         pinned = 'elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.17.0/zig" ]'

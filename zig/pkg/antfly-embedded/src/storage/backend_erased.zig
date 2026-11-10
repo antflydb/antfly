@@ -320,7 +320,8 @@ pub const ReadScope = struct {
         return self.vtable.visit_prepared_scores != null;
     }
     pub fn visitPreparedScores(self: *@This(), plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
-        return BoundaryAbi.call("visit_prepared_scores", self.boundary_dispatch, self.vtable.visit_prepared_scores orelse return error.Unsupported, .{ self.ptr, plan, sink });
+        const visit = self.vtable.visit_prepared_scores orelse return error.Unsupported;
+        return BoundaryAbi.call("visit_prepared_scores", self.boundary_dispatch, visit, .{ self.ptr, plan, sink });
     }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         return BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
@@ -1096,8 +1097,16 @@ pub const NamespaceBatch = struct {
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
+        staged_bytes: ?*const fn (*anyopaque) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    /// Bytes staged for commit admission, or null when the backend has no
+    /// such measure.
+    pub fn stagedBytes(self: *NamespaceBatch) !?u64 {
+        const staged = self.vtable.staged_bytes orelse return null;
+        return try BoundaryAbi.call("staged_bytes", self.boundary_dispatch, staged, .{self.ptr});
+    }
 
     pub fn abort(self: *NamespaceBatch) void {
         self.vtable.abort(self.allocator, self.ptr);
@@ -1139,6 +1148,17 @@ pub const NamespaceBatch = struct {
     }
 };
 
+/// Coordination required by consumers that read and modify shared keys inside
+/// a write transaction. Gates are backend-owned and shared by all store views.
+pub const WriteSerialization = union(enum) {
+    unsupported,
+    /// Opening a write transaction acquires coordination retained until its
+    /// commit or abort. Serializing individual callbacks is insufficient.
+    intrinsic,
+    /// Callers hold this shared gate for the whole read/modify/write operation.
+    gate: *std.atomic.Mutex,
+};
+
 pub const Store = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -1148,6 +1168,11 @@ pub const Store = struct {
     /// The backend owns this gate and must outlive all stores/transactions.
     /// Reads and computation outside a write transaction remain concurrent.
     write_gate: ?*std.atomic.Mutex = null,
+    write_serialization: WriteSerialization = .unsupported,
+
+    pub fn writeSerialization(self: *const Store) WriteSerialization {
+        return if (self.write_gate != null) .intrinsic else self.write_serialization;
+    }
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
@@ -2143,8 +2168,15 @@ pub fn namespaceBatchFrom(
         fn delete(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror!void {
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
+
+        pub fn stagedBytes(ptr: *anyopaque) anyerror!u64 {
+            const inner = &unbox(ptr).handle;
+            if (comptime @hasDecl(Handle, "stagedLogicalBytes")) return inner.stagedLogicalBytes();
+            return try inner.stagedBytes() orelse error.Unsupported;
+        }
     };
 
+    const has_staged = comptime @hasDecl(Handle, "stagedLogicalBytes") or @hasDecl(Handle, "stagedBytes");
     return .{
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
@@ -2156,6 +2188,7 @@ pub fn namespaceBatchFrom(
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
+            .staged_bytes = if (has_staged) vt.stagedBytes else null,
         },
     };
 }
@@ -2412,6 +2445,12 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
     return .{
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
+        .write_serialization = if (Handle == Store)
+            handle.writeSerialization()
+        else if (@hasDecl(Handle, "writeSerialization"))
+            box_ptr.handle.writeSerialization()
+        else
+            .unsupported,
         .vtable = &.{
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,

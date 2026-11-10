@@ -1521,3 +1521,76 @@ func TestGenerationStreamPreservesNativeThinkingMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, original, string(encoded))
 }
+
+func TestClient_ReadAudioPreservesRecognitionOptionsAndTemporalEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/ai/v1/read", r.URL.Path)
+		var request map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, "transcribers/meeting", request["model"])
+		require.Equal(t, "c291cmNl", request["audio"])
+		require.Equal(t, map[string]any{"language": "en", "timestamps": true, "diarization": false}, request["audio_options"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"object":"list","model":"transcribers/meeting","usage":{"prompt_tokens":0,"completion_tokens":1,"total_tokens":1},"data":[{"object":"read","index":0,"source_id":"audio-0","kind":"audio","origin":"transcription","status":"truncated","text":"hello","audio":{"language":"en","language_source":"forced","duration_ms":90000,"segments":[{"text":"hello","text_start":0,"text_end":5,"start_ms":65000,"end_ms":66000}]}}]}`)
+	}))
+	defer server.Close()
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	on, off := true, false
+	result, err := client.ReadAudio(context.Background(), "transcribers/meeting", []byte("source"), oapi.InferenceAudioReadOptions{Language: "en", Timestamps: &on, Diarization: &off})
+	require.NoError(t, err)
+	require.Len(t, result.Data, 1)
+	assert.Equal(t, int64(65000), result.Data[0].Audio.Segments[0].StartMs)
+	assert.Equal(t, int64(5), result.Data[0].Audio.Segments[0].TextEnd)
+	assert.EqualValues(t, "truncated", result.Data[0].Status)
+}
+
+func TestAudioReadUnknownDurationRoundTrip(t *testing.T) {
+	for _, duration := range []string{"null", "0", "90000"} {
+		t.Run(duration, func(t *testing.T) {
+			var metadata oapi.InferenceAudioReadMetadata
+			require.NoError(t, json.Unmarshal([]byte(`{"duration_ms":`+duration+`}`), &metadata))
+			if duration == "null" {
+				require.Nil(t, metadata.DurationMs)
+			} else {
+				require.NotNil(t, metadata.DurationMs)
+			}
+			encoded, err := json.Marshal(metadata)
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"duration_ms":`+duration+`}`, string(encoded))
+		})
+	}
+}
+
+func TestAudioReadMetadataPresenceRoundTrip(t *testing.T) {
+	for _, audio := range []string{"null", `{"duration_ms":null}`, `{"duration_ms":0}`} {
+		t.Run(audio, func(t *testing.T) {
+			var item oapi.InferenceReadResult
+			require.NoError(t, json.Unmarshal([]byte(`{"audio":`+audio+`}`), &item))
+			if audio == "null" {
+				require.Nil(t, item.Audio)
+				return
+			}
+			require.NotNil(t, item.Audio)
+			encoded, err := json.Marshal(item)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			assert.JSONEq(t, audio, string(fields["audio"]))
+		})
+	}
+}
+
+func TestCascadeAgreementTraceRoundTripPreservesFalseAndAbsence(t *testing.T) {
+	for _, wire := range []string{
+		`{"decider":"c","definition_sha256":"abc","answered_by":"strong","stages":[],"agreement_status":"agreed","agreed":true}`,
+		`{"decider":"c","definition_sha256":"abc","answered_by":"strong","stages":[],"agreement_status":"disagreed","agreed":false,"disagreed_questions":["same"]}`,
+		`{"decider":"c","definition_sha256":"abc","answered_by":"fast","stages":[],"agreement_status":"unverified"}`,
+	} {
+		var trace oapi.DecisionCascadeTrace
+		require.NoError(t, json.Unmarshal([]byte(wire), &trace))
+		encoded, err := json.Marshal(trace)
+		require.NoError(t, err)
+		assert.JSONEq(t, wire, string(encoded))
+	}
+}

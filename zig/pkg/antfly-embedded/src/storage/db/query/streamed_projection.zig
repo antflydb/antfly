@@ -19,7 +19,60 @@ const Plan = @import("relational_projection.zig").Plan;
 const codec = @import("../algebraic/relational_row_codec.zig");
 const document = @import("../document_query.zig");
 const native_writer = @import("../../native_writer.zig");
+
+test "public graph metric borrowed wire owner COUNT validates borrowed residual byte comparisons" {
+    const a = std.testing.allocator;
+    const schema = @import("../../schema.zig");
+    const predicates = @import("../relational_predicate.zig");
+    const KeyValue = @import("../relational_index_keys.zig").Value;
+    const Op = @import("../../relational_index.zig").RelationalCheckOp;
+    const samples = [_]?[]const u8{ null, "", "a", "A", "a\x00", "\x00a", "aa", "ab", "é" };
+    for ([_]schema.RelationalColumnType{ .string, .blob }) |kind| {
+        const columns = [_]schema.RelationalColumn{.{ .name = "body", .path = "body", .column_type = kind, .allows_null = true }};
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+        var layout = try codec.PhysicalLayout.init(a, table);
+        defer layout.deinit();
+        for ([_][]const u8{ "C", "ci" }) |collation| {
+            if (kind == .blob and std.mem.eql(u8, collation, "ci")) continue;
+            for (samples) |expected| {
+                var predicate = try predicates.Plan.init(a, table, &layout, .{ .column = "body", .collation = if (kind == .string) collation else null, .op = .eq, .value = if (expected) |bytes| if (kind == .string) .{ .string = bytes } else .{ .blob = bytes } else .null });
+                defer predicate.deinit();
+                var source = try predicate.projectSource(a, table, &layout);
+                defer source.deinit();
+                for (samples) |actual| {
+                    const encoded = try codec.serializeOrdinal(a, 1, &columns, if (actual) |bytes| &.{.{ .ordinal = 0, .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = bytes } }} else &.{}, @splat(0));
+                    defer a.free(encoded);
+                    const row = try codec.ordinalRowView(encoded, table, &layout);
+                    const value: KeyValue = if (actual) |bytes| if (kind == .string) .{ .string = bytes } else .{ .blob = bytes } else .null;
+                    var scratch: std.ArrayList(u8) = .empty;
+                    defer scratch.deinit(a);
+                    inline for (.{ Op.eq, Op.ne, Op.lt, Op.lte, Op.gt, Op.gte, Op.is_distinct, Op.is_not_distinct, Op.is_null, Op.is_not_null }) |op| {
+                        predicate.op = op;
+                        const truth = try predicate.evaluateValue(a, &scratch, value);
+                        try std.testing.expectEqual(truth, try source.evaluate(std.testing.failing_allocator, &scratch, row));
+                    }
+                }
+            }
+        }
+        const wide = try a.alloc(u8, 2 << 20);
+        defer a.free(wide);
+        @memset(wide, 0);
+        const encoded = try codec.serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = wide } }}, @splat(0));
+        defer a.free(encoded);
+        const row = try codec.ordinalRowView(encoded, table, &layout);
+        var predicate = try predicates.Plan.init(a, table, &layout, .{ .column = "body", .op = .eq, .value = if (kind == .string) .{ .string = "tiny" } else .{ .blob = "tiny" } });
+        defer predicate.deinit();
+        var source = try predicate.projectSource(a, table, &layout);
+        defer source.deinit();
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(a);
+        try std.testing.expectEqual(predicates.Truth.no, try source.evaluate(std.testing.failing_allocator, &scratch, row));
+        try std.testing.expectEqual(@as(usize, 0), scratch.capacity);
+    }
+}
+
 pub const Context = struct {
+    property_projection: []const @import("cypher").read_fields.Projection = &.{},
     scratch: std.mem.Allocator,
     value: union(enum) {
         row: struct { plan: Plan, row: codec.OrdinalRowView },
@@ -29,7 +82,85 @@ pub const Context = struct {
         json_fields: []const u8,
     },
     pub fn borrow(self: *@This()) @import("../types.zig").BorrowedScanDocument {
-        return .{ .context = self, .write_fields_fn = writeFields };
+        return .{ .context = self, .write_fields_fn = writeFields, .count_projection_fn = countProjection };
+    }
+    /// Retain a private projection after the physical read scope closes.
+    /// Only selected carriers are copied; source payloads remain borrowed.
+    pub fn projectOwned(self: *@This(), alloc: std.mem.Allocator, scratch: std.mem.Allocator, presence: []const []const u8) !?std.json.Value {
+        const value = (try countProjection(self, scratch, presence)) orelse return null;
+        return try @import("../../../common/owned_json.zig").clone(alloc, value);
+    }
+    fn isPresence(fields: []const []const u8, name: []const u8) bool {
+        for (fields) |field| if (std.mem.eql(u8, field, name)) return true;
+        return false;
+    }
+    fn rawValue(a: std.mem.Allocator, raw: []const u8, presence: bool) !std.json.Value {
+        if (presence) {
+            const trimmed = std.mem.trim(u8, raw, " \r\n\t");
+            if (trimmed.len != 0 and (trimmed[0] == '{' or trimmed[0] == '[')) {
+                const JsonView = @import("json_view.zig").View;
+                var view = JsonView.init(a, raw);
+                const selector: @import("json_projection_plan.zig").Selector = .{ .prepared = true };
+                try view.prepareProjectionWithOptions(&selector, .all, .any_container, .{ .defer_fanout = true });
+            }
+            try @import("cypher").value.validateJsonSlice(a, raw, 1);
+            return if (std.mem.eql(u8, std.mem.trim(u8, raw, " \r\n\t"), "null")) .null else .{ .bool = true };
+        }
+        return std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false });
+    }
+    fn countProjection(ptr: ?*anyopaque, a: std.mem.Allocator, presence: []const []const u8) !?std.json.Value {
+        const self: *@This() = @ptrCast(@alignCast(ptr orelse return error.InvalidArgument));
+        var result = std.json.ObjectMap.empty;
+        switch (self.value) {
+            .document => |v| {
+                if (@import("cypher").read_fields.rootKeys(v.plan.property_projection)) {
+                    const fields = try a.alloc([]const u8, v.plan.paths.len);
+                    for (v.plan.paths, fields) |path, *name| {
+                        if (path.parts.len != 1) return null;
+                        name.* = path.parts[0];
+                    }
+                    return try @import("cypher_projection.zig").record(a, v.raw, fields, presence, v.plan.property_projection);
+                }
+                if (v.plan.include_all or v.plan.passthrough) return null;
+                for (v.plan.paths) |path| if (path.parts.len != 1) return null;
+                const JsonView = @import("json_view.zig").View;
+                var view = JsonView.init(a, v.raw);
+                // Keep the ordinary scan's syntax and duplicate-key checks;
+                // count-only values are validated separately in Cypher's domain.
+                try view.prepareProjectionWithOptions(v.plan.selector, .all, .object_only, .{ .defer_fanout = true });
+                for (v.plan.paths) |path| {
+                    const name = path.parts[0];
+                    if (try view.field(&view.root, name)) |node| try result.put(a, name, if (@import("cypher_projection.zig").find(v.plan.property_projection, name)) |item|
+                        try @import("cypher_projection.zig").rawValue(a, node.raw, item)
+                    else
+                        try rawValue(a, node.raw, isPresence(presence, name)));
+                }
+            },
+            .row => |v| {
+                if (v.plan.paths.len != 0) return null;
+                if (v.plan.base.schema_version != v.row.table_schema.version) return error.RelationalRowSchemaMismatch;
+                for (v.plan.base.ordinals) |ordinal| {
+                    const column = v.row.table_schema.relational_columns[ordinal];
+                    const cell = (try v.row.findCell(ordinal)) orelse continue;
+                    const keys_only = @import("cypher").read_fields.rootKeys(self.property_projection);
+                    const predicate_item = @import("cypher_projection.zig").find(self.property_projection, column.name);
+                    const value: std.json.Value = if (predicate_item != null and predicate_item.?.mode == .validation and !cell.is_json)
+                        try @import("cypher_projection.zig").validationJson(a, if (cell.is_null) .null else if (column.column_type == .string) .{ .string = cell.value.bytes_val } else try codec.borrowedJsonValueFromCellAlloc(a, column, cell))
+                    else if (predicate_item != null and predicate_item.?.mode == .predicate and !cell.is_json) try @import("cypher_projection.zig").predicateJson(a, if (cell.is_null) .null else if (column.column_type == .string) .{ .string = cell.value.bytes_val } else try codec.borrowedJsonValueFromCellAlloc(a, column, cell), predicate_item.?) else if (cell.is_null) .null else if (keys_only and predicate_item == null and !cell.is_json and !isPresence(presence, column.name)) .{ .bool = true } else if (cell.is_json)
+                        if (@import("cypher_projection.zig").find(self.property_projection, column.name)) |item|
+                            try @import("cypher_projection.zig").rawValue(a, cell.value.bytes_val, item)
+                        else
+                            try rawValue(a, cell.value.bytes_val, isPresence(presence, column.name) or (keys_only and predicate_item == null))
+                    else if (isPresence(presence, column.name) and (column.column_type == .string or column.column_type == .blob or column.column_type == .geoshape))
+                        .{ .bool = true }
+                    else
+                        try codec.borrowedJsonValueFromCellAlloc(a, column, cell);
+                    try result.put(a, column.name, value);
+                }
+            },
+            else => return null,
+        }
+        return .{ .object = result };
     }
     fn writeFields(ptr: ?*anyopaque, destination: native_writer.Borrow) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr orelse return error.InvalidArgument));
@@ -126,4 +257,109 @@ test "public graph metric borrowed wire full row producers avoid reconstruction 
         try std.testing.expectError(error.WriteFailed, context.borrow().writeFields(&failed));
         try std.testing.expectEqual(@as(usize, 0), budget.live);
     }
+}
+
+test "public graph metric borrowed wire owner COUNT validates wide values without materializing payloads" {
+    const a = std.testing.allocator;
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"tenant\":\"acme\",\"body\":\"\\u0041");
+    try raw.writer.splatByteAll('x', 2 << 20);
+    try raw.writer.writeAll("\",\"zero\":0,\"false\":false,\"array\":[],\"object\":{},\"nil\":null}");
+    var plan = (try document.SpanProjectionPlan.init(a, .{ .fields = &.{ "tenant", "body", "zero", "false", "array", "object", "nil", "missing" }, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 32 << 10 };
+    {
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        var context: Context = .{ .scratch = arena.allocator(), .value = .{ .document = .{ .raw = raw.written(), .plan = &plan } } };
+        const value = (try context.borrow().countProjection(arena.allocator(), &.{ "body", "zero", "false", "array", "object", "nil", "missing" })).?;
+        try std.testing.expectEqualStrings("acme", value.object.get("tenant").?.string);
+        for ([_][]const u8{ "body", "zero", "false", "array", "object" }) |field| try std.testing.expect(value.object.get(field).?.bool);
+        try std.testing.expect(value.object.get("nil").? == .null);
+        try std.testing.expect(value.object.get("missing") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    for ([_][]const u8{ "{\"body\":1e999}", "{\"body\":9223372036854775808}" }) |invalid| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var context: Context = .{ .scratch = arena.allocator(), .value = .{ .document = .{ .raw = invalid, .plan = &plan } } };
+        try std.testing.expectError(error.CypherNumericOverflow, context.borrow().countProjection(arena.allocator(), &.{"body"}));
+    }
+}
+
+test "public graph metric borrowed wire owner COUNT validates relational JSON spans within bounded scratch" {
+    const a = std.testing.allocator;
+    const schema = @import("../../schema.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "body", .path = "body", .column_type = .json, .is_json = true, .json_kind = .any },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try Plan.init(a, table, &layout, &.{"body"});
+    defer plan.deinit();
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"nested\":\"\\u0041");
+    try raw.writer.splatByteAll('x', 2 << 20);
+    try raw.writer.writeAll("\"}");
+    for ([_][]const u8{ raw.written(), "null", "false", "0", "[]", "{}", "{\"x\":1e999}", "{\"x\":0,\"x\":1}" }) |json| {
+        // Construct checksum-valid fixtures directly, including noncanonical
+        // escapes and invalid semantic domains, to exercise read validation.
+        const bytes = try codec.serializePreparedOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "body", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = json } }}, @splat(0));
+        defer a.free(bytes);
+        const row = try codec.ordinalRowViewTrusted(bytes, table, &layout);
+        var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 32 << 10 };
+        {
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            var context: Context = .{ .scratch = arena.allocator(), .value = .{ .row = .{ .plan = plan, .row = row } } };
+            const result = context.borrow().countProjection(arena.allocator(), &.{"body"});
+            if (std.mem.indexOf(u8, json, "1e999") != null) {
+                try std.testing.expectError(error.CypherNumericOverflow, result);
+            } else if (std.mem.eql(u8, json, "{\"x\":0,\"x\":1}")) {
+                try std.testing.expectError(error.DuplicateField, result);
+            } else {
+                const value = (try result).?.object.get("body").?;
+                if (std.mem.eql(u8, json, "null")) try std.testing.expect(value == .null) else try std.testing.expect(value.bool);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+}
+
+test "public graph metric borrowed wire owner COUNT validates owned point projections survive source reuse" {
+    const a = std.testing.allocator;
+    const schema = @import("../../schema.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string },
+        .{ .name = "body", .path = "body", .column_type = .string },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try Plan.init(a, table, &layout, &.{ "id", "body" });
+    defer plan.deinit();
+    const wide = try a.alloc(u8, 2 << 20);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    const encoded = try codec.serializeOrdinal(a, 1, &columns, &.{
+        .{ .ordinal = 0, .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "kept" } },
+        .{ .ordinal = 1, .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = wide } },
+    }, @splat(0));
+    defer a.free(encoded);
+    const row = try codec.ordinalRowView(encoded, table, &layout);
+    var quota: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 32 << 10 };
+    var arena = std.heap.ArenaAllocator.init(quota.allocator());
+    defer arena.deinit();
+    var context: Context = .{
+        .scratch = arena.allocator(),
+        .property_projection = &.{ .{ .name = "", .mode = .children, .keys = true, .root = true }, .{ .name = "id", .mode = .value } },
+        .value = .{ .row = .{ .plan = plan, .row = row } },
+    };
+    const retained = (try context.projectOwned(arena.allocator(), arena.allocator(), &.{})).?;
+    @memset(encoded, 0xaa);
+    try std.testing.expectEqualStrings("kept", retained.object.get("id").?.string);
+    try std.testing.expect(retained.object.get("body").?.bool);
 }

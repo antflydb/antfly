@@ -144,11 +144,10 @@ pub fn stripUnitFingerprintValue(alloc: std.mem.Allocator, value: *std.json.Valu
 /// Removes every hierarchy field reserved for storage or internal transport
 /// before a value crosses the public API boundary. Internal shard encoders
 /// must opt into their stricter revision-envelope serializer instead.
+pub const public_internal_fields = [_][]const u8{ unit_fingerprint_field, grouped_unit_revision_envelope_field, "_resolution_work" };
 pub fn stripPublicInternalFieldsValue(alloc: std.mem.Allocator, value: *std.json.Value) void {
     if (value.* != .object) return;
-    removeOwnedObjectField(alloc, &value.object, unit_fingerprint_field);
-    removeOwnedObjectField(alloc, &value.object, grouped_unit_revision_envelope_field);
-    removeOwnedObjectField(alloc, &value.object, "_resolution_work");
+    for (public_internal_fields) |field| removeOwnedObjectField(alloc, &value.object, field);
 }
 
 fn removeOwnedObjectField(

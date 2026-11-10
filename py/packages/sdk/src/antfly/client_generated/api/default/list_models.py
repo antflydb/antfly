@@ -108,7 +108,8 @@ def sync_detailed(
     ## Readers
 
     - Vision2Seq models from `models_dir/readers/`
-    - TrOCR, Donut, Florence-2 for OCR and document understanding
+    - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document
+    understanding
 
     ## Transcribers
 
@@ -177,7 +178,8 @@ def sync(
     ## Readers
 
     - Vision2Seq models from `models_dir/readers/`
-    - TrOCR, Donut, Florence-2 for OCR and document understanding
+    - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document
+    understanding
 
     ## Transcribers
 
@@ -242,7 +244,8 @@ async def asyncio_detailed(
     ## Readers
 
     - Vision2Seq models from `models_dir/readers/`
-    - TrOCR, Donut, Florence-2 for OCR and document understanding
+    - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document
+    understanding
 
     ## Transcribers
 
@@ -309,7 +312,8 @@ async def asyncio(
     ## Readers
 
     - Vision2Seq models from `models_dir/readers/`
-    - TrOCR, Donut, Florence-2 for OCR and document understanding
+    - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document
+    understanding
 
     ## Transcribers
 

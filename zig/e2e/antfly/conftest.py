@@ -1257,7 +1257,13 @@ def _data_command(
 
 class StatefulAntflyServer:
     def __init__(
-        self, binary: str, host: str, port: int, *, auth_enabled: bool = False
+        self,
+        binary: str,
+        host: str,
+        port: int,
+        *,
+        auth_enabled: bool = False,
+        data_config: dict | None = None,
     ):
         self.binary = binary
         self.host = host
@@ -1277,6 +1283,12 @@ class StatefulAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            self.data_config_path = None
+            if data_config is not None:
+                self.data_config_path = self.root / "data-config.json"
+                self.data_config_path.write_text(
+                    json.dumps(data_config), encoding="utf-8"
+                )
             self.replica_root = self.root / "data-replicas"
             self.metadata_log_path = self.root / "metadata.log"
             self.data_log_path = self.root / "data.log"
@@ -1343,6 +1355,8 @@ class StatefulAntflyServer:
             root=self.root,
             auth_enabled=self.auth_enabled,
         )
+        if self.data_config_path is not None:
+            data_command.extend(["--config", str(self.data_config_path)])
         self.data_proc = self.port_reservations.handoff_to(
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(
@@ -1468,7 +1482,7 @@ class StandaloneAntflyServer:
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
     ):
-        self.binary = binary
+        self.binary = resolve_binary_path(binary)
         self.host = host
         self.config_path = config_path
         self.storage_engine = storage_engine
@@ -1482,7 +1496,9 @@ class StandaloneAntflyServer:
             self.health_port = self.port_reservations.reserve() if metrics else None
             self.health_url = f"http://{host}:{self.health_port}" if metrics else None
             self.url = f"http://{host}:{port}"
-            self.api_url = antfly_public_api_url(self.url, binary=binary, root=api_root)
+            self.api_url = antfly_public_api_url(
+                self.url, binary=self.binary, root=api_root
+            )
             self.tempdir = tempfile.TemporaryDirectory(
                 prefix="antfly-zig-standalone-e2e-"
             )

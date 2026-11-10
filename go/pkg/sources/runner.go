@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Ownership includes previously attempted writes across interrupted inventories.
@@ -37,15 +38,30 @@ import (
 const maxOwnedSourceObjects = 1000000
 
 type Profile struct {
-	CatalogTable      string                `json:"catalog_table,omitempty"`
-	Version           int                   `json:"version"`
-	Endpoint          string                `json:"endpoint"`
-	DataPlaneTokenEnv string                `json:"data_plane_token_env,omitempty"`
-	Principals        []string              `json:"principals,omitempty"`
-	Connections       map[string]Connection `json:"connections"`
-	Sources           []Source              `json:"sources"`
+	LocalMigrations   map[string]LocalMigrationReceipt `json:"local_migrations,omitempty"`
+	CatalogTable      string                           `json:"catalog_table,omitempty"`
+	Version           int                              `json:"version"`
+	Endpoint          string                           `json:"endpoint"`
+	DataPlaneTokenEnv string                           `json:"data_plane_token_env,omitempty"`
+	Principals        []string                         `json:"principals,omitempty"`
+	Connections       map[string]Connection            `json:"connections"`
+	Sources           []Source                         `json:"sources"`
+}
+
+// Identity names the opaque prefix that scopes a source's row keys,
+// independent of its connection or config (see IdentityKey). Immutable once
+// set: Service rejects any later change.
+type Identity struct {
+	Namespace string `json:"namespace,omitempty"`
 }
 type Source struct {
+	Processing    *ProcessingDeclaration `json:"processing,omitempty"`
+	SearchVersion int                    `json:"search_version,omitempty"`
+	Artifacts     []ArtifactBinding      `json:"artifacts,omitempty"`
+	Streams       []SearchStream         `json:"streams,omitempty"`
+	// Publication defaults to native acquisition. Binary rows require a revision-enforcing
+	// fetch resolver, supplied by the source service or an embedding application.
+	Publication          string          `json:"publication,omitempty"`
 	ID                   string          `json:"id"`
 	Alias                string          `json:"alias"`
 	Connection           string          `json:"connection"`
@@ -53,8 +69,19 @@ type Source struct {
 	Config               json.RawMessage `json:"config"`
 	Permissions          *Permissions    `json:"permissions"`
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
+	Identity             Identity        `json:"identity,omitzero"`
 }
 type Runner struct {
+	// SourceID selects one source while retaining the complete profile/catalog.
+	// Filtering Profile.Sources would incorrectly retire unrelated bindings.
+	SourceID string
+
+	// Only Service's resolver opts in: checkMediaAccess proves current access
+	// and revision, including any policy imposed by an injected connector.
+	mediaReferenceAuthorizes bool
+	// MediaInventory publishes a compact authority generation at checkpoint boundaries.
+	MediaInventory        func(context.Context, Source, *Inventory, *Inventory) error
+	MediaReference        func(context.Context, Source, Request, Item) (MediaReference, error)
 	Profile               Profile
 	StateDir, CatalogPath string
 	Factory               Factory
@@ -79,6 +106,12 @@ func (r *Runner) Sync(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
+	return r.withStateLock(ctx, func() error { return r.syncLocked(ctx) })
+}
+
+// withStateLock serializes every mutation of a Runner's database ownership and
+// checkpoint files, including purge. Callbacks must not reacquire this lock.
+func (r *Runner) withStateLock(ctx context.Context, work func() error) error {
 	if err := os.MkdirAll(r.StateDir, 0700); err != nil {
 		return err
 	}
@@ -91,6 +124,10 @@ func (r *Runner) Sync(ctx context.Context) error {
 		return fmt.Errorf("source state is locked")
 	}
 	defer lock.Unlock()
+	return work()
+}
+
+func (r *Runner) syncLocked(ctx context.Context) error {
 	catalogTable := r.Profile.CatalogTable
 	if catalogTable == "" {
 		catalogTable = DefaultCatalogTable
@@ -149,8 +186,15 @@ func (r *Runner) Sync(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{ID: source.ID, Alias: alias, Table: source.Table, DocumentField: "grep", Filter: SourceFilter(source.ID), Status: "pending"}
-		if prior, ok := old[source.ID]; ok && prior.Table == source.Table {
+		binding := Binding{SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		if len(binding.Streams) == 0 && source.Publication != "media" {
+			binding.Streams = DefaultSearchStreams(source.SearchVersion)
+		}
+		binding.Publication = source.Publication
+		if binding.Publication == "" {
+			binding.Publication = "native"
+		}
+		if prior, ok := old[source.ID]; ok && prior.Table == source.Table && binding.SameRecordLayout(prior) {
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
 			binding.PublishedRevision = prior.PublishedRevision
@@ -175,6 +219,17 @@ func (r *Runner) Sync(ctx context.Context) error {
 		return err
 	}
 	for i, source := range r.Profile.Sources {
+		if r.SourceID != "" && source.ID != r.SourceID {
+			continue
+		}
+		if source.Processing != nil {
+			if err := r.Publisher.EnsureTable(ctx, source.Table); err != nil {
+				return err
+			}
+			if err := ReconcileProcessing(ctx, r.Publisher, source.Table, source.Processing); err != nil {
+				return err
+			}
+		}
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
 		catalog.Sources[i].ValidUntil = nil
@@ -217,7 +272,11 @@ func (r *Runner) validate() error {
 		return err
 	}
 	seen := map[string]bool{}
+	selected := r.SourceID == ""
 	for _, s := range r.Profile.Sources {
+		if s.ID == r.SourceID {
+			selected = true
+		}
 		catalogTable := r.Profile.CatalogTable
 		if catalogTable == "" {
 			catalogTable = DefaultCatalogTable
@@ -228,13 +287,31 @@ func (r *Runner) validate() error {
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
 		}
+		if err := ValidateProcessing(s.Processing); err != nil {
+			return err
+		}
+		if err := ValidateSearchBindings(s.SearchVersion, s.Streams, s.Artifacts); err != nil {
+			return err
+		}
+		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" && s.Publication != "native" {
+			return fmt.Errorf("publication must be native, text or media")
+		}
+		if s.Publication == "media" && r.MediaReference == nil && (r.SourceID == "" || r.SourceID == s.ID) {
+			return fmt.Errorf("media publication requires a revision-enforcing fetch resolver; use antfly-source serve")
+		}
 		seen[s.ID] = true
-		if _, ok := r.Profile.Connections[s.Connection]; !ok {
+		if _, ok := r.Profile.Connections[s.Connection]; !ok && (r.SourceID == "" || r.SourceID == s.ID) {
 			return fmt.Errorf("source connection is not configured")
 		}
 		if s.PermissionTTLSeconds != 0 && (s.PermissionTTLSeconds < 60 || s.PermissionTTLSeconds > 86400) {
 			return fmt.Errorf("permission TTL must be 60..86400 seconds")
 		}
+		if ns := s.Identity.Namespace; ns != "" && (len(ns) > 4096 || !utf8.ValidString(ns) || strings.ContainsAny(ns, "\x00\r\n")) {
+			return fmt.Errorf("invalid source identity namespace")
+		}
+	}
+	if !selected {
+		return fmt.Errorf("selected source is not configured")
 	}
 	return nil
 }
@@ -259,7 +336,12 @@ func canonicalID(id string) bool {
 // with the full Workspace service list; an exact match permits safe adoption.
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
+	source.Streams = nil // Search/producer bindings do not change acquired bytes.
+	source.Artifacts = nil
+	source.SearchVersion = 0
+	source.Processing = nil
 	source.PermissionTTLSeconds = 0
+	source.Identity = Identity{} // Row keying, not acquisition; see IdentityKey.
 	identity, err := json.Marshal(struct {
 		Source     Source
 		Connection Connection
@@ -271,7 +353,13 @@ func sourceConfigurationHash(source Source, connection Connection) (string, erro
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection) (int64, string, error) {
+func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection) (started int64, resultRevision string, failure error) {
+	phase := "load_state"
+	defer func() {
+		if failure != nil {
+			failure = &sourceSyncError{sourceID: s.ID, phase: phase, cause: failure}
+		}
+	}()
 	statePath := filepath.Join(r.StateDir, s.ID+".json")
 	identityConnection := connection
 	if connection.Provider == ProviderGoogleWorkspace {
@@ -314,6 +402,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, "", err
 	}
+	if err := restoreInventoryRelativeKeys(s, connection.Provider, state.Published); err != nil {
+		return 0, "", err
+	}
 	if state.Owned == nil {
 		state.Owned = map[string]string{}
 	}
@@ -330,11 +421,20 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := replayOwnership(journalPath, request.SourceNamespace, state.Owned); err != nil {
 		return 0, "", err
 	}
+	phase = "connect"
 	connector, err := r.Factory(ctx, connection)
 	if err != nil {
 		return 0, "", err
 	}
+	connector, err = publicationConnector(connector, s)
+	if err != nil {
+		return 0, "", err
+	}
 	if c, ok := connector.(*CollaborationConnector); ok {
+		// Pool immutable provider transports/token sources, never per-acquisition
+		// cursors, scope caches, or hydration state across logical sources.
+		run := c.newAcquisition()
+		c, connector = run, run
 		c.Baseline = state.Published
 		if r.Restart {
 			c.Baseline = nil
@@ -351,6 +451,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if r.Restart {
 		state.Pending = nil
 	}
+	phase = "enumerate"
 	if state.Pending == nil {
 		enumerationStarted := time.Now().Unix()
 		inventory, err := connector.Enumerate(ctx, request)
@@ -378,6 +479,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			return 0, "", err
 		}
 	}
+	if err := restoreInventoryRelativeKeys(s, connection.Provider, state.Pending); err != nil {
+		return 0, "", err
+	}
 	if !state.Pending.Authoritative || len(state.Pending.Objects) > sourceInventoryLimit(connection.Provider) {
 		return 0, "", fmt.Errorf("invalid persisted inventory authority")
 	}
@@ -388,11 +492,17 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		seenPending[item.ID] = true
 	}
+	phase = "validate_inventory"
 	if err := connector.ValidateInventory(ctx, request, *state.Pending); err != nil {
 		return 0, "", err
 	}
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
+	}
+	if r.MediaInventory != nil && s.Publication != "text" {
+		if err := r.MediaInventory(ctx, s, state.Pending, state.Published); err != nil {
+			return 0, "", err
+		}
 	}
 	if err := resetOwnershipJournal(journalPath); err != nil {
 		return 0, "", err
@@ -400,11 +510,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := r.Publisher.EnsureTable(ctx, s.Table); err != nil {
 		return 0, "", err
 	}
-	providerIDs := make([]string, 0, len(state.Pending.Objects))
-	for _, item := range state.Pending.Objects {
-		providerIDs = append(providerIDs, item.ID)
-	}
-	writer, err := NewSyncWriter(r.Publisher, s.Table, s.ID, providerIDs, state.Pending.Authoritative)
+	writer, err := NewSyncWriterWithIdentity(r.Publisher, s.Table, s.ID, s.Identity.Namespace, state.Pending.Objects, state.Pending.Authoritative)
 	if err != nil {
 		return 0, "", err
 	}
@@ -415,6 +521,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		sort.Strings(legacy)
 	}
+	phase = "publish"
 	selected := map[string]bool{}
 	var total int64
 	for _, item := range state.Pending.Objects {
@@ -422,20 +529,44 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			return 0, "", err
 		}
 		selected[item.ID] = true
-		data, err := connector.Read(ctx, request, item)
-		if err != nil {
-			return 0, "", err
-		}
-		total += int64(len(data))
-		if total > 10<<30 {
-			return 0, "", fmt.Errorf("source run exceeds 10 GiB")
-		}
 		item.Metadata = cloneSourceMetadata(item.Metadata)
 		item.Metadata["connection_id"] = s.Connection
-		doc, err := Normalize(s.ID, item, data, *s.Permissions, time.Now())
-		if err != nil {
-			return 0, "", err
+		var doc Document
+		if UsesNativeResource(s, item) {
+			if r.MediaReference == nil {
+				return 0, "", fmt.Errorf("native binary publication requires a source media service")
+			}
+			phase = "verify_media"
+			if !r.mediaReferenceAuthorizes {
+				if err := connector.CheckAccess(ctx, request, item); err != nil {
+					return 0, "", err
+				}
+			}
+			ref, err := r.MediaReference(ctx, s, request, item)
+			if err != nil {
+				return 0, "", err
+			}
+			doc, err = NormalizeMedia(s.ID, item, ref, *s.Permissions, time.Now())
+			if err != nil {
+				return 0, "", err
+			}
+		} else {
+			phase = "read_content"
+			data, err := connector.Read(ctx, request, item)
+			if err != nil {
+				return 0, "", err
+			}
+			total += int64(len(data))
+			if total > 10<<30 {
+				return 0, "", fmt.Errorf("source run exceeds 10 GiB")
+			}
+			doc, err = Normalize(s.ID, item, data, *s.Permissions, time.Now())
+			if err != nil {
+				return 0, "", err
+			}
 		}
+
+		phase = "publish"
 		if _, exists := state.Owned[item.ID]; !exists && len(state.Owned) >= maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget; complete reconciliation before selecting more items")
 		}
@@ -446,7 +577,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if len(state.Owned) > maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget")
 		}
-		key, err := RecordKey(s.ID, item.ID)
+		key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
 		if err != nil {
 			return 0, "", err
 		}
@@ -461,9 +592,11 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 	}
 	sort.Strings(absent)
+	phase = "validate_absence"
 	if err := connector.ValidateAbsentSources(ctx, request, absent); err != nil {
 		return 0, "", err
 	}
+	phase = "reconcile_deletions"
 	if _, err := writer.Finish(ctx); err != nil {
 		return 0, "", err
 	}
@@ -487,14 +620,17 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		digest := sha256.Sum256(raw)
 		revision = hex.EncodeToString(digest[:])
 	}
-	if c, ok := connector.(*CollaborationConnector); ok {
+	_, isCollaboration := connector.(*CollaborationConnector)
+	_, isDriveMedia := connector.(*driveMediaConnector)
+	if isCollaboration || isDriveMedia {
+		phase = "audit_permissions"
 		ttl := s.PermissionTTLSeconds
 		if ttl == 0 {
 			ttl = 900
 		}
 		checkedAt := time.Now()
 		auditCtx, cancel := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
-		err := c.ValidateInventory(auditCtx, request, *state.Pending)
+		err := connector.ValidateInventory(auditCtx, request, *state.Pending)
 		cancel()
 		if err != nil {
 			return 0, "", err
@@ -506,12 +642,18 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		// Slow audits must never extend the advertised maximum access age.
 		state.StartedAt = checkedAt.Unix()
 	}
+	phase = "commit_state"
 	state.Published = state.Pending
 	state.Pending = nil
 	state.AcquisitionID = ""
 	state.RecordFormat = 2
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
+	}
+	if r.MediaInventory != nil && s.Publication != "text" {
+		if err := r.MediaInventory(ctx, s, nil, state.Published); err != nil {
+			return 0, "", err
+		}
 	}
 	if err := resetOwnershipJournal(journalPath); err != nil {
 		return 0, "", err
@@ -591,4 +733,114 @@ func writeJSON(path string, value any, limit int64) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+// Drive media uses the same inventory, access checks and revision-checked binary
+// reads as GoogleConnector, bypassing collaboration's text/OCR extraction.
+func publicationConnector(connector Connector, source Source) (Connector, error) {
+	if source.Publication == "text" {
+		return connector, nil
+	}
+	if c, ok := connector.(*GoogleConnector); ok && c.ProviderName == ProviderGoogleDrive {
+		return &driveMediaConnector{GoogleConnector: c, sourceKind: c.ProviderName}, nil
+	}
+	if c, ok := connector.(*CollaborationConnector); ok {
+		config, err := decodeSourceConfig[CollaborationConfig](source.Config)
+		if err != nil {
+			return nil, err
+		}
+		if c.ProviderName != ProviderGoogleWorkspace || config.Resource != "drive" {
+			if source.Publication == "media" {
+				return nil, fmt.Errorf("mixed collaboration sources require native publication")
+			}
+			copy := *c
+			copy.NativeAttachments = true
+			return &copy, nil
+		}
+		if err := c.Validate(context.Background(), Request{Mode: ImportModeSource, Config: source.Config}); err != nil {
+			return nil, err
+		}
+		return &driveMediaConnector{GoogleConnector: c.drive(), sourceKind: ProviderGoogleWorkspace}, nil
+	}
+	return connector, nil
+}
+
+type driveMediaConnector struct {
+	*GoogleConnector
+	sourceKind string
+}
+
+// A materialized text snapshot remains usable after Drive changes. A media
+// reference does not: both acquisition and publication audits must prove that
+// the pinned revision can still be fetched, including when a digest is cached.
+func (c *driveMediaConnector) ValidateInventory(ctx context.Context, request Request, inventory Inventory) error {
+	if err := c.ValidateCachedSnapshot(ctx, request, inventory); err != nil {
+		return err
+	}
+	for _, item := range inventory.Objects {
+		if err := c.CheckMedia(ctx, request, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (Inventory, error) {
+	inventory, err := c.GoogleConnector.Enumerate(ctx, request)
+	if err != nil {
+		return inventory, err
+	}
+	for i := range inventory.Objects {
+		item := &inventory.Objects[i]
+		if c.sourceKind != "" {
+			item.SourceKind = c.sourceKind
+		}
+		if configString(item.Metadata, "export_mime_type") == "" {
+			continue
+		}
+		original := configString(item.Metadata, "mime_type")
+		switch original {
+		case "application/vnd.google-apps.document", "application/vnd.google-apps.presentation":
+		default:
+			return Inventory{}, fmt.Errorf("unsupported native Drive export %s", original)
+		}
+		item.Metadata = cloneSourceMetadata(item.Metadata)
+		item.Metadata["original_mime_type"] = original
+		item.Metadata["export_mime_type"] = "application/pdf"
+		item.Metadata["mime_type"] = "application/pdf"
+		if request.Preview {
+			continue
+		} // Review descriptors without exporting originals.
+		data, err := c.GoogleConnector.Read(ctx, request, *item)
+		if err != nil {
+			return Inventory{}, err
+		}
+		item.Size = int64(len(data))
+		item.Metadata["size_is_upper_bound"] = false
+		item.Metadata["representation_sha256"] = fmt.Sprintf("%x", sha256.Sum256(data))
+	}
+	return inventory, nil
+}
+
+func UsesNativeResource(source Source, item Item) bool {
+	if source.Publication == "media" {
+		return true
+	}
+	if source.Publication == "text" {
+		return false
+	}
+	if item.SourceKind != ProviderS3 && item.SourceKind != ProviderLocal && item.SourceKind != ProviderGCS && item.SourceKind != ProviderGoogleDrive && item.SourceKind != ProviderGoogleWorkspace && configString(item.Metadata, "attachment_id") == "" {
+		return false
+	}
+	if configString(item.Metadata, "acquisition") != "" && configString(item.Metadata, "attachment_id") == "" {
+		return false
+	}
+	typ := strings.ToLower(strings.Split(MediaMIME(item), ";")[0])
+	return !strings.HasPrefix(typ, "text/") && typ != "application/json" && typ != "application/xml"
+}
+
+// PublicationConnector selects original-binary acquisition for media sources.
+// Provider authentication and resource allowlists remain the runtime's job.
+func PublicationConnector(connector Connector, source Source) (Connector, error) {
+	return publicationConnector(connector, source)
 }

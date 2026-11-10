@@ -140,6 +140,9 @@ pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     max_body_size: usize = 10 * 1024 * 1024,
+    /// Optional ceiling for explicitly limited buffered routes. The fallback
+    /// limit for routes without an override remains max_body_size.
+    max_route_body_size: ?usize = null,
     /// Optional ceiling for explicitly bounded raw-streaming routes. It does
     /// not enlarge ordinary bodies or the process-wide buffering budget.
     max_streamed_body_size: ?usize = null,
@@ -204,7 +207,7 @@ pub const ServerConfig = struct {
     /// in-flight requests a client can have on one connection. 0 = use default (100).
     h2_max_concurrent_streams: u32 = 100,
     /// Aggregate request-body bytes retained across every HTTP/1 and HTTP/2
-    /// connection. Values below max_body_size are raised to it so one valid
+    /// connection. Values below the buffered route ceiling are raised to it so one valid
     /// request can always complete; 0 selects that minimum.
     request_body_buffer_budget_bytes: usize = 64 * 1024 * 1024,
     /// Reserved for future server-side TLS support. Zig 0.16 only provides
@@ -216,6 +219,10 @@ pub const ServerConfig = struct {
     /// Resolves every sentinel/default and enforces dependent bounds. Shared
     /// HttpRuntime owners must size their lanes from this value so the runtime
     /// and Server cannot interpret the same listener configuration differently.
+    pub fn bufferedBodyCeiling(config: @This()) usize {
+        return @max(config.max_body_size, config.max_route_body_size orelse config.max_body_size);
+    }
+
     pub fn normalized(config: @This()) @This() {
         var resolved = config;
         if (resolved.max_connections == 0) resolved.max_connections = 1000;
@@ -224,7 +231,7 @@ pub const ServerConfig = struct {
         // Do not advertise more simultaneous streams on one connection than
         // this listener can ever publish to its bounded handler lane.
         resolved.h2_max_concurrent_streams = @min(resolved.h2_max_concurrent_streams, resolved.max_request_tasks);
-        resolved.request_body_buffer_budget_bytes = @max(resolved.request_body_buffer_budget_bytes, resolved.max_body_size);
+        resolved.request_body_buffer_budget_bytes = @max(resolved.request_body_buffer_budget_bytes, resolved.bufferedBodyCeiling());
         resolved.accept_error_backoff_initial_ms = @max(resolved.accept_error_backoff_initial_ms, 1);
         resolved.accept_error_backoff_max_ms = @max(resolved.accept_error_backoff_max_ms, resolved.accept_error_backoff_initial_ms);
         return resolved;
@@ -261,9 +268,12 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         error.BodyCapacityExceeded => 429,
         error.EndOfStream,
         error.SyntaxError,
+        error.UnexpectedEndOfInput,
         error.UnexpectedToken,
         error.MissingField,
         error.UnknownField,
+        error.DuplicateField,
+        error.InvalidEnumTag,
         error.InvalidRequest,
         => 400,
         else => 500,
@@ -280,6 +290,23 @@ fn h2BodyAdmissionErrorStatus(err: anyerror) ?u16 {
 
 fn parserErrorStatus(reason: ParserErrorReason) u16 {
     return if (reason == .body_too_large) 413 else 400;
+}
+
+/// A handler error that reaches the server names the problem when the error
+/// identifies one. These are static strings: the error path never allocates
+/// and never echoes request content.
+fn routeErrorBodyFor(code: u16, err: ?anyerror) []const u8 {
+    if (code == 400) if (err) |e| switch (e) {
+        error.SyntaxError => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: syntax error in request body\"}",
+        error.EndOfStream, error.UnexpectedEndOfInput => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: request body ended unexpectedly\"}",
+        error.UnexpectedToken => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field has the wrong type\"}",
+        error.MissingField => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a required field is missing\"}",
+        error.UnknownField => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: unknown field in request body\"}",
+        error.DuplicateField => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field appears more than once\"}",
+        error.InvalidEnumTag => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field has an unsupported value\"}",
+        else => {},
+    };
+    return routeErrorBody(code);
 }
 
 fn routeErrorBody(code: u16) []const u8 {
@@ -307,7 +334,7 @@ fn hasCompleteBufferedH1Request(allocator: Allocator, input: []const u8, config:
     // In particular, do not reserve the declared Content-Length before the
     // complete body is known to be buffered.
     probe.store_body = false;
-    probe.max_body_size = config.max_body_size;
+    probe.max_body_size = config.bufferedBodyCeiling();
     probe.max_headers = config.max_headers;
     _ = probe.feed(input) catch return false;
     return probe.isComplete();
@@ -2213,6 +2240,7 @@ pub const Server = struct {
         var parser = Parser.init(self.allocator);
         defer parser.deinit();
         parser.max_body_size = self.config.max_body_size;
+        parser.max_route_body_size = self.config.max_route_body_size;
         parser.max_headers = self.config.max_headers;
         parser.body_budget = &self.body_budget;
         if (self.router.hasBodyLimits()) {
@@ -2497,7 +2525,7 @@ pub const Server = struct {
                 // response would corrupt the connection. Closing the
                 // connection is the only valid terminal action.
                 if (ctx.h1_stream_sent) return;
-                return self.sendError(&sock, status);
+                return self.sendErrorBody(&sock, status, routeErrorBodyFor(status, err));
             };
             if (application.status) |status| return self.sendError(&sock, status);
             var response = application.response.?;
@@ -2608,7 +2636,7 @@ pub const Server = struct {
         const ceiling = if (self.router.requestBodyStreaming(method, path) == .raw)
             self.config.max_streamed_body_size orelse self.config.max_body_size
         else
-            self.config.max_body_size;
+            self.config.bufferedBodyCeiling();
         return @min(route_limit, ceiling);
     }
 
@@ -3216,7 +3244,7 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                 return;
             };
         }
@@ -3242,7 +3270,7 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                 return;
             };
         } else {
@@ -3256,7 +3284,7 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                     return;
                 };
             } else if (self.global_handler) |global_handler| {
@@ -3265,7 +3293,7 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                     return;
                 };
             } else {
@@ -3324,7 +3352,10 @@ pub const Server = struct {
 
     /// Sends the same safe JSON error envelope used by HTTP/1.
     fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
-        const body = routeErrorBody(code);
+        return self.sendH2ErrorBody(h2, writer, stream_id, code, routeErrorBody(code));
+    }
+
+    fn sendH2ErrorBody(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16, body: []const u8) !void {
         var length_buf: [32]u8 = undefined;
         const length = try std.fmt.bufPrint(&length_buf, "{d}", .{body.len});
         var extra = [_]hpack.HeaderEntry{
@@ -3345,6 +3376,13 @@ pub const Server = struct {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
         try self.sendH2Error(h2, writer, stream_id, code);
+    }
+
+    /// Route-error variant: the body names the handler error when it can.
+    fn sendH2RouteErrorLocked(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16, err: anyerror) !void {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+        try self.sendH2ErrorBody(h2, writer, stream_id, code, routeErrorBodyFor(code, err));
     }
 
     /// StreamManager stores Stream allocations separately from its hash map.
@@ -3451,10 +3489,14 @@ pub const Server = struct {
 
     /// Sends an error response.
     fn sendError(self: *Self, socket: *Socket, code: u16) !void {
+        return self.sendErrorBody(socket, code, routeErrorBody(code));
+    }
+
+    fn sendErrorBody(self: *Self, socket: *Socket, code: u16, body: []const u8) !void {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
-        resp.body = routeErrorBody(code);
+        resp.body = body;
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
         // Every sendError caller terminates the HTTP/1 connection. Make that
         // lifecycle explicit so clients do not return the socket to a pool.
@@ -3955,6 +3997,23 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
         routeErrorBody(400),
     );
+    try std.testing.expectEqual(@as(?u16, 400), routeErrorStatus(error.UnexpectedEndOfInput));
+    try std.testing.expectEqual(@as(?u16, 400), routeErrorStatus(error.InvalidEnumTag));
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: syntax error in request body\"}",
+        routeErrorBodyFor(400, error.SyntaxError),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a required field is missing\"}",
+        routeErrorBodyFor(400, error.MissingField),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field has the wrong type\"}",
+        routeErrorBodyFor(400, error.UnexpectedToken),
+    );
+    // Errors without a specific description keep the generic envelope.
+    try std.testing.expectEqualStrings(routeErrorBody(400), routeErrorBodyFor(400, error.InvalidRequest));
+    try std.testing.expectEqualStrings(routeErrorBody(500), routeErrorBodyFor(500, error.SyntaxError));
     try std.testing.expectEqualStrings(
         "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
         routeErrorBody(404),
@@ -4053,6 +4112,46 @@ test "route body limits resolve before transport body admission" {
 
     try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/bounded/7?x=1"));
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));
+}
+
+test "privacy buffered route opt-in raises only explicitly limited bodies" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .max_body_size = 4,
+        .max_route_body_size = 16,
+        .request_body_buffer_budget_bytes = 0,
+    });
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postWithBodyLimit("/privacy", 32, handler);
+    try server.postWithBodyLimit("/small", 2, handler);
+    try server.post("/ordinary", handler);
+    try std.testing.expectEqual(@as(usize, 16), server.config.request_body_buffer_budget_bytes);
+    try std.testing.expectEqual(@as(?usize, 16), Server.resolveRequestBodyLimit(&server, .POST, "/privacy"));
+    try std.testing.expectEqual(@as(?usize, 2), Server.resolveRequestBodyLimit(&server, .POST, "/small"));
+    try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/ordinary"));
+    var parser = Parser.init(std.testing.allocator);
+    defer parser.deinit();
+    parser.max_body_size = server.config.max_body_size;
+    parser.max_route_body_size = server.config.max_route_body_size;
+    parser.request_body_limit_context = &server;
+    parser.request_body_limit_resolver = Server.resolveRequestBodyLimit;
+    const request = "POST /privacy HTTP/1.1\r\nHost: local\r\nContent-Length: 10\r\n\r\n0123456789";
+    _ = try parser.feed(request);
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expect(hasCompleteBufferedH1Request(std.testing.allocator, request, server.config));
+    var ordinary = Parser.init(std.testing.allocator);
+    defer ordinary.deinit();
+    ordinary.max_body_size = server.config.max_body_size;
+    ordinary.max_route_body_size = server.config.max_route_body_size;
+    ordinary.request_body_limit_context = &server;
+    ordinary.request_body_limit_resolver = Server.resolveRequestBodyLimit;
+    _ = try ordinary.feed("POST /ordinary HTTP/1.1\r\nHost: local\r\nContent-Length: 10\r\n\r\n0123456789");
+    try std.testing.expect(ordinary.isError());
+    try std.testing.expectEqual(.body_too_large, ordinary.error_reason);
 }
 
 test "attachment body streaming requires route opt-in and framed content type" {

@@ -19,8 +19,55 @@ pub const db_mod = @import("../storage/db/selected_root.zig").db;
 pub const managed_embedder = @import("../inference/managed_embedder.zig");
 pub const document_content_hash = @import("../storage/db/document_content_hash.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
-pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentConfig) void {
+/// Deterministic topological order, including chunk -> media-output -> chunk
+/// pipelines. Kind/name order only breaks ties between independent producers.
+/// External dependencies are left to catalog validation or the installed DB.
+pub fn sortArtifactEnrichmentsByDependency(alloc: std.mem.Allocator, configs: []db_mod.types.EnrichmentConfig) !void {
+    if (configs.len < 2) return;
     std.mem.sort(db_mod.types.EnrichmentConfig, configs, {}, artifactEnrichmentLessThan);
+    var names: std.StringHashMapUnmanaged(usize) = .empty;
+    defer names.deinit(alloc);
+    for (configs, 0..) |cfg, i| {
+        const entry = try names.getOrPut(alloc, cfg.name);
+        if (!entry.found_existing) entry.value_ptr.* = i;
+    }
+    const degrees = try alloc.alloc(usize, configs.len);
+    defer alloc.free(degrees);
+    @memset(degrees, 0);
+    const edges = try alloc.alloc(std.ArrayListUnmanaged(usize), configs.len);
+    defer alloc.free(edges);
+    for (edges) |*edge| edge.* = .empty;
+    defer for (edges) |*edge| edge.deinit(alloc);
+    for (configs, 0..) |cfg, i| {
+        if (cfg.source_artifact_name.len == 0) continue;
+        const parent = names.get(cfg.source_artifact_name) orelse continue;
+        try edges[parent].append(alloc, i);
+        degrees[i] += 1;
+    }
+    const Order = struct {
+        fn compare(_: void, left: usize, right: usize) std.math.Order {
+            return std.math.order(left, right);
+        }
+    };
+    var ready = std.PriorityQueue(usize, void, Order.compare).initContext({});
+    defer ready.deinit(alloc);
+    try ready.ensureTotalCapacity(alloc, configs.len);
+    for (degrees, 0..) |degree, i| if (degree == 0) {
+        try ready.push(alloc, i);
+    };
+    const ordered = try alloc.alloc(db_mod.types.EnrichmentConfig, configs.len);
+    defer alloc.free(ordered);
+    var count: usize = 0;
+    while (ready.pop()) |i| {
+        ordered[count] = configs[i];
+        count += 1;
+        for (edges[i].items) |child| {
+            degrees[child] -= 1;
+            if (degrees[child] == 0) try ready.push(alloc, child);
+        }
+    }
+    if (count != configs.len) return error.InvalidEnrichmentConfig;
+    @memcpy(configs, ordered);
 }
 
 pub fn collectArtifactEnrichmentsFromValueWithOptions(
@@ -154,6 +201,15 @@ pub fn validateArtifactEnrichmentConfigs(
                 }
             },
             .asset => {
+                var producer = try @import("../storage/db/enrichment/asset_producer.zig").parseProducerConfig(alloc, cfg.producer_json);
+                defer producer.deinit(alloc);
+                if (producer.type == .media_output) {
+                    // Media-output projections consume model-aware chunk
+                    // passes. Ordinary asset dependencies remain asset-only.
+                    const upstream = findArtifactEnrichmentConfig(configs, .chunk, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                    try enrichment_config_validation.validateMediaOutputSource(alloc, cfg.producer_json, upstream.chunker_json, upstream.source_artifact_name);
+                    continue;
+                }
                 // Walk the asset-consumes-asset chain: every upstream must
                 // resolve to an admitted asset, and the chain must terminate
                 // without revisiting this config (self-reference is the
@@ -166,6 +222,7 @@ pub fn validateArtifactEnrichmentConfigs(
                     if (findArtifactEnrichmentConfig(configs, .group, current) != null) break;
                     const upstream = findArtifactEnrichmentConfig(configs, .asset, current) orelse
                         return error.InvalidEnrichmentConfig;
+                    if (try enrichment_config_validation.assetSourceChainEndsHere(alloc, upstream.producer_json)) break;
                     current = upstream.source_artifact_name;
                     hops += 1;
                     if (hops > configs.len) return error.InvalidEnrichmentConfig;
@@ -213,6 +270,7 @@ pub fn artifactEnrichmentConfigsEqual(
         std.mem.eql(u8, a.field, b.field) and
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.embedding_input == b.embedding_input and
         a.expected_dims == b.expected_dims and
         std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and

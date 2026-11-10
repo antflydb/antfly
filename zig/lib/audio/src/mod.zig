@@ -145,6 +145,8 @@ const Complex = struct { re: f64, im: f64 };
 
 pub const NormalizationType = enum { whisper, simple };
 
+pub const MelScale = enum { htk, slaney };
+
 pub const AudioConfig = struct {
     sample_rate: u32,
     n_fft: u32,
@@ -152,6 +154,8 @@ pub const AudioConfig = struct {
     n_mels: u32,
     chunk_length_s: u32,
     normalization: NormalizationType,
+    mel_scale: MelScale = .htk,
+    center: bool = false,
 };
 
 pub const Audio = struct {
@@ -308,6 +312,14 @@ pub const DecodeOptions = struct {
     file_name_hint: ?[]const u8 = null,
 };
 
+/// Borrowed encoded audio and its preprocessing contract. Keep these together
+/// through admission, queueing and decoding; sniffing alone may select a
+/// different codec than the caller's explicit format or MIME declaration.
+pub const EncodedClip = struct {
+    bytes: []const u8,
+    decode_options: DecodeOptions = .{},
+};
+
 /// Resolve the encoded format using the same hint precedence as decoding.
 /// Header-only admission must use this before interpreting format-specific data.
 pub fn detectFormatWithOptions(audio_bytes: []const u8, options: DecodeOptions) ?EncodedFormat {
@@ -381,71 +393,71 @@ pub fn detectFormatFromMime(mime: []const u8) ?EncodedFormat {
     const normalized = normalizeMime(mime);
     if (normalized.len == 0) return null;
 
-    if (std.mem.eql(u8, normalized, "audio/wav") or
-        std.mem.eql(u8, normalized, "audio/x-wav") or
-        std.mem.eql(u8, normalized, "audio/wave"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/wav") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-wav") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/wave"))
         return .wav;
 
-    if (std.mem.eql(u8, normalized, "audio/mpeg") or
-        std.mem.eql(u8, normalized, "audio/mp3"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/mpeg") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/mp3"))
         return .mp3;
 
-    if (std.mem.eql(u8, normalized, "audio/aac") or
-        std.mem.eql(u8, normalized, "audio/x-aac") or
-        std.mem.eql(u8, normalized, "audio/mp4a-latm"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/aac") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aac") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/mp4a-latm"))
         return .aac;
 
-    if (std.mem.eql(u8, normalized, "audio/mp4") or
-        std.mem.eql(u8, normalized, "audio/m4a") or
-        std.mem.eql(u8, normalized, "audio/x-m4a") or
-        std.mem.eql(u8, normalized, "audio/x-m4b") or
-        std.mem.eql(u8, normalized, "audio/x-m4p") or
-        std.mem.eql(u8, normalized, "audio/quicktime") or
-        std.mem.eql(u8, normalized, "video/quicktime") or
-        std.mem.eql(u8, normalized, "application/mp4") or
-        std.mem.eql(u8, normalized, "video/mp4"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/mp4") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/m4a") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-m4a") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-m4b") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-m4p") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/quicktime") or
+        std.ascii.eqlIgnoreCase(normalized, "video/quicktime") or
+        std.ascii.eqlIgnoreCase(normalized, "application/mp4") or
+        std.ascii.eqlIgnoreCase(normalized, "video/mp4"))
         return .mp4;
 
-    if (std.mem.eql(u8, normalized, "audio/flac") or
-        std.mem.eql(u8, normalized, "audio/x-flac"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/flac") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-flac"))
         return .flac;
 
-    if (std.mem.eql(u8, normalized, "audio/aiff") or
-        std.mem.eql(u8, normalized, "audio/x-aiff") or
-        std.mem.eql(u8, normalized, "audio/aif") or
-        std.mem.eql(u8, normalized, "audio/x-aif") or
-        std.mem.eql(u8, normalized, "audio/aifc") or
-        std.mem.eql(u8, normalized, "audio/x-aifc"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/aiff") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aiff") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/aif") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aif") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/aifc") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aifc"))
         return .aiff;
 
-    if (std.mem.eql(u8, normalized, "audio/caf") or
-        std.mem.eql(u8, normalized, "audio/x-caf"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/caf") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-caf"))
         return .caf;
 
-    if (std.mem.eql(u8, normalized, "audio/basic") or
-        std.mem.eql(u8, normalized, "audio/au") or
-        std.mem.eql(u8, normalized, "audio/x-au") or
-        std.mem.eql(u8, normalized, "audio/snd") or
-        std.mem.eql(u8, normalized, "audio/x-snd"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/basic") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/au") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-au") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/snd") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-snd"))
         return .au;
 
-    if (std.mem.eql(u8, normalized, "audio/opus"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/opus"))
         return .opus;
 
-    if (std.mem.eql(u8, normalized, "audio/ogg") or
-        std.mem.eql(u8, normalized, "application/ogg"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/ogg") or
+        std.ascii.eqlIgnoreCase(normalized, "application/ogg"))
     {
         if (std.mem.indexOf(u8, mime, "opus") != null) return .opus;
         return .ogg;
     }
 
-    if (std.mem.eql(u8, normalized, "audio/vorbis")) return .ogg;
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/vorbis")) return .ogg;
 
-    if (std.mem.eql(u8, normalized, "audio/webm") or
-        std.mem.eql(u8, normalized, "video/webm") or
-        std.mem.eql(u8, normalized, "audio/x-matroska") or
-        std.mem.eql(u8, normalized, "video/x-matroska") or
-        std.mem.eql(u8, normalized, "video/matroska"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/webm") or
+        std.ascii.eqlIgnoreCase(normalized, "video/webm") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-matroska") or
+        std.ascii.eqlIgnoreCase(normalized, "video/x-matroska") or
+        std.ascii.eqlIgnoreCase(normalized, "video/matroska"))
         return .webm;
 
     return null;
@@ -1088,12 +1100,20 @@ pub fn logMelSpectrogramWithConfig(
 
     const min_samples = config.chunk_length_s * config.sample_rate;
     const padded_len = @max(samples.len, min_samples);
-    const padded = try allocator.alloc(f32, padded_len);
+    const padding = if (config.center) n_fft / 2 else 0;
+    const padded = try allocator.alloc(f32, padded_len + 2 * padding);
     defer allocator.free(padded);
-    @memcpy(padded[0..samples.len], samples);
-    @memset(padded[samples.len..], 0);
+    @memcpy(padded[padding..][0..samples.len], samples);
+    @memset(padded[padding + samples.len .. padding + padded_len], 0);
+    if (config.center) {
+        const body = padded[padding..][0..padded_len];
+        for (0..padding) |i| {
+            padded[i] = body[reflectSampleIndex(@as(isize, @intCast(i)) - @as(isize, @intCast(padding)), padded_len)];
+            padded[padding + padded_len + i] = body[reflectSampleIndex(@intCast(padded_len + i), padded_len)];
+        }
+    }
 
-    const filters = try melFilterbank(allocator, n_mels, n_fft, config.sample_rate);
+    const filters = try melFilterbankWithScale(allocator, n_mels, n_fft, config.sample_rate, 0, 0, config.mel_scale);
     defer allocator.free(filters);
 
     const window = try allocator.alloc(f32, n_fft);
@@ -1109,12 +1129,20 @@ pub fn logMelSpectrogramWithConfig(
     const output = try allocator.alloc(f32, n_mels * max_frames);
     @memset(output, 0);
 
-    const actual_frames = @min((padded_len - n_fft) / hop + 1, max_frames);
+    // Centered STFT has one extra end frame; Whisper drops that frame.
+    const actual_frames = if (config.center) @min(padded_len / hop, max_frames) else @min((padded_len - n_fft) / hop + 1, max_frames);
     const magnitudes = try allocator.alloc(f32, n_freq);
     defer allocator.free(magnitudes);
 
     for (0..actual_frames) |frame| {
         const start = frame * hop;
+        // A short clip is zero padded to the complete encoder context. Avoid
+        // transforming windows wholly inside that padding; their spectrum is
+        // exactly zero. Keep reflected boundary windows on the normal path.
+        if (start >= padding + samples.len and start + n_fft <= padding + padded_len) {
+            for (0..n_mels) |m| output[m * max_frames + frame] = 1e-10;
+            continue;
+        }
         try fft_plan.powerSpectrumWindowed(padded[start .. start + n_fft], window, magnitudes);
 
         for (0..n_mels) |m| {
@@ -1150,22 +1178,36 @@ pub fn melFilterbankWithRange(
     min_hz: f32,
     max_hz: f32,
 ) ![]f32 {
+    return melFilterbankWithScale(allocator, n_mels, n_fft, sample_rate, min_hz, max_hz, .htk);
+}
+
+pub fn melFilterbankWithScale(
+    allocator: std.mem.Allocator,
+    n_mels: u32,
+    n_fft: u32,
+    sample_rate: u32,
+    min_hz: f32,
+    max_hz: f32,
+    scale: MelScale,
+) ![]f32 {
     const n_freq = n_fft / 2 + 1;
     const filters = try allocator.alloc(f32, n_mels * n_freq);
+    errdefer allocator.free(filters);
     @memset(filters, 0);
 
     const sr_f: f32 = @floatFromInt(sample_rate);
     const fft_f: f32 = @floatFromInt(n_fft);
 
-    const mel_low = hzToMel(min_hz);
-    const mel_high = hzToMel(if (max_hz > 0) @min(max_hz, sr_f / 2.0) else sr_f / 2.0);
+    const mel_low = if (scale == .slaney) hzToSlaneyMel(min_hz) else hzToMel(min_hz);
+    const high_hz = if (max_hz > 0) @min(max_hz, sr_f / 2.0) else sr_f / 2.0;
+    const mel_high = if (scale == .slaney) hzToSlaneyMel(high_hz) else hzToMel(high_hz);
 
     const n_points = n_mels + 2;
     const mel_points = try allocator.alloc(f32, n_points);
     defer allocator.free(mel_points);
     for (0..n_points) |i| {
         const mel = mel_low + @as(f32, @floatFromInt(i)) * (mel_high - mel_low) / @as(f32, @floatFromInt(n_points - 1));
-        mel_points[i] = melToHz(mel);
+        mel_points[i] = if (scale == .slaney) slaneyMelToHz(mel) else melToHz(mel);
     }
 
     const bin_points = try allocator.alloc(f32, n_points);
@@ -1199,6 +1241,23 @@ pub fn melFilterbankWithRange(
 
 fn melFilterbank(allocator: std.mem.Allocator, n_mels: u32, n_fft: u32, sample_rate: u32) ![]f32 {
     return melFilterbankWithRange(allocator, n_mels, n_fft, sample_rate, 0, 0);
+}
+
+/// Reflect padding excludes the endpoint, as in torch.stft(center=true).
+pub fn reflectSampleIndex(index: isize, len: usize) usize {
+    if (len <= 1) return 0;
+    if (index >= 0 and index < len) return @intCast(index);
+    const period: isize = @intCast(2 * (len - 1));
+    const wrapped = @mod(index, period);
+    return @intCast(if (wrapped < len) wrapped else period - wrapped);
+}
+
+fn hzToSlaneyMel(hz: f32) f32 {
+    return if (hz < 1000) hz / (200.0 / 3.0) else 15.0 + @log(hz / 1000.0) * (27.0 / @log(6.4));
+}
+
+fn slaneyMelToHz(mel: f32) f32 {
+    return if (mel < 15) mel * (200.0 / 3.0) else 1000.0 * @exp((mel - 15.0) * (@log(6.4) / 27.0));
 }
 
 fn hzToMel(hz: f32) f32 {
@@ -1418,11 +1477,23 @@ pub const FftPlan = struct {
     n_freq: usize,
     m: usize,
     use_bluestein: bool,
+    mixed400_twiddles: []Complex = &.{},
     chirp: []Complex,
     kernel_fft: []Complex,
     work: []Complex,
 
     pub fn init(allocator: std.mem.Allocator, n: usize) !FftPlan {
+        // Whisper factors as 16 * 5 * 5, avoiding two 1024-point FFTs.
+        if (n == 400) {
+            const twiddles = try allocator.alloc(Complex, n);
+            errdefer allocator.free(twiddles);
+            const work = try allocator.alloc(Complex, n);
+            for (twiddles, 0..) |*value, k| {
+                const angle = -2 * std.math.pi * @as(f64, @floatFromInt(k)) / 400;
+                value.* = .{ .re = @cos(angle), .im = @sin(angle) };
+            }
+            return .{ .n = n, .n_freq = 201, .m = n, .use_bluestein = false, .mixed400_twiddles = twiddles, .chirp = &.{}, .kernel_fft = &.{}, .work = work };
+        }
         if (std.math.isPowerOfTwo(n)) {
             const work = try allocator.alloc(Complex, n);
             errdefer allocator.free(work);
@@ -1471,6 +1542,7 @@ pub const FftPlan = struct {
     }
 
     pub fn deinit(self: *FftPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.mixed400_twiddles);
         allocator.free(self.chirp);
         allocator.free(self.kernel_fft);
         allocator.free(self.work);
@@ -1486,6 +1558,10 @@ pub const FftPlan = struct {
         std.debug.assert(window.len == self.n);
         std.debug.assert(out.len >= self.n_freq);
 
+        if (self.mixed400_twiddles.len != 0) {
+            try self.powerSpectrum400(frame, window, out);
+            return;
+        }
         @memset(self.work, .{ .re = 0, .im = 0 });
         if (!self.use_bluestein) {
             for (0..self.n) |i| {
@@ -1518,7 +1594,57 @@ pub const FftPlan = struct {
             out[k] = @floatCast(spectrum.re * spectrum.re + spectrum.im * spectrum.im);
         }
     }
+    fn powerSpectrum400(self: *FftPlan, frame: []const f32, window: []const f32, out: []f32) !void {
+        const tw = self.mixed400_twiddles;
+        for (0..25) |r| {
+            var values: [16]Complex = undefined;
+            for (&values, 0..) |*value, j| value.* = .{ .re = @floatCast(frame[j * 25 + r] * window[j * 25 + r]), .im = 0 };
+            try fftComplex(&values, false);
+            for (values, 0..) |value, p| self.work[p * 25 + r] = complexMul(value, tw[r * p]);
+        }
+        for (0..16) |p| {
+            var intermediate: [25]Complex = undefined;
+            for (0..5) |r| {
+                var values: [5]Complex = undefined;
+                for (&values, 0..) |*value, j| value.* = self.work[p * 25 + j * 5 + r];
+                fftFive(&values);
+                for (values, 0..) |value, q| intermediate[q * 5 + r] = complexMul(value, tw[16 * q * r]);
+            }
+            for (0..5) |q| {
+                var values: [5]Complex = intermediate[q * 5 ..][0..5].*;
+                fftFive(&values);
+                for (values, 0..) |value, j| {
+                    const k = p + 16 * (q + 5 * j);
+                    if (k < self.n_freq) out[k] = @floatCast(value.re * value.re + value.im * value.im);
+                }
+            }
+        }
+    }
 };
+
+fn complexScale(value: Complex, scale: f64) Complex {
+    return .{ .re = value.re * scale, .im = value.im * scale };
+}
+
+fn fftFive(values: *[5]Complex) void {
+    const a = complexAdd(values[1], values[4]);
+    const b = complexAdd(values[2], values[3]);
+    const c = complexSub(values[1], values[4]);
+    const d = complexSub(values[2], values[3]);
+    const c1 = 0.3090169943749474241;
+    const c2 = -0.8090169943749474241;
+    const s1 = 0.9510565162951535721;
+    const s2 = 0.5877852522924731292;
+    const t0 = complexAdd(values[0], complexAdd(complexScale(a, c1), complexScale(b, c2)));
+    const t1 = complexAdd(values[0], complexAdd(complexScale(a, c2), complexScale(b, c1)));
+    const odd_first = complexAdd(complexScale(c, s1), complexScale(d, s2));
+    const odd_second = complexSub(complexScale(c, s2), complexScale(d, s1));
+    values[0] = complexAdd(values[0], complexAdd(a, b));
+    values[1] = complexAdd(t0, .{ .re = odd_first.im, .im = -odd_first.re });
+    values[4] = complexSub(t0, .{ .re = odd_first.im, .im = -odd_first.re });
+    values[2] = complexAdd(t1, .{ .re = odd_second.im, .im = -odd_second.re });
+    values[3] = complexSub(t1, .{ .re = odd_second.im, .im = -odd_second.re });
+}
 
 fn fftComplex(values: []Complex, inverse: bool) !void {
     if (values.len == 0) return;
@@ -1654,7 +1780,7 @@ fn maxValueSimd(values: []const f32) f32 {
 
 fn clampScaleWhisper(values: []f32, max_val: f32) void {
     const floor_val = max_val - 8.0;
-    const offset_val = max_val - 4.0;
+    const offset_val: f32 = -4.0;
     const floor_vec: F32xN = @splat(floor_val);
     const offset_vec: F32xN = @splat(offset_val);
     const scale_vec: F32xN = @splat(0.25);
@@ -3490,4 +3616,77 @@ test "streaming audio Ogg chains reset codecs and preserve independent segment c
         compare.stop = true;
         try std.testing.expectError(error.Cancelled, streaming.visit(a, bytes, .{}, .{ .context = &compare, .write = Compare.write }));
     }
+}
+
+/// Shared independent reference check for FFT and system BLAS implementations.
+/// Only instantiated by test builds.
+pub const whisper_reference_test = @import("whisper_reference_test.zig");
+
+test "Whisper FFT features match independent centered Slaney reference at two amplitudes" {
+    const Extract = struct {
+        fn run(alloc: std.mem.Allocator, samples: []const f32, bins: u32) ![]f32 {
+            return logMelSpectrogramWithConfig(alloc, samples, .{
+                .sample_rate = 16000,
+                .n_fft = 400,
+                .hop_length = 160,
+                .n_mels = bins,
+                .chunk_length_s = 1,
+                .normalization = .whisper,
+                .mel_scale = .slaney,
+                .center = true,
+            });
+        }
+    };
+    try whisper_reference_test.check(Extract.run);
+}
+
+test "Whisper silence has the reference floor and complete 30 second shape" {
+    const alloc = std.testing.allocator;
+    const output = try logMelSpectrogramWithConfig(alloc, &.{}, .{
+        .sample_rate = 16000,
+        .n_fft = 400,
+        .hop_length = 160,
+        .n_mels = 80,
+        .chunk_length_s = 30,
+        .normalization = .whisper,
+        .mel_scale = .slaney,
+        .center = true,
+    });
+    defer alloc.free(output);
+    try std.testing.expectEqual(@as(usize, 80 * 3000), output.len);
+    for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, -1.5), value, 1e-6);
+}
+
+test "Whisper implicit silence padding matches explicit PCM padding" {
+    const alloc = std.testing.allocator;
+    var samples: [16000]f32 = @splat(0);
+    for (samples[0..1234], 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.137) * 0.2;
+    for ([_]u32{ 80, 128 }) |bins| {
+        const config = AudioConfig{ .sample_rate = 16000, .n_fft = 400, .hop_length = 160, .n_mels = bins, .chunk_length_s = 1, .normalization = .whisper, .mel_scale = .slaney, .center = true };
+        const implicit = try logMelSpectrogramWithConfig(alloc, samples[0..1234], config);
+        defer alloc.free(implicit);
+        const explicit = try logMelSpectrogramWithConfig(alloc, &samples, config);
+        defer alloc.free(explicit);
+        try std.testing.expectEqualSlices(f32, explicit, implicit);
+    }
+}
+
+test "detect format from mime ignores type case without allocating" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "audio/wav",       "audio/x-wav",     "audio/mpeg",       "audio/aac",    "audio/mp4",
+        "application/mp4", "video/quicktime", "audio/flac",       "audio/aiff",   "audio/x-caf",
+        "audio/basic",     "audio/opus",      "audio/ogg",        "audio/vorbis", "application/ogg",
+        "audio/webm",      "video/webm",      "audio/x-matroska",
+    };
+    for (cases) |mime| {
+        const upper = try std.ascii.allocUpperString(a, mime);
+        defer a.free(upper);
+        try std.testing.expectEqual(detectFormatFromMime(mime), detectFormatFromMime(upper));
+        const padded = try std.fmt.allocPrint(a, " \t{s}; charset=binary", .{upper});
+        defer a.free(padded);
+        try std.testing.expectEqual(detectFormatFromMime(mime), detectFormatFromMime(padded));
+    }
+    try std.testing.expectEqual(EncodedFormat.opus, detectFormatFromMime("Audio/Ogg; codecs=opus").?);
+    try std.testing.expect(detectFormatFromMime("Image/Wav") == null);
 }

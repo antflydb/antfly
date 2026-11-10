@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.dense_index_algorithm import DenseIndexAlgorithm
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..models.index_publication_policy import IndexPublicationPolicy
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
     from ..models.created_provider_config import CreatedProviderConfig
     from ..models.index_execution_config import IndexExecutionConfig
+    from ..models.leann_index_config import LeannIndexConfig
 
 
 T = TypeVar("T", bound="CreatedEmbeddingsIndexConfig")
@@ -33,6 +35,7 @@ class CreatedEmbeddingsIndexConfig:
             coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
                 completeness.
             external (bool | Unset):  Default: False.
+            external_vector_space (str | Unset):
             sparse (bool | Unset):  Default: False.
             dimension (int | Unset):
             field (str | Unset):
@@ -46,6 +49,12 @@ class CreatedEmbeddingsIndexConfig:
             distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
                 models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
                 product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
+            algorithm (DenseIndexAlgorithm | Unset): Dense vector index algorithm (dense only). "hbc" (default) keeps
+                quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ
+                codes and recomputes exact distances for a few candidates per query, re-embedding them (see
+                leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes
+                do not yet support shard splits or native index backups.
+            leann (LeannIndexConfig | Unset): Tuning for algorithm=leann dense indexes. All fields are optional.
             mem_only (bool | Unset):
             embedder (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index creation.
                 Only non-secret provider settings are represented.
@@ -61,6 +70,7 @@ class CreatedEmbeddingsIndexConfig:
     publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
+    external_vector_space: str | Unset = UNSET
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
@@ -69,6 +79,8 @@ class CreatedEmbeddingsIndexConfig:
     source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
+    algorithm: DenseIndexAlgorithm | Unset = UNSET
+    leann: LeannIndexConfig | Unset = UNSET
     mem_only: bool | Unset = UNSET
     embedder: CreatedProviderConfig | Unset = UNSET
     chunker: ChunkerConfig | Unset = UNSET
@@ -88,6 +100,8 @@ class CreatedEmbeddingsIndexConfig:
             coverage_policy = self.coverage_policy.value
 
         external = self.external
+
+        external_vector_space = self.external_vector_space
 
         sparse = self.sparse
 
@@ -111,6 +125,14 @@ class CreatedEmbeddingsIndexConfig:
         distance_metric: str | Unset = UNSET
         if not isinstance(self.distance_metric, Unset):
             distance_metric = self.distance_metric.value
+
+        algorithm: str | Unset = UNSET
+        if not isinstance(self.algorithm, Unset):
+            algorithm = self.algorithm.value
+
+        leann: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.leann, Unset):
+            leann = self.leann.to_dict()
 
         mem_only = self.mem_only
 
@@ -141,6 +163,8 @@ class CreatedEmbeddingsIndexConfig:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
             field_dict["external"] = external
+        if external_vector_space is not UNSET:
+            field_dict["external_vector_space"] = external_vector_space
         if sparse is not UNSET:
             field_dict["sparse"] = sparse
         if dimension is not UNSET:
@@ -157,6 +181,10 @@ class CreatedEmbeddingsIndexConfig:
             field_dict["template"] = template
         if distance_metric is not UNSET:
             field_dict["distance_metric"] = distance_metric
+        if algorithm is not UNSET:
+            field_dict["algorithm"] = algorithm
+        if leann is not UNSET:
+            field_dict["leann"] = leann
         if mem_only is not UNSET:
             field_dict["mem_only"] = mem_only
         if embedder is not UNSET:
@@ -180,6 +208,7 @@ class CreatedEmbeddingsIndexConfig:
         from ..models.chunker_config import ChunkerConfig
         from ..models.created_provider_config import CreatedProviderConfig
         from ..models.index_execution_config import IndexExecutionConfig
+        from ..models.leann_index_config import LeannIndexConfig
 
         d = dict(src_dict)
         _publication_policy = d.pop("publication_policy", UNSET)
@@ -197,6 +226,8 @@ class CreatedEmbeddingsIndexConfig:
             coverage_policy = DerivedCoveragePolicy(_coverage_policy)
 
         external = d.pop("external", UNSET)
+
+        external_vector_space = d.pop("external_vector_space", UNSET)
 
         sparse = d.pop("sparse", UNSET)
 
@@ -225,6 +256,20 @@ class CreatedEmbeddingsIndexConfig:
             distance_metric = UNSET
         else:
             distance_metric = DistanceMetric(_distance_metric)
+
+        _algorithm = d.pop("algorithm", UNSET)
+        algorithm: DenseIndexAlgorithm | Unset
+        if isinstance(_algorithm, Unset):
+            algorithm = UNSET
+        else:
+            algorithm = DenseIndexAlgorithm(_algorithm)
+
+        _leann = d.pop("leann", UNSET)
+        leann: LeannIndexConfig | Unset
+        if isinstance(_leann, Unset):
+            leann = UNSET
+        else:
+            leann = LeannIndexConfig.from_dict(_leann)
 
         mem_only = d.pop("mem_only", UNSET)
 
@@ -259,6 +304,7 @@ class CreatedEmbeddingsIndexConfig:
             publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
+            external_vector_space=external_vector_space,
             sparse=sparse,
             dimension=dimension,
             field=field,
@@ -267,6 +313,8 @@ class CreatedEmbeddingsIndexConfig:
             source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
+            algorithm=algorithm,
+            leann=leann,
             mem_only=mem_only,
             embedder=embedder,
             chunker=chunker,

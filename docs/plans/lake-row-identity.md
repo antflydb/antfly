@@ -1252,7 +1252,7 @@ The earlier configuration-only probe remains historical evidence, not evidence
 for the implementation above. Filesystem observations do not qualify live-cloud
 transport or retention behavior.
 
-The [version-3 native compaction observation](../../zig/bench/lake/native-compaction-v3-observation.json)
+The [version-3 native compaction observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/native-compaction-v3-observation.json)
 retains equal-answer comparisons on frozen Parquet inputs, including the
 intermediate JSON metadata regression and the compact-page result. It records
 all sort-work/timing samples and refresh provenance, distinguishing the explicit
@@ -1303,7 +1303,7 @@ enumeration materializes partial runs when a complete bitmap is actually needed.
 Empty Boolean filters retain their zero-match semantics. Attachment and query
 options do not change.
 
-The [shared-navigation comparison](../../zig/bench/lake/native-shared-navigation-v3-observation.json)
+The [shared-navigation comparison](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/native-shared-navigation-v3-observation.json)
 retains the final binary identity, all samples and the exact-answer comparison.
 On the frozen 16,384-row source, process-restarted median latency is 215 ms versus
 922 ms for the prior compact-page implementation; warm medians remain about

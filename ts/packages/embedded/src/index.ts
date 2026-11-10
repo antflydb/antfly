@@ -89,14 +89,19 @@ export { Connection } from "./sql.js";
 export type { SqlColumn, SqlResult } from "./sql-types.js";
 
 export { SqlError } from "./sql-types.js";
+export { GraphError } from "./graph-types.js";
+export type { GraphDiagnostic } from "./graph-types.js";
 export type {
   Capabilities,
   CheckReport,
   CompactReport,
   InferenceOptions,
   InferenceStatus,
+  LiveByteAccounting,
+  LiveByteCategory,
   MemoryAdmissionStats,
   OpenOptions,
+  OutcomeReceiptStatus,
   PendingWorkStatus,
   PullProgress,
   ReplayGeneratedEnrichmentsResult,

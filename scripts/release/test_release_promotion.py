@@ -116,7 +116,7 @@ class ReleasePromotionTests(unittest.TestCase):
         document = json.loads((RELEASE_DIR / "build-contract.json").read_text())
 
         self.assertEqual(
-            set(document["required_source_paths"]), contract.REQUIRED_PATHS
+            set(document["required_source_paths"]), contract.APPLE_PROVIDER_PATHS
         )
         missing = [
             path
@@ -194,7 +194,7 @@ class ReleasePromotionTests(unittest.TestCase):
             )
 
         with mock.patch.object(contract, "git_object", side_effect=read_object):
-            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 6)
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 7)
             document["runtime_products"] = ["server", "lite", "inference"]
             with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
                 contract.validate(RELEASE_DIR, COMMIT)
@@ -342,7 +342,7 @@ class ReleasePromotionTests(unittest.TestCase):
         payload = load_module(
             "apache_release_spec_payload_test", "build_release_payload.py"
         )
-        for schema in (1, 2, 3, 4, 5, 6):
+        for schema in (1, 2, 3, 4, 5, 6, 7):
             with (
                 self.subTest(schema=schema),
                 tempfile.TemporaryDirectory() as directory,
@@ -542,8 +542,9 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertEqual(
             stable["recovery_sources"], ["github-release", "object-storage"]
         )
-        self.assertEqual((next_name, next_channel["npm_tag"]), ("next", "next"))
-        self.assertTrue(next_channel["publish_npm"])
+        self.assertEqual((next_name, next_channel["npm_tag"]), ("next", None))
+        self.assertFalse(next_channel["publish_npm"])
+        self.assertEqual(next_channel["bootstrap_sources"], ["object-storage"])
         self.assertEqual(next_channel["retention"]["grace_days"], 90)
         self.assertEqual(
             (nightly_name, nightly["npm_tag"], nightly["github_release"]),
@@ -562,6 +563,8 @@ class ReleasePromotionTests(unittest.TestCase):
             0,
         )
         identity = channels.github_outputs(next_name, next_channel, "v1.3.0-rc.2")
+        self.assertEqual(identity["publish_npm"], "false")
+        self.assertEqual(identity["npm_tag"], "")
         self.assertEqual(
             {
                 key: identity[key]

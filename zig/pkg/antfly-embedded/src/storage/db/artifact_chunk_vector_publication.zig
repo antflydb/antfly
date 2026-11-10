@@ -49,6 +49,7 @@ pub fn CaptureSession(comptime Txn: type) type {
         request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest,
         authority: publication.Authority,
         generation: u64,
+        effect_protocol: u16,
 
         pub fn capture(self: @This(), alloc: std.mem.Allocator, scope: []const u8) !Input {
             return captureMember(alloc, self.txn, self.request, self.authority, self.generation, scope);
@@ -75,7 +76,7 @@ pub fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: @import("
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace) or
         !std.mem.eql(u8, &catalogs.digest(), &binding.digest) or !plan.matchesArtifactInventory(catalogs)) return error.ArtifactCatalogDrift;
-    return .{ .txn = txn, .request = request, .authority = authority, .generation = generation };
+    return .{ .txn = txn, .request = request, .authority = authority, .generation = generation, .effect_protocol = binding.effect_protocol };
 }
 
 fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, authority: publication.Authority, generation: u64, scope: []const u8) !Input {
@@ -216,7 +217,10 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
             try changed.append(owned, expected);
         } else try deleted.append(owned, expected);
     }
-    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = try owned.dupe(u8, command.producer_scope_key), .requires_member = changed.items.len != 0 }, .batch = .{
+    // Finish allocations before copying the arena owner. Growing the arena
+    // after that copy would leave its new allocation chain unowned.
+    const owned_scope = try owned.dupe(u8, command.producer_scope_key);
+    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0 }, .batch = .{
         .dense_embeddings = dense.items,
         .sparse_embeddings = sparse.items,
         .changed_artifact_keys = changed.items,

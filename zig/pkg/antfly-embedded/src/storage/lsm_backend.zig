@@ -679,6 +679,20 @@ pub const Backend = struct {
         versions: ?*runtime_mod.ReadVersion = null,
     };
     pub var test_deep_mutable_snapshots: bool = false;
+    /// One-shot commit fault for outcome-classification tests.
+    pub const TestCommitFault = struct {
+        at: enum { before_wal_append, after_wal_append, after_publish },
+        err: anyerror,
+    };
+    pub var test_commit_fault: if (builtin.is_test) ?TestCommitFault else void = if (builtin.is_test) null else {};
+
+    fn takeTestCommitFault(comptime at: @FieldType(TestCommitFault, "at")) !void {
+        if (comptime !builtin.is_test) return;
+        const fault = test_commit_fault orelse return;
+        if (fault.at != at) return;
+        test_commit_fault = null;
+        return fault.err;
+    }
     pub const OpenPhase = enum {
         idle,
         initializing_storage,
@@ -1745,6 +1759,13 @@ pub const Backend = struct {
     unpublished_wal_logical_bytes: u64 = 0,
     unpublished_wal_max_batch_logical_bytes: u64 = 0,
     wal_retention: WalRetentionState = .{},
+    /// WAL appends and direct ingests started, counted before any write so a
+    /// commit can tell whether a failure may follow a durable or visible one.
+    write_publication_attempts: u64 = 0,
+    /// A failed WAL append may have left bytes that could not be cut back.
+    /// The next append repairs this tail first (under the WAL lock), and
+    /// fails without writing if it still cannot; recovery repairs it too.
+    wal_unrepaired_tail: ?wal_mod.TornTail = null,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
@@ -4253,6 +4274,10 @@ pub const Backend = struct {
             self.root_dir.?,
             oldest_active - 1,
         );
+        // A deferred repair of a retired segment has nothing left to repair.
+        if (self.wal_unrepaired_tail) |torn| if (torn.segment <= oldest_active - 1) {
+            self.wal_unrepaired_tail = null;
+        };
         self.syncTrackedWalRetentionUsageCurrentLocked();
     }
 
@@ -4385,6 +4410,7 @@ pub const Backend = struct {
     }
 
     pub fn maybeFlushMutable(self: *Backend) !void {
+        try takeTestCommitFault(.after_publish);
         if (self.shouldFlushMutable()) {
             if (self.shouldDeferCommitFlush()) {
                 try self.rotateMutableToImmutable();
@@ -4900,6 +4926,7 @@ pub const Backend = struct {
     /// mutable state followed immediately by another run for the new batch.
     pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
         if (!self.options.direct_bulk_ingest) return false;
+        self.write_publication_attempts +%= 1;
 
         if (self.canQueueDirectBulkStateWithPendingImmutable()) {
             // Commit serialization orders the old mutable entries before the
@@ -5403,6 +5430,7 @@ pub const Backend = struct {
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
+        self.write_publication_attempts +%= 1;
 
         if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
@@ -5444,6 +5472,7 @@ pub const Backend = struct {
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
+        self.write_publication_attempts +%= 1;
         if (self.root_dir != null) {
             try self.ingestSortedState(state);
             return;
@@ -5926,17 +5955,32 @@ pub const Backend = struct {
         };
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
+        if (self.wal_unrepaired_tail) |torn| {
+            // Nothing may be appended after bytes an earlier failure left.
+            try wal_mod.repairSegmentTail(self.storage.?, self.allocator, self.root_dir.?, torn.segment, torn.valid_bytes);
+            self.wal_unrepaired_tail = null;
+            self.wal_retention.invalidateAll();
+        }
+        try takeTestCommitFault(.before_wal_append);
+        self.write_publication_attempts +%= 1;
+        var proven_unwritten = false;
+        errdefer if (proven_unwritten) {
+            // Nothing reached the segment: this commit has not applied.
+            self.write_publication_attempts -%= 1;
+        };
         const append_result = try self.wal_retention.append(
             self.storage.?,
             self.allocator,
             self.root_dir.?,
             state,
             self.options.wal_sync_on_commit,
-            .{ .segment_bytes = self.options.wal_segment_bytes },
+            .{ .segment_bytes = self.options.wal_segment_bytes, .unrepaired_tail = &self.wal_unrepaired_tail, .proven_unwritten = &proven_unwritten },
             self.writeStatsNowNs(),
         );
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
+        // Stands in for a sync failure after the record reached the segment.
+        try takeTestCommitFault(.after_wal_append);
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entryCount());
         self.write_stats.wal_append_bytes += append_result.bytes;
@@ -5973,7 +6017,7 @@ pub const Backend = struct {
         const stats = blk: {
             var wal_lock = try self.acquireWalOperationLock(if (self.options.backend.read_only) .shared else .exclusive);
             defer wal_lock.release();
-            break :blk try wal_mod.replayIntoMutableWithHooksAndOptions(
+            const replayed = try wal_mod.replayIntoMutableWithHooksAndOptions(
                 self.storage.?,
                 self.allocator,
                 self.root_dir.?,
@@ -5985,6 +6029,14 @@ pub const Backend = struct {
                     .retained_cap_bytes = self.options.recovery_scratch_retained_cap_bytes,
                 },
             );
+            // Cut a torn tail before this writer appends anything after it;
+            // otherwise the next recovery stops at the torn bytes and drops
+            // every record written behind them.
+            if (replayed.torn_tail) |torn| if (!self.options.backend.read_only) {
+                try wal_mod.repairSegmentTail(self.storage.?, self.allocator, self.root_dir.?, torn.segment, torn.valid_bytes);
+                self.wal_retention.invalidateAll();
+            };
+            break :blk replayed;
         };
         if (!self.options.backend.read_only and
             recovery_session.flushes > 0 and
@@ -6096,6 +6148,10 @@ pub const Backend = struct {
             self.root_dir.?,
             self.writeStatsNowNs(),
         );
+        // The reset removed every segment, torn bytes included. A deferred
+        // repair offset belongs to the old generation and must not be applied
+        // to the new one.
+        self.wal_unrepaired_tail = null;
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
@@ -11325,6 +11381,202 @@ fn implementationTests() type {
             defer read.abort();
             try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
             try std.testing.expect(backend.write_stats.wal_replay_records > 0);
+        }
+
+        test "issue1431 lsm commit failure records whether the write may have applied" {
+            const Case = struct { at: @FieldType(Backend.TestCommitFault, "at"), maybe_applied: bool, visible: bool, replayed: bool };
+            const cases = [_]Case{
+                // Before the WAL append nothing was written.
+                .{ .at = .before_wal_append, .maybe_applied = false, .visible = false, .replayed = false },
+                // The record is in the segment but was not published here.
+                .{ .at = .after_wal_append, .maybe_applied = true, .visible = false, .replayed = true },
+                // Published and durable; a later flush step failed.
+                .{ .at = .after_publish, .maybe_applied = true, .visible = true, .replayed = true },
+            };
+            for (cases) |case| {
+                var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+                defer storage.deinit();
+                const root_dir = "/lsm-commit-outcome";
+                const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+                var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                // Close on every path, including a failed assertion.
+                var backend_open = true;
+                defer if (backend_open) backend.close();
+                {
+                    var txn = try backend.beginWrite();
+                    defer txn.abort();
+                    try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                    Backend.test_commit_fault = .{ .at = case.at, .err = error.InputOutput };
+                    defer Backend.test_commit_fault = null;
+                    var progress: backend_types.CommitProgress = .{};
+                    backend_types.commit_progress = &progress;
+                    defer backend_types.commit_progress = null;
+                    // The cause is kept; progress says whether it may have applied.
+                    try std.testing.expectError(error.InputOutput, txn.commit());
+                    try std.testing.expectEqual(case.maybe_applied, progress.maybe_applied);
+                }
+                {
+                    var read = try backend.beginRead();
+                    defer read.abort();
+                    const got = read.get(.{ .name = "docs" }, "doc:a") catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    try std.testing.expectEqual(case.visible, got != null);
+                }
+                backend.options.backend.read_only = true;
+                backend_open = false;
+                backend.close();
+                backend = try Backend.open(std.testing.allocator, root_dir, options);
+                backend_open = true;
+                var read = try backend.beginRead();
+                defer read.abort();
+                const got = read.get(.{ .name = "docs" }, "doc:a") catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                try std.testing.expectEqual(case.replayed, got != null);
+            }
+        }
+
+        test "issue1431 lsm torn wal tail never hides later acknowledged writes" {
+            // `.crash`: the process dies right after a partial append, so the
+            // torn bytes reach recovery. `.in_place`: the failed append
+            // repairs its own tail. `.deferred`: that repair fails, and the
+            // next append repairs first.
+            const Mode = enum { crash, in_place, deferred };
+            for ([_]Mode{ .crash, .in_place, .deferred }) |mode| {
+                const crash = mode == .crash;
+                var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+                defer storage.deinit();
+                const root_dir = "/lsm-torn-wal-tail";
+                const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+                var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                // Close on every path, including a failed assertion.
+                var backend_open = true;
+                defer if (backend_open) backend.close();
+                {
+                    var txn = try backend.beginWrite();
+                    defer txn.abort();
+                    try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                    try txn.commit();
+                }
+                {
+                    var txn = try backend.beginWrite();
+                    defer txn.abort();
+                    try txn.put(.{ .name = "docs" }, "doc:torn", "never acknowledged");
+                    wal_mod.test_append_fault = .{ .bytes = 8, .crash = crash, .fail_repairs = if (mode == .deferred) 1 else 0 };
+                    defer wal_mod.test_append_fault = null;
+                    const expected: anyerror = if (crash) error.TestCrashAfterPartialAppend else error.InputOutput;
+                    try std.testing.expectError(expected, txn.commit());
+                }
+                if (crash) {
+                    backend.options.backend.read_only = true;
+                    backend_open = false;
+                    backend.close();
+                    backend = try Backend.open(std.testing.allocator, root_dir, options);
+                    backend_open = true;
+                }
+                // An acknowledged write after the failure.
+                {
+                    var txn = try backend.beginWrite();
+                    defer txn.abort();
+                    try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+                    try txn.commit();
+                }
+                // Crash and recover: both acknowledged writes survive.
+                backend.options.backend.read_only = true;
+                backend_open = false;
+                backend.close();
+                backend = try Backend.open(std.testing.allocator, root_dir, options);
+                backend_open = true;
+                var read = try backend.beginRead();
+                defer read.abort();
+                try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+                try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+                try std.testing.expectError(error.NotFound, read.get(.{ .name = "docs" }, "doc:torn"));
+            }
+        }
+
+        test "issue1431 lsm append refused before writing keeps its cause and the wal usable" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+            var backend = try Backend.open(std.testing.allocator, "/lsm-refused-append", options);
+            defer backend.close();
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:refused", "x");
+                // Refused before any byte is written, and the repair path is
+                // also refused: neither may fence the healthy WAL.
+                wal_mod.test_append_fault = .{ .bytes = 0, .err = error.EnrichmentWaitCanceled, .fail_repairs = 1 };
+                defer wal_mod.test_append_fault = null;
+                defer wal_mod.test_fail_repairs = 0;
+                var progress: backend_types.CommitProgress = .{};
+                backend_types.commit_progress = &progress;
+                defer backend_types.commit_progress = null;
+                try std.testing.expectError(error.EnrichmentWaitCanceled, txn.commit());
+                try std.testing.expect(!progress.maybe_applied);
+            }
+            try std.testing.expect(backend.wal_unrepaired_tail == null);
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+            try txn.commit();
+        }
+
+        test "issue1431 lsm deferred wal repair is discharged by a later wal reset" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const root_dir = "/lsm-deferred-repair-reset";
+            const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+            var backend = try Backend.open(std.testing.allocator, root_dir, options);
+            // Close on every path, including a failed assertion.
+            var backend_open = true;
+            defer if (backend_open) backend.close();
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            {
+                // Partial append whose immediate repair fails: deferred.
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:torn", "never acknowledged");
+                wal_mod.test_append_fault = .{ .bytes = 8, .fail_repairs = 1 };
+                defer wal_mod.test_append_fault = null;
+                try std.testing.expectError(error.InputOutput, txn.commit());
+            }
+            try std.testing.expect(backend.wal_unrepaired_tail != null);
+            // A durable sync flushes, checkpoints the manifest and resets the
+            // WAL, removing the torn segment with it.
+            try backend.sync(true);
+            try std.testing.expect(backend.wal_unrepaired_tail == null);
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+                try txn.commit();
+            }
+            backend.options.backend.read_only = true;
+            backend_open = false;
+            backend.close();
+            backend = try Backend.open(std.testing.allocator, root_dir, options);
+            backend_open = true;
+            var read = try backend.beginRead();
+            defer read.abort();
+            try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+            try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+            try std.testing.expectError(error.NotFound, read.get(.{ .name = "docs" }, "doc:torn"));
         }
 
         test "lsm backend maintenance stats report retained wal debt across reopen and reset" {
@@ -22854,6 +23106,44 @@ fn implementationTests() type {
                 defer allocator.free(encoded);
                 try std.testing.expect(encoded.len <= wire);
             }
+        }
+
+        test "lsm manifest credits remain additive across interleaved long-key cohorts" {
+            const a = std.testing.allocator;
+            var prior: State = .{};
+            defer prior.deinit(a);
+            var incoming: State = .{};
+            defer incoming.deinit(a);
+            var combined: State = .{};
+            defer combined.deinit(a);
+            const value = try a.alloc(u8, 250 * 1024);
+            defer a.free(value);
+            @memset(value, 'v');
+            for ([_][]const u8{ "b", "h" }) |key| {
+                try prior.upsert(a, .{}, key, value, false);
+                try combined.upsert(a, .{}, key, value, false);
+            }
+            var key: [16 * 1024]u8 = @splat('k');
+            for ("acegik") |first| {
+                key[0] = first;
+                try incoming.upsert(a, .{}, &key, "value", false);
+                try combined.upsert(a, .{}, &key, "value", false);
+            }
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var backend = try Backend.open(a, "/manifest-credit-cohorts", .{
+                .storage = storage.storage(),
+                .max_run_file_bytes = 512 * 1024,
+                .max_run_file_physical_bytes = 1024 * 1024,
+            });
+            defer backend.close();
+            const credit = try backend.prepareManifestCredit(&prior, &@as(State, .{})) + try backend.prepareManifestCredit(&incoming, &@as(State, .{}));
+            var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &combined, 0);
+            defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
+            try std.testing.expect(outputs.items.len > 1);
+            const encoded = try repository_mod.encodeManifestAlloc(a, backend.next_run_id, outputs.items, &.{});
+            defer a.free(encoded);
+            try std.testing.expect(encoded.len <= credit);
         }
 
         test "lsm point leases pin immutable values across flush and overwrite" {

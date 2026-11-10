@@ -26,6 +26,15 @@ var processed: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
 var expanded_audits: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
 var partitions: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, *std.Build.Step.Compile) = .empty;
 var memory_profiles: std.AutoHashMapUnmanaged(*std.Build, runtime_memory.TestPartitionProfile) = .empty;
+var authored_partition_claims: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, usize) = .empty;
+
+/// Consumer code generation and its physical implementation are independent
+/// compilations. An independently authored partition claim must not grow when
+/// only the consumer's measured reservation changes.
+pub fn setAuthoredMaxRss(b: *std.Build, consumer: *std.Build.Step.Compile, bytes: usize) void {
+    std.debug.assert(bytes != 0);
+    authored_partition_claims.put(b.allocator, consumer, bytes) catch @panic("OOM");
+}
 
 /// Set before source-owner finalization; dependency builds keep their own profile.
 pub fn setMemoryProfile(b: *std.Build, profile: runtime_memory.TestPartitionProfile) void {
@@ -217,7 +226,8 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
 
 fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     const tests = testObject(executable) orelse return null;
-    const max_rss = if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
+    const max_rss = authored_partition_claims.get(tests) orelse
+        if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
     // A consumer's reservation is not evidence for its physical partition.
     // Apply independently measured partition claims only to qualified profiles;
     // other configurations keep the inherited floor and stable labels.
@@ -274,6 +284,7 @@ var local_installs: std.ArrayList(LocalInstall) = .empty;
 
 /// Install the physical implementation owner, after source bindings finalize.
 /// Installing the consumer alone silently omits named-dependency tests.
+/// Standalone embedded roots own their tests directly and have no partition.
 pub fn installLocalArtifact(b: *std.Build, consumer: *std.Build.Step.Compile, step_name: []const u8, description: []const u8, basename: []const u8) void {
     local_installs.append(b.allocator, .{
         .consumer = consumer,
@@ -363,7 +374,7 @@ fn hasInventory(run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, fla
 pub fn add(b: *std.Build) void {
     for (local_installs.items) |*install| {
         if (install.installed) continue;
-        const local = partition(b, install.consumer) orelse @panic("portable tests require a local implementation owner");
+        const local = partition(b, install.consumer) orelse directLocalOwner(b, install.consumer);
         install.step.dependOn(&b.addInstallArtifact(local, .{ .dest_sub_path = install.basename }).step);
         install.installed = true;
     }
@@ -480,4 +491,21 @@ pub fn add(b: *std.Build) void {
             previous = null;
         }
     }
+}
+
+fn directLocalOwner(b: *std.Build, executable: *std.Build.Step.Compile) *std.Build.Step.Compile {
+    const tests = testObject(executable) orelse @panic("portable tests require a test artifact");
+    // A split consumer must retain its physical partition, even if source
+    // selection is accidentally empty. Only an authored embedded root owns
+    // implementation tests without a named-dependency partition.
+    if (source_owner.localFor(tests.root_module) == null) {
+        if (tests.root_module.root_source_file) |source| {
+            if (paths.authored(b, source)) |path| {
+                const directory = paths.authored(b, b.path("pkg/antfly-embedded/src")).?;
+                if (std.mem.startsWith(u8, path, b.fmt("{s}{s}", .{ directory, std.fs.path.sep_str })))
+                    return executable;
+            }
+        }
+    }
+    @panic("portable tests require a local implementation owner");
 }

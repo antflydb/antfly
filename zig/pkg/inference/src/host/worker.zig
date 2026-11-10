@@ -477,7 +477,7 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 /// down with it -- see `BackendRuntime.hasUninterruptibleCalls`). The
 /// `antfly` CLI binary re-execs itself, which is correct: `argv[0]` names the
 /// `antfly` binary the user launched. A library host (libantfly linked into a
-/// Go test binary, `examples/dogfood`, or any other consumer) has no such
+/// Go test binary, `examples/antfly-docs-knowledge-base`, or any other consumer) has no such
 /// self: its `argv[0]` is the host binary, not an `antfly` executable that
 /// understands `inference _worker`. Resolution order:
 ///

@@ -21,6 +21,8 @@ import unittest
 import yaml
 
 import generate_graph_identifier_policy as generator
+from openapi_inputs import load_yaml
+from openapi_joiner import resolve_pointer, resolve_ref_path, split_ref
 
 
 class GraphIdentifierPolicyTest(unittest.TestCase):
@@ -105,11 +107,44 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
         )
 
     def test_graph_execution_defaults_match_runtime_limits(self) -> None:
-        config = yaml.safe_load(
-            (generator.ROOT / "specs/openapi/antfly/config.yaml").read_text(
-                encoding="utf-8"
-            )
-        )["components"]["schemas"]["GraphExecutionConfig"]["properties"]
+        # Follow the server's public configuration path rather than assuming
+        # that an externally referenced policy lives in config.yaml itself.
+        documents = {}
+
+        def resolve(path, schema):
+            seen = set()
+            while "$ref" in schema:
+                reference = schema["$ref"]
+                self.assertNotIn((path, reference), seen, "cyclic policy reference")
+                seen.add((path, reference))
+                relative, pointer = split_ref(reference)
+                if relative:
+                    path = resolve_ref_path(relative, path)
+                if path not in documents:
+                    documents[path] = load_yaml(path)
+                schema = resolve_pointer(documents[path], pointer.removeprefix("#"))
+            return path, schema
+
+        path = generator.ROOT / "specs/openapi/antfly/config.yaml"
+        documents[path] = load_yaml(path)
+        config = documents[path]["components"]["schemas"]["Config"]
+        for field in ("resources", "query", "request_limits", "graph"):
+            path, config = resolve(path, config["properties"][field])
+        config = config["properties"]
+        policy = (
+            generator.ROOT / "zig/lib/platform/src/resource_policy.zig"
+        ).read_text(encoding="utf-8")
+        graph_limits = re.search(
+            r"pub const GraphLimits = struct \{(.*?)\n    pub fn", policy, re.DOTALL
+        )
+        self.assertIsNotNone(graph_limits, "missing canonical GraphLimits")
+        defaults = dict(
+            re.findall(r"^    (\w+): usize = ([^,]+),$", graph_limits[1], re.MULTILINE)
+        )
+        self.assertTrue(defaults, "GraphLimits must expose nonempty defaults")
+        self.assertEqual(
+            set(config), set(defaults), "OpenAPI must cover every graph limit"
+        )
         runtime = (
             generator.ROOT / "zig/pkg/antfly-embedded/src/graph/work_budget.zig"
         ).read_text(encoding="utf-8")
@@ -121,16 +156,23 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
                 runtime,
             )
             self.assertIsNotNone(match, f"missing runtime default {constant}")
-            expression = match.group(1).replace("_", "").strip()
-            factors = [int(factor.strip()) for factor in expression.split("*")]
-            runtime_default = 1
-            for factor in factors:
-                runtime_default *= factor
-            self.assertEqual(
-                schema["default"],
-                runtime_default,
-                f"OpenAPI default for {name} drifted from {constant}",
-            )
+            for source, expression in (
+                ("canonical GraphLimits", defaults[name]),
+                (constant, match.group(1)),
+            ):
+                with self.subTest(field=name, source=source):
+                    factors = [
+                        int(factor.strip().replace("_", ""))
+                        for factor in expression.split("*")
+                    ]
+                    runtime_default = 1
+                    for factor in factors:
+                        runtime_default *= factor
+                    self.assertEqual(
+                        schema["default"],
+                        runtime_default,
+                        f"OpenAPI default for {name} drifted from {source}",
+                    )
 
 
 if __name__ == "__main__":

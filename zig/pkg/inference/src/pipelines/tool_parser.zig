@@ -1632,18 +1632,9 @@ fn replaceOwnedToken(allocator: std.mem.Allocator, current: []const u8, replacem
 }
 
 fn appendJsonString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (text) |ch| {
-        switch (ch) {
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, ch),
-        }
-    }
-    try buf.append(allocator, '"');
+    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, buf);
+    defer buf.* = writer.toArrayList();
+    std.json.Stringify.encodeJsonString(text, .{}, &writer.writer) catch return error.OutOfMemory;
 }
 
 test "parse tool choice variants" {
@@ -2019,4 +2010,15 @@ test "forced tool call fallback accepts plain and fenced json content" {
         .auto,
     );
     try std.testing.expectEqual(@as(?[]ToolCall, null), skipped);
+}
+
+test "tool parser JSON strings round-trip control characters" {
+    const a = std.testing.allocator;
+    const raw = "nul\x00bell\x07esc\x1bquote\"slash\\";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    try appendJsonString(&out, a, raw);
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(raw, parsed.value);
 }

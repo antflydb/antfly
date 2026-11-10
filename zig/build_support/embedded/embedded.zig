@@ -66,6 +66,7 @@ pub fn configureBrowserModule(
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_platform", platform_mod);
     mod.addImport("antfly_chunking", chunking_mod);
+    mod.addImport("antfly_chunking_api_openapi", chunking_mod.import_table.get("antfly_chunking_api_openapi").?);
     mod.addImport("bloom", bloom_mod);
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -119,7 +120,6 @@ pub const AddEmbeddedResult = struct {
     run_lite_rs_tests: *std.Build.Step.Run,
     run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
-    run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
     run_capi_tests: *std.Build.Step.Run,
 };
@@ -277,7 +277,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
+        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -293,14 +293,23 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_enrichment_mod,
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
-        @as(u64, if (antfly_imports.darwin_release_memory) 3 else 8) * 1024 * 1024 * 1024,
+        @as(u64, if (antfly_imports.darwin_release_memory or antfly_imports.darwin_cross_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
+    // Source-level embedded API consumers can use compiled media without a
+    // shared storage engine. Link that owner independently of storage discovery.
+    if (antfly_imports.image_native_contract != null or antfly_imports.pdf_native_contract != null)
+        embedded_api_mod.linkLibrary(native_enrichment);
+    // Contract tests can render shared PDF templates directly from their
+    // local C API root. Its consumer must link the compute owner even when
+    // no embedded API facade (or installed shared library) is reachable.
+    if (antfly_imports.shared_pdf_templates)
+        capi_root_mod.linkLibrary(native_enrichment);
     const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
         const owner_options = b.addOptions();
         owner_options.addOption(bool, "shared_storage_core", true);
         owner_options.addOption(bool, "storage_engine_owner", true);
         capi_mod.addOptions("storage_engine_options", owner_options);
-        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @as(u64, if (antfly_imports.darwin_shared_storage_sdk27) 14 else if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16) * 1024 * 1024 * 1024);
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @import("shared_library.zig").nativeStorageCompileMaxRss(b.graph.host.result, target.result, optimize, @import("shared_library.zig").storageCompileMaxRss(target.result.os.tag, antfly_imports.darwin_shared_storage_sdk27, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory)));
         owner.link_function_sections = true;
         owner.link_data_sections = true;
         @import("source_owner.zig").registerStorageProvider(owner, b.allocator.dupe(*std.Build.Step.Compile, &.{ native_inference, native_enrichment }) catch @panic("OOM"));
@@ -382,7 +391,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_smoke_mod.link_libc = true;
     capi_smoke_mod.addIncludePath(b.path("pkg/antfly-embedded/include"));
     capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_c_smoke.c"),
+        .file = b.path("pkg/antfly-embedded/tests/capi_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     const capi_smoke = b.addExecutable(.{
@@ -498,37 +507,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "go",
         "run",
         ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-go-example.afb",
+        "smoke",
+        "-reset",
+        "-db",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.aflite",
+        "-backup",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.afb",
     });
     run_lite_go_example.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
+    run_lite_go_example.setCwd(b.path("../examples/antfly-docs-knowledge-base"));
     run_lite_go_example.step.dependOn(install_libantfly);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
+    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go knowledge-base example's model-free smoke check");
     lite_go_example_step.dependOn(&run_lite_go_example.step);
-
-    const run_lite_go_retrieval_template = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
-    });
-    run_lite_go_retrieval_template.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(install_libantfly);
-    run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
     const run_cabi_packaging_tests = b.addSystemCommand(&.{
         "env",
@@ -545,7 +536,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
+        "capi path gate",
         "storage owner runtime status",
+        "capi storage owner candidate batches",
         "storage owner remote content source",
         "capi relational expression errors preserve public status semantics",
         "bounded Lite retirement admission is retryable while uncertain publication is not",
@@ -562,6 +555,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi concurrent calls and closes on one handle never touch freed memory",
         "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
+        "capi embedded graph catalog and query retain table identities across reopen",
         "capi fact relationships preserve identities and filter before ranking",
         "capi fact path serialization and parsing release partial allocations",
         "capi fact algebraic paths retain provenance and respect frontier limits",
@@ -588,6 +582,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "capi native memory",
+        "capi native short lived writers",
+        "capi native marker sweep",
+        "capi native unbounded writer admits reusable pool before a large request",
+        "capi native allocator proof",
+        "capi native recovery agenda",
+        "capi native logical generations",
+        "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
         "capi graph replacement retains indexed serving edges",
@@ -600,6 +601,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inline resolver ownership",
         "capi retired resolver identities",
         "capi query retry errors",
+        "capi Cypher authority",
         "capi resolver",
         "resolver import cross",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
@@ -630,6 +632,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // and explicit model qualification. Installed models must not silently
     // change the cost or selection of the ordinary unit gate.
     const run_capi_tests = capiTestRun(b, capi_tests, &capi_default_filters, false);
+    if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .x86_64 and
+        target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
+        target.result.abi == .gnu and optimize == .debug)
+    {
+        // Main's GNU Debug implementation completed under its existing 7 GiB
+        // claim. The 17.14 GB overrun was the separate consumer test object.
+        @import("../antfly/test_partitions.zig").setAuthoredMaxRss(b, capi_tests.object, 7 * 1024 * 1024 * 1024);
+    }
     run_capi_tests.addArgs(&.{ "--skip-test-filter", "capi local model " });
     // The remote-content boundary fixture shares this C API compilation.
     // Its focused target remains independently selectable; the unit gate runs
@@ -640,6 +650,23 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
+    const maintenance_activity_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/capi/maintenance_activity.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const run_maintenance_activity = b.addRunArtifact(maintenance_activity_tests);
+    run_capi_tests.step.dependOn(&run_maintenance_activity.step);
+    b.step("capi-maintenance-activity-test", "Verify manual drains yield admission to detached publishers")
+        .dependOn(&run_maintenance_activity.step);
+    const cypher_capi_tests = b.addTest(.{
+        .root_module = capi_root_mod,
+        .filters = &.{ "capi embedded graph", "capi Cypher authority" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_capi_tests).step);
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,
@@ -651,7 +678,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .root_module = lake_test_mod,
         // Compile reader/cursor regressions, not unrelated server fixture tests
         // reachable through shared schema and credential modules.
-        .filters = selectTestFilters(b, &.{ "lake SQL", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "lake host resolver" }),
+        .filters = selectTestFilters(b, &.{ "lake SQL", "lake catalog", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "external lake retirement", "external lake bootstrap", "external lake immutable", "lake host resolver" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("embedded-lake-test", "Test lake readers and SQL cursors without the server")
@@ -659,6 +686,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_test_step = b.step("capi-test", "Run C API tests");
     capi_test_step.dependOn(&run_capi_tests.step);
+    // Share the exact contract executable while allowing focused API
+    // regressions to avoid compiling unrelated resolver replay fixtures.
+    b.step("capi-contract-test", "Run hermetic C API contracts without resolver replay suites")
+        .dependOn(&run_capi_tests.step);
+    // Physical C API regressions can build their existing implementation owner
+    // directly. The ordinary gate still audits and runs both partitions.
+    @import("../antfly/test_partitions.zig").installLocalArtifact(b, capi_tests.executable, "capi-contract-owner-test-build", "Build physical C API contract tests without consumer discovery", "capi-contract-owner-tests");
 
     // Resolver and scorer are owned by embedded storage. Run their pure tests
     // in embedded CI as well as the compatibility lib-* test targets.
@@ -705,7 +739,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .run_lite_rs_tests = run_lite_rs_tests,
         .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
-        .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,
         .run_capi_tests = run_capi_tests,
     };

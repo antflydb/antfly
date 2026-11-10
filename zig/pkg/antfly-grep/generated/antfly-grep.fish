@@ -3,6 +3,8 @@ complete -c antfly-grep -n '__fish_seen_subcommand_from cache' -a clear
 complete -c antfly-grep -n '__fish_seen_subcommand_from workspace; and not __fish_seen_subcommand_from serve' -a serve
 complete -c antfly-grep -l after-context -r
 complete -c antfly-grep -l agent -r -f -a 'codex claude-code opencode'
+complete -c antfly-grep -l all-artifacts
+complete -c antfly-grep -l artifact -r
 complete -c antfly-grep -l ask -r
 complete -c antfly-grep -l auto-hybrid-regex
 complete -c antfly-grep -l backend -r -f -a 'http antfly local'
@@ -75,6 +77,7 @@ complete -c antfly-grep -l ignore-vcs
 complete -c antfly-grep -l include-dependencies
 complete -c antfly-grep -l include-sensitive
 complete -c antfly-grep -l include-zero
+complete -c antfly-grep -l indexed-media-transport -r -f -a 'inline source'
 complete -c antfly-grep -l invert-match
 complete -c antfly-grep -l json
 complete -c antfly-grep -l json-compact

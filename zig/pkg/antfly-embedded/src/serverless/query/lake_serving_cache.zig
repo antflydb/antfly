@@ -27,6 +27,8 @@ pub const Cache = struct {
     /// Pinned tree paths must not evict compact planning metadata or prevent
     /// file-order admission. Navigation has independent bounded residency.
     navigation: @import("lake_decoded_cache.zig").Cache,
+    /// Large native source payloads cannot evict compact planning structures.
+    text_pages: @import("lake_decoded_cache.zig").Cache,
     /// Manifest decoding has separate admission from snapshot construction.
     manifests: @import("lake_decoded_cache.zig").Cache,
     inventory_chunks: @import("lake_decoded_cache.zig").Cache,
@@ -299,7 +301,7 @@ pub const Cache = struct {
         return initWithMemoryLimit(alloc, 64 * 1024 * 1024);
     }
     pub fn initWithMemoryLimit(alloc: Allocator, maximum: usize) Cache {
-        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .navigation = .{ .a = alloc, .max_bytes = @min(16 * 1024 * 1024, maximum / 4), .max_entries = 256 }, .manifests = .{ .a = alloc }, .inventory_chunks = .{ .a = alloc }, .delete_files = .{ .a = alloc }, .inventory_catalogs = .{ .budget = .{ .backing = alloc, .limit = 128 * 1024 * 1024 } }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .text_pages = .{ .a = alloc, .max_bytes = @min(32 * 1024 * 1024, maximum / 2), .max_entries = 512, .max_loading_bytes = 8 * 1024 * 1024 }, .navigation = .{ .a = alloc, .max_bytes = @min(16 * 1024 * 1024, maximum / 4), .max_entries = 256 }, .manifests = .{ .a = alloc }, .inventory_chunks = .{ .a = alloc }, .delete_files = .{ .a = alloc }, .inventory_catalogs = .{ .budget = .{ .backing = alloc, .limit = 128 * 1024 * 1024 } }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
         // Request/status callers are quiescent. Cancel and join restoration
@@ -314,6 +316,7 @@ pub const Cache = struct {
         if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
         self.navigation.deinit();
+        self.text_pages.deinit();
         self.delete_files.deinit();
         self.inventory_catalogs.deinit();
         self.inventory_chunks.deinit();
@@ -397,7 +400,7 @@ pub const Cache = struct {
         try context.ensureActive();
         const key = try immutableKey(a, scope, identity, length, digest);
         defer a.free(key);
-        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
             return .{ .mapped = mapped };
         };
@@ -423,7 +426,7 @@ pub const Cache = struct {
             try context.ensureActive();
             return .{ .mapping = mapping };
         }
-        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
             return self.admitMapping(key, mapped);
         };
@@ -484,7 +487,7 @@ pub const Cache = struct {
             try context.ensureActive();
             return .{ .mapping = value };
         }
-        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
             self.recordRead(true, length);
             var lease = self.admitMapping(key, value);
             errdefer lease.deinit();
@@ -503,7 +506,11 @@ pub const Cache = struct {
         if (verified.value.bytes.ptr != verified.owner.bytes.ptr or verified.value.bytes.len != verified.owner.bytes.len or verified.value.bytes.len != length or !std.mem.eql(u8, &verified.value.digest, &digest)) return error.ArtifactIntegrityMismatch;
         const key = try immutableKey(a, scope, identity, length, digest);
         defer a.free(key);
-        if (self.persistentCache()) |disk| _ = disk.enqueueWrite(key, verified.value.bytes);
+        if (comptime @import("builtin").os.tag != .freestanding) {
+            if (self.persistentCache()) |disk| {
+                _ = disk.enqueueWrite(key, verified.value.bytes);
+            }
+        }
         self.store(key, verified.value.bytes) catch {};
         if (self.pin(key)) |value| {
             errdefer value.release();
@@ -525,7 +532,7 @@ pub const Cache = struct {
         const resident = self.entries.contains(key) or self.mappings.contains(key);
         self.mutex.unlock();
         if (resident) return true;
-        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
             var lease = self.admitMapping(key, value);
             lease.deinit();
             return true;
@@ -648,7 +655,7 @@ pub const Cache = struct {
         }
         defer if (claim) |active| self.finish(active, context.io.?);
         if (claim != null) if (try self.lookup(a, key)) |bytes| return bytes;
-        const disk_bytes = if (self.persistentCache()) |disk| try disk.readAlloc(a, key, length) else null;
+        const disk_bytes = if (comptime @import("builtin").os.tag == .freestanding) null else if (self.persistentCache()) |disk| try disk.readAlloc(a, key, length) else null;
         if (disk_bytes) |bytes| {
             var actual: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
@@ -674,7 +681,11 @@ pub const Cache = struct {
         self.stats.provider_reads +|= traffic.requests;
         self.stats.provider_bytes +|= traffic.bytes;
         self.mutex.unlock();
-        if (self.persistentCache()) |disk| _ = disk.enqueueWrite(key, bytes);
+        if (comptime @import("builtin").os.tag != .freestanding) {
+            if (self.persistentCache()) |disk| {
+                _ = disk.enqueueWrite(key, bytes);
+            }
+        }
         self.store(key, bytes) catch {};
         return bytes;
     }
@@ -936,7 +947,7 @@ pub const Reader = struct {
                     lease.release();
                     continue;
                 }
-                if (self.cache.persistentCache()) |disk| if (try disk.readAlloc(std.heap.page_allocator, key, member.range.len)) |bytes| {
+                if (comptime @import("builtin").os.tag != .freestanding) if (self.cache.persistentCache()) |disk| if (try disk.readAlloc(std.heap.page_allocator, key, std.math.cast(usize, member.range.len) orelse return error.LakeRowsScanBudgetExceeded)) |bytes| {
                     defer std.heap.page_allocator.free(bytes);
                     try worker.context.ensureActive();
                     self.cache.recordRead(true, bytes.len);
@@ -964,7 +975,11 @@ pub const Reader = struct {
                     const key = try worker.rangeKey(work.arena.allocator(), member);
                     const begin: usize = @intCast(member.range.offset - envelope.range.offset);
                     const slice = bytes[begin..][0..@intCast(member.range.len)];
-                    if (self.cache.persistentCache()) |disk| _ = disk.enqueueWrite(key, slice);
+                    if (comptime @import("builtin").os.tag != .freestanding) {
+                        if (self.cache.persistentCache()) |disk| {
+                            _ = disk.enqueueWrite(key, slice);
+                        }
+                    }
                     self.cache.storeOwned(key, slice, owner) catch {};
                 }
             }
@@ -1126,14 +1141,14 @@ pub const Reader = struct {
         // The credential-scoped, versioned key is identical in both tiers.
         // Disk corruption/missing entries are misses inside the persistent
         // cache; an allocation failure still belongs to this request.
-        const disk_bytes = if (self.cache.persistentCache()) |disk| try disk.readAlloc(alloc, key, read.range.len) else null;
+        const disk_bytes = if (comptime @import("builtin").os.tag == .freestanding) null else if (self.cache.persistentCache()) |disk| try disk.readAlloc(alloc, key, std.math.cast(usize, read.range.len) orelse return error.LakeRowsScanBudgetExceeded) else null;
         const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
         self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
         // Cache admission is optional and never turns a successful read into
         // an allocation failure in a long-lived shared owner.
-        if (disk_bytes == null) if (self.cache.persistentCache()) |disk| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (disk_bytes == null) if (self.cache.persistentCache()) |disk| {
             _ = disk.enqueueWrite(key, bytes);
         };
         self.cache.store(key, bytes) catch {};

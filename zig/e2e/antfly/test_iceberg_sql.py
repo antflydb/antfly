@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import struct
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -69,12 +70,25 @@ def _export_table(table, root):
     def put(key, payload):
         path = objects / key
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(
+        encoded = (
             b"AFOBJ001"
             + struct.pack("<QI", len(payload), 0)
             + hashlib.sha256(payload).hexdigest().encode()
             + payload
         )
+        # Model object PUT semantics: readers see a complete old or new object.
+        # Immutable warehouse objects must also retain their bytes and identity
+        # across exports instead of invalidating every cached manifest.
+        if path.exists() and path.read_bytes() == encoded:
+            return
+        output = tempfile.NamedTemporaryFile(dir=root, prefix=".export-", delete=False)
+        staging = Path(output.name)
+        try:
+            with output:
+                output.write(encoded)
+            os.replace(staging, path)
+        finally:
+            staging.unlink(missing_ok=True)
 
     avro_files = []
     exported_lengths = {}
@@ -96,6 +110,7 @@ def _export_table(table, root):
                         if not k.startswith("avro.")
                     },
                     records,
+                    hashlib.sha256(payload).digest()[:16],
                 )
             )
             continue
@@ -104,12 +119,19 @@ def _export_table(table, root):
         put(path.relative_to(directory).as_posix(), payload)
     # Manifest-list lengths describe the rewritten Avro payloads exactly.
     avro_files.sort(key=lambda entry: bool(entry[4] and "manifest_path" in entry[4][0]))
-    for path, schema, codec, metadata, records in avro_files:
+    for path, schema, codec, metadata, records, sync_marker in avro_files:
         for record in records:
             if "manifest_path" in record:
                 record["manifest_length"] = exported_lengths[record["manifest_path"]]
         out = io.BytesIO()
-        fastavro.writer(out, schema, records, codec=codec, metadata=metadata)
+        fastavro.writer(
+            out,
+            schema,
+            records,
+            codec=codec,
+            metadata=metadata,
+            sync_marker=sync_marker,
+        )
         payload = out.getvalue()
         key = path.relative_to(directory).as_posix()
         exported_lengths["object://antfly/" + key] = len(payload)
@@ -120,6 +142,94 @@ def _export_table(table, root):
         json.dumps(remote(json.loads(latest.read_bytes()))).encode(),
     )
     put("metadata/version-hint.text", b"1\n")
+
+
+def test_iceberg_export_preserves_immutable_objects_across_refresh(tmp_path):
+    fastavro = pytest.importorskip("fastavro")
+    warehouse = tmp_path / "warehouse"
+    metadata = warehouse / "metadata"
+    metadata.mkdir(parents=True)
+    manifest = metadata / "manifest.avro"
+    manifest_list = metadata / "list.avro"
+    with manifest.open("wb") as output:
+        fastavro.writer(
+            output,
+            {
+                "type": "record",
+                "name": "Entry",
+                "fields": [{"name": "data_file", "type": "string"}],
+            },
+            [{"data_file": (warehouse / "part.parquet").as_uri()}],
+        )
+    with manifest_list.open("wb") as output:
+        fastavro.writer(
+            output,
+            {
+                "type": "record",
+                "name": "Manifest",
+                "fields": [
+                    {"name": "manifest_path", "type": "string"},
+                    {"name": "manifest_length", "type": "long"},
+                ],
+            },
+            [
+                {
+                    "manifest_path": manifest.as_uri(),
+                    "manifest_length": manifest.stat().st_size,
+                }
+            ],
+        )
+    first_metadata = metadata / "0001.metadata.json"
+    first_metadata.write_text(
+        json.dumps({"snapshot": 1, "manifest-list": manifest_list.as_uri()})
+    )
+
+    class Table:
+        metadata_location = first_metadata.as_uri()
+
+        def location(self):
+            return warehouse.as_uri()
+
+    table = Table()
+    root = tmp_path / "objects"
+    _export_table(table, root)
+    objects = root / "buckets" / "antfly" / "objects"
+    before = {
+        path.relative_to(objects): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
+    _export_table(table, root)
+    for relative, (payload, modified) in before.items():
+        assert (objects / relative).read_bytes() == payload
+        assert (objects / relative).stat().st_mtime_ns == modified
+    records = list(
+        fastavro.reader(io.BytesIO((objects / "metadata/list.avro").read_bytes()[84:]))
+    )
+    assert records == [
+        {
+            "manifest_path": "object://antfly/metadata/manifest.avro",
+            "manifest_length": len((objects / "metadata/manifest.avro").read_bytes())
+            - 84,
+        }
+    ]
+    second_metadata = metadata / "0002.metadata.json"
+    second_metadata.write_text(
+        json.dumps({"snapshot": 2, "manifest-list": manifest_list.as_uri()})
+    )
+    table.metadata_location = second_metadata.as_uri()
+    _export_table(table, root)
+    for relative, (payload, modified) in before.items():
+        if relative == Path("metadata/v1.metadata.json"):
+            continue  # Only the publication alias advances to the new snapshot.
+        assert (objects / relative).read_bytes() == payload
+        assert (objects / relative).stat().st_mtime_ns == modified
+    assert (
+        json.loads((objects / "metadata/v1.metadata.json").read_bytes()[84:])[
+            "snapshot"
+        ]
+        == 2
+    )
 
 
 def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_path):
@@ -1331,15 +1441,120 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     break
             assert time.monotonic() < deadline, index
             time.sleep(0.1)
-        if vector_kind:
-            # Keep the archive publication fixed while exercising incremental
-            # accepted cuts. The background writer otherwise drains the first
-            # batch before the second request, legitimately removing its rows
-            # from the recent overlay. Reads need the catalog head/records but
-            # only commits use the intent namespace.
-            intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
-            intents.rename(intents.with_name("held-intents"))
-            intents.write_bytes(b"hold catalog publication for accepted-cut reuse")
+        # First establish a real WAL head and let its no-op update reach the
+        # published index. An empty suffix with no WAL head cannot be extended
+        # incrementally and would miss the regression seen after HN ingestion.
+        seeded = call(
+            "POST",
+            "/tables/wal_windows/lake/changes",
+            {
+                "batch_id": "published-seed",
+                "source": "e2e",
+                "epoch": "1",
+                "checkpoint": "0",
+                "key_fields": ["id"],
+                "changes": [
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "id": 0,
+                            "body": "quasar ",
+                            **(
+                                {
+                                    "dense_native": "[1,0]",
+                                    "sparse_native": '{"1":1}',
+                                }
+                                if vector_kind
+                                else {}
+                            ),
+                        },
+                    }
+                ],
+            },
+        )
+        deadline = time.monotonic() + 120
+        while True:
+            response = requests.post(
+                server.api_url + "/tables/wal_windows/query",
+                json={
+                    "full_text_search": {"match": "quasar", "field": "body"},
+                    "read_requirements": {
+                        "visibility": "published",
+                        "after_write": seeded["read_receipt"],
+                        "wait_ms": 1000,
+                    },
+                    "limit": row_count,
+                },
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            if response.ok:
+                break
+            assert response.status_code == 503 and time.monotonic() < deadline, (
+                response.text + server.debug_logs()
+            )
+            time.sleep(0.1)
+        # Keep the archive publication fixed while exercising incremental
+        # accepted cuts. Otherwise the background writer can drain a batch
+        # before its receipt is read, hiding an accepted-overlay regression.
+        # Reads need catalog head/records; only commits use the intent namespace.
+        intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
+        intents.rename(intents.with_name("held-intents"))
+        intents.write_bytes(b"hold catalog publication for accepted-cut reuse")
+        # Cache an empty, unbound suffix before its first keyed write. The next
+        # receipt-constrained query must extend that cached cut immediately.
+        empty_request = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "read_requirements": {"visibility": "accepted"},
+            "limit": row_count,
+        }
+        empty_cut = call("POST", "/tables/wal_windows/query", empty_request)
+        assert len(empty_cut["hits"]["hits"]) == row_count, empty_cut
+        # Reproduce HN's exact receipt check: replace an already published row
+        # with the same values, then immediately perform a metadata-only read.
+        # Text matching alone does not exercise lazy metadata membership.
+        unchanged = {
+            "id": 0,
+            "body": "quasar ",
+            **(
+                {"dense_native": "[1,0]", "sparse_native": '{"1":1}'}
+                if vector_kind
+                else {}
+            ),
+        }
+        noop = call(
+            "POST",
+            "/tables/wal_windows/lake/changes",
+            {
+                "batch_id": "unchanged-row",
+                "source": "e2e",
+                "epoch": "1",
+                "checkpoint": "noop-probe",
+                "expected_checkpoint": "0",
+                "key_fields": ["id"],
+                "changes": [{"op": "upsert", "row": unchanged}],
+            },
+        )
+        noop_query = {
+            "full_text_search": {"match_all": {}},
+            "filter_query": {"term": {"path": "/id", "value": 0}},
+            "fields": ["id", "body"],
+            "limit": 2,
+            "read_requirements": {
+                "visibility": "accepted",
+                "after_write": noop["read_receipt"],
+            },
+        }
+        visible = call("POST", "/tables/wal_windows/query", noop_query)
+        assert [h["_source"] for h in visible["hits"]["hits"]] == [
+            {"id": 0, "body": "quasar "}
+        ], visible
+        noop_query["remote_snapshot"] = visible["remote_snapshot"]
+        excluded_query = dict(noop_query, limit=row_count)
+        excluded_query["exclusion_query"] = excluded_query.pop("filter_query")
+        excluded = call("POST", "/tables/wal_windows/query", excluded_query)
+        assert len(excluded["hits"]["hits"]) == row_count - 1, excluded
+        assert all(h["_source"]["id"] != 0 for h in excluded["hits"]["hits"])
         vector_image = (
             {"dense_native": "[0,1]", "sparse_native": '{"2":2}'} if vector_kind else {}
         )
@@ -1351,6 +1566,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "source": "e2e",
                 "epoch": "1",
                 "checkpoint": "1",
+                "expected_checkpoint": "noop-probe",
                 "key_fields": ["id"],
                 "changes": [
                     {"op": "delete", "row": {"id": 1}},
@@ -1392,6 +1608,22 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         assert rows[1000] == "quasar recent recent"
         assert all(h.get("_highlights") for h in hits), first
         pinned = dict(query, remote_snapshot=first["remote_snapshot"])
+        page = call(
+            "POST",
+            "/tables/wal_windows/query",
+            dict(pinned, limit=5, order_by=[{"field": "id"}]),
+        )
+        continuation = dict(
+            pinned,
+            limit=5,
+            order_by=[{"field": "id"}],
+            search_after=page["hits"]["hits"][-1]["_sort"],
+        )
+        next_page = call("POST", "/tables/wal_windows/query", continuation)
+        assert {h["_source"]["id"] for h in page["hits"]["hits"]}.isdisjoint(
+            h["_source"]["id"] for h in next_page["hits"]["hits"]
+        )
+        assert len(next_page["hits"]["hits"]) == 5, next_page
         hybrid_request = None
         hybrid_first = None
         if vector_kind:
@@ -1482,7 +1714,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             assert fresh_envelope["state"] == old_envelope["state"]
             assert fresh_envelope["expires_ms"] >= old_envelope["expires_ms"]
             assert started_ms + 300_000 <= fresh_envelope["expires_ms"]
-            assert fresh_envelope["expires_ms"] <= finished_ms + 300_000
+            # Default five-minute retention is a minimum. Issuance rounds up
+            # within a three-second cohort to reuse immutable capabilities.
+            assert fresh_envelope["expires_ms"] < finished_ms + 303_000
             assert len(fresh_envelope["reader_token"]) == 16
             newer = call(
                 "POST",
@@ -1550,6 +1784,20 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         for restart in (False, True):
             if restart:
                 server.restart()
+            # A newer accepted cut and a process restart must not alter this
+            # receipt's pinned no-op row or its lazy inclusion/exclusion result.
+            unchanged_cut = call("POST", "/tables/wal_windows/query", noop_query)
+            assert unchanged_cut["hits"] == visible["hits"]
+            excluded_cut = call("POST", "/tables/wal_windows/query", excluded_query)
+            assert excluded_cut["hits"] == excluded["hits"]
+            original = call(
+                "POST",
+                "/tables/wal_windows/query",
+                dict(empty_request, remote_snapshot=empty_cut["remote_snapshot"]),
+            )
+            assert original["hits"] == empty_cut["hits"]
+            resumed = call("POST", "/tables/wal_windows/query", continuation)
+            assert resumed["hits"] == next_page["hits"]
             if hybrid_request:
                 hybrid = call("POST", "/tables/wal_windows/query", hybrid_request)
                 assert hybrid["hits"] == hybrid_first["hits"]

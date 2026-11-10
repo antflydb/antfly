@@ -32,6 +32,7 @@ pub const OpenAIReasoningEffort = types.OpenAIReasoningEffort;
 pub const OpenRouterGeneratorConfig = types.OpenRouterGeneratorConfig;
 pub const RateLimitConfig = types.RateLimitConfig;
 pub const RetryConfig = types.RetryConfig;
+pub const SourceContentPart = types.SourceContentPart;
 pub const TextContentPart = types.TextContentPart;
 pub const ToolCall = types.ToolCall;
 pub const ToolCallFunction = types.ToolCallFunction;

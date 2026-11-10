@@ -142,7 +142,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     for (inventory.files) |file| estimated_rows +|= file.row_count;
     const capture_eligible = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(try std.json.parseFromSliceLeaky(std.json.Value, metadata.allocator(), table.indexes_json, .{}));
     if (full_scan and capture_eligible and input_recipes.len != 0 and estimated_rows >= 128) capture_out.* = try @import("lake_row_payloads.zig").Capture.start(capture_allocator, provider, store, columns);
-    if (capture_out.*) |capture| capture.configureOrdering(runtime, store) catch |err| {
+    if (capture_out.*) |capture| capture.configureOrdering(runtime) catch |err| {
         if (!capture.optionalFailure(err)) return err;
         capture.deinit();
         capture_out.* = null;

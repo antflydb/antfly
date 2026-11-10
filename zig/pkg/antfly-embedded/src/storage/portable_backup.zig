@@ -1298,10 +1298,11 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                         if (value.len >= 8) std.mem.readInt(u64, value[0..8], .little) else 0
                     else
                         0,
+                    .ttl_source_ns = if (timestamp_value) |value| archiveTtlSource(value) else null,
                 });
                 owned_key_pending = false;
                 owned_value_pending = false;
-                doc_batch_bytes += user_key.len + owned_value.len;
+                doc_batch_bytes += user_key.len + owned_value.len + 17 + @as(usize, if (doc_batch.items[doc_batch.items.len - 1].ttl_source_ns != null) 16 else 0);
 
                 if (doc_batch_bytes >= batch_target_bytes) {
                     try flushDocBatch(alloc, out, &doc_batch, &counts);
@@ -1674,6 +1675,13 @@ fn flushDocBatch(
     batch.clearRetainingCapacity();
 }
 
+/// Zero in the legacy archive timestamp field means missing metadata. Carry
+/// an explicit source for an existing epoch record so restore preserves presence.
+fn archiveTtlSource(value: []const u8) ?i128 {
+    const source = @import("ttl.zig").sourceTimestamp(value) orelse return null;
+    return if (value.len == 24 or source == 0) source else null;
+}
+
 fn timestampValueAlloc(alloc: Allocator, timestamp_ns: u64) ![]u8 {
     const value = try alloc.alloc(u8, 8);
     std.mem.writeInt(u64, value[0..8], timestamp_ns, .little);
@@ -1754,6 +1762,7 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
 }
 
 pub fn isPortableMetadataKey(key: []const u8) bool {
+    if (std.mem.eql(u8, key, @import("ttl.zig").document_version_watermark_key)) return true;
     // Destination facts must be rebuilt from imported physical records, never
     // copied from a source's potentially partial maintenance certificate.
     if (@import("artifact_footprint.zig").isKey(key)) return false;
@@ -2444,6 +2453,13 @@ fn PortableArchiveReader(comptime RawReader: type) type {
 }
 
 pub const default_schema_cache_bytes: usize = 16 * 1024 * 1024;
+
+/// Options shared by direct and independently compiled staged restore decoders.
+pub const RestoreImportOptions = struct {
+    identity_namespace: ?doc_identity.Namespace = null,
+    embedding_source_fields: []const ImportOptions.EmbeddingSourceField = &.{},
+    cancellation: @import("db/types.zig").CancellationToken = .none,
+};
 
 pub const ImportOptions = struct {
     pub const EmbeddingSourceField = struct {
@@ -4692,6 +4708,8 @@ fn validatePortableDocumentEntryAgainstArchive(
 /// the archive-wide, schema-aware preflight has succeeded.
 fn validatePortableDocumentEntry(entry: backup_codec.DocumentEntry) !void {
     if (entry.value_flags & ~backup_codec.doc_value_known_flags != 0) return error.InvalidBackupRequest;
+    if (entry.value_flags & backup_codec.doc_value_flag_ttl_source != 0 and entry.ttl_source_ns == null) return error.InvalidBackupRequest;
+    if (entry.ttl_source_ns != null and entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) return error.InvalidBackupRequest;
     if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) return;
     if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0) return error.InvalidBackupRequest;
     _ = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
@@ -4719,7 +4737,9 @@ fn validateMetadataEntries(
 ) !void {
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
-        if (@import("db/group_source_index.zig").isRevisionClockKey(entry.key)) {
+        if (std.mem.eql(u8, entry.key, @import("ttl.zig").document_version_watermark_key)) {
+            if (entry.value.len != 8 or std.mem.readInt(u64, entry.value[0..8], .little) == 0) return error.InvalidMetadataBatch;
+        } else if (@import("db/group_source_index.zig").isRevisionClockKey(entry.key)) {
             @import("db/group_source_index.zig").validateRevisionClock(entry.key, entry.value) catch return error.InvalidMetadataBatch;
         } else if (entry.key.len == 20 and std.mem.startsWith(u8, entry.key, @import("db/group_source_state.zig").lease_clock_prefix)) {
             if (entry.value.len < 37 or entry.value.len > 64 or !std.mem.eql(u8, entry.value[0..4], "GSC1") or !std.mem.eql(u8, entry.value[entry.value.len - 32 ..], &@import("db/group_source_queue.zig").checksum(entry.key, entry.value[4 .. entry.value.len - 32]))) return error.InvalidMetadataBatch;
@@ -5085,10 +5105,10 @@ fn importDecodedDocumentEntriesWithExtra(alloc: Allocator, store: *DocStore, ent
             break :blk decompressed;
         } else e.value;
         try writes.append(alloc, .{ .key = store_key, .value = value });
-        if (e.timestamp_ns != 0) {
+        if (e.timestamp_ns != 0 or e.ttl_source_ns != null) {
             const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, e.key);
             try owned_keys.append(alloc, timestamp_key);
-            const timestamp_value = try timestampValueAlloc(alloc, e.timestamp_ns);
+            const timestamp_value = try @import("ttl.zig").encodeTimestampAlloc(alloc, e.timestamp_ns, e.ttl_source_ns orelse @as(i128, e.timestamp_ns));
             try owned_keys.append(alloc, timestamp_value);
             try writes.append(alloc, .{ .key = timestamp_key, .value = timestamp_value });
         }
@@ -7767,4 +7787,32 @@ test "portable backup native resolver authority retains heads policy and queue i
     defer incomplete.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);
     try std.testing.expectError(error.InvalidMetadataBatch, incomplete.finish(alloc));
+}
+
+test "time series portable restore retains signed TTL source independently of version" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var store = try openTestStore(a, &directory);
+    defer store.close();
+    const ttl = @import("ttl.zig");
+    const cases = [_]struct { key: []const u8, version: u64, source: i128 }{
+        .{ .key = "historical", .version = 12345, .source = -1_000_000_000 },
+        .{ .key = "epoch", .version = 23456, .source = 0 },
+        .{ .key = "legacy_epoch", .version = 0, .source = 0 },
+        .{ .key = "legacy_positive", .version = 12345, .source = 12345 },
+    };
+    for (cases) |case| {
+        const metadata = try ttl.encodeTimestampAlloc(a, case.version, case.source);
+        defer a.free(metadata);
+        const archive_source = archiveTtlSource(metadata);
+        if (case.source == 0) try std.testing.expectEqual(@as(?i128, 0), archive_source);
+        if (std.mem.eql(u8, case.key, "legacy_positive")) try std.testing.expect(archive_source == null);
+        const encoded = try backup_codec.encodeDocumentBatch(a, &.{.{ .key = case.key, .value_flags = 0, .value = "{}", .timestamp_ns = case.version, .ttl_source_ns = archive_source }});
+        defer a.free(encoded);
+        try importDocumentBatch(a, &store, encoded);
+        try std.testing.expectEqual(@as(?u64, case.version), try ttl.readTimestamp(&store, a, case.key));
+        try std.testing.expectEqual(@as(?i128, case.source), try ttl.readSourceTimestamp(&store, a, case.key));
+        try std.testing.expect(try ttl.isDocExpired(&store, a, case.key, .{ .duration_ns = 1_000_000_000 }, 2_000_000_000));
+    }
 }

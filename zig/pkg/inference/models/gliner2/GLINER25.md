@@ -13,6 +13,251 @@ See [GLINER25_FAMILY.md](GLINER25_FAMILY.md) for the multilingual boundary
 artifacts and the ModernBERT Decide-1B architecture, tokenizer contracts,
 backend limits, and reproducible family checks.
 
+## Runtime capacity and measured coverage
+
+Boundary serving separates supported artifacts, backends and features from
+measured geometry. The `LengthContract` ranges below record test coverage; they
+are not runtime context ceilings or minimum request sizes. The evidence-only
+`Gate` continues to check them for qualification receipts. Serving uses
+`Admission` to verify the exact consumed artifact, backend and complete request
+feature union, then plans exact model and resource requirements before inference.
+
+The pinned base model supports **4096 body words**, including any separate
+synthetic terminal word and excluding synthetic enum-prefix words. The default
+processor/encoder ceiling is **16384 encoded prompt tokens**, including schema,
+enum prefixes and body subwords. These are different units. DeBERTa's relative
+position buckets do not impose a 512-token context ceiling; ModernBERT's declared
+position extent does constrain its encoded sequence. Explicit processor, device,
+attention-work, document and output budgets still apply and can refuse a request
+before inference. Published `boundary_runtime` values are default upper bounds,
+not a guarantee that every schema/shape fits every device budget.
+
+For windows using the full word limit, set `long_document.window_words` to `4096`; the default
+remains `1024` for throughput. Windows include schema cost in exact tokenization
+and shrink only when the real encoded prompt capacity requires it. Fitting uses
+exact per-word token costs and prefix sums to select the largest fitting uniform
+word budget. Changing width moves window boundaries, so fitting checks candidates
+without assuming token counts are monotonic. The requested ceiling is prepared
+once when it fits; otherwise at most 4,096 candidate widths use indexed source
+geometry, without retokenizing the document for each candidate. Fitting preserves
+overlap/global offsets and never silently truncates input. A synthetic terminal period can also exceed
+the encoded-fragment byte limit; this window-dependent refusal participates in
+fitting. The invariant schema prompt is validated before fitting costs are
+indexed. Exhausting candidate widths preserves the original processor refusal.
+The [fragment-fitting follow-up receipt](../../../../bench/baselines/gliner-fragment-fitting-20261103.json)
+records 62 passing Debug checks, including the pinned tokenizer at the default
+fragment limit, cache reuse and allocation-failure cleanup.
+Physical window groups shrink independently
+when aggregate batch work or memory limits require it. Workspace planning and
+execution use the same preparation and group admission paths.
+
+Pull metadata retains `qualified_limits.profiles` as measured coverage and marks
+its role explicitly with `boundary_profiles_role`. `boundary_runtime` separately
+reports the model body-word bound and default encoded-token ceiling. SDKs already
+represent this metadata as an open object, so no SDK API change is required.
+
+### Full-context execution check (2026-11-02)
+
+Focused Debug validation passed 49 tests, with three skips (CUDA unavailable and
+the small-model directory environment unset). The installed pinned base model completed real
+Metal inference with all 4096 body words (4105 prompt tokens), and independently
+with 16381 of 16384 prompt tokens in one window under the default work budget.
+A tokenizer-only check with an explicitly larger work budget fitted a larger
+synthetic document to three windows with 37470 total tokens.
+Native/Metal pinned window parity, the base checkpoint's ten upstream pipeline
+reference cases, metadata, cancellation, declared-budget and allocation-failure
+checks passed. These checks establish execution/admission at the boundaries and
+preserve existing reference parity; they do not establish long-context extraction
+accuracy or optimized throughput.
+
+From `zig/`, set `ANTFLY_GLINER25_BASE_MODEL_DIR` and
+`ANTFLY_GLINER_WINDOW_MODEL_DIR` to the installed pinned base artifact, then run:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
+  -Doptimize=debug -j1 --cache-dir ../.zig-cache \
+  '-Dtest-filter=boundary qualification' \
+  '-Dtest-filter=extractors.gliner_boundary_long_executor.test.' \
+  '-Dtest-filter=gliner boundary pipeline Python parity pinned base' \
+  '-Dtest-filter=qualified limits JSON' \
+  '-Dtest-filter=boundary full context learned Metal' \
+  '-Dtest-filter=GLiNER bounded window composition'
+```
+
+### Prepared windows and physical work budgets (2026-11-03)
+
+Long-document preparation retains tokenized windows in a request-local store.
+Fitting, geometry admission, workspace sizing and execution reuse those samples;
+physical batches are repacked against the current device/encoder limits without
+repeating tokenizer work. Geometry keys include artifact/tokenizer identity,
+schema, content and processor/window limits. Decoder/output-budget changes reuse
+the samples while recomputing the semantic plan fingerprint and rebinding live
+control/validator callbacks. No store survives its request. Default bounds are
+32 MiB per retained window cache and 64 MiB across the request, including fitting
+trials and retained geometry; the enclosing request heap remains the outer bound.
+
+Prompt-token reporting remains the logical sum of window prompts. Admission now
+charges padded physical batch tokens and attention elements across all layers.
+Backing-OOM retries count against both budgets, and subdivisions stay within the
+original admitted group boundaries. Declared evidence-budget exhaustion reports
+its memory-limit error without speculative smaller-group retries.
+
+At `2dc7086a03`, Debug validation passed **71 tests locally (4 skips)** and **65 CUDA tests
+on glowworm's NVIDIA GB10 (no skips)**. Both Metal and CUDA completed the full
+4096-body-word boundary and a 16381/16384-token prompt under the default work
+budget. Pinned CUDA parity covered window groups of 1/2/4 and an injected backing
+allocation failure. An additional CUDA check verified increased retry charges,
+unchanged logical prompt usage and refusal when the original quota cannot cover
+those extra attempts. Repacking, physical budgets, semantic identity rebinding and
+all-allocation-failure cleanup checks passed.
+
+A real-tokenizer preparation-only benchmark measured three geometry passes per
+request, alternating reuse disabled/enabled in ABBA order. Timing includes final
+request-store teardown on both paths; tokenizer/config loading, JSON/schema
+parsing and model execution are excluded. Two requests per mode
+totaled 410.751/144.068 ms locally (**2.85x**) and 335.414/119.950 ms on glowworm
+(**2.80x**). This compares the request store disabled/enabled in the same Debug
+implementation; it is not an old-head comparison or an end-to-end inference
+throughput claim. The public synthetic inputs, model pins, raw measurements and
+tested runtime-source hashes are recorded in
+[`gliner-preparation-reuse-20261103.json`](../../../../bench/baselines/gliner-preparation-reuse-20261103.json).
+
+To reproduce, extend the preceding focused command with
+`'-Dtest-filter=boundary preparation'`,
+`'-Dtest-filter=pipelines.gliner_boundary_processor.test.'` and
+`'-Dtest-filter=pipelines.gliner_boundary_long_document.test.'`, and set
+`ANTFLY_GLINER_PREPARATION_BENCH=1`. On CUDA, add `-Dcuda=true`; select
+`boundary full context learned CUDA` and
+`GLiNER bounded window composition pinned CUDA` for the learned checks. The
+receipt lists the exact scope and skip reasons; aggregate repository CI remains
+separate.
+
+### Exact fitting and complete-request diagnostic (2026-11-03)
+
+Window fitting now selects the largest valid uniform width using exact word-cost
+prefix sums and indexed terminal geometry. The former binary search could reject
+valid requests because changing width moves the partition boundaries. Regressions
+cover the reproduced width-12/width-10 case, exhaustive tokenized partitions,
+Unicode and both splitters, bounded tokenizer calls at a 4096-word ceiling, and
+all fitting allocation failures. The native OOM retry test now injects failure
+inside the learned encoder instead of relying on a platform-dependent whole-request
+6 MiB cap; retry completion passes on macOS and Linux.
+
+Fresh checks passed native/Metal/CUDA window parity and the 4096-body-word and
+16381/16384-token learned boundaries. The extracting suite passed all 37 tests.
+The [source-pinned receipt](../../../../bench/baselines/gliner-token-fitting-20261103.json)
+records the main suites, environment failures and successful reruns separately.
+
+A supplemental warm **in-process CUDA** comparison used the same Debug/reference
+implementation with preparation reuse disabled/enabled. After warming both modes,
+eight ABBA rounds measured 16 requests per mode and produced identical responses.
+Median latency fell from **146.6 to 104.7 ms**, and nearest-rank p95 from
+**147.6 to 105.4 ms** (about **1.40x** requests per unit time). Timing includes
+workspace/qualification planning, inference, global decoding, serialization and
+preparation-store teardown. Model/tokenizer loading, input JSON/schema parsing,
+HTTP transport/server queues and returned-response disposal are excluded. This
+is a shared-host diagnostic, not optimized HTTP-service throughput or an
+old-commit comparison.
+
+To reproduce on CUDA, set `ANTFLY_GLINER25_BASE_MODEL_DIR` to the pinned base
+artifact and `ANTFLY_GLINER_E2E_BENCH=1`, then run `inference-test -Dcuda=true
+-Doptimize=debug` with `'-Dtest-filter=boundary end-to-end CUDA benchmark'`.
+The benchmark is opt-in; its ordinary test run skips it.
+
+### Native head admission
+
+Native and browser group planning now checks the head's cumulative intermediate
+charges and shared-pool scratch limits before encoder dispatch. When a group is
+too large, batch size shrinks while each window retains its full context. Single
+native inputs use the same scalar head planner. A cached preparation rechecks the
+current head limits on every admission.
+
+The native base-model regression admits four 4096-word windows as two groups of
+two. Each admitted head group charges 221,478,338 bytes against the unchanged
+256 MiB limit. The planner covers optional content, record, count and abstention
+outputs. Planning and execution share checked byte charging, and Debug learned
+execution asserts that planned and actual charges agree.
+
+The [native head admission receipt](../../../../bench/baselines/gliner-native-head-admission-20261103.json)
+records **67 passing Debug checks with no skips**. Real published head weights
+completed a two-by-4096-word forward at the exact planned budget; zero pooled
+states isolate head execution from the encoder. All 16 optional-head combinations
+and pinned base all-task pipeline parity passed. The no-model-read regression
+also proves that impossible head caps fail before encoder dispatch. GPU execution
+and throughput were not remeasured for this native admission change.
+
+### Complete native pipeline and HTTP qualification
+
+Real-weight native Debug execution now covers the encoder, shared head and
+decoder together at 4096 body words (4105 prompt tokens), at four full-word
+windows (16440 logical prompt tokens), and at 16381 of 16384 encoded tokens in
+one window. All six selected checks passed without skips, including projection
+parity, allocation-failure cleanup and pinned all-task parity. The three learned
+cases share the serving path's unchanged 512 MiB live-heap bound; their measured
+peaks were 186167928, 384021726 and 517336416 bytes respectively.
+
+The encoded-token HTTP check initially exposed a real native heap refusal.
+Native DeBERTa now projects unique relative-position buckets for long inputs,
+expands their results into the existing attention layout, and releases content
+and relative projections after synchronous attention. Attention output is freed
+after its output projection, before the FFN. This removes overlapping phase
+lifetimes without increasing the request heap or the model/work limits. Device
+backends retain their command-frame lifetimes.
+
+With the pinned base model installed, select the word/window checks separately
+from the more expensive encoded-token boundary:
+
+```sh
+ANTFLY_GLINER25_BASE_MODEL_DIR=/path/to/gliner2.5-base-v1 \
+VECLIB_MAXIMUM_THREADS=2 \
+ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
+  -Doptimize=debug -j1 --cache-dir ../.zig-cache \
+  '-Dtest-filter=boundary full context learned native base word capacity' \
+  '-Dtest-filter=boundary full context learned native grouped words'
+```
+
+The explicit `scripts/gliner25/qualify_context_http.py` command checks encoded
+capacity through an already-running loopback HTTP service. It measures dense
+and filler word token costs using small requests, fills exactly 16384 tokens, and
+requires a single window, exact reported token usage and valid source spans.
+It does not measure long-context extraction accuracy:
+
+```sh
+python3 pkg/inference/scripts/gliner25/qualify_context_http.py \
+  --endpoint http://127.0.0.1:18776/ai/v1/extract --output context-report.json
+```
+
+`benchmark_linux_cpu_http.py --concurrency 4` adds synchronized client bursts to
+the paired warm HTTP comparison. Burst timing starts when all clients are ready
+and ends at the last response body. Every client captures its body and timestamp
+before any response parsing or oracle comparison begins; all checks finish
+before the next arm starts. Reports retain individual client latencies, burst
+throughput, paired confidence intervals and per-round host load. Every response
+is checked against the pinned oracle, and binaries/model files are hashed before
+and after measurement. The four-client profile provisions the same 4 GiB
+aggregate scratch allowance on both services (`--scratch-budget-mb 4096`); the
+initial baseline trial exhausted its default 1 GiB allowance. Per-request model,
+head and work limits remain unchanged.
+
+The [2026-11-03 local qualification receipt](../../../../bench/baselines/gliner-native-http-20261103/summary.json)
+records the fixed native service accepting exactly 16384 prompt tokens in one
+window with the unchanged 512 MiB request heap. Performance qualification remains
+partial. Some paired confidence intervals do not establish the declared 5%
+median-cost bound, and one short-request phase showed a large slowdown that was
+not consistently reproduced. Changing host/runtime state remains an unresolved
+confounder. These shared-host measurements do not establish production tail
+latency or long-context extraction accuracy, and aggregate CI remains outstanding.
+The earlier concurrent timings are preserved as superseded evidence because
+validation could delay other clients' timestamps. The full-word four-client run
+failed after seven complete pairs with live-host-memory admission refusal.
+The corrected harness completed 100 pairs each for four-client short and
+reference-window requests. Their candidate/baseline median ratios were 0.9867
+(95% interval 0.9580–0.9958) and 1.0050 (0.9814–1.0264), meeting the declared
+1.05 upper-bound criterion. The same campaign then failed during composed
+windows after 53 complete pairs: live-host admission refused a fourth 512 MiB
+reservation. The server/model artifacts and cases were verified unchanged after
+failure. Composed-window and full-word concurrency qualification remain open.
+
 ## Current status
 
 | Artifact | Backbone | Precision | Backend | Status |
@@ -91,15 +336,12 @@ Advertisement and execution are enforced independently, on purpose:
    `ModelManifest.hasSupportedGlinerRuntime()` stays permanently `false` for
    boundary architecture there, by design (see its doc comment).
 2. **Request-time execution** (`zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig`'s
-   `Gate`, backed by `gliner_boundary_qualification.require()`): every
-   extraction request against a boundary model re-derives the exact
-   identity of the live session's consumed weight/sidecar bytes, the actual
-   backend (native or Metal), the full feature union of the request, and the
-   real prepared geometry (words, windows, encoded sequence length) -- and
-   requires all four to match one production row before any learned work
-   runs. A mismatched digest, an unreviewed backend, a feature outside the
-   row (e.g. long-document windowing), or a request outside the measured
-   length bounds is refused, regardless of what pull-time advertised.
+   `Admission`): extraction revalidates the exact consumed artifact and backend
+   against a row supporting the complete feature union. Exact tokenization and
+   processor/encoder/device planning enforce model capacity and configured
+   resource budgets before learned work. Unknown digests/backends and unsupported
+   feature combinations remain refused. Historical measured geometry is checked
+   separately by the evidence-only `Gate`.
 
 Nothing in this design lets `runtime_available` or an empty-vs-nonempty
 production table "leak" execution permission to an unreviewed artifact:
@@ -127,8 +369,8 @@ follow from how these bounds were measured:
   plan real documents (no model weights) against the dogfood schema.
 - Bounds are schema-shape-specific. The schema's entity/relation vocabulary
   is encoded ahead of the document, so a narrower schema can produce a
-  `padded_sequence_tokens` value below a row's floor and be refused even for a
-  "shorter" request. Rows were measured with `examples/dogfood`'s
+  `padded_sequence_tokens` value below a measured row's floor. That is outside
+  that row's evidence coverage; it is not a serving refusal. Rows were measured with `examples/antfly-docs-knowledge-base`'s
   11-entity/6-relation schema.
 - The single-window and long-document rows require disjoint features
   (`.single_window` vs `.long_document`), so neither can borrow the other's
@@ -136,9 +378,47 @@ follow from how these bounds were measured:
 - Geometry depends only on the tokenizer and schema, so `fp16_encoder` rows
   reuse the fp32 `LengthContract`s unchanged (re-measured byte-for-byte
   against the converted bundle).
-- The corpus floor (`document_bytes >= 1`) covers `examples/dogfood`'s
+- The corpus floor (`document_bytes >= 1`) covers `examples/antfly-docs-knowledge-base`'s
   smallest real section (`zig/SCHEMA.md`'s 20-byte "Related Docs" after link
   stripping) and a one-character document.
+
+### Metal request batches
+
+The exact FP32 base artifacts (original and Transformers wrapper) and
+multilingual-v1 profiles have separate Metal single-window rows for 2–8 input
+items. They preserve every existing per-item feature and geometry bound.
+Multilingual feature profiles remain independent; batching does not admit a
+union of otherwise incompatible profiles. Reduced precision, Multi-Decide,
+and multi-item long-document requests retain their existing qualification.
+
+Compatible consecutive items share a padded encoder/head pass and retain
+their original output order. Different execution options start another
+physical group. Token and aggregate-work ceilings can split a group further.
+Resident Metal workspace admission uses the maximum physical `batch *
+padded_sequence_tokens` across those groups before execution starts.
+The per-model admission lock also prevents queued requests from reserving
+duplicate device scratch. Preprocessing runs before this lock, and waiting
+requests remain cancellable.
+
+`GLiNER production Metal distinct input batches` tests the public HTTP path
+with exact pinned checkpoints, distinct inputs and schemas, 2/4/8 items,
+reversed order, singleton parity, device allocation counts, workspace reuse,
+released request leases, and rejection of nine-item boundary requests before
+GPU work. Multilingual coverage includes the classifier/entity floors,
+endpoint captures, and extended short/long profiles. Decide additionally
+exercises 9-, 17-, and 128-item requests using bounded physical groups.
+Boundary batch discovery remains conservative because windowed requests have
+an independent one-item contract.
+
+`GLiNER production Metal batch lifecycle` covers base, multilingual-v1 and
+DeBERTa Decide through real HTTP sockets. It requires two simultaneously
+admitted, tokenized batches before execution, cancels a queued batch with a
+TCP reset, and checks repeated retryable capacity denials followed by successful
+retries. Results must retain singleton parity and restore request leases.
+The pressure check fills the scratch admission ledger using a separate owner's
+reservation without allocating equivalent physical RAM. Run these checks with
+`-Doptimize=ReleaseFast` and compile-time filter
+`-Dtest-filter='GLiNER production Metal'`.
 
 ### Long-document execution
 
@@ -153,17 +433,23 @@ independent of document length.
   per window. The default was chosen because attention cost is quadratic in
   window length: 1024-word windows measured ~2.1x faster end to end than the
   former 4096/128 default on real corpus sections.
+- Word-window sizes are ceilings. Exact schema/body tokenization fits them to
+  actual processor/model capacity, independently of measured profile geometry.
+  Workspace planning and execution share this fitting and physical-group
+  admission path, preserving source offsets and bounded overlap.
 - `Limits.window_batch_size` (default **4**) groups a document's windows into
   one forward pass, except for schemas with classification or JointIE, which
   run one window per call. An `error.OutOfMemory` on a group retries the same
   starting window with a halved group (down to one window) instead of failing
   the document.
 - `Limits.max_total_encoded_tokens` (default 131,072) and
-  `Limits.max_total_attention_work` (default 8 GiB of attention-score
-  elements) are separate cumulative safety caps; a document inside the
-  reviewed geometry can still fail closed with
+  `Limits.max_total_attention_work` are separate cumulative safety caps. The
+  default attention budget is the configured encoder per-call attention-work
+  ceiling multiplied by the model layer count (48 Gi score elements for the
+  pinned base model), so it admits one full-context call. Explicit budgets,
+  including smaller ones, override that default. Requests can still fail with
   `error.LongDocumentWorkLimitExceeded`.
-- `examples/dogfood` requests `"long_document":{"mode":"window"}` for every
+- `examples/antfly-docs-knowledge-base` requests `"long_document":{"mode":"window"}` for every
   section; the wire default mode is `.reject`.
 
 ### Long-document geometry evidence
@@ -281,7 +567,7 @@ Single-process, one request in flight, real dogfood schema with windowing,
 on the 40-section corpus sample (32 sections of 1–8 KB, 8 of 20–40 KB):
 fp32 Metal ~2.7 sections/s, fp32 native ~0.49 sections/s. HTTP and
 in-process (`Node.extractDirect`) measure the same within noise; the lower
-rate seen during a full `examples/dogfood` ingest was attributed to
+rate seen during a full `examples/antfly-docs-knowledge-base` ingest was attributed to
 contention with concurrent embedding on the one Metal device and to the
 embedded worker's process hop, not to the extraction path. CPU direct-core latency versus pinned Fastino
 CPU is recorded in the [CPU benchmark runs](../../../../../docs/design/inference/history/gliner2/gliner25-cpu-benchmark-runs.md).
@@ -350,7 +636,7 @@ These are the exact digests compiled into `gliner_boundary_qualification.zig`'s
 
 #### Follow-up: fp16-encoder long-document qualification and corpus-shaped throughput
 
-Reviewed 2026-09-20. `examples/dogfood` requests `long_document.mode=window`
+Reviewed 2026-09-20. `examples/antfly-docs-knowledge-base` requests `long_document.mode=window`
 for every section and essentially every real section needs it, so the
 single-window fp16 row above cannot serve real traffic on its own. The
 long-document row for `fastino_gliner25_base_v1_fp16_encoder` (native and
@@ -447,9 +733,9 @@ backend where it costs nothing), not because it is faster.
 6. Update this document's status table and evidence section.
 
 A mismatched digest, an unreviewed backend, a feature outside the row, or
-geometry outside the measured bounds must continue to fail closed with
-`error.UnsupportedGlinerBoundaryRuntime` -- that is what the qualification
-module's own tests in `models/gliner_boundary_qualification.zig` enforce.
+geometry outside the measured bounds must fail evidence qualification. Runtime
+admission still rejects mismatched artifacts, backends and unsupported features;
+geometry is enforced by actual model and resource limits instead.
 
 ### Embedded knowledge graph extraction and bounded windows
 
@@ -468,9 +754,10 @@ requires memory admission, including resident weights and bounded head scratch.
 The pinned base and multi-Decide FP32 boundary artifacts also qualify bounded
 word windows with descriptions and classification, including prompts smaller
 than the former 103-token floor. Each complete schema/body prompt is tokenized
-before execution and must fit 1024 tokens. Window bodies shrink to fit schema
-cost; oversized schemas fail before inference. Requests remain bounded by 64
-windows, 1 MiB of text, 131072 words and runtime token/output limits. These are
+before execution and must fit the model/backend token capacity. The 1024-token
+composition profile records measured coverage. Window bodies shrink to fit actual
+schema cost; oversized schemas fail before inference. Default planning bounds
+remain 64 windows, 1 MiB of text, 131072 words and runtime token/output limits. These are
 composed per-window and merger ceilings, not a claim of model attention across
 an entire document. Classification aggregates owned-word-weighted raw logits;
 mentions and relations preserve global offsets and overlap semantics.
@@ -481,4 +768,4 @@ encoded inputs, learned head intermediates, valid span scores and final outputs
 on native and Metal. Unsupported structures/attributes, joint decoding and
 relation endpoint constraints remain rejected. Pull metadata publishes
 `qualified_limits` for verified artifacts; refresh older pulls to record it.
-See [Lite knowledge graph usage](../../../../LITE_KNOWLEDGE_GRAPH.md).
+See [Lite knowledge-graph pipelines](../../../../LITE.md#embedded-library) and [entity resolution](../../../../RESOLUTION.md#query-keys-aliases-and-migration-lite-native).

@@ -63,6 +63,11 @@ const execution_context = @import("antfly_inference_execution_context");
 const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
 var traced_local_batches = @import("antfly_platform").atomic.Value(u64).init(0);
+const platform_time = @import("antfly_platform").time;
+// Dimension-probe retry shares its transient/permanent error classification
+// contract with operator repair: both treat admission refusals, a model
+// still loading, and provider rate limits as clearing on their own.
+const repair_failure = @import("../storage/db/repair_failure.zig");
 
 pub const SparseEmbedding = db_embedder.SparseEmbedding;
 
@@ -135,6 +140,9 @@ pub const AntflyProvider = struct {
         parts: []const template_mod.ContentPart,
         context: EmbeddingRequestContext,
     ) anyerror![][]f32 = null,
+    /// One vector from ordered parts. Independent media batches continue to
+    /// use embed_dense_parts_with_context and return one vector per item.
+    embed_dense_group_with_context: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const template_mod.ContentPart, EmbeddingRequestContext) anyerror![][]f32 = null,
     rerank_texts: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -557,7 +565,24 @@ pub const InitOptions = struct {
     /// should supply their runtime; standalone embedders retain an owned
     /// fallback for compatibility.
     provider_runtime: ?*ProviderRuntime = null,
+    /// Bound on retrying a transient strict dimension probe (local-provider
+    /// admission refusal, a model still loading, a remote rate limit)
+    /// before giving up with `error.EmbeddingProbeUnavailable`. Null uses
+    /// `default_probe_retry_budget_ns`. `0` disables retrying, not the
+    /// probe: the single attempt keeps its normal deadline (the caller's
+    /// deadline if set, otherwise the provider's default request timeout),
+    /// and a transient failure on it fails immediately. A nonzero budget is
+    /// one absolute deadline for the whole probe, first attempt included,
+    /// intersected with the caller's deadline; keep it at least as long as
+    /// one provider request.
+    probe_retry_budget_ns: ?u64 = null,
 };
+
+/// Default budget for `InitOptions.probe_retry_budget_ns`. Table and index
+/// creation probe the embedder right after `antfly inference pull`, when the
+/// local `antfly` provider's model may not be admitted or finished loading
+/// yet; that condition usually clears within tens of seconds.
+pub const default_probe_retry_budget_ns: u64 = 45 * std.time.ns_per_s;
 
 fn bindOwnedHttpIoIfNeeded(
     alloc: std.mem.Allocator,
@@ -654,7 +679,7 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     model_identity: []u8 = "",
-    planned_text_lease: ?inference_work.CapabilityLease = null,
+    planned_embedding_lease: ?inference_work.CapabilityLease = null,
     truncate: []u8 = "",
     /// Borrowed from the service ProviderRuntime, or from the owning
     /// ManagedEmbedder's standalone fallback. Service-scoped managers keep
@@ -1324,6 +1349,8 @@ pub const ManagedEmbedder = struct {
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_batch_planned_fn = embedDenseBatchPlanned,
             .dense_embed_parts_fn = embedDenseParts,
+            .dense_embed_parts_planned_fn = embedDensePartsPlanned,
+            .text_parts_equivalent_fn = textPartsEquivalent,
             .dense_embed_part_items_fn = embedDensePartItems,
             .dense_embed_raster_items_fn = embedDenseRasterItems,
             .dense_embed_part_items_with_context_fn = embedDensePartItemsWithContext,
@@ -1774,8 +1801,17 @@ pub const ManagedEmbedder = struct {
             try value.check();
             applyRequestContext(&entry, value, &cancellation);
         }
-        entry.planned_text_lease = lease;
+        entry.planned_embedding_lease = lease;
         return embedBatchWithEntry(alloc, &entry, texts, dims);
+    }
+
+    fn textPartsEquivalent(ptr: *anyopaque, name: []const u8) bool {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(name) orelse return false;
+        // Declared multimodal routes may implement text through a different
+        // parts executor. The text-only adapter path already flattens one
+        // text part into precisely the same text invocation.
+        return !entry.sparse and !entry.declaresMedia();
     }
 
     fn embedDenseParts(
@@ -1858,17 +1894,17 @@ pub const ManagedEmbedder = struct {
             for (vectors[0..initialized]) |vector| alloc.free(vector);
             alloc.free(vectors);
         }
+        entry.planned_embedding_lease = lease;
+        const wire_options = if (entry.antfly_provider) |local|
+            if (local.embed_dense_parts_with_context != null)
+                embedding_wire.Options.fromEmbeddingContext(entry.model, embeddingRequestContext(entry, .retrieval_document), false)
+            else
+                embedding_wire.Options{ .model = entry.model }
+        else
+            embedding_wire.Options{ .model = entry.model };
         var offset: usize = 0;
         while (offset < items.len) {
-            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset, .{
-                .model = entry.model,
-                .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
-                .dimensions = if (dims > 0) dims else null,
-                .task_type = if (entry.antfly_provider) |local|
-                    if (local.embed_dense_parts_with_context != null) EmbeddingTaskType.retrieval_document.canonical() else null
-                else
-                    null,
-            });
+            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset, wire_options);
             const chunk = items[offset..end];
             try validateDensePartItemInvocation(alloc, capabilities, attachment_transport, chunk);
             const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims, lease);
@@ -1938,6 +1974,21 @@ pub const ManagedEmbedder = struct {
         try invocation_context.check();
         try validateDenseBatch(vectors, items.len, dims);
         return vectors;
+    }
+
+    fn embedDensePartsPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, parts: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        entry.planned_embedding_lease = lease;
+        return embedWithEntryParts(alloc, &entry, parts, dims);
     }
 
     fn embedDensePartsWithContext(
@@ -2159,10 +2210,30 @@ pub const ManagedEmbedder = struct {
                 return owned;
             };
         }
+        if (entry.provider != .antfly and !entry.declaresMedia()) {
+            // These are adapter contracts, not remote capability guesses.
+            // Reuse model/format ceilings from the actual request executors.
+            const max_items: usize = switch (entry.provider) {
+                .cloudflare => 100,
+                .openai, .openrouter, .ollama => 2048, // client invocation ceiling
+                .cohere => provider_defaults.cohere_max_embedding_batch_size,
+                .bedrock => bedrock_provider.maxBatchSizeForFormat(entry.bedrock_request_format),
+                .gemini, .vertex => vertex_provider.maxEmbeddingBatchSize(entry.google_request_format, entry.model, entry.google_batch_size),
+                .antfly => unreachable,
+            };
+            return .{ .capabilities = .{
+                .task = .embed,
+                .input_modalities = .{ .text = true },
+                .accepted_mime_types = .{ .text_plain = true },
+                .input_granularity = .chunk,
+                .batch = .{ .mode = if (max_items > 1) .native else .serial_compatibility, .preferred_items = @min(32, max_items), .max_items = max_items },
+                .output = .embedding,
+            } };
+        }
         // Unknown remote capability is deliberately conservative. It remains
         // usable, but the document planner cannot assume fused batching or a
         // provider-specific memory ceiling, and media needs declared inputs.
-        return .{ .capabilities = .{
+        return .{ .planning_only = true, .capabilities = .{
             .task = .embed,
             .input_modalities = .{ .text = true },
             .accepted_mime_types = .{ .text_plain = true },
@@ -2335,7 +2406,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
         },
         .task_type = task_type,
         .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
-        .model_revision = if (entry.planned_text_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else null,
+        .model_revision = if (entry.planned_embedding_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else null,
         .dimensions = if (entry.dimensions > 0) entry.dimensions else null,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
     };
@@ -2462,6 +2533,7 @@ fn applyAntflyEmbeddingRequestControls(
         @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
     );
     provider.model_identity = if (entry.model_identity.len > 0) entry.model_identity else null;
+    provider.model_revision = if (entry.planned_embedding_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else provider.model_revision;
     provider.requested_dense_dimensions = if (entry.dimensions > 0) entry.dimensions else null;
     if (provider.model_identity != null) provider.numeric_dense_dimensions = null;
     provider.setRequestCancellation(entry.cancellation);
@@ -2954,6 +3026,9 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    if (cfg.external_vector_space) |space| {
+        if (!external or sparse or space.len == 0 or space.len > 4096) return error.InvalidCreateTableRequest;
+    }
     const publication_policy = cfg.publication_policy orelse .progressive;
     if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
     if (external and cfg.publication_policy != null) return error.InvalidCreateTableRequest;
@@ -2964,6 +3039,8 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     defer if (semantic_producer_json) |raw| alloc.free(raw);
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
+    const leann_algorithm = try denseAlgorithmIsLeann(root);
+    if (sparse and leann_algorithm) return error.InvalidCreateTableRequest;
 
     const field_name = cfg.field;
     const template_value = cfg.template;
@@ -3035,7 +3112,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer embedder_cfg.deinit(alloc);
             if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
             _ = parseEmbedderProvider(embedder_cfg) catch return error.UnsupportedCreateTableRequest;
-            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
+            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, semantic_producer_json, options.inference_api_url, options.inference_api_key);
         } else null;
         defer if (embedder_json) |raw| alloc.free(raw);
         if (embedder_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -3110,7 +3187,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         _ = try parseEmbedderProvider(embedder_cfg);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, semantic_producer_json, options.inference_api_url, options.inference_api_key);
     } else null;
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -3130,6 +3207,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
+    // Transient vector storage re-embeds candidates from the document's own
+    // field or template, so it needs the index's embedder and one vector per
+    // document: no external vectors, chunking, or artifacts from other
+    // enrichments.
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and chunker_json == null and embedder_json != null);
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3161,6 +3243,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try out.append(alloc, '}');
     } else {
         try out.appendSlice(alloc, ",\"external\":true");
+        if (cfg.external_vector_space) |space| {
+            try out.appendSlice(alloc, ",\"external_vector_space\":");
+            try appendJsonString(alloc, &out, space);
+        }
     }
 
     if (embedder_json) |embedder| {
@@ -3172,9 +3258,220 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try appendJsonString(alloc, &out, producer);
     }
 
+    // LEANN carries its code width inside its own config block.
+    if (!leann_algorithm) try appendDenseQuantizationIfPresent(alloc, &out, root, dims);
     try appendExecutionObjectIfPresent(alloc, &out, root);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Reads the public `algorithm` / `leann` fields. Returns whether the dense
+/// index uses LEANN. A `leann` block requires `algorithm: "leann"`.
+fn denseAlgorithmIsLeann(root: std.json.ObjectMap) !bool {
+    const leann = if (root.get("algorithm")) |algorithm| blk: {
+        if (algorithm != .string) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, algorithm.string, "leann")) break :blk true;
+        if (std.mem.eql(u8, algorithm.string, "hbc")) break :blk false;
+        return error.InvalidCreateTableRequest;
+    } else false;
+    if (root.get("leann") != null and !leann) return error.InvalidCreateTableRequest;
+    return leann;
+}
+
+/// Mirrors `leann.Config.default_rabitq_bits` (this module does not depend on
+/// the vector index library).
+const leann_default_rabitq_bits: i64 = 4;
+
+/// Emits the normalized internal `"algorithm":"leann","leann":{...}` fields,
+/// validating the public LeannIndexConfig ranges. Every knob is written so
+/// the stored config (and its hash) is explicit. The code width comes from the
+/// dense index's top-level `quantization_bits`, shared with HBC; HBC's
+/// `quantization_refine` does not apply, since LEANN's error bounds already
+/// decide which candidates get exact distances.
+fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, can_reembed: bool) !void {
+    var max_degree: i64 = 30;
+    var quantizer: []const u8 = "rabitq";
+    var search_ef: i64 = 0;
+    var bound_scale: f64 = 1.0;
+    var batch_size: i64 = 0;
+    var quantization_bits: i64 = 0;
+    var vector_storage: ?[]const u8 = null;
+    if (root.get("leann")) |leann| {
+        if (leann != .object) return error.InvalidCreateTableRequest;
+        var it = leann.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "max_degree")) {
+                max_degree = try jsonIntegerInRange(value, 4, 128);
+            } else if (std.mem.eql(u8, key, "quantizer")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "rabitq") and !std.mem.eql(u8, value.string, "pq")) return error.InvalidCreateTableRequest;
+                quantizer = value.string;
+            } else if (std.mem.eql(u8, key, "search_ef")) {
+                search_ef = try jsonIntegerInRange(value, 0, 4096);
+            } else if (std.mem.eql(u8, key, "bound_scale")) {
+                bound_scale = switch (value) {
+                    .integer => |v| @floatFromInt(v),
+                    .float => |v| v,
+                    else => return error.InvalidCreateTableRequest,
+                };
+                if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
+            } else if (std.mem.eql(u8, key, "batch_size")) {
+                batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else if (std.mem.eql(u8, key, "vector_storage")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
+                vector_storage = value.string;
+            } else return error.InvalidCreateTableRequest;
+        }
+    }
+    if (root.get("quantization_bits")) |value| quantization_bits = try jsonIntegerInRange(value, 1, 8);
+    if (root.get("quantization_refine") != null) return error.InvalidCreateTableRequest;
+    // Unset picks the quantizer's default. PQ codes have no bit width above 1.
+    const rabitq = std.mem.eql(u8, quantizer, "rabitq");
+    if (!rabitq and quantization_bits > 1) return error.InvalidCreateTableRequest;
+    if (quantization_bits == 0) quantization_bits = if (rabitq) leann_default_rabitq_bits else 1;
+    // Transient storage rebuilds graphs from RaBitQ codes, so PQ keeps
+    // vectors. It is the default wherever re-embedding is possible.
+    const transient_allowed = can_reembed and rabitq;
+    if (vector_storage) |requested| {
+        if (std.mem.eql(u8, requested, "transient") and !transient_allowed) return error.InvalidCreateTableRequest;
+    }
+    const resolved_storage = vector_storage orelse if (transient_allowed) "transient" else "persistent";
+    const json = try std.fmt.allocPrint(
+        alloc,
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
+        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size },
+    );
+    defer alloc.free(json);
+    try out.appendSlice(alloc, json);
+}
+
+fn jsonIntegerInRange(value: std.json.Value, min: i64, max: i64) !i64 {
+    if (value != .integer or value.integer < min or value.integer > max) return error.InvalidCreateTableRequest;
+    return value.integer;
+}
+
+test "managed embedder translates leann algorithm into dense config" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"external":true,"dimension":4,"distance_metric":"cosine","algorithm":"leann","leann":{"max_degree":16,"bound_scale":1.5}}
+    , .{});
+    defer parsed.deinit();
+    const out = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", parsed.value, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"algorithm\":\"leann\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"max_degree\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"quantizer\":\"rabitq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"quantization_bits\":4") != null);
+    // External vectors cannot be re-embedded, so they stay persistent.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"vector_storage\":\"persistent\"") != null);
+
+    for ([_][2][]const u8{
+        // An embedder-backed field index defaults to transient storage.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"transient\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
+        // PQ graphs rebuild from vectors, so they keep them.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq"}}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
+    }) |case| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
+        defer p.deinit();
+        const translated = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{});
+        defer alloc.free(translated);
+        try std.testing.expect(std.mem.indexOf(u8, translated, case[1]) != null);
+    }
+
+    for ([_][2][]const u8{
+        .{
+            \\{"external":true,"dimension":4,"algorithm":"leann","quantization_bits":2}
+            ,
+            "\"quantization_bits\":2",
+        },
+        .{
+            \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantizer":"pq"}}
+            ,
+            "\"quantization_bits\":1",
+        },
+    }) |case| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
+        defer p.deinit();
+        const translated = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{});
+        defer alloc.free(translated);
+        try std.testing.expect(std.mem.indexOf(u8, translated, case[1]) != null);
+    }
+
+    for ([_][]const u8{
+        \\{"external":true,"dimension":4,"leann":{"max_degree":16}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"max_degree":2}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"faiss"}
+        ,
+        \\{"external":true,"sparse":true,"algorithm":"leann"}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","quantization_bits":9}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","quantization_bits":4,"leann":{"quantizer":"pq"}}
+        ,
+        // The bit width is top-level now, shared with HBC.
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantization_bits":2}}
+        ,
+        // quantization_refine is HBC-only.
+        \\{"external":true,"dimension":4,"algorithm":"leann","quantization_refine":"all"}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"transient"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"sometimes"}}
+        ,
+    }) |bad| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});
+        defer p.deinit();
+        // Unknown enum values fail typed parsing (InvalidEnumTag) before the
+        // LEANN checks run; either rejection is fine.
+        if (translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{})) |translated| {
+            alloc.free(translated);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}
+
+/// Copies the public dense `quantization_bits` (1..8) and
+/// `quantization_refine` into the internal HBC config, validating them.
+fn appendDenseQuantizationIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    root: std.json.ObjectMap,
+    dims: anytype,
+) !void {
+    if (root.get("quantization_bits")) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > 8) return error.InvalidCreateTableRequest;
+        // Extended codes need at least two dimensions.
+        if (value.integer > 1 and dims < 2) return error.InvalidCreateTableRequest;
+        const encoded = try std.fmt.allocPrint(alloc, ",\"quantization_bits\":{d}", .{value.integer});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (root.get("quantization_refine")) |value| {
+        if (value != .string or std.meta.stringToEnum(indexes_openapi.QuantizationRefine, value.string) == null)
+            return error.InvalidCreateTableRequest;
+        try out.appendSlice(alloc, ",\"quantization_refine\":");
+        try appendJsonString(alloc, out, value.string);
+    }
 }
 
 fn normalizeAntflyChunkerDefaultModelJson(
@@ -4930,9 +5227,15 @@ fn buildManagedEmbeddingEntry(
         .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
         .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+        // `base_url` is the endpoint this embedder will call (explicit, catalog
+        // pinned, or the node default). Only the node default endpoint
+        // receives the node credential.
         .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(
             alloc,
-            embedder_cfg.api_key orelse options.inference_api_key,
+            embedder_cfg.api_key orelse if (sameAntflyInferenceEndpoint(base_url, options.inference_api_url))
+                options.inference_api_key
+            else
+                null,
             "ANTFLY_INFERENCE_API_KEY",
         ),
         .ollama, .bedrock, .vertex => null,
@@ -5080,7 +5383,7 @@ fn resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
     defer managed.deinit(alloc);
     try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
     if (managed.provider == .bedrock) managed.provider_runtime = options.provider_runtime;
-    return try resolveEmbeddingDimensionsForEntry(alloc, cfg, &managed);
+    return try resolveEmbeddingDimensionsForEntry(alloc, cfg, &managed, options.probe_retry_budget_ns);
 }
 
 fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
@@ -5103,7 +5406,7 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
     try attachProviderQuota(&managed, options);
     try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
     if (managed.provider == .bedrock) managed.provider_runtime = options.provider_runtime;
-    return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
+    return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation, options.probe_retry_budget_ns);
 }
 
 fn validateSparseEmbeddingForManagedConfig(
@@ -5122,34 +5425,30 @@ fn validateSparseEmbeddingForManagedConfig(
     };
     defer managed.deinit(alloc);
     try attachProviderQuota(&managed, options);
-    try validateSparseEmbeddingForEntry(alloc, &managed);
+    try validateSparseEmbeddingForEntry(alloc, &managed, options.probe_retry_budget_ns);
 }
 
 fn validateSparseEmbeddingForEntry(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
+    probe_retry_budget_ns: ?u64,
 ) !void {
-    var embedding = embedSparseWithEntry(alloc, entry, dimension_probe_text) catch |err| switch (err) {
-        error.EmptyEmbeddingResponse,
-        error.InvalidEmbeddingResponse,
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
-        error.QueueFull,
-        error.EmbedRequestFailed,
-        => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
-        else => return err,
-    };
-    embedding.deinit(alloc);
+    _ = try probeEmbeddingRetryingTransient(void, validateSparseEmbeddingOnce, .{}, alloc, entry, .strict, probe_retry_budget_ns);
+}
+
+fn validateSparseEmbeddingOnce(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
+    var embedding = try embedSparseWithEntry(alloc, entry, dimension_probe_text);
+    defer embedding.deinit(alloc);
 }
 
 fn resolveEmbeddingDimensionsForEntry(
     alloc: std.mem.Allocator,
     cfg: indexes_openapi.EmbeddingsIndexConfig,
     entry: *const ManagedEmbeddingEntry,
+    probe_retry_budget_ns: ?u64,
 ) !u32 {
     const declared = try resolveDeclaredEmbeddingDimensions(cfg);
-    return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, entry, declared, .strict);
+    return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, entry, declared, .strict, probe_retry_budget_ns);
 }
 
 fn resolveEmbeddingDimensionsForEntryWithValidation(
@@ -5157,35 +5456,189 @@ fn resolveEmbeddingDimensionsForEntryWithValidation(
     entry: *const ManagedEmbeddingEntry,
     declared: ?u32,
     validation: DimensionProbeValidation,
+    probe_retry_budget_ns: ?u64,
 ) !u32 {
-    const probe_dims = inferEmbeddingDimensionsFromEntry(alloc, entry, declared orelse 0) catch |err| switch (err) {
-        error.InvalidEmbeddingDimensions,
-        error.EmptyEmbeddingResponse,
-        error.InvalidEmbeddingResponse,
-        error.EmbedRequestFailed,
-        => return error.InvalidCreateTableRequest,
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
-        => if (validation == .defer_probe) {
-            return declared orelse error.InvalidCreateTableRequest;
-        } else {
-            return error.EmbeddingProbeUnavailable;
-        },
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
-        else => {
-            if (isOperationalEmbeddingProbeError(err)) {
-                if (validation == .defer_probe) return declared orelse error.InvalidCreateTableRequest;
-                return error.EmbeddingProbeUnavailable;
-            }
-            return err;
-        },
-    };
+    const probe_dims = (try probeEmbeddingDimensionsRetryingTransient(alloc, entry, declared, validation, probe_retry_budget_ns)) orelse
+        return declared orelse error.InvalidCreateTableRequest;
     if (probe_dims == 0) return error.InvalidCreateTableRequest;
     if (declared) |declared_dims| {
         if (declared_dims != probe_dims) return error.InvalidCreateTableRequest;
         return declared_dims;
     }
     return probe_dims;
+}
+
+/// Below this much remaining time, another provider attempt would almost
+/// certainly be cut off before a real response could arrive. Stop and
+/// surface `error.EmbeddingProbeUnavailable` instead of spending the last
+/// sliver of the deadline on an attempt that cannot succeed.
+const min_probe_attempt_remaining_ns: u64 = 250 * std.time.ns_per_ms;
+
+/// Probe the provider for its embedding dimension, retrying a transient
+/// failure with the operator-repair backoff schedule
+/// (`repair_failure.repairTransientBackoffNs`) bounded by one absolute
+/// deadline computed once at the start of the probe: `now + budget_ns`
+/// (`probe_retry_budget_ns`, or `default_probe_retry_budget_ns` when null),
+/// clipped to the caller's own request deadline (`entry.deadline_ns`) when
+/// that is earlier.
+///
+/// `probe_retry_budget_ns` bounds *retrying*, never the first attempt:
+/// `budget_ns == 0` means "retry nothing," not "give the first attempt no
+/// time." The first attempt always keeps its normal deadline (the caller's
+/// own deadline when set, otherwise `embeddingOperationDeadline`'s default
+/// provider timeout) so a healthy provider still answers it; a budget of 0
+/// just means a transient failure on that one attempt returns
+/// `error.EmbeddingProbeUnavailable` immediately, with no backoff and no
+/// retry, same as disabling the retry loop entirely.
+///
+/// A dimension probe fails transiently when the local `antfly` provider
+/// refuses admission because memory is tight, or the model is still loading
+/// right after `antfly inference pull`; table and index creation call this
+/// at exactly that moment. Giving up on the first such failure turns an
+/// ordinary startup race into a 503 that nothing retries, so loop here
+/// instead and only surface `error.EmbeddingProbeUnavailable` once the
+/// deadline is spent.
+///
+/// With a nonzero budget, every attempt shares that one deadline (via a
+/// request overlay's `deadline_ns`, the same mechanism
+/// `embeddingOperationDeadline` already uses to size a provider timeout)
+/// instead of each computing its own fresh `max_embedding_request_timeout_ns`
+/// window: without this, a provider that always times out could let each
+/// retry restart a full fresh timeout, turning one bounded budget into
+/// several minutes of real wall-clock waiting. A timed-out attempt
+/// (`error.Timeout`) is itself transient and retries while time remains, via
+/// `isOperationalEmbeddingProbeError`.
+///
+/// `EmbeddingProbeUnavailable` means "this is transient, ask again later" —
+/// true only when the probe's *own* retry budget ran out while the caller
+/// still had time. An already-expired (or mid-retry-expired) caller deadline
+/// or cancellation is the caller's own signal, not a condition retrying
+/// could ever fix, so it is never folded into that retryable error: it
+/// surfaces as `error.Timeout`/`error.Cancelled` instead, whatever the
+/// create-table/add-index path already maps a request deadline or
+/// cancellation to.
+///
+/// Returns `null` only when `validation == .defer_probe` meets a transient
+/// failure: deferring the probe already means the caller does not want to
+/// block create on this provider call, so it never retries either — the
+/// caller falls back to `declared`.
+fn probeEmbeddingDimensionsRetryingTransient(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    declared: ?u32,
+    validation: DimensionProbeValidation,
+    probe_retry_budget_ns: ?u64,
+) !?u32 {
+    return probeEmbeddingRetryingTransient(u32, inferEmbeddingDimensionsFromEntry, .{declared orelse 0}, alloc, entry, validation, probe_retry_budget_ns);
+}
+
+/// Dense and sparse validation share deadline, cancellation, error identity,
+/// quota and retry semantics. The result stays typed; sparse probes own and
+/// release their output and return void instead of inventing dimensions.
+fn probeEmbeddingRetryingTransient(
+    comptime Result: type,
+    comptime invoke: anytype,
+    args: anytype,
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    validation: DimensionProbeValidation,
+    probe_retry_budget_ns: ?u64,
+) !?Result {
+    // An already-expired caller deadline or cancellation can't be fixed by
+    // retrying at all; surface it before spending a single attempt on it.
+    try ensureEntryDeadline(entry);
+
+    const budget_ns = probe_retry_budget_ns orelse default_probe_retry_budget_ns;
+    const budget_deadline_ns = monotonicNowNs() +| budget_ns;
+    // Decided once, from the two fixed deadlines: whichever is earlier is
+    // "binding", and that alone decides what running out of time means below
+    // — the caller's own deadline maps to their timeout, never to
+    // EmbeddingProbeUnavailable, regardless of which specific check (a stale
+    // "now", or too little time left for another attempt) trips first.
+    const caller_binds = if (entry.deadline_ns) |caller_deadline| caller_deadline <= budget_deadline_ns else false;
+    // A budget of 0 must never cut the first attempt short: fall back to
+    // the same deadline the first attempt would get with retrying disabled
+    // altogether (the caller's deadline, or the provider's default request
+    // timeout) instead of folding `now + 0` in below.
+    const deadline_ns = if (budget_ns == 0)
+        embeddingOperationDeadline(entry)
+    else if (entry.deadline_ns) |caller_deadline|
+        @min(caller_deadline, budget_deadline_ns)
+    else
+        budget_deadline_ns;
+    const out_of_time_err: anyerror = if (caller_binds) error.Timeout else error.EmbeddingProbeUnavailable;
+
+    // Every attempt reuses this overlay so `embeddingOperationDeadline` sizes
+    // each provider timeout from the same fixed `deadline_ns`, shrinking as
+    // the probe spends it, rather than each attempt getting a fresh default
+    // timeout from `entry.deadline_ns == null`.
+    var probing = entry.requestOverlay(alloc);
+    probing.deadline_ns = deadline_ns;
+    defer probing.auth_header_cache.deinit(alloc);
+
+    var attempt: u32 = 1;
+    while (true) {
+        if (@call(.auto, invoke, .{ alloc, &probing } ++ args)) |result| return result else |err| {
+            const transient = switch (err) {
+                error.InvalidEmbeddingDimensions,
+                error.EmptyEmbeddingResponse,
+                error.InvalidEmbeddingResponse,
+                error.EmbedRequestFailed,
+                => return error.InvalidCreateTableRequest,
+                error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
+                error.EmbedRateLimited, error.EmbedTransientFailure => true,
+                else => isOperationalEmbeddingProbeError(err),
+            };
+            if (!transient) return err;
+            if (validation == .defer_probe) return null;
+            // Cancellation is always the caller's own signal; it never maps
+            // to the probe's own retryable unavailability.
+            if (entry.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            // A budget of 0 disables retrying, period: surface this (only)
+            // attempt's transient failure now, with no backoff. But
+            // disabling retries must never mask the caller's own deadline:
+            // in this branch `deadline_ns` above is exactly
+            // `entry.deadline_ns` whenever the caller set one (see
+            // `embeddingOperationDeadline`), so it is always the binding
+            // deadline here. Recheck it the same way the retry loop below
+            // does via `out_of_time_err` before surfacing
+            // `EmbeddingProbeUnavailable`, so a caller timeout spent during
+            // this one attempt is reported as their own `error.Timeout`,
+            // never as retryable probe unavailability.
+            if (budget_ns == 0) {
+                if (entry.deadline_ns) |caller_deadline| {
+                    if (err == error.Timeout or monotonicNowNs() >= caller_deadline) return error.Timeout;
+                }
+                return error.EmbeddingProbeUnavailable;
+            }
+            const now_ns = monotonicNowNs();
+            if (now_ns >= deadline_ns) return out_of_time_err;
+            const remaining_ns = deadline_ns - now_ns;
+            if (remaining_ns < min_probe_attempt_remaining_ns) return out_of_time_err;
+            // Never sleep past the point where the next attempt would no
+            // longer have a meaningful amount of the deadline left.
+            const delay_ns = @min(repair_failure.repairTransientBackoffNs(attempt), remaining_ns -| min_probe_attempt_remaining_ns);
+            // Wait out the backoff the same cancellable, deadline-aware way
+            // the query retry paths do: an unconditional sleep here would
+            // hold a cancelled or expiring probe (and its worker) for up to
+            // one backoff step -- four seconds at the cap -- instead of
+            // noticing within a 25ms poll. The wait rechecks cancellation
+            // and the shared deadline immediately before it returns, so the
+            // next loop iteration dispatches (or gives up) on fresh state.
+            const wait_context: RequestContext = .{
+                .io = embeddingIo(entry),
+                .deadline_ns = deadline_ns,
+                .cancellation = entry.cancellation,
+                .progress = entry.progress,
+            };
+            repair_failure.admissionRetryWaitNs(wait_context, delay_ns) catch |wait_err| switch (wait_err) {
+                error.Cancelled => return error.Cancelled,
+                error.Timeout => return out_of_time_err,
+                else => |e| return e,
+            };
+            attempt += 1;
+        }
+    }
 }
 
 fn isOperationalEmbeddingProbeError(err: anyerror) bool {
@@ -5212,6 +5665,12 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         // permanent configuration failure.
         error.ConcurrencyUnavailable,
         error.QueueFull,
+        // normalizeLocalEmbeddingError's distinct identity for a local
+        // provider's admission refusal. The dimension probe must keep
+        // retrying it exactly like the EmbedTransientFailure it used to
+        // report, without probeEmbeddingDimensionsRetryingTransient needing
+        // to know about the finer-grained distinction.
+        error.EmbedAdmissionRefused,
         => true,
         else => false,
     };
@@ -5220,6 +5679,7 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
 test "managed embedder treats normalized capability discovery failure as operational" {
     try std.testing.expect(isOperationalEmbeddingProbeError(error.RemoteCapabilityDiscoveryTransient));
     try std.testing.expect(!isOperationalEmbeddingProbeError(error.RemoteCapabilityDiscoveryRejected));
+    try std.testing.expect(isOperationalEmbeddingProbeError(error.EmbedAdmissionRefused));
 }
 
 fn inferEmbeddingDimensionsFromEntry(
@@ -5599,8 +6059,15 @@ fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected
 
 fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
     return switch (err) {
+        // The request never ran: the local provider refused admission, not a
+        // real provider failure. Keep this distinct from
+        // error.EmbedTransientFailure (5xx, timeouts, connection errors) so
+        // the enrichment retry-budget exemption
+        // (repair_failure.isAdmissionRefusal) can spare the document's
+        // attempt budget for admission contention without also exempting a
+        // genuinely failing provider.
         error.ResourceTemporarilyUnavailable,
-        => error.EmbedTransientFailure,
+        => error.EmbedAdmissionRefused,
         else => err,
     };
 }
@@ -5705,7 +6172,7 @@ fn validateDensePartsMimeTypes(
 }
 
 pub fn testSingleMultimodalEmbeddingAdmission() !void {
-    const image_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const image_url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const parts = [_]template_mod.ContentPart{
         .{ .text = "ocr" },
         .{ .media_url = image_url },
@@ -5721,6 +6188,7 @@ pub fn testSingleMultimodalEmbeddingAdmission() !void {
 
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const binary_parts = [_]template_mod.ContentPart{.{
@@ -5762,10 +6230,17 @@ fn bindRemoteEmbeddingLease(
 // after the lease is ready. Every planner/executor/query lookup shares this path.
 fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *httpx.Client, headers: []const [2][]const u8) !remote_capabilities.CapabilityLease {
     const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-    return cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
+    var lease = try cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
         .deadline_ns = entry.deadline_ns,
         .cancellation = entry.cancellation orelse .none,
     });
+    // Older catalogs expose an observed identity without promising that their
+    // executor can pin it. Keep those routes usable, but never stamp their
+    // unqualified outputs as results of that immutable generation.
+    if (lease.capabilities) |*caps| if (!caps.model_revision_pinning) {
+        caps.model_revision = null;
+    };
+    return lease;
 }
 
 fn acquireRemoteEmbeddingLease(
@@ -5774,7 +6249,7 @@ fn acquireRemoteEmbeddingLease(
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
 ) !remote_capabilities.CapabilityLease {
-    if (entry.planned_text_lease) |planned| {
+    if (entry.planned_embedding_lease) |planned| {
         if (planned.scope_digest) |scope| {
             const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
             if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
@@ -5782,12 +6257,16 @@ fn acquireRemoteEmbeddingLease(
         // Keep the coordinator's route and descriptor through every retry.
         // Discovering another lease here could stamp its vectors with the old
         // generation captured before execution.
-        provider.setFramedAttachments(if (planned.capabilities) |caps| caps.framed_attachments else false);
+        provider.model_revision = if (planned.capabilities) |caps| caps.model_revision else null;
+        var execution = planned;
+        if (execution.planning_only) execution.capabilities = null;
+        provider.setFramedAttachments(if (execution.capabilities) |caps| caps.framed_attachments else false);
         if (planned.routing_token) |token| try provider.setCapabilityToken(token.slice());
         if (planned.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
-        return planned;
+        return execution;
     }
     const lease = try discoverRemoteEmbeddingLease(entry, http, headers);
+    provider.model_revision = if (lease.capabilities) |caps| caps.model_revision else null;
     // Providers are reused across invocations, but transport support belongs
     // to this concrete lease. Reset first so a legacy or downgraded route can
     // never inherit framed mode from an earlier endpoint.
@@ -5906,15 +6385,17 @@ fn embedWithEntryPartsForTaskOnce(
     if (isAntflyProvider(entry.provider) and (entry.declaresMedia() or partsContainMedia(parts))) {
         if (parts.len == 0) return error.EmptyEmbeddingResponse;
         if (entry.antfly_provider) |local| {
-            if (local.embed_dense_parts) |embed_parts| {
+            if (local.embed_dense_group_with_context != null or local.embed_dense_parts_with_context != null or local.embed_dense_parts != null) {
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
-                if (context.model_identity != null and local.embed_dense_parts_with_context == null) return error.InvalidEmbeddingIdentity;
-                const vectors = (if (local.embed_dense_parts_with_context) |embed_parts_with_context|
+                if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_parts_with_context == null and local.embed_dense_group_with_context == null) return error.InvalidEmbeddingIdentity;
+                const vectors = (if (local.embed_dense_group_with_context) |embed_group|
+                    AntflyProviderBoundary.call("embed_dense_group_with_context", local.boundary_dispatch, embed_group, .{ local.ptr, alloc, entry.model, parts, context })
+                else if (local.embed_dense_parts_with_context) |embed_parts_with_context|
                     AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, embed_parts_with_context, .{ local.ptr, alloc, entry.model, parts, context })
                 else
-                    AntflyProviderBoundary.call("embed_dense_parts", local.boundary_dispatch, embed_parts, .{ local.ptr, alloc, entry.model, parts })) catch |err|
+                    AntflyProviderBoundary.call("embed_dense_parts", local.boundary_dispatch, local.embed_dense_parts.?, .{ local.ptr, alloc, entry.model, parts })) catch |err|
                     return normalizeLocalEmbeddingError(err);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 try context.check();
@@ -5957,7 +6438,7 @@ fn embedWithEntryPartsForTaskOnce(
         const operation_deadline_ns = embeddingOperationDeadline(entry);
         try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
-        var result = provider.embedPartsWithTask(
+        var result = provider.embedGroupWithTask(
             alloc,
             entry.model,
             parts,
@@ -6151,7 +6632,7 @@ fn densePartBatchEnd(
 
 test "managed embedder metadata sizing matches wire JSON at every prefix" {
     const alloc = std.testing.allocator;
-    const options = embedding_wire.Options{ .dimensions = 128, .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
+    const options = embedding_wire.Options{ .model_revision = @splat(9), .dimensions = 128, .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
     var parts: [105]template_mod.ContentPart = undefined;
     var wire_parts: [105]template_mod.ContentPart = undefined;
     var payloads: [105]httpx.attachment_envelope.Attachment = undefined;
@@ -6170,7 +6651,9 @@ test "managed embedder metadata sizing matches wire JSON at every prefix" {
         const json = try std.json.Stringify.valueAlloc(alloc, .{
             .model = options.model,
             .model_identity = options.model_identity,
+            .model_revision = options.model_revision,
             .dimensions = options.dimensions,
+            .grouped = options.grouped,
             .parts = wire_parts[0 .. i + 1],
             .attachment_count = attachments,
             .task_type = options.task_type,
@@ -6225,6 +6708,7 @@ test "managed embedder metadata envelope sizing includes binary framing and payl
     const alloc = std.testing.allocator;
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const part = template_mod.ContentPart{ .binary = .{ .mime_type = "image/png", .data = &png } };
@@ -6250,6 +6734,7 @@ test "managed embedder metadata ceiling splits mixed batches before dispatch" {
     const alloc = std.testing.allocator;
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const binary = template_mod.ContentPart{ .binary = .{ .mime_type = "image/png", .data = &png } };
@@ -6290,6 +6775,7 @@ test "managed embedder metadata ceiling splits mixed batches before dispatch" {
 test "managed embedder admission follows the selected attachment transport" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const items = [_]template_mod.ContentPart{
@@ -6337,7 +6823,7 @@ test "managed embedder admission follows the selected attachment transport" {
 }
 
 test "managed embedder partitions and validates inline image data URIs" {
-    const first = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const first = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     // The second payload is valid base64 but not an image. The encoded-byte
     // window closes before it, proving partitioning does not materialize or
     // inspect a payload that cannot fit the current invocation.
@@ -6400,7 +6886,7 @@ fn embedPartItemsWithEntry(
         try checkEntryDispatchDeadline(entry);
         const context = embeddingRequestContext(entry, .retrieval_document);
         try context.check();
-        if (context.model_identity != null and local.embed_dense_parts_with_context == null) return error.InvalidEmbeddingIdentity;
+        if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_parts_with_context == null) return error.InvalidEmbeddingIdentity;
         const vectors = (if (local.embed_dense_parts_with_context) |with_context|
             AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, with_context, .{ local.ptr, alloc, entry.model, items, context })
         else
@@ -6705,6 +7191,34 @@ fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_
     return try normalizeAntflyInferenceBaseUrl(alloc, raw);
 }
 
+/// The node default credential is scoped by the effective endpoint; see
+/// `execution_context.isDefaultEndpoint`.
+fn sameAntflyInferenceEndpoint(endpoint: []const u8, default_endpoint: ?[]const u8) bool {
+    return execution_context.isDefaultEndpoint(endpoint, default_endpoint);
+}
+
+test "node default inference endpoint matching ignores the api suffix only" {
+    try std.testing.expect(sameAntflyInferenceEndpoint("http://shared:8080/ai/v1", "http://shared:8080"));
+    try std.testing.expect(sameAntflyInferenceEndpoint("http://shared:8080/", "http://shared:8080/ai/v1/"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://third-party:8080/ai/v1", "http://shared:8080/ai/v1"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("", "http://shared:8080"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080", null));
+    // Background embedding uses the same scoping guard: route paths stay
+    // case-sensitive and interior slashes stay significant.
+    try std.testing.expect(sameAntflyInferenceEndpoint("HTTP://Shared:8080/tenantA/ai/v1", "http://shared:8080/tenantA"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080/tenanta/ai/v1", "http://shared:8080/tenantA/ai/v1"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080/tenantA//ai/v1", "http://shared:8080/tenantA/ai/v1"));
+}
+
+fn effectiveEndpointIsDefault(alloc: std.mem.Allocator, cfg: embeddings_types.Config, semantic_producer_json: ?[]const u8, inference_api_url: ?[]const u8) !bool {
+    const producer = semantic_producer_json orelse
+        return cfg.url.len == 0 or sameAntflyInferenceEndpoint(cfg.url, inference_api_url);
+    var identity = std.json.parseFromSlice(std.json.Value, alloc, producer, .{}) catch
+        return error.InvalidEmbeddingArtifactProducer;
+    defer identity.deinit();
+    return sameAntflyInferenceEndpoint(try semanticIdentityStringField(identity.value, "endpoint"), inference_api_url);
+}
+
 fn configuredDefaultAntflyInferenceURL(options: InitOptions) ?[]const u8 {
     const value = options.inference_api_url orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -6901,7 +7415,7 @@ fn embedBatchWithEntryForTask(
 // A query retry budget covers inference, not scale-from-zero preparation.
 // Reuse the normal capability cache before establishing the default query clock.
 fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
-    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_text_lease != null) return;
+    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_embedding_lease != null) return;
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = try entry.httpClient(alloc, &fallback_http);
@@ -6926,7 +7440,17 @@ fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entr
     while (true) : (attempt += 1) {
         try ensureEntryDeadline(&bounded);
         return @call(.auto, invoke, .{ alloc, &bounded } ++ args) catch |err| {
-            if (err != error.EmbedTransientFailure or attempt >= 3) return err;
+            // An interactive query does not care whether the local provider
+            // never ran the request (EmbedAdmissionRefused) or a provider
+            // failed outright (EmbedTransientFailure): either retries the
+            // same way here. Only the document enrichment retry-budget
+            // accounting needs the finer-grained identity, so collapse it
+            // back once this retry gives up, keeping every caller outside
+            // this loop seeing the one query-path unavailable error it saw
+            // before that distinction existed.
+            const admission_refused = err == error.EmbedAdmissionRefused;
+            const retryable = err == error.EmbedTransientFailure or admission_refused;
+            if (!retryable or attempt >= 3) return if (admission_refused) error.EmbedTransientFailure else err;
             try waitQueryEmbeddingRetry(&bounded, deadline);
             continue;
         };
@@ -7247,6 +7771,7 @@ fn embedBatchWithCohereRequest(
     defer if (fallback_http) |*client| client.deinit();
     const client = try entry.httpClient(alloc, &fallback_http);
     var response = try client.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = body,
         .headers = &headers,
@@ -7406,6 +7931,7 @@ fn embedBatchWithOpenAiCompatible(
     const client = try entry.httpClient(alloc, &fallback_http);
 
     var response = try client.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = json_body,
         .headers = headers_buf[0..header_count],
@@ -7665,6 +8191,8 @@ fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
     raw_value: std.json.Value,
+    semantic_producer_json: ?[]const u8,
+    inference_api_url: ?[]const u8,
     inference_api_key: ?[]const u8,
 ) ![]u8 {
     const base_json = try embeddings_types.stringifyAlloc(alloc, cfg);
@@ -7672,7 +8200,14 @@ fn stringifyManagedEmbedderConfigAlloc(
 
     const requests_per_minute = configObjectU32(raw_value, "requests_per_minute");
     const burst = configObjectU32(raw_value, "burst");
-    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)))
+    // The node credential belongs to the node endpoint. Scope it by the
+    // effective endpoint this index executes against: its durable
+    // semantic_producer identity when present (an older index stays pinned to
+    // the endpoint it was created with), otherwise its own URL. An index that
+    // names another (possibly third-party) endpoint, or is pinned to a former
+    // default, never inherits the current key.
+    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)) and
+        try effectiveEndpointIsDefault(alloc, cfg, semantic_producer_json, inference_api_url))
         inference_api_key
     else
         null;
@@ -7808,7 +8343,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
     const planned = managed.denseInterface().withPartLease(lease);
     const items = [_]template_mod.ContentPart{.{ .binary = .{
         .mime_type = "image/png",
-        .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3 },
+        .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 'I', 'H', 'D', 'R', 0, 0, 0, 2, 0, 0, 0, 3 },
     } }};
     const vectors = try planned.embedDensePartItems(alloc, "visual", &items, 2);
     defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
@@ -8374,6 +8909,20 @@ test "managed embedder preserves coverage policy in storage config" {
     ,
         config_json,
     );
+    var external_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3,\"external_vector_space\":\"recipe-v1\"}", .{});
+    defer external_config.deinit();
+    const physical = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "authored", external_config.value, .{});
+    defer std.testing.allocator.free(physical);
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator, "{\"external\":true,\"external_vector_space\":\"recipe-v1\"}", physical);
+    for ([_][]const u8{
+        "{\"external\":false,\"dimension\":3,\"external_vector_space\":\"recipe-v1\"}",
+        "{\"external\":true,\"sparse\":true,\"external_vector_space\":\"recipe-v1\"}",
+        "{\"external\":true,\"dimension\":3,\"external_vector_space\":\"\"}",
+    }) |raw| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "invalid", invalid.value, .{}));
+    }
 }
 
 test "managed embedder rejects unsupported execution namespaces" {
@@ -9046,6 +9595,15 @@ pub fn testRemoteEmbeddingCancellation() !void {
         release: std.atomic.Value(bool) = .init(false),
         completed: std.atomic.Value(bool) = .init(false),
 
+        fn waitEntered(self: *@This(), done: *const std.atomic.Value(bool)) !void {
+            const deadline = monotonicNowNs() + 5 * std.time.ns_per_s;
+            while (!self.entered.load(.acquire)) {
+                if (done.load(.acquire)) return error.InferenceFinishedBeforeDispatch;
+                if (monotonicNowNs() >= deadline) return error.Timeout;
+                std.atomic.spinLoopHint();
+            }
+        }
+
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
         }
@@ -9100,7 +9658,8 @@ pub fn testRemoteEmbeddingCancellation() !void {
     defer managed.deinit();
 
     const Worker = struct {
-        fn run(target: *ManagedEmbedder, err_out: *?anyerror) void {
+        fn run(target: *ManagedEmbedder, err_out: *?anyerror, done: *std.atomic.Value(bool)) void {
+            defer done.store(true, .release);
             const vector = target.embedQuery(alloc, "semantic_idx", "alpha concept") catch |err| {
                 err_out.* = err;
                 return;
@@ -9110,8 +9669,13 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     var err_out: ?anyerror = null;
-    var worker = try std.testing.io.concurrent(Worker.run, .{ &managed, &err_out });
-    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+    var done = std.atomic.Value(bool).init(false);
+    var worker = try std.testing.io.concurrent(Worker.run, .{ &managed, &err_out, &done });
+    app.waitEntered(&done) catch |err| {
+        app.release.store(true, .release);
+        worker.await(std.testing.io);
+        return err_out orelse err;
+    };
 
     const started_ns = monotonicNowNs();
     cancellation.store(true, .release);
@@ -9142,9 +9706,10 @@ pub fn testRemoteEmbeddingCancellation() !void {
     defer multimodal.deinit();
 
     const PartsWorker = struct {
-        fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror) void {
+        fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror, finished: *std.atomic.Value(bool)) void {
+            defer finished.store(true, .release);
             const parts = [_]template_mod.ContentPart{.{
-                .media_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
+                .media_url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD",
             }};
             const vector = target.denseInterface().embedDenseParts(
                 alloc,
@@ -9160,8 +9725,13 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     err_out = null;
-    var parts_worker = try std.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out });
-    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+    done.store(false, .release);
+    var parts_worker = try std.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out, &done });
+    app.waitEntered(&done) catch |err| {
+        app.release.store(true, .release);
+        parts_worker.await(std.testing.io);
+        return err_out orelse err;
+    };
 
     const parts_started_ns = monotonicNowNs();
     parts_cancellation.store(true, .release);
@@ -9314,6 +9884,13 @@ pub fn testFileBackedApiKeyRotation() !void {
     const documents = try managed.denseInterface().embedDenseBatch(alloc, "semantic_idx", &.{"document"}, 3);
     defer db_embedder.freeDenseEmbeddingBatch(alloc, documents);
     try app.expectHeader(1, "Bearer first-key");
+
+    // Planned calls own invocation-local authorization caches. Seed the
+    // configured owner's cache explicitly so the rotation assertions below
+    // still prove overlays never copy or mutate its storage or mutex.
+    const owner_header = (try optionalBearerAuthHeaderOwned(&managed.entries[0], alloc, &managed.entries[0].api_key.?)).?;
+    defer alloc.free(owner_header);
+    try std.testing.expectEqualStrings("Bearer first-key", owner_header);
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = store_path,
@@ -9900,7 +10477,440 @@ fn testManagedEmbedderStrictDimensionProbeFailureIsRetryable() !void {
     );
     defer parsed.deinit();
 
-    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{}));
+    // A persistently rate-limited provider must still give up eventually.
+    // Pin the retry budget to zero so this test does not pay for the real
+    // backoff sleeps `probeEmbeddingDimensionsRetryingTransient` uses in
+    // production.
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .probe_retry_budget_ns = 0 }));
+}
+
+// Fakes a local `antfly` embedder the way it behaves right after `antfly
+// inference pull`: the first calls refuse admission or report the model is
+// still loading, then it serves normally once ready.
+const FlakyLocalAntflyEmbedder = struct {
+    failures_remaining: usize,
+    calls: usize = 0,
+    failure: anyerror = error.ResourceTemporarilyUnavailable,
+
+    fn dense(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) anyerror![][]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.failures_remaining > 0) {
+            self.failures_remaining -= 1;
+            return self.failure;
+        }
+        const vectors = try alloc.alloc([]f32, texts.len);
+        errdefer alloc.free(vectors);
+        for (texts, 0..) |_, i| vectors[i] = try alloc.dupe(f32, &.{ 0.25, 0.5, 0.75 });
+        return vectors;
+    }
+
+    fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+        return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+    }
+};
+
+const antfly_embeddinggemma_index_json =
+    \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"google/embeddinggemma-2:bf16-safetensors-bundle-v1"}}
+;
+
+test "managed embedder retries a local provider that is unavailable twice then succeeds" {
+    // Reproduces the table-create bug: the local `antfly` provider refuses
+    // admission (or the model is still loading) right after `antfly
+    // inference pull`, and the create request must not surface
+    // EmbeddingProbeUnavailable for a condition that clears on its own.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = 2 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        // Short enough to keep the test fast (two retries: 500ms + 1s), long
+        // enough to cover both backoff steps.
+        .probe_retry_budget_ns = 5 * std.time.ns_per_s,
+    })).?;
+    defer std.testing.allocator.free(normalized);
+
+    try std.testing.expectEqual(@as(usize, 3), local.calls);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"dimension\":3") != null);
+}
+
+test "managed embedder dimension probe with a zero retry budget still succeeds on a healthy provider" {
+    // Regression test: probe_retry_budget_ns = 0 must bound only retries,
+    // never the first attempt. A healthy provider must still be called and
+    // answer normally instead of the probe surfacing
+    // EmbeddingProbeUnavailable without ever dispatching.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = 0 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 0,
+    })).?;
+    defer std.testing.allocator.free(normalized);
+
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"dimension\":3") != null);
+}
+
+test "managed embedder dimension probe with a zero retry budget fails fast after one call" {
+    // A transient failure with retries disabled (budget 0) must surface
+    // EmbeddingProbeUnavailable immediately after the single attempt, with
+    // no backoff sleep and no second call.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    // Comfortably below the first backoff step (500ms); see the permanent-
+    // failure test below for why this isn't tighter.
+    try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
+}
+
+test "managed embedder dimension probe with a zero retry budget reports the caller's timeout instead of EmbeddingProbeUnavailable" {
+    // Regression test for the zero-budget path masking a caller timeout as
+    // probe unavailability: disabling retries must still recheck the
+    // caller's own deadline before applying the "no budget left" return.
+    // Here the single attempt itself runs long enough (simulated via the
+    // logical test clock, so this stays fast) to carry the caller's
+    // deadline into the past before it reports a transient failure; that
+    // must surface as `error.Timeout`, never the retryable
+    // `EmbeddingProbeUnavailable`.
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
+
+    const ClockAdvancingLocal = struct {
+        calls: usize = 0,
+
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Simulate the attempt's own execution time carrying the clock
+            // past the caller's deadline before the transient failure is
+            // reported.
+            _ = TestClock.offset_ns.fetchAdd(500 * std.time.ns_per_ms, .monotonic);
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var local = ClockAdvancingLocal{};
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Timeout, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = ClockAdvancingLocal.dense, .embed_sparse_texts = ClockAdvancingLocal.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 0,
+        .deadline_ns = monotonicNowNs() + 100 * std.time.ns_per_ms,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "managed embedder dimension probe with a zero retry budget surfaces cancellation during the attempt" {
+    // Mirrors the deadline regression above for cancellation: a budget of
+    // zero must still report the caller's own cancellation, flipped true
+    // only during the single attempt, as `error.Cancelled` rather than
+    // folding it into the probe's own retryable unavailability.
+    const CancelingLocal = struct {
+        calls: usize = 0,
+        cancel_flag: *std.atomic.Value(bool),
+
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cancel_flag.store(true, .monotonic);
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var canceled = std.atomic.Value(bool).init(false);
+    var local = CancelingLocal{ .cancel_flag = &canceled };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = CancelingLocal.dense, .embed_sparse_texts = CancelingLocal.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 0,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "managed embedder fails fast on a permanent local provider error without retrying" {
+    // A permanent failure (here: an unsupported provider response) must not
+    // pay for a single backoff sleep; it is not the condition the retry
+    // loop exists for.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = 1, .failure = error.UnsupportedEmbeddingProvider };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expectError(error.UnsupportedCreateTableRequest, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = default_probe_retry_budget_ns,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    // Comfortably below the first backoff step (500ms) so this still
+    // catches an accidental retry sleep without flaking under scheduling
+    // delays on a loaded machine.
+    try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
+
+    // A named model-not-found failure is just as permanent and must not
+    // retry either; the caller turns this into a 404 naming the model.
+    var missing_model = FlakyLocalAntflyEmbedder{ .failures_remaining = 1, .failure = error.ModelNotFound };
+    var missing_model_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer missing_model_parsed.deinit();
+    const missing_model_started_ns = monotonicNowNs();
+    try std.testing.expectError(error.ModelNotFound, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", missing_model_parsed.value, .{
+        .antfly_provider = .{ .ptr = &missing_model, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = default_probe_retry_budget_ns,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), missing_model.calls);
+    try std.testing.expect(monotonicNowNs() - missing_model_started_ns < 400 * std.time.ns_per_ms);
+}
+
+test "managed embedder gives up with EmbeddingProbeUnavailable once the retry budget is spent" {
+    // A persistently unavailable provider must still surface
+    // EmbeddingProbeUnavailable (the handler layer turns this into a 503
+    // with Retry-After), and must not wait past the configured budget.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        // Smaller than the first backoff step (500ms), so the budget is
+        // spent before any sleep and this test stays fast.
+        .probe_retry_budget_ns = 10 * std.time.ns_per_ms,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    // Comfortably below the first backoff step (500ms); see the permanent-
+    // failure test above for why this isn't tighter.
+    try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
+}
+
+test "managed embedder dimension probe treats a timed-out attempt as transient and keeps retrying" {
+    // error.Timeout (what a spent deadline produces) must not be surfaced as
+    // a permanent failure: it is exactly the condition one absolute deadline
+    // is meant to retry while time remains.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = 1, .failure = error.Timeout };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 5 * std.time.ns_per_s,
+    })).?;
+    defer std.testing.allocator.free(normalized);
+
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+}
+
+test "managed embedder dimension probe rejects an already-expired caller deadline without attempting" {
+    // A deadline that is already in the past when the probe starts can never
+    // be fixed by retrying. This must surface as the caller's own timeout
+    // (whatever the create-table/add-index path already maps a request
+    // deadline to), never as the retryable EmbeddingProbeUnavailable, and
+    // without spending a single provider call on an attempt that cannot
+    // possibly land before the deadline.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Timeout, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        // A generous budget: if this is reached at all, something ignored
+        // the already-expired deadline below.
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .deadline_ns = monotonicNowNs() -| std.time.ns_per_s,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder dimension probe reports the caller's timeout when its deadline expires mid-retry" {
+    // The caller's deadline is fine at the start (unlike the test above) but
+    // runs out after one retry, well before the much larger retry budget
+    // would. Running out of *our own* budget while the caller still has
+    // time returns EmbeddingProbeUnavailable (see the "once the retry
+    // budget is spent" test above); running out of the *caller's* own time
+    // must not — it has to surface as their timeout instead, exactly like
+    // the already-expired case.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expectError(error.Timeout, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        // A retry budget this large would, by itself, keep retrying for
+        // seconds; the much shorter caller deadline below must win instead.
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        // Long enough to survive the first attempt and its 500ms backoff
+        // step, short enough to be spent by the second attempt's check.
+        .deadline_ns = monotonicNowNs() + 600 * std.time.ns_per_ms,
+    }));
+    // Two attempts: the first failure's backoff (capped short of the
+    // deadline) still leaves a meaningful window, but the second failure
+    // finds the caller's deadline already behind it.
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+    try std.testing.expect(monotonicNowNs() - started_ns < 1 * std.time.ns_per_s);
+}
+
+test "managed embedder dimension probe rejects already-cancelled caller without attempting" {
+    // Mirrors the already-expired-deadline test: cancellation set before the
+    // probe starts must surface as error.Cancelled with no attempt spent.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder dimension probe surfaces caller cancellation mid-retry instead of EmbeddingProbeUnavailable" {
+    // Cancellation is always the caller's own signal, exactly like their
+    // deadline: it must never be folded into the probe's retryable
+    // unavailability, whether it is set before the probe starts (the test
+    // above) or, as here, flips true only once the first attempt fails.
+    const CancelingLocal = struct {
+        calls: usize = 0,
+        cancel_flag: *std.atomic.Value(bool),
+
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cancel_flag.store(true, .monotonic);
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var canceled = std.atomic.Value(bool).init(false);
+    var local = CancelingLocal{ .cancel_flag = &canceled };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = CancelingLocal.dense, .embed_sparse_texts = CancelingLocal.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    // One attempt only: cancellation is checked (and wins) right after it
+    // fails, before any backoff sleep is considered.
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "managed embedder dimension probe backoff wait is cancellable" {
+    // Regression test: an unconditional sleep for the backoff would hold a
+    // cancelled probe (and its worker) for up to the full backoff step --
+    // four seconds at the cap -- before noticing. Cancelling partway into
+    // the *first* backoff (500ms) must return error.Cancelled within about
+    // one poll interval instead.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var cancelled_at_ns = std.atomic.Value(u64).init(0);
+    const Canceller = struct {
+        fn run(flag: *std.atomic.Value(bool), at: *std.atomic.Value(u64)) void {
+            platform_time.sleepNs(30 * std.time.ns_per_ms);
+            at.store(monotonicNowNs(), .release);
+            flag.store(true, .release);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{ &cancelled, &cancelled_at_ns });
+    defer canceller.join();
+
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    }));
+    // An unconditional sleep cannot end early, so it would hold the probe
+    // for the rest of the 500ms first backoff after cancellation. Measure
+    // from the cancellation itself: sleeps can overrun badly under load
+    // (macOS turns a 25ms poll into ~80ms), so a bound from the start of
+    // the probe would test sleep accuracy rather than cancellation.
+    try std.testing.expect(monotonicNowNs() - cancelled_at_ns.load(.acquire) < repair_failure.repairTransientBackoffNs(1));
+}
+
+test "managed embedder dimension probe spends slow provider attempts against the same deadline" {
+    // Reproduces the regression this fix targets: a provider that always
+    // eventually answers transient-failure, but takes real time to do so,
+    // must not get a fresh timeout window on every retry. Advancing the
+    // logical clock inside the fake response simulates that provider time
+    // without paying for it in real test wall-clock.
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
+
+    const FakeApp = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            // Each "attempt" costs 2s of logical time before the provider
+            // answers 429 (rate limited, transient).
+            _ = TestClock.offset_ns.fetchAdd(2 * std.time.ns_per_s, .monotonic);
+            return .{
+                .status = 429,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+    var app = FakeApp{};
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, app.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    const index_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}"}}}}
+    , .{base_uri});
+    defer std.testing.allocator.free(index_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, index_json, .{});
+    defer parsed.deinit();
+
+    // The first attempt alone (2s simulated execution) plus its backoff
+    // sleep (500ms) already spends nearly all of the 3s budget. The second
+    // attempt never reaches the network at all: `checkEntryDispatchDeadline`
+    // finds the one shared deadline already passed and fails it with
+    // `error.Timeout` before dispatch. With the old budget-minus-sleeps
+    // accounting (no shared deadline, a fresh per-attempt timeout instead),
+    // this provider's execution time would never count against the budget,
+    // and it would keep hitting the network for several retries instead.
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .probe_retry_budget_ns = 3 * std.time.ns_per_s,
+    }));
+    try std.testing.expectEqual(@as(u32, 1), app.calls.load(.monotonic));
 }
 
 test "managed embedder routes antfly model to local provider" {
@@ -10012,9 +11022,15 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     try std.testing.expectError(error.QueueFull, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.ResourceTemporarilyUnavailable;
+    // A query retries an admission refusal exactly like a provider transient
+    // failure and collapses the identity back once it gives up (see
+    // withQueryEmbeddingRetry), so the dense query path still surfaces
+    // EmbedTransientFailure here. Sparse and media document embedding never
+    // go through that retry wrapper, so they surface the adapter's distinct
+    // admission-refusal identity directly.
     try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
-    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
-    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+    try std.testing.expectError(error.EmbedAdmissionRefused, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.EmbedAdmissionRefused, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.ResourceLimitExceeded;
     try std.testing.expectError(error.ResourceLimitExceeded, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
@@ -10261,7 +11277,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
             try std.testing.expectEqualStrings("local-model", model);
             try std.testing.expectEqual(@as(usize, 3), parts_slice.len);
             try std.testing.expectEqualStrings("caption", parts_slice[0].text);
-            try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD", parts_slice[1].media_url);
+            try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD", parts_slice[1].media_url);
             try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
             self.saw_parts = true;
 
@@ -10302,10 +11318,10 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     defer bedrock_managed.deinit();
     try std.testing.expectEqual(@as(?usize, null), bedrock_managed.denseInterface().mediaPartLimit("bedrock_idx"));
 
-    const png_header = "\x89PNG\r\n\x1a\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x03";
+    const png_header = "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\x00\x00\x00\x02\x00\x00\x00\x03";
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },
-        .{ .media_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" },
+        .{ .media_url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD" },
         .{ .binary = .{ .mime_type = "image/png", .data = png_header } },
     };
     const vector = try embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3);
@@ -10810,6 +11826,71 @@ test "managed embedder endpoint access denial survives HTTP probing and runtime 
     try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
 }
 
+test "managed embedder rejects provider redirects without forwarding credentials or input" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer dummy-managed-provider-key", req.header("Authorization") orelse return error.MissingProviderCredential);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "private-managed-embedding-input") != null);
+        }
+
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            server.handleOne() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => failure.* = err,
+            };
+        }
+    };
+
+    for ([_][]const u8{ "openai", "cohere" }) |provider| {
+        for ([_]u16{ 307, 308 }) |status| {
+            errdefer std.debug.print("managed embedding redirect: provider={s}, status={d}\n", .{ provider, status });
+            var destination = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/capture", .respond = .{ .status = 400 } }});
+            defer destination.deinit();
+            const location = try destination.url("/capture");
+            defer a.free(location);
+            const response_headers: []const httpx.testing_mod.HeaderPair = &.{.{ .name = "Location", .value = location }};
+            var origin = try httpx.TestServer.start(a, io, &.{.{
+                .method = .POST,
+                .path = if (std.mem.eql(u8, provider, "openai")) "/v1/embeddings" else "/v2/embed",
+                .assert_request = Check.request,
+                .respond = .{ .status = status, .headers = response_headers },
+            }});
+            defer origin.deinit();
+            const config = try std.fmt.allocPrint(a,
+                \\{{"semantic":{{"type":"embeddings","field":"body","dimension":2,"embedder":{{"provider":"{s}","model":"model","url":"{s}","api_key":"dummy-managed-provider-key"}}}}}}
+            , .{ provider, origin.baseUrl() });
+            defer a.free(config);
+            var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, config, .{ .io = io, .bounded_http_request = true });
+            defer managed.deinit();
+            // Exercise the production managed path with its own permissive
+            // client, independently of the direct OpenAI provider adapter.
+            managed.owned_http_client.?.config.redirect_policy.follow_redirects = true;
+            var origin_failure: ?anyerror = null;
+            var destination_failure: ?anyerror = null;
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            try group.concurrent(io, Check.serve, .{ &origin, &origin_failure });
+            try group.concurrent(io, Check.serve, .{ &destination, &destination_failure });
+            try std.testing.expectError(error.EmbedRequestFailed, managed.denseInterface().embedDenseBatchWithContext(
+                a,
+                "semantic",
+                &.{"private-managed-embedding-input"},
+                2,
+                .{ .io = io, .deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s },
+            ));
+            group.cancel(io);
+            if (origin_failure) |err| return err;
+            if (destination_failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), origin.route_hits[0]);
+            try std.testing.expectEqual(@as(usize, 0), destination.route_hits[0]);
+        }
+    }
+}
+
 test "managed embedder Cloudflare compatibility preserves indexed results without resizing" {
     const a = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -11139,7 +12220,11 @@ test "managed embedder cold activation precedes default probe and query inferenc
             defer parsed.deinit();
             const result = normalizeEmbeddingsIndexDimensionJsonWithOptions(a, "semantic", parsed.value, options);
             if (case.bounded) {
-                try std.testing.expectError(error.EmbeddingProbeUnavailable, result);
+                // The caller's own 20ms deadline is what ran out here, not the
+                // probe's much larger retry budget, so this must match the
+                // query path above: error.Timeout, never the retryable
+                // EmbeddingProbeUnavailable.
+                try std.testing.expectError(error.Timeout, result);
             } else {
                 const normalized = try result;
                 defer if (normalized) |value| a.free(value);
@@ -11148,4 +12233,462 @@ test "managed embedder cold activation precedes default probe and query inferenc
         if (!case.bounded) try std.testing.expectEqual(@as(u32, 1), service.activations.load(.monotonic));
         try std.testing.expectEqual(@as(u32, if (case.bounded) 0 else 1), service.embeddings.load(.monotonic));
     }
+}
+
+test "managed embedder forwards dense quantization settings" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_bits":4,"quantization_refine":"all"}
+    , .{});
+    defer parsed.deinit();
+    const config_json = try translateEmbeddingsIndexConfigJson(alloc, "dense_q", parsed.value);
+    defer alloc.free(config_json);
+    try ant_json.testing.expectSubsetJsonText(alloc,
+        \\{"quantization_bits":4,"quantization_refine":"all"}
+    , config_json);
+
+    // One-bit codes still work at one dimension.
+    var one_dim = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":1,"external":true,"quantization_bits":1}
+    , .{});
+    defer one_dim.deinit();
+    const one_dim_json = try translateEmbeddingsIndexConfigJson(alloc, "dense_q", one_dim.value);
+    alloc.free(one_dim_json);
+
+    for ([_][]const u8{
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_bits":9}
+        ,
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_refine":"some"}
+        ,
+        // Extended codes need at least two dimensions.
+        \\{"type":"embeddings","dimension":1,"external":true,"quantization_bits":4}
+    }) |raw| {
+        var bad = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer bad.deinit();
+        // Rejected either here or by the generated config parser.
+        if (translateEmbeddingsIndexConfigJson(alloc, "dense_q", bad.value)) |unexpected| {
+            alloc.free(unexpected);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "managed embedder retains normalized admission refusal classification" {
+    const normalized = normalizeLocalEmbeddingError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expect(repair_failure.isAdmissionRefusal(normalized));
+}
+
+test "managed embedder text batch limits follow provider model and format contracts" {
+    const Case = struct {
+        provider: ProviderKind,
+        model: []const u8 = "model",
+        google_format: vertex_provider.RequestFormat = .predict,
+        google_batch: ?u32 = null,
+        bedrock_format: bedrock_provider.RequestFormat = .titan_text,
+        maximum: usize,
+    };
+    for ([_]Case{
+        .{ .provider = .ollama, .maximum = 2048 },
+        .{ .provider = .openai, .maximum = 2048 },
+        .{ .provider = .openrouter, .maximum = 2048 },
+        .{ .provider = .cloudflare, .maximum = 100 },
+        .{ .provider = .cohere, .maximum = 96 },
+        .{ .provider = .bedrock, .maximum = 1 },
+        .{ .provider = .bedrock, .bedrock_format = .cohere_v3, .maximum = 96 },
+        .{ .provider = .gemini, .google_format = .batch_embed_contents, .maximum = 100 },
+        .{ .provider = .gemini, .google_format = .embed_content, .maximum = 1 },
+        .{ .provider = .vertex, .model = "text-embedding-005", .maximum = 250 },
+        .{ .provider = .vertex, .model = "text-embedding-005", .google_batch = 2, .maximum = 2 },
+        .{ .provider = .vertex, .model = "future-model", .maximum = 1 },
+        .{ .provider = .antfly, .maximum = 1 },
+    }) |case| {
+        const entry = ManagedEmbeddingEntry{
+            .alloc = std.testing.allocator,
+            .index_name = @constCast("index"),
+            .provider = case.provider,
+            .model = @constCast(case.model),
+            .base_url = "",
+            .dimensions = 2,
+            .google_request_format = case.google_format,
+            .google_batch_size = case.google_batch,
+            .bedrock_request_format = case.bedrock_format,
+        };
+        const caps = try ManagedEmbedder.denseCapabilitiesForEntry(&entry, std.testing.allocator);
+        try caps.validate();
+        try std.testing.expectEqual(case.maximum, caps.batch.max_items);
+    }
+}
+
+test "managed embedder Ollama text batches preserve full HTTP arrays and result order" {
+    const a = std.testing.allocator;
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 32), parsed.value.object.get("input").?.array.items.len);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(alloc);
+            try body.appendSlice(alloc, "{\"data\":[");
+            for (0..32) |n| {
+                if (n != 0) try body.append(alloc, ',');
+                const row = try std.fmt.allocPrint(alloc, "{{\"index\":{d},\"embedding\":[{d},1]}}", .{ 31 - n, 31 - n });
+                defer alloc.free(row);
+                try body.appendSlice(alloc, row);
+            }
+            try body.appendSlice(alloc, "]}");
+            return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try body.toOwnedSlice(alloc) };
+        }
+    };
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const uri = try listener.baseUri(a);
+    defer a.free(uri);
+    const config = try std.fmt.allocPrint(a,
+        \\{{"semantic":{{"type":"embeddings","field":"body","dimension":2,"embedder":{{"provider":"ollama","model":"model","url":"{s}"}}}}}}
+    , .{uri});
+    defer a.free(config);
+    var managed = try ManagedEmbedder.initFromIndexesJson(a, config);
+    defer managed.deinit();
+    const provider = managed.denseInterface();
+    try std.testing.expect(provider.textPartsEquivalent("semantic"));
+    var texts: [32][]const u8 = undefined;
+    @memset(&texts, "sample");
+    const vectors = try provider.embedDenseBatch(a, "semantic", &texts, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(a, vectors);
+    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
+    for (vectors, 0..) |v, i| try std.testing.expectEqual(@as(f32, @floatFromInt(i)), v[0]);
+    const controlled = try provider.embedDenseBatchWithContext(a, "semantic", &texts, 2, .{ .io = std.testing.io, .deadline_ns = null });
+    defer db_embedder.freeDenseEmbeddingBatch(a, controlled);
+    try std.testing.expectEqual(@as(usize, 2), app.calls.load(.monotonic));
+    for (controlled, 0..) |v, i| try std.testing.expectEqual(@as(f32, @floatFromInt(i)), v[0]);
+}
+
+test "managed embedder grouped queries preserve ordered parts task and single output" {
+    const P = struct {
+        calls: usize = 0,
+        revision: u8 = 1,
+        task: EmbeddingTaskType = .retrieval_query,
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
+        fn texts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.UnexpectedTextCall;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return error.UnexpectedSparseCall;
+        }
+        fn items(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) ![][]f32 {
+            return error.UnexpectedIndependentItems;
+        }
+        fn itemWithContext(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, parts: []const template_mod.ContentPart, context: EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expectEqual(@as([32]u8, @splat(1)), context.model_revision.?);
+            try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, context.task_type);
+            try std.testing.expectEqual(@as(usize, 1), parts.len);
+            self.calls += 1;
+            const rows = try a.alloc([]f32, 1);
+            errdefer a.free(rows);
+            rows[0] = try a.dupe(f32, &.{ 1, 0 });
+            return rows;
+        }
+        fn group(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, parts: []const template_mod.ContentPart, context: EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expectEqual(self.task, context.task_type);
+            if (self.task == .retrieval_document) try std.testing.expectEqual(@as([32]u8, @splat(1)), context.model_revision.?);
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            try std.testing.expectEqualStrings("astronaut", parts[0].text);
+            switch (parts[1]) {
+                .media_url => |url| try std.testing.expectEqualStrings("data:image/png;base64,AA==", url),
+                .binary => |binary| {
+                    try std.testing.expectEqualStrings("image/png", binary.mime_type);
+                    try std.testing.expectEqualSlices(u8, &.{0}, binary.data);
+                },
+                else => return error.UnexpectedContentPart,
+            }
+            self.calls += 1;
+            const rows = try a.alloc([]f32, 1);
+            errdefer a.free(rows);
+            rows[0] = try a.dupe(f32, &.{ 1, 0 });
+            return rows;
+        }
+    };
+    const a = std.testing.allocator;
+    var p = P{};
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .owns_invocation_admission = true, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_parts_with_context = P.itemWithContext, .embed_dense_group_with_context = P.group, .model_capabilities = P.capabilities } }};
+    var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
+    const vector = try managed.embedQueryWithTemplate(a, "visual", "data:image/png;base64,AA==", "astronaut {{media url=this}}");
+    defer a.free(vector);
+    try std.testing.expectEqual(@as(usize, 1), p.calls);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vector);
+    const dense = managed.denseInterface();
+    const context = RequestContext{ .io = std.testing.io, .deadline_ns = null };
+    const generation = try dense.captureTextGenerationWithContext(a, "visual", context);
+    const item_lease = try dense.resolvePartLease(a, "visual");
+    p.revision = 2;
+    p.task = .retrieval_document;
+    const parts = [_]template_mod.ContentPart{ .{ .text = "astronaut" }, .{ .media_url = "data:image/png;base64,AA==" } };
+    const document_vector = try dense.withTextGeneration(generation).embedDensePartsWithContext(a, "visual", &parts, 2, context);
+    defer a.free(document_vector);
+    try std.testing.expectError(error.EnrichmentSourceChanged, dense.requireTextGenerationWithContext(a, "visual", generation, context));
+    try std.testing.expectEqual(@as(usize, 2), p.calls);
+    const item_vectors = try dense.withPartLease(item_lease).embedDensePartItems(a, "visual", parts[0..1], 2);
+    defer {
+        for (item_vectors) |item| a.free(item);
+        a.free(item_vectors);
+    }
+    try std.testing.expectEqual(@as(usize, 3), p.calls);
+}
+
+test "managed embedder sparse validation shares bounded admission retry and caller authority" {
+    const Local = struct {
+        failure: ?anyerror = error.ResourceTemporarilyUnavailable,
+        failures_left: usize = 1,
+        calls: usize = 0,
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.failure) |failure| if (self.failures_left > 0) {
+                self.failures_left -= 1;
+                return failure;
+            };
+            const batch = try alloc.alloc(db_embedder.SparseEmbedding, 1);
+            errdefer alloc.free(batch);
+            const indices = try alloc.dupe(u32, &.{1});
+            errdefer alloc.free(indices);
+            batch[0] = .{ .indices = indices, .values = try alloc.dupe(f32, &.{0.5}) };
+            return batch;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var local = Local{};
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(alloc,
+        \\{"sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model"}}}
+    , .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse });
+    defer managed.deinit();
+    const entry = managed.findEntry("sparse_idx").?;
+    try validateSparseEmbeddingForEntry(alloc, entry, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+    local = .{};
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, validateSparseEmbeddingForEntry(alloc, entry, 0));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        local = .{ .failure = failure };
+        try std.testing.expectError(failure, validateSparseEmbeddingForEntry(alloc, entry, 2 * std.time.ns_per_s));
+        try std.testing.expectEqual(@as(usize, 1), local.calls);
+    }
+    local = .{};
+    var overlay = entry.requestOverlay(alloc);
+    defer overlay.auth_header_cache.deinit(alloc);
+    overlay.deadline_ns = monotonicNowNs() -| 1;
+    try std.testing.expectError(error.Timeout, validateSparseEmbeddingForEntry(alloc, &overlay, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+    var cancelled = std.atomic.Value(bool).init(true);
+    overlay.deadline_ns = null;
+    overlay.cancellation = CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Cancelled, validateSparseEmbeddingForEntry(alloc, &overlay, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder remote grouped query uses one HTTP input and one vector" {
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.method == .GET) return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, "{\"embedders\":{\"model\":{}}}") };
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, request.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            try std.testing.expectEqualStrings("RETRIEVAL_QUERY", root.get("task_type").?.string);
+            const inputs = root.get("input").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), inputs.len);
+            const parts = inputs[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            try std.testing.expectEqualStrings("astronaut", std.mem.trim(u8, parts[0].object.get("text").?.string, " \r\n\t"));
+            if (parts[1].object.get("image_url")) |url| {
+                try std.testing.expectEqualStrings("data:image/png;base64,AA==", url.object.get("url").?.string);
+            } else {
+                try std.testing.expectEqualStrings("image/png", parts[1].object.get("mime_type").?.string);
+                try std.testing.expectEqualStrings("AA==", parts[1].object.get("data").?.string);
+            }
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, "{\"data\":[{\"embedding\":[1,0]}]}") };
+        }
+    };
+    const a = std.testing.allocator;
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base = try listener.baseUri(a);
+    defer a.free(base);
+    const indexes = try std.fmt.allocPrint(a, "{{\"visual\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{{\"provider\":\"antfly\",\"model\":\"model\",\"api_url\":\"{s}\",\"inputs\":[\"text\",\"image\"]}}}}}}", .{base});
+    defer a.free(indexes);
+    var managed = try ManagedEmbedder.initFromIndexesJson(a, indexes);
+    defer managed.deinit();
+    const vector = try managed.embedQueryWithTemplate(a, "visual", "data:image/png;base64,AA==", "astronaut {{media url=this}}");
+    defer a.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vector);
+    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
+}
+
+test "managed embedder legacy parts reject revision bound groups and independent items" {
+    const Local = struct {
+        revision: u8 = 1,
+        calls: usize = 0,
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
+        fn texts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn parts(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const a = std.testing.allocator;
+    var local = Local{};
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.texts, .embed_sparse_texts = Local.sparse, .embed_dense_parts = Local.parts, .model_capabilities = Local.capabilities } }};
+    var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
+    const dense = managed.denseInterface();
+    const context = RequestContext{ .io = std.testing.io, .deadline_ns = null };
+    const generation = try dense.captureTextGenerationWithContext(a, "visual", context);
+    const lease = try dense.resolvePartLease(a, "visual");
+    for ([_]u8{ 1, 2, 1 }) |revision| {
+        local.revision = revision;
+        try std.testing.expectError(error.InvalidEmbeddingIdentity, dense.withTextGeneration(generation).embedDensePartsWithContext(a, "visual", &.{.{ .text = "input" }}, 2, context));
+        try std.testing.expectError(error.InvalidEmbeddingIdentity, dense.withPartLease(lease).embedDensePartItems(a, "visual", &.{.{ .text = "input" }}, 2));
+    }
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder HTTP revision pins fence text grouped framed and numeric results" {
+    const a = std.testing.allocator;
+    const App = struct {
+        mode: std.atomic.Value(u8) = .init(0), // missing, stale, matching
+        numeric: std.atomic.Value(bool) = .init(false),
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const mode = self.mode.load(.acquire);
+            if (req.method == .GET) {
+                try std.testing.expect(mode == 3 or mode == 4);
+                var catalog = try std.json.parseFromSlice(std.json.Value, alloc, "{\"embedders\":{\"mutable-model\":{\"inputs\":[\"text\",\"image\"],\"model_revision\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}}", .{});
+                defer catalog.deinit();
+                if (mode == 4) {
+                    const info = catalog.value.object.getPtr("embedders").?.object.getPtr("mutable-model").?;
+                    try info.object.put(catalog.arena.allocator(), "model_revision_pinning", .{ .bool = true });
+                }
+                return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try std.json.Stringify.valueAlloc(alloc, catalog.value, .{}) };
+            }
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            var envelope: ?httpx.attachment_envelope.Envelope = null;
+            defer if (envelope) |*value| value.deinit();
+            const metadata = if (req.header("Content-Type")) |ct| blk: {
+                if (std.ascii.eqlIgnoreCase(ct, httpx.attachment_envelope.content_type)) {
+                    envelope = try httpx.attachment_envelope.parseAlloc(alloc, req.body, .{});
+                    try std.testing.expectEqual(@as(usize, 1), envelope.?.attachments.len);
+                    break :blk envelope.?.metadata;
+                }
+                break :blk req.body;
+            } else req.body;
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata, .{});
+            defer parsed.deinit();
+            const expected = std.fmt.bytesToHex(@as([32]u8, @splat(0x11)), .lower);
+            if (mode == 3) {
+                try std.testing.expect(!parsed.value.object.contains("model_revision"));
+            } else try std.testing.expectEqualStrings(&expected, parsed.value.object.get("model_revision").?.string);
+            var response = http_common.HttpResponse{ .status = 200 };
+            errdefer response.deinit(alloc);
+            if (mode == 1 or mode == 2 or mode == 4) {
+                const name = try alloc.dupe(u8, httpx.embedding_revision.response_header);
+                errdefer alloc.free(name);
+                const actual = std.fmt.bytesToHex(@as([32]u8, @splat(if (mode == 1) @as(u8, 0x22) else 0x11)), .lower);
+                const value = try alloc.dupe(u8, &actual);
+                errdefer alloc.free(value);
+                response.headers = try alloc.alloc(http_common.Header, 1);
+                response.headers[0] = .{ .name = name, .value = value };
+            }
+            if (self.numeric.load(.acquire)) {
+                response.content_type = try alloc.dupe(u8, httpx.numeric_response.content_type);
+                response.body = try httpx.numeric_response.allocFrame(alloc, .dense, 1, 2);
+                try httpx.numeric_response.setValue(response.body, 0, 0.25);
+                try httpx.numeric_response.setValue(response.body, 1, 0.75);
+            } else {
+                response.content_type = try alloc.dupe(u8, "application/json");
+                response.body = try alloc.dupe(u8, "{\"data\":[{\"index\":0,\"embedding\":[0.25,0.75]}]}");
+            }
+            return response;
+        }
+    };
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(a);
+    defer a.free(url);
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("mutable-model"), .base_url = url, .dimensions = 2, .declared_inputs = .{ .text = true, .image = true }, .io = std.testing.io }};
+    var cache = remote_capabilities.Cache.init(a, std.testing.io);
+    defer cache.deinit();
+    entries[0].shared_remote_capability_cache = &cache;
+    var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "caption" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 'I', 'H', 'D', 'R', 0, 0, 0, 2, 0, 0, 0, 3 } } },
+    };
+    for (0..3) |transport| for ([_]bool{ false, true }) |numeric| {
+        app.numeric.store(numeric, .release);
+        const lease = inference_work.CapabilityLease{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(0x11), .model_revision_pinning = true, .framed_attachments = transport == 2, .numeric_responses_v1 = numeric, .batch = .{ .max_media_parts_per_item = 1 } } };
+        const planned = managed.denseInterface().withPartLease(lease);
+        for (0..3) |mode| {
+            app.mode.store(@intCast(mode), .release);
+            const result = if (transport == 0) blk: {
+                const rows = planned.embedDenseBatch(a, "visual", &.{"caption"}, 2) catch |err| break :blk @as(anyerror![]f32, err);
+                defer a.free(rows);
+                break :blk @as(anyerror![]f32, @constCast(rows[0]));
+            } else planned.embedDenseParts(a, "visual", &parts, 2);
+            if (result) |vector| {
+                defer a.free(vector);
+                try std.testing.expectEqual(@as(usize, 2), mode);
+                try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, vector);
+            } else |err| {
+                if (mode == 2) return err;
+                try std.testing.expectEqual(error.InferenceCapabilitiesStale, err);
+            }
+        }
+    };
+    app.mode.store(3, .release);
+    app.numeric.store(false, .release);
+    const legacy = try managed.denseInterface().captureTextGeneration(a, "visual");
+    try std.testing.expect(legacy.revision == null);
+    const legacy_rows = try managed.denseInterface().withTextGeneration(legacy).embedDenseBatch(a, "visual", &.{"legacy"}, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(a, legacy_rows);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, legacy_rows[0]);
+    // Once an upgraded endpoint advertises execution pinning, discovery must
+    // retain its revision and propagate it automatically through real calls.
+    try invalidateRemoteEmbeddingLease(&entries[0], &.{});
+    app.mode.store(4, .release);
+    const upgraded = try managed.denseInterface().captureTextGeneration(a, "visual");
+    try std.testing.expectEqual(@as([32]u8, @splat(0x11)), upgraded.revision.?);
+    const upgraded_rows = try managed.denseInterface().withTextGeneration(upgraded).embedDenseBatch(a, "visual", &.{"upgraded"}, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(a, upgraded_rows);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, upgraded_rows[0]);
 }

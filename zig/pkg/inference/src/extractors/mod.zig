@@ -28,6 +28,7 @@ test {
     _ = decide;
     _ = gliner_boundary_executor;
     _ = gliner_span_v2_executor;
+    _ = @import("gliner_specialty_parity_test.zig");
     _ = gliner_boundary_long_executor;
     _ = @import("../runtime/bounded_allocator.zig");
 }

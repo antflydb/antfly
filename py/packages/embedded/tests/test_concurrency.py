@@ -222,7 +222,11 @@ def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path)
                     # the first reader still owns the fallback inode fence.
                     with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as second:
                         assert second.sql("SELECT name FROM items")["rows"] == [["before"]]
-                        assert list(directory.iterdir()) == [snapshot]
+                        # The lock sidecar is the lock authority and must not
+                        # appear. The writer's FIFO admission queue
+                        # (<sidecar>.q) only orders writers and may.
+                        assert not (directory / f"{snapshot.name}.lock").exists()
+                        assert set(directory.iterdir()) <= {snapshot, directory / f"{snapshot.name}.lock.q"}
                         with pytest.raises(antfly_embedded.BusyError):
                             writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
                     assert cursor.fetch(10)["result"]["rows"] == [["before"]]
@@ -596,3 +600,58 @@ with antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=10.0) as db:
                 if worker.poll() is None:
                     worker.terminate()
                     worker.wait(timeout=5)
+
+
+def test_sql_sessions_own_native_arrays_and_numeric_pages_across_reopen(tmp_path: Path) -> None:
+    from contextlib import closing
+    from decimal import Decimal
+
+    path = tmp_path / "native-transactions.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=5.0) as first:
+        with antfly_embedded.open(path, no_sync=True, busy_timeout=5.0) as second:
+            first.sql("CREATE TABLE items (id BIGINT PRIMARY KEY,n NUMERIC,tags TEXT[])")
+            with closing(first.sql_session()) as session:
+                session.execute("BEGIN")
+                session.execute("INSERT INTO items (id,n,tags) VALUES (1,CAST('1.25' AS NUMERIC),ARRAY['pending'])")
+                second.sql("INSERT INTO items (id,n,tags) VALUES (2,CAST('2.5' AS NUMERIC),ARRAY['committed'])")
+                rows = session.execute("SELECT id,n,tags FROM items ORDER BY id")["rows"]
+                assert [(row[0], Decimal(row[1]), row[2]["values"]) for row in rows] == [
+                    ("1", Decimal("1.25"), ["pending"]),
+                    ("2", Decimal("2.5"), ["committed"]),
+                ]
+                assert session.execute("SELECT id FROM items WHERE n>CAST('2' AS NUMERIC)")["rows"] == [["2"]]
+                assert session.execute("SELECT id FROM items WHERE tags=ARRAY['pending']")["rows"] == [["1"]]
+                session.execute("COMMIT")
+                assert len(second.sql("SELECT id,n,tags FROM items")["rows"]) == 2
+
+
+@pytest.mark.parametrize("filename_bytes", [247, 250])
+def test_long_database_filename_with_reader_epochs(tmp_path: Path, filename_bytes: int) -> None:
+    path = tmp_path / ("d" * (filename_bytes - len(".aflite")) + ".aflite")
+    assert len(path.name.encode()) == filename_bytes
+    with antfly_embedded.create(path, no_sync=True) as db:
+        db.batch_json({"inserts": {"doc": {"text": "alpha", "value": 1}}})
+        db.run_until_idle()
+        assert db.lookup("doc")["value"] == 1
+    with antfly_embedded.open(path, no_sync=True) as db:
+        assert db.lookup("doc")["value"] == 1
+        db.batch_json({"inserts": {"doc": {"text": "beta", "value": 2}}})
+        db.run_until_idle()
+        assert db.lookup("doc")["value"] == 2
+        assert db.check()["valid"] is True
+
+
+def test_portable_restore_retains_reader_epoch_page_reuse(tmp_path: Path) -> None:
+    with antfly_embedded.create(tmp_path / "source.aflite", no_sync=True) as source:
+        source.batch_json({"inserts": {"doc": {"payload": "x" * 8192, "value": 0}}})
+        backup = source.backup()
+    path = tmp_path / "restored.aflite"
+    antfly_embedded.restore(path, backup, storage=antfly_embedded.Storage.LITE)
+    with antfly_embedded.open(path, no_sync=True) as restored:
+        for value in range(80):
+            restored.batch_json({"inserts": {"doc": {"payload": "x" * 8192, "value": value}}})
+        assert restored.status()["storage"]["reclamation"]["reused_pages"] > 0
+        assert restored.lookup("doc")["value"] == 79
+        assert restored.check()["valid"] is True
+    with antfly_embedded.open(path, no_sync=True) as restored:
+        assert restored.lookup("doc")["value"] == 79

@@ -176,17 +176,26 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if branch.get("description", "").startswith(
-                "Relevance, filtering, backward/offset pagination"
+            if any(
+                part.get("properties", {}).get("hierarchy", {}).get("required")
+                == ["children"]
+                for part in branch.get("allOf", [])
+            )
+            and any(
+                {"required": ["query"]} in part.get("anyOf", [])
+                for part in branch.get("allOf", [])
             )
         )
         rejected_child_fields = {
             item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
         }
         allowed_child_fields = {
+            "filter_query",
             "table",
             "table_target",
             "fields",
+            "select",
+            "params",
             "hierarchy",
             "limit",
             "timeout_ms",
@@ -217,6 +226,8 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after": ["hn1/revision/artifact/1/0/fingerprint", "artifact:unit"],
         }
         self.assertEqual([], list(validator.iter_errors(valid)))
+        conditional = {**valid, "select": {"text": {"field": "text"}}, "params": {}}
+        self.assertEqual([], list(validator.iter_errors(conditional)))
         resumed = {**valid, "remote_snapshot": "a" * 64}
         self.assertEqual([], list(validator.iter_errors(resumed)))
         with_read_requirement = copy.deepcopy(valid)
@@ -235,6 +246,15 @@ class McpSchemaFragmentTests(unittest.TestCase):
         invalid_wait = copy.deepcopy(with_read_requirement)
         invalid_wait["read_requirements"]["wait_ms"] = 60001
         self.assertTrue(list(validator.iter_errors(invalid_wait)))
+
+        filtered_members = copy.deepcopy(valid)
+        filtered_members["hierarchy"]["children"].update(
+            level="member", artifact="extraction"
+        )
+        filtered_members["filter_query"] = {
+            "term": {"path": "/tenant", "value": "acme"}
+        }
+        self.assertEqual([], list(validator.iter_errors(filtered_members)))
 
         invalid_variants = []
         for field, value in (

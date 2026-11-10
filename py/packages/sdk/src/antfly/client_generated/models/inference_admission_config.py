@@ -1,56 +1,66 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
 from ..types import UNSET, Unset
-
-if TYPE_CHECKING:
-    from ..models.inference_request_admission_config import InferenceRequestAdmissionConfig
-
 
 T = TypeVar("T", bound="InferenceAdmissionConfig")
 
 
 @_attrs_define
 class InferenceAdmissionConfig:
-    """Process-local foreground request admission settings.
-
+    """
     Attributes:
-        inference (InferenceRequestAdmissionConfig | Unset):
+        max_work_units (int | Unset): Weighted work and media capacity, independent of request count. Omitted derives
+            capacity from concurrency; zero disables weighted accounting.
+        max_concurrent_requests (int | Unset): Maximum concurrent inference requests admitted by this process.
+            The budget covers embedded inference routes, direct providers, and
+            public connection inference forwarding. Remote forwarding holds a
+            slot for the full upstream request. The runtime-reserved
+            `local-inference` connection dispatches in process and is admitted
+            once by the destination inference route; configured URLs remain
+            remote boundaries even when they alias the local listener.
+            Embedded standalone uses one shared coordinator for all of those
+            surfaces; API-only runtimes use the same setting as a local forwarding
+            gate. Weighted work/media capacity is controlled independently by
+            max_work_units; when omitted it derives from max_concurrent_requests.
+            Request count zero disables only the request-count gate. An explicit
+            max_work_units remains authoritative. Excess work is rejected with
+            503 and Retry-After; it is not queued.
+             Default: 32. Example: 32.
     """
 
-    inference: InferenceRequestAdmissionConfig | Unset = UNSET
+    max_work_units: int | Unset = UNSET
+    max_concurrent_requests: int | Unset = 32
 
     def to_dict(self) -> dict[str, Any]:
-        inference: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.inference, Unset):
-            inference = self.inference.to_dict()
+        max_work_units = self.max_work_units
+
+        max_concurrent_requests = self.max_concurrent_requests
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
-        if inference is not UNSET:
-            field_dict["inference"] = inference
+        if max_work_units is not UNSET:
+            field_dict["max_work_units"] = max_work_units
+        if max_concurrent_requests is not UNSET:
+            field_dict["max_concurrent_requests"] = max_concurrent_requests
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_request_admission_config import InferenceRequestAdmissionConfig
-
         d = dict(src_dict)
-        _inference = d.pop("inference", UNSET)
-        inference: InferenceRequestAdmissionConfig | Unset
-        if isinstance(_inference, Unset):
-            inference = UNSET
-        else:
-            inference = InferenceRequestAdmissionConfig.from_dict(_inference)
+        max_work_units = d.pop("max_work_units", UNSET)
+
+        max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
 
         inference_admission_config = cls(
-            inference=inference,
+            max_work_units=max_work_units,
+            max_concurrent_requests=max_concurrent_requests,
         )
 
         return inference_admission_config

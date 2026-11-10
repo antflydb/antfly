@@ -79,6 +79,7 @@ fn matches(comptime T: type, expected: T, actual: std.json.Value) bool {
             .number_string => |value| expected == (std.fmt.parseFloat(T, value) catch return false),
             else => false,
         },
+        .@"enum" => actual == .string and std.mem.eql(u8, @tagName(expected), actual.string),
         .pointer => |pointer| blk: {
             if (pointer.size != .slice) @compileError("unit field must be a slice");
             if (pointer.child == u8) break :blk actual == .string and std.mem.eql(u8, expected, actual.string);
@@ -114,6 +115,8 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned
     };
     if (value != .object) return error.InvalidDocumentExtractionManifest;
     const object = value.object;
+    const fingerprint = try string(object, "_artifact_unit_fingerprint");
+    const version = fingerprints.persistedVersion(fingerprint) orelse return error.InvalidDocumentExtractionManifest;
     if (!std.mem.eql(u8, try string(object, "_parent_doc_key"), expected.document) or
         !std.mem.eql(u8, try string(object, "_artifact_name"), expected.producer) or
         !std.mem.eql(u8, try string(object, "unit_id"), expected.unit) or expected.unit.len == 0 or
@@ -122,6 +125,7 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned
     const provenance_value = object.get("provenance") orelse return error.InvalidDocumentExtractionManifest;
     if (provenance_value != .object) return error.InvalidDocumentExtractionManifest;
     const provenance = provenance_value.object;
+    if (version == .v5 and (object.contains("ocr_render_policy") or provenance.contains("ocr_render_policy"))) return error.InvalidDocumentExtractionManifest;
     var unit: extraction.Unit = .{ .unit_id = undefined, .unit_type = undefined, .text = undefined, .method = undefined };
     inline for (@typeInfo(extraction.Unit).@"struct".field_names, @typeInfo(extraction.Unit).@"struct".field_types, @typeInfo(extraction.Unit).@"struct".field_attrs) |reflected_name, field_type, field_attrs| {
         const root = comptime std.mem.eql(u8, reflected_name, "unit_id") or std.mem.eql(u8, reflected_name, "unit_type") or std.mem.eql(u8, reflected_name, "text");
@@ -139,10 +143,8 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned
     }
     if (unit.unit_type.len == 0 or unit.method.len == 0) return error.InvalidDocumentExtractionManifest;
     try validateCoordinates(unit);
-    try validateFormatMirrors(object, provenance, unit);
-    const fingerprint = try string(object, "_artifact_unit_fingerprint");
-    const computed = try fingerprints.fingerprintAlloc(owned, unit);
-    if (!std.mem.eql(u8, fingerprint, computed)) return error.InvalidDocumentExtractionManifest;
+    try validateFormatMirrors(object, provenance, unit, version);
+    if (!try fingerprints.matchesPersistedFingerprint(owned, unit, fingerprint)) return error.InvalidDocumentExtractionManifest;
     if (expected.fingerprint) |declared| if (!std.mem.eql(u8, fingerprint, declared)) return error.InvalidDocumentExtractionManifest;
     const route: Route = .{
         .range_id = try string(object, "_artifact_range_id"),
@@ -153,10 +155,11 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned
     return .{ .arena = arena, .unit = unit, .fingerprint = fingerprint, .route = route };
 }
 
-fn validateFormatMirrors(object: std.json.ObjectMap, provenance: std.json.ObjectMap, unit: extraction.Unit) !void {
+fn validateFormatMirrors(object: std.json.ObjectMap, provenance: std.json.ObjectMap, unit: extraction.Unit, version: fingerprints.PersistedVersion) !void {
     const format_value = provenance.get("format_provenance") orelse return error.InvalidDocumentExtractionManifest;
     if (format_value != .object) return error.InvalidDocumentExtractionManifest;
     const format = format_value.object;
+    if (version == .v5 and format.contains("ocr_render_policy")) return error.InvalidDocumentExtractionManifest;
     if (!std.mem.eql(u8, try string(format, "schema"), "antfly.document_format_provenance.v1") or
         !std.mem.eql(u8, try string(format, "coordinate_system"), "source_page_points") or
         !std.mem.eql(u8, try string(format, "extraction_method"), unit.method) or
@@ -171,7 +174,9 @@ fn validateFormatMirrors(object: std.json.ObjectMap, provenance: std.json.Object
             std.mem.eql(u8, reflected_name, "text") or std.mem.eql(u8, reflected_name, "method") or
             std.mem.eql(u8, reflected_name, "char_start") or std.mem.eql(u8, reflected_name, "char_end") or std.mem.eql(u8, reflected_name, "transcript_spans");
         if (!excluded) {
-            if (!matches(field_type, @field(unit, reflected_name), format.get(reflected_name) orelse return error.InvalidDocumentExtractionManifest)) return error.InvalidDocumentExtractionManifest;
+            if (comptime std.mem.eql(u8, reflected_name, "ocr_render_policy")) {
+                if (version == .v6 and !matches(field_type, unit.ocr_render_policy, format.get(reflected_name) orelse return error.InvalidDocumentExtractionManifest)) return error.InvalidDocumentExtractionManifest;
+            } else if (!matches(field_type, @field(unit, reflected_name), format.get(reflected_name) orelse return error.InvalidDocumentExtractionManifest)) return error.InvalidDocumentExtractionManifest;
         }
     }
 }
@@ -188,6 +193,13 @@ fn validateCoordinates(unit: extraction.Unit) !void {
     for (unit.text_regions) |region| {
         if (region.span[1] < region.span[0] or region.span[1] > unit.text.len) return error.InvalidDocumentExtractionManifest;
         try finiteBox(region.bbox);
+        if (region.font_size) |font_size| if (!std.math.isFinite(font_size) or font_size <= 0) return error.InvalidDocumentExtractionManifest;
+    }
+    for (unit.text_blocks, 0..) |block, index| {
+        const reading_order = std.math.cast(u32, index) orelse return error.InvalidDocumentExtractionManifest;
+        if (block.span[1] < block.span[0] or block.span[1] > unit.text.len or block.reading_order != reading_order) return error.InvalidDocumentExtractionManifest;
+        try finiteBox(block.bbox);
+        if (block.font_size) |font_size| if (!std.math.isFinite(font_size) or font_size <= 0) return error.InvalidDocumentExtractionManifest;
     }
     if (unit.ocr_bbox) |box| try finiteBox(box);
     if (unit.page_bbox) |box| try finiteBox(box);
@@ -217,8 +229,11 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
         .confidence = confidence,
+        .native_text_quality = unit.native_text_quality,
+        .native_text_diagnostics = unit.native_text_diagnostics,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = unit.ocr_render_policy,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -232,6 +247,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
         .extraction_warning = unit.extraction_warning,
+        .text_blocks = unit.text_blocks,
         .provenance = .{
             .source_url = source_url,
             .source_path = unit.source_path,
@@ -240,9 +256,12 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
             .source_sha256 = unit.source_sha256,
             .byte_length = unit.byte_length,
             .confidence = confidence,
+            .native_text_quality = unit.native_text_quality,
+            .native_text_diagnostics = unit.native_text_diagnostics,
             .ocr_used = unit.ocr_used,
             .ocr_attempted = unit.ocr_attempted,
             .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_render_policy = unit.ocr_render_policy,
             .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
             .ocr_rendered_width = unit.ocr_rendered_width,
             .ocr_rendered_height = unit.ocr_rendered_height,
@@ -263,6 +282,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
             .page_bbox = unit.page_bbox,
             .page_rotation = unit.page_rotation,
             .text_regions = unit.text_regions,
+            .text_blocks = unit.text_blocks,
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
@@ -276,9 +296,12 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
                 .source_sha256 = unit.source_sha256,
                 .byte_length = unit.byte_length,
                 .confidence = confidence,
+                .native_text_quality = unit.native_text_quality,
+                .native_text_diagnostics = unit.native_text_diagnostics,
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_render_policy = unit.ocr_render_policy,
                 .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
                 .ocr_rendered_width = unit.ocr_rendered_width,
                 .ocr_rendered_height = unit.ocr_rendered_height,
@@ -298,6 +321,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
                 .page_bbox = unit.page_bbox,
                 .page_rotation = unit.page_rotation,
                 .text_regions = unit.text_regions,
+                .text_blocks = unit.text_blocks,
             },
         },
     }, .{});
@@ -306,7 +330,8 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
 test "ordered artifact inventory typed unit payload owns fields and authenticates identity metadata and fingerprint" {
     const alloc = std.testing.allocator;
     var spans = [_]extraction.TranscriptSpan{.{ .char_start = 0, .char_end = 5, .start_ms = 10, .end_ms = 20, .speaker_index = 2 }};
-    var regions = [_]extraction.TextRegion{.{ .span = .{ 0, 5 }, .bbox = .{ 1, 2, 3, 4 } }};
+    var regions = [_]extraction.TextRegion{.{ .span = .{ 0, 5 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 11, .bold = true, .italic = false }};
+    var blocks = [_]extraction.TextBlock{.{ .span = .{ 0, 5 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 11, .bold = true, .italic = false }};
     const unit: extraction.Unit = .{
         .unit_id = @constCast("unit\x00x"),
         .unit_type = @constCast("page"),
@@ -314,11 +339,25 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
         .method = @constCast("text"),
         .source_path = @constCast("page/1"),
         .byte_length = 512,
+        .native_text_quality = .{ .too_short = true, .trimmed_len = 5, .non_whitespace_chars = 5 },
+        .native_text_diagnostics = .{
+            .policy = .page,
+            .semantic_coverage = .partial,
+            .actual_text_replacements = 1,
+            .unaligned_runs = 1,
+            .source_run_count = 2,
+            .emitted_run_count = 1,
+            .outside_page_spans = 2,
+            .invisible_spans = 3,
+            .unpositioned_spans = 4,
+            .has_nontext_visual = true,
+        },
         .page_number = 7,
         .page_rotation = 90,
         .ocr_attempted = true,
         .ocr_used = true,
         .ocr_render_dpi = 150,
+        .ocr_render_policy = .{ .sampling = .smooth, .resolved_profile = .smooth },
         .ocr_confidence = 0.75,
         .ocr_bbox = .{ 0, 1, 4, 8 },
         .transcript_used = true,
@@ -326,6 +365,7 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
         .transcript_spans = &spans,
         .page_bbox = .{ 0, 0, 4, 8 },
         .text_regions = &regions,
+        .text_blocks = &blocks,
         .char_start = 30,
         .char_end = 35,
     };
@@ -424,4 +464,81 @@ test "ordered artifact inventory typed unit payload validates offsets before acc
         defer alloc.free(encoded);
         try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(alloc, encoded, identity));
     }
+}
+
+test "OCR sampling unit payload roundtrip authenticates rendering policy" {
+    const a = std.testing.allocator;
+    const unit = extraction.Unit{ .unit_id = @constCast("page:1"), .unit_type = @constCast("page"), .text = @constCast("text"), .method = @constCast("ocr_text"), .ocr_render_policy = .{ .sampling = .smooth, .resolved_profile = .smooth } };
+    const id = Identity{ .document = "doc", .producer = "units", .unit = unit.unit_id };
+    const fingerprint = try fingerprints.fingerprintAlloc(a, unit);
+    defer a.free(fingerprint);
+    const bytes = try encodeAlloc(a, id.document, id.producer, unit, fingerprint, "input", "application/pdf", .{ .range_id = "range:0" });
+    defer a.free(bytes);
+    var decoded = try decodeAlloc(a, bytes, id);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(unit.ocr_render_policy, decoded.unit.ocr_render_policy);
+    var changed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer changed.deinit();
+    try changed.value.object.getPtr("ocr_render_policy").?.object.put(changed.arena.allocator(), "sampling", .{ .string = "pdf" });
+    const altered = try std.json.Stringify.valueAlloc(a, changed.value, .{});
+    defer a.free(altered);
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(a, altered, id));
+}
+
+test "OCR sampling persisted v5 units authenticate before child work during migration" {
+    const a = std.testing.allocator;
+    const raw = @embedFile("testdata/unit_v5.json");
+    const identity: Identity = .{ .document = "doc", .producer = "units", .unit = "page-1" };
+    var decoded = try decodeAlloc(a, raw, identity);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("duf5:acda8ad8765b4ad978ed1792837bb279b11ea01f7a3509605320b8b26d1c7122", decoded.fingerprint);
+    try std.testing.expectEqualStrings("hello world", decoded.unit.text);
+    try std.testing.expect(decoded.unit.ocr_render_policy == null);
+    try std.testing.expect(!fingerprints.isCurrent(decoded.fingerprint));
+    try std.testing.expect(!fingerprints.stateVersionIsCurrent(.{ .integer = 5 }));
+    const fingerprint = try fingerprints.fingerprintAlloc(a, decoded.unit);
+    defer a.free(fingerprint);
+    const updated = try encodeAlloc(a, "doc", "units", decoded.unit, fingerprint, "input", "text/plain", decoded.route);
+    defer a.free(updated);
+    var current = try decodeAlloc(a, updated, identity);
+    defer current.deinit();
+    try std.testing.expect(fingerprints.isCurrent(current.fingerprint));
+}
+
+test "OCR sampling persisted v5 refuses tampering unknown versions and unhashed policy" {
+    const a = std.testing.allocator;
+    const raw = @embedFile("testdata/unit_v5.json");
+    const identity: Identity = .{ .document = "doc", .producer = "units", .unit = "page-1" };
+    for (0..7) |variant| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const owned = parsed.arena.allocator();
+        const object = &parsed.value.object;
+        const provenance = &object.getPtr("provenance").?.object;
+        const format = &provenance.getPtr("format_provenance").?.object;
+        switch (variant) {
+            0 => try object.put(owned, "text", .{ .string = "jello world" }),
+            1 => try object.put(owned, "_artifact_unit_fingerprint", .{ .string = "duf7:acda8ad8765b4ad978ed1792837bb279b11ea01f7a3509605320b8b26d1c7122" }),
+            2 => try object.put(owned, "ocr_render_policy", .null),
+            3 => try provenance.put(owned, "ocr_render_policy", .null),
+            4 => try format.put(owned, "ocr_render_policy", .null),
+            5 => {
+                try object.put(owned, "method", .{ .string = "different" });
+                try provenance.put(owned, "method", .{ .string = "different" });
+                try format.put(owned, "extraction_method", .{ .string = "different" });
+            },
+            6 => try object.put(owned, "_artifact_unit_fingerprint", .{ .string = "duf5:bcda8ad8765b4ad978ed1792837bb279b11ea01f7a3509605320b8b26d1c7122" }),
+            else => unreachable,
+        }
+        const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(changed);
+        try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(a, changed, identity));
+    }
+    const Check = struct {
+        fn run(allocator: Allocator) !void {
+            var decoded = try decodeAlloc(allocator, raw, identity);
+            defer decoded.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{});
 }

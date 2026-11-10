@@ -111,6 +111,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
+    _privacy_policy_version: ?[]const u8 = null,
     _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -163,6 +164,7 @@ pub const OwnedAlgebraicTensorExpr = query_contract.OwnedAlgebraicTensorExprEnve
 pub const OwnedAlgebraicTensorProgram = query_contract.OwnedAlgebraicTensorProgramEnvelope;
 
 pub const ParsedExplicitTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedTextStatsFieldRequest = &.{},
@@ -176,6 +178,7 @@ pub const ParsedExplicitTextStatsRequest = struct {
 };
 
 pub const ParsedBackgroundTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedBackgroundTextStatsFieldRequest = &.{},
@@ -230,11 +233,18 @@ pub fn parseTextStatsRequest(
 ) !ParsedTextStatsRequest {
     var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, body, .{});
     defer parsed.deinit();
+    const privacy_policy_version = try parseTextStatsPrivacyVersion(parsed.value._privacy_policy_version);
     if (parsed.value.query_request) |query_value| {
         if (parsed.value._resolved_doc_filter != null) return error.InvalidQueryRequest;
         const encoded_query = try std.json.Stringify.valueAlloc(alloc, query_value, .{});
         defer alloc.free(encoded_query);
-        return .{ .query_request = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query) };
+        var query = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query);
+        errdefer query.deinit(alloc);
+        if (privacy_policy_version) |version| {
+            if (query.req.privacy_policy_version) |inner| if (!std.mem.eql(u8, &inner, &version)) return error.InvalidQueryRequest;
+            query.req.privacy_policy_version = version;
+        }
+        return .{ .query_request = query };
     }
     if (parsed.value.fields) |fields_value| {
         var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
@@ -268,6 +278,7 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .explicit_fields = .{
+            .privacy_policy_version = privacy_policy_version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
@@ -307,12 +318,52 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .background_fields = .{
+            .privacy_policy_version = privacy_policy_version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
         } };
     }
     return error.InvalidQueryRequest;
+}
+
+fn parseTextStatsPrivacyVersion(value: ?[]const u8) !?[64]u8 {
+    const text = value orelse return null;
+    if (std.mem.eql(u8, text, "none")) return @as([64]u8, @splat(0));
+    if (text.len != 64) return error.InvalidQueryRequest;
+    for (text) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+    return text[0..64].*;
+}
+
+test "local query contract text stats wire preserves privacy controls and rejects unknown metadata" {
+    const a = std.testing.allocator;
+    const version = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for ([_][]const u8{ "none", version }) |value| {
+        const expected: [64]u8 = if (std.mem.eql(u8, value, "none")) @splat(0) else version.*;
+        const bodies = [_][]const u8{
+            "\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]",
+            "\"background_fields\":[{\"aggregation_name\":\"sig\",\"field\":\"body\",\"terms\":[\"alpha\"],\"background_query\":{\"match_all\":{}}}]",
+            "\"query_request\":{}",
+        };
+        for (bodies) |body| {
+            const wire = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",{s}}}", .{ value, body });
+            defer a.free(wire);
+            var parsed = try parseTextStatsRequest(a, "docs", wire);
+            defer parsed.deinit(a);
+            const actual = switch (parsed) {
+                .explicit_fields => |request| request.privacy_policy_version,
+                .background_fields => |request| request.privacy_policy_version,
+                .query_request => |request| request.req.privacy_policy_version,
+            };
+            try std.testing.expect(actual != null);
+            try std.testing.expectEqualSlices(u8, &expected, &actual.?);
+        }
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", "{\"_privacy_policy_version\":\"bad\",\"fields\":[]}"));
+    try std.testing.expectError(error.UnknownField, parseTextStatsRequest(a, "docs", "{\"unexpected\":true,\"fields\":[]}"));
+    const conflicting = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",\"query_request\":{{\"_privacy_policy_version\":\"none\"}}}}", .{version});
+    defer a.free(conflicting);
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", conflicting));
 }
 
 pub fn identityGenerationFromTextStatsResolvedFilter(
@@ -1258,6 +1309,8 @@ pub fn algebraicConstraintsForRequestAlloc(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
 ) !?[]db_mod.aggregations.FixedConstraint {
+    if (try temporalMaterializedConstraintsAlloc(alloc, req)) |constraints| return constraints;
+    if (req.filter_text != null) return null;
     var out = std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint).empty;
     errdefer freeAlgebraicConstraints(alloc, out.items);
 
@@ -3288,9 +3341,40 @@ pub fn encodeQueryRequestWithGraphWireMode(
     // Canonical hierarchy requests require an explicit projection at both
     // ingress and storage. Their parser reconstructs deferred projection from
     // these fields, so retain them rather than emitting an invalid envelope.
+    const conditional_delivery = @import("field_projection.zig").storageEligible(req) or @import("field_projection.zig").hydrationEligible(req);
+    if (conditional_delivery) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const projection = try std.json.parseFromSliceLeaky(@import("field_projection.zig").Request, a, req.field_projection_json, .{});
+        const selected = try @import("field_projection.zig").selection(a, projection);
+        if (selected.object.count() != 0) {
+            try appendJsonFieldName(alloc, &out, &first, "select");
+            try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, selected, .{}));
+            try appendJsonFieldName(alloc, &out, &first, "params");
+            try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, projection.params, .{}));
+        }
+        if (!req.include_all_fields) {
+            var plan = try @import("field_projection.zig").decode(a, req.field_projection_json);
+            defer plan.deinit();
+            var required: std.ArrayList([]const u8) = .empty;
+            try required.appendSlice(a, req.fields);
+            var it = plan.required_fields.keyIterator();
+            while (it.next()) |field| {
+                if (std.mem.eql(u8, field.*, "_id")) continue;
+                const exists = for (required.items) |prior| {
+                    if (std.mem.eql(u8, prior, field.*)) break true;
+                } else false;
+                if (!exists) try required.append(a, field.*);
+            }
+            try appendJsonFieldNames(alloc, &out, &first, "fields", required.items);
+        }
+        try appendJsonFieldName(alloc, &out, &first, "_projection_source_fields");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, .{ .fields = req.fields, .include_all = req.include_all_fields }, .{}));
+    }
     const requires_hierarchy_fields = req.hierarchy_children != null or
         req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
-    if (!req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
+    if (!conditional_delivery and !req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {
@@ -3326,6 +3410,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    if (req.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
     if (req.document_authority_mode != .none) {
         try appendJsonFieldName(alloc, &out, &first, "_document_authority");
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});
@@ -3339,6 +3424,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try out.appendSlice(alloc, encoded);
     }
     if (req.remote_snapshot) |snapshot| try appendJsonFieldString(alloc, &out, &first, "remote_snapshot", snapshot);
+    if (req.response_live_read) try appendJsonFieldBool(alloc, &out, &first, "_response_live_read", true);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);
     }
@@ -3386,6 +3472,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.identity_read_generation) |generation| {
         try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
     }
+    if (req.hierarchy_parent_admitted) try appendJsonFieldBool(alloc, &out, &first, "_hierarchy_parent_admitted", true);
     if (req.hierarchy_children != null or req.defer_hierarchy_child_hydration) {
         try appendJsonFieldBool(alloc, &out, &first, "_defer_hierarchy_child_hydration", true);
     }
@@ -3516,7 +3603,10 @@ pub fn encodeStorageKernelQueryRequestForExecution(alloc: std.mem.Allocator, req
 }
 
 pub const StorageKernelLookupWireRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
+    privacy_original: bool = false,
     key: []const u8,
+    cypher_prepare: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_receipt: ?struct {
@@ -3538,6 +3628,9 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
+            .cypher_prepare = self.cypher_prepare,
+            .privacy_policy_version = self.privacy_policy_version,
+            .privacy_original = self.privacy_original,
             .row_policy_principal_proof = self.row_policy_principal_proof,
             .row_policy_database = self.row_policy_database,
             .row_policy_receipt = if (self.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
@@ -3622,7 +3715,10 @@ pub fn encodeStorageKernelLookupRequest(
     opts: db_mod.types.LookupOptions,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
+        .privacy_policy_version = opts.privacy_policy_version,
+        .privacy_original = opts.privacy_original,
         .key = key,
+        .cypher_prepare = opts.cypher_prepare,
         .row_policy_principal_proof = opts.row_policy_principal_proof,
         .row_policy_database = opts.row_policy_database,
         .row_policy_receipt = if (opts.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
@@ -3639,6 +3735,17 @@ pub fn encodeStorageKernelLookupRequest(
         .group_source_query_json = opts.group_source_query_json,
         .relational_topology_json = opts.relational_topology_json,
     }, .{});
+}
+
+test "compiled lookup wire preserves private Cypher admission without exposing a row" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeStorageKernelLookupRequest(alloc, "", .{ .cypher_prepare = true });
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(StorageKernelLookupWireRequest, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.options().cypher_prepare);
+    try std.testing.expectEqualStrings("", parsed.value.key);
+    try std.testing.expect(parsed.value.options().row_policy_principal_proof.len == 0);
 }
 
 pub const StorageKernelDocumentArtifactManifestWireRequest = struct {
@@ -3685,6 +3792,10 @@ pub fn encodeStorageKernelDocumentArtifactManifestsResponse(
 }
 
 pub const StorageKernelScanWireRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
+    privacy_original: bool = false,
+    privacy_status: bool = false,
+    resume_from_key: bool = false,
     from_key: []const u8 = "",
     to_key: []const u8 = "",
     inclusive_from: bool = false,
@@ -3702,6 +3813,10 @@ pub const StorageKernelScanWireRequest = struct {
 
     pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
         return .{
+            .privacy_policy_version = self.privacy_policy_version,
+            .privacy_original = self.privacy_original,
+            .privacy_status = self.privacy_status,
+            .resume_from_key = self.resume_from_key,
             .inclusive_from = self.inclusive_from,
             .exclusive_to = self.exclusive_to,
             .include_documents = self.include_documents,
@@ -3736,6 +3851,10 @@ pub fn encodeStorageKernelScanRequest(
     opts: db_mod.types.ScanOptions,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelScanWireRequest{
+        .privacy_policy_version = opts.privacy_policy_version,
+        .privacy_original = opts.privacy_original,
+        .privacy_status = opts.privacy_status,
+        .resume_from_key = opts.resume_from_key,
         .from_key = from_key,
         .to_key = to_key,
         .inclusive_from = opts.inclusive_from,
@@ -3874,9 +3993,21 @@ pub fn appendQueryHierarchyField(
     try appendJsonFieldName(alloc, out, first, "hierarchy");
     try out.append(alloc, '{');
     if (req.hierarchy_children) |children| {
-        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",\"id\":");
-        try appendJsonString(alloc, out, children.parent_id);
-        try out.appendSlice(alloc, "},\"level\":\"unit\"}");
+        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",");
+        if (children.parent_ids.len != 0) {
+            try out.appendSlice(alloc, "\"ids\":");
+            const ids_json = try std.json.Stringify.valueAlloc(alloc, children.parent_ids, .{});
+            defer alloc.free(ids_json);
+            try out.appendSlice(alloc, ids_json);
+        } else {
+            try out.appendSlice(alloc, "\"id\":");
+            try appendJsonString(alloc, out, children.parent_id);
+        }
+        if (children.artifact_name) |name| {
+            try out.appendSlice(alloc, "},\"level\":\"member\",\"artifact\":");
+            try appendJsonString(alloc, out, name);
+            try out.append(alloc, '}');
+        } else try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
         // `group_by` is its own opt-in control (grouped matches, or explicit
         // unit-level grouping); `ancestors` (hydrating a chunk hit's source/
@@ -4888,6 +5019,8 @@ const RemoteSearchParser = struct {
         try self.expect(.object_begin);
         var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
         var stored: ?[]u8 = null;
+        var computed: ?[]u8 = null;
+        errdefer if (computed) |value| self.alloc.free(value);
         var pending: ?db_mod.types.document_authority.Pending = null;
         errdefer if (stored) |value| self.alloc.free(value);
         var seen: u64 = 0;
@@ -4898,6 +5031,11 @@ const RemoteSearchParser = struct {
                     var captured: db_mod.types.document_authority.Pending = .{};
                     if (try rawObjectSourceRange(&self.source_workspace, &self.scanner, self.options, .{ .ctx = &captured, .member_fn = db_mod.types.document_authority.Pending.observe }) != null) pending = captured;
                 } else stored = try self.source();
+            } else if (std.mem.eql(u8, name, "_computed")) {
+                // Retain validated lexical spans directly, including exact
+                // numbers and escaped payloads, just like stored source.
+                computed = try self.source();
+                if (computed) |value| _ = try @import("antfly-json").RawObject.init(value);
             } else try self.member(metadata_openapi.QueryHit, &wire, i, a);
         }
         if (!required(metadata_openapi.QueryHit, "_id", seen) or !required(metadata_openapi.QueryHit, "_score", seen)) return error.MissingField;
@@ -4916,6 +5054,9 @@ const RemoteSearchParser = struct {
         if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
         hit.stored_data = stored;
         stored = null;
+        hit.computed_json = computed;
+        hit.computed_receipt = null;
+        computed = null;
         return hit;
     }
     fn rows(self: *@This()) !void {
@@ -5216,8 +5357,15 @@ pub fn parseRemoteHierarchyArtifactRefAlloc(
     errdefer alloc.free(owned_name);
     const owned_unit_id = if (artifact.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null;
     errdefer if (owned_unit_id) |unit_id| alloc.free(unit_id);
-    const source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    var source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    errdefer if (source) |*value| value.deinit(alloc);
+    const revision = if (artifact.revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (revision) |value| alloc.free(value);
+    const derivation_revision = if (artifact.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (derivation_revision) |value| alloc.free(value);
     return db_mod.types.ArtifactRef{
+        .revision = revision,
+        .derivation_revision = derivation_revision,
         .document_id = owned_document_id,
         .name = owned_name,
         .kind = kind,
@@ -7453,4 +7601,343 @@ test "public graph metric borrowed wire source scan rejects invalid authority en
         defer a.free(wire);
         try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
     }
+}
+
+test "api query contract worker computed spans preserve numbers and reject malformed objects" {
+    const a = std.testing.allocator;
+    const prefix = "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_score\":1,\"_computed\":";
+    const suffix = "}]},\"status\":200,\"table\":\"docs\",\"took\":0}]}";
+    const body = prefix ++ "{\"integer\":9007199254740993,\"decimal\":1e0,\"text\":\"\\u03bb\\n\"}" ++ suffix;
+    var result = try parseRemoteSearchResult(a, body);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("{\"integer\":9007199254740993,\"decimal\":1e0,\"text\":\"\\u03bb\\n\"}", result.hits[0].computed_json.?);
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "[]" ++ suffix));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":1,\"x\":2}" ++ suffix));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":NaN}" ++ suffix));
+}
+
+/// A range can be eliminated from the document predicate only when every output
+/// uses that exact range and both boundaries are complete materialized buckets.
+fn temporalMaterializedConstraintsAlloc(a: std.mem.Allocator, req: db_mod.types.SearchRequest) !?[]db_mod.aggregations.FixedConstraint {
+    if (req.query != .match_all or (if (req.full_text) |text| text != .match_all else false) or req.aggregations_json.len == 0) return null;
+    const requests = query_contract.parseAggregationRequestsJson(a, req.aggregations_json) catch return null;
+    defer query_contract.freeAggregationRequests(a, requests);
+    if (requests.len == 0) return null;
+    var field: []const u8 = "";
+    var range: ?db_mod.algebraic.ir.TimeRange = null;
+    for (requests) |request| {
+        const hist = if (std.mem.eql(u8, request.type, "date_histogram")) request else blk: {
+            if (!std.mem.eql(u8, request.type, "terms") or request.aggregations.len != 1) return null;
+            break :blk request.aggregations[0];
+        };
+        if (!std.mem.eql(u8, hist.type, "date_histogram") or hist.bucket_origin.len != 0) return null;
+        const dt = @import("../datetime.zig");
+        const source_range = try temporalSourceRangeAlloc(a, req, hist.field) orelse return null;
+        const first = source_range.start_ns;
+        const last = source_range.end_ns;
+        if (first >= last) return null;
+        // Presentation bounds are optional, but when supplied must describe
+        // the same source extent. Disabling gap filling never changes proof.
+        if (hist.date_bounds_start.len > 0 and ((dt.parseRfc3339ToSignedNs(hist.date_bounds_start) orelse return null) != first or (dt.parseRfc3339ToSignedNs(hist.date_bounds_end) orelse return null) != last)) return null;
+        const agg = @import("../search/aggregation.zig");
+        const interval = agg.parseDateInterval(hist.calendar_interval, hist.fixed_interval, "") catch return null;
+        if ((agg.truncateSignedToInterval(first, interval) catch return null) != first or (agg.truncateSignedToInterval(last, interval) catch return null) != last) return null;
+        if (range) |prior| {
+            if (!std.mem.eql(u8, field, hist.field) or prior.start_ns != first or prior.end_ns != last) return null;
+        } else {
+            field = hist.field;
+            range = .{ .start_ns = first, .end_ns = last };
+        }
+    }
+    var constraints = std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint).empty;
+    defer {
+        for (constraints.items) |c| {
+            a.free(c.field);
+            a.free(c.value);
+        }
+        constraints.deinit(a);
+    }
+    var found = false;
+    if (req.filter_text) |text| {
+        if (!try collectTemporalTextPredicate(a, text, field, range.?, &found, &constraints)) return null;
+    }
+    if (req.filter_query_json.len > 0) {
+        var json = std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{}) catch return null;
+        defer json.deinit();
+        if (!try collectTemporalMaterializedPredicate(a, json.value, field, range.?, &found, &constraints)) return null;
+    }
+    if (!found) return null;
+    try constraints.append(a, .{ .field = try a.dupe(u8, field), .value = try a.dupe(u8, ""), .time_range = range });
+    return try constraints.toOwnedSlice(a);
+}
+
+fn temporalSourceRangeAlloc(a: std.mem.Allocator, req: db_mod.types.SearchRequest, field: []const u8) !?db_mod.algebraic.ir.TimeRange {
+    if (req.filter_text) |text| if (temporalSourceTextRange(text, field)) |range| return range;
+    if (req.filter_query_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{}) catch return null;
+    defer parsed.deinit();
+    return temporalSourceJsonRange(parsed.value, field);
+}
+
+fn temporalSourceTextRange(query: db_mod.types.TextQuery, field: []const u8) ?db_mod.algebraic.ir.TimeRange {
+    switch (query) {
+        .date_range => |range| {
+            if (!std.mem.eql(u8, range.field, field) or range.start_ns == null or range.end_ns == null or !range.inclusive_start or range.inclusive_end) return null;
+            return .{ .start_ns = range.start_ns.?, .end_ns = range.end_ns.? };
+        },
+        .bool_query => |clauses| {
+            if (!temporalTextFilterCanConsider(query)) return null;
+            for (clauses.must) |child| if (temporalSourceTextRange(child, field)) |range| return range;
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn temporalSourceJsonRange(value: std.json.Value, field: []const u8) ?db_mod.algebraic.ir.TimeRange {
+    if (value != .object) return null;
+    if (value.object.get("conjuncts")) |children| {
+        if (children != .array) return null;
+        for (children.array.items) |child| if (temporalSourceJsonRange(child, field)) |range| return range;
+    }
+    if (value.object.get("bool")) |clauses| {
+        if (clauses != .object) return null;
+        inline for (.{ "must", "filter" }) |key| if (clauses.object.get(key)) |children| {
+            if (children != .array) return null;
+            for (children.array.items) |child| if (temporalSourceJsonRange(child, field)) |range| return range;
+        };
+    }
+    const predicate = value.object.get("date_range") orelse value.object.get("range") orelse return null;
+    if (predicate != .object) return null;
+    const path = predicate.object.get("field") orelse predicate.object.get("path") orelse return null;
+    if (path != .string) return null;
+    const simple = if (std.mem.startsWith(u8, path.string, "/")) path.string[1..] else path.string;
+    if (!std.mem.eql(u8, simple, field)) return null;
+    const first = predicate.object.get("start_ns") orelse predicate.object.get("start") orelse predicate.object.get("gte") orelse return null;
+    const last = predicate.object.get("end_ns") orelse predicate.object.get("end") orelse predicate.object.get("lt") orelse return null;
+    const dt = @import("../datetime.zig");
+    return .{
+        .start_ns = (if (first == .string) dt.parseRfc3339ToSignedNs(first.string) else dt.rangeNanoseconds(first)) orelse return null,
+        .end_ns = (if (last == .string) dt.parseRfc3339ToSignedNs(last.string) else dt.rangeNanoseconds(last)) orelse return null,
+    };
+}
+
+fn collectTemporalMaterializedPredicate(a: std.mem.Allocator, value: std.json.Value, field: []const u8, range: db_mod.algebraic.ir.TimeRange, found: *bool, out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint)) anyerror!bool {
+    if (value != .object) return false;
+    if (value.object.get("conjuncts")) |children| {
+        if (value.object.count() != 1 or children != .array) return false;
+        for (children.array.items) |child| if (!try collectTemporalMaterializedPredicate(a, child, field, range, found, out)) return false;
+        return true;
+    }
+    if (value.object.get("bool")) |clauses| {
+        if (value.object.count() != 1 or clauses != .object) return false;
+        var it = clauses.object.iterator();
+        while (it.next()) |entry| {
+            if ((!std.mem.eql(u8, entry.key_ptr.*, "must") and !std.mem.eql(u8, entry.key_ptr.*, "filter")) or entry.value_ptr.* != .array) return false;
+            for (entry.value_ptr.array.items) |child| if (!try collectTemporalMaterializedPredicate(a, child, field, range, found, out)) return false;
+        }
+        return true;
+    }
+    if (value.object.get("date_range")) |predicate| {
+        if (value.object.count() != 1 or predicate != .object) return false;
+        const path = predicate.object.get("field") orelse predicate.object.get("path") orelse return false;
+        if (path != .string) return false;
+        const simple = if (std.mem.startsWith(u8, path.string, "/")) path.string[1..] else path.string;
+        if (!std.mem.eql(u8, simple, field)) return false;
+        const first = predicate.object.get("start_ns") orelse predicate.object.get("start") orelse return false;
+        const last = predicate.object.get("end_ns") orelse predicate.object.get("end") orelse return false;
+        if (predicate.object.get("inclusive_start")) |flag| if (flag != .bool or !flag.bool) return false;
+        if (predicate.object.get("inclusive_end")) |flag| if (flag != .bool or flag.bool) return false;
+        const dt = @import("../datetime.zig");
+        const first_ns = if (first == .string) dt.parseRfc3339ToSignedNs(first.string) else dt.rangeNanoseconds(first);
+        const last_ns = if (last == .string) dt.parseRfc3339ToSignedNs(last.string) else dt.rangeNanoseconds(last);
+        if ((first_ns orelse return false) != range.start_ns or (last_ns orelse return false) != range.end_ns) return false;
+        found.* = true;
+        return true;
+    }
+    if (value.object.get("range")) |predicate| {
+        if (value.object.count() != 1 or predicate != .object or predicate.object.count() != 3) return false;
+        const path = predicate.object.get("path") orelse predicate.object.get("field") orelse return false;
+        const first = predicate.object.get("gte") orelse return false;
+        const last = predicate.object.get("lt") orelse return false;
+        if (path != .string or first != .string or last != .string) return false;
+        const simple = if (std.mem.startsWith(u8, path.string, "/")) path.string[1..] else path.string;
+        if (!std.mem.eql(u8, simple, field)) return false;
+        const dt = @import("../datetime.zig");
+        if ((dt.parseRfc3339ToSignedNs(first.string) orelse return false) != range.start_ns or (dt.parseRfc3339ToSignedNs(last.string) orelse return false) != range.end_ns) return false;
+        found.* = true;
+        return true;
+    }
+    return try collectAlgebraicFilterConstraints(a, value, out);
+}
+
+/// A TTL table can use materialized counts only if the actual source predicate
+/// excludes every document that can expire before the execution deadline.
+pub fn temporalRangeVisibleThroughDeadline(req: db_mod.types.SearchRequest, constraints: []const db_mod.aggregations.FixedConstraint, ttl_field: []const u8, duration_ns: u64, wall_ns: u64, monotonic_ns: u64) bool {
+    if (duration_ns == 0) return true;
+    const deadline = req.execution_deadline_ns orelse return false;
+    const horizon = @as(i128, wall_ns) + (deadline -| monotonic_ns) - @as(i128, duration_ns);
+    for (constraints) |constraint| if (constraint.time_range) |range| {
+        if (std.mem.eql(u8, constraint.field, ttl_field) and range.start_ns >= horizon) return true;
+    };
+    return false;
+}
+
+pub fn temporalTextFilterCanConsider(query: db_mod.types.TextQuery) bool {
+    return switch (query) {
+        .date_range => true,
+        .value => |value| value.kind == .equals and value.case_sensitive,
+        .bool_query => |clauses| blk: {
+            if (clauses.should.len != 0 or clauses.must_not.len != 0 or clauses.min_should != 0 or clauses.must.len == 0) break :blk false;
+            for (clauses.must) |child| if (!temporalTextFilterCanConsider(child)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn temporalTextRangeMatches(query: db_mod.types.TextQuery, field: []const u8, range: db_mod.algebraic.ir.TimeRange) bool {
+    return switch (query) {
+        .date_range => |predicate| std.mem.eql(u8, predicate.field, field) and predicate.start_ns != null and predicate.end_ns != null and predicate.start_ns.? == range.start_ns and predicate.end_ns.? == range.end_ns and predicate.inclusive_start and !predicate.inclusive_end,
+        .bool_query => |clauses| blk: {
+            if (!temporalTextFilterCanConsider(query)) break :blk false;
+            for (clauses.must) |child| if (!temporalTextRangeMatches(child, field, range)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn collectTemporalTextPredicate(a: std.mem.Allocator, query: db_mod.types.TextQuery, field: []const u8, range: db_mod.algebraic.ir.TimeRange, found: *bool, out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint)) anyerror!bool {
+    switch (query) {
+        .date_range => {
+            if (!temporalTextRangeMatches(query, field, range)) return false;
+            found.* = true;
+            return true;
+        },
+        .value => |value| {
+            if (value.kind != .equals or !value.case_sensitive) return false;
+            try appendAlgebraicConstraint(out, a, value.field, value.text);
+            return true;
+        },
+        .bool_query => |clauses| {
+            if (!temporalTextFilterCanConsider(query)) return false;
+            for (clauses.must) |child| if (!try collectTemporalTextPredicate(a, child, field, range, found, out)) return false;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Private coarse protocol: planners and physical index handles stay at the
+/// storage owner. Shards export complete algebraic states, never local top-N.
+pub const TemporalShard = struct {
+    signature: []const u8,
+    partials: [][]const db_mod.algebraic.distributed.Partial,
+};
+pub const TemporalWire = struct {
+    temporal_query: []const u8,
+    table_name: []const u8,
+    shards_json: ?[]const u8 = null,
+    /// Portable remaining budget; monotonic clock epochs differ between nodes.
+    /// Kept outside the query so it is present even without a native read cut.
+    timeout_ms: ?u32 = null,
+
+    pub fn executionDeadline(self: @This(), started_ns: u64, parsed: ?u64, transport: ?u64) ?u64 {
+        var deadline = parsed;
+        const relative: ?u64 = if (self.timeout_ms) |ms| started_ns +| @as(u64, ms) *| std.time.ns_per_ms else null;
+        for ([_]?u64{ relative, transport }) |candidate| if (candidate) |limit| {
+            deadline = if (deadline) |existing| @min(existing, limit) else limit;
+        };
+        return deadline;
+    }
+};
+
+test "time series owner budgets are portable and never extend an admitted deadline" {
+    const wire: TemporalWire = .{ .temporal_query = "{}", .table_name = "readings", .timeout_ms = 5 };
+    try std.testing.expectEqual(@as(?u64, 105_000_000), wire.executionDeadline(100_000_000, null, null));
+    try std.testing.expectEqual(@as(?u64, 15_000_000), wire.executionDeadline(10_000_000, null, null));
+    try std.testing.expectEqual(@as(?u64, 101_000_000), wire.executionDeadline(100_000_000, null, 101_000_000));
+    try std.testing.expectEqual(@as(?u64, 102_000_000), wire.executionDeadline(100_000_000, 102_000_000, 103_000_000));
+    const expired: TemporalWire = .{ .temporal_query = "{}", .table_name = "readings", .timeout_ms = 0 };
+    try std.testing.expectEqual(@as(?u64, 100_000_000), expired.executionDeadline(100_000_000, null, null));
+    const unbounded: TemporalWire = .{ .temporal_query = "{}", .table_name = "readings" };
+    try std.testing.expect(unbounded.executionDeadline(100_000_000, null, null) == null);
+}
+pub const temporal_max_cells: usize = 1_000_000;
+pub const temporal_max_bytes: usize = 64 * 1024 * 1024;
+
+test "time series TTL visibility must hold through the entire deadline" {
+    const constraints = [_]db_mod.aggregations.FixedConstraint{.{ .field = "ts", .value = "", .time_range = .{ .start_ns = 950, .end_ns = 1000 } }};
+    const req: db_mod.types.SearchRequest = .{ .execution_deadline_ns = 150 };
+    try std.testing.expect(temporalRangeVisibleThroughDeadline(req, &constraints, "ts", 100, 1000, 100));
+    try std.testing.expect(!temporalRangeVisibleThroughDeadline(.{ .execution_deadline_ns = 151 }, &constraints, "ts", 100, 1000, 100));
+    try std.testing.expect(!temporalRangeVisibleThroughDeadline(req, &constraints, "other", 100, 1000, 100));
+    try std.testing.expect(!temporalRangeVisibleThroughDeadline(.{}, &constraints, "ts", 100, 1000, 100));
+    try std.testing.expect(temporalRangeVisibleThroughDeadline(.{}, &.{}, "", 0, 1000, 100));
+}
+
+pub fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
+    return (if (req.full_text) |query| query == .match_all else true) and
+        (if (req.filter_text) |query| temporalTextFilterCanConsider(query) else true) and
+        req.exclusion_text == null and
+        req.exclusion_query_json.len == 0 and
+        req.full_text_queries.len == 0 and
+        req.dense == null and
+        req.sparse == null and
+        req.dense_queries.len == 0 and
+        req.sparse_queries.len == 0 and
+        req.graph_queries.len == 0 and
+        req.merge_config == null and
+        req.reranker == null and
+        req.pruner == null and
+        req.filter_prefix.len == 0 and
+        req.filter_ids.len == 0 and
+        req.exclude_ids.len == 0 and
+        req.filter_doc_ids.len == 0 and
+        !req.filter_doc_ids_positive and
+        req.exclude_doc_ids.len == 0 and
+        !searchRequestHasResolvedDocFilter(req) and
+        req.distance_over == null and
+        req.distance_under == null;
+}
+
+pub const TemporalDecline = enum {
+    scan_unsupported_temporal_shape,
+    scan_unproven_temporal_predicate,
+    scan_missing_temporal_index,
+    scan_temporal_index_not_ready,
+    scan_stale_temporal_index,
+    scan_temporal_ttl_visibility,
+    scan_temporal_materialization_declined,
+    scan_temporal_schema_changed,
+    scan_temporal_owner_unavailable,
+    scan_temporal_budget,
+};
+
+/// Coordinator admission is separate from the exact scan's source budget.
+/// Exhaustion declines an accelerator; it is never a query failure by itself.
+pub const TemporalTransferBudget = struct {
+    remaining_bytes: usize = temporal_max_bytes,
+    remaining_cells: usize = temporal_max_cells,
+    pub fn acceptBytes(self: *@This(), count: usize) bool {
+        if (count > self.remaining_bytes) return false;
+        self.remaining_bytes -= count;
+        return true;
+    }
+    pub fn acceptCells(self: *@This(), count: usize) bool {
+        if (count > self.remaining_cells) return false;
+        self.remaining_cells -= count;
+        return true;
+    }
+};
+
+test "time series distributed transfer declines before exceeding shared budgets" {
+    var budget = TemporalTransferBudget{ .remaining_bytes = 9, .remaining_cells = 3 };
+    try std.testing.expect(budget.acceptBytes(5));
+    try std.testing.expect(!budget.acceptBytes(5));
+    try std.testing.expectEqual(@as(usize, 4), budget.remaining_bytes);
+    try std.testing.expect(budget.acceptCells(2));
+    try std.testing.expect(!budget.acceptCells(2));
+    try std.testing.expect(budget.acceptCells(1));
 }

@@ -7,6 +7,14 @@
     background: color-mix(in oklch, var(--primary) 22%, transparent);
   }
 
+  /* Inside product UI, headings are interface text (Inter). Aeonik stays for
+     marketing headings and explicit .font-display brand moments. */
+  .af-dashboard :is(h1, h2, h3, h4, h5, h6):not(.font-display):not(.font-aeonik) {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
   .af-dashboard code,
   .af-dashboard kbd,
   .af-dashboard pre,

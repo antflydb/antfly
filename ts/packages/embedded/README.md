@@ -182,10 +182,10 @@ try {
 ```
 
 For decision question types and examples, see the
-[typed decision guide](../../../docs/guides/decisions.md).
+[typed decision guide](../../../docs/reference/decisions.md).
 
 - **Calls**: `embed`, `rerank`, `chunk`, `generate`, `generateBatch`,
-  `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
+  `rewrite`, `decide`, `extract`, `read` (documents, images, audio), `listModels` -- each with
   a bare form (parsed JSON) and a `...Raw` form (raw `Buffer`), following the
   same convention as `Database`. Binary inputs (images, audio) go inline in
   the request JSON, as base64 or `data:` URIs. Responses are always
@@ -315,13 +315,33 @@ Every failed call rejects with an `AntflyError` subclass carrying:
 Subclasses: `InvalidArgumentError` (1), `NotFoundError` (2),
 `VersionConflictError` (3), `IntentConflictError` (4), `TxnNotFoundError` (5),
 `BusyError` (6), `OutcomeUnknownError` (7, not safe to retry automatically --
-publication may have succeeded but crash durability could not be confirmed),
+the operation may have taken effect, but whether it applied or became durable
+could not be confirmed),
 `UnsupportedError` (8, not transient), `StalledError` (9, a bounded drain
 like `runUntilIdle` made no progress and gave up), `CancelledError` (10, the
 caller returned `false` from an `Inference.pull()` `onProgress` or
 `Inference.generateStream()` `onChunk` callback -- a callback that throws
 instead stops the operation the same way, but rejects with the thrown error
 itself, not `CancelledError`), `InternalError` (255).
+
+### Outcome receipts
+
+When an autocommit SQL write (`sqlJson`, `Connection` outside a transaction)
+ends with ANTFLY_OUTCOME_UNKNOWN, the rejection (`SqlError`, or
+`OutcomeUnknownError` without a SQL diagnostic) carries `.outcomeReceipt`
+(`undefined` when none was issued). Resolve it on any handle for the same
+database with `db.outcomeReceiptStatus(receipt)`, which resolves to
+`"applied"` or `"not_applied"`, or rejects with `StalledError` while the
+uncertain commit is not reconciled yet (Lite: retry; directory database:
+close the issuing handle and reopen first). Call
+`db.forgetOutcomeReceipt(receipt)` once resolved; afterwards it can no
+longer be resolved.
+
+`batch`, `batchJson` and `batchJsonRaw` rejections carry `.outcomeReceipt`
+too: they use `antfly_db_batch_with_receipt` and
+`antfly_db_batch_json_with_receipt`, which return the receipt from the same
+native call (the thread-local `antfly_last_error_outcome_receipt` cannot follow
+an async call to a worker thread).
 
 ## API surface
 
@@ -351,7 +371,7 @@ Mirrors `go/pkg/embedded`'s surface idiomatically:
   `decodeArtifactId`, `abiVersion`, `threadingMode`, `validateAbi`.
 - **`Inference`**: `Inference.open(options?)`, `close()`,
   `[Symbol.asyncDispose]`; `embed`/`rerank`/`chunk`/`generate`/
-  `generateBatch`/`rewrite`/`extract`/`read`/`transcribe`/`listModels`
+  `generateBatch`/`rewrite`/`extract`/`read`/`listModels`
   (each with a `...Raw` form); `generateStream(request, onChunk)` /
   `generateStreamRaw`; `pull(request, onProgress?, signal?)`; plus
   `InferenceOptions`, `PullProgress`, `CancelledError`,
@@ -439,6 +459,11 @@ const people = await sql.selectFrom("people").selectAll().execute();
 await sql.destroy(); // The caller still owns database.
 ```
 
+For typed search relations, migration-table setup, and generated Kysely schema
+interfaces, see the [Kysely reference](../sdk/docs/kysely.md) and
+[`examples/kysely.mjs`](examples/kysely.mjs). The optional shared helpers live in
+`@antfly/sdk/kysely`.
+
 `createTable`, `listTables`, `openTable`, and `dropTable` expose the shared
 document catalog. Table handles reuse existing schema, index, enrichment,
 search, and document methods. Close them before dropping their tables;
@@ -453,3 +478,25 @@ backups.
 
 See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
 READ COMMITTED, savepoints, transactional DDL restrictions, and commit outcomes.
+
+## Cypher and SQL graph composition
+
+`graphCatalogJson`, `cypherJson`, and `graphWriteStatus` expose durable named graphs, Cypher queries and mutations, and
+transaction receipts through libantfly. Catalog requests use `action` (`put`,
+`get`, `list`, `drop`), a graph `name`, and a `definition` for puts. Replacement
+and drop require the current decimal-string `expected_revision`.
+
+Queries use the same request contract as the server: `query`, `parameters` or
+lossless `typed_parameters`, optional limits, and `write_request_id`. Results
+contain tagged graph values; integer values are decimal strings. Native writes
+return a commit receipt. Retain the request ID and resolve an unknown outcome
+through the status method instead of replaying the query. `GraphError` preserves
+the diagnostic code, span, outcome, and transaction ID when available.
+
+Local SQL supports `GRAPH_TABLE` over these catalogs, including ordinary-table
+joins and staged SQL rows in an explicit transaction. Graph definitions pin
+local table and graph-index identities across reopen. Raw embedded calls reject
+protected tables; authenticated principal queries use the server API.
+
+See [the Cypher contract](../../../zig/CYPHER.md) for grammar, mapping, value,
+mutation, and deployment semantics.

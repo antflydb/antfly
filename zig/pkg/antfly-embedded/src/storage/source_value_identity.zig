@@ -1,0 +1,244 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Canonical JSON value identities shared by storage publication and delivery.
+const std = @import("std");
+const V = std.json.Value;
+const identity_impl = @import("../common/value_identity.zig");
+const digestValue = identity_impl.digestValue;
+pub const identity = identity_impl.identity;
+pub const validatedScalarDigest = identity_impl.validatedScalarDigest;
+const projection = @import("document_projection.zig");
+const prefix = "\x00\x00__metadata__:source_value_identity_v1:";
+pub const Key = [prefix.len + 32]u8;
+// Semantic ABI, deliberately independent of compiler version, comments, tests,
+// lookup algorithms and directory layout. Bump ONLY when typed canonical JSON
+// semantics change; golden vectors gate compiler upgrades. Unknown versions
+// safely fall back and backfill. Public identities remain opaque sv1 tokens.
+const canonical_abi: [32]u8 = abi: {
+    @setEvalBranchQuota(100_000);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("antfly.source.canonical-json/1", &digest, .{});
+    break :abi digest;
+};
+const header_bytes = 111;
+const record_bytes = 34;
+pub const maximum_bytes = header_bytes + projection.maximum_fields * record_bytes;
+pub fn keyForRevision(key: anytype) Key {
+    var result: Key = undefined;
+    @memcpy(result[0..prefix.len], prefix);
+    @memcpy(result[prefix.len..], key[key.len - 32 ..]);
+    return result;
+}
+/// Separate bounded metadata preserves the existing path directory's coverage
+/// and admission budget. Terminal ranges are disjoint, so canonical hashing adds
+/// linear write work, including arrays and opaque objects. Expanded parents
+/// are excluded; old certificates fall back until republished.
+pub fn build(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, directory: []const u8) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const proof = .{ .bytes = @as(u64, body.len), .kind = kind, .digest = digest };
+    const paths = (try projection.Directory.open(temp, directory, proof)) orelse return null;
+    if (paths.version < 2) return null;
+    var collector: Collector = .{ .a = temp };
+    for (paths.fields) |field| {
+        if (field.kind != .object) try Collector.visit(&collector, field.index, body[@intCast(field.offset)..][0..@intCast(field.length)]);
+    }
+    return try collector.encode(a, body.len, kind, digest, directory);
+}
+const Record = struct { index: u16, digest: [32]u8 };
+const Collector = struct {
+    a: std.mem.Allocator,
+    records: [projection.maximum_fields]Record = undefined,
+    count: usize = 0,
+    fn visit(raw: *anyopaque, index: u16, value: []const u8) !void {
+        const self: *Collector = @ptrCast(@alignCast(raw));
+        const digest = (try validatedScalarDigest(self.a, value)) orelse return;
+        self.records[self.count] = .{ .index = index, .digest = digest };
+        self.count += 1;
+    }
+    fn encode(self: *const Collector, a: std.mem.Allocator, bytes: usize, kind: u8, digest: [32]u8, directory: []const u8) ![]u8 {
+        const count = self.count;
+        const output = try a.alloc(u8, header_bytes + count * record_bytes);
+        @memcpy(output[0..4], "SVI2");
+        std.mem.writeInt(u64, output[4..12], bytes, .little);
+        @memcpy(output[12..44], &digest);
+        output[44] = kind;
+        std.crypto.hash.sha2.Sha256.hash(directory, output[45..77], .{});
+        std.mem.writeInt(u16, output[77..79], @intCast(count), .little);
+        @memcpy(output[79..111], &canonical_abi);
+        for (self.records[0..count], 0..) |record, i| {
+            const offset = header_bytes + i * record_bytes;
+            std.mem.writeInt(u16, output[offset..][0..2], record.index, .little);
+            @memcpy(output[offset + 2 ..][0..32], &record.digest);
+        }
+        return output;
+    }
+};
+/// Atomic writers share the directory walk. The two disposable formats retain
+/// independent budgets; failed/unsupported directories never publish partial facts.
+pub const Publication = struct { directory: ?[]u8, identities: ?[]u8 };
+pub fn buildAuthority(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8) !Publication {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer arena.deinit();
+    var collector: Collector = .{ .a = arena.allocator() };
+    const directory = try projection.buildAuthorityObserved(a, body, kind, digest, .{ .ctx = &collector, .visit = Collector.visit });
+    errdefer if (directory) |value| a.free(value);
+    const identities = if (directory) |paths| if (std.mem.startsWith(u8, paths, "DPD2"))
+        try collector.encode(a, body.len, kind, digest, paths)
+    else
+        null else null;
+    return .{ .directory = directory, .identities = identities };
+}
+/// Qualified prior publication from the same writer snapshot. No document body
+/// is retained or read: directories certify raw leaf digests and exact ancestry.
+pub const Prior = struct { bytes: u64, kind: u8, digest: [32]u8, directory: []const u8, identities: []const u8 };
+pub const ReuseStats = struct { reused_bytes: usize = 0, canonical_bytes: usize = 0, reused_leaves: usize = 0 };
+pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, prior: Prior, stats: *ReuseStats) !Publication {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer arena.deinit();
+    const temp = arena.allocator();
+    if (kind != prior.kind) return buildAuthority(a, body, kind, digest);
+    const old = (try projection.Directory.open(temp, prior.directory, prior)) orelse return buildAuthority(a, body, kind, digest);
+    const certificate = Certificate.open(prior.identities, prior.directory, prior) orelse return buildAuthority(a, body, kind, digest);
+    if (old.version != 2) return buildAuthority(a, body, kind, digest);
+    // Keep the fused reference writer for layouts with no worthwhile leaf.
+    // Metadata-only rows should not pay for a second directory decode.
+    const worthwhile = for (old.fields) |field| {
+        if (field.kind != .object and field.length >= 4096 and certificate.find(field.index) != null) break true;
+    } else false;
+    if (!worthwhile) return buildAuthority(a, body, kind, digest);
+    const directory = (try projection.buildAuthority(a, body, kind, digest)) orelse return .{ .directory = null, .identities = null };
+    errdefer a.free(directory);
+    const next = (try projection.Directory.open(temp, directory, .{ .bytes = @as(u64, body.len), .kind = kind, .digest = digest })) orelse return .{ .directory = directory, .identities = null };
+    var collector: Collector = .{ .a = temp };
+    var mapped: [projection.maximum_fields]?u16 = @splat(null);
+    for (next.fields) |field| {
+        const siblings = if (field.parent == projection.no_parent) old.fields[0..old.root_count] else if (mapped[field.parent]) |parent| old.fields[old.fields[parent].first_child..][0..old.fields[parent].child_count] else &.{};
+        // Packed children are sorted by decoded name. Paths, rather than indices
+        // or payload digests alone, bind reuse even when siblings move or grow.
+        var low: usize = 0;
+        var high: usize = siblings.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, siblings[mid].name, field.name)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => {
+                    if (siblings[mid].kind == field.kind) mapped[field.index] = siblings[mid].index;
+                    break;
+                },
+            }
+        }
+        if (field.kind == .object) continue;
+        if (mapped[field.index]) |index| {
+            const previous = old.fields[index];
+            if (previous.length == field.length and std.mem.eql(u8, &previous.digest, &field.digest)) {
+                if (certificate.find(index)) |canonical| {
+                    collector.records[collector.count] = .{ .index = field.index, .digest = canonical };
+                    collector.count += 1;
+                    stats.reused_bytes += @intCast(field.length);
+                    stats.reused_leaves += 1;
+                    continue;
+                }
+            }
+        }
+        stats.canonical_bytes += @intCast(field.length);
+        try Collector.visit(&collector, field.index, body[@intCast(field.offset)..][0..@intCast(field.length)]);
+    }
+    return .{ .directory = directory, .identities = try collector.encode(a, body.len, kind, digest, directory) };
+}
+
+pub const Certificate = struct {
+    /// Coverage epoch, separate from the unchanged canonical value ABI.
+    opaque_coverage: bool = false,
+    records: []const u8,
+    pub fn open(raw: []const u8, directory: []const u8, proof: anytype) ?Certificate {
+        if (raw.len < header_bytes or raw.len > maximum_bytes) return null;
+        const opaque_coverage = std.mem.eql(u8, raw[0..4], "SVI2");
+        if (!opaque_coverage and !std.mem.eql(u8, raw[0..4], "SVI1")) return null;
+        if (!std.mem.eql(u8, raw[79..111], &canonical_abi)) return null;
+        if (std.mem.readInt(u64, raw[4..12], .little) != proof.bytes or raw[44] != proof.kind or !std.mem.eql(u8, raw[12..44], &proof.digest)) return null;
+        var directory_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(directory, &directory_digest, .{});
+        if (!std.mem.eql(u8, raw[45..77], &directory_digest)) return null;
+        const count = std.mem.readInt(u16, raw[77..79], .little);
+        if (count > projection.maximum_fields or raw.len != header_bytes + @as(usize, count) * record_bytes) return null;
+        var prior: ?u16 = null;
+        for (0..count) |i| {
+            const index = std.mem.readInt(u16, raw[header_bytes + i * record_bytes ..][0..2], .little);
+            if (index >= projection.maximum_fields or (prior != null and index <= prior.?)) return null;
+            prior = index;
+        }
+        return .{ .records = raw[header_bytes..], .opaque_coverage = opaque_coverage };
+    }
+    pub fn needsCoverageRepair(self: Certificate, directory: projection.Directory) bool {
+        if (self.opaque_coverage) return false;
+        for (directory.fields) |field| if (field.kind == .subtree) return true;
+        return false;
+    }
+    pub fn find(self: Certificate, index: u16) ?[32]u8 {
+        var low: usize = 0;
+        var high = self.records.len / record_bytes;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const record = self.records[mid * record_bytes ..][0..record_bytes];
+            const found = std.mem.readInt(u16, record[0..2], .little);
+            if (found < index) low = mid + 1 else if (found > index) high = mid else return record[2..34].*;
+        }
+        return null;
+    }
+};
+
+test "logical value conditional opaque terminal identities reuse without parent overlap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try a.alloc(u8, 32768);
+    @memset(payload, 'x');
+    const body = try std.fmt.allocPrint(a, "{{\"arr\":[{{\"value\":\"{s}\"}}],\"metadata\":1}}", .{payload});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const publication = try buildAuthority(a, body, 16, digest);
+    const proof = .{ .bytes = @as(u64, body.len), .kind = @as(u8, 16), .digest = digest };
+    const directory = (try projection.Directory.open(a, publication.directory.?, proof)).?;
+    const field = directory.resolveExact("arr").?;
+    try std.testing.expect(field.kind == .subtree);
+    try std.testing.expect(directory.resolveExact("arr.0") == null);
+    const certificate = Certificate.open(publication.identities.?, publication.directory.?, proof).?;
+    try std.testing.expect(!certificate.needsCoverageRepair(directory));
+    const legacy = try a.dupe(u8, publication.identities.?);
+    @memcpy(legacy[0..4], "SVI1");
+    const old_certificate = Certificate.open(legacy, publication.directory.?, proof).?;
+    try std.testing.expect(old_certificate.needsCoverageRepair(directory));
+    const expected = (try validatedScalarDigest(a, body[@intCast(field.offset)..][0..@intCast(field.length)])).?;
+    try std.testing.expectEqualSlices(u8, &expected, &certificate.find(field.index).?);
+    const next_body = try std.fmt.allocPrint(a, "{{\"metadata\":2,\"arr\":[{{\"value\":\"{s}\"}}]}}", .{payload});
+    var next_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(next_body, &next_digest, .{});
+    var stats: ReuseStats = .{};
+    const next = try buildAuthorityReusing(a, next_body, 16, next_digest, .{ .bytes = body.len, .kind = 16, .digest = digest, .directory = publication.directory.?, .identities = publication.identities.? }, &stats);
+    const reference = try buildAuthority(a, next_body, 16, next_digest);
+    try std.testing.expectEqualSlices(u8, reference.identities.?, next.identities.?);
+    try std.testing.expectEqual(@as(usize, @intCast(field.length)), stats.reused_bytes);
+    try std.testing.expect(stats.canonical_bytes < 16);
+    try std.testing.expect(Certificate.open(publication.identities.?, next.directory.?, .{ .bytes = @as(u64, next_body.len), .kind = @as(u8, 16), .digest = next_digest }) == null);
+    var deep: std.Io.Writer.Allocating = .init(a);
+    for (0..300) |_| try deep.writer.writeByte('[');
+    try deep.writer.writeAll("null");
+    for (0..300) |_| try deep.writer.writeByte(']');
+    try std.testing.expect(try validatedScalarDigest(a, deep.written()) == null);
+}

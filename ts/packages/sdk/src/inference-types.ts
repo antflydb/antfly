@@ -7,6 +7,10 @@ import type { components, operations } from "./public-api.js";
 
 // Request/Response types
 export type EmbedRequest = components["schemas"]["InferenceEmbedRequest"];
+export type EmbedOptions = Pick<
+  EmbedRequest,
+  "task_type" | "dimensions" | "instruction" | "error_policy"
+> & { truncate?: boolean } & RequestOptions;
 export type EmbedResponse = components["schemas"]["InferenceEmbedResponse"];
 
 export type ChunkRequest = components["schemas"]["InferenceChunkRequest"];
@@ -68,9 +72,6 @@ export type RewriteResponse = components["schemas"]["InferenceRewriteResponse"];
 
 export type ModelsResponse = components["schemas"]["InferenceModelsResponse"];
 
-export type TranscribeRequest = components["schemas"]["InferenceTranscribeRequest"];
-export type TranscribeResponse = components["schemas"]["InferenceTranscribeResponse"];
-
 export type InferenceChatMessage = components["schemas"]["InferenceChatMessage"];
 export type GenerateRequest = components["schemas"]["InferenceGenerateRequest"];
 export type GenerateResponse = components["schemas"]["InferenceGenerateResponse"];
@@ -89,10 +90,10 @@ export type ImageURL = components["schemas"]["InferenceImageURL"];
 
 // Configuration types
 export type Config = components["schemas"]["InferenceConfig"];
-export type ContentSecurityConfig = components["schemas"]["InferenceContentSecurityConfig"];
-export type Credentials = components["schemas"]["InferenceCredentials"];
-export type Level = components["schemas"]["InferenceLevel"];
-export type Style = components["schemas"]["InferenceStyle"];
+export type ContentSecurityConfig = components["schemas"]["ContentSecurityConfig"];
+export type Credentials = components["schemas"]["Credentials"];
+export type Level = components["schemas"]["Level"];
+export type Style = components["schemas"]["Style"];
 
 // Error type
 export type InferenceError = components["schemas"]["InferenceError"];
@@ -133,4 +134,10 @@ export const logStyles: Style[] = ["terminal", "json", "logfmt", "noop"];
 export interface RequestOptions {
   /** AbortSignal to cancel the request */
   signal?: AbortSignal;
+  /** Per-call HTTP headers. Defined values override configured headers case-insensitively. */
+  headers?: Record<string, string | undefined>;
 }
+
+export type AudioReadOptions = components["schemas"]["InferenceAudioReadOptions"];
+export type AudioReadMetadata = components["schemas"]["InferenceAudioReadMetadata"];
+export type AudioReadSegment = components["schemas"]["InferenceAudioReadSegment"];

@@ -1,0 +1,687 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Public authenticated Cypher through real metadata/data Raft owners."""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import pytest
+import test_backup_restore
+from conftest import (
+    AUTH_BOOTSTRAP_PASSWORD,
+    internal_service_headers,
+    ready_index_status,
+)
+from cypher_qualification_retry import retry_allowed
+
+three_by_three_backup_cluster = test_backup_restore.three_by_three_backup_cluster
+
+
+@pytest.fixture(autouse=True)
+def cypher_principal_authority(monkeypatch):
+    # Metadata signs row-policy grants and data owners verify them. Provision
+    # the same isolated authority before either set of processes starts.
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET",
+        "cypher-cluster-principal-authority-secret-v1",
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-cluster")
+
+
+def _policy_publication_diagnostics(cluster, endpoint):
+    policy_diagnostics = []
+    leader = urlsplit(endpoint)
+    try:
+        snapshot = cluster.metadata_snapshot(
+            cluster.metadata_admin_ports.index(leader.port), request_timeout_s=5
+        )
+        for table in snapshot.get("tables", []):
+            request = urllib.request.Request(
+                endpoint + "/internal/v1/system-catalog",
+                json.dumps(
+                    {"policy_publication_status": int(table["table_id"])}
+                ).encode(),
+                {
+                    **internal_service_headers(),
+                    "Content-Type": "application/json",
+                    "X-Antfly-Raft-Mutation-Remaining-Ms": "5000",
+                    "X-Antfly-Raft-Mutation-Forwards-Remaining": "0",
+                    "X-Antfly-Raft-Mutation-Campaign-Allowed": "false",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=6) as response:
+                policy_diagnostics.append(json.load(response))
+        body = json.dumps({"policy_publication_work": 0}).encode()
+        expires = int(time.time()) + 60
+        key = hmac.new(
+            os.environ["ANTFLY_SETTING_AUTHORITY_SECRET"].encode(),
+            b"antfly/sql-setting-authority/key/v1",
+            hashlib.sha256,
+        ).digest()
+        mac = hmac.new(
+            key,
+            b"sql-setting-catalog-v1"
+            + os.environ["ANTFLY_SETTING_AUTHORITY_ISSUER"].encode()
+            + b"\0read"
+            + struct.pack("<q", expires)
+            + hashlib.sha256(body).digest(),
+            hashlib.sha256,
+        ).hexdigest()
+        request = urllib.request.Request(
+            endpoint + "/internal/v1/system-catalog",
+            body,
+            {
+                **internal_service_headers(),
+                "Content-Type": "application/json",
+                "x-antfly-setting-grant": f"v1:{expires}:{mac}",
+                "X-Antfly-Raft-Mutation-Remaining-Ms": "5000",
+                "X-Antfly-Raft-Mutation-Forwards-Remaining": "0",
+                "X-Antfly-Raft-Mutation-Campaign-Allowed": "false",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=6) as response:
+            work = json.load(response)
+        publication = work.get("publication")
+        if publication:
+            policy_diagnostics.append(
+                {
+                    "phase": publication["phase"],
+                    "owners": len(publication["required_owners"]),
+                    "installed": len(publication["acknowledged_owners"]),
+                    "serving": len(publication["serving_acknowledged_owners"]),
+                }
+            )
+    except Exception as diagnostic_error:
+        policy_diagnostics.append({"diagnostic_error": str(diagnostic_error)})
+    return policy_diagnostics
+
+
+def test_authenticated_cypher_postimage_policy_on_replicated_owners(
+    three_by_three_backup_cluster,
+):
+    cluster = three_by_three_backup_cluster
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    endpoint = f"{leader.scheme}://{leader.hostname}:{leader.port}"
+    for name, expected in (
+        (
+            "verify_cypher_postimage_policy.py",
+            "4 authenticated Cypher postimage-policy checks passed",
+        ),
+        (
+            "verify_cypher_edge_policy.py",
+            "8 authenticated edge-only SQL-null, unit-CALL and WITH CHECK checks passed",
+        ),
+    ):
+        script = Path(__file__).resolve().parents[2] / "scripts" / name
+        result = subprocess.run(
+            [sys.executable, str(script), "--url", endpoint],
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=220,
+        )
+        assert result.returncode == 0, (
+            result.stdout
+            + result.stderr
+            + "\npolicy publication stamps: "
+            + json.dumps(_policy_publication_diagnostics(cluster, endpoint))
+            + "\n"
+            + cluster.debug_logs()
+        )
+        assert expected in result.stdout
+
+
+def test_authenticated_cypher_storage_contract_on_replicated_owners(
+    three_by_three_backup_cluster,
+):
+    cluster = three_by_three_backup_cluster
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "verify_cypher_storage_contract.py"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--url",
+            f"{leader.scheme}://{leader.hostname}:{leader.port}",
+        ],
+        env={
+            **os.environ,
+            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    assert result.returncode == 0, (
+        result.stdout + result.stderr + "\n" + cluster.debug_logs()
+    )
+    assert "Authenticated lossless Cypher storage contract passed" in result.stdout
+
+
+@pytest.mark.parametrize("preexisting_producers", [False, True])
+def test_authenticated_cypher_producer_postimages_on_replicated_owners(
+    preexisting_producers,
+    three_by_three_backup_cluster,  # noqa: F811
+):
+    cluster = three_by_three_backup_cluster
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    endpoint = f"{leader.scheme}://{leader.hostname}:{leader.port}"
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_mutations.py"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--url",
+            endpoint,
+            *(["--preexisting-producers"] if preexisting_producers else []),
+        ],
+        env={
+            **os.environ,
+            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+        },
+        capture_output=True,
+        text=True,
+        timeout=220,
+        check=False,
+    )
+    witnesses = []
+    if result.returncode != 0:
+        for metadata_node in range(3):
+            try:
+                snapshot = cluster.metadata_snapshot(metadata_node, request_timeout_s=2)
+                for store in snapshot.get("stores", []):
+                    for report in store.get("runtime_statuses", []):
+                        for index in report.get("indexes", []):
+                            if index.get("name") != "mixed":
+                                continue
+                            witnesses.append(
+                                {
+                                    "metadata_node": metadata_node + 1,
+                                    "store": store.get("node_id"),
+                                    "store_generation": store.get("status_generation"),
+                                    "group": report.get("group_id"),
+                                    "source": report.get("source"),
+                                    "freshness": report.get("freshness"),
+                                    "generation": report.get("status_generation"),
+                                    "target_revision": report.get(
+                                        "target_observation_revision"
+                                    ),
+                                    "target_complete": report.get(
+                                        "target_observation_complete"
+                                    ),
+                                    "enrichment": report.get("enrichment"),
+                                    "index": {
+                                        key: index.get(key)
+                                        for key in (
+                                            "replay_applied_sequence",
+                                            "replay_target_sequence",
+                                            "edge_count",
+                                            "source_replay",
+                                        )
+                                    },
+                                }
+                            )
+            except Exception as error:
+                witnesses.append(
+                    {"metadata_node": metadata_node + 1, "error": str(error)}
+                )
+    assert result.returncode == 0, (
+        result.stdout
+        + result.stderr
+        + "\n[runtime-witnesses]\n"
+        + json.dumps(witnesses, sort_keys=True)
+        + "\n"
+        + cluster.debug_logs()
+    )
+    assert "producer postimages and deferred shortest paths passed" in result.stdout
+
+
+def test_authenticated_cypher_across_replicated_owner_nodes(
+    three_by_three_backup_cluster,
+):
+    cluster = three_by_three_backup_cluster
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    endpoint = f"{leader.scheme}://{leader.hostname}:{leader.port}"
+    script = Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_http.py"
+    receipt_file = cluster.root / "cypher-write-receipt.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--url",
+            endpoint,
+            "--shards",
+            "2",
+            "--writes",
+            "--receipt-artifact",
+            str(receipt_file),
+        ],
+        env={
+            **os.environ,
+            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        result.stdout + result.stderr + "\n" + cluster.debug_logs()
+    )
+    assert "checks passed" in result.stdout, result.stdout
+
+    catalog_campaign = subprocess.run(
+        [
+            sys.executable,
+            str(script.with_name("verify_cypher_catalog.py")),
+            "--url",
+            endpoint,
+        ],
+        env={
+            **os.environ,
+            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+        },
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert catalog_campaign.returncode == 0, (
+        catalog_campaign.stdout + catalog_campaign.stderr + "\n" + cluster.debug_logs()
+    )
+    assert (
+        "6 authenticated graph catalog revision checks passed"
+        in catalog_campaign.stdout
+    )
+
+    for filename in [
+        "verify_cypher_expressions.py",
+        "verify_cypher_normalization.py",
+    ]:
+        # Mutation and postimage-policy campaigns have dedicated replicated
+        # owner tests above, including both producer-installation modes.
+        qualification = subprocess.run(
+            [sys.executable, str(script.with_name(filename)), "--url", endpoint]
+            + (["--distributed"] if filename == "verify_cypher_expressions.py" else []),
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert qualification.returncode == 0, (
+            filename
+            + "\n"
+            + qualification.stdout
+            + qualification.stderr
+            + "\n"
+            + cluster.debug_logs()
+        )
+        assert "checks passed" in qualification.stdout
+
+    transaction_id = json.loads(receipt_file.read_text())["transaction_id"]
+    authorization = (
+        "Basic "
+        + base64.b64encode(f"admin:{AUTH_BOOTSTRAP_PASSWORD}".encode()).decode()
+    )
+
+    def receipt(base):
+        deadline = time.monotonic() + 30
+        while True:
+            request = urllib.request.Request(
+                base + "/db/v1/transactions/" + transaction_id + "/status",
+                headers={"Authorization": authorization},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    result = json.loads(response.read())
+                assert result["disposition"] == "committed", result
+                assert result["durable"] is True, result
+                return result
+            except urllib.error.HTTPError as error:
+                assert error.code == 503 and time.monotonic() < deadline, (
+                    base,
+                    error.code,
+                    error.read().decode(),
+                    cluster.debug_logs(),
+                )
+            except (TimeoutError, ConnectionError):
+                assert time.monotonic() < deadline, (base, cluster.debug_logs())
+            time.sleep(0.1)
+
+    # Reads must work on every metadata replica, without routing to an owner.
+    for base in cluster.metadata_admin_urls:
+        receipt(base)
+
+    owner_index = cluster.metadata_admin_ports.index(leader.port)
+    owner = cluster.metadata_procs[owner_index]
+    owner.kill()
+    owner.wait(timeout=15)
+    for index, base in enumerate(cluster.metadata_admin_urls):
+        if index != owner_index:
+            receipt(base)
+
+    # A committed request ID is globally reserved after leader failover, even
+    # when submitted against a different graph and the original table is gone.
+    new_leader = urlsplit(cluster.metadata_leader_public_url())
+    base = f"{new_leader.scheme}://{new_leader.hostname}:{new_leader.port}"
+    table = "cypher_failover_" + uuid.uuid4().hex
+    graph = table + "_graph"
+    created_table = created_graph = False
+
+    def call(path, body=None, method="POST", accepted=(200, 201, 202, 204)):
+        request = urllib.request.Request(
+            base + "/db/v1" + path,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "Authorization": authorization,
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    code, content = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, content = error.code, error.read()
+            # A failover can delay the new graph's owner admission. Only the
+            # explicit not-started response permits replay, including when the
+            # intended result is a duplicate-request rejection.
+            if (
+                code not in accepted
+                and attempt < 39
+                and retry_allowed(code, content, path=path, body=body)
+            ):
+                time.sleep(0.25)
+                continue
+            break
+        assert code in accepted, (path, code, content.decode(), cluster.debug_logs())
+        return json.loads(content) if content else None
+
+    try:
+        call(f"/tables/{table}", {"num_shards": 2})
+        created_table = True
+        call(
+            f"/graphs/{graph}",
+            {"labels": [{"name": "Document", "table": table}], "relationships": []},
+        )
+        created_graph = True
+        deadline = time.monotonic() + 30
+        while True:
+            result = call(
+                f"/graphs/{graph}/query",
+                {"query": "MATCH (n:Document) RETURN n"},
+                accepted=(200, 503),
+            )
+            if result.get("rows") == []:
+                break
+            assert time.monotonic() < deadline, result
+            time.sleep(0.1)
+        denied = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "CREATE (n:Document {id:'duplicate'}) RETURN n",
+                "write_request_id": transaction_id,
+            },
+            accepted=(409,),
+        )
+        assert denied["code"] == "CypherWriteRequestAlreadyUsed", denied
+        assert (
+            call(f"/graphs/{graph}/query", {"query": "MATCH (n:Document) RETURN n"})[
+                "rows"
+            ]
+            == []
+        )
+    finally:
+        if created_graph:
+            call(f"/graphs/{graph}", method="DELETE")
+        if created_table:
+            call(f"/tables/{table}", method="DELETE")
+    # Allow replay of this campaign's durable drop-repair backlog before
+    # readiness. The shared fixture keeps its shorter default for other tests.
+    cluster.restart_crashed_node(
+        metadata=True, index=owner_index, startup_timeout_s=120.0
+    )
+    for base in cluster.metadata_admin_urls:
+        receipt(base)
+
+
+def test_cypher_receipt_recovers_owner_loss_during_index_visibility(
+    three_by_three_backup_cluster, progressive_openai_embedder
+):
+    cluster = three_by_three_backup_cluster
+    embedder = progressive_openai_embedder
+    entered, released = threading.Event(), threading.Event()
+    original_vector = embedder._vector_for_text
+    marker = "beta cypher-failover-barrier"
+
+    def vector(text):
+        if marker in text:
+            entered.set()
+            assert released.wait(90), "embedding visibility barrier was not released"
+        return original_vector(text)
+
+    embedder._vector_for_text = vector
+    authorization = (
+        "Basic "
+        + base64.b64encode(f"admin:{AUTH_BOOTSTRAP_PASSWORD}".encode()).decode()
+    )
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    base = f"{leader.scheme}://{leader.hostname}:{leader.port}"
+    owner_index = cluster.metadata_admin_ports.index(leader.port)
+    table = "cypher_commit_fault_" + uuid.uuid4().hex
+    graph = table + "_graph"
+    transaction_id = uuid.uuid4().hex
+    created_table = created_graph = crashed = False
+
+    def call(
+        path,
+        body=None,
+        method="POST",
+        accepted=(200, 201, 202, 204),
+        timeout=30,
+        retry_aborted=False,
+    ):
+        request = urllib.request.Request(
+            base + "/db/v1" + path,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "Authorization": authorization,
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    code, content = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, content = error.code, error.read()
+            if (
+                code not in accepted
+                and (
+                    retry_allowed(code, content, path=path, body=body)
+                    or (
+                        retry_aborted
+                        and code == 409
+                        and content == b"batch transaction conflicted"
+                    )
+                )
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.2)
+                continue
+            break
+        assert code in accepted, (path, code, content.decode(), cluster.debug_logs())
+        return json.loads(content) if content else None
+
+    try:
+        call(f"/tables/{table}", {"num_shards": 2})
+        created_table = True
+        call(
+            f"/tables/{table}/indexes/semantic_idx",
+            {
+                "name": "semantic_idx",
+                "type": "embeddings",
+                "field": "body",
+                "dimension": 3,
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": embedder.url,
+                },
+            },
+        )
+        # Index publication on the seeded shard does not establish readiness
+        # on the other shard, where the randomly generated CREATE key may land.
+        # Establish the complete index generation before injecting owner loss.
+        ready_deadline = time.monotonic() + 60
+        while True:
+            index = call(f"/tables/{table}/indexes/semantic_idx", method="GET")
+            if ready_index_status(index, until="complete") is not None:
+                break
+            assert time.monotonic() < ready_deadline, (index, cluster.debug_logs())
+            time.sleep(0.2)
+        call(
+            f"/tables/{table}/batch",
+            {
+                "sync_level": "full_index",
+                "inserts": {"a": {"id": "a", "body": "alpha concept"}},
+            },
+            # Fixture seeding precedes fault injection. This response denotes
+            # a definite prepare abort, unlike an admitted/unknown CREATE.
+            retry_aborted=True,
+        )
+        call(
+            f"/graphs/{graph}",
+            {"labels": [{"name": "Document", "table": table}], "relationships": []},
+        )
+        created_graph = True
+        readiness_deadline = time.monotonic() + 30
+        while True:
+            readiness = call(
+                f"/graphs/{graph}/query",
+                {"query": "MATCH (n) RETURN n LIMIT 0"},
+                accepted=(200, 409, 503),
+            )
+            if readiness.get("complete"):
+                break
+            assert time.monotonic() < readiness_deadline, (
+                readiness,
+                cluster.debug_logs(),
+            )
+            time.sleep(0.2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Admit one mutation. Only explicit nonadmission permits restart;
+            # owner loss must reconcile this ID without replaying an admitted
+            # or unknown write or generating a second ID.
+            future = executor.submit(
+                call,
+                f"/graphs/{graph}/query",
+                {
+                    "query": "CREATE (n:Document {id:'c',body:$body}) RETURN n.id",
+                    "parameters": {"body": marker},
+                    "write_request_id": transaction_id,
+                },
+                timeout=90,
+            )
+            injection_deadline = time.monotonic() + 30
+            while not entered.wait(0.2):
+                if future.done():
+                    # Surface admission/prepare failures instead of hiding them
+                    # behind an unrelated embedding-checkpoint timeout.
+                    delivered = future.result()
+                    raise AssertionError(
+                        (
+                            "write ended before fault injection",
+                            delivered,
+                            cluster.debug_logs(),
+                        )
+                    )
+                assert time.monotonic() < injection_deadline, cluster.debug_logs()
+            owner = cluster.metadata_procs[owner_index]
+            owner.kill()
+            owner.wait(timeout=15)
+            crashed = True
+            released.set()
+            try:
+                delivered = future.result(timeout=30)
+                assert delivered["commit"]["transaction_id"] == transaction_id, (
+                    delivered
+                )
+            except (OSError, ConnectionError, TimeoutError):
+                pass
+        new_leader = urlsplit(cluster.metadata_leader_public_url())
+        base = f"{new_leader.scheme}://{new_leader.hostname}:{new_leader.port}"
+        deadline = time.monotonic() + 90
+        while True:
+            result = call(
+                f"/transactions/{transaction_id}/status",
+                method="GET",
+                accepted=(200, 503),
+            )
+            if result.get("disposition") == "committed":
+                assert result["durable"] is True, result
+                break
+            assert result.get("disposition") != "aborted", result
+            assert time.monotonic() < deadline, (result, cluster.debug_logs())
+            time.sleep(0.2)
+        nodes = call(
+            f"/graphs/{graph}/query",
+            {"query": "MATCH (n:Document {id:'c'}) RETURN n.id"},
+        )
+        assert nodes["rows"] == [[{"type": "string", "value": "c"}]], nodes
+        ranked = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": f"CALL antfly.search('{table}', {{query:'beta',mode:'semantic',indexes:['semantic_idx'],limit:10}}) YIELD node RETURN node.id"
+            },
+        )
+        assert {row[0]["value"] for row in ranked["rows"]} == {"a", "c"}, ranked
+    finally:
+        released.set()
+        if crashed:
+            cluster.restart_crashed_node(metadata=True, index=owner_index)
+        if created_graph:
+            call(f"/graphs/{graph}", method="DELETE")
+        if created_table:
+            call(f"/tables/{table}", method="DELETE")

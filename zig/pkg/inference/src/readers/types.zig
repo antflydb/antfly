@@ -71,6 +71,15 @@ pub const Result = struct {
     }
 };
 
+/// Resolve an omitted output budget from the selected model, bounded by serving
+/// policy. Preserve explicit requests so validation can reject excess values.
+/// Non-generative readers have no completion budget.
+pub fn resolveOutputTokens(requested: ?usize, model_default: ?usize, ceiling: ?usize) ?usize {
+    if (requested) |value| return value;
+    const value = model_default orelse return null;
+    return if (ceiling) |limit| @min(value, limit) else value;
+}
+
 pub const ReadOptions = struct {
     prompt: ?[]const u8 = null,
     max_tokens: ?usize = null,

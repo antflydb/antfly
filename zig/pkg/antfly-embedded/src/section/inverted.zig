@@ -6244,7 +6244,13 @@ fn writeMappedInvertedSection(
     defer if (!stream_norms) alloc.free(merged_norms);
     if (!stream_norms) @memset(merged_norms, 0);
     const serialize_scratch = &workspace.compact_scratch;
-    var dict_builder = try StreamingTermDictionaryBuilder.init(alloc, config.wireVersion());
+    // Navigation already proves a vocabulary upper bound. Do not reserve the
+    // maximum FST registry for every tiny merge (notably metadata fields).
+    var term_upper_bound: usize = 0;
+    for (readers, reader_present) |*reader, present| if (present) {
+        term_upper_bound +|= reader.dictionaryTermUpperBound();
+    };
+    var dict_builder = try StreamingTermDictionaryBuilder.initWithHint(alloc, term_upper_bound, config.wireVersion());
     defer dict_builder.deinit();
     var merged_term = std.ArrayListUnmanaged(u8).empty;
     defer merged_term.deinit(alloc);
@@ -9673,6 +9679,11 @@ pub const ScopedInvertedIndexReader = struct {
     pub fn deinit(self: *ScopedInvertedIndexReader) void {
         if (self.context) |context| Context.release(context);
         self.* = undefined;
+    }
+
+    fn dictionaryTermUpperBound(self: *const ScopedInvertedIndexReader) usize {
+        const blocks = if (self.contiguous) |*reader| reader.dict_block_count else self.context.?.native.block_count;
+        return @as(usize, blocks) *| term_dict_block_max_entries;
     }
 
     pub fn layoutStats(self: *const ScopedInvertedIndexReader) !InvertedIndexReader.LayoutStats {

@@ -19,10 +19,11 @@ const image = @import("antfly_image");
 const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
 const CompatibilityRenderSession = if (builtin.os.tag == .macos) darwin_render.SharedSession else struct {};
 
-pub const text_encoding = @import("text_encoding.zig");
+pub const text_encoding = @import("pdf_text_encoding");
 pub const reader = @import("reader.zig");
-pub const syntax = @import("syntax.zig");
+pub const syntax = @import("pdf_syntax");
 pub const render = @import("render.zig");
+pub const text_structure = @import("pdf_text_structure");
 /// Native layout producers use the same immutable faces and metrics as the
 /// rasterizer, avoiding platform font dependencies and layout/render drift.
 pub const native_fonts = struct {
@@ -36,145 +37,52 @@ const Allocator = std.mem.Allocator;
 const minimum_direct_render_dpi: u16 = 1;
 const minimum_requested_render_dpi: u16 = 72;
 
-pub const RenderedPagePng = struct {
-    png: []u8,
-    requested_dpi: u16,
-    effective_dpi: u16,
-    width: u32,
-    height: u32,
-    quality: RenderQuality = .native,
-    diagnostics: ?reader.PageRenderDiagnostics = null,
-
-    pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
-        alloc.free(self.png);
-        self.* = undefined;
-    }
-};
+pub const RenderedPagePng = @import("pdf_values").RenderedPagePng;
 
 /// Physical layout of an unencoded page raster. Formats are deliberately
 /// closed here rather than inferred from byte length so local inference ABIs
 /// can validate the producer/consumer contract before borrowing the bytes.
-pub const PixelFormat = enum {
-    rgba8,
-
-    pub fn bytesPerPixel(self: @This()) usize {
-        return switch (self) {
-            .rgba8 => 4,
-        };
-    }
-};
+pub const PixelFormat = @import("pdf_values").PixelFormat;
 
 /// Allocator-owned, tightly packed page pixels. Scratch allocations used to
 /// parse and paint the page are never retained by this value; only `bytes`
 /// survives the render call and must be released with `deinit`.
-pub const RenderedPageRaster = struct {
-    bytes: []u8,
-    pixel_format: PixelFormat,
-    width: u32,
-    height: u32,
-    stride: usize,
-    requested_dpi: u16,
-    effective_dpi: u16,
-    quality: RenderQuality = .native,
-    diagnostics: ?reader.PageRenderDiagnostics = null,
+pub const RenderedPageRaster = @import("pdf_values").RenderedPageRaster;
 
-    pub fn deinit(self: *RenderedPageRaster, alloc: Allocator) void {
-        alloc.free(self.bytes);
-        self.* = undefined;
-    }
-};
+pub const RenderQuality = @import("pdf_values").RenderQuality;
 
-pub const RenderQuality = enum {
-    /// Every supported page paint operation was rendered by the native Zig
-    /// path within its deterministic limits.
-    native,
-    /// Native rendering completed, but one or more text groups used the
-    /// bounded raster-font fallback. Callers may still OCR the result while
-    /// surfacing the diagnostic counters.
-    degraded,
-    /// Native decoding rejected an unsupported construct and a compatibility
-    /// backend produced the pixels. This is never selected on platforms
-    /// without such a backend.
-    compatibility_backend,
-};
+pub const RenderProfile = @import("pdf_values").RenderProfile;
+pub const ImageSamplingPolicy = @import("pdf_values").ImageSamplingPolicy;
+pub const RenderPolicy = @import("pdf_values").RenderPolicy;
 
-pub const RenderProfile = enum {
-    /// Preserve PDF sampling semantics exactly, including nearest-neighbor
-    /// minification when /Interpolate is absent.
-    exact,
-    /// Preserve bilevel ink coverage during minification for OCR inputs.
-    ocr,
-};
+pub const RenderResolutionPolicy = @import("pdf_values").RenderResolutionPolicy;
 
-pub const RenderResolutionPolicy = enum { requested_dpi, model_input };
-
-pub const PageRenderRequest = struct {
-    page_number: usize,
-    requested_dpi: u16 = 150,
-    max_pixels: u64 = 40_000_000,
-    max_dimension: u32 = 4096,
-    /// Model input dimensions are not a quality guarantee. Direct rendering
-    /// to those dimensions changes text antialiasing and requires opt-in.
-    resolution_policy: RenderResolutionPolicy = .requested_dpi,
-    /// Optional downstream fixed raster target. When both are set, geometry
-    /// planning chooses the lowest DPI that supplies at least this many source
-    /// samples on both axes. If the configured DPI/caps cannot reach it, the
-    /// ordinary highest-quality admissible geometry is retained.
-    preferred_width: ?u32 = null,
-    preferred_height: ?u32 = null,
-    /// Bound retained output for this page. PNG rendering resizes and
-    /// re-encodes when necessary; raw raster rendering constrains geometry
-    /// before painting because its byte size is known exactly.
-    max_output_bytes: ?usize = null,
-    min_output_dimension: u32 = 1,
-    max_output_attempts: u8 = 8,
-};
+pub const PageRenderRequest = @import("pdf_values").PageRenderRequest;
 
 /// Erased fixed-worker executor supplied by a process-lifetime runtime. Each
 /// callback runs completely on one physical worker and receives that worker's
 /// private resettable scratch allocator. The executor call is synchronous: no
 /// callback may retain either the allocator or scratch-backed memory.
-pub const PageRenderExecutor = struct {
-    ptr: *anyopaque,
-    concurrent_capacity: usize,
-    run_batch_fn: *const fn (
-        ptr: *anyopaque,
-        contexts: []const *anyopaque,
-        run: *const fn (context: *anyopaque, scratch: Allocator) void,
-        max_scratch_bytes: usize,
-    ) anyerror!BatchStats,
-
-    pub const BatchStats = struct {
-        peak_parallelism: usize,
-    };
-
-    pub fn runBatch(
-        self: @This(),
-        contexts: []const *anyopaque,
-        run: *const fn (context: *anyopaque, scratch: Allocator) void,
-        max_scratch_bytes: usize,
-    ) !BatchStats {
-        if (self.concurrent_capacity == 0) return error.InvalidPageRenderExecutor;
-        return try self.run_batch_fn(self.ptr, contexts, run, max_scratch_bytes);
-    }
-};
+pub const PageRenderExecutor = @import("pdf_values").PageRenderExecutor;
 
 /// Admission policy for one render microbatch. The caller deliberately owns
 /// document-level windowing: requests.len must not exceed max_batch_pages, so
 /// this API cannot accidentally retain a whole large document in memory.
-pub const default_render_bytes_per_pixel_reserve: usize = 12;
+pub const default_render_bytes_per_pixel_reserve = @import("pdf_values").default_render_bytes_per_pixel_reserve;
 
 /// Called at most once, with concurrent worker calls serialized by the batch.
 /// Must admit memory without waiting for another invocation or reclaiming it.
 /// Returns the new total grant, never above max_bytes. The caller owns that
 /// grant until all workers and their scratch allocations have been destroyed.
-pub const RenderScratchGrowth = struct {
-    context: *anyopaque,
-    max_bytes: usize,
-    grow_fn: *const fn (*anyopaque) usize,
-};
+pub const RenderScratchGrowth = @import("pdf_values").RenderScratchGrowth;
 
 pub const PageRenderBatchOptions = struct {
+    /// Borrowed synchronous decoder control. Each CPU worker installs this
+    /// scope itself; the coordinator never retains TLS over an I/O wait.
+    image_control: ?image.work_control.Control = null,
+    /// Optional terminal worker identity borrow, written only by the joined
+    /// coordinator before returning its scalar failure. No worker retains it.
+    failure_identity_out: ?*?image.work_control.Failure = null,
     max_batch_pages: usize = 8,
     max_parallel_pages: usize = 1,
     max_inflight_pixels: u64 = 50_000_000,
@@ -210,70 +118,13 @@ pub const PageRenderBatchOptions = struct {
     executor_io: ?std.Io = null,
 };
 
-pub const PageRenderResult = struct {
-    page_number: usize,
-    rendered: ?RenderedPagePng = null,
-    failure: ?anyerror = null,
-    /// Wall-clock time spent inside the page worker's render operation. This
-    /// excludes wave preparation, admission, and start-gate wait time.
-    render_elapsed_ns: u64 = 0,
+pub const PageRenderResult = @import("pdf_values").PageRenderResult;
 
-    pub fn deinit(self: *PageRenderResult, alloc: Allocator) void {
-        if (self.rendered) |*page| page.deinit(alloc);
-        self.* = undefined;
-    }
-};
+pub const RenderedPageBatch = @import("pdf_values").RenderedPageBatch;
 
-pub const RenderedPageBatch = struct {
-    results: []PageRenderResult,
-    requested_parallelism: usize,
-    /// Maximum number of worker tasks launched in a wave. This is distinct
-    /// from peak_parallelism: launched work may still be queued by the runtime.
-    peak_launched_workers: usize,
-    /// Maximum number of workers executing their render operation at once.
-    peak_parallelism: usize,
-    peak_admitted_pixels: u64,
-    /// Worst-case live worker memory admitted in one wave, including raster
-    /// reservations, render-fork metadata, and per-page decode working sets.
-    peak_admitted_bytes: usize,
-    peak_worker_scratch_bytes: usize = 0,
-    thread_spawn_fallbacks: usize,
+pub const PageRasterResult = @import("pdf_values").PageRasterResult;
 
-    pub fn deinit(self: *RenderedPageBatch, alloc: Allocator) void {
-        for (self.results) |*result| result.deinit(alloc);
-        alloc.free(self.results);
-        self.* = undefined;
-    }
-};
-
-pub const PageRasterResult = struct {
-    page_number: usize,
-    rendered: ?RenderedPageRaster = null,
-    failure: ?anyerror = null,
-    render_elapsed_ns: u64 = 0,
-
-    pub fn deinit(self: *PageRasterResult, alloc: Allocator) void {
-        if (self.rendered) |*page| page.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const RenderedPageRasterBatch = struct {
-    results: []PageRasterResult,
-    requested_parallelism: usize,
-    peak_launched_workers: usize,
-    peak_parallelism: usize,
-    peak_admitted_pixels: u64,
-    peak_admitted_bytes: usize,
-    peak_worker_scratch_bytes: usize = 0,
-    thread_spawn_fallbacks: usize,
-
-    pub fn deinit(self: *RenderedPageRasterBatch, alloc: Allocator) void {
-        for (self.results) |*result| result.deinit(alloc);
-        alloc.free(self.results);
-        self.* = undefined;
-    }
-};
+pub const RenderedPageRasterBatch = @import("pdf_values").RenderedPageRasterBatch;
 
 pub const Backend = struct {
     ptr: *const anyopaque,
@@ -392,6 +243,8 @@ fn renderParsedPagePngEffectiveWithRotationAllocators(
     return renderParsedPagePngNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
+        error.UnsupportedPdfInlineImage,
+        error.InvalidPdfInlineImage,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
@@ -440,6 +293,8 @@ fn renderParsedPagePngNativeWithAllocators(
     const raw = try renderParsedPageRgbaNativeWithAllocators(scratch_alloc, scratch_alloc, parsed, page_number, dpi, max_pixels, rotation, profile);
     defer scratch_alloc.free(raw.rgba);
     try parsed.checkCancellation();
+    const encode_timer = @import("antfly_platform").document_pipeline_metrics.start(.media_encode);
+    defer encode_timer.finish();
     return try image.png.encodeRgbaWithCancellation(
         scratch_alloc,
         output_alloc,
@@ -488,9 +343,7 @@ fn renderParsedPageRgbaNativeWithAllocators(
     var render_runs = try parsed.extractPageRenderRunsForRasterAlloc(page_number, @intFromFloat(preflight_width), @intFromFloat(preflight_height));
     defer render_runs.deinit(reader_alloc);
     try parsed.checkCancellation();
-    if (profile == .ocr) {
-        try reader.prepareOcrRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, parsed.cancellationProbe());
-    }
+    try reader.prepareRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, profile, parsed.cancellationProbe());
     scalePageRenderRuns(&render_runs, scale);
     // The integer raster plan is authoritative. Scaling negative/fractional
     // origins can turn an exact extent into N + epsilon; another ceil would
@@ -562,6 +415,8 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
     return renderParsedPageRgbaNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
+        error.UnsupportedPdfInlineImage,
+        error.InvalidPdfInlineImage,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
@@ -590,16 +445,7 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
     };
 }
 
-fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
-    const normalized = @mod(rotation orelse 0, 360);
-    return switch (normalized) {
-        0 => .none,
-        90 => .clockwise_90,
-        180 => .clockwise_180,
-        270 => .clockwise_270,
-        else => error.InvalidPageRotation,
-    };
-}
+const normalizedPageRotation = @import("pdf_values").normalizedPageRotation;
 
 /// Invert the native page renderer's raster transform for one Reader region.
 ///
@@ -612,92 +458,7 @@ fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
 /// `raster_bbox` is `[left, top, right, bottom]` in the final rotated raster.
 /// The returned box is `[min_x, min_y, max_x, max_y]` in source page points.
 /// Compatibility renderers intentionally do not use this contract.
-pub fn nativeRasterBboxToPagePoints(
-    page_box: reader.PageBox,
-    effective_dpi: u16,
-    raster_width: u32,
-    raster_height: u32,
-    page_rotation: ?i32,
-    raster_bbox: [4]f64,
-) ?[4]f64 {
-    if (effective_dpi == 0 or raster_width == 0 or raster_height == 0) return null;
-    if (!std.math.isFinite(page_box.min_x) or !std.math.isFinite(page_box.min_y) or
-        !std.math.isFinite(page_box.max_x) or !std.math.isFinite(page_box.max_y) or
-        !(page_box.min_x < page_box.max_x) or !(page_box.min_y < page_box.max_y))
-        return null;
-    for (raster_bbox) |coordinate| if (!std.math.isFinite(coordinate)) return null;
-    const left = raster_bbox[0];
-    const top = raster_bbox[1];
-    const right = raster_bbox[2];
-    const bottom = raster_bbox[3];
-    const final_width: f64 = @floatFromInt(raster_width);
-    const final_height: f64 = @floatFromInt(raster_height);
-    if (!(left < right) or !(top < bottom) or left < 0 or top < 0 or
-        right > final_width or bottom > final_height)
-        return null;
-
-    const rotation = normalizedPageRotation(page_rotation) catch return null;
-    const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
-    const expected_unrotated_width = @ceil((page_box.max_x - page_box.min_x) * scale);
-    const expected_unrotated_height = @ceil((page_box.max_y - page_box.min_y) * scale);
-    if (!std.math.isFinite(expected_unrotated_width) or !std.math.isFinite(expected_unrotated_height) or
-        expected_unrotated_width < 1 or expected_unrotated_height < 1)
-        return null;
-    const expected_final_width = if (rotation == .clockwise_90 or rotation == .clockwise_270)
-        expected_unrotated_height
-    else
-        expected_unrotated_width;
-    const expected_final_height = if (rotation == .clockwise_90 or rotation == .clockwise_270)
-        expected_unrotated_width
-    else
-        expected_unrotated_height;
-    if (final_width != expected_final_width or final_height != expected_final_height) return null;
-    var unrotated: [4]f64 = undefined;
-    var unrotated_width = final_width;
-    var unrotated_height = final_height;
-    switch (rotation) {
-        .none => unrotated = raster_bbox,
-        .clockwise_90 => {
-            unrotated_width = final_height;
-            unrotated_height = final_width;
-            unrotated = .{ top, unrotated_height - right, bottom, unrotated_height - left };
-        },
-        .clockwise_180 => {
-            unrotated = .{
-                unrotated_width - right,
-                unrotated_height - bottom,
-                unrotated_width - left,
-                unrotated_height - top,
-            };
-        },
-        .clockwise_270 => {
-            unrotated_width = final_height;
-            unrotated_height = final_width;
-            unrotated = .{ unrotated_width - bottom, left, unrotated_width - top, right };
-        },
-    }
-    if (unrotated[0] < 0 or unrotated[1] < 0 or
-        unrotated[2] > unrotated_width or unrotated[3] > unrotated_height)
-        return null;
-
-    // `scale` and the exact pixel-grid dimensions were validated above.
-    const mapped = [4]f64{
-        page_box.min_x + unrotated[0] / scale,
-        page_box.min_y + (unrotated_height - unrotated[3]) / scale,
-        page_box.min_x + unrotated[2] / scale,
-        page_box.min_y + (unrotated_height - unrotated[1]) / scale,
-    };
-    // The renderer rounds the trailing CropBox edges up to whole pixels. A
-    // region touching those pixels may extend past the original page bounds.
-    const clipped = [4]f64{
-        std.math.clamp(mapped[0], page_box.min_x, page_box.max_x),
-        std.math.clamp(mapped[1], page_box.min_y, page_box.max_y),
-        std.math.clamp(mapped[2], page_box.min_x, page_box.max_x),
-        std.math.clamp(mapped[3], page_box.min_y, page_box.max_y),
-    };
-    if (!(clipped[0] < clipped[2]) or !(clipped[1] < clipped[3])) return null;
-    return clipped;
-}
+pub const nativeRasterBboxToPagePoints = @import("pdf_values").nativeRasterBboxToPagePoints;
 
 test "native raster region inversion preserves fractional CropBox geometry through rotations" {
     const page_box = reader.PageBox{ .min_x = 10.25, .min_y = -4.5, .max_x = 82.45, .max_y = 31.9 };
@@ -1002,64 +763,16 @@ fn renderParsedPageRasterWithGeometryAllocators(
     };
 }
 
-const AdaptiveRenderGeometry = struct {
-    effective_dpi: u16,
-    width: u32,
-    height: u32,
-    pixels: u64,
-    rotation: render.PageRotation,
-};
+const AdaptiveRenderGeometry = @import("pdf_values").AdaptiveRenderGeometry;
 
-pub const PageRenderGeometry = struct {
-    effective_dpi: u16,
-    width: u32,
-    height: u32,
-    pixels: u64,
-};
+pub const PageRenderGeometry = @import("pdf_values").PageRenderGeometry;
 
 /// Immutable geometry resolved against one prepared Reader. Keeping this value
 /// beside a planner's page item lets batch admission reuse the exact result
 /// instead of resolving the page dictionary for a second time. The source
 /// identity is checked again at execution, so plans cannot be mixed across
 /// prepared documents accidentally.
-pub const PreparedPageRenderPlan = struct {
-    _request: PageRenderRequest,
-    _geometry: AdaptiveRenderGeometry,
-    _source_ptr: [*]const u8,
-    _source_len: usize,
-    /// Ordered page-local preparation failure. Such entries occupy an output
-    /// slot but never launch a renderer or consume pixel admission.
-    failure: ?anyerror = null,
-
-    pub fn request(self: @This()) PageRenderRequest {
-        return self._request;
-    }
-
-    pub fn geometry(self: @This()) PageRenderGeometry {
-        if (self.failure != null) return .{ .effective_dpi = 0, .width = 0, .height = 0, .pixels = 0 };
-        return .{
-            .effective_dpi = self._geometry.effective_dpi,
-            .width = self._geometry.width,
-            .height = self._geometry.height,
-            .pixels = self._geometry.pixels,
-        };
-    }
-
-    /// Return the same source-bound geometry with a caller-owned encoded
-    /// output ceiling. Output admission does not affect raster geometry, so a
-    /// document planner may narrow this limit after it sizes the complete
-    /// inference window without repeating page-tree and box discovery.
-    pub fn withMaxOutputBytes(self: @This(), max_output_bytes: ?usize) @This() {
-        var updated = self;
-        updated._request.max_output_bytes = max_output_bytes;
-        return updated;
-    }
-
-    fn matchesSource(self: @This(), parsed: *const reader.Reader) bool {
-        const source = parsed.sourceBytes();
-        return self._source_ptr == source.ptr and self._source_len == source.len;
-    }
-};
+pub const PreparedPageRenderPlan = @import("pdf_values").PreparedPageRenderPlan;
 
 pub fn prepareParsedPageRenderPlan(
     parsed: *reader.Reader,
@@ -1129,7 +842,7 @@ pub fn estimatePreparedPageRenderWaveScratchBytes(
     var first: usize = 0;
     var live: usize = 0;
     for (plans) |plan| {
-        if (!plan.matchesSource(parsed)) return error.PreparedPageRenderSourceMismatch;
+        if (!plan.matchesSourceBytes(parsed.sourceBytes())) return error.PreparedPageRenderSourceMismatch;
         if (plan.failure != null) continue;
         const raster_bytes = std.math.mul(
             usize,
@@ -1574,7 +1287,7 @@ test "render heap evicts idle slabs without invalidating live fonts" {
     try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
 }
 
-pub const RenderBatchOutputKind = enum { png, raster };
+pub const RenderBatchOutputKind = @import("pdf_values").RenderBatchOutputKind;
 
 const PreparedRenderPage = struct {
     request_index: usize,
@@ -1715,6 +1428,8 @@ const PageRenderWorker = struct {
     rendered_png: ?RenderedPagePng = null,
     rendered_raster: ?RenderedPageRaster = null,
     failure: ?anyerror = null,
+    failure_identity: ?image.work_control.Failure = null,
+    image_control: image.work_control.Control = .{},
     render_elapsed_ns: u64 = 0,
     thread: ?std.Thread = null,
     wave_control: *RenderWaveControl = undefined,
@@ -1742,7 +1457,7 @@ const PageRenderWorker = struct {
     fn configure(self: *PageRenderWorker, fork_template: *const reader.RenderForkTemplate, prepared: PreparedRenderPage, profile: RenderProfile, output_kind: RenderBatchOutputKind, wave_control: *RenderWaveControl, shared_budget: *RenderBatchBudget, output_allocator: ?Allocator, max_retained_output_bytes: usize, compatibility_session: ?*CompatibilityRenderSession) void {
         std.debug.assert(!self.task_configured);
         self.request = prepared.request;
-        self.profile = profile;
+        self.profile = if (prepared.request.sampling == .auto) profile else prepared.request.sampling.profile();
         self.output_kind = output_kind;
         self.fork_template = fork_template;
         self.shared_budget = shared_budget;
@@ -1766,6 +1481,8 @@ const PageRenderWorker = struct {
         self.rendered_png = null;
         self.rendered_raster = null;
         self.failure = null;
+        self.failure_identity = null;
+        self.image_control = image.work_control.current();
         self.render_elapsed_ns = 0;
         self.task_configured = true;
     }
@@ -1813,6 +1530,8 @@ const PageRenderWorker = struct {
     }
 
     fn runWithScratch(self: *PageRenderWorker, backing: Allocator) void {
+        const image_scope = image.work_control.Scope.enter(self.image_control);
+        defer image_scope.deinit();
         std.debug.assert(self.task_configured);
         if (!self.scratch_initialized) {
             self.scratch_budget = .{
@@ -1874,6 +1593,9 @@ const PageRenderWorker = struct {
             error.RenderWorkerMemoryLimitExceeded
         else
             err;
+        const identity = image.work_control.failure(self.failure.?);
+        // A sibling's wave-stop marker is secondary to the forwarded control.
+        self.failure_identity = if (identity.localError() == null) identity else null;
         if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
             self.wave_control.stop();
     }
@@ -2045,7 +1767,7 @@ pub fn renderPreparedPagesBatchAlloc(
     plans: []const PreparedPageRenderPlan,
     options: PageRenderBatchOptions,
 ) !RenderedPageBatch {
-    for (plans) |plan| if (!plan.matchesSource(parsed))
+    for (plans) |plan| if (!plan.matchesSourceBytes(parsed.sourceBytes()))
         return error.PreparedPageRenderSourceMismatch;
     return renderParsedPageWorkBatchAlloc(.png, alloc, parsed, &.{}, plans, options);
 }
@@ -2068,7 +1790,7 @@ pub fn renderPreparedPagesRasterBatchAlloc(
     plans: []const PreparedPageRenderPlan,
     options: PageRenderBatchOptions,
 ) !RenderedPageRasterBatch {
-    for (plans) |plan| if (!plan.matchesSource(parsed))
+    for (plans) |plan| if (!plan.matchesSourceBytes(parsed.sourceBytes()))
         return error.PreparedPageRenderSourceMismatch;
     return renderParsedPageWorkBatchAlloc(.raster, alloc, parsed, &.{}, plans, options);
 }
@@ -2081,6 +1803,7 @@ fn renderParsedPageWorkBatchAlloc(
     prepared_plans: ?[]const PreparedPageRenderPlan,
     options: PageRenderBatchOptions,
 ) !(if (output_kind == .png) RenderedPageBatch else RenderedPageRasterBatch) {
+    if (options.failure_identity_out) |identity| identity.* = null;
     if (options.max_batch_pages == 0 or options.max_parallel_pages == 0 or
         options.max_inflight_pixels == 0 or options.max_inflight_bytes == 0 or
         (output_kind == .png and options.max_retained_png_bytes == 0) or
@@ -2244,6 +1967,7 @@ fn renderParsedPageWorkBatchAlloc(
                 max_retained_output_bytes,
                 &compatibility_session,
             );
+            workers[i].image_control = options.image_control orelse image.work_control.current();
             initialized_workers += 1;
         }
 
@@ -2285,7 +2009,21 @@ fn renderParsedPageWorkBatchAlloc(
         for (wave[0..wave_len], workers[0..wave_len]) |candidate, *worker| {
             results[candidate.request_index].render_elapsed_ns = worker.render_elapsed_ns;
             if (worker.failure) |err| {
-                if (err == error.OutOfMemory or err == error.Canceled) return err;
+                if (err == error.OutOfMemory or err == error.Canceled) {
+                    if (options.failure_identity_out) |identity| {
+                        // Wave cancellation may make an earlier lane fail
+                        // before the lane that reported the original error.
+                        for (workers[0..wave_len]) |*lane| {
+                            if (lane.failure) |lane_error| {
+                                if (lane_error == err and lane.failure_identity != null) {
+                                    identity.* = lane.failure_identity;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return err;
+                }
                 results[candidate.request_index].failure = err;
                 continue;
             }
@@ -3111,6 +2849,32 @@ test "native backend renders embedded fixture pdf first page png" {
     const png = try backend.renderFirstPagePng(alloc, fixture);
     defer alloc.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+}
+
+test "OCR continuous-tone profile smooths PDF images without contaminating exact rendering" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/continuous_sampling_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var exact = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, 72, 64, 8, .exact);
+    defer exact.deinit(alloc);
+    var ocr = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, 72, 64, 8, .ocr);
+    defer ocr.deinit(alloc);
+    var exact_again = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, 72, 64, 8, .exact);
+    defer exact_again.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, exact.png, exact_again.png);
+    try std.testing.expectEqual(@as(u32, 4), exact.width);
+    try std.testing.expectEqual(exact.width, ocr.width);
+    try std.testing.expectEqual(exact.height, ocr.height);
+
+    const nearest = try image.png.decodeRgba(alloc, exact.png);
+    defer alloc.free(nearest.rgba);
+    const smoothed = try image.png.decodeRgba(alloc, ocr.png);
+    defer alloc.free(smoothed.rgba);
+    try std.testing.expect(!std.mem.eql(u8, nearest.rgba, smoothed.rgba));
+    // The middle samples contain both colors only in the OCR profile.
+    try std.testing.expect(nearest.rgba[4] == 0 or nearest.rgba[6] == 0);
+    try std.testing.expect(smoothed.rgba[4] > 0 and smoothed.rgba[6] > 0);
 }
 
 test "parsed rendering releases reader-owned runs with the reader allocator" {
@@ -4878,6 +4642,7 @@ test {
     _ = reader;
     _ = syntax;
     _ = render;
+    _ = text_structure;
 }
 
 /// Test allocator that records page-sized allocations while serializing an
@@ -5992,4 +5757,22 @@ test "compatibility rendering scales page content up and down through rotations"
             try std.testing.expectEqualSlices(usize, &expected, &bounds);
         }
     }
+}
+
+test "OCR sampling page overrides survive prepared batch rendering" {
+    const a = std.testing.allocator;
+    var parsed = try reader.Reader.init(a, @embedFile("../testdata/continuous_sampling_fixture.pdf"));
+    defer parsed.deinit();
+    var batch = try renderParsedPagesBatchAlloc(a, &parsed, &.{
+        .{ .page_number = 1, .requested_dpi = 72, .sampling = .pdf },
+        .{ .page_number = 1, .requested_dpi = 72, .sampling = .auto },
+        .{ .page_number = 1, .requested_dpi = 72, .sampling = .smooth },
+    }, .{ .max_batch_pages = 3, .max_parallel_pages = 1 });
+    defer batch.deinit(a);
+    for (batch.results) |result| try std.testing.expect(result.failure == null);
+    const exact = batch.results[0].rendered.?;
+    const automatic = batch.results[1].rendered.?;
+    const smooth = batch.results[2].rendered.?;
+    try std.testing.expect(!std.mem.eql(u8, exact.png, automatic.png));
+    try std.testing.expectEqualSlices(u8, automatic.png, smooth.png);
 }

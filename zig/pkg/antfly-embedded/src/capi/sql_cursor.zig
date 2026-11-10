@@ -60,6 +60,14 @@ pub fn diagnostic(err: anyerror, out: *h.capi.Buffer) h.capi.ErrorCode {
 pub fn diagnosticCode(description: dependencies.sql_errors.Diagnostic) h.capi.ErrorCode {
     if (std.mem.eql(u8, description.code, "0A000")) return .unsupported;
     if (std.mem.eql(u8, description.code, "55P03")) return .busy;
+    // Retryable capacity refusals happen before execution; C callers retry
+    // on busy, so report them that way rather than as a bad request.
+    if (std.mem.eql(u8, description.code, "53300")) return .busy;
+    if (std.mem.eql(u8, description.code, "57014")) return .cancelled;
+    if (std.mem.eql(u8, description.code, "53100") or std.mem.eql(u8, description.code, "58000")) return .internal;
+    // Not applied, waiting on reconciliation; or committed with visibility
+    // pending. Neither is a request error or an unknown outcome.
+    if (std.mem.eql(u8, description.code, "55000") or std.mem.eql(u8, description.code, "AF001")) return .stalled;
     if (std.mem.eql(u8, description.code, "40001")) return .version_conflict;
     if (std.mem.eql(u8, description.code, "40003")) return .outcome_unknown;
     if (std.mem.eql(u8, description.code, "XX000") or std.mem.eql(u8, description.code, "53200")) return .internal;
@@ -114,13 +122,13 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
     cursor.session_id = request.session_id;
     cursor.compiled = try sql.compiler.compile(cursor.budget.allocator(), request.statement, .{});
     errdefer cursor.compiled.deinit();
-    switch (cursor.compiled.statement) {
-        .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => return error.UnsupportedSqlExecution,
-        else => {},
-    }
+    // Cursor entry uses read-only storage intent even though registry access
+    // is exclusive. Unsupported shapes fall back to materialized execution;
+    // they must never execute a mutation through the streaming path.
+    if (cursor.compiled.statement != .select) return error.UnsupportedSqlExecution;
     try api.requireEmbeddedSqlCatalogOwnership(handle, cursor.compiled.statement);
     if (session) |value| if (value.failed) return error.SqlTransactionAborted;
-    cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    cursor.adapter = .{ .graph_parameters = request.parameters, .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     return request;
 }
 pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
@@ -129,7 +137,7 @@ pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, o
     h.capi.clearLastError();
     out.* = .{};
     out_id.* = 0;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);

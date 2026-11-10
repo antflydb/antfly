@@ -18,11 +18,11 @@ Your React app has a search page and an answer box on the same Antfly table. Typ
 
 ## Before You Start
 
-Antfly running with an indexed table, and Ollama with a small model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
+Antfly running with an indexed table and the Gemma 4 generation model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/tables/docs | head -c 300
-ollama pull gemma3:4b
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
 ## Build It
@@ -109,7 +109,7 @@ import {
   renderThumbsUpDown,
 } from '@antfly/components'
 
-const GENERATOR = { provider: 'ollama', model: 'gemma3:4b' }
+const GENERATOR = { provider: 'antfly', model: 'ggml-org/gemma-4-E4B-it-GGUF' }
 
 export function AnswerBox() {
   return (

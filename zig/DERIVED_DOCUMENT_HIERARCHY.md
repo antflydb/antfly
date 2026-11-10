@@ -113,14 +113,16 @@ Example configuration shape:
     "etag_field": "etag",
     "checksum_field": "sha256"
   },
+  "ocr": {
+    "reader": { "provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B" }
+  },
   "routes": [
     {
       "match": { "content_type": "application/pdf" },
       "extractor": {
         "type": "pdf",
         "unit": "page",
-        "mechanical_text": true,
-        "ocr_fallback": true
+        "mechanical_text": true
       }
     },
     {
@@ -158,6 +160,8 @@ Routing should use, in order:
 5. A configured default route or unsupported-file result.
 
 The route result should be persisted in the artifact manifest so retries and downstream enrichments are deterministic.
+
+The `ocr` reader serves both the image route and scanned PDF pages. Without an `ocr` block, PDF pages keep their native text and an `ocr` route is rejected.
 
 ## Relationship To Existing Enrichments
 

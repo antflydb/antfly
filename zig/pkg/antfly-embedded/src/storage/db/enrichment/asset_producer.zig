@@ -31,6 +31,10 @@ pub const InvocationContext = struct {
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
     max_response_bytes: ?usize = null,
+    /// Optional execution fence for speculative results. Supporting producers
+    /// reject an unprovable/different revision before dispatch and report the
+    /// bound revision on ProducedBatch. Other producers leave the report null.
+    expected_model_revision: ?[32]u8 = null,
     document_checkpoints: ?@import("antfly_readers").document_rpc.Factory = null,
     progress: ?request_context.ProgressSink = null,
 
@@ -50,6 +54,18 @@ pub const InvocationContext = struct {
         };
     }
 };
+
+// Generic text/JSON assets can feed native chunks without pretending to be
+// document-extraction manifests. Binary media still requires an explicit text
+// producer; ordered document extraction keeps its unit publication protocol.
+pub fn supportsScalarTextProjection(kind: ProducerType, content_type: []const u8) bool {
+    if (kind == .media_output) return true;
+    if (!std.mem.eql(u8, content_type, "text/plain") and !std.mem.eql(u8, content_type, "application/json")) return false;
+    return switch (kind) {
+        .copy, .generator, .extractor, .decision, .reader, .transcriber => true,
+        else => false,
+    };
+}
 
 pub const ProducerType = enum {
     copy,
@@ -153,6 +169,11 @@ pub const ProducedItem = inference_work.WorkItemResult([]u8);
 pub const ProducedBatch = struct {
     items: []ProducedItem,
     execution: inference_work.ExecutionReport,
+    /// Revision of the model actually dispatched, bound by an immutable model
+    /// reference or a server-enforced capability lease. Discovery metadata and
+    /// model_revision_pinning alone cannot populate this field. Null means the
+    /// producer cannot prove execution identity; callers must not reuse output.
+    executed_model_revision: ?[32]u8 = null,
 
     /// Validate the complete producer envelope against the logical requests
     /// that own its results. Execution telemetry is request-scoped at this
@@ -689,7 +710,16 @@ fn invocationResolutionLimit(requests: []const Request) !usize {
 
 fn invocationResolutionScaledLimit(requests: []const Request) !usize {
     var source_bytes: usize = 0;
-    for (requests) |request| {
+    var config_structure: usize = 0;
+    var source_structure: usize = 0;
+    for (requests, 0..) |request, index| {
+        const privacy = @import("../../../privacy/document.zig");
+        if (std.mem.indexOf(u8, request.config_json, privacy.config_key) != null) {
+            if (index == 0 or !std.mem.eql(u8, request.config_json, requests[index - 1].config_json)) {
+                config_structure = try std.math.add(usize, config_structure, try std.math.mul(usize, 4, try privacy.jsonStructureBytes(request.config_json)));
+            }
+            source_structure = @max(source_structure, try privacy.jsonStructureBytes(request.source_text));
+        }
         source_bytes = std.math.add(usize, source_bytes, request.config_json.len) catch
             return error.InferenceEncodedBytesExceeded;
         source_bytes = std.math.add(usize, source_bytes, request.source_text.len) catch
@@ -704,8 +734,9 @@ fn invocationResolutionScaledLimit(requests: []const Request) !usize {
         return error.InferenceEncodedBytesExceeded;
     const control = std.math.mul(usize, @max(requests.len, 1), 4096) catch
         return error.InferenceEncodedBytesExceeded;
-    return std.math.add(usize, parsed, control) catch
-        error.InferenceEncodedBytesExceeded;
+    const structures = std.math.add(usize, config_structure, source_structure) catch return error.InferenceEncodedBytesExceeded;
+    const base = std.math.add(usize, parsed, control) catch return error.InferenceEncodedBytesExceeded;
+    return std.math.add(usize, base, structures) catch error.InferenceEncodedBytesExceeded;
 }
 
 test "invocation resolution budget never falls below the fixed planning floor" {

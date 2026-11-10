@@ -112,7 +112,28 @@ pub const RequestDiagnostics = struct {
     }
 };
 
+pub const SQLCompletionOwner = struct {
+    id: u64,
+    schema_version: u32,
+    kind: enum { table, fk_initial, fk_generation, restore } = .table,
+    publication_id: ?[16]u8 = null,
+};
+
 pub const RequestContext = struct {
+    pub fn markSQLSubmission(self: RequestContext) void {
+        if (self.sql_completion_submission) |observed| observed.* = true;
+    }
+    /// Borrowed native admission observer; never decoded from request JSON.
+    /// Set only at the first possible durable submission (or existing job).
+    sql_completion_submission: ?*bool = null,
+    /// Borrowed native ingress capability. The coordinator must reserve an
+    /// owner proof before sealing a mutation; never deserialize this from SQL.
+    sql_completion: ?struct {
+        ptr: *anyopaque,
+        prepare_transaction: *const fn (*anyopaque, [16]u8) anyerror!void,
+        prepare_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
+        reject_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
+    } = null,
     /// Native service admission only; never reconstructed from user input.
     native_service: ?@import("../common/service_ownership.zig").Owner = null,
     /// Granted only after administrator authentication by a trusted native
@@ -171,7 +192,25 @@ pub const RequestContext = struct {
     catalog_route_fence_json: []const u8 = "",
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
-        if (self.cancellation.isCancelled()) return error.Canceled;
+        // This is a fallible operation checkpoint, not a transport probe.
+        // Preserve scoped expiry rather than collapsing it into a client
+        // disconnect through isCancelled(). Unknown fence failures still abort.
+        self.cancellation.check() catch |err| return switch (err) {
+            error.DeadlineExceeded => error.DeadlineExceeded,
+            else => error.Canceled,
+        };
+        try self.ensureDeadlineActive();
+    }
+
+    /// Nonblocking transport probe. Keep explicit parent probes separate from
+    /// fallible checkpoints, which can renew leases or use task-local I/O.
+    pub fn isCancellationRequested(self: RequestContext) bool {
+        if (self.cancellation.isCancelled()) return true;
+        self.ensureDeadlineActive() catch return true;
+        return false;
+    }
+
+    fn ensureDeadlineActive(self: RequestContext) ApiError!void {
         if (self.deadline_ns) |deadline| {
             const now_ns = if (self.deadline_io) |borrow| blk: {
                 var receiver = borrow.receive() catch return error.Internal;

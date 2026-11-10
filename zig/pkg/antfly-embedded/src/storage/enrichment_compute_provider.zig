@@ -118,13 +118,35 @@ fn cloneUnit(alloc: Allocator, unit: extraction.Unit) !extraction.Unit {
     errdefer if (out.extraction_status) |value| alloc.free(value);
     out.source_sha256 = try dupeOptional(alloc, unit.source_sha256);
     errdefer if (out.source_sha256) |value| alloc.free(value);
+    out.ocr_failure_stage = try dupeOptional(alloc, unit.ocr_failure_stage);
+    errdefer if (out.ocr_failure_stage) |value| alloc.free(value);
+    out.ocr_trigger_reasons = try dupeOptional(alloc, unit.ocr_trigger_reasons);
+    errdefer if (out.ocr_trigger_reasons) |value| alloc.free(value);
+    out.ocr_embedded_quality = try dupeOptional(alloc, unit.ocr_embedded_quality);
+    errdefer if (out.ocr_embedded_quality) |value| alloc.free(value);
+    out.ocr_output_quality = try dupeOptional(alloc, unit.ocr_output_quality);
+    errdefer if (out.ocr_output_quality) |value| alloc.free(value);
     out.extraction_warning = try dupeOptional(alloc, unit.extraction_warning);
     errdefer if (out.extraction_warning) |value| alloc.free(value);
     out.page_label = try dupeOptional(alloc, unit.page_label);
     errdefer if (out.page_label) |value| alloc.free(value);
+    out.transcript_spans = if (unit.transcript_spans.len == 0) &.{} else try alloc.dupe(extraction.TranscriptSpan, unit.transcript_spans);
+    errdefer if (out.transcript_spans.len > 0) alloc.free(out.transcript_spans);
     out.text_regions = if (unit.text_regions.len == 0) &.{} else try alloc.dupe(extraction.TextRegion, unit.text_regions);
+    errdefer if (out.text_regions.len > 0) alloc.free(out.text_regions);
+    out.text_blocks = if (unit.text_blocks.len == 0) &.{} else try alloc.dupe(extraction.TextBlock, unit.text_blocks);
     out.byte_length = unit.byte_length;
+    out.native_text_quality = unit.native_text_quality;
+    out.native_text_diagnostics = unit.native_text_diagnostics;
     out.ocr_used = unit.ocr_used;
+    out.ocr_attempted = unit.ocr_attempted;
+    out.ocr_render_dpi = unit.ocr_render_dpi;
+    out.ocr_render_policy = unit.ocr_render_policy;
+    out.ocr_effective_render_dpi = unit.ocr_effective_render_dpi;
+    out.ocr_rendered_width = unit.ocr_rendered_width;
+    out.ocr_rendered_height = unit.ocr_rendered_height;
+    out.ocr_rendered_bytes = unit.ocr_rendered_bytes;
+    out.ocr_failure_retryable = unit.ocr_failure_retryable;
     out.ocr_confidence = unit.ocr_confidence;
     out.ocr_bbox = unit.ocr_bbox;
     out.transcript_used = unit.transcript_used;
@@ -142,9 +164,15 @@ fn unitBytes(unit: extraction.Unit) usize {
         (if (unit.source_path) |v| v.len else 0) +
         (if (unit.extraction_status) |v| v.len else 0) +
         (if (unit.source_sha256) |v| v.len else 0) +
+        (if (unit.ocr_failure_stage) |v| v.len else 0) +
+        (if (unit.ocr_trigger_reasons) |v| v.len else 0) +
+        (if (unit.ocr_embedded_quality) |v| v.len else 0) +
+        (if (unit.ocr_output_quality) |v| v.len else 0) +
         (if (unit.extraction_warning) |v| v.len else 0) +
         (if (unit.page_label) |v| v.len else 0) +
-        unit.text_regions.len * @sizeOf(extraction.TextRegion);
+        unit.transcript_spans.len * @sizeOf(extraction.TranscriptSpan) +
+        unit.text_regions.len * @sizeOf(extraction.TextRegion) +
+        unit.text_blocks.len * @sizeOf(extraction.TextBlock);
 }
 
 pub fn extractStream(
@@ -182,8 +210,89 @@ pub fn extractStream(
     return .ok;
 }
 
-pub fn renderPdfPagePng(
-    request: *const abi.EnrichmentRenderPdfRequest,
+/// Session and allocator adapter have one stable address. A Reader must never
+/// retain an adapter table or deadline living in the open/render call's frame.
+const PdfSessionState = struct {
+    allocator: abi.Allocator,
+    deadline: extraction.PdfRenderDeadline,
+    pdf: extraction.PdfRenderSession,
+    cancellation: abi.PdfCancellation,
+    deadline_enabled: bool,
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context.?));
+        if (self.cancellation.is_cancelled) |callback| if (callback(self.cancellation.context) != 0) return true;
+        if (self.deadline_enabled) self.deadline.probe().check() catch return true;
+        return false;
+    }
+
+    fn probe(self: *const @This()) extraction.PdfCancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn resetDeadline(self: *@This(), timeout_ms: u64, cancellation: abi.PdfCancellation) void {
+        self.deadline = .init(timeout_ms);
+        self.deadline_enabled = timeout_ms != 0;
+        self.cancellation = cancellation;
+        self.pdf.setCancellationProbe(self.probe());
+    }
+};
+
+pub fn pdfSessionOpen(
+    request: *const abi.PdfSessionOpenRequest,
+    out_session: *?*abi.PdfSession,
+    out_page_count: *u64,
+    out_failure: *abi.FailureIdentity,
+) callconv(.c) abi.Status {
+    out_session.* = null;
+    out_page_count.* = 0;
+    out_failure.* = .{};
+    if (request.version != abi.abi_version)
+        return fail(error.InvalidAbiVersion, .pdf_session_open, out_failure);
+    if (request._reserved0 != 0 or (request.pdf_bytes.len != 0 and request.pdf_bytes.ptr == null))
+        return fail(error.InvalidArgument, .pdf_session_open, out_failure);
+    if (request.allocator) |allocator| if (!allocator.valid())
+        return fail(error.InvalidArgument, .pdf_session_open, out_failure);
+    const limits = extraction.PdfDecodeLimits{
+        .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .pdf_session_open, out_failure),
+        .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .pdf_session_open, out_failure),
+    };
+    // The default allocator value has process lifetime. Custom contexts must
+    // remain live through close, as required by the private ABI contract.
+    const default_allocator = &std.heap.c_allocator;
+    const allocator = if (request.allocator) |value| value.* else abi.Allocator.fromStd(default_allocator);
+    const state = allocator.asStd().create(PdfSessionState) catch |err|
+        return fail(err, .pdf_session_open, out_failure);
+    state.allocator = allocator;
+    state.deadline = .init(request.timeout_ms);
+    state.deadline_enabled = request.timeout_ms != 0;
+    state.cancellation = request.cancellation;
+    const alloc = state.allocator.asStd();
+    state.pdf = extraction.PdfRenderSession.initWithDecodeLimitsAndCancellation(
+        alloc,
+        request.pdf_bytes.slice(),
+        limits,
+        state.probe(),
+    ) catch |err| {
+        alloc.destroy(state);
+        return fail(err, .pdf_session_open, out_failure);
+    };
+    const count = state.pdf.pageCount() catch |err| {
+        state.pdf.deinit();
+        alloc.destroy(state);
+        return fail(err, .pdf_session_open, out_failure);
+    };
+    state.cancellation = .{};
+    out_page_count.* = @intCast(count);
+    out_session.* = @ptrCast(state);
+    return .ok;
+}
+
+pub fn pdfSessionRenderPng(
+    session: *abi.PdfSession,
+    request: *const abi.PdfSessionRenderRequest,
     out_png: *abi.OwnedBytes,
     out_page: *abi.EnrichmentRenderedPdfPage,
     out_failure: *abi.FailureIdentity,
@@ -192,29 +301,26 @@ pub fn renderPdfPagePng(
     out_page.* = .{};
     out_failure.* = .{};
     if (request.version != abi.abi_version)
-        return fail(error.InvalidAbiVersion, .render_pdf_page, out_failure);
+        return fail(error.InvalidAbiVersion, .pdf_session_render, out_failure);
+    if (request._reserved0 != 0)
+        return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    if (request.output_allocator) |allocator| if (!allocator.valid())
+        return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    const output_allocator = if (request.output_allocator) |allocator| allocator.asStd() else std.heap.c_allocator;
     const page_number = std.math.cast(usize, request.page_number) orelse
-        return fail(error.InvalidArgument, .render_pdf_page, out_failure);
-    if (request.allocator) |allocator| if (!allocator.valid()) return fail(error.InvalidArgument, .render_pdf_page, out_failure);
-    const decoder_alloc = if (request.allocator) |allocator| allocator.asStd() else std.heap.c_allocator;
-    var deadline = extraction.PdfRenderDeadline.init(request.render_timeout_ms);
-    var session = extraction.PdfRenderSession.initWithDecodeLimitsAndCancellation(decoder_alloc, request.pdf_bytes.slice(), .{
-        .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
-            return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
-        .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
-            return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
-    }, if (request.render_timeout_ms == 0) .{} else deadline.probe()) catch |err| return fail(err, .render_pdf_page, out_failure);
-    defer session.deinit();
-    deadline = extraction.PdfRenderDeadline.init(request.render_timeout_ms);
-    const rendered = session.renderPagePngAdaptiveAlloc(
-        std.heap.c_allocator,
+        return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    const state: *PdfSessionState = @ptrCast(@alignCast(session));
+    state.resetDeadline(request.timeout_ms, request.cancellation);
+    defer state.cancellation = .{};
+    const sampling = std.enums.fromInt(extraction.ImageSamplingPolicy, request.sampling) orelse return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    const rendered = state.pdf.renderPagePngAdaptiveWithSamplingAlloc(
+        output_allocator,
         page_number,
         request.dpi,
         request.max_pixels,
         request.max_dimension,
-    ) catch |err| {
-        return fail(err, .render_pdf_page, out_failure);
-    };
+        sampling,
+    ) catch |err| return fail(err, .pdf_session_render, out_failure);
     out_png.* = .{ .ptr = rendered.png.ptr, .len = @intCast(rendered.png.len) };
     out_page.* = .{
         .requested_dpi = rendered.requested_dpi,
@@ -222,6 +328,73 @@ pub fn renderPdfPagePng(
         .width = rendered.width,
         .height = rendered.height,
     };
+    return .ok;
+}
+
+pub fn pdfSessionClose(session: *?*abi.PdfSession) callconv(.c) void {
+    const handle = session.* orelse return;
+    session.* = null;
+    const state: *PdfSessionState = @ptrCast(@alignCast(handle));
+    state.pdf.deinit();
+    const allocator = state.allocator;
+    allocator.asStd().destroy(state);
+}
+
+pub fn renderPdfPagePng(
+    request: *const abi.EnrichmentRenderPdfRequest,
+    out_png: *abi.OwnedBytes,
+    out_page: *abi.EnrichmentRenderedPdfPage,
+    out_failure: *abi.FailureIdentity,
+) callconv(.c) abi.Status {
+    // Preserve the existing one-shot operation identity while sharing its
+    // implementation with retained sessions.
+    var session: ?*abi.PdfSession = null;
+    defer pdfSessionClose(&session);
+    var count: u64 = 0;
+    out_png.* = .{};
+    out_page.* = .{};
+    var status = pdfSessionOpen(&.{
+        .version = request.version,
+        .allocator = request.allocator,
+        .pdf_bytes = request.pdf_bytes,
+        .timeout_ms = request.render_timeout_ms,
+        .max_decoded_stream_bytes = request.max_decoded_stream_bytes,
+        .max_working_set_bytes = request.max_working_set_bytes,
+    }, &session, &count, out_failure);
+    if (status == .ok) status = pdfSessionRenderPng(session.?, &.{
+        .timeout_ms = request.render_timeout_ms,
+        .page_number = request.page_number,
+        .dpi = request.dpi,
+        .sampling = request.sampling,
+        .max_pixels = request.max_pixels,
+        .max_dimension = request.max_dimension,
+    }, out_png, out_page, out_failure);
+    if (status != .ok) out_failure.operation = @backingInt(abi.EnrichmentOperation.render_pdf_page);
+    return status;
+}
+
+/// Use the original backend operations verbatim: text ordering/error skipping,
+/// 72-DPI first-page rendering, exact sampling and default limits remain here.
+pub fn pdfBackend(
+    request: *const abi.PdfBackendRequest,
+    out_bytes: *abi.CallerOwnedBytes,
+    out_failure: *abi.FailureIdentity,
+) callconv(.c) abi.Status {
+    out_bytes.* = .{};
+    out_failure.* = .{};
+    if (request.version != abi.abi_version)
+        return fail(error.InvalidAbiVersion, .pdf_backend, out_failure);
+    const allocator = request.allocator orelse return fail(error.InvalidArgument, .pdf_backend, out_failure);
+    if (!allocator.valid() or (request.pdf_bytes.len != 0 and request.pdf_bytes.ptr == null))
+        return fail(error.InvalidArgument, .pdf_backend, out_failure);
+    const alloc = allocator.asStd();
+    const backend = @import("antfly_pdf").Backend.native();
+    const result = switch (request.operation) {
+        .extract_text => backend.extractText(alloc, request.pdf_bytes.slice()),
+        .render_first_page_png => backend.renderFirstPagePng(alloc, request.pdf_bytes.slice()),
+        _ => return fail(error.InvalidArgument, .pdf_backend, out_failure),
+    } catch |err| return fail(err, .pdf_backend, out_failure);
+    out_bytes.* = .{ .ptr = if (result.len == 0) null else result.ptr, .len = @intCast(result.len) };
     return .ok;
 }
 
@@ -242,4 +415,20 @@ fn fail(
 pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
     if (buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(buffer.len)]);
     buffer.* = .{};
+}
+
+pub fn pipelineMetricsJson(version: u32, out_json: *abi.OwnedBytes) callconv(.c) abi.Status {
+    out_json.* = .{};
+    if (version != 1) return .invalid_abi;
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, @import("antfly_platform").document_pipeline_metrics.snapshot(), .{}) catch |err| return error_identity.statusFromError(err);
+    out_json.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+/// Hidden operation accessors keep unused PDF operations dead-strippable.
+pub fn exportPdfNativeOperations() void {
+    if (@hasDecl(@import("build_options"), "pdf_native_provider") and @import("build_options").pdf_native_provider)
+        @import("pdf_native_provider.zig").exportOperations();
+    if (@hasDecl(@import("build_options"), "image_native_provider") and @import("build_options").image_native_provider)
+        @import("image_native_provider.zig").exportOperations();
 }

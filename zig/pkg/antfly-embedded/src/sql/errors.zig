@@ -33,7 +33,12 @@ pub const Diagnostic = struct {
         if (std.mem.eql(u8, self.code, "42501")) return 403;
         if (std.mem.eql(u8, self.code, "53300") or std.mem.eql(u8, self.code, "55P03")) return 503;
         if (std.mem.startsWith(u8, self.code, "40")) return 409;
-        if (std.mem.eql(u8, self.code, "XX000") or std.mem.eql(u8, self.code, "53200")) return 500;
+        if (std.mem.eql(u8, self.code, "XX000") or std.mem.eql(u8, self.code, "53200") or std.mem.eql(u8, self.code, "58000")) return 500;
+        if (std.mem.eql(u8, self.code, "53100")) return 507;
+        // Refused until an earlier unknown outcome is reconciled.
+        if (std.mem.eql(u8, self.code, "55000")) return 409;
+        // Committed; derived visibility still pending. Not a client error.
+        if (std.mem.eql(u8, self.code, "AF001")) return 202;
         return 400;
     }
 };
@@ -84,6 +89,32 @@ pub fn notNull(context: ?*Context, name: []const u8) anyerror {
 pub fn isRowEvaluationError(err: anyerror) bool {
     const code = describe(err).code;
     return std.mem.startsWith(u8, code, "22") or std.mem.startsWith(u8, code, "21") or err == error.SqlTypeMismatch;
+}
+
+/// Errors whose identity already means "the outcome is unknown".
+pub fn isUnknownOutcome(err: anyerror) bool {
+    return switch (err) {
+        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown => true,
+        else => false,
+    };
+}
+
+/// Classifies a failure that a commit boundary has proved happened before its
+/// decision, so the statement was not applied. Call it only with that proof:
+/// the boundary's state (for example, the primary write not committed and no
+/// checkpoint publication uncertain), never on an error name alone.
+/// Errors that already have a specific diagnostic keep it; their messages
+/// describe a refused statement. An unknown-outcome identity reaching a
+/// proven pre-decision step can only be a refusal caused by an earlier
+/// unresolved commit (sticky publication uncertainty), never this statement's.
+pub fn notApplied(err: anyerror) anyerror {
+    if (isUnknownOutcome(err)) return error.SqlReconciliationRequired;
+    if (!std.mem.eql(u8, describe(err).code, "XX000")) return err;
+    return switch (err) {
+        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
+        error.LiteStorageBudgetExceeded, error.LiteInsufficientDiskSpace, error.NoSpaceLeft, error.DiskQuota => error.SqlMutationNotAppliedNoSpace,
+        else => error.SqlMutationNotApplied,
+    };
 }
 
 pub fn describe(err: anyerror) Diagnostic {
@@ -215,7 +246,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlTruncateExternalForeignKey => .{ .code = "0A000", .message = "TRUNCATE cannot yet retire inverse foreign-key witnesses on an untouched parent.", .hint = "Use DELETE, or explicitly truncate a complete dependency cohort. No barrier was admitted.", .retryable = false },
         error.RelationalCheckViolation => .{ .code = "23514", .message = "The mutation violates a check constraint.", .hint = "Change the row values to satisfy the table's check constraints.", .retryable = false },
         error.StoredDestinationAuthorizationRevoked => .{ .code = "42501", .message = "The durable credential no longer authorizes this SQL operation.", .hint = "Use a current Basic or API-key credential with whole-table admin permission before retrying DDL.", .retryable = false },
-        error.Forbidden, error.Unauthorized, error.AccessDenied => .{ .code = "42501", .message = "Permission denied for this SQL operation.", .hint = "Check the current credential and permissions for every affected table.", .retryable = false },
+        error.Forbidden, error.Unauthorized, error.AccessDenied, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => .{ .code = "42501", .message = "Permission denied for this SQL operation.", .hint = "Check the current credential and permissions for every affected table.", .retryable = false },
         error.InvalidSqlBinaryRepresentation => .{ .code = "22P03", .message = "A binary SQL value has invalid framing or payload.", .hint = "Use the declared PostgreSQL type and a complete binary value." },
         error.SqlBinaryTypeMismatch => .{ .code = "42804", .message = "The binary value's element type differs from the declared SQL type.", .hint = "Encode the parameter using its declared element type." },
         error.SqlUntranslatableCharacter => .{ .code = "22P05", .message = "SQL TEXT and JSONB strings and object keys cannot contain NUL (U+0000).", .hint = "Remove NUL characters or replace them with U+FFFD before binding.", .retryable = false },
@@ -223,6 +254,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidRegularExpression => .{ .code = "2201B", .message = "The regular expression is invalid.", .hint = "Use PostgreSQL-compatible regular expression syntax." },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
+        error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.CypherValueDepthExceeded, error.CypherPathBudgetExceeded, error.CypherRecursionBudgetExceeded => .{ .code = "54000", .message = "The graph query exceeds an operator execution limit.", .hint = "Narrow the graph anchors, bound traversal, or reduce retained and intermediate results.", .retryable = false },
         error.SqlWorkingMemoryLimitExceeded => .{ .code = "54000", .message = "The statement exceeds its working-memory limit (default: 256 MiB, 268435456 bytes).", .hint = "Reduce the number and size of simultaneously retained rows or increase the runtime retained-byte limit.", .retryable = false },
         error.SqlRequestTooLarge => .{ .code = "54000", .message = "The SQL JSON request exceeds the 64 MiB (67108864 byte) limit.", .hint = "Reduce the statement and parameter payload size.", .retryable = false },
         error.SqlProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
@@ -230,14 +262,22 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlNegativeOffset => .{ .code = "2201X", .message = "OFFSET must not be negative." },
         error.InvalidSqlLimit => .{ .code = "54000", .message = "The SQL execution limit is invalid.", .hint = "Choose execution limits within the configured capacity." },
         error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.Timeout => .{ .code = "57014", .message = "The SQL operation was canceled or its deadline expired.", .hint = "Reduce the operation's work or choose a suitable deadline." },
-        error.CatalogGenerationChanged, error.PreparedGenerationChanged, error.GenerationRetired, error.IntegrityCatalogChanged => .{ .code = "40001", .message = "The table definition changed before the statement could complete.", .hint = "Prepare the statement again against the current schema.", .retryable = true },
+        error.CatalogGenerationChanged, error.PreparedGenerationChanged, error.GenerationRetired, error.IntegrityCatalogChanged, error.RowPolicyCatalogChanged => .{ .code = "40001", .message = "The table or policy definition changed before the statement could complete.", .hint = "Prepare the statement again against the current schema and policies.", .retryable = true },
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
+        // These identities are assigned only at a commit boundary that has
+        // proved the statement was not applied (see `notApplied`).
+        error.SqlMutationNotAppliedBusy => .{ .code = "55P03", .message = "The database was busy with competing work; the statement was not applied.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
+        error.SqlMutationNotAppliedNoSpace => .{ .code = "53100", .message = "The database has no storage capacity left for this statement; it was not applied.", .hint = "Free disk space or raise the storage budget, then retry.", .retryable = false },
+        error.SqlMutationNotApplied => .{ .code = "58000", .message = "The statement failed before it committed; it was not applied.", .hint = "It is safe to retry; if the failure repeats, contact the operator.", .retryable = true },
+        error.PreDecisionDeadlineExceeded => .{ .code = "57014", .message = "The statement's deadline expired before it committed; nothing was applied.", .hint = "Retry with a longer deadline.", .retryable = true },
+        error.OutcomeReconciliationRequired, error.SqlReconciliationRequired => .{ .code = "55000", .message = "An earlier commit's outcome is unresolved; this statement was not applied.", .hint = "Reconcile the earlier receipt. Lite connections recover on their next call; other handles must reopen the database.", .retryable = false },
+        error.CommitVisibilityNotSatisfied, error.CommitPropagationIncomplete => .{ .code = "AF001", .message = "The mutation committed, but its derived visibility is still pending.", .hint = "Do not replay the statement.", .retryable = false },
         error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
-        error.SqlStatementReadUnavailable => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
+        error.SqlStatementReadUnavailable, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.ReadIndexTimeout, error.EnrichmentRetryInProgress, error.CypherSnapshotNotReady, error.CypherSnapshotRequired, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.EnrichmentSourceChanged, error.ArtifactPublicationPending, error.ArtifactCatalogDrift, error.IndexRebuilding => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
-        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
+        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
         error.OutOfMemory => .{ .code = "53200", .message = "The server could not reserve enough memory for this SQL operation.", .hint = "Reduce result size or concurrent load." },
         else => .{ .code = "XX000", .message = "The SQL operation could not be completed because of an internal error.", .hint = "Contact the operator with the request or transaction receipt; do not assume a failed mutation was rolled back." },
     };
@@ -251,6 +291,15 @@ pub fn message(err: anyerror, buffer: []u8) []const u8 {
     return std.fmt.bufPrint(buffer, "{s} {s}", .{ value.message, hint }) catch value.message;
 }
 
+test "SQL graph readiness failures preserve retryable statement diagnostics" {
+    for ([_]anyerror{ error.EnrichmentRetryInProgress, error.CypherSnapshotNotReady, error.CypherSnapshotRequired }) |err| {
+        const result = describe(err);
+        try std.testing.expectEqualStrings("53300", result.code);
+        try std.testing.expectEqual(@as(u16, 503), result.httpStatus());
+        try std.testing.expectEqual(@as(?bool, true), result.retryable);
+    }
+}
+
 test "SQL diagnostics retain definite constraints conflicts and unknown outcomes" {
     try std.testing.expectEqual(@as(u16, 503), describe(error.SqlStatementReadUnavailable).httpStatus());
     try std.testing.expectEqual(@as(u16, 503), describe(error.FileBusy).httpStatus());
@@ -260,9 +309,17 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.RelationalCheckViolation, .code = "23514", .retryable = false },
         .{ .err = error.SqlNotNullViolation, .code = "23502", .retryable = false },
         .{ .err = error.PreparedReadSetChanged, .code = "40001", .retryable = true },
+        .{ .err = error.RowPolicyCatalogChanged, .code = "40001", .retryable = true },
+        .{ .err = error.RowPolicyDenied, .code = "42501", .retryable = false },
+        .{ .err = error.RowPolicyAuthenticationRequired, .code = "42501", .retryable = false },
         .{ .err = error.FileBusy, .code = "55P03", .retryable = true },
         .{ .err = error.WouldBlock, .code = "55P03", .retryable = true },
         .{ .err = error.SqlStatementReadUnavailable, .code = "53300", .retryable = true },
+        .{ .err = error.PrivacyStale, .code = "53300", .retryable = true },
+        .{ .err = error.EnrichmentSourceChanged, .code = "53300", .retryable = true },
+        .{ .err = error.ArtifactPublicationPending, .code = "53300", .retryable = true },
+        .{ .err = error.ArtifactCatalogDrift, .code = "53300", .retryable = true },
+        .{ .err = error.PrivacyPublicationPending, .code = "53300", .retryable = true },
         .{ .err = error.TableTopologyProtocolUpgradeRequired, .code = "53300", .retryable = true },
         .{ .err = error.SettingAuthorityUnavailable, .code = "53300", .retryable = false },
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
@@ -279,6 +336,18 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         try std.testing.expect(value.hint != null);
         try std.testing.expect(std.mem.indexOf(u8, value.message, @errorName(case.err)) == null);
     }
+}
+
+test "SQL graph owner admission failures retain retryable read diagnostics" {
+    for ([_]anyerror{ error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.ReadIndexTimeout }) |failure| {
+        const diagnostic = describe(failure);
+        try std.testing.expectEqualStrings("53300", diagnostic.code);
+        try std.testing.expectEqual(@as(u16, 503), diagnostic.httpStatus());
+        try std.testing.expectEqual(@as(?bool, true), diagnostic.retryable);
+    }
+    try std.testing.expectEqualStrings("42501", describe(error.Forbidden).code);
+    try std.testing.expectEqualStrings("57014", describe(error.DeadlineExceeded).code);
+    try std.testing.expectEqual(@as(?bool, false), describe(error.SqlMutationOutcomeUnknown).retryable);
 }
 
 test "SQL FK decoder upgrade is definite nonadmission not an ambiguous DDL outcome" {

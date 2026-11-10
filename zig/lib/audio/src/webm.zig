@@ -641,156 +641,175 @@ const TimelineSink = struct {
 
 /// Immutable timeline spans over exact codec windows, including pause gaps,
 /// codec delay and container tail padding. No decoded PCM is retained.
-pub const WindowIndex = struct {
-    const Span = struct { first: usize, source: usize, count: usize };
-    const CodecIndex = union(enum) { opus: opus.WindowIndex, vorbis: vorbis.WindowIndex };
-    allocator: std.mem.Allocator,
-    codec: CodecIndex,
-    spans: []Span,
-    samples: usize,
-    sample_rate: u32,
-    channels: u8,
-    pub fn init(a: std.mem.Allocator, bytes: []const u8, max_packets: usize) !WindowIndex {
-        var demuxed = try demux(a, bytes);
-        defer demuxed.deinit();
-        if (demuxed.access_units.len == 0 or demuxed.access_units.len > max_packets) return error.UnsupportedStreamingAudioProfile;
-        const counts = try a.alloc(usize, demuxed.access_units.len);
-        defer a.free(counts);
-        var codec: CodecIndex = undefined;
-        var delay: usize = 0;
-        var rate: u32 = 48000;
-        var channels: u8 = 0;
-        var total: usize = 0;
-        switch (demuxed.codec) {
-            .opus => {
-                var head = try opus.parseHead(demuxed.codec_private);
-                head.pre_skip = effectiveOpusPreSkip(head.pre_skip, demuxed.codec_delay_ns);
-                delay = head.pre_skip;
-                channels = head.channels;
-                const packets = try a.alloc([]u8, demuxed.access_units.len);
-                errdefer a.free(packets);
-                var initialized: usize = 0;
-                errdefer for (packets[0..initialized]) |packet| a.free(packet);
-                const tocs = try a.alloc(opus.Toc, packets.len);
-                errdefer a.free(tocs);
-                const raw_counts = try a.alloc(u16, packets.len);
-                errdefer a.free(raw_counts);
-                var raw_total: u64 = 0;
-                var skip: usize = head.pre_skip;
-                for (packets, tocs, raw_counts, counts, demuxed.access_units) |*packet, *toc, *raw_count, *count, unit| {
-                    if (unit.len == 0) return error.UnsupportedAudioFormat;
-                    packet.* = try a.dupe(u8, unit);
-                    initialized += 1;
-                    toc.* = try opus.parseToc(unit[0]);
-                    raw_count.* = try opus.packetSamples(unit, 48000);
-                    const drop = @min(skip, raw_count.*);
-                    skip -= drop;
-                    count.* = raw_count.* - drop;
-                    raw_total += raw_count.*;
-                    total = try std.math.add(usize, total, count.*);
+pub const WindowIndex = WindowIndexFor(opus.WindowIndex);
+pub fn WindowIndexFor(comptime OpusIndex: type) type {
+    return struct {
+        const Self = @This();
+        const Span = struct { first: usize, source: usize, count: usize };
+        const CodecIndex = union(enum) { opus: OpusIndex, vorbis: vorbis.WindowIndex };
+        allocator: std.mem.Allocator,
+        codec: CodecIndex,
+        spans: []Span,
+        samples: usize,
+        sample_rate: u32,
+        channels: u8,
+        retained_owner: ?OpusIndex = null,
+        pub fn init(a: std.mem.Allocator, bytes: []const u8, max_packets: usize) !Self {
+            const Builder = struct {
+                fn build(_: @This(), alloc: std.mem.Allocator, demuxed: opus.Demuxed, max: usize) !OpusIndex {
+                    return OpusIndex.build(alloc, demuxed, max);
                 }
-                const owned = opus.Demuxed{ .header = head, .packets = packets, .packet_tocs = tocs, .packet_sample_counts = raw_counts, .total_decoded_frames = raw_total, .playable_frames = total, .discard_padding_frames = 0, .allocator = a };
-                codec = .{ .opus = try opus.WindowIndex.build(a, owned, max_packets) };
-            },
-            .vorbis => {
-                const packets = try buildOggPackets(a, try splitXiphLacedTriple(demuxed.codec_private), demuxed.access_units);
-                defer {
-                    for (packets) |packet| a.free(packet.bytes);
-                    a.free(packets);
+            };
+            return initWithBuilder(a, bytes, max_packets, Builder{});
+        }
+        pub fn initWithBuilder(a: std.mem.Allocator, bytes: []const u8, max_packets: usize, builder: anytype) !Self {
+            var demuxed = try demux(a, bytes);
+            defer demuxed.deinit();
+            if (demuxed.access_units.len == 0 or demuxed.access_units.len > max_packets) return error.UnsupportedStreamingAudioProfile;
+            const counts = try a.alloc(usize, demuxed.access_units.len);
+            defer a.free(counts);
+            var codec: CodecIndex = undefined;
+            var delay: usize = 0;
+            var rate: u32 = 48000;
+            var channels: u8 = 0;
+            var total: usize = 0;
+            switch (demuxed.codec) {
+                .opus => {
+                    var head = try opus.parseHead(demuxed.codec_private);
+                    head.pre_skip = effectiveOpusPreSkip(head.pre_skip, demuxed.codec_delay_ns);
+                    delay = head.pre_skip;
+                    channels = head.channels;
+                    const packets = try a.alloc([]u8, demuxed.access_units.len);
+                    errdefer a.free(packets);
+                    var initialized: usize = 0;
+                    errdefer for (packets[0..initialized]) |packet| a.free(packet);
+                    const tocs = try a.alloc(opus.Toc, packets.len);
+                    errdefer a.free(tocs);
+                    const raw_counts = try a.alloc(u16, packets.len);
+                    errdefer a.free(raw_counts);
+                    var raw_total: u64 = 0;
+                    var skip: usize = head.pre_skip;
+                    for (packets, tocs, raw_counts, counts, demuxed.access_units) |*packet, *toc, *raw_count, *count, unit| {
+                        if (unit.len == 0) return error.UnsupportedAudioFormat;
+                        packet.* = try a.dupe(u8, unit);
+                        initialized += 1;
+                        toc.* = try opus.parseToc(unit[0]);
+                        raw_count.* = try opus.packetSamples(unit, 48000);
+                        const drop = @min(skip, raw_count.*);
+                        skip -= drop;
+                        count.* = raw_count.* - drop;
+                        raw_total += raw_count.*;
+                        total = try std.math.add(usize, total, count.*);
+                    }
+                    const owned = opus.Demuxed{ .header = head, .packets = packets, .packet_tocs = tocs, .packet_sample_counts = raw_counts, .total_decoded_frames = raw_total, .playable_frames = total, .discard_padding_frames = 0, .allocator = a };
+                    codec = .{ .opus = try builder.build(a, owned, max_packets) };
+                },
+                .vorbis => {
+                    const packets = try buildOggPackets(a, try splitXiphLacedTriple(demuxed.codec_private), demuxed.access_units);
+                    defer {
+                        for (packets) |packet| a.free(packet.bytes);
+                        a.free(packets);
+                    }
+                    const index = try vorbis.WindowIndex.initPackets(a, packets, max_packets);
+                    codec = .{ .vorbis = index };
+                    rate = index.demuxed.headers.identification.sample_rate;
+                    channels = index.demuxed.headers.identification.channels;
+                    total = index.samples;
+                    delay = @max(nsToFrames(demuxed.codec_delay_ns, rate), index.demuxed.audio_packets[0].decoded_sample_count);
+                    for (index.demuxed.audio_packets, counts, 0..) |packet, *count, i| count.* = if (i == 0) 0 else packet.decoded_sample_count;
+                },
+                else => return error.UnsupportedStreamingAudioProfile,
+            }
+            errdefer switch (codec) {
+                inline else => |*index| index.deinit(),
+            };
+            var spans = std.ArrayList(Span).empty;
+            errdefer spans.deinit(a);
+            var cursor: usize = 0;
+            var source: usize = 0;
+            var inserted: usize = 0;
+            for (counts, demuxed.access_unit_times_ns) |count, time| {
+                const wanted = nsToFrames(time, rate) -| delay;
+                if (wanted > cursor + @max(1, rate / 1000)) {
+                    inserted = try std.math.add(usize, inserted, wanted - cursor);
+                    if (inserted > max_timeline_silence_seconds * rate) return error.UnsupportedAudioFormat;
+                    cursor = wanted;
                 }
-                const index = try vorbis.WindowIndex.initPackets(a, packets, max_packets);
-                codec = .{ .vorbis = index };
-                rate = index.demuxed.headers.identification.sample_rate;
-                channels = index.demuxed.headers.identification.channels;
-                total = index.samples;
-                delay = @max(nsToFrames(demuxed.codec_delay_ns, rate), index.demuxed.audio_packets[0].decoded_sample_count);
-                for (index.demuxed.audio_packets, counts, 0..) |packet, *count, i| count.* = if (i == 0) 0 else packet.decoded_sample_count;
-            },
-            else => return error.UnsupportedStreamingAudioProfile,
-        }
-        errdefer switch (codec) {
-            inline else => |*index| index.deinit(),
-        };
-        var spans = std.ArrayList(Span).empty;
-        errdefer spans.deinit(a);
-        var cursor: usize = 0;
-        var source: usize = 0;
-        var inserted: usize = 0;
-        for (counts, demuxed.access_unit_times_ns) |count, time| {
-            const wanted = nsToFrames(time, rate) -| delay;
-            if (wanted > cursor + @max(1, rate / 1000)) {
-                inserted = try std.math.add(usize, inserted, wanted - cursor);
-                if (inserted > max_timeline_silence_seconds * rate) return error.UnsupportedAudioFormat;
-                cursor = wanted;
+                const available = @min(count, total -| source);
+                if (available != 0) {
+                    if (spans.items.len != 0 and spans.items[spans.items.len - 1].first + spans.items[spans.items.len - 1].count == cursor and spans.items[spans.items.len - 1].source + spans.items[spans.items.len - 1].count == source) {
+                        spans.items[spans.items.len - 1].count += available;
+                    } else try spans.append(a, .{ .first = cursor, .source = source, .count = available });
+                }
+                source += available;
+                cursor = try std.math.add(usize, cursor, available);
             }
-            const available = @min(count, total -| source);
-            if (available != 0) {
-                if (spans.items.len != 0 and spans.items[spans.items.len - 1].first + spans.items[spans.items.len - 1].count == cursor and spans.items[spans.items.len - 1].source + spans.items[spans.items.len - 1].count == source) {
-                    spans.items[spans.items.len - 1].count += available;
-                } else try spans.append(a, .{ .first = cursor, .source = source, .count = available });
+            if (source < total) {
+                try spans.append(a, .{ .first = cursor, .source = source, .count = total - source });
+                cursor = try std.math.add(usize, cursor, total - source);
             }
-            source += available;
-            cursor = try std.math.add(usize, cursor, available);
+            const trim = if (demuxed.discard_padding_ns > 0) nsToFrames(@intCast(demuxed.discard_padding_ns), rate) else 0;
+            return .{ .allocator = a, .codec = codec, .spans = try spans.toOwnedSlice(a), .samples = if (trim < cursor) cursor - trim else cursor, .sample_rate = rate, .channels = channels };
         }
-        if (source < total) {
-            try spans.append(a, .{ .first = cursor, .source = source, .count = total - source });
-            cursor = try std.math.add(usize, cursor, total - source);
+        pub fn deinit(self: *Self) void {
+            const a = self.allocator;
+            const spans = self.spans;
+            var retained = self.retained_owner;
+            a.free(spans);
+            switch (self.codec) {
+                inline else => |*index| index.deinit(),
+            }
+            if (retained) |*owner| owner.deinit();
         }
-        const trim = if (demuxed.discard_padding_ns > 0) nsToFrames(@intCast(demuxed.discard_padding_ns), rate) else 0;
-        return .{ .allocator = a, .codec = codec, .spans = try spans.toOwnedSlice(a), .samples = if (trim < cursor) cursor - trim else cursor, .sample_rate = rate, .channels = channels };
-    }
-    pub fn deinit(self: *WindowIndex) void {
-        switch (self.codec) {
-            inline else => |*index| index.deinit(),
+        pub fn copy(self: Self, a: std.mem.Allocator) !Self {
+            const spans = try a.dupe(Span, self.spans);
+            errdefer a.free(spans);
+            return .{ .allocator = a, .codec = switch (self.codec) {
+                .opus => |index| .{ .opus = try index.copy(a) },
+                .vorbis => |index| .{ .vorbis = try index.copy(a) },
+            }, .spans = spans, .samples = self.samples, .sample_rate = self.sample_rate, .channels = self.channels };
         }
-        self.allocator.free(self.spans);
-    }
-    pub fn copy(self: WindowIndex, a: std.mem.Allocator) !WindowIndex {
-        return .{ .allocator = a, .codec = switch (self.codec) {
-            .opus => |index| .{ .opus = try index.copy(a) },
-            .vorbis => |index| .{ .vorbis = try index.copy(a) },
-        }, .spans = try a.dupe(Span, self.spans), .samples = self.samples, .sample_rate = self.sample_rate, .channels = self.channels };
-    }
-    pub fn estimatedBytes(self: WindowIndex) usize {
-        return self.spans.len *| @sizeOf(Span) +| switch (self.codec) {
-            inline else => |index| index.estimatedBytes(),
-        };
-    }
-    pub fn visitWindow(self: *const WindowIndex, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink) !void {
-        if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
-        var lo: usize = 0;
-        var hi = self.spans.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.spans[mid].first + self.spans[mid].count <= first) lo = mid + 1 else hi = mid;
+        pub fn estimatedBytes(self: Self) usize {
+            return self.spans.len *| @sizeOf(Span) +| switch (self.codec) {
+                inline else => |index| index.estimatedBytes(),
+            };
         }
-        var cursor = first;
-        const zeros: [2048]f32 = @splat(0);
-        for (self.spans[lo..]) |span| {
-            if (span.first >= last) break;
-            try @import("work_control.zig").check();
-            while (cursor < @min(last, span.first)) {
-                const count = @min(@min(last, span.first) - cursor, zeros.len / self.channels);
+        pub fn visitWindow(self: *const Self, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink) !void {
+            if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
+            var lo: usize = 0;
+            var hi = self.spans.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.spans[mid].first + self.spans[mid].count <= first) lo = mid + 1 else hi = mid;
+            }
+            var cursor = first;
+            const zeros: [2048]f32 = @splat(0);
+            for (self.spans[lo..]) |span| {
+                if (span.first >= last) break;
+                try @import("work_control.zig").check();
+                while (cursor < @min(last, span.first)) {
+                    const count = @min(@min(last, span.first) - cursor, zeros.len / self.channels);
+                    try sink.push(zeros[0 .. count * self.channels], self.sample_rate, self.channels);
+                    cursor += count;
+                }
+                const begin = @max(cursor, span.first);
+                const end = @min(last, span.first + span.count);
+                if (end > begin) {
+                    switch (self.codec) {
+                        inline else => |*index| try index.visitWindow(a, span.source + begin - span.first, span.source + end - span.first, sink),
+                    }
+                    cursor = end;
+                }
+            }
+            while (cursor < last) {
+                try @import("work_control.zig").check();
+                const count = @min(last - cursor, zeros.len / self.channels);
                 try sink.push(zeros[0 .. count * self.channels], self.sample_rate, self.channels);
                 cursor += count;
             }
-            const begin = @max(cursor, span.first);
-            const end = @min(last, span.first + span.count);
-            if (end > begin) {
-                switch (self.codec) {
-                    inline else => |*index| try index.visitWindow(a, span.source + begin - span.first, span.source + end - span.first, sink),
-                }
-                cursor = end;
-            }
         }
-        while (cursor < last) {
-            try @import("work_control.zig").check();
-            const count = @min(last - cursor, zeros.len / self.channels);
-            try sink.push(zeros[0 .. count * self.channels], self.sample_rate, self.channels);
-            cursor += count;
-        }
-    }
-};
+    };
+}
 
 pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
     var demuxed = try demux(a, bytes);

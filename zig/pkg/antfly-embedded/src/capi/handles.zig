@@ -59,10 +59,19 @@ pub const Handle = struct {
     parent_handle: ?*Handle = null,
     table_handles: std.ArrayList(*anyopaque) = .empty,
     sql_decision_uncertain: bool = false,
+    /// Outcome-receipt writer for exported writes on this database handle.
+    outcome_writer: @import("outcome_receipts.zig").Writer = .{},
     // New generations inspect durable recovery once. Every job producer dirties
     // these flags before admission, including uncertain publication outcomes.
     sql_commit_recovery_needed: bool = true,
     sql_ddl_recovery_needed: bool = true,
+    sql_ddl_recovery_generation: [16]u8 = @splat(0),
+    sql_ddl_agenda_after: [128]u8 = @splat(0),
+    sql_ddl_agenda_after_len: u8 = 0,
+    sql_ddl_recovering: bool = false,
+    sql_ddl_agenda_scan_generation: [16]u8 = @splat(0),
+    sql_ddl_agenda_scan_started: bool = false,
+    sql_ddl_agenda_scan_complete: bool = true,
     sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     maintenance_references: usize = 0,
@@ -74,6 +83,9 @@ pub const Handle = struct {
     /// Live coordinator only; detached provider snapshots never drive groups.
     lite_scheduling_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
+    /// Scope and start of the current maintenance writer hold (statistics).
+    maintenance_writer_scope: u8 = 0,
+    maintenance_writer_held_from: i96 = 0,
     maintenance_writer_references: usize = 0,
     maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
@@ -129,6 +141,10 @@ pub const Handle = struct {
     query_producer_mutex: std.Io.Mutex = .init,
     /// Protected by the native path gate; pins provider and extractor lifetime.
     query_borrows: usize = 0,
+    /// Borrowers executing against this root's immutable catalog and indexes.
+    /// The path gate protects this count; refresh must replace rather than
+    /// mutate a root while any such borrower remains.
+    immutable_query_borrows: usize = 0,
 
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads
@@ -141,6 +157,7 @@ pub const Handle = struct {
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
     sql_commit_mutex: std.Io.Mutex = .init,
+    sql_preparation: @import("sql.zig").PreparationAdmission = .{},
 
     pub fn database(self: *Handle) *db_mod.DB {
         return self.selected_db orelse &self.db;
@@ -256,6 +273,8 @@ pub fn closeHandle(handle: *Handle) void {
         }
     }
     invalidateQueryProducer(handle);
+    // Uncertain directory-handle commits settle on the next open.
+    handle.outcome_writer.deinit();
     if (handle.lite_connection) |connection| {
         connection.close();
         handle.alloc.destroy(handle);
@@ -1419,6 +1438,7 @@ pub fn fillDateHistogramBucketKeys(
 
     var current = first_key;
     while (current <= last_key) {
+        if (keys.items.len >= 10000) return error.QueryCandidateBudgetExceeded;
         try keys.append(alloc, current);
         const next = try nextDateHistogramBucketKey(current, interval);
         if (next <= current) break;
@@ -1435,6 +1455,8 @@ pub fn nextDateHistogramBucketKey(current: u64, interval: search_agg_mod.DateInt
         .week => current + 7 * std.time.ns_per_day,
         .month => try addCalendarMonths(current, 1),
         .year => try addCalendarYears(current, 1),
+        .quarter => try addCalendarMonths(current, 3),
+        .fixed => |spec| std.math.add(u64, current, spec.every_ns) catch return error.InvalidAggregation,
     };
 }
 
@@ -1493,47 +1515,11 @@ pub fn extractTimestampFieldFromStoredJson(alloc: Allocator, raw_json: []const u
 }
 
 pub fn parseDateInterval(request: JsonSearchAggregationRequest) !search_agg_mod.DateInterval {
-    const value = if (request.calendar_interval.len > 0) request.calendar_interval else request.fixed_interval;
-    if (std.mem.eql(u8, value, "minute") or std.mem.eql(u8, value, "1m")) return .minute;
-    if (std.mem.eql(u8, value, "hour") or std.mem.eql(u8, value, "1h")) return .hour;
-    if (std.mem.eql(u8, value, "day") or std.mem.eql(u8, value, "1d")) return .day;
-    if (std.mem.eql(u8, value, "week") or std.mem.eql(u8, value, "1w")) return .week;
-    if (std.mem.eql(u8, value, "month")) return .month;
-    if (std.mem.eql(u8, value, "year")) return .year;
-    return error.UnsupportedAggregation;
+    return search_agg_mod.parseDateInterval(request.calendar_interval, request.fixed_interval, "");
 }
 
 pub fn parseRfc3339ToNs(text: []const u8) !?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
+    return @import("../datetime.zig").parseRfc3339ToNs(text);
 }
 
 pub fn daysFromCivil(year: i64, month: i64, day: i64) i64 {

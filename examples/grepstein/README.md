@@ -161,22 +161,54 @@ separate; it needs read access to the originals bucket.
 ./grepstein publish --state ./grepstein-corpus --bucket antfly-showcases-originals
 # Set ANTFLY_API_KEY securely to a write key for this instance/table.
 ./grepstein load --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --create-table --num-shards 4 --reader-config lightonocr-reader.example.json \
+  --create-table --num-shards 4 --source-connection "$GCS_SOURCE_CONNECTION" \
+  --reader-config lightonocr-reader.example.json \
   --inference-url "$ANTFLY_INFERENCE_URL" \
   --inference-secret antfly.antfly_inference.api_key
 ./grepstein wait --url "$ANTFLY_URL"
+./grepstein qualify --state ./grepstein-corpus --url "$ANTFLY_URL" \
+  --output ./grepstein-corpus/extraction-qualification.json
 ./grepstein stats --state ./grepstein-corpus --url "$ANTFLY_URL"
 ```
 
+`wait` checks index serving milestones. `qualify` separately checks every PDF in
+the sealed publication against its native generation-pinned GCS artifact, exact
+page count and explicit OCR counters from the raw extraction manifest. With API
+authentication enabled, `qualify` needs a table-admin key to read that raw evidence.
+Failed or unfinished extraction, missing counters, stale source bindings or any
+OCR failure block qualification, even when full-text search is ready. Run it
+before semantic/graph enrichment; a successful receipt measures extraction
+coverage, not OCR transcription accuracy, source authorization or public readiness.
+
 The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
-inference, running Antfly v0.3.0-rc.5 or later. Its native `/read` contract uses
-an image-only prompt, so the extraction producer keeps `prompt_policy: plain`.
-The profile requests at most 1024 output tokens per page; truncated OCR returns
-an error instead of publishing incomplete text. Dense pages can need a separate
-larger-budget `/generate` workflow. Shared inference also offers the smaller
-`lightonocr3-0.8b` model; select its pinned identity in a copy of the reader profile
-when qualifying the latency/quality tradeoff. The LightOnOCR models return
+inference. Qualify both reader sizes on the deployed pool and run a representative
+PDF pilot before backfill. Its native `/read` contract uses
+an image-only prompt; the extraction producer sends no prompt to readers.
+The profile requests at most 2048 output tokens per page. A cached dense DOJ
+page exceeded the earlier 512-token allowance; both reader checkpoints completed
+it at 2048 and retained the checked page-tail text. This is a bounded sample,
+not a completeness guarantee for every page. The serving policy must permit
+`resources.inference.request_limits.max_output_tokens_per_item: 2048` and at
+least 12 `resources.inference.admission.max_work_units` for one image-only
+request. Keep request concurrency at one while qualifying the intended GPU and
+memory limits. The deployed 512-token/eight-unit policy needs a separately
+reviewed update before this profile can be used there.
+Truncated OCR returns an error instead of publishing incomplete text. Do not
+count failed or truncated pages as searchable. Complete the
+[release qualification](../../docs/design/inference/grepstein-release-qualification.md)
+before backfill or enrichment. `zig/tools/qualify_reader_generator_pools.py`
+uses a 512-token reader policy by default; pass
+`--reader-max-output-tokens 2048` to check the larger serving ceiling and its
+exact rejection boundary. Its synthetic pass does not establish corpus coverage.
+The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
+`ocr.render.sampling` defaults to `auto`: smooth continuous-tone PDF images
+and retain one-bit scan coverage. Use `pdf` to preserve PDF interpolation rules,
+or `smooth` to explicitly interpolate one-bit image color too (which can blur
+thin strokes). Model resizing, DPI and resource caps remain independent. Native
+unit and chunk provenance records the versioned rendering policy. A completed
+decode is not proof of transcription accuracy; compare visible text before backfill.
+
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
 `--inference-url` binds the LightOnOCR profile and relation extractor to that endpoint.
 The Cloud connection uses the existing `antfly.antfly_inference.api_key` server
@@ -200,8 +232,7 @@ The relation stage defaults to pinned `fastino/gliner2.5-base-v1`, with entity a
 relation schemas and bounded long-document windowing. Colony must deploy its
 GLiNER2.5 and LightOnOCR GPU routes before the hosted pipeline is qualified. CUDA
 kernels alone do not qualify the GLiNER2.5 serving policy: use a runtime with
-measured CUDA production profiles, then verify the deployed L4 path. RC.2 rejects
-GLiNER2.5 CUDA. Preserve the existing GLiNER2 route for other callers.
+measured CUDA production profiles, then verify the deployed L4 path. Preserve the existing GLiNER2 route for other callers.
 
 For semantic backfill, use `--embedder-config antfly-embedder.example.json` to select
 EmbeddingGemma 2 with 768 dimensions consistently across enrichment and the index.
@@ -218,16 +249,20 @@ truncated/blocked model completions and preserve all final Vertex text parts. In
 publication can be rerun. Keep the state and immutable source snapshots for
 recovery. No local source server is required after publication.
 
-V1 uses Antfly's **existing S3-compatible remote-content reader against GCS's
-XML endpoint**: source rows use `s3://BUCKET/objects/sha256/...`. They are GCS
-objects, not AWS objects. Configure a bucket-scoped GCS HMAC read credential in
-Colony's existing S3 provider connection, endpoint `storage.googleapis.com`, SSL
-enabled, with `buckets: ["antfly-showcases-originals"]`. Colony already publishes
-these credentials to Antfly's secret store and hot-reloaded remote-content
-configuration. Keep HMAC material out of manifests, index configs, and Pulumi
-state. Self-hosted deployments configure that same bucket-scoped `remote_content.s3`
-entry with secret references. Direct `gs://` remote artifact fetching is not added
-by this example; the existing GCS source connector uses the JSON API separately.
+Native artifact reads use `gs://BUCKET/objects/sha256/...?generation=GENERATION`
+through an existing `connections` entry with protocol `gcs`, capability
+`content.fetch`, an exact bucket allowlist and prefix `objects/sha256`.
+Set `GCS_SOURCE_CONNECTION` to that runtime connection name. In Cloud, configure
+the existing instance GCS provider connection with Google Workload Identity,
+read-only access, the bucket and prefix; Colony seals this selector and publishes
+the scoped runtime connection. Grant only the instance's Kubernetes Workload
+Identity principal `roles/storage.objectViewer` on the originals bucket.
+Self-hosting uses the same canonical connection with ADC or a keystore-backed
+Google credential source. A bare `gs://` URL never enables ambient access.
+No HMAC keys or organization-policy exceptions are required.
+
+Keep the corpus private until the deployed runtime passes generation, scope
+and real-PDF OCR checks for native artifact downloads.
 
 `load` defaults to full text only and resumes durable batches against the exact
 manifest, endpoint, table identity, and extraction configuration. Reuse the same
@@ -236,11 +271,8 @@ checkpoint. `wait` requires complete and queryable aggregate **and shard**
 readiness; successful submission alone is not success. `grep` and `graph` also
 check artifact generations and unit inventories before publishing derived data.
 
-The Cloud default `v0.2.5` runtime lacks the stable `table_id` required by resumable
-loading. The dedicated showcase was upgraded to digest-pinned `v0.3.0-rc.2` and
-its stable table identity was verified live. Live testing
-accepts the corrected combined table request, including the public schema's
-`simple` text analyzer. The server creates its system-owned default text index;
+Resumable loading requires a stable `table_id` and a table schema with the
+`simple` text analyzer. Verify both on the target instance. The server creates its system-owned default text index;
 the client declares only its named artifact index. Native PDF extraction works,
 but that is insufficient qualification of the complete load. Qualify the
 actual load, readiness, and artifact contracts before importing the corpus. Do
@@ -266,9 +298,8 @@ The stable Google model ID is not `gemini-embedding-002`. The native adapter use
 the model does not accept the older `task_type` request field. Binary media
 remains in raw storage; this stage embeds the selected PDFs' native text chunks.
 
-The exact `v0.3.0-rc.2` image predates this adapter correction. Keep semantic
-enrichment disabled until a reviewed runtime containing it is deployed and a
-live query/document embedding probe succeeds. Do not silently substitute the
+Enable semantic enrichment after query and document embedding probes succeed
+on the deployed runtime. Do not silently substitute the
 older `gemini-embedding-001` model. OCR has its separate native reader profile;
 both providers require the remote worker's scoped Vertex Workload Identity.
 The OCR profile explicitly pins its modern model and `global` location. Stored
@@ -308,47 +339,35 @@ rejects image requests whose spend cannot be bounded. Do not point an OCR reader
 at that gateway and assume it works. Managed image billing/capability qualification,
 BYO Vertex connection UI/CLI, and Document AI OCR are separate follow-ups.
 
-## Canonical grep in Cloud
+## Native artifact grep
 
-The projection copies native page text byte-for-byte, without a second PDF/OCR
-pipeline. Each item is **one page**: regex and multiline matches are exact within
-that page. Cross-page multiline matching is not promised. Parts retain original
-page offsets; grep paths identify the source record and original page.
+`grep` writes a binding to the existing corpus. It performs no extraction, TXT
+export, derived-bucket upload, or source re-ingestion:
 
 ```sh
-./grepstein grep --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --gcs-projection-bucket antfly-showcases-derived \
-  --provider-auth-id "$COLONY_GCS_CONNECTION_ID"
-# Review grepstein-corpus/cloud-jobs.json, then supply a Colony user access token
-# securely through GREPSTEIN_CLOUD_TOKEN. This is not the table's read API key.
-./grepstein cloud-jobs --plan ./grepstein-corpus/cloud-jobs.json \
-  --jobs-url "$COLONY_INSTANCE_IMPORT_JOBS_URL"
+./grepstein grep --state ./grepstein-corpus --url "$ANTFLY_URL"
+antfly-grep --table-config ./grepstein-corpus/grep.json 'pattern'
+antfly-grep --table-config ./grepstein-corpus/grep.json --artifact chunks 'pattern'
 ```
 
-The GCS connection reads the derived bucket with a separate read-only Google
-identity. The plan uses existing scheduled `source` jobs, one per populated
-dataset/hash partition, at most 10,000 pages each. It does not feed binary PDFs
-into the text-only source importer. Jobs refresh hourly with a 24-hour permission
-lease. Leave `max_objects` unset: an explicit value requests a non-authoritative
-subset and cannot promote a searchable catalog or renew its permission lease.
-The connector already enforces a 10,000-object hard ceiling. Colony owns job
-UUIDs, catalog rows, readiness, and revocation policy.
-`cloud-jobs` reuses identical jobs after a lost response and refuses a conflicting
-existing job; it does not archive or replace jobs automatically. New extraction
-snapshots require a reviewed job lifecycle/config update.
+The default `extracted` stream reads `document_units_v1` through
+`document_units_text`. Each native extraction unit is a matching boundary; a
+regex never spans pages or transcript units. The optional `chunks` stream uses
+`document_text`; its semantic overlap is deliberately excluded from default
+lexical search. Both use the same originals, extraction, revision fencing and
+artifact lifecycle as the explorer and semantic/graph indexes. Native index
+readiness is checked separately from source publication, including failed OCR.
 
-Once Colony reports source jobs searchable, use Antfly grep's ordinary Cloud
-source selection. For self-hosting, omit `--gcs-projection-bucket`: `grep` uses the
-shared publisher directly and writes `grep-sync/catalog.json`. For example:
+The binding maps the corpus's existing fields to source identity and permissions.
+New prepared rows include `indexed_at` and private `user:self` reader metadata;
+regenerate and publish older prepared rows before using the new binding. Local
+principal filtering narrows results; exposed APIs still require their own current
+caller authorization/RLS. The ordinary Antfly API and binding format are the
+same in Cloud and self-hosted deployments. Never distribute a write/admin key
+with the binding.
 
-```sh
-antfly-grep --source-catalog ./grepstein-corpus/grep-sync/catalog.json \
-  --source grepstein-doj-12-a 'pattern'
-```
-
-Use a populated alias from the catalog. Standalone catalogs need refresh before
-their 24-hour lease expires. Do not publish a standalone catalog through Cloud
-and expect it to substitute for Colony's source job authorization policy.
+The former `--grep-table`, `--gcs-projection-bucket` and page source-job workflow
+are retired. Existing projection tables/buckets are not automatically deleted.
 
 ## Explorer and hosting
 
@@ -391,3 +410,27 @@ index readiness, queue drain, and OCR spend before loading the full v1 set. Incr
 CPU/memory/disk through existing instance configuration and scale inference
 separately. Indexing large datasets and automatic large-corpus capacity selection
 are deferred; their raw originals can be preserved independently.
+
+### Investigating incomplete OCR
+
+A manifest's `merge_status: converged` reports artifact publication, not OCR
+success. Inspect `ocr_failed_count` on document artifact summaries and run
+`qualify` before declaring extraction complete. A nonempty text index can still
+contain embedded PDF text while OCR pages have failed. Failed OCR pages must not
+qualify for Antfly's unchanged-source fast path. Transient failures use the
+existing per-request retry budget and backoff; exhausted or terminal failures
+remain repair debt. Fix the reported cause before reprocessing those artifacts.
+
+Use the existing named-table artifact and repair APIs through the Cloud session
+or an instance-scoped key. Reprocessing an artifact preserves the source document;
+there is no need to delete its table or index. Keep native repair/reprocess job
+IDs and advance their bounded passes until complete; job creation alone is not
+proof that a repair finished. If an API response is uncertain, inspect the job or
+artifact generation before submitting the mutation again.
+
+Cloud global discovery and named-table requests must resolve the same live user
+permissions. A `401` on global discovery with working named-table requests is a
+proxy routing/authentication problem. A Cloudflare `403` with error `1010` is a
+separate transport rejection. Diagnostic clients should identify themselves with
+a descriptive application `User-Agent`, such as `antfly-cloud/grepstein-diagnostics`.
+Do not treat either response as evidence that OCR failed or that the GPU is busy.

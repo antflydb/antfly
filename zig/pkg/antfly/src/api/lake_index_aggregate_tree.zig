@@ -30,12 +30,10 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const Recipe = local.sql_aggregate_materialization.Recipe;
 pub const Index = struct {
     domain: [32]u8,
-    /// 1: historical one-row columnar blocks; 2: recipe-bound transitions.
-    layout: u8 = 1,
+    /// Recipe-bound transition records.
+    layout: u8 = 2,
     page: ?tree.Ref = null,
     pub fn jsonStringify(self: Index, writer: anytype) !void {
-        // Preserve historical interpretation commitments, including JSON shape.
-        if (self.layout == 1) return writer.write(.{ .domain = self.domain, .page = self.page });
         return writer.write(.{ .domain = self.domain, .layout = self.layout, .page = self.page });
     }
     pub fn count(self: Index) u64 {
@@ -50,37 +48,17 @@ pub fn eligible(recipe: Recipe) bool {
 pub fn encode(a: A, input: operators.GroupResult, recipe: Recipe) ![]u8 {
     return record.encode(a, input, recipe);
 }
-pub const View = union(enum) {
-    legacy: spill.ColumnarBlock,
-    native: record.View,
-    fn keys(self: View, a: A, recipe: Recipe) ![]const local.sql_scalar.Datum {
-        if (self == .native) return self.native.keys(a);
-        const cells = try a.alloc(local.sql_scalar.Datum, recipe.keys.len);
-        for (cells, 0..) |*cell, i| cell.* = try self.legacy.keyCell(0, i);
-        return cells;
-    }
-    fn read(self: View, a: A, recipe: Recipe, slot: usize) !operators.Aggregate {
-        return if (self == .native) self.native.read(a, slot) else partial.readPhysical(a, self.legacy, 0, partial.physicalOffset(recipe.inputs, slot), recipe.inputs[slot].spec);
-    }
-    fn finish(self: View, a: A, recipe: Recipe, slot: usize, spec: operators.AggregateSpec) !local.sql_scalar.Datum {
-        return if (self == .native) self.native.finish(a, slot, spec) else partial.finishPhysical(a, self.legacy, 0, partial.physicalOffset(recipe.inputs, slot), spec);
-    }
-};
+pub const View = record.View;
 pub fn view(a: A, bytes: []const u8, recipe: Recipe, layout: u8, prepared: ?*const record.Layout) !View {
-    if (layout == 2) {
-        const compiled = prepared orelse new: {
-            const value = try a.create(record.Layout);
-            value.* = try record.Layout.init(a, recipe);
-            break :new value;
-        };
-        return .{ .native = try record.View.init(bytes, compiled) };
-    }
-    if (layout != 1) return error.InvalidNativeAggregateArtifact;
-    const result = try spill.decodeColumnarBlockInArena(a, bytes, 4 * 1024 * 1024);
-    if (result.count() != 1 or result.keys.len != recipe.keys.len or result.values.len != partial.physicalWidth(recipe.inputs)) return error.InvalidNativeAggregateArtifact;
-    return .{ .legacy = result };
+    if (layout != 2) return error.InvalidNativeAggregateArtifact;
+    const compiled = prepared orelse new: {
+        const value = try a.create(record.Layout);
+        value.* = try record.Layout.init(a, recipe);
+        break :new value;
+    };
+    return record.View.init(bytes, compiled);
 }
-/// Only the oversized-record compatibility publisher needs every physical lane.
+/// Only the oversized-record fallback publisher needs every physical lane.
 pub fn block(a: A, bytes: []const u8, recipe: Recipe) !spill.ColumnarBlock {
     const compiled = try a.create(record.Layout);
     compiled.* = try record.Layout.init(a, recipe);
@@ -100,34 +78,26 @@ const Physical = struct {
     fn read(raw: *const anyopaque, a: A, slot: usize) !operators.Aggregate {
         const self: *const @This() = @ptrCast(@alignCast(raw));
         if (slot >= self.slots.len or self.slots[slot] >= self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
-        return self.value.read(a, self.recipe, self.slots[slot]);
+        return self.value.read(a, self.slots[slot]);
     }
     fn finish(raw: *const anyopaque, a: A, slot: usize, spec: operators.AggregateSpec) !local.sql_scalar.Datum {
         const self: *const @This() = @ptrCast(@alignCast(raw));
         if (slot >= self.slots.len or self.slots[slot] >= self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
         const p = self.slots[slot];
         if (!std.meta.eql(spec, self.recipe.inputs[p].spec)) return error.InvalidSqlBackendResponse;
-        return self.value.finish(a, self.recipe, p, spec);
+        return self.value.finish(a, p, spec);
     }
 };
 pub fn row(a: A, value: View, recipe: Recipe, slots: []const u16, outputs: ?[]const u16, ordinal: u64) !operators.GroupResult {
     const reader = try a.create(Physical);
     reader.* = .{ .value = value, .recipe = recipe, .slots = slots };
-    return .{ .keys = try value.keys(a, recipe), .aggregates = &.{}, .state_reader = .{ .ptr = reader, .count = slots.len, .read = Physical.read, .finish = Physical.finish }, .aggregate_slots = outputs, .ordinal = ordinal };
+    return .{ .keys = try value.keys(a), .aggregates = &.{}, .state_reader = .{ .ptr = reader, .count = slots.len, .read = Physical.read, .finish = Physical.finish }, .aggregate_slots = outputs, .ordinal = ordinal };
 }
-fn merged(a: A, left: ?[]const u8, right: ?[]const u8, recipe: Recipe, left_layout: u8, right_layout: u8, layout: *const record.Layout) !?[]const u8 {
+fn merged(a: A, left: ?[]const u8, right: ?[]const u8, layout: *const record.Layout) !?[]const u8 {
     if (left == null and right == null) return null;
-    if (left == null and right_layout == 2) return try a.dupe(u8, right.?);
-    if (right == null and left_layout == 2) return try a.dupe(u8, left.?);
-    if (left != null and right != null and left_layout == 2 and right_layout == 2) return try record.merge(a, left.?, right.?, layout);
-    const l = if (left) |bytes| try view(a, bytes, recipe, left_layout, layout) else null;
-    const r = if (right) |bytes| try view(a, bytes, recipe, right_layout, layout) else null;
-    const states = try a.alloc(operators.Aggregate, recipe.inputs.len);
-    for (states, 0..) |*state, slot| {
-        state.* = try (l orelse r.?).read(a, recipe, slot);
-        if (l != null and r != null) try partial.merge(state, try r.?.read(a, recipe, slot));
-    }
-    return try record.encodeWithLayout(a, .{ .keys = try (l orelse r.?).keys(a, recipe), .aggregates = &.{}, .typed_states = states, .ordinal = 0 }, layout.*);
+    if (left == null) return try a.dupe(u8, right.?);
+    if (right == null) return try a.dupe(u8, left.?);
+    return try record.merge(a, left.?, right.?, layout);
 }
 fn same(left: ?tree.Ref, right: ?tree.Ref) bool {
     if (left == null or right == null) return left == null and right == null;
@@ -139,41 +109,48 @@ fn differences(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref, vis
 /// Zip routing intervals rather than child positions. Splits, merges and a new
 /// minimum key may change fences while retaining nearly every child reference.
 fn differencesRange(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref, lower: []const u8, upper: ?[]const u8, visitor: anytype) anyerror!void {
+    return differencesViews(a, backing, left, right, tree.KeyView.from(lower), if (upper) |bound| tree.KeyView.from(bound) else null, visitor);
+}
+fn differencesViews(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref, lower: tree.KeyView, upper: ?tree.KeyView, visitor: anytype) anyerror!void {
     try backing.check(backing.ptr);
     if (same(left, right)) return;
-    var lp: ?tree.Page = if (left != null and left.?.height != 0) try tree.readPage(a, backing, left.?) else null;
+    var lp: ?tree.NavigationPage = if (left != null and left.?.height != 0) try tree.readNavigationPage(a, backing, left.?) else null;
     defer if (lp) |*page| page.deinit(a);
-    var rp: ?tree.Page = if (right != null and right.?.height != 0) try tree.readPage(a, backing, right.?) else null;
+    var rp: ?tree.NavigationPage = if (right != null and right.?.height != 0) try tree.readNavigationPage(a, backing, right.?) else null;
     defer if (rp) |*page| page.deinit(a);
     if (lp != null or rp != null) {
         var li: usize = 0;
         var ri: usize = 0;
         var begin = lower;
         while (true) {
-            if (lp) |page| while (li + 1 < page.entries.len and std.mem.order(u8, page.entries[li + 1].key, begin) != .gt) {
+            if (lp) |page| while (li + 1 < page.entries.len and page.key(li + 1).order(begin) != .gt) {
                 li += 1;
             };
-            if (rp) |page| while (ri + 1 < page.entries.len and std.mem.order(u8, page.entries[ri + 1].key, begin) != .gt) {
+            if (rp) |page| while (ri + 1 < page.entries.len and page.key(ri + 1).order(begin) != .gt) {
                 ri += 1;
             };
             var end = upper;
             if (lp) |page| if (li + 1 < page.entries.len) {
-                const fence = page.entries[li + 1].key;
-                if (end == null or std.mem.order(u8, fence, end.?) == .lt) end = fence;
+                const fence = page.key(li + 1);
+                if (end == null or fence.order(end.?) == .lt) end = fence;
             };
             if (rp) |page| if (ri + 1 < page.entries.len) {
-                const fence = page.entries[ri + 1].key;
-                if (end == null or std.mem.order(u8, fence, end.?) == .lt) end = fence;
+                const fence = page.key(ri + 1);
+                if (end == null or fence.order(end.?) == .lt) end = fence;
             };
-            try differencesRange(a, backing, if (lp) |page| page.entries[li].valueEntry().child else left, if (rp) |page| page.entries[ri].valueEntry().child else right, begin, end, visitor);
-            if (end == null or (upper != null and std.mem.eql(u8, end.?, upper.?))) break;
+            try differencesViews(a, backing, if (lp) |page| page.entries[li].valueEntry().child else left, if (rp) |page| page.entries[ri].valueEntry().child else right, begin, end, visitor);
+            if (end == null or (upper != null and end.?.order(upper.?) == .eq)) break;
             begin = end.?;
         }
         return;
     }
-    var lc = try tree.Cursor.init(a, backing, left, lower, upper);
+    const lower_bytes = try lower.dupe(a);
+    defer a.free(lower_bytes);
+    const upper_bytes = if (upper) |bound| try bound.dupe(a) else null;
+    defer if (upper_bytes) |bytes| a.free(bytes);
+    var lc = try tree.Cursor.init(a, backing, left, lower_bytes, upper_bytes);
     defer lc.deinit();
-    var rc = try tree.Cursor.init(a, backing, right, lower, upper);
+    var rc = try tree.Cursor.init(a, backing, right, lower_bytes, upper_bytes);
     defer rc.deinit();
     var l = try lc.next();
     var r = try rc.next();
@@ -198,7 +175,7 @@ pub const Previous = struct { parent: Index, left: ?Index, right: ?Index };
 /// removal and exact NUMERIC without subtraction or old-generation chains.
 pub fn merge(a: A, store: *stores.ArtifactStore, recipe: Recipe, left: Index, right: Index, previous: ?Previous, token: Token, metrics: ?*Metrics) !Index {
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-    if (!std.mem.eql(u8, &scope.domain, &left.domain) or !std.mem.eql(u8, &scope.domain, &right.domain)) return error.InvalidNativeAggregateArtifact;
+    if (left.layout != 2 or right.layout != 2 or !std.mem.eql(u8, &scope.domain, &left.domain) or !std.mem.eql(u8, &scope.domain, &right.domain)) return error.InvalidNativeAggregateArtifact;
     if (left.page == null) return right;
     if (right.page == null) return left;
     var access: directory.Access = undefined;
@@ -212,40 +189,23 @@ pub fn merge(a: A, store: *stores.ArtifactStore, recipe: Recipe, left: Index, ri
     defer if (metrics) |m| {
         m.written_bytes = before_writes - access.writes;
     };
-    if (previous) |prior| if (left.layout == 2 and right.layout == 2 and prior.parent.layout == 2 and (prior.left == null or prior.left.?.layout == 2) and (prior.right == null or prior.right.?.layout == 2)) if (try incremental(a, backing, recipe, left, right, prior, metrics, &layout)) |result| return result;
-    // Distinct grouping-key ranges need no reducer work. Keep their immutable
-    // descendants and rewrite only the connecting boundary, in either order.
-    // Historical layouts still pass through the normal one-time upgrade.
-    if (left.layout == 2 and right.layout == 2) if (try tree.joinDisjoint(a, backing, left.page.?, right.page.?)) |page| return .{ .domain = scope.domain, .layout = 2, .page = page };
-    if (left.layout == 2 and right.layout == 2) {
-        const Reducer = struct {
-            layout: *const record.Layout,
-            pub fn merge(self: @This(), scratch: A, l: []const u8, r: []const u8) ![]const u8 {
-                return record.merge(scratch, l, r, self.layout);
-            }
-        };
-        return .{ .domain = scope.domain, .layout = 2, .page = try tree.mergeSorted(a, backing, left.page.?, right.page.?, Reducer{ .layout = &layout }) };
+    if (previous) |prior| {
+        if (prior.parent.layout != 2 or (prior.left != null and prior.left.?.layout != 2) or (prior.right != null and prior.right.?.layout != 2)) return error.InvalidNativeAggregateArtifact;
+        if (try incremental(a, backing, left, right, prior, metrics, &layout)) |result| return result;
     }
-    var builder: tree.SortedBuilder = .{ .alloc = a, .store = backing };
-    defer builder.deinit();
-    var lc = try tree.Cursor.init(a, backing, left.page, "", null);
-    defer lc.deinit();
-    var rc = try tree.Cursor.init(a, backing, right.page, "", null);
-    defer rc.deinit();
-    var l = try lc.next();
-    var r = try rc.next();
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    while (l != null or r != null) {
-        _ = scratch.reset(.free_all);
-        const order = if (l == null) std.math.Order.gt else if (r == null) std.math.Order.lt else std.mem.order(u8, l.?.key, r.?.key);
-        try builder.add(if (order == .gt) r.?.key else l.?.key, (try merged(scratch.allocator(), if (order != .gt) l.?.value else null, if (order != .lt) r.?.value else null, recipe, left.layout, right.layout, &layout)).?);
-        if (order != .gt) l = try lc.next();
-        if (order != .lt) r = try rc.next();
-    }
-    return .{ .domain = scope.domain, .layout = 2, .page = try builder.finish() };
+    // Distinct grouping-key ranges retain immutable descendants and rewrite
+    // only the connecting boundary, in either order.
+    if (try tree.joinDisjoint(a, backing, left.page.?, right.page.?)) |page| return .{ .domain = scope.domain, .layout = 2, .page = page };
+    const Reducer = struct {
+        layout: *const record.Layout,
+        pub fn merge(self: @This(), scratch: A, l: []const u8, r: []const u8) ![]const u8 {
+            return record.merge(scratch, l, r, self.layout);
+        }
+    };
+    return .{ .domain = scope.domain, .layout = 2, .page = try tree.mergeSorted(a, backing, left.page.?, right.page.?, Reducer{ .layout = &layout }) };
 }
-fn incremental(a: A, backing: tree.Store, recipe: Recipe, left: Index, right: Index, prior: Previous, metrics: ?*Metrics, layout: *const record.Layout) !?Index {
+
+fn incremental(a: A, backing: tree.Store, left: Index, right: Index, prior: Previous, metrics: ?*Metrics, layout: *const record.Layout) !?Index {
     var budget: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 8 * 1024 * 1024 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -305,7 +265,7 @@ fn incremental(a: A, backing: tree.Store, recipe: Recipe, left: Index, right: In
         var bytes: usize = 0;
         while (end < edits.len and end - offset < 1024) {
             const edit = &edits[end];
-            const value = try merged(scratch.allocator(), try lc.at(edit.key), try rc.at(edit.key), recipe, left.layout, right.layout, layout);
+            const value = try merged(scratch.allocator(), try lc.at(edit.key), try rc.at(edit.key), layout);
             edit.value = value;
             bytes +|= edit.key.len +| if (value) |v| v.len else 0;
             end += 1;
@@ -317,7 +277,7 @@ fn incremental(a: A, backing: tree.Store, recipe: Recipe, left: Index, right: In
     return .{ .domain = left.domain, .layout = 2, .page = root };
 }
 
-test "external lake aggregate interval differences skip retained pages across fences splits and height changes" {
+test "external lake metadata navigation aggregate interval differences skip retained pages across fences splits and height changes" {
     const a = std.testing.allocator;
     var memory: tree.testing.MemoryStore = .{ .alloc = a };
     defer memory.deinit();
@@ -367,7 +327,7 @@ test "external lake aggregate interval differences skip retained pages across fe
     try std.testing.expect(memory.reads - before <= 1);
 }
 
-test "external lake aggregate incremental batches retain absent-key successors and exact old snapshots" {
+test "external lake metadata navigation aggregate incremental batches retain absent-key successors and exact old snapshots" {
     const a = std.testing.allocator;
     var memory: tree.testing.MemoryStore = .{ .alloc = a };
     defer memory.deinit();
@@ -396,7 +356,7 @@ test "external lake aggregate incremental batches retain absent-key successors a
         root.* = .{ .domain = backing.domain, .layout = 2, .page = try builder.finish() };
     }
     var metrics: Metrics = .{};
-    const changed = (try incremental(a, backing, recipe, roots[3], roots[4], .{ .parent = roots[2], .left = roots[0], .right = roots[1] }, &metrics, &layout)).?;
+    const changed = (try incremental(a, backing, roots[3], roots[4], .{ .parent = roots[2], .left = roots[0], .right = roots[1] }, &metrics, &layout)).?;
     try std.testing.expectEqual(@as(usize, 4352), metrics.changed_groups);
     try std.testing.expectEqual(@as(u64, 3328), changed.count());
     var cursor = try tree.Cursor.init(a, backing, changed.page, "", null);

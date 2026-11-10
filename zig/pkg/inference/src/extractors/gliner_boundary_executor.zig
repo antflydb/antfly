@@ -13,15 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Schema-aware execution inside an admitted, managed model session. CUDA
-//! groups compatible inputs into bounded physical batches; native and Metal
-//! retain their qualified serial request execution.
+//! Schema-aware execution inside an admitted, managed model session. CUDA and
+//! Metal group compatible inputs into bounded physical batches; native retains
+//! its qualified serial request execution.
 //! Output is buffered atomically and independently bounded across all inputs.
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
 const engine = @import("../architectures/gliner/boundary_engine.zig");
 const device_request = @import("../architectures/gliner/boundary_request_device.zig");
+const device_engine = @import("../architectures/gliner/boundary_engine_device.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const compute = @import("../ops/ops.zig");
@@ -33,7 +34,28 @@ const Allocator = std.mem.Allocator;
 const observation = @import("extraction_observer.zig");
 const qualification = @import("gliner_boundary_qualification.zig");
 
+pub const PreparationStore = long_executor.PreparationStore;
+
+/// Physical forward evidence for one caller-owned row. Filled only after the
+/// corresponding encoder/head invocation succeeds; preparation is not execution.
+pub const ItemExecution = struct {
+    prompt_tokens: usize = 0,
+    output_values: usize = 0,
+    rows: usize = 0,
+    group: usize = 0,
+};
+
 pub const Options = struct {
+    /// Synchronous row consumer for independent broker callers. It owns
+    /// serialization failures locally; the executor never builds a combined
+    /// response when this sink is installed.
+    row_sink: ?RowSink = null,
+    /// Immutable rows prepared under this request's tokenizer and options.
+    /// Owners remain borrowed through synchronous planning and execution.
+    prepared_samples: ?[]const processor.Sample = null,
+    item_executions: ?[]ItemExecution = null,
+    brokered_request: bool = false,
+    preparations: ?*PreparationStore = null,
     max_response_bytes: usize = 64 * 1024 * 1024,
     processor: processor.Options = .{},
     engine: engine.Options = .{},
@@ -49,6 +71,73 @@ pub const Options = struct {
     long_document: long_executor.Limits = .{},
     observer: ?observation.Observer = null,
 };
+
+pub const RowSink = struct {
+    context: *anyopaque,
+    emit_fn: *const fn (*anyopaque, usize, wire.Item, pipeline.Sample, usize) void,
+    fail_fn: *const fn (*anyopaque, usize, anyerror) void,
+    check_fn: *const fn (?*anyopaque, usize) anyerror!void,
+};
+
+const RowCheck = struct {
+    sink: RowSink,
+    first: usize,
+    fn check(raw: ?*anyopaque, index: usize) !void {
+        const self: *const @This() = @ptrCast(@alignCast(raw.?));
+        try self.sink.check_fn(self.sink.context, self.first + index);
+    }
+};
+
+test "gliner microbatch complete device planning rejects oversized heads before dispatch" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("head plan test"), .sidecars = @splat(artifact.Digest.of("head plan test")) } };
+    var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer prepared.deinit();
+    const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+    const combined = try device_request.plan(&config, &prepared, &schemas, .{ .limits = options.device });
+    options.device.head.max_result_download_bytes = combined.minimum_result_download_bytes / 2;
+    // The encoder fits both rows; only the combined head download rejects it.
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    options.engine.limits.max_batch = 1;
+    try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
+}
+
+test "gliner microbatch reuses prepared short rows through cohort planning and serial fallback" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada met Bob"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var left = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[0..1], .{});
+    defer left.deinit();
+    var right = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], .{});
+    defer right.deinit();
+    const calls = tokenizer.calls;
+    const samples = [_]processor.Sample{ left.samples[0], right.samples[0] };
+    const identity = artifact.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("prepared row test"), .sidecars = @splat(artifact.Digest.of("prepared row test")) };
+    var options = Options{ .prepared_samples = &samples, .identity = identity };
+    var cohort = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer cohort.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cohort.samples.len);
+    try std.testing.expectEqual(left.sequence_length, cohort.sequence_length);
+    _ = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+    _ = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, options);
+    options.prepared_samples = samples[1..];
+    var serial = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], options);
+    defer serial.deinit();
+    try std.testing.expectEqualSlices(i64, right.input_ids, serial.input_ids);
+    try std.testing.expectEqual(calls, tokenizer.calls);
+    options.prepared_samples = samples[0..1];
+    try std.testing.expectError(error.InvalidBoundaryPipelineRouting, prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], options));
+}
 
 /// Both device owners enforce these caps independently before allocating.
 /// Serial inputs/windows reuse this reservation; simultaneous encoder/head
@@ -67,7 +156,7 @@ fn progress(options: Options, index: ?usize, stage: []const u8) !void {
     if (observation.Stage.fromFailure(stage)) |phase| observation.emit(options.observer, .{ .phase = phase });
 }
 
-fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, tokens: usize, values: usize) void {
+pub fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, tokens: usize, values: usize) void {
     const active = observer orelse return;
     var summary = observation.Sample{ .prompt_tokens = tokens, .output_values = values };
     for ([_]?pipeline.Diagnostics{ sample.classification_solver, sample.joint_solver, sample.record_solver }, &summary.solvers) |value, *out| if (value) |diagnostic| {
@@ -85,6 +174,7 @@ pub fn preflight(request: *const wire.Request, options: Options) !void {
     try progress(options, null, "preflight");
     if (request.items.len == 0 or options.max_response_bytes == 0) return error.InvalidExtractionRequest;
     for (request.items, 0..) |item, index| {
+        if (options.row_sink != null and item.options.long_document.mode == .window) return error.InvalidExtractionRequest;
         try progress(options, index, "preflight");
         try item.options.validateNativeLimits(options.pipeline);
         try pipeline.validateOptions(item.options.native(options.pipeline));
@@ -140,26 +230,50 @@ pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: 
     return executeChecked(cb, allocator, config, tokenizer, request, options, null);
 }
 
-/// Serving entrypoint: one exact live-artifact policy row must cover the full
-/// request before the first learned operation. Diagnostic execute stays separate.
+/// Serving admission verifies the exact live artifact and complete feature union.
+/// Model/backend geometry and work budgets are planned before learned operations.
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
     if (options.control) |control| try control.check();
     try cb.checkExecutionControl();
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
     if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
-    var gate = try qualification.Gate.initResolved(identity, switch (cb.kind()) {
+    var gate = try qualification.Admission.initResolved(identity, switch (cb.kind()) {
         .metal => .metal,
         .cuda => .cuda,
         else => .native,
     }, request, options.pipeline, options.control);
-    try qualifyRequestGeometry(cb, allocator, config, tokenizer, request, options, &gate);
+    var local_store = PreparationStore.init(allocator);
+    defer local_store.deinit();
+    var prepared_options = options;
+    if (prepared_options.preparations == null) prepared_options.preparations = &local_store;
+    try qualifyRequestGeometry(cb, allocator, config, tokenizer, request, prepared_options, &gate);
     if (options.control) |control| try control.check();
-    return executeChecked(cb, allocator, config, tokenizer, request, options, &gate);
+    return executeChecked(cb, allocator, config, tokenizer, request, prepared_options, &gate);
+}
+
+/// Prepare and qualify a single short row once, before broker enrollment.
+/// The returned owner must outlive every repacked planning/execution view.
+pub fn prepareQualifiedShortRow(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !processor.PreparedBatch {
+    if (request.items.len != 1 or request.items[0].options.long_document.mode == .window) return error.InvalidExtractionRequest;
+    const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
+    if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
+    var gate = try qualification.Admission.initResolved(identity, switch (backend) {
+        .metal => .metal,
+        .cuda => .cuda,
+        .native => .native,
+        else => return error.UnsupportedGlinerBoundaryBackend,
+    }, request, options.pipeline, options.control);
+    try preflight(request, options);
+    try progress(options, 0, "tokenizing");
+    var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items, options);
+    errdefer prepared.deinit();
+    try observeGroup(allocator, config, request.items, &prepared, options, &gate);
+    return prepared;
 }
 
 /// The receiver is a compile-time parameter for the quiet scalar observation
-/// path only. Learned entrypoints always require the concrete closed Gate.
+/// path only. Learned entrypoints always require concrete runtime admission.
 fn qualifyRequestGeometry(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: anytype) !void {
     return planRequestGeometry(cb.kind(), allocator, config, tokenizer, request, options, gate);
 }
@@ -195,23 +309,99 @@ fn workspaceGeometryFor(backend: compute.BackendKind, allocator: Allocator, conf
     return receiver.peak_tokens;
 }
 
+/// Encoder device bytes the reference (non-resident) Metal/CUDA path needs for
+/// this exact request: the largest encoder plan over the batches and windows it
+/// will execute. Admission reserves this instead of the configured encoder
+/// ceiling, so a short input does not hold the whole ceiling. Never exceeds
+/// `options.device.max_encoder_device_bytes`; planning fails if it would.
+pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
+    if (backend != .metal and backend != .cuda) return error.UnsupportedGlinerBoundaryBackend;
+    const identity = options.identity orelse return error.MissingGlinerBoundaryIdentity;
+    const Precision = @TypeOf(identity.precision);
+    const Receiver = struct {
+        config: *const model.Config,
+        options: Options,
+        precision: Precision,
+        peak: usize = 0,
+        failure: ?anyerror = null,
+        fn note(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            if (self.failure != null) return;
+            const planned = device_engine.plan(self.config, prepared, .{
+                .precision = self.precision,
+                .execution_policy = .reference_v1,
+                .admission = self.options.engine.limits,
+                .max_device_bytes = self.options.device.max_encoder_device_bytes,
+                .control = self.options.control,
+            }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.peak = @max(self.peak, planned.device_upper_bound_bytes);
+        }
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+        }
+        // observeGroupBatch already planned the physical batch. Per-item
+        // qualification views retain its tensors but slice samples to one row,
+        // so they are not complete batches accepted by the device planner.
+        pub fn observeSingle(_: *@This(), _: Allocator, _: []const u8, _: *const processor.PreparedBatch, _: processor.Options) !void {}
+        pub fn observeGroupBatch(self: *@This(), _: Allocator, items: []const wire.Item, prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+            // Encoder bytes alone do not establish that the complete cohort
+            // fits: head routes and result-download ceilings scale with rows
+            // too. Validate them before the broker can enter learned work.
+            if (items.len > device_request.max_admission_batch) return error.ResourceLimitExceeded;
+            var schemas: [device_request.max_admission_batch]*const @TypeOf(items[0].compiled) = undefined;
+            for (items, schemas[0..items.len]) |*item, *compiled| compiled.* = &item.compiled;
+            var device_limits = self.options.device;
+            device_limits.encoder = self.options.engine.limits;
+            var pipeline_options = items[0].options.native(self.options.pipeline);
+            pipeline_options.control = self.options.control;
+            _ = try device_request.plan(self.config, prepared, schemas[0..items.len], .{
+                .independent_requests = self.options.row_sink != null or self.options.brokered_request,
+                .precision = self.precision,
+                .execution_policy = .reference_v1,
+                .limits = device_limits,
+                .pipeline = pipeline_options,
+            });
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.note(prepared);
+        }
+    };
+    var receiver = Receiver{ .config = config, .options = options, .precision = identity.precision };
+    try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &receiver);
+    if (receiver.failure) |err| return err;
+    if (receiver.peak == 0) return error.InvalidBoundaryPipelineInput;
+    return receiver.peak;
+}
+
 /// Contiguous compatible items share one forward pass without reordering results.
 /// The same preparation/planning routine runs before qualification and execution.
 fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, items: []const wire.Item, options: Options) !processor.PreparedBatch {
-    const limit = if (backend == .cuda) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
+    const limit = if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
     if (limit == 0 or items.len == 0) return error.ResourceLimitExceeded;
     var count: usize = 1;
     while (count < @min(limit, items.len) and items[count].options.long_document.mode != .window and std.meta.eql(items[0].options, items[count].options)) : (count += 1) {}
     var process_options = qualification.singleProcessor(config, &items[0], options.processor, options.engine.limits.max_queries, options.control);
     process_options.max_batch_tokens = @min(process_options.max_batch_tokens, options.engine.limits.max_batch_tokens);
-    process_options.max_sequence_tokens = @min(process_options.max_sequence_tokens, options.engine.limits.max_sequence_tokens);
+    process_options.max_sequence_tokens = qualification.sequenceLimit(config, @min(process_options.max_sequence_tokens, options.engine.limits.max_sequence_tokens));
     var engine_options = options.engine;
     engine_options.control = options.control;
     while (true) {
         const inputs = try allocator.alloc(processor.Item, count);
         defer allocator.free(inputs);
         for (inputs, items[0..count]) |*input, *item| input.* = .{ .text = item.text, .schema = &item.compiled };
-        var prepared = processor.prepare(allocator, tokenizer, inputs, process_options) catch |err| {
+        const preparation = if (options.prepared_samples) |samples| repacked: {
+            if (samples.len < count) return error.InvalidBoundaryPipelineRouting;
+            for (samples[0..count], items[0..count]) |sample, item| {
+                if (!std.mem.eql(u8, sample.original_text, item.text) or !std.mem.eql(u8, &sample.schema_fingerprint, &item.compiled.fingerprint)) return error.InvalidBoundaryPipelineRouting;
+            }
+            break :repacked processor.packSamples(allocator, samples[0..count], process_options);
+        } else processor.prepare(allocator, tokenizer, inputs, process_options);
+        var prepared = preparation catch |err| {
             if (err == error.BoundaryBatchLimitExceeded and count > 1) {
                 count = (count + 1) / 2;
                 continue;
@@ -229,11 +419,15 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
             }
             return err;
         };
+        if ((backend == .native or backend == .wasm) and prepared.query_width != 0)
+            _ = try @import("../architectures/gliner/boundary_head.zig").planShape(config, .{ .batch = prepared.samples.len, .text_length = prepared.word_width, .queries = prepared.query_width }, options.pipeline.head_limits);
         return prepared;
     }
 }
 
 fn observeGroup(allocator: Allocator, config: *const model.Config, items: []const wire.Item, prepared: *const processor.PreparedBatch, options: Options, gate: anytype) !void {
+    // Planners that size device work see the batch exactly as it executes.
+    if (comptime @hasDecl(@TypeOf(gate.*), "observeGroupBatch")) try gate.observeGroupBatch(allocator, items[0..prepared.samples.len], prepared);
     for (items[0..prepared.samples.len], 0..) |*item, index| {
         // Preserve the physical padded length in every item's policy check.
         var view = prepared.*;
@@ -247,8 +441,9 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
     var quiet = options;
     quiet.observer = null;
     try preflight(request, quiet);
+    if (options.prepared_samples) |samples| if (samples.len != request.items.len) return error.InvalidBoundaryPipelineRouting;
     var remaining_tokens = options.long_document.max_total_encoded_tokens;
-    var remaining_attention = options.long_document.max_total_attention_work;
+    var remaining_attention = try options.long_document.attentionWorkLimit(config, options.engine.limits);
     var remaining_windows = options.long_document.max_request_windows;
     var index: usize = 0;
     while (index < request.items.len) {
@@ -265,6 +460,7 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
             var pipeline_options = item.options.native(options.pipeline);
             pipeline_options.control = options.control;
             const used = try long_executor.planGeometry(backend, allocator, config, tokenizer, item, .{
+                .preparations = options.preparations,
                 .identity = options.identity.?,
                 .processor = item.options.preprocessing(options.processor),
                 .engine = options.engine,
@@ -276,13 +472,15 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
                 .control = options.control,
                 .observer = null,
             }, gate);
-            remaining_tokens -= used.prompt_tokens;
+            remaining_tokens -= used.encoded_tokens;
             remaining_attention -= used.attention_work_items;
             remaining_windows -= used.window_count;
             index += 1;
             continue;
         }
-        var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items[index..], quiet);
+        var group_options = quiet;
+        if (options.prepared_samples) |samples| group_options.prepared_samples = samples[index..];
+        var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items[index..], group_options);
         defer prepared.deinit();
         try observeGroup(allocator, config, request.items[index..], &prepared, quiet, gate);
         index += prepared.samples.len;
@@ -290,18 +488,23 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
     if (options.control) |control| try control.check();
 }
 
-fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: ?*qualification.Gate) ![]u8 {
+fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: ?*qualification.Admission) ![]u8 {
     if (cb.kind() != .native and cb.kind() != .wasm and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     try preflight(request, options);
+    if (options.prepared_samples) |samples| if (samples.len != request.items.len) return error.InvalidBoundaryPipelineRouting;
+    if (options.item_executions) |evidence| {
+        if (evidence.len != request.items.len) return error.InvalidExtractionRequest;
+        @memset(evidence, .{});
+    }
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
-    try writer.begin(request.model);
+    if (options.row_sink == null) try writer.begin(request.model);
     var prompt_tokens: usize = 0;
     var remaining_values = options.pipeline.max_output_values;
     var remaining_window_tokens = options.long_document.max_total_encoded_tokens;
-    var remaining_window_attention = options.long_document.max_total_attention_work;
+    var remaining_window_attention = try options.long_document.attentionWorkLimit(config, options.engine.limits);
     var remaining_windows = options.long_document.max_request_windows;
     var index: usize = 0;
     while (index < request.items.len) {
@@ -320,6 +523,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             pipeline_options.control = options.control;
             pipeline_options.max_output_values = remaining_values;
             const long_options = long_executor.Options{
+                .preparations = options.preparations,
                 .identity = options.identity orelse return error.MissingGlinerBoundaryIdentity,
                 .processor = item.options.preprocessing(options.processor),
                 .engine = options.engine,
@@ -343,18 +547,21 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             const used = try outputValues(result.sample);
             if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
             remaining_values -= used;
-            remaining_window_tokens -= result.prompt_tokens;
+            remaining_window_tokens -= result.encoded_tokens;
             remaining_window_attention -= result.attention_work_items;
             remaining_windows -= result.window_count;
             prompt_tokens = try std.math.add(usize, prompt_tokens, result.prompt_tokens);
+            if (options.item_executions) |evidence| evidence[index] = .{ .prompt_tokens = result.prompt_tokens, .output_values = used, .rows = 1, .group = index };
             try progress(options, index, "serializing");
-            try writer.append(item, result.sample);
+            if (options.row_sink) |sink| sink.emit_fn(sink.context, index, item, result.sample, result.prompt_tokens) else try writer.append(item, result.sample);
             observeSample(options.observer, result.sample, result.prompt_tokens, used);
             index += 1;
             continue;
         }
         try progress(options, index, "tokenizing");
-        var prepared = try prepareGroup(cb.kind(), allocator, config, tokenizer, request.items[index..], options);
+        var group_options = options;
+        if (options.prepared_samples) |samples| group_options.prepared_samples = samples[index..];
+        var prepared = try prepareGroup(cb.kind(), allocator, config, tokenizer, request.items[index..], group_options);
         defer prepared.deinit();
         if (gate) |active| try observeGroup(allocator, config, request.items[index..], &prepared, options, active);
         const schemas = try allocator.alloc(*const @TypeOf(item.compiled), prepared.samples.len);
@@ -367,6 +574,14 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         var pipeline_options = item.options.native(options.pipeline);
         pipeline_options.control = options.control;
         pipeline_options.max_output_values = remaining_values;
+        var row_errors: [device_request.max_admission_batch]?anyerror = undefined;
+        var row_check: RowCheck = undefined;
+        if (options.row_sink) |sink| {
+            if (prepared.samples.len > row_errors.len) return error.ResourceLimitExceeded;
+            pipeline_options.max_output_values = options.pipeline.max_output_values;
+            row_check = .{ .sink = sink, .first = index };
+            pipeline_options.independent_rows = .{ .errors = row_errors[0..prepared.samples.len], .context = &row_check, .check_fn = RowCheck.check };
+        }
         var result = switch (cb.kind()) {
             .native, .wasm => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
@@ -394,16 +609,26 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         defer result.deinit();
         if (result.samples.len != prepared.samples.len) return error.InvalidExtractionOutput;
         for (result.samples, prepared.samples, request.items[index..][0..result.samples.len], 0..) |sample, input, source, row| {
+            if (options.row_sink) |sink| {
+                if (row_errors[row]) |err| {
+                    sink.fail_fn(sink.context, index + row, err);
+                    continue;
+                }
+            }
             const used = try outputValues(sample);
-            if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
-            remaining_values -= used;
+            if (options.item_executions) |evidence| evidence[index + row] = .{ .prompt_tokens = input.input_ids.len, .output_values = used, .rows = prepared.samples.len, .group = index };
+            if (options.row_sink == null) {
+                if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
+                remaining_values -= used;
+            }
             try progress(options, index + row, "serializing");
-            try writer.append(source, sample);
+            if (options.row_sink) |sink| sink.emit_fn(sink.context, index + row, source, sample, input.input_ids.len) else try writer.append(source, sample);
             observeSample(options.observer, sample, input.input_ids.len, used);
         }
         index += prepared.samples.len;
     }
     try progress(options, null, "serializing");
+    if (options.row_sink != null) return allocator.alloc(u8, 0);
     return writer.finish(prompt_tokens);
 }
 
@@ -770,6 +995,8 @@ const QualificationGeometryTest = struct {
     const Mode = enum { success, late_item, late_window, cancelled, sequence_limit };
     const TokenizerProbe = struct {
         calls: usize = 0,
+        one_token_words: bool = false,
+        tokens_per_word: usize = 1,
         const markers = [_][]const u8{ "[P]", "[C]", "[E]", "[R]", "[L]", "[SEP_STRUCT]", "[SEP_TEXT]", "[DESCRIPTION]", "[EXAMPLE]", "[OUTPUT]" };
         fn tokenizer(self: *@This()) Tokenizer {
             return .{ .ptr = self, .vtable = &.{ .encode = encode, .encodeInto = encodeInto, .encodeForModel = undefined, .encodeGeneration = undefined, .decode = undefined, .specialTokens = specialTokens, .allSpecialTokenIds = specialIds, .vocabSize = vocabSize, .deinit = undefined } };
@@ -793,6 +1020,10 @@ const QualificationGeometryTest = struct {
                     break;
                 };
                 if (matched) continue;
+                if (self.one_token_words) {
+                    for (0..self.tokens_per_word) |_| try out.append(a, 64);
+                    return;
+                }
                 try out.append(a, @as(i32, text[position]) + 10);
                 position += 1;
             }
@@ -840,7 +1071,7 @@ const QualificationGeometryTest = struct {
         }
     };
     fn config() model.Config {
-        return .{ .version = 3, .architecture_version = 1, .max_len = 32, .backbone = .small, .head = .{}, .encoder = .{
+        return .{ .version = 3, .architecture_version = 1, .max_len = 32, .backbone = .small, .head = .{ .candidate_pool = .shared, .candidate_attention_layers = 0, .query_attention_layers = 0 }, .encoder = .{
             .hidden_size = 64,
             .intermediate_size = 128,
             .num_hidden_layers = 1,
@@ -966,6 +1197,424 @@ test "boundary qualification quiet geometry covers complete request and all owne
     try QualificationGeometryTest.exercise(std.testing.allocator, .success);
 }
 
+test "boundary qualification serving uses full context beyond measured composition profiles" {
+    const a = std.testing.allocator;
+    const policy = @import("../models/gliner_boundary_qualification.zig");
+    // Request the artifact's full word capacity, beyond both historical token
+    // profiles. Two encoded tokens per word also exercise DeBERTa beyond its
+    // relative-position table extent, which must not become a context cap.
+    const word = "configuration_visibility_maintenance_acknowledgement ";
+    const text = try a.alloc(u8, word.len * 8200);
+    defer a.free(text);
+    for (0..8200) |index| @memcpy(text[index * word.len ..][0..word.len], word);
+    try std.testing.expect(text.len > 182000 and text.len < 1024 * 1024);
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "geometry-only",
+        .schema = .{ .entities = .{"concept"} },
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 4096) } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true, .tokens_per_word = 2 };
+    var config = QualificationGeometryTest.config();
+    config.max_len = 4096;
+    config.backbone = policy.fastino_gliner25_base_v1.backbone;
+    config.encoder.max_position_embeddings = 512;
+    config.head.candidate_pool = .shared;
+    config.head.candidate_attention_layers = 0;
+    config.head.query_attention_layers = 0;
+    var options = Options{ .identity = policy.fastino_gliner25_base_v1 };
+    options.engine.limits.max_batch_tokens = 9000;
+    var gate = try qualification.Admission.initResolved(options.identity.?, .metal, &request, options.pipeline, null);
+    try planRequestGeometry(.metal, a, &config, tokenizer.tokenizer(), &request, options, &gate);
+    try std.testing.expect(gate.long_document_supported);
+    // Workspace sizing must use the identical bounded window geometry, even
+    // though its receiver performs no qualification checks of its own.
+    const workspace = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, options);
+    try std.testing.expect(workspace > 8192 and workspace <= 9000);
+    // The measured profile remains an evidence checker, separate from serving.
+    var coverage = try qualification.Gate.initResolved(options.identity.?, .metal, &request, options.pipeline, null);
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, planRequestGeometry(.metal, a, &config, tokenizer.tokenizer(), &request, options, &coverage));
+    // A low trial width exceeds the window-count cap, while a larger width
+    // fits both that cap and exact token capacity. Search must continue upward.
+    options.processor.max_sequence_tokens = 6000;
+    options.long_document.plan.max_windows = 3;
+    const fitted = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, options);
+    try std.testing.expect(fitted > 5900 and fitted <= 6000);
+    options.long_document.max_total_encoded_tokens = 128;
+    try std.testing.expectError(error.LongDocumentWorkLimitExceeded, workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, options));
+}
+
+test "boundary qualification exact prompt limit and model body limit remain distinct" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 4096 * 2);
+    defer a.free(text);
+    for (0..4096) |i| @memcpy(text[i * 2 ..][0..2], "x ");
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "geometry-only",
+        .schema = .{ .entities = .{"concept"} },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true, .tokens_per_word = 2 };
+    var config = QualificationGeometryTest.config();
+    config.max_len = 4096;
+    var options = Options{};
+    // 4096 source words plus synthetic punctuation is over the model's word
+    // limit; explicit windowing is required. No silent truncation is allowed.
+    try std.testing.expectError(error.BoundaryTextLimitExceeded, prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, options));
+    request.items[0].text = text[0 .. text.len - 2];
+    var prepared = try prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, options);
+    const exact = prepared.sequence_length;
+    try std.testing.expectEqual(@as(usize, 4096), prepared.samples[0].body_word_count);
+    try std.testing.expect(exact > 8192);
+    prepared.deinit();
+    options.processor.max_sequence_tokens = exact;
+    prepared = try prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, options);
+    prepared.deinit();
+    options.processor.max_sequence_tokens = exact - 1;
+    try std.testing.expectError(error.BoundarySequenceLimitExceeded, prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, options));
+    // Relative-position DeBERTa accepted the full prompt above. The absolute
+    // ModernBERT extent must instead constrain preparation before execution.
+    options.processor.max_sequence_tokens = 16384;
+    config.encoder.family = .modern_bert;
+    try std.testing.expectError(error.BoundarySequenceLimitExceeded, prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, options));
+}
+
+test "boundary qualification real base tokenizer fits full encoded context" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const c_file = @import("../util/c_file.zig");
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try c_file.readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
+    defer a.free(config_bytes);
+    const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+    const word = "configuration_visibility_maintenance_acknowledgement ";
+    const text = try a.alloc(u8, word.len * 4096);
+    defer a.free(text);
+    for (0..4096) |i| @memcpy(text[i * word.len ..][0..word.len], word);
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "base",
+        .schema = .{ .entities = .{"concept"} },
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 4096) } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    var admission = try qualification.Admission.initResolved(identity, .native, &request, .{}, null);
+    const Receiver = struct {
+        admission: *qualification.Admission,
+        peak: usize = 0,
+        pub fn observe(self: *@This(), bytes: usize, words: usize, windows: usize, prepared: *const processor.PreparedBatch) !void {
+            try self.admission.observe(bytes, words, windows, prepared);
+            self.peak = @max(self.peak, prepared.sequence_length);
+            try std.testing.expect(prepared.samples[0].body_word_count <= 4096);
+        }
+    };
+    var receiver = Receiver{ .admission = &admission };
+    const supplied = long_executor.Options{
+        .identity = identity,
+        .limits = .{
+            // This explicitly larger work budget permits a full-context geometry
+            // test; normal serving still enforces its configured cumulative budget.
+            .max_total_attention_work = 512 * 1024 * 1024 * 1024,
+            .window_batch_size = 1,
+        },
+    };
+    const usage = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], supplied, &receiver);
+    try std.testing.expect(usage.window_count > 1);
+    try std.testing.expect(receiver.peak > 16000 and receiver.peak <= 16384);
+    std.debug.print("full-context base tokenizer: peak_tokens={} windows={} total_tokens={}\n", .{ receiver.peak, usage.window_count, usage.prompt_tokens });
+}
+
+test "boundary full context learned Metal base serving uses word and token capacity" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try learnedFullContext(.metal, .both, false);
+}
+
+test "boundary full context learned CUDA base serving uses word and token capacity" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    try learnedFullContext(.cuda, .both, false);
+}
+
+test "boundary full context learned native base word capacity" {
+    try learnedFullContext(.native, .words, false);
+}
+
+test "boundary full context learned native base token capacity" {
+    try learnedFullContext(.native, .tokens, false);
+}
+
+test "boundary full context learned native grouped words" {
+    try learnedFullContext(.native, .words, true);
+}
+
+fn learnedFullContext(comptime backend: enum { native, metal, cuda }, comptime extent: enum { words, tokens, both }, comptime grouped: bool) !void {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    const session = switch (backend) {
+        .native => try factory.createNativeSession(a, directory),
+        .metal => try factory.createMetalSession(a, directory),
+        .cuda => try factory.createCudaSession(a, directory),
+    };
+    defer session.close();
+    const config = try factory.getGlinerBoundaryConfig(session);
+    const identity = try factory.getGlinerBoundaryIdentity(session);
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+    const BoundedAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    const FailureProbe = struct {
+        last: ?BoundedAllocator.AllocationFailure = null,
+        fn record(raw: ?*anyopaque, failure: BoundedAllocator.AllocationFailure) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.last = failure;
+        }
+    };
+    var heap_failure = FailureProbe{};
+    // Native execution shares the serving request's fixed live-heap bound.
+    // Model/tokenizer residency is owned separately by the session.
+    var native_heap = BoundedAllocator{ .backing = a, .limit = 512 * 1024 * 1024, .failure_context = &heap_failure, .allocation_failed = FailureProbe.record };
+    const execution_allocator = if (backend == .native) native_heap.allocator() else a;
+    defer if (backend == .native) {
+        if (heap_failure.last) |failure| std.debug.print("native serving heap failure: {any}\n", .{failure});
+        std.debug.print("native serving heap: peak={} limit={} live={}\n", .{ native_heap.peak, native_heap.limit, native_heap.live });
+        std.debug.assert(native_heap.live == 0);
+    };
+    const source_words = (config.max_len - 1) * (if (grouped) @as(usize, 4) else 1);
+    const text = try a.alloc(u8, source_words * 4);
+    defer a.free(text);
+    for (0..source_words) |i| @memcpy(text[i * 4 ..][0..4], "the ");
+    const schema_json = if (grouped)
+        "{\"entities\":[\"concept\"],\"entity_definitions\":{\"concept\":{\"description\":\"A concept\"}}}"
+    else
+        "{\"entities\":[\"concept\"]}";
+    const schema = try std.json.parseFromSlice(std.json.Value, a, schema_json, .{});
+    defer schema.deinit();
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "base",
+        .schema = schema.value,
+        .options = .{ .long_document = .{ .mode = "window", .window_words = config.max_len, .overlap_words = if (grouped) @as(usize, 0) else 128 } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    // Verify this is exactly the full body-word boundary before learned work.
+    var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = text[0 .. (config.max_len - 1) * 4], .schema = &request.items[0].compiled }}, .{});
+    try std.testing.expectEqual(@as(usize, config.max_len), prepared.samples[0].body_word_count);
+    const exact_tokens = prepared.sequence_length;
+    prepared.deinit();
+    const watchdog = try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a);
+    defer watchdog.destroy();
+    try watchdog.start(std.testing.io);
+    const control = Control{ .hard_cancellation = watchdog.boundary(), .deadline_ns = @import("antfly_platform").time.monotonicNs() + (if (backend == .native) @as(u64, 900) else 180) * std.time.ns_per_s };
+    var managed = try factory.getManagedComputeBackend(session, execution_allocator, null, control);
+    defer managed.deinit();
+    if (extent != .tokens) {
+        const response = try executeQualified(&managed.backend, execution_allocator, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
+        defer execution_allocator.free(response);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, @intCast(exact_tokens * (if (grouped) @as(usize, 4) else 1))), root.get("usage").?.object.get("prompt_tokens").?.integer);
+        const rows = root.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(if (grouped) @as(i64, 4) else 1, rows[0].object.get("long_document").?.object.get("window_count").?.integer);
+        std.debug.print("full-context learned {s}: body_words={} prompt_tokens={} windows={}\n", .{ @tagName(backend), config.max_len, exact_tokens * (if (grouped) @as(usize, 4) else 1), if (grouped) @as(usize, 4) else 1 });
+    }
+    if (extent == .words) return;
+
+    // Exercise the independent encoded-token boundary with the real tokenizer,
+    // weights and default work budget too. Measure one word's token cost using
+    // the same complete schema/punctuation grammar, then fill that capacity.
+    const word = "configuration_visibility_maintenance_acknowledgement ";
+    var probe = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = word, .schema = &request.items[0].compiled }}, .{});
+    const first_word = probe.samples[0].words[0];
+    const word_tokens = first_word.input_end - first_word.input_start;
+    const overhead = probe.sequence_length - word_tokens;
+    probe.deinit();
+    const capacity = qualification.sequenceLimit(&config, (engine.Limits{}).max_sequence_tokens);
+    const dense_source_words = (capacity - overhead) / word_tokens;
+    try std.testing.expect(dense_source_words + 1 <= config.max_len);
+    const dense_text = try a.alloc(u8, dense_source_words * word.len);
+    defer a.free(dense_text);
+    for (0..dense_source_words) |i| @memcpy(dense_text[i * word.len ..][0..word.len], word);
+    request.items[0].text = dense_text;
+    var dense = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = dense_text, .schema = &request.items[0].compiled }}, .{});
+    const dense_tokens = dense.sequence_length;
+    dense.deinit();
+    try std.testing.expect(dense_tokens > 16000 and dense_tokens <= capacity);
+    const dense_response = try executeQualified(&managed.backend, execution_allocator, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
+    defer execution_allocator.free(dense_response);
+    const dense_parsed = try std.json.parseFromSlice(std.json.Value, a, dense_response, .{});
+    defer dense_parsed.deinit();
+    const dense_root = dense_parsed.value.object;
+    try std.testing.expectEqual(@as(i64, @intCast(dense_tokens)), dense_root.get("usage").?.object.get("prompt_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), dense_root.get("data").?.array.items[0].object.get("long_document").?.object.get("window_count").?.integer);
+    std.debug.print("full-context learned {s}: prompt_tokens={}/{} windows=1 default_work_budget\n", .{ @tagName(backend), dense_tokens, capacity });
+}
+
+const PreparationReuseTest = struct {
+    const Receiver = struct {
+        encoded: usize = 0,
+        attention: u64 = 0,
+        single_attention: u64 = 0,
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.single_attention += prepared.sequence_length * prepared.sequence_length;
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.encoded += prepared.input_ids.len;
+            self.attention += prepared.samples.len * prepared.sequence_length * prepared.sequence_length;
+        }
+    };
+    fn exercise(a: Allocator) !void {
+        var request = try wire.parseJson(a,
+            \\{"schema_version":2,"model":"geometry-only","schema":{"entities":["concept"]},"options":{"long_document":{"mode":"window","window_words":4,"overlap_words":1}},"inputs":[{"content":"a b c d e f g h i j k l m n o p q r s t"}]}
+        , .{});
+        defer request.deinit();
+        var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+        const config = QualificationGeometryTest.config();
+        var store = PreparationStore.init(a);
+        defer store.deinit();
+        var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+        identity.backbone = config.backbone;
+        const options = long_executor.Options{ .preparations = &store, .identity = identity };
+        var receiver = Receiver{};
+        const used = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expect(used.encoded_tokens > used.prompt_tokens);
+        try std.testing.expectEqual(receiver.encoded, used.encoded_tokens);
+        try std.testing.expectEqual(receiver.attention, used.attention_work_items);
+        const calls = tokenizer.calls;
+        receiver = .{};
+        const repeated = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expectEqual(calls, tokenizer.calls);
+        try std.testing.expectEqualDeep(used, repeated);
+        // Decoder caps may change after earlier items produce output; they
+        // must refresh semantic identity without re-tokenizing these windows.
+        var decoded = options;
+        decoded.pipeline.max_output_values -= 1;
+        const adjusted = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], decoded, &receiver);
+        try std.testing.expectEqualDeep(used, adjusted);
+        try std.testing.expectEqual(calls, tokenizer.calls);
+
+        receiver = .{};
+        _ = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expect(receiver.single_attention < used.attention_work_items);
+        var limited = options;
+        limited.limits.max_total_attention_work = receiver.single_attention;
+        const attention_failure = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], limited, &receiver);
+        if (attention_failure) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.LongDocumentWorkLimitExceeded), err);
+        }
+        limited = options;
+        limited.limits.max_total_encoded_tokens = used.prompt_tokens;
+        const token_failure = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], limited, &receiver);
+        if (token_failure) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.LongDocumentWorkLimitExceeded), err);
+        }
+        limited = options;
+        limited.limits.max_prepared_bytes = 1;
+        const memory_failure = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], limited, &receiver);
+        if (memory_failure) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.MemoryBudgetExceeded), err);
+        }
+        _ = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expectEqual(calls, tokenizer.calls);
+    }
+};
+
+test "boundary qualification padded work and repeated planning reuse bounded samples" {
+    try PreparationReuseTest.exercise(std.testing.allocator);
+}
+
+test "boundary qualification retained preparation releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, PreparationReuseTest.exercise, .{});
+}
+
+test "boundary preparation benchmark isolates request-local tokenizer reuse" {
+    const env = @import("antfly_platform").env;
+    if (!env.getenvBool("ANTFLY_GLINER_PREPARATION_BENCH")) return error.SkipZigTest;
+    const directory = env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
+    defer a.free(config_bytes);
+    const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+    const sentence = "Alice met Bob at Antfly to discuss maintenance and visibility. ";
+    const text = try a.alloc(u8, sentence.len * 120);
+    defer a.free(text);
+    for (0..120) |i| @memcpy(text[i * sentence.len ..][0..sentence.len], sentence);
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "base",
+        .schema = .{ .entities = .{ "person", "organization", "concept" } },
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 128), .overlap_words = @as(usize, 16) } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const Receiver = struct {
+        pub fn observe(_: *@This(), _: usize, _: usize, _: usize, _: *const processor.PreparedBatch) !void {}
+    };
+    var receiver = Receiver{};
+    var expected: ?long_executor.GeometryUsage = null;
+    var totals = [_]u64{ 0, 0 };
+    // ABBA ordering reduces warmup/order bias. Each request has three quiet
+    // geometry passes and a fresh store; tokenizer loading is outside timing.
+    for ([_]bool{ false, true, true, false }) |reuse| {
+        var store = PreparationStore.init(a);
+        var store_live = true;
+        defer if (store_live) store.deinit();
+        const options = long_executor.Options{ .identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1, .preparations = if (reuse) &store else null };
+        const started = @import("antfly_platform").time.monotonicNs();
+        for (0..3) |_| {
+            const used = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+            if (expected) |value| try std.testing.expectEqualDeep(value, used) else expected = used;
+        }
+        store.deinit();
+        store_live = false;
+        const elapsed = @import("antfly_platform").time.monotonicNs() - started;
+        totals[@intFromBool(reuse)] += elapsed;
+        std.debug.print("preparation_bench reuse={} passes=3 ns={}\n", .{ reuse, elapsed });
+    }
+    std.debug.print("preparation_bench total_without_ns={} total_with_ns={}\n", .{ totals[0], totals[1] });
+}
+
 test "boundary qualification later item and window rejection cancels quietly and retries cleanly" {
     for ([_]QualificationGeometryTest.Mode{ .late_item, .late_window, .cancelled, .sequence_limit }) |mode| try QualificationGeometryTest.exercise(std.testing.allocator, mode);
 }
@@ -974,7 +1623,7 @@ test "boundary qualification quiet geometry releases every failed allocation" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
 }
 
-test "CUDA boundary request groups distinct ragged inputs within physical limits" {
+test "GPU boundary request groups distinct ragged inputs within physical limits" {
     const a = std.testing.allocator;
     var request = try wire.parseJson(a,
         \\{"schema_version":2,"model":"geometry-only","schema":{"entities":["person"]},"inputs":[{"content":"Ada"},{"content":"Ada visited 東京 with Grace"},{"content":"last","options":{"word_splitter":"char"}}]}
@@ -1005,9 +1654,76 @@ test "CUDA boundary request groups distinct ragged inputs within physical limits
     var bounded = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
     defer bounded.deinit();
     try std.testing.expectEqual(@as(usize, 1), bounded.samples.len);
-    var serial = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, .{});
+    var metal = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, .{});
+    defer metal.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metal.samples.len);
+    try std.testing.expectEqualSlices(i64, group.input_ids, metal.input_ids);
+    try std.testing.expectEqualSlices(i64, group.attention_mask, metal.attention_mask);
+    var metal_bounded = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer metal_bounded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metal_bounded.samples.len);
+    var serial = try prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, .{});
     defer serial.deinit();
     try std.testing.expectEqual(@as(usize, 1), serial.samples.len);
+    const geometry_options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
+    var tail = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items[2..], geometry_options);
+    defer tail.deinit();
+    const peak = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expectEqual(@max(metal.input_ids.len, tail.input_ids.len), peak);
+    var serial_geometry_options = geometry_options;
+    serial_geometry_options.engine.limits.max_batch = 1;
+    try std.testing.expect(peak > try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, serial_geometry_options));
+    // The reference device path reserves the request's own encoder plan, not
+    // the configured ceiling, and refuses a ceiling the request cannot fit.
+    const encoder_bytes = try referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expect(encoder_bytes > 0);
+    try std.testing.expect(encoder_bytes < geometry_options.device.max_encoder_device_bytes);
+    try std.testing.expect(encoder_bytes > try referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, serial_geometry_options));
+    var tight = geometry_options;
+    tight.device.max_encoder_device_bytes = encoder_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, tight));
+}
+
+test "GPU boundary classification windows fit backend-specific reference reservations" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"geometry-only","schema":{"classifications":[{"name":"intent","labels":["refund","support"]}]},"inputs":[{"content":"Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada"}]}
+    , .{});
+    defer request.deinit();
+    request.items[0].options.long_document = .{ .mode = .window, .window_words = 4, .overlap_words = 1, .max_windows = 16 };
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    const config = QualificationGeometryTest.config();
+    const options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
+    const metal_reserved = try referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, options);
+    const reserved = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+    const Receiver = struct {
+        config: *const model.Config,
+        options: Options,
+        peak: usize = 0,
+        failure: ?anyerror = null,
+        fn note(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            const planned = device_engine.plan(self.config, prepared, .{ .precision = .fp32, .max_device_bytes = self.options.device.max_encoder_device_bytes }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.peak = @max(self.peak, planned.device_upper_bound_bytes);
+        }
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+        }
+        pub fn observeSingle(_: *@This(), _: Allocator, _: []const u8, _: *const processor.PreparedBatch, _: processor.Options) !void {}
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.note(prepared);
+        }
+    };
+    var receiver = Receiver{ .config = &config, .options = options };
+    try planRequestGeometry(.cuda, a, &config, tokenizer.tokenizer(), &request, options, &receiver);
+    if (receiver.failure) |err| return err;
+    try std.testing.expectEqual(receiver.peak, reserved);
+    try std.testing.expect(reserved > metal_reserved);
+    var tight = options;
+    tight.device.max_encoder_device_bytes = reserved - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
 }
 
 test "CUDA boundary managed Multi-Decide batches windows and recovers after cancellation" {
@@ -1127,4 +1843,401 @@ test "CUDA boundary managed Multi-Decide batches windows and recovers after canc
         }
         std.debug.print("family_cuda_windows: windows={d} batched_serial_equal=true cancellation_recovered=true\n", .{window_count});
     }
+}
+
+fn exerciseNonmonotonicFitting(a: Allocator) !void {
+    const weights = [_]usize{ 1, 1, 1, 15, 30, 15, 1, 15, 15, 1, 30, 1, 30, 15, 1, 15, 1, 1, 1, 30, 15, 1, 1, 15 };
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(a);
+    for (weights) |weight| {
+        for (0..weight) |_| try text.append(a, 'a');
+        try text.append(a, ' ');
+    }
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "probe", .schema = .{ .entities = .{"x"} }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 12), .overlap_words = @as(usize, 0), .max_windows = @as(usize, 3) } }, .inputs = .{.{ .content = text.items }} }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var empty = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "", .schema = &request.items[0].compiled }}, .{});
+    const prefix_and_terminal = empty.sequence_length;
+    empty.deinit();
+    var config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    const options = long_executor.Options{ .identity = identity, .processor = .{ .max_sequence_tokens = prefix_and_terminal + 103 }, .limits = .{ .window_batch_size = 1 } };
+    var receiver = PreparationReuseTest.Receiver{};
+    const fitted = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+    request.items[0].options.long_document.window_words = 10;
+    const valid = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(@as(usize, 3), fitted.window_count);
+    try std.testing.expectEqual(valid.prompt_tokens, fitted.prompt_tokens);
+    // Checking thousands of candidate widths must not multiply tokenizer work.
+    config.max_len = 4096;
+    request.items[0].options.long_document.window_words = 4096;
+    const before = tokenizer.calls;
+    const wide = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(valid.prompt_tokens, wide.prompt_tokens);
+    try std.testing.expect(tokenizer.calls - before < 256);
+}
+
+test "boundary qualification fitting preserves valid nonmonotonic partitions" {
+    try exerciseNonmonotonicFitting(std.testing.allocator);
+}
+
+test "boundary qualification token fitting releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseNonmonotonicFitting, .{});
+}
+
+test "boundary qualification indexed fitting matches exhaustive tokenized partitions" {
+    const a = std.testing.allocator;
+    const documents = @import("../pipelines/gliner_boundary_long_document.zig");
+    const texts = [_][]const u8{ "İΣ a bc def 😀 https://x.test @owner a@b.test a bb ccc dddd ", "a bb ccc dddd eeeee ffffff ggggggg h i j k l!", "https://x.test a b c d e f https://y.test" };
+    for (texts) |text| for ([_]processor.WordSplitter{ .whitespace, .char }) |splitter| {
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "probe", .schema = .{ .entities = .{"x"} }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 12), .overlap_words = @as(usize, 1) } }, .inputs = .{.{ .content = text }} }, .{});
+        defer a.free(raw);
+        var request = try wire.parseJson(a, raw, .{});
+        defer request.deinit();
+        const item = &request.items[0];
+        item.options.word_splitter = splitter;
+        var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+        var empty = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "", .schema = &item.compiled }}, .{ .word_splitter = splitter });
+        const overhead = empty.sequence_length;
+        empty.deinit();
+        const config = QualificationGeometryTest.config();
+        var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+        identity.backbone = config.backbone;
+        for ([_]usize{ 4, 8, 16, 24 }) |body_budget| {
+            const cap = overhead + body_budget;
+            var expected: ?struct { tokens: usize, windows: usize } = null;
+            var width: usize = 12;
+            while (width >= 2) : (width -= 1) {
+                var document = documents.plan(a, text, item.compiled.fingerprint, .{ .mode = .windowed, .word_splitter = splitter, .max_window_body_words = width, .overlap_words = 1 }) catch |err| switch (err) {
+                    error.InvalidLongDocumentLimits => continue,
+                    else => return err,
+                };
+                defer document.deinit();
+                var total: usize = 0;
+                var fits = true;
+                for (document.windows) |window| {
+                    var batch = processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = try document.windowText(window.index), .schema = &item.compiled }}, .{ .word_splitter = splitter, .max_text_words = width, .max_sequence_tokens = cap }) catch |err| switch (err) {
+                        error.BoundarySequenceLimitExceeded => {
+                            fits = false;
+                            break;
+                        },
+                        else => return err,
+                    };
+                    total += batch.sequence_length;
+                    batch.deinit();
+                }
+                if (fits) {
+                    expected = .{ .tokens = total, .windows = document.windows.len };
+                    break;
+                }
+            }
+            var receiver = PreparationReuseTest.Receiver{};
+            const result = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), item, .{ .identity = identity, .processor = .{ .max_sequence_tokens = cap }, .limits = .{ .window_batch_size = 1 } }, &receiver);
+            if (expected) |value| {
+                const actual = try result;
+                try std.testing.expectEqual(value.tokens, actual.prompt_tokens);
+                try std.testing.expectEqual(value.windows, actual.window_count);
+            } else if (result) |_| return error.TestUnexpectedResult else |err| {
+                if (err == error.OutOfMemory) return err;
+            }
+        }
+    };
+}
+
+test "boundary end-to-end CUDA benchmark measures complete warm requests" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    const env = @import("antfly_platform").env;
+    if (!env.getenvBool("ANTFLY_GLINER_E2E_BENCH")) return error.SkipZigTest;
+    const directory = env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    const session = try factory.createCudaSession(a, directory);
+    defer session.close();
+    const config = try factory.getGlinerBoundaryConfig(session);
+    const identity = try factory.getGlinerBoundaryIdentity(session);
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const sentence = "The library indexes records and answers search queries. ";
+    const text = try a.alloc(u8, sentence.len * 64);
+    defer a.free(text);
+    for (0..64) |i| @memcpy(text[i * sentence.len ..][0..sentence.len], sentence);
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "base",
+        .schema = .{ .entities = .{"concept"} },
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 128), .overlap_words = @as(usize, 16) } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const watchdog = try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a);
+    defer watchdog.destroy();
+    try watchdog.start(std.testing.io);
+    const control = Control{ .hard_cancellation = watchdog.boundary(), .deadline_ns = @import("antfly_platform").time.monotonicNs() + 600 * std.time.ns_per_s };
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    var expected: ?[]u8 = null;
+    defer if (expected) |response| a.free(response);
+    var totals = [_]u64{ 0, 0 };
+    // Warm both modes, then collect eight ABBA rounds (16 requests per mode). Identical learned dispatch policy and
+    // grouping isolate preparation reuse. Include final preparation-store free;
+    // exclude model/tokenizer loading, JSON parsing, transport and response free.
+    for (0..34) |sample| {
+        const reuse = if (sample < 2) sample == 1 else ((sample - 2) % 4 == 1 or (sample - 2) % 4 == 2);
+        var store = PreparationStore.init(a);
+        const options = Options{ .identity = identity, .control = control, .preparations = if (reuse) &store else null };
+        const start = @import("antfly_platform").time.monotonicNs();
+        const response = response: {
+            errdefer store.deinit();
+            _ = try workspaceGeometryFor(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+            var gate = try qualification.Admission.initResolved(identity, .cuda, &request, options.pipeline, control);
+            try qualifyRequestGeometry(&managed.backend, a, &config, tokenizer.tokenizer(), &request, options, &gate);
+            break :response try executeChecked(&managed.backend, a, &config, tokenizer.tokenizer(), &request, options, &gate);
+        };
+        defer a.free(response);
+        store.deinit();
+        const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+        if (expected) |reference| try std.testing.expectEqualStrings(reference, response) else expected = try a.dupe(u8, response);
+        if (sample < 2) continue;
+        totals[@intFromBool(reuse)] += elapsed;
+        std.debug.print("e2e_bench backend=cuda policy=reference_v1 reuse={} ns={} response_bytes={}\n", .{ reuse, elapsed, response.len });
+    }
+    std.debug.print("e2e_bench total_without_ns={} total_with_ns={} equal_responses=true\n", .{ totals[0], totals[1] });
+}
+
+fn exerciseFragmentFitting(a: Allocator) !void {
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"probe","schema":{"entities":["x"]},"options":{"long_document":{"mode":"window","window_words":6,"overlap_words":0}},"inputs":[{"content":"a b c d https://xxxx e f g"}]}
+    , .{});
+    defer request.deinit();
+    var tok = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    const config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    var store = PreparationStore.init(a);
+    defer store.deinit();
+    const options = long_executor.Options{ .preparations = &store, .identity = identity, .processor = .{ .max_fragment_bytes = 12 } };
+    var receiver = PreparationReuseTest.Receiver{};
+    const first = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+
+    request.items[0].options.long_document.window_words = 4;
+    const fitting = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(fitting.window_count, first.window_count);
+    try std.testing.expectEqual(fitting.prompt_tokens, first.prompt_tokens);
+    request.items[0].options.long_document.window_words = 6;
+    const before = tok.calls;
+    const cached = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(first.prompt_tokens, cached.prompt_tokens);
+    try std.testing.expectEqual(before, tok.calls);
+    // A source word that already exceeds the cap cannot be fixed by fitting.
+    request.items[0].text = "a b c d https://xxxxx e f g";
+    const invalid = long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    if (invalid) |_| return error.TestUnexpectedResult else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(@as(anyerror, error.BoundaryFragmentLimitExceeded), err);
+    }
+}
+
+test "boundary qualification fragment fitting respects the default cap with pinned base tokenizer" {
+    const a = std.testing.allocator;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer tok.tokenizer().deinitTokenizer();
+    var url = std.ArrayListUnmanaged(u8).empty;
+    defer url.deinit(a);
+    try url.appendSlice(a, "https://");
+    while (url.items.len + "configuration".len <= 65536) try url.appendSlice(a, "configuration");
+    while (url.items.len < 65536) try url.append(a, 'x');
+    const text = try std.fmt.allocPrint(a, "a b c d {s} e f g", .{url.items});
+    defer a.free(text);
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "probe", .schema = .{ .entities = .{"x"} }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 6), .overlap_words = @as(usize, 0) } }, .inputs = .{.{ .content = text }} }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    var config = QualificationGeometryTest.config();
+    config.encoder.vocab_size = @intCast(tok.tokenizer().vocabSize());
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    const options = long_executor.Options{ .identity = identity };
+    var receiver = PreparationReuseTest.Receiver{};
+    const fitted = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+
+    request.items[0].options.long_document.window_words = 4;
+    const accepted = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(accepted.window_count, fitted.window_count);
+    try std.testing.expectEqual(accepted.prompt_tokens, fitted.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 5083), fitted.prompt_tokens);
+}
+
+test "boundary qualification fragment fitting preserves valid partitions" {
+    try exerciseFragmentFitting(std.testing.allocator);
+}
+
+test "boundary qualification fragment fitting releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFragmentFitting, .{});
+}
+
+test "boundary qualification fragment fitting rejects invalid schema before source indexing" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"probe","schema":{"entities":["oversized_entity_label"]},"options":{"long_document":{"mode":"window","window_words":6,"overlap_words":0}},"inputs":[{"content":"a b c d https://xxxx e f g"}]}
+    , .{});
+    defer request.deinit();
+    var tok = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    const config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    var receiver = PreparationReuseTest.Receiver{};
+    try std.testing.expectError(error.BoundaryFragmentLimitExceeded, long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], .{ .identity = identity, .processor = .{ .max_fragment_bytes = 12 } }, &receiver));
+    // Only two bounded schema attempts: initial window, then empty prefix.
+    try std.testing.expect(tok.calls < 32);
+}
+
+test "boundary qualification native full-context groups fit head budgets before encoding" {
+    const a = std.testing.allocator;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const config_path = try std.fs.path.join(a, &.{ directory, "config.json" });
+    defer a.free(config_path);
+    const encoder_path = try std.fs.path.join(a, &.{ directory, "encoder_config/config.json" });
+    defer a.free(encoder_path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, config_path);
+    defer a.free(bytes);
+    const encoder_bytes = try @import("../util/c_file.zig").readFile(a, encoder_path);
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, bytes, encoder_bytes);
+    const text = try a.alloc(u8, 4095 * 4 * 4);
+    defer a.free(text);
+    for (0..4095 * 4) |i| @memcpy(text[i * 4 ..][0..4], "the ");
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "base", .schema = .{ .entities = .{"concept"}, .entity_definitions = .{ .concept = .{ .description = "A concept" } } }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 4096), .overlap_words = @as(usize, 0) } }, .inputs = .{.{ .content = text }} }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const Receiver = struct {
+        gate: qualification.Admission,
+        batch: usize = 0,
+        words: usize = 0,
+        pub fn observe(self: *@This(), size: usize, words: usize, windows: usize, prepared: *const processor.PreparedBatch) !void {
+            try self.gate.observe(size, words, windows, prepared);
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.batch = @max(self.batch, prepared.samples.len);
+            self.words = @max(self.words, prepared.word_width);
+        }
+    };
+    const identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    var receiver = Receiver{ .gate = try qualification.Admission.init(identity, .native, &request, null) };
+    var tok = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    var preparations = PreparationStore.init(a);
+    defer preparations.deinit();
+    var options = long_executor.Options{ .identity = identity, .preparations = &preparations };
+    const usage = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(@as(usize, 2), receiver.batch);
+    try std.testing.expectEqual(@as(usize, 4096), receiver.words);
+    const head = @import("../architectures/gliner/boundary_head.zig");
+    const planned = try head.planShape(&config, .{ .batch = receiver.batch, .text_length = receiver.words, .queries = 1 }, .{});
+    try std.testing.expect(planned.intermediate_bytes <= (head.Limits{}).max_intermediate_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, head.planShape(&config, .{ .batch = 4, .text_length = 4096, .queries = 1 }, .{}));
+    try std.testing.expectEqual(@as(usize, 4), usage.window_count);
+    // An impossible head cap must fail before the empty backend can read any
+    // model weights. Cache reuse must re-check the current head limits.
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var context = native.NativeCompute.init(a, &weights, null);
+    defer context.deinit();
+    const cb = compute.ComputeBackend{ .ptr = &context, .vtable = &native.vtable_impl };
+    options.pipeline.head_limits.max_intermediate_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, long_executor.executeNative(&cb, a, &config, tok.tokenizer(), &request.items[0], options));
+    options.pipeline.head_limits = .{};
+    const recovered = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(usage.prompt_tokens, recovered.prompt_tokens);
+    options.pipeline.head_limits.max_intermediate_bytes = 1;
+    request.items[0].options.long_document.mode = .reject;
+    request.items[0].text = text[0 .. 4095 * 4];
+    try std.testing.expectError(error.ResourceLimitExceeded, prepareGroup(.native, a, &config, tok.tokenizer(), request.items, .{ .identity = identity, .pipeline = options.pipeline }));
+    std.debug.print("native-head admission: windows={} words={} admitted_batch={} planned_bytes={}\n", .{ usage.window_count, receiver.words, receiver.batch, planned.intermediate_bytes });
+}
+
+test "gliner microbatch preflight includes record callback downloads" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"structures":{"record":{"mode":"latent","fields":{"name":"str"}}}},"inputs":[{"content":"Ada"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    var config = QualificationGeometryTest.config();
+    config.head.pool_size = 1;
+    config.head.min_pool_per_query = 1;
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("review"), .sidecars = @splat(artifact.Digest.of("review")) } };
+    var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer prepared.deinit();
+    const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+    const combined = try device_request.plan(&config, &prepared, &schemas, .{ .limits = options.device });
+    // One candidate, one field => one object + two assignment logits per row.
+    // A singleton fits, but two callbacks require 24 bytes, not 12.
+    options.brokered_request = true;
+    options.device.head.max_result_download_bytes = combined.minimum_result_download_bytes + 12;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: usize, _: wire.Item, _: pipeline.Sample, _: usize) void {}
+        fn fail(_: *anyopaque, _: usize, _: anyerror) void {}
+        fn check(_: ?*anyopaque, _: usize) !void {}
+    };
+    options.brokered_request = false;
+    options.row_sink = .{ .context = &tokenizer, .emit_fn = Sink.emit, .fail_fn = Sink.fail, .check_fn = Sink.check };
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    options.engine.limits.max_batch = 1;
+    try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
+}
+
+test "gliner microbatch callback planning covers every frozen schema route" {
+    const a = std.testing.allocator;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const bytes = try fixtures.fixtureBytes(a, "pipeline_cases_base.json");
+    defer a.free(bytes);
+    const Cases = struct { cases: []const struct { id: []const u8, schema: std.json.Value } };
+    const cases = try std.json.parseFromSlice(Cases, a, bytes, .{ .ignore_unknown_fields = true });
+    defer cases.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var checked: usize = 0;
+    for (cases.value.cases) |case| {
+        const json = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "m", .schema = case.schema, .inputs = .{ .{ .content = "Ada met Bob." }, .{ .content = "Bob met Ada." } } }, .{});
+        defer a.free(json);
+        var request = try wire.parseJson(a, json, .{});
+        defer request.deinit();
+        var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, .{});
+        defer prepared.deinit();
+        const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+        var options = device_request.Options{ .independent_requests = true };
+        const plan = try device_request.plan(&config, &prepared, &schemas, options);
+        if (plan.callback_result_download_upper_bound_bytes == 0) continue;
+        checked += 1;
+        options.limits.scorer.max_result_download_bytes = plan.minimum_result_download_bytes + plan.callback_result_download_upper_bound_bytes - 1;
+        try std.testing.expectError(error.ResourceLimitExceeded, device_request.plan(&config, &prepared, &schemas, options));
+        // The exact same initial transfers fit without independent-caller
+        // admission. Only callback headroom is responsible for subdivision.
+        options.independent_requests = false;
+        var errors: [2]?anyerror = @splat(null);
+        options.pipeline.independent_rows = .{ .errors = errors[0..1] };
+        try std.testing.expectError(error.InvalidBoundaryPipelineOptions, device_request.plan(&config, &prepared, &schemas, options));
+        options.pipeline.independent_rows = .{ .errors = &errors };
+        try std.testing.expectError(error.ResourceLimitExceeded, device_request.plan(&config, &prepared, &schemas, options));
+        options.pipeline.independent_rows = null;
+        const atomic = try device_request.plan(&config, &prepared, &schemas, options);
+        try std.testing.expectEqual(@as(usize, 0), atomic.callback_result_download_upper_bound_bytes);
+    }
+    try std.testing.expect(checked >= 7);
 }

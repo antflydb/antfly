@@ -8,13 +8,13 @@ import {
   CardHeader,
   CardTitle,
   Input,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
 import type { BatchRequest } from "@antfly/sdk";
 import { CircleAlert, CircleCheck } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useState } from "react";
-import { Spinner } from "@/components/spinner";
 import { api, type JSONSchemaProperty, type TableSchema } from "../api";
 
 interface DocumentBuilderProps {
@@ -278,7 +278,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
               <select
                 value={selectedSchemaType}
                 onChange={(e) => setSelectedSchemaType(e.target.value)}
-                className="rounded-none border border-input bg-background px-3 py-2 text-sm"
+                className="rounded-md border border-input bg-background px-3 py-2 text-sm"
               >
                 <option value="">Select a document type</option>
                 {Object.keys(schema.document_schemas).map((schemaName) => (

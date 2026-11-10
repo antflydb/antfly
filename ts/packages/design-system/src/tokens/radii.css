@@ -1,12 +1,14 @@
 /**
- * Visual language: square corners everywhere. The radius variables stay
- * defined so existing shadcn components that compute from --radius still
- * work — they just all resolve to 0.
+ * Visual language: the page is square, the things you hold are rounded.
+ * Page structure (sections, rules, rails, full-bleed bands) stays square.
+ * Controls (buttons, inputs, chips, menu items) use sm/md; panels and
+ * floating surfaces (cards, menus, popovers) use lg; dialogs and the
+ * product frame use xl.
  */
 :root {
-  --radius: 0;
-  --radius-sm: 0;
-  --radius-md: 0;
-  --radius-lg: 0;
-  --radius-xl: 0;
+  --radius: 6px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
 }

@@ -36,11 +36,18 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = @import("api/resolvers.zig");
+    _ = @import("api/managed_sources.zig");
     _ = @import("api/protected_future.zig");
+    _ = @import("api/sql_graph_overlay_test.zig");
+    _ = @import("api/graph_execution.zig");
+    _ = @import("api/graph_statement_source.zig");
+    _ = @import("api/retained_read_client.zig").consumer_tests;
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/kernel_owner_source.zig");
     _ = @import("api/sql_execution.zig");
+    _ = @import("api/lake_row_payloads.zig");
+    _ = @import("api/lake_expiring_objects.zig");
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
@@ -50,6 +57,8 @@ test {
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
     _ = @import("api/http_client.zig");
+    _ = @import("api/internal_group_operations.zig");
+    _ = @import("antfly_local_sources").api_batch;
     _ = @import("api/distributed_join.zig");
     _ = @import("api/distributed_graph.zig");
     _ = @import("antfly_inference_query_embedding_cache");
@@ -83,13 +92,27 @@ test "system catalog routing and transport discovery" {
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 test {
+    _ = @import("antfly_local_sources").section_source_capture;
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/native_query_repository.zig");
     _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/lake_index_sort_stream.zig");
+    _ = @import("serverless/build/lake_build_limits.zig");
+    _ = @import("api/lake_index_coordinator.zig");
+    _ = @import("api/lake_index_sql_rows.zig");
+    _ = @import("api/sql_memory_owner.zig");
+    _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_statistics.zig");
+    _ = @import("api/lake_index_page_mutations.zig");
+    _ = @import("api/lake_row_identity_delta.zig");
+    _ = @import("api/lake_index_text_directory.zig");
+    _ = @import("api/lake_index_navigation_warming.zig");
+    _ = @import("api/lake_index_artifact_recovery.zig");
+    _ = @import("api/lake_index_navigation_pages.zig");
+    _ = @import("api/lake_source_navigation.zig");
     _ = @import("api/lake_index_seekable_text.zig");
     _ = @import("api/lake_index_text_opening_pack.zig");
 }
@@ -106,6 +129,11 @@ test "external lake SQL schema cache discovery" {
 // Filtered roots must reach the mounted transport tests through a named anchor.
 test "api HTTP runtime discovery" {
     _ = httpx_handler;
+}
+
+test "httpx inference gateway source discovery" {
+    _ = @import("api/inference_gateway.zig");
+    _ = @import("api/inference_source.zig");
 }
 
 // Keep bounded merge storage contracts reachable in focused test builds.

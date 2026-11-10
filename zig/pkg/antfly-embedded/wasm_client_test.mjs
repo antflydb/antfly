@@ -18,7 +18,25 @@ import {
     createGoParityRemoteTemplateRenderer,
     formatDotpromptMediaUrl,
     instantiateAntflyEmbeddedApiFromBytes,
+    bindAntflyEmbeddedApi,
 } from "./wasm_client.mjs";
+
+const resultApi = bindAntflyEmbeddedApi({});
+assert.equal(resultApi.searchTotalHits({ responses: [
+    { hits: { total: { value: 12, relation: "exact" }, hits: [{ _id: "a" }] } },
+    { hits: { total: { value: 7, relation: "at_least" }, hits: [] } },
+] }), 19, "typed totals count matches beyond the returned page");
+assert.equal(resultApi.searchTotalHits({ responses: [
+    { hits: { total: 8, hits: [] } },
+    { hits: { hits: [{ _id: "b" }, { _id: "c" }] } },
+] }), 10, "legacy numeric totals and missing totals remain supported");
+assert.equal(resultApi.searchTotalHits({ responses: [
+    { hits: { total: { value: 0, relation: "exact" }, hits: [] } },
+] }), 0);
+assert.equal(resultApi.searchTotalHits({ responses: [{ _id: "a" }, { _id: "b" }] }), 2);
+assert.equal(resultApi.searchTotalHits({ responses: [] }), 0);
+assert.equal(resultApi.searchTotalHits({ responses: [{ hits: { total: 6 } }] }), 6);
+assert.equal(resultApi.searchTotalHits({ responses: [{ hits: { total: { value: 9 } } }] }), 9);
 
 const renderer = createGoParityRemoteTemplateRenderer({
     remoteText({ url, credentials }) {

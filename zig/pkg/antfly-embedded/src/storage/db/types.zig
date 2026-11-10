@@ -15,6 +15,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+/// Shared transient/permanent classification and operator hints for
+/// enrichment and repair failures.
+pub const repair_failure = @import("repair_failure.zig");
 pub const SparseOrdinalSelection = @import("../../sparse/ordinal_lookup.zig").Selection;
 pub const SparseOrdinalWorkBudget = @import("../../sparse/ordinal_lookup.zig").WorkBudget;
 pub const SparseOrdinalKeyFilter = @import("../../sparse/ordinal_lookup.zig").KeyFilter;
@@ -53,39 +56,10 @@ pub const GeoShapeRelation = enum {
     contains,
 };
 
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-};
-
-pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
-    if (std.mem.eql(u8, text, "propose")) return .propose;
-    if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
-    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "full_index")) return .full_index;
-    return null;
-}
-
-pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
-    return switch (value) {
-        .string => |text| parsePublicSyncLevelText(text),
-        else => null,
-    };
-}
-
-pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
-    return switch (level) {
-        .propose => "propose",
-        .write => "write",
-        .full_text => "full_text",
-        .enrichments => "enrichments",
-        .full_index => "full_index",
-    };
-}
+pub const SyncLevel = @import("mutation_values.zig").SyncLevel;
+pub const parsePublicSyncLevelText = @import("mutation_values.zig").parsePublicSyncLevelText;
+pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicSyncLevelJson;
+pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;
 
 test "public sync level text accepts full_index and rejects removed aknn alias" {
     try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
@@ -93,75 +67,12 @@ test "public sync level text accepts full_index and rejects removed aknn alias" 
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
 }
 
-pub const BatchWrite = struct {
-    key: []const u8,
-    value: []const u8,
-    /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
-    /// Validated against the pinned relational schema before preparation.
-    json_null_fields: []const []const u8 = &.{},
-};
-
-pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
-    if (fields.len == 0) return &.{};
-    const copy = try alloc.alloc([]const u8, fields.len);
-    errdefer alloc.free(copy);
-    var initialized: usize = 0;
-    errdefer for (copy[0..initialized]) |name| alloc.free(name);
-    for (fields, copy) |name, *out| {
-        out.* = try alloc.dupe(u8, name);
-        initialized += 1;
-    }
-    return copy;
-}
-
-pub const TransformOpType = enum {
-    set,
-    set_on_insert,
-    unset,
-    inc,
-    push,
-    pull,
-    add_to_set,
-    pop,
-    mul,
-    min,
-    max,
-    current_date,
-    rename,
-};
-
-/// Canonical public wire spelling for document transform operations. Keep the
-/// representation beside the value contract so routing/serialization code
-/// does not need to import the physical transform executor.
-pub fn transformOpText(op: TransformOpType) []const u8 {
-    return switch (op) {
-        .set => "$set",
-        .set_on_insert => "$setOnInsert",
-        .unset => "$unset",
-        .inc => "$inc",
-        .push => "$push",
-        .pull => "$pull",
-        .add_to_set => "$addToSet",
-        .pop => "$pop",
-        .mul => "$mul",
-        .min => "$min",
-        .max => "$max",
-        .current_date => "$currentDate",
-        .rename => "$rename",
-    };
-}
-
-pub const TransformOp = struct {
-    op: TransformOpType,
-    path: []const u8,
-    value_json: ?[]const u8 = null,
-};
-
-pub const DocumentTransform = struct {
-    key: []const u8,
-    operations: []const TransformOp = &.{},
-    upsert: bool = false,
-};
+pub const BatchWrite = @import("mutation_values.zig").BatchWrite;
+pub const cloneJsonNullFields = @import("mutation_values.zig").cloneJsonNullFields;
+pub const TransformOpType = @import("mutation_values.zig").TransformOpType;
+pub const transformOpText = @import("mutation_values.zig").transformOpText;
+pub const TransformOp = @import("mutation_values.zig").TransformOp;
+pub const DocumentTransform = @import("mutation_values.zig").DocumentTransform;
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
@@ -335,6 +246,11 @@ pub const TransactionMutation = union(enum) {
     },
 };
 
+/// The ordered command owns version semantics, including during WAL/Raft
+/// replay. `admit_current` is local ingress only; absent private wire fields
+/// decode as legacy. The admission timestamp is separate from the revision.
+pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
+
 pub const BatchRequest = struct {
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
@@ -345,6 +261,7 @@ pub const BatchRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     /// Exact metadata read-index snapshot fetched and validated by the owner
     /// leader before proposal. Followers consume these committed bytes locally;
     /// they must never perform metadata IO from deterministic Raft apply.
@@ -366,6 +283,10 @@ pub const BatchRequest = struct {
     /// Bounded authenticated upload stages for a large ordered publication.
     /// Only the owner leader proposes these private controls.
     artifact_publication_transport: ?@import("artifact_publication_transport.zig").Request = null,
+    /// Leader-planned LEANN graph record (see storage/leann_replica.zig).
+    /// Only the owner leader proposes it; replicas persist the committed
+    /// bytes and apply them verbatim in log order. Never public JSON.
+    leann_record: ?LeannRecordCommand = null,
     /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
     restore_staging: ?@import("restore_staging_contract.zig").Control = null,
     restore_staging_scope: ?[32]u8 = null,
@@ -402,6 +323,9 @@ pub const BatchRequest = struct {
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
+    /// `admit_current` is local admission only. Persisted commands explicitly
+    /// select revision_v1; an absent wire field always decodes as legacy.
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
@@ -473,6 +397,12 @@ pub const BatchRequest = struct {
         try jw.endObject();
     }
 };
+
+/// Promote a borrowed public view without copying or granting private authority.
+/// The caller retains every buffer through the synchronous mutation call.
+pub fn fromPublicMutation(req: @import("mutation_values.zig").PublicBatchRequest) BatchRequest {
+    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level };
+}
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
     if (req.merge_artifacts.len == 0) return;
@@ -649,6 +579,8 @@ pub const ArtifactRef = struct {
     window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
+    revision: ?[]u8 = null,
+    derivation_revision: ?[]u8 = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
         const document_id = try alloc.dupe(u8, self.document_id);
@@ -657,7 +589,13 @@ pub const ArtifactRef = struct {
         errdefer alloc.free(name);
         const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (unit_id) |id| alloc.free(id);
+        const revision = if (self.revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (revision) |value| alloc.free(value);
+        const derivation_revision = if (self.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (derivation_revision) |value| alloc.free(value);
         return .{
+            .revision = revision,
+            .derivation_revision = derivation_revision,
             .document_id = document_id,
             .name = name,
             .kind = self.kind,
@@ -671,6 +609,8 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.revision) |value| alloc.free(value);
+        if (self.derivation_revision) |value| alloc.free(value);
         if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
@@ -1420,6 +1360,17 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
+    /// Private read-index preparation for a later fenced graph snapshot.
+    /// Public lookup decoders never populate this maintenance-only flag.
+    cypher_prepare: bool = false,
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
     /// Local output allocation policy; never parsed from public requests.
     /// Raw copies and flat native projections already allocate exact bodies.
     output_exact: bool = false,
@@ -1535,6 +1486,9 @@ pub const RelationalRowQuery = struct {
     };
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     page_bytes: usize = 16 * 1024 * 1024,
     fields: []const []const u8,
     index: ?[]const u8 = null,
@@ -1542,6 +1496,7 @@ pub const RelationalRowQuery = struct {
     /// pinned catalog snapshot. This is deliberately a hint: no usable index
     /// is a correct primary-key fallback.
     auto_index: bool = false,
+    reverse: bool = false,
     after: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,
@@ -1550,6 +1505,16 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
+    /// Private administration census; emits value-free inspection status.
+    privacy_status: bool = false,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
@@ -1577,6 +1542,9 @@ pub const ScanOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    /// Internal Cypher visitation only. Reserved document identities consume
+    /// progress but must not be decoded by a user row filter. Never serialized.
+    cypher_node_keys_only: bool = false,
     /// Internal-only response mode used by linear merge. Public scans leave
     /// this false and retain their existing NDJSON shape.
     include_content_hashes: bool = false,
@@ -1586,6 +1554,10 @@ pub const ScanOptions = struct {
     /// scan lifetime.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+
+    /// Private maintenance continuation: exclude from_key even when empty.
+    /// Only trusted internal transports preserve this marker.
+    resume_from_key: bool = false,
 
     pub fn isRelational(self: ScanOptions) bool {
         return self.relational_query != null or self.relational_query_json.len != 0;
@@ -1640,11 +1612,21 @@ pub const ScanVisitor = struct {
     borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+    /// Optional physical-candidate accounting, before visibility/predicate work.
+    /// Owner count readers report rejected candidates as well as emitted rows.
+    progress: ?*const fn (context: ?*anyopaque, examined: usize) anyerror!void = null,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
-    const NativeCallbacks = struct { visit: @FieldType(ScanVisitor, "visit") };
+    const NativeCallbacks = struct {
+        visit: @FieldType(ScanVisitor, "visit"),
+        progress: @typeInfo(@FieldType(ScanVisitor, "progress")).optional.child,
+    };
     const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
 
+    pub fn reportProgress(self: ScanVisitor, examined: usize) anyerror!void {
+        const callback = self.progress orelse return;
+        return NativeBoundary.call("progress", self.callback_dispatch, callback, .{ self.context, examined });
+    }
     pub fn visitEntry(self: ScanVisitor, entry: ScanVisitEntry) anyerror!void {
         return NativeBoundary.call("visit", self.callback_dispatch, self.visit, .{ self.context, entry });
     }
@@ -1674,6 +1656,23 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     to_key: []const u8 = "",
     limit: u32 = 100,
     shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+    /// Private continuation marker: from_key is the last admitted identifier,
+    /// even when empty. Keep the identifier in one place on the owner wire.
+    resume_from_key: bool = false,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        // Preserve the legacy initial-request envelope. Only actual resumes
+        // add the marker; an empty cursor remains distinct from an open bound.
+        inline for (comptime std.meta.fieldNames(@This())) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else true;
+            if (emit) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -1734,11 +1733,8 @@ pub const GraphTraversalResult = traversal_mod.TraversalResult;
 pub const GraphPathWeightMode = paths_mod.PathWeightMode;
 pub const GraphPath = paths_mod.Path;
 
-pub const TransactionWrite = struct {
-    key: []const u8,
-    value: []const u8,
-    json_null_fields: []const []const u8 = &.{},
-};
+/// Transactions and batches share one authored write value and planner.
+pub const TransactionWrite = BatchWrite;
 
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
@@ -1757,9 +1753,11 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
@@ -1773,6 +1771,8 @@ pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
@@ -1935,8 +1935,16 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Trusted graph admission workspace; never part of the public wire DSL.
+    graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    /// Borrowed, request-local proof of an already selected bounded key set.
+    /// Retained after native filters are consumed; never encoded on the wire.
+    value_search_candidate_keys: []const []const u8 = &.{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
     value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
@@ -1955,6 +1963,14 @@ pub const SearchRequest = struct {
     /// Immutable local projection borrowed until synchronous search completion.
     /// Never serialized or populated by a public request.
     document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
+    /// Normalized final projection, owning selected source paths, expressions
+    /// and data parameters. Pure output does not affect retrieval membership.
+    field_projection_json: []const u8 = "",
+    /// Request-owned immutable IR, borrowed only while its exact input remains
+    /// live. Never serialized; created locally after expression validation.
+    field_projection_plan: ?@import("../../api/field_projection.zig").BorrowedPlan = null,
+    /// Trusted private worker delivery, never accepted at public ingress.
+    field_projection_transport: bool = false,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -1966,6 +1982,8 @@ pub const SearchRequest = struct {
     document_lookup_groups: []const u64 = &.{},
     /// Borrowed coordinator label; routing and storage continue using immutable identities.
     response_table_name: ?[]const u8 = null,
+    /// Trusted coordinator response annotation. Never accepted from public JSON.
+    response_live_read: bool = false,
     /// Borrowed physical name of the queried table, set by the API read
     /// source together with `graph_index_complete_snapshot`. Graph executors
     /// canonicalize a `target_table` tag naming this table to the local
@@ -2059,6 +2077,9 @@ pub const SearchRequest = struct {
     /// Internal distributed-planning control. Parent-owned navigation and
     /// globally merged unit groups may return identity-only hits for payloads
     /// routed elsewhere; direct callers fail closed when payload is absent.
+    /// Private coordinator proof: source predicates were evaluated on the
+    /// same retained table cut before fanout to independent member owners.
+    hierarchy_parent_admitted: bool = false,
     defer_hierarchy_child_hydration: bool = false,
     hierarchy_source_fields: []const []const u8 = &.{},
     hierarchy_source_include_all_fields: bool = true,
@@ -2139,6 +2160,13 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "privacy_policy_version",
+    "graph_work_budget",
+    // Conditional delivery runs after child authorization and retrieval.
+    "field_projection_json",
+    "field_projection_plan",
+    "field_projection_transport",
+    "value_search_candidate_keys",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2147,6 +2175,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "document_output_exact",
     "document_projection_plan",
     "response_table_name",
+    "response_live_read",
     "prepared_read_table_id",
     "native_query_cut",
     // The public retained capability accompanies the authenticated physical cut.
@@ -2155,6 +2184,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",
+    "hierarchy_parent_admitted",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -2263,9 +2293,17 @@ fn auditHierarchyChildrenSearchRequestFields() void {
 pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     @setEvalBranchQuota(100_000);
     comptime auditHierarchyChildrenSearchRequestFields();
-    const children = req.hierarchy_children orelse return true;
-    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
-    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    const children = req.hierarchy_children orelse return !req.hierarchy_parent_admitted;
+    if (req.hierarchy_parent_admitted and children.artifact_name == null) return false;
+    if (children.parent_level != .source or children.level != .unit) return false;
+    if (children.parent_ids.len != 0) {
+        if (children.parent_id.len != 0 or children.artifact_name == null or children.parent_ids.len > 100) return false;
+        for (children.parent_ids, 0..) |id, i| {
+            if (id.len == 0) return false;
+            for (children.parent_ids[0..i]) |prior| if (std.mem.eql(u8, id, prior)) return false;
+        }
+    } else if (children.parent_id.len == 0) return false;
+    if (req.return_mode != (if (children.artifact_name != null) ReturnMode.member else ReturnMode.unit) or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
     // Traversal is deliberately not a retrieval operation. Reject every
     // scoring, ranking, or transform control at this final typed boundary so
     // embedded callers and worker envelopes cannot receive plausible-looking
@@ -2277,7 +2315,7 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     }
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
     if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
-    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.search_before.len > 0 or (req.include_all_fields and children.artifact_name == null)) return false;
     if (req.order_by.len != 2 or
         !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
         req.order_by[0].desc or
@@ -2445,7 +2483,9 @@ pub const HierarchyGroupLevel = enum {
 };
 
 pub const HierarchyChildrenRequest = struct {
-    parent_id: []const u8,
+    artifact_name: ?[]const u8 = null,
+    parent_id: []const u8 = "",
+    parent_ids: []const []const u8 = &.{},
     parent_level: HierarchyGroupLevel = .source,
     level: HierarchyGroupLevel = .unit,
 };
@@ -2665,10 +2705,21 @@ pub const GraphMetricRerankScoreDetails = struct {
 pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
 
+/// Producer receipt for normalized, publicly projected JSON. This is local
+/// execution evidence, never a document-access grant or a wire input. Its bytes
+/// remain owned by SearchHit; replacement or transport serialization retires it.
+pub const FinalizedSource = struct {
+    bytes: []const u8,
+    pub fn matches(self: @This(), bytes: []const u8) bool {
+        return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len;
+    }
+};
+
 pub const SearchHit = struct {
     /// Owned internal selection proof; absent on ordinary/public results.
     document_authority: ?*const @import("query/document_authority.zig").Authority = null,
     computed_json: ?[]u8 = null,
+    computed_receipt: ?*@import("../../api/field_projection.zig").Receipt = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
     /// table. This is not serialized as part of the public search-hit shape.
@@ -2684,6 +2735,8 @@ pub const SearchHit = struct {
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
+    /// Storage-certified final source extent; owned and never caller metadata.
+    finalized_source: ?FinalizedSource = null,
     /// Owned typed source for providers that hydrate after source-dependent
     /// ranking/filtering. Highlighting and public projection consume this
     /// directly; encoding happens once at the response boundary. Providers
@@ -2705,6 +2758,7 @@ pub const SearchHit = struct {
             alloc.free(cloned.id);
             if (cloned.document_authority) |proof| alloc.destroy(proof);
             if (cloned.computed_json) |data| alloc.free(data);
+            if (cloned.computed_receipt) |receipt| alloc.destroy(receipt);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
@@ -2723,6 +2777,13 @@ pub const SearchHit = struct {
             cloned.document_authority = owned;
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
+        if (self.computed_receipt) |receipt| if (self.computed_json) |previous| {
+            if (cloned.computed_json) |bytes| if (receipt.afterCopy(previous, bytes)) |value| {
+                const owned = try alloc.create(@import("../../api/field_projection.zig").Receipt);
+                owned.* = value;
+                cloned.computed_receipt = owned;
+            };
+        };
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
@@ -2732,6 +2793,11 @@ pub const SearchHit = struct {
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        if (self.finalized_source) |receipt| if (self.stored_data) |previous| {
+            if (receipt.matches(previous)) {
+                if (cloned.stored_data) |bytes| cloned.finalized_source = .{ .bytes = bytes };
+            }
+        };
         cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
         cloned.column_source = if (self.column_source) |source| try source.cloneInto(alloc) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
@@ -2755,10 +2821,21 @@ pub const SearchHit = struct {
         return cloned;
     }
 
+    pub fn clearSource(self: *SearchHit, alloc: Allocator) void {
+        if (self.stored_data) |data| alloc.free(data);
+        if (self.source_value) |*value| deinitJsonValue(alloc, value);
+        if (self.column_source) |source| source.deinit();
+        self.stored_data = null;
+        self.finalized_source = null;
+        self.source_value = null;
+        self.column_source = null;
+    }
+
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
+        if (self.computed_receipt) |receipt| alloc.destroy(receipt);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
@@ -4162,6 +4239,12 @@ pub const ArtifactRepairRunRequest = struct {
     repair_attempt_id: ?u64 = null,
     repair_job_created_at_ms: ?u64 = null,
     repair_cancel_base_uri: ?[]const u8 = null,
+    /// Set only by operator repair entry points (the run endpoint and repair
+    /// jobs). Operator repair retries the selected index's permanently failed
+    /// enrichment documents and backs off transient provider errors within
+    /// the pass. Automatic and structural repair never set it, so they make
+    /// no model calls.
+    operator_initiated: bool = false,
 };
 
 pub const RepairCancelCheck = struct {
@@ -4292,9 +4375,10 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Managed operator requests persist/enqueue intent work and return
-    /// immediately. Standalone callers leave this false and advance through
-    /// the same state machine synchronously.
+    /// Managed operator requests persist/enqueue generation and enrichment
+    /// work without running providers under the group-operation guard. Polls
+    /// observe the durable replay outcome. Standalone callers leave this false
+    /// and execute their repair pass synchronously.
     defer_durable_index_repair_execution: bool = false,
 
     pub fn cancelled(self: ArtifactRepairRunOptions) bool {
@@ -5405,6 +5489,51 @@ pub const GraphEndpointCleanupStatus = struct {
         };
     }
 };
+
+pub const LeannRecordCommand = struct {
+    index_name: []const u8,
+    record: []const u8,
+};
+
+/// Leader's planned LEANN records, returned by the `leann_plan` topology
+/// lookup. The caller proposes each proposal's records in order as
+/// `leann_record` commands.
+pub const LeannPlanStatus = struct {
+    proposals: []const Proposal = &.{},
+
+    pub const Proposal = struct {
+        index_name: []const u8,
+        records_base64: []const []const u8,
+    };
+};
+
+/// Upper bound for one record: writes plus an inline generation.
+pub const leann_record_max_bytes: usize = 8 << 20;
+
+/// A LEANN record is a standalone private command: it carries no other
+/// effect, so replicas never apply part of a batch.
+pub fn validateLeannRecordCommand(req: BatchRequest) !void {
+    const command = req.leann_record orelse return;
+    if (command.index_name.len == 0 or command.index_name.len > 1024) return error.InvalidBatchRequest;
+    if (command.record.len == 0 or command.record.len > leann_record_max_bytes) return error.InvalidBatchRequest;
+    const defaults = BatchRequest{};
+    inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime !std.mem.eql(u8, field_name, "leann_record") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
+            const value = @field(req, field_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+        }
+    }
+}
+
+test "leann record command must stand alone" {
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .sync_level = .write });
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "", .record = "r" } }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "" } }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .deletes = &.{"doc"} }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .activate_range_tracking = true }));
+}
 
 /// Cleanup is a private, effect-bearing command, never a flag that can be
 /// attached to a public mutation or a lifecycle control.

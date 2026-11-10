@@ -53,6 +53,10 @@ pub const RelationSchemaMutation = struct {
     }
 };
 
+/// An authoritative binding check for a graph already admitted by ingress.
+/// Each call observes a fresh catalog cut, including projection replacement.
+pub const GraphAuthority = struct { name: []const u8, graph_id: u64 };
+pub const GraphAuthorityResult = struct { present: bool };
 pub const Call = union(enum) {
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
@@ -75,6 +79,10 @@ pub const Call = union(enum) {
     policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
     fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
     fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
+    sql_completion_ready: void,
+    sql_completion_reference: [16]u8,
+    sql_completion_reference_mutate: @import("../metadata/sql_completion_references.zig").Command,
+    fk_publication_completion: @import("../metadata/fk_generation_publication.zig").CompletionRequest,
     fk_generation_publication_status: u64,
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
@@ -98,12 +106,16 @@ pub const Call = union(enum) {
     list_tables: TableList,
     export_snapshot: void,
     read: Read,
+    graph_authority: GraphAuthority,
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
+    /// Current physical definition, including runtime progress. This private
+    /// point read is deliberately independent of semantic catalog caches.
+    table_record_read: []const u8,
     /// Private body-bound native service provisioning. Old metadata peers
     /// reject this tag before any table or private source is published.
     native_memory_create: Request,
@@ -113,11 +125,12 @@ pub const Call = union(enum) {
     write_validation: []const u8,
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
+    lake_source_owner_read: u64,
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
             .relation_replace, .relation_schema_mutate, .native_memory_create => true,
-            .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
+            .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
     }
@@ -129,11 +142,15 @@ pub const Call = union(enum) {
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
             .lake_index_lifecycle_read,
+            .lake_source_owner_read,
             .lake_index_lifecycle_work,
             .setting_snapshot,
             .policy_snapshot,
             .policy_install_snapshot,
             .policy_publication_work,
+            .sql_completion_ready,
+            .sql_completion_reference,
+            .fk_publication_completion,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
@@ -145,6 +162,14 @@ pub const Call = union(enum) {
             .fk_initial_create_work,
             .fk_initial_parent_decision,
             => true,
+            else => false,
+        };
+    }
+
+    /// Calls whose native owners report the first possible durable effect.
+    pub fn tracksSQLSubmission(self: @This()) bool {
+        return switch (self) {
+            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
             else => false,
         };
     }
@@ -183,6 +208,10 @@ test "native lake lifecycle calls bind private read and mutation grants" {
     const read: Call = .{ .lake_index_lifecycle_read = 4 };
     const write: Call = .{ .lake_index_lifecycle_mutate = .{ .table_id = 4, .expected_revision = 7, .mutation = .{ .release = @splat(9) } } };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    const owner: Call = .{ .lake_source_owner_read = 4 };
+    try std.testing.expect(owner.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!owner.requiresAdministrativeGrant());
+    try std.testing.expect(!owner.isMutation());
     try std.testing.expect(!read.requiresAdministrativeGrant());
     try std.testing.expect(!read.isMutation());
     try std.testing.expect(write.requiresAdministrativeGrant());
@@ -228,4 +257,20 @@ test "system catalog relation replacement wire retains exact owner and rejects i
     request.replacement = table;
     request.guard.incarnation = @splat(0);
     try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
+}
+
+test "SQL pgwire native completion mutations require administrative grant and mutation forwarding" {
+    const write: Call = .{ .sql_completion_reference_mutate = undefined };
+    try std.testing.expect(write.requiresAdministrativeGrant());
+    try std.testing.expect(write.isMutation());
+    try std.testing.expect(!write.requiresSettingAuthorityReadGrant());
+    const read: Call = .{ .sql_completion_reference = @splat(1) };
+    try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!read.isMutation());
+}
+
+test "privacy table record transport is a service read without mutation authority" {
+    const read: Call = .{ .table_record_read = "private" };
+    try std.testing.expect(!read.isMutation());
+    try std.testing.expect(!read.requiresAdministrativeGrant());
 }

@@ -23,6 +23,68 @@ const ast = dependencies.sql_ast;
 pub const compiler = dependencies.sql_compiler;
 pub const runtime = dependencies.sql_runtime;
 
+/// Live preparation bytes shared by callers of one database, including plans
+/// queued for its API/writer gate. The owner is a stable path gate (or a pinned
+/// non-Lite root handle), never a serving runtime that admission can replace.
+pub const PreparationAdmission = struct {
+    limit: usize = runtime.resource_limits.preparation_bytes,
+    used: std.atomic.Value(usize) = .init(0),
+    test_after_prepare: if (@import("builtin").is_test) ?struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque, usize, usize, bool) void,
+    } else void = if (@import("builtin").is_test) null else {},
+
+    pub fn budget(self: *PreparationAdmission, backing: std.mem.Allocator) dependencies.sql_memory_budget {
+        return .{
+            .backing = backing,
+            .limit = runtime.resource_limits.preparation_bytes,
+            .admission = .{ .ptr = self, .reserve = reserve, .release = release },
+        };
+    }
+    fn reserve(ptr: *anyopaque, bytes: usize) bool {
+        if (bytes == 0) return true;
+        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
+        var used = self.used.load(.monotonic);
+        while (true) {
+            if (bytes > self.limit -| used) return false;
+            used = self.used.cmpxchgWeak(used, used + bytes, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+    fn release(ptr: *anyopaque, bytes: usize) void {
+        if (bytes == 0) return;
+        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
+        const previous = self.used.fetchSub(bytes, .release);
+        std.debug.assert(previous >= bytes);
+    }
+};
+
+/// Locking mode does not indicate whether SQL publishes persistent changes.
+/// EXPLAIN is read-only (ANALYZE rejects mutations); COMMIT can flush staged DML.
+pub fn statementMayMutate(statement: ast.Statement) bool {
+    return switch (statement) {
+        .select, .explain, .begin, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => false,
+        else => true,
+    };
+}
+
+test "capi SQL storage intent follows compiled statements including EXPLAIN and COMMIT" {
+    for ([_]struct { text: []const u8, mutates: bool }{
+        .{ .text = "SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN INSERT INTO t (_id) VALUES ('x')", .mutates = false },
+        .{ .text = "EXPLAIN ANALYZE SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN ANALYZE INSERT INTO t (_id) VALUES ('x')", .mutates = false },
+        .{ .text = "/* SELECT */ INSERT INTO t (_id) VALUES ('x')", .mutates = true },
+        .{ .text = "BEGIN READ ONLY", .mutates = false },
+        .{ .text = "ROLLBACK", .mutates = false },
+        .{ .text = "COMMIT", .mutates = true },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.text, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.mutates, statementMayMutate(compiled.statement));
+    }
+}
+
 /// Highlight JSON is a SQL JSONB value. Build it directly in the cursor's
 /// region, owning strings before the captured search result is released.
 pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Value {
@@ -65,9 +127,10 @@ pub fn Adapter(comptime native: type) type {
         table_name: []const u8,
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
+        graph_parameters: []const std.json.Value = &.{},
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -343,6 +406,7 @@ pub fn Adapter(comptime native: type) type {
         }
 
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
+            if (self.handle) |handle| try @import("sql_ddl.zig").requireCatalogRecovered(handle);
             if (self.handle) |handle| if (handle.owned_lite_backend != null) return self.liteCatalog(alloc, version);
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
@@ -454,7 +518,8 @@ pub fn Adapter(comptime native: type) type {
         fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
-            const txn_id = try self.db.beginTransaction(now);
+            const outcomes = dependencies.sql_errors;
+            const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
                 .schema_version = request.schema_version,
@@ -466,9 +531,12 @@ pub fn Adapter(comptime native: type) type {
                 .predicates = request.predicates,
                 .integrity_commands = request.integrity_commands,
             }) catch |err| {
-                self.db.abortTransaction(txn_id, now +| 1) catch return error.SqlMutationOutcomeUnknown;
+                // Commit was never requested, so the mutation is not applied
+                // even if the abort fails; recovery aborts leftover intents.
+                self.db.abortTransaction(txn_id, now +| 1) catch {};
                 self.outcome_transaction_id = null;
-                return if (err == error.VersionConflict) error.SqlWriteConflict else err;
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
             };
             // Only durable status can classify a failure after commit starts.
             // Never abort/replay a possibly published mutation.
@@ -525,19 +593,34 @@ pub fn Adapter(comptime native: type) type {
             for (requests, prepared) |request, *out| if (request.request.search) |search| {
                 var selected_adapter = try self.selected(request.table.physical_name);
                 out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
+                // A durable SQL commit can precede derived publication. Drain
+                // the selected search owner's indexing before taking cohort
+                // fences, so ranking and row hydration describe the same cut.
+                try selected_adapter.db.waitForCurrentSyncLevel(.full_index);
             };
             var owners: [64]*DB = undefined;
             var owner_count: usize = 0;
+            var has_graph = false;
             for (requests) |request| {
-                const selected_adapter = try self.selected(request.table.physical_name);
-                const exists = for (owners[0..owner_count]) |db| {
-                    if (db == selected_adapter.db) break true;
-                } else false;
-                if (!exists) {
-                    owners[owner_count] = selected_adapter.db;
-                    owner_count += 1;
+                const dependencies_to_capture = if (request.table.graph) |binding| blk: {
+                    has_graph = true;
+                    break :blk binding.dependencies;
+                } else &.{request.table};
+                for (dependencies_to_capture) |table| {
+                    const selected_adapter = try self.selected(table.physical_name);
+                    const exists = for (owners[0..owner_count]) |db| {
+                        if (db == selected_adapter.db) break true;
+                    } else false;
+                    if (!exists) {
+                        if (owner_count == owners.len) return error.SqlProgramLimitExceeded;
+                        owners[owner_count] = selected_adapter.db;
+                        owner_count += 1;
+                    }
                 }
             }
+            if (has_graph) for (owners[0..owner_count]) |db| {
+                if (!self.read_only) _ = try db.lookup(alloc, "", .{ .cypher_prepare = true }) else try db.waitForCurrentSyncLevel(.full_index);
+            };
             std.mem.sort(*DB, owners[0..owner_count], {}, struct {
                 fn less(_: void, a: *DB, b: *DB) bool {
                     return a.core.identity_namespace.table_id < b.core.identity_namespace.table_id;
@@ -581,7 +664,9 @@ pub fn Adapter(comptime native: type) type {
                 if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
             }
             for (requests, prepared, cursors) |request, *search, *cursor| {
-                if (search.*) |*owned| {
+                if (request.table.graph) |binding| {
+                    cursor.* = try @import("sql_graph.zig").open(self, alloc, binding.*, request.request, owners[0..owner_count], fences[0..held]);
+                } else if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
                     cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
                 } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
@@ -867,6 +952,10 @@ pub fn Adapter(comptime native: type) type {
             return .{ .ptr = cursor, .next = SearchCursor.next, .next_columns = if (reader == null) SearchCursor.nextColumns else null, .close = SearchCursor.close };
         }
 
+        fn resolveGraph(ptr: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return @import("sql_graph.zig").resolve(self, alloc, definition);
+        }
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             if (name.database != null or (name.namespace != null and !std.mem.eql(u8, name.namespace.?, "public"))) return error.UndefinedTable;
@@ -914,14 +1003,13 @@ pub fn Adapter(comptime native: type) type {
             projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
-                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
+                var page = try self.session.nextViewPage(alloc, limit);
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
                 const layout = try self.projection.pageLayout(owned);
-                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
-                const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
-                return .{ .rows = rows, .after = after, .owned_arena = page.arena };
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, row.sqlRow());
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -940,7 +1028,7 @@ pub fn Adapter(comptime native: type) type {
                 errdefer page.deinit();
                 const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
                 for (page.rows, rows) |row, *out| out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
-                return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1051,13 +1139,14 @@ pub fn Adapter(comptime native: type) type {
                 } else try deletes.append(temporary, mutation.key);
             }
             const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
+            const outcomes = dependencies.sql_errors;
             var prepared: ?integrity.Prepared = null;
             defer if (prepared) |*value| value.deinit();
             var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
             defer view.release();
             if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
             if (view.hasCoordinatedConstraints()) {
-                const metadata = try self.localCatalog(temporary, table.schema_version);
+                const metadata = self.localCatalog(temporary, table.schema_version) catch |err| return outcomes.notApplied(err);
                 var generation: ?[32]u8 = null;
                 var commands: std.ArrayList(@typeInfo(@FieldType(types.BatchRequest, "integrity_commands")).pointer.child) = .empty;
                 for (mutations) |mutation| if (mutation.conflict_guard) |proof| {
@@ -1069,16 +1158,25 @@ pub fn Adapter(comptime native: type) type {
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
                 for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
-                prepared = try integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{});
+                // Preparation only reads: any failure here is not applied.
+                prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);
             }
-            self.db.batch(request) catch |err| switch (err) {
-                error.VersionConflict => return error.SqlWriteConflict,
-                error.CommitVisibilityNotSatisfied, error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress, error.CommitPropagationIncomplete => return .committed_pending,
-                error.EnrichmentWorkerFailed => return .committed_repair_required,
-                else => return err,
+            // Classify by the batch's own state, not by error name: whether the
+            // primary write became durable, and whether its publication was
+            // left uncertain (reported as an unknown outcome).
+            var primary_committed = false;
+            // Named tables commit to their own database, which holds the marker.
+            const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
+            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
+                // A confirmed primary write wins: later uncertainty in derived
+                // or control publication leaves it committed, not unknown.
+                if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
+                if (outcomes.isUnknownOutcome(err)) return error.SqlMutationOutcomeUnknown;
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
             };
             return .committed;
         }

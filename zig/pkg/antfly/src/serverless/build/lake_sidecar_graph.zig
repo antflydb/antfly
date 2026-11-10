@@ -66,7 +66,7 @@ pub fn buildGraphSidecarFromRowSourceAlloc(
 ) !GraphSidecarBuildResult {
     var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
     return buildGraphSidecarBoundedAlloc(working_set.allocator(), source, binding, options) catch |err| {
-        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        if (err == error.OutOfMemory and working_set.limitExceeded()) return error.LakeSidecarBuildBudgetExceeded;
         return err;
     };
 }
@@ -142,7 +142,7 @@ pub fn publishGraphSidecarFromRowSourceAlloc(
     try scope.validate();
     var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
     return publishPagedGraph(working_set.allocator(), artifacts, source, binding, options, scope) catch |err| {
-        if ((err == error.OutOfMemory and working_set.limit_exceeded) or err == error.GraphPageWriteBudgetExceeded or err == error.ArtifactReadBudgetExceeded)
+        if ((err == error.OutOfMemory and working_set.limitExceeded()) or err == error.GraphPageWriteBudgetExceeded or err == error.ArtifactReadBudgetExceeded)
             return error.LakeSidecarBuildBudgetExceeded;
         return err;
     };

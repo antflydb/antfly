@@ -134,6 +134,10 @@ pub const NamedGraphResult = struct {
     result: graph_query.GraphQueryResult,
 };
 
+pub const DocNumPredicate = struct {
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, u32) anyerror!bool,
+};
 pub const SearchRequest = struct {
     tie_rank: ?scorer_mod.TieRank = null,
     control: query_mod.ExecutionControl = .{},
@@ -151,6 +155,7 @@ pub const SearchRequest = struct {
     filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
+    doc_num_predicate: ?DocNumPredicate = null,
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
     /// Private coordinator hint, valid only for score top-K. Equal scores
@@ -722,6 +727,7 @@ fn executeMatch(
     if (preferParallelText(snap) and mq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
     if (requestHasDocNumConstraints(request) or request.tie_rank != null) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
+        if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
     }
     const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
     const tokens = try analyzer.analyze(alloc, mq.text);
@@ -941,13 +947,48 @@ fn freePhraseFilterTerms(alloc: Allocator, filter: query_mod.Filter) void {
     }
 }
 
+// Constrain deferred producers before they acquire source values, not merely
+// their resulting bitmap. The caller owns the small scratch clause arrays.
+fn filterWithDocNumConstraints(filter: query_mod.Filter, request: SearchRequest, must: *[2]query_mod.Filter, excluded: *[2]query_mod.Filter, stages: *[2]query_mod.Filter) query_mod.Filter {
+    if (!requestHasDocNumConstraints(request)) return filter;
+    var n: usize = 0;
+    var x: usize = 0;
+    if (request.filter_doc_bitmap) |bitmap| {
+        must[n] = .{ .doc_num = .{ .doc_nums = &.{}, .bitmap = bitmap } };
+        n += 1;
+    }
+    if (request.filter_doc_nums_positive) {
+        must[n] = .{ .doc_num = .{ .doc_nums = request.filter_doc_nums } };
+        n += 1;
+    }
+    if (request.exclude_doc_bitmap) |bitmap| {
+        excluded[x] = .{ .doc_num = .{ .doc_nums = &.{}, .bitmap = bitmap } };
+        x += 1;
+    }
+    if (request.exclude_doc_nums.len != 0) {
+        excluded[x] = .{ .doc_num = .{ .doc_nums = request.exclude_doc_nums } };
+        x += 1;
+    }
+    stages[0] = .{ .bool_filter = .{
+        .must = if (n == 0) &.{.{ .match_all = {} }} else must[0..n],
+        .should = &.{},
+        .must_not = excluded[0..x],
+    } };
+    stages[1] = filter;
+    return .{ .bool_filter = .{ .must = stages, .should = &.{}, .must_not = &.{} } };
+}
+
 fn executeFilterQuery(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
-    filter: query_mod.Filter,
+    unscoped_filter: query_mod.Filter,
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
+    var required: [2]query_mod.Filter = undefined;
+    var stages: [2]query_mod.Filter = undefined;
+    var excluded: [2]query_mod.Filter = undefined;
+    const filter = filterWithDocNumConstraints(unscoped_filter, request, &required, &excluded, &stages);
     if (request.tie_rank == null and request.sort == null and request.aggregations.len == 0 and !requestHasDocNumConstraints(request)) {
         // Count each leased segment directly and seek only its requested page.
         // Complete producer facts never become a copied/rebased global bitmap.
@@ -1105,6 +1146,7 @@ fn executeScoredPhraseFilter(
         .tie_rank = request.tie_rank,
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .doc_num_predicate = request.doc_num_predicate,
         .filter_doc_bitmap = request.filter_doc_bitmap,
         .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
@@ -1533,7 +1575,7 @@ fn executeMatchAll(
         var filtered = try std.ArrayListUnmanaged(u32).initCapacity(alloc, raw_doc_ids.len);
         errdefer filtered.deinit(alloc);
         for (raw_doc_ids) |doc_id| {
-            if (requestAllowsDocNum(request, doc_id)) filtered.appendAssumeCapacity(doc_id);
+            if (try requestAllowsDocNum(request, doc_id)) filtered.appendAssumeCapacity(doc_id);
         }
         const owned = try filtered.toOwnedSlice(alloc);
         owned_filtered = owned;
@@ -1732,7 +1774,7 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
 }
 
 fn requestHasDocNumConstraints(request: SearchRequest) bool {
-    return request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+    return request.doc_num_predicate != null or request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
 }
 
 fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBitmap, request: SearchRequest) !void {
@@ -1754,7 +1796,7 @@ fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBit
             var visited: usize = 0;
             while (iterator.next()) |doc_id| : (visited += 1) {
                 if (visited % 256 == 0) try request.control.check();
-                if (requestAllowsDocNum(request, doc_id)) try allowed.add(doc_id);
+                if (try requestAllowsDocNum(request, doc_id)) try allowed.add(doc_id);
             }
         }
         matches.deinit();
@@ -1785,10 +1827,19 @@ fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBit
         matches.deinit();
         matches.* = allowed;
     }
+    if (request.doc_num_predicate) |predicate| {
+        var allowed = roaring.RoaringBitmap.init(alloc);
+        errdefer allowed.deinit();
+        var iterator = matches.iterator();
+        while (iterator.next()) |doc| if (try predicate.allows(predicate.ptr, doc)) try allowed.add(doc);
+        matches.deinit();
+        matches.* = allowed;
+    }
     try request.control.check();
 }
 
-fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
+fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) !bool {
+    if (request.doc_num_predicate) |predicate| if (!try predicate.allows(predicate.ptr, doc_id)) return false;
     if (request.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
     if (request.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
     if (request.filter_doc_nums_positive and !containsSortedU32(request.filter_doc_nums, doc_id)) return false;
@@ -1808,7 +1859,7 @@ fn applyDocNumConstraintsToScoreMap(
 
     var it = map.iterator();
     while (it.next()) |entry| {
-        if (!requestAllowsDocNum(request, entry.key_ptr.*)) {
+        if (!try requestAllowsDocNum(request, entry.key_ptr.*)) {
             try to_remove.append(alloc, entry.key_ptr.*);
         }
     }
@@ -1891,6 +1942,7 @@ const FastTopK = struct {
     filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
+    doc_num_predicate: ?DocNumPredicate = null,
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
@@ -2035,7 +2087,7 @@ const FastTopK = struct {
     }
 
     pub fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
-        if (!self.allows(doc_id)) return;
+        if (!try self.allows(doc_id)) return;
         const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
         if (self.producers.present() or (if (self.tie_rank) |rank| rank.resolve_many != null else false)) {
             self.pending[self.pending_count] = hit;
@@ -2062,7 +2114,8 @@ const FastTopK = struct {
         try scorer_mod.offerLazyTopKWithRank(self.alloc, &self.hits, self.k, candidate, self.tie_rank);
     }
 
-    fn allows(self: *const FastTopK, doc_id: u32) bool {
+    fn allows(self: *const FastTopK, doc_id: u32) !bool {
+        if (self.doc_num_predicate) |predicate| if (!try predicate.allows(predicate.ptr, doc_id)) return false;
         if (self.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
         if (self.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
         if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
@@ -2098,6 +2151,14 @@ fn compareU32(expected: u32, item: u32) std.math.Order {
     return std.math.order(expected, item);
 }
 
+// Flattening a match with multiple distinct terms changes its OR membership
+// and the parent's minimum_should_match cardinality. Keep it as a child node.
+fn singleAnalyzedTerm(tokens: []const analysis_mod.Token) bool {
+    if (tokens.len == 0) return false;
+    for (tokens[1..]) |token| if (!std.mem.eql(u8, tokens[0].term, token.term)) return false;
+    return true;
+}
+
 fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTextTerm), query: SearchQuery) !bool {
     switch (query) {
         .term => |tq| {
@@ -2108,7 +2169,7 @@ fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTe
             const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(alloc, mq.text);
             defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
-            if (tokens.len == 0) return false;
+            if (!singleAnalyzedTerm(tokens)) return false;
 
             for (tokens, 0..) |tok, i| {
                 var duplicate = false;
@@ -2838,6 +2899,7 @@ fn executeSimpleTextBoolWithProducers(
         .alloc = alloc,
         .k = effectiveK(request, snap),
         .producers = producers,
+        .doc_num_predicate = request.doc_num_predicate,
         .filter_doc_bitmap = request.filter_doc_bitmap,
         .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
@@ -3611,6 +3673,62 @@ pub const TextNavigationPlan = struct {
             else => return null,
         };
     }
+    /// Conservative membership ceiling for optional driver costing, never an
+    /// exact count or a pruning proof. Exclusions cannot increase cardinality.
+    pub fn candidateUpperBound(self: *const TextNavigationPlan) u32 {
+        return self.nodeCandidateUpperBound(self.root);
+    }
+    fn nodeCandidateUpperBound(self: *const TextNavigationPlan, node: *const LoweredText) u32 {
+        const count = self.stats.count;
+        return switch (node.kind) {
+            .none => 0,
+            .all, .bitmap => count,
+            .term => blk: {
+                const term = node.term.?;
+                const field = self.stats.fields.get(term.field) orelse break :blk count;
+                break :blk @min(count, (field.frequencies.get(term.term) orelse break :blk count).value);
+            },
+            .filter => blk: {
+                const terms = node.pattern_terms orelse break :blk count;
+                var sum: u64 = 0;
+                for (terms) |term| {
+                    const field = self.stats.fields.get(term.field) orelse break :blk count;
+                    sum +|= (field.frequencies.get(term.term) orelse break :blk count).value;
+                }
+                break :blk @intCast(@min(count, sum));
+            },
+            .phrase => blk: {
+                if (node.groups.len == 0) break :blk 0;
+                var upper = count;
+                // Every phrase position requires one alternative. Union
+                // ceilings within a position, then intersect across positions.
+                // Missing statistics remain unknown, never an exclusion proof.
+                for (node.groups) |group| {
+                    var sum: u64 = 0;
+                    for (group) |term| {
+                        const field = self.stats.fields.get(node.field) orelse {
+                            sum = count;
+                            break;
+                        };
+                        sum +|= if (field.frequencies.get(term)) |frequency| frequency.value else count;
+                    }
+                    upper = @min(upper, @as(u32, @intCast(@min(count, sum))));
+                }
+                break :blk upper;
+            },
+            .boolean => blk: {
+                var upper = count;
+                for (node.must) |child| upper = @min(upper, self.nodeCandidateUpperBound(child));
+                if (node.minimum != 0) {
+                    if (node.minimum > node.should.len) break :blk 0;
+                    var sum: u64 = 0;
+                    for (node.should) |child| sum +|= self.nodeCandidateUpperBound(child);
+                    upper = @min(upper, @as(u32, @intCast(@min(count, sum / node.minimum))));
+                }
+                break :blk upper;
+            },
+        };
+    }
     pub fn bound(self: *const TextNavigationPlan, source: Summaries) !f32 {
         return (try self.rangeBound(source)).upper;
     }
@@ -3961,7 +4079,7 @@ const LoweredText = struct {
                 .term => |t| try out.append(self.a, .{ .field = t.field, .term = t.term, .boost = t.boost }),
                 .match => |m| {
                     const tokens = try self.stats.analyzed(m.text, m.analyzer orelse &analysis_mod.default_analyzer);
-                    if (tokens.len == 0) return false;
+                    if (!singleAnalyzedTerm(tokens)) return false;
                     for (tokens, 0..) |token, i| {
                         var duplicate = false;
                         for (tokens[0..i]) |prior| if (std.mem.eql(u8, prior.term, token.term)) {
@@ -5096,7 +5214,7 @@ const StreamingBoolParallel = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const producers: ProducerConstraints = .{ .include = if (self.include) |*adapter| adapter.wrapped() else null, .exclude = if (self.exclude) |*adapter| adapter.wrapped() else null };
-        var local: FastTopK = .{ .tie_rank = self.request.tie_rank, .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
+        var local: FastTopK = .{ .tie_rank = self.request.tie_rank, .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .doc_num_predicate = self.request.doc_num_predicate, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
         defer local.deinit();
         while (true) {
             const index = self.next_work.fetchAdd(1, .monotonic);
@@ -5263,7 +5381,7 @@ fn scoreStreamingBoolPlans(alloc: Allocator, snap: *const index_mod.IndexSnapsho
 
 fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, producers: ProducerConstraints) !?SearchResult {
     if (request.aggregations.len != 0 or !canStreamBool(.{ .bool_query = bq }, 0)) return null;
-    var collector: FastTopK = .{ .tie_rank = request.tie_rank, .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
+    var collector: FastTopK = .{ .tie_rank = request.tie_rank, .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .doc_num_predicate = request.doc_num_predicate, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
     defer collector.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5383,15 +5501,73 @@ fn executeBool(
     return executeBoolAllHit(alloc, snap, bq, request);
 }
 
-/// Correctness reference/fallback for boolean shapes that are not yet lowered
-/// to streaming scorers. Kept separate so differential tests can compare the
-/// bounded iterator tree against the former all-hit/hash-map implementation.
+fn queryHasDeferredProducer(query: SearchQuery) bool {
+    return switch (query) {
+        .doc_num => |d| d.producer != null,
+        .bool_query => |b| blk: {
+            for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| for (children) |child| {
+                if (queryHasDeferredProducer(child)) break :blk true;
+            };
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn queryHasIndexedMembership(query: SearchQuery) bool {
+    return switch (query) {
+        .knn, .hybrid => false,
+        .doc_num => |d| d.producer == null,
+        .bool_query => |b| blk: {
+            for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| for (children) |child| {
+                if (!queryHasIndexedMembership(child)) break :blk false;
+            };
+            break :blk true;
+        },
+        else => true,
+    };
+}
+
+// A mixed subtree can still contain required indexed predicates. Descend only
+// through positive must edges: optional OR branches and exclusions cannot bound
+// every result. Wholly indexed subtrees retain their complete Boolean semantics.
+fn appendRequiredIndexedBounds(alloc: Allocator, clauses: *std.ArrayListUnmanaged(query_mod.Filter), query: SearchQuery) anyerror!void {
+    if (query == .match_all) return;
+    if (queryHasIndexedMembership(query)) {
+        try clauses.append(alloc, try searchQueryToFilterArena(alloc, query));
+    } else if (query == .bool_query) {
+        for (query.bool_query.must) |child| try appendRequiredIndexedBounds(alloc, clauses, child);
+    }
+}
+
+// Only required clauses establish a safe candidate bound. Optional/disjunctive
+// producer branches must never be used to discard a different branch's rows.
+fn indexedMustCandidates(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest) !?roaring.RoaringBitmap {
+    if (!queryHasDeferredProducer(.{ .bool_query = bq })) return null;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var clauses = std.ArrayListUnmanaged(query_mod.Filter).empty;
+    try appendRequiredIndexedBounds(arena.allocator(), &clauses, .{ .bool_query = bq });
+    if (clauses.items.len == 0) return null;
+    var required: [2]query_mod.Filter = undefined;
+    var stages: [2]query_mod.Filter = undefined;
+    var excluded: [2]query_mod.Filter = undefined;
+    const filter = filterWithDocNumConstraints(.{ .bool_filter = .{ .must = clauses.items, .should = &.{}, .must_not = &.{} } }, request, &required, &excluded, &stages);
+    return try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
+}
+
+/// Scoring fallback for trees containing deferred membership. Indexed required
+/// clauses establish a bound first; score accumulation keeps caller order.
 fn executeBoolAllHit(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     bq: BoolQuery,
-    request: SearchRequest,
+    original_request: SearchRequest,
 ) anyerror!SearchResult {
+    var candidates = try indexedMustCandidates(alloc, snap, bq, original_request);
+    defer if (candidates) |*bitmap| bitmap.deinit();
+    var request = original_request;
+    if (candidates) |*bitmap| request.filter_doc_bitmap = bitmap;
     var combined: ScoreMap = .{};
     var initialized = false;
     errdefer combined.deinit(alloc);
@@ -5607,7 +5783,7 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
             const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must, prepared);
             const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should, prepared);
             const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not, prepared);
-            const filter_must = if (bq.pure_should_optional and must.len == 0) required: {
+            const filter_must = if (must.len == 0 and (bq.pure_should_optional or should.len == 0)) required: {
                 const match_all = try alloc.alloc(query_mod.Filter, 1);
                 match_all[0] = .{ .match_all = {} };
                 break :required match_all;
@@ -5618,9 +5794,8 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
                 !bq.pure_should_optional) 1 else bq.min_should;
             break :blk .{
                 .bool_filter = .{
-                    // The bitmap engine uses a missing required branch to infer a
-                    // one-clause should minimum. Preserve optional scoring should
-                    // semantics with an internal match-all membership anchor.
+                    // Preserve optional should, empty Boolean and pure exclusion
+                    // semantics with a universe anchor in the membership engine.
                     .must = filter_must,
                     .should = should,
                     .must_not = must_not,
@@ -6064,10 +6239,11 @@ fn buildResult(
     if (requestHasDocNumConstraints(request)) {
         var filtered: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty;
         defer filtered.deinit(alloc);
-        for (scored) |hit| if (requestAllowsDocNum(request, hit.doc_id)) {
+        for (scored) |hit| if (try requestAllowsDocNum(request, hit.doc_id)) {
             try filtered.append(alloc, hit);
         };
         var next = request;
+        next.doc_num_predicate = null;
         next.filter_doc_bitmap = null;
         next.exclude_doc_bitmap = null;
         next.filter_doc_nums = &.{};
@@ -10506,8 +10682,8 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
     var stats: StreamingBoolStats = .{ .a = storage.allocator(), .snap = writer.snapshot(), .count = 20 };
     try stats.collect(request.query);
     try stats.load();
-    // Preserve the established streaming arithmetic order bit for bit. The
-    // all-hit tree groups duplicate match clauses differently before summing.
+    // Segment binding must preserve the grouped clause tree and its arithmetic
+    // while sharing the request's cached analysis across repeated matches.
     var legacy_scratch = std.heap.ArenaAllocator.init(a);
     defer legacy_scratch.deinit();
     const legacy_plans = try planStreamingBoolSegments(a, &legacy_scratch, writer.snapshot(), bq, request, &stats, .{});
@@ -10520,7 +10696,12 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
     var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false };
     stats.lowered = try lowerer.lower(request.query);
     try std.testing.expectEqual(@as(usize, 1), stats.analyses.items.len);
-    try std.testing.expectEqual(@as(usize, 4), stats.lowered.?.should.len);
+    try std.testing.expectEqual(@as(usize, 2), stats.lowered.?.should.len);
+    try std.testing.expectEqual(@as(u32, 2), stats.lowered.?.minimum);
+    for (stats.lowered.?.should) |child| {
+        try std.testing.expectEqual(@as(usize, 2), child.should.len);
+        try std.testing.expectEqual(@as(u32, 1), child.minimum);
+    }
     // If segment preparation accidentally returns to syntax lowering, this
     // analyzer now produces one nonexistent token and changes every result.
     analyzer.tokenizer = .keyword;
@@ -10868,6 +11049,37 @@ test "streaming boolean inherited publication cutoff prunes before payload admis
     try std.testing.expectEqual(@as(u64, 0), diagnostics.segments_searched);
 }
 
+test "candidate predicates run before text top-k in native and fallback scorers" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "hidden", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 10, .norm = 10 }} },
+        .{ .id = "visible", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "also-hidden", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 5, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Gate = struct {
+        fail: bool = false,
+        fn allows(ptr: *anyopaque, doc: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.PredicateFailed;
+            return doc == 1;
+        }
+    };
+    var gate: Gate = .{};
+    const term: SearchQuery = .{ .term = .{ .field = "title", .term = "hello" } };
+    for ([_]SearchQuery{ term, .{ .match_all = {} }, .{ .bool_query = .{ .must = &.{term} } } }) |query| {
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false, .doc_num_predicate = .{ .ptr = &gate, .allows = Gate.allows } });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqual(@as(u32, 1), result.hits[0].doc_id);
+    }
+    gate.fail = true;
+    try std.testing.expectError(error.PredicateFailed, execute(a, writer.snapshot(), .{ .query = term, .k = 1, .doc_num_predicate = .{ .ptr = &gate, .allows = Gate.allows } }));
+}
+
 test "external lake metadata navigation shares scorer lowering and conservative signed phrase bounds" {
     const a = std.testing.allocator;
     const bytes = try buildTestSegmentWithStoredDocs(a, &.{
@@ -10923,6 +11135,9 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         .{ .match = .{ .field = "title", .text = "COMMON rare common", .analyzer = &custom } },
         common,
         .{ .bool_query = .{ .must = &.{ common, missing } } },
+        .{ .bool_query = .{ .must = &.{ common, rare } } },
+        .{ .bool_query = .{ .should = &.{ rare, rare }, .min_should = 2 } },
+        .{ .bool_query = .{ .should = &.{ common, .match_all }, .min_should = 2 } },
         .{ .bool_query = .{ .should = &.{ common, missing }, .min_should = 2 } },
         .{ .bool_query = .{ .must = &.{common}, .should = &.{missing} } },
         .{ .term_phrase = .{ .field = "title", .terms = &.{ "common", "missing" } } },
@@ -10952,6 +11167,7 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         try std.testing.expectError(error.Timeout, countMatchesPreparedWithControl(a, source.snapshot, query, plan, .{ .deadline_ns = 1 }));
         try std.testing.expectEqual(try countMatches(a, source.snapshot, query), try countMatchesPrepared(a, source.snapshot, query, plan));
         if (plan.exactMetadataCount()) |count| try std.testing.expectEqual(try countMatches(a, source.snapshot, query), count);
+        try std.testing.expect(plan.candidateUpperBound() >= try countMatches(a, source.snapshot, query));
         // Physical membership wrapping must borrow the analyzed child without
         // bypassing the new required branch.
         const wrapped: SearchQuery = .{ .bool_query = .{ .must = &.{ query, .{ .match_none = {} } } } };
@@ -10983,6 +11199,7 @@ test "external lake metadata navigation shares scorer lowering and conservative 
     const baseline: SearchQuery = .{ .bool_query = .{ .must_not = &.{rare} } };
     const full = (try TextNavigationPlan.prepare(a, baseline, .{ .ptr = &source, .count = 2, .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
     defer full.deinit();
+    try std.testing.expectEqual(@as(u32, 2), full.candidateUpperBound());
     var reference = try execute(a, source.snapshot, .{ .query = baseline, .k = 10, .include_stored = false });
     defer reference.deinit();
     var reused = try execute(a, source.snapshot, .{ .query = baseline, .k = 10, .include_stored = false, .text_navigation_plan = full });
@@ -11343,5 +11560,160 @@ test "producer top k batches score ties spanning distinct candidate tiles" {
             if (left.score == right.score) try std.testing.expect(left.doc_id > right.doc_id);
         }
         try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
+    }
+}
+
+test "external lake metadata navigation phrase ceilings union alternatives and preserve unknown statistics" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var field: StreamingBoolStats.Field = .{ .average = 10 };
+    try field.frequencies.put(sa, "rare", .{ .value = 20 });
+    try field.frequencies.put(sa, "alternative", .{ .value = 30 });
+    try field.frequencies.put(sa, "common", .{ .value = 9000 });
+    var phrase: LoweredText = .{ .kind = .phrase, .field = "body", .groups = &.{ &.{"common"}, &.{"rare"} } };
+    var plan: TextNavigationPlan = .{ .a = a, .arena = undefined, .query = .match_all, .config = .{}, .stats = .{ .a = sa, .count = 10000 }, .root = &phrase };
+    try plan.stats.fields.put(sa, "body", field);
+    try std.testing.expectEqual(@as(u32, 20), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{ "rare", "alternative" }, &.{"common"} };
+    try std.testing.expectEqual(@as(u32, 50), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{ "common", "unknown" }, &.{"rare"} };
+    try std.testing.expectEqual(@as(u32, 20), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{"unknown"}, &.{"unknown"} };
+    try std.testing.expectEqual(@as(u32, 10000), plan.candidateUpperBound());
+    phrase.groups = &.{ &.{ "common", "common" }, &.{ "common", "common" } };
+    try std.testing.expectEqual(@as(u32, 10000), plan.candidateUpperBound());
+    phrase.field = "unobserved";
+    try std.testing.expectEqual(@as(u32, 10000), plan.candidateUpperBound());
+    phrase.groups = &.{};
+    try std.testing.expectEqual(@as(u32, 0), plan.candidateUpperBound());
+    std.debug.print("PHRASE_COST documents=10000 rare_upper=20 alternative_upper=50 unknown_upper=10000\n", .{});
+}
+
+test "logical value multiword match remains one boolean child" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "both", .data = "{}", .terms = &.{ .{ .term = "red", .freq = 1, .norm = 10 }, .{ .term = "blue", .freq = 1, .norm = 10 } } },
+        .{ .id = "red", .data = "{}", .terms = &.{.{ .term = "red", .freq = 1, .norm = 10 }} },
+        .{ .id = "blue", .data = "{}", .terms = &.{.{ .term = "blue", .freq = 1, .norm = 10 }} },
+        .{ .id = "green", .data = "{}", .terms = &.{.{ .term = "green", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const match: SearchQuery = .{ .match = .{ .field = "title", .text = "red blue red" } };
+    const red: SearchQuery = .{ .term = .{ .field = "title", .term = "red" } };
+    const blue: SearchQuery = .{ .term = .{ .field = "title", .term = "blue" } };
+    const cases = [_]struct { query: SearchQuery, ids: []const u32 }{
+        .{ .query = match, .ids = &.{ 0, 1, 2 } },
+        .{ .query = .{ .bool_query = .{ .must = &.{ match, red } } }, .ids = &.{ 0, 1 } },
+        .{ .query = .{ .bool_query = .{ .must = &.{match}, .must_not = &.{blue} } }, .ids = &.{1} },
+        .{ .query = .{ .bool_query = .{ .should = &.{ match, red }, .min_should = 2 } }, .ids = &.{ 0, 1 } },
+        .{ .query = .{ .bool_query = .{ .must_not = &.{match} } }, .ids = &.{3} },
+    };
+    for (cases) |case| {
+        var result = try execute(a, writer.snapshot(), .{ .query = case.query, .k = 10, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(case.ids.len, result.hits.len);
+        try std.testing.expectEqual(@as(u32, @intCast(case.ids.len)), try countMatches(a, writer.snapshot(), case.query));
+        for (case.ids) |id| {
+            var found = false;
+            for (result.hits) |hit| if (hit.doc_id == id) {
+                found = true;
+            };
+            try std.testing.expect(found);
+        }
+    }
+}
+
+test "logical value mixed conjunction bounds deferred verification before scoring" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "other", .freq = 1, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "other", .freq = 1, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "needle", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const Producer = struct {
+        probed: usize = 0,
+        bounded: bool = true,
+        fn produce(raw: *anyopaque, alloc: Allocator, _: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            if (incoming) |candidates| {
+                if (self.bounded and candidates.cardinality() > 1) return error.VerificationBudgetExceeded;
+                self.probed += candidates.cardinality();
+                try result.orWith(candidates);
+            } else {
+                if (self.bounded) return error.ExpectedIndexedCandidates;
+                self.probed += count;
+                for (0..count) |doc| try result.add(@intCast(doc));
+            }
+            return result;
+        }
+    };
+    var state: Producer = .{};
+    const deferred: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &state, .produce = Producer.produce } } };
+    const logical: SearchQuery = .{ .bool_query = .{ .should = &.{deferred} } };
+    const term: SearchQuery = .{ .term = .{ .field = "title", .term = "needle" } };
+    const other: SearchQuery = .{ .term = .{ .field = "title", .term = "other" } };
+    const missing: SearchQuery = .{ .term = .{ .field = "title", .term = "absent" } };
+    const complement: SearchQuery = .{ .bool_query = .{ .must_not = &.{other} } };
+    const indexed: SearchQuery = .{ .bool_query = .{ .should = &.{ missing, complement } } };
+    var expected = roaring.RoaringBitmap.init(a);
+    defer expected.deinit();
+    try expected.add(2);
+    try expected.add(5);
+    const reference_leaf: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &expected } };
+    const reference: SearchQuery = .{ .bool_query = .{ .should = &.{reference_leaf} } };
+    for ([_]bool{ false, true }) |nested| {
+        for ([_]bool{ false, true }) |reverse| {
+            for (0..3) |scope| {
+                state.probed = 0;
+                const bound: SearchQuery = if (nested) .{ .bool_query = .{ .must = &.{ logical, .{ .bool_query = .{ .must = &.{indexed} } } } } } else indexed;
+                const reference_bound: SearchQuery = if (nested) .{ .bool_query = .{ .must = &.{ reference, .{ .bool_query = .{ .must = &.{indexed} } } } } } else indexed;
+                const clauses = if (reverse) [_]SearchQuery{ bound, logical } else [_]SearchQuery{ logical, bound };
+                const oracle = if (reverse) [_]SearchQuery{ reference_bound, reference } else [_]SearchQuery{ reference, reference_bound };
+                var req: SearchRequest = .{ .query = .{ .bool_query = .{ .must = &clauses, .should = &.{term}, .min_should = 1, .boost = 1.25 } }, .k = 10, .include_stored = false };
+                if (scope != 0) {
+                    req.filter_doc_bitmap = &expected;
+                    req.filter_doc_nums_positive = true;
+                    req.filter_doc_nums = if (scope == 1) &.{ 2, 5 } else &.{};
+                    req.exclude_doc_nums = &.{5};
+                }
+                var result = try execute(a, writer.snapshot(), req);
+                defer result.deinit();
+                var reference_req = req;
+                reference_req.query = .{ .bool_query = .{ .must = &oracle, .should = &.{term}, .min_should = 1, .boost = 1.25 } };
+                var before = try execute(a, writer.snapshot(), reference_req);
+                defer before.deinit();
+                try std.testing.expectEqual(before.total_hits, result.total_hits);
+                try std.testing.expectEqual(before.hits.len, result.hits.len);
+                try std.testing.expectEqual(@as(usize, if (scope == 0) 2 else if (scope == 1) 1 else 0) * @as(usize, if (nested) 2 else 1), state.probed);
+                for (before.hits, result.hits) |want, got| {
+                    try std.testing.expectEqual(want.doc_id, got.doc_id);
+                    try std.testing.expectApproxEqAbs(want.score, got.score, 0.000001);
+                }
+            }
+        }
+    }
+    // A term in a separate OR branch establishes no necessary bound.
+    state.bounded = false;
+    state.probed = 0;
+    var union_result = try execute(a, writer.snapshot(), .{ .query = .{ .bool_query = .{ .should = &.{ logical, term } } }, .k = 10, .include_stored = false });
+    defer union_result.deinit();
+    try std.testing.expectEqual(@as(usize, 6), union_result.hits.len);
+    try std.testing.expectEqual(@as(usize, 6), state.probed);
+    for ([_]SearchQuery{ .{ .bool_query = .{} }, complement }) |query| {
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 10, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(result.total_hits, try countMatches(a, writer.snapshot(), query));
     }
 }

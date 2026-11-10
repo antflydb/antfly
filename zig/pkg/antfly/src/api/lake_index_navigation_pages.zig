@@ -25,12 +25,43 @@ const ranges = @import("lake_index_page_ranges.zig");
 const Decoded = local.serverless_query_lake_decoded_cache;
 const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
-const Value = struct { page: tree.Page };
+const Value = struct { page: tree.NavigationPage };
+/// Borrow an address-stable request's cache context. Text, source navigation
+/// and background warmers use the same decoded leases and bounded range waves.
+/// Neither the context nor its reader authority may outlive the caller.
+pub fn cacheBinding(cached: *const artifacts.CachedRead) pages.ReadCache {
+    const Adapter = struct {
+        fn context(raw: *anyopaque) *const artifacts.CachedRead {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+        fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Token, remaining: *u64) ![]u8 {
+            try context(raw).context.ensureActive();
+            try token.check();
+            try charge(remaining, length);
+            return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, context(raw).*);
+        }
+        fn decoded(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, ref: tree.Ref, token: Token, remaining: *u64) !tree.NavigationPage {
+            try context(raw).context.ensureActive();
+            try token.check();
+            try charge(remaining, ref.bytes);
+            const reader: Reader = .{ .store = store.*, .domain = domain, .cached = context(raw).*, .token = token };
+            return reader.read(a, ref, null);
+        }
+        fn many(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs: []const tree.Ref, output: []tree.NavigationPage, token: Token, remaining: *u64) !void {
+            const reader: Reader = .{ .store = store.*, .domain = domain, .cached = context(raw).*, .token = token };
+            return reader.many(a, refs, output, .{ .ptr = remaining, .charge = charge });
+        }
+    };
+    return .{ .ptr = @constCast(cached), .read = Adapter.read, .decoded_read = Adapter.decoded, .decoded_many = Adapter.many };
+}
 fn release(owner: *anyopaque, item: *anyopaque) void {
     const lease: Decoded.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
     lease.release();
 }
-fn page(lease: Decoded.Lease) tree.Page {
+fn page(lease: Decoded.Lease) tree.NavigationPage {
     const value: *const Value = @ptrCast(@alignCast(lease.item.payload.extension));
     var result = value.page;
     result.lease = .{ .owner = lease.cache, .item = lease.item, .release = release };
@@ -69,7 +100,7 @@ pub const Reader = struct {
         return result;
     }
     /// Authority is checked even when a caller reuses a warm-page allowance.
-    pub fn lookup(self: *const Reader, ref: tree.Ref) !?tree.Page {
+    pub fn lookup(self: *const Reader, ref: tree.Ref) !?tree.NavigationPage {
         try ref.validate();
         try self.check();
         const held = self.cached.cache.navigation.lookup(self.key(ref)) orelse return null;
@@ -77,7 +108,7 @@ pub const Reader = struct {
         try self.check();
         return page(held);
     }
-    pub fn read(self: *const Reader, a: A, ref: tree.Ref, encoded: ?[]const u8) !tree.Page {
+    pub fn read(self: *const Reader, a: A, ref: tree.Ref, encoded: ?[]const u8) !tree.NavigationPage {
         try ref.validate();
         try self.check();
         const Loader = struct {
@@ -99,7 +130,7 @@ pub const Reader = struct {
             }
             fn fill(self_: *@This(), item: *Decoded.Item, out: A) !void {
                 const value = try out.create(Value);
-                value.* = .{ .page = try tree.decodePage(out, self_.reader.domain, self_.ref, try self_.bytes(out)) };
+                value.* = .{ .page = try tree.decodeNavigationPage(out, self_.reader.domain, self_.ref, try self_.bytes(out)) };
                 item.payload = .{ .extension = value };
             }
         };
@@ -114,17 +145,25 @@ pub const Reader = struct {
         var context = self.cached.context;
         context.checkpoint = .{ .ptr = &check_, .check = Check.active };
         const held = self.cached.cache.navigation.acquire(self.key(ref), tree.readWorkspace(ref) * 2, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
-            if (err != error.SqlMemoryLimitExceeded) return err;
+            if (err != error.OutOfMemory and err != error.SqlMemoryLimitExceeded) return err;
+            // Flights, cache items and their payloads are optional residency.
+            // The request may already own enough workspace for a required read
+            // even when the cache's backing allocator cannot grow. Decode
+            // directly without re-entering admission or charging its caller's
+            // read allowance a second time.
             try self.check();
-            return tree.decodePage(a, self.domain, ref, try loader.bytes(a));
+            var decoded = try tree.decodeNavigationPage(a, self.domain, ref, try loader.bytes(a));
+            errdefer decoded.deinit(a);
+            try self.check();
+            return decoded;
         };
         errdefer held.release();
         try self.check();
         return page(held);
     }
-    pub fn many(self: *const Reader, a: A, refs: []const tree.Ref, output: []tree.Page, budget: ranges.Budget) !void {
+    pub fn many(self: *const Reader, a: A, refs: []const tree.Ref, output: []tree.NavigationPage, budget: ranges.Budget) !void {
         if (refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidGraphPage;
-        var ready: [tree.max_read_batch]?tree.Page = @splat(null);
+        var ready: [tree.max_read_batch]?tree.NavigationPage = @splat(null);
         defer for (&ready) |*value| if (value.*) |*held| held.deinit(a);
         var missing: [tree.max_read_batch]tree.Ref = undefined;
         var positions: [tree.max_read_batch]usize = undefined;
@@ -184,6 +223,127 @@ pub const Reader = struct {
     }
 };
 
+test "external lake navigation cache allocation failures preserve required reads and budgets" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("navigation-admission-fallback");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    store.upload_scope = scope;
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes = reads;
+    var storage: pages.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = storage.store() };
+    defer builder.deinit();
+    try builder.add("key", "value");
+    const ref = (try builder.finish()).?;
+    // Fail flight creation, flight-map growth, item creation and payload
+    // allocation independently; request and backend allocations remain healthy.
+    for (0..4) |failure_index| {
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+        cache.navigation.a = failing.allocator();
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+        storage.read_cache = cacheBinding(&cached);
+        reads = ref.bytes;
+        var actual = try tree.readNavigationPage(a, storage.store(), ref);
+        defer actual.deinit(a);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(actual.lease == null);
+        try std.testing.expectEqualStrings("value", actual.entries[0].value);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        // The batched binding must also preserve its single range charge.
+        reads = ref.bytes;
+        const batch = storage.store().read_many.?;
+        var output: [1]tree.NavigationPage = undefined;
+        try batch.read(batch.ptr, a, &.{ref}, &output);
+        defer output[0].deinit(a);
+        try std.testing.expectEqualStrings("value", output[0].entries[0].value);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        const cancelled = std.atomic.Value(bool).init(true);
+        var reader: Reader = .{ .store = store, .domain = scope.domain, .cached = cached, .token = Token.fromAtomic(&cancelled) };
+        try std.testing.expectError(error.Canceled, reader.read(a, ref, null));
+        reader.token = .none;
+        reader.cached.context.deadline_ns = @import("antfly_platform").time.monotonicNs() -| 1;
+        try std.testing.expectError(error.DeadlineExceeded, reader.read(a, ref, null));
+        reader.cached.context.deadline_ns = null;
+        var request_failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, reader.read(request_failure.allocator(), ref, null));
+    }
+}
+
+test "external lake streaming navigation renews allowances across raw and decoded cache dispatch" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("streaming-navigation-budget");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope = try stores.UploadScope.forPublication(@splat(4), 1, std.testing.io);
+    store.upload_scope = scope;
+    var reads: u64 = 0;
+    var writes: u64 = 16 * 1024 * 1024;
+    var storage: pages.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .coalesce_reads = true };
+    var roots: [2]tree.Ref = undefined;
+    for (&roots, [_][]const u8{ "one", "two" }) |*root, value| {
+        var builder: tree.SortedBuilder = .{ .alloc = a, .store = storage.store() };
+        defer builder.deinit();
+        try builder.add("key", value);
+        root.* = (try builder.finish()).?;
+    }
+    for ([_]bool{ false, true }) |decoded| {
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+        var binding = cacheBinding(&cached);
+        if (!decoded) {
+            binding.decoded_read = null;
+            binding.decoded_many = null;
+        }
+        storage.read_cache = binding;
+        storage.streaming = true;
+        // Exhausted prior work cannot cap the next bounded streaming page.
+        // Repeating exercises both cold and warm decoded-cache dispatch.
+        for (0..2) |_| {
+            reads = 0;
+            var page_ = try tree.readNavigationPage(a, storage.store(), roots[0]);
+            page_.deinit(a);
+            try std.testing.expectEqual(@as(u64, tree.max_page_bytes) - roots[0].bytes, reads);
+        }
+        const batch = storage.store().read_many.?;
+        const total_bytes = @as(u64, roots[0].bytes) + roots[1].bytes;
+        for (0..2) |_| {
+            reads = 0;
+            var output: [2]tree.NavigationPage = undefined;
+            try batch.read(batch.ptr, a, &roots, &output);
+            for (&output) |*page_| page_.deinit(a);
+            try std.testing.expectEqual(@as(u64, tree.max_page_bytes) * roots.len - total_bytes, reads);
+        }
+        // Ordinary query budgets remain cumulative even on warm cache hits.
+        storage.streaming = false;
+        reads = roots[0].bytes;
+        var page_ = try tree.readNavigationPage(a, storage.store(), roots[0]);
+        page_.deinit(a);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        try std.testing.expectError(error.ArtifactReadBudgetExceeded, tree.readNavigationPage(a, storage.store(), roots[0]));
+        reads = total_bytes;
+        var output: [2]tree.NavigationPage = undefined;
+        try batch.read(batch.ptr, a, &roots, &output);
+        for (&output) |*value| value.deinit(a);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        try std.testing.expectError(error.ArtifactReadBudgetExceeded, batch.read(batch.ptr, a, &roots, &output));
+        storage.streaming = true;
+        const cancelled = std.atomic.Value(bool).init(true);
+        storage.cancellation = Token.fromAtomic(&cancelled);
+        try std.testing.expectError(error.Canceled, tree.readNavigationPage(a, storage.store(), roots[0]));
+        try std.testing.expectError(error.Canceled, batch.read(batch.ptr, a, &roots, &output));
+        storage.cancellation = .none;
+    }
+}
+
 test "external lake shared navigation leases reuse decoded pages and preserve authority budgets and shapes" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("shared-navigation-pages");
@@ -215,7 +375,7 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
     // Optional encoded copies cannot fail required cache-owned page reads.
     var narrow: local.sql_memory_budget = .{ .backing = a, .limit = 1 };
     const before_narrow = reads;
-    var recovered: [3]tree.Page = undefined;
+    var recovered: [3]tree.NavigationPage = undefined;
     try reader.many(narrow.allocator(), &refs, &recovered, .{ .ptr = &reads, .charge = Charge.charge });
     for (&recovered) |*value| value.deinit(narrow.allocator());
     try std.testing.expectEqual(before_narrow - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
@@ -223,20 +383,28 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, reader.many(failing.allocator(), &refs, &recovered, .{ .ptr = &reads, .charge = Charge.charge }));
     reader.cached.scope = @splat(9);
-    var first: [3]tree.Page = undefined;
+    var first: [3]tree.NavigationPage = undefined;
     try reader.many(a, &refs, &first, .{ .ptr = &reads, .charge = Charge.charge });
     defer for (&first) |*value| value.deinit(a);
     try std.testing.expect(first[0].entries.ptr == first[2].entries.ptr);
     const traffic = cache.snapshot().provider_reads;
     const before = reads;
-    var second: [3]tree.Page = undefined;
+    var second: [3]tree.NavigationPage = undefined;
     try reader.many(a, &refs, &second, .{ .ptr = &reads, .charge = Charge.charge });
     defer for (&second) |*value| value.deinit(a);
     for (first, second) |left, right| try std.testing.expect(left.entries.ptr == right.entries.ptr);
     try std.testing.expectEqual(traffic, cache.snapshot().provider_reads);
     try std.testing.expectEqual(before - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
+    storage.read_cache = cacheBinding(&reader.cached);
+    const batch_read = storage.store().read_many.?;
+    const before_bound = reads;
+    var bound: [3]tree.NavigationPage = undefined;
+    try batch_read.read(batch_read.ptr, a, &refs, &bound);
+    for (&bound) |*value| value.deinit(a);
+    try std.testing.expectEqual(before_bound - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
+
     var denied: u64 = 1;
-    var rejected: [3]tree.Page = undefined;
+    var rejected: [3]tree.NavigationPage = undefined;
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, reader.many(a, &refs, &rejected, .{ .ptr = &denied, .charge = Charge.charge }));
     var wrong = roots[0];
     wrong.records += 1;

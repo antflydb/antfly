@@ -5,8 +5,9 @@ import {
   AccordionTrigger,
   Badge,
   Button,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Switch,
 } from "@antfly/design-system";
 import type { components, query_components } from "@antfly/sdk";
@@ -140,18 +141,18 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
       )}
       {showLimitAndOffset && (
         <div className="flex gap-2">
-          <div className="flex-1">
-            <Label className="text-xs mb-1 block">Limit</Label>
+          <Field className="gap-1 flex-1">
+            <FieldLabel className="text-xs">Limit</FieldLabel>
             <Input
               placeholder="Limit"
               type="number"
               value={queryRequest.limit}
               onChange={(e) => handleLimitChange(parseInt(e.target.value, 10))}
             />
-          </div>
+          </Field>
           {showOrderByAndFacets && (
-            <div className="flex-1">
-              <Label className="text-xs mb-1 block">Offset</Label>
+            <Field className="gap-1 flex-1">
+              <FieldLabel className="text-xs">Offset</FieldLabel>
               <Input
                 placeholder={disableOffset ? "Disabled" : "Offset"}
                 type="number"
@@ -161,13 +162,13 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
                 }
                 disabled={disableOffset}
               />
-            </div>
+            </Field>
           )}
         </div>
       )}
       {showOrderByAndFacets && (
         <Accordion type="multiple" className="space-y-2">
-          <AccordionItem value="orderby" className="border rounded-none bg-card/50 px-3">
+          <AccordionItem value="orderby" className="border rounded-lg bg-card/50 px-3">
             <AccordionTrigger className="py-2.5 hover:no-underline">
               <span className="font-medium text-sm">Order By</span>
             </AccordionTrigger>
@@ -175,7 +176,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
               {orderBy.map((sortField, index) => (
                 <div
                   key={`orderby-${sortField.field}-${sortField.desc}`}
-                  className="flex items-center gap-2 p-2 bg-muted/30 rounded-none border"
+                  className="flex items-center gap-2 p-2 bg-muted/30 rounded-md border"
                 >
                   <Input
                     placeholder="Field name"
@@ -216,7 +217,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
             </AccordionContent>
           </AccordionItem>
 
-          <AccordionItem value="aggregations" className="border rounded-none bg-card/50 px-3">
+          <AccordionItem value="aggregations" className="border rounded-lg bg-card/50 px-3">
             <AccordionTrigger className="py-2.5 hover:no-underline">
               <div className="flex items-center gap-2">
                 <span className="font-medium text-sm">Aggregations</span>

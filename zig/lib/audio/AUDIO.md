@@ -261,3 +261,13 @@ cancellation propagates immediately. Run from the repository root:
 zig build --build-file zig/pkg/inference/build.zig test-audio-streaming -Dmetal=false -Doptimize=ReleaseSafe
 zig build --build-file zig/pkg/inference/build.zig test-audio-codecs -Dmetal=false -Doptimize=ReleaseSafe
 ```
+
+Whisper feature extraction uses centered reflect-padding, periodic Hann windows,
+Slaney-spaced area-normalized filters, and the reference fixed log-mel transform
+`(max(log10(max(power, 1e-10)), peak - 8) + 4) / 4`. Both 80-bin and 128-bin
+checkpoints use that frontend. FFT and system BLAS paths are checked against
+independent Hugging Face NumPy reference fixtures at two signal levels and at
+both ends of a full window. Regenerate the fixtures without downloading models
+with `scripts/generate_whisper_reference.py` using the inference E2E environment.
+The generic frontend keeps HTK spacing and uncentered framing as defaults;
+Whisper selects its behavior explicitly in its model preset.

@@ -52,7 +52,7 @@ ENTRYPOINTS = (
 PACKAGE_ENTRYPOINTS = (
     "zig/pkg/antfly-embedded/src/root.zig",
     "zig/pkg/antfly-embedded/src/engine/root.zig",
-    "zig/examples/antfly_wasm.zig",
+    "zig/pkg/antfly-embedded/src/wasm_root.zig",
     "zig/pkg/inference/src/main.zig",
     "zig/pkg/inference/src/wasm_entry_wasm32.zig",
     "zig/pkg/inference/src/wasm_entry_wasm64.zig",
@@ -68,6 +68,18 @@ SOURCE_MODULES = {
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
     "storage_ordinal_options": (),
     "storage_engine_options": (),
+    "read_session_backend": (
+        "zig/pkg/antfly-embedded/src/storage/read_session_source.zig",
+        "zig/pkg/antfly-embedded/src/storage/read_session_client.zig",
+    ),
+    # Generated bridges expose these exact checked-in value namespaces from
+    # the consumer's existing source catalog. Audit both backend profiles.
+    "read_session_types": (
+        "zig/pkg/antfly-embedded/src/storage/read_session_types.zig",
+    ),
+    "read_session_source_types": (
+        "zig/pkg/antfly-embedded/src/storage/read_session_source_types.zig",
+    ),
     "storage_engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
@@ -78,6 +90,8 @@ SOURCE_MODULES = {
     "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
+    "cypher": ("zig/lib/cypher/root.zig",),
+    "cypher_regex_capture": ("zig/lib/regex/src/captures.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
     ),
@@ -94,6 +108,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_usermgr_server_openapi/root.zig",
     ),
     "antfly_cancellation": ("zig/lib/runtime/src/cancellation.zig",),
+    "antfly_chat_context": ("zig/lib/chat_context/root.zig",),
     "antfly_cache_budget": ("zig/lib/runtime/src/cache_budget.zig",),
     "antfly_runtime_abi": ("zig/lib/runtime/src/root.zig",),
     "antfly_private_error_diagnostics": (
@@ -160,11 +175,19 @@ SOURCE_MODULES = {
     "cloudflare_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
     ),
+    "bedrock_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig",
+    ),
+    "anthropic_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig",
+    ),
+    "fastino_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig",
+    ),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
     ),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_document_runs": ("zig/lib/readers/src/document_runs.zig",),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
@@ -181,10 +204,33 @@ SOURCE_MODULES = {
     ),
     "antfly_google": ("zig/lib/google/src/root.zig",),
     "antfly_hash": ("zig/lib/hash/src/mod.zig",),
-    "antfly_image": ("zig/lib/image/src/mod.zig",),
+    "antfly_image": (
+        "zig/lib/image/src/mod.zig",
+        "zig/pkg/antfly-embedded/src/storage/image_facade.zig",
+    ),
+    "image_values": ("zig/lib/image/src/values.zig",),
+    "image_processing": ("zig/lib/image/src/processing.zig",),
+    "image_work_control": ("zig/lib/image/src/work_control.zig",),
+    "image_native_contract": (
+        "zig/pkg/antfly-embedded/src/storage/image_native_contract.zig",
+    ),
+    "media_native_abi": ("zig/pkg/antfly-embedded/src/storage/media_native_abi.zig",),
+    "pdf_values": ("zig/lib/pdf/src/values.zig",),
+    "pdf_syntax": ("zig/lib/pdf/src/syntax.zig",),
+    "pdf_text_encoding": ("zig/lib/pdf/src/text_encoding.zig",),
+    "pdf_text_structure": ("zig/lib/pdf/src/text_structure.zig",),
+    "pdf_native_contract": (
+        "zig/pkg/antfly-embedded/src/storage/pdf_native_contract.zig",
+    ),
+    "antfly_pdf_backend_client": (
+        "zig/pkg/antfly-embedded/src/storage/pdf_backend_client.zig",
+    ),
     "antfly_video_media": ("zig/lib/media/src/inference.zig",),
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
+    ),
+    "antfly_resources_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_resources_openapi/root.zig",
     ),
     "antfly_inference_config_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_inference_config_openapi/root.zig",
@@ -232,13 +278,19 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
     "antfly_matcher": ("zig/pkg/antfly-embedded/matcher/src/mod.zig",),
+    "antfly_privacy_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_privacy_openapi/root.zig",
+    ),
     "antfly_metadata_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),
     "antfly_middleware_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_middleware_openapi/root.zig",
     ),
-    "antfly_pdf": ("zig/lib/pdf/src/mod.zig",),
+    "antfly_pdf": (
+        "zig/lib/pdf/src/mod.zig",
+        "zig/pkg/antfly-embedded/src/storage/pdf_facade.zig",
+    ),
     "antfly_platform": ("zig/lib/platform/src/root.zig",),
     "antfly_provider_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig",
@@ -249,7 +301,6 @@ SOURCE_MODULES = {
     "antfly_query_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
@@ -326,6 +377,7 @@ SOURCE_MODULES = {
     "kernel_owner_abi": ("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig",),
     "lmdb_engine": ("zig/lib/lmdb/src/root.zig",),
     "local_query_client": ("zig/pkg/antfly-embedded/src/storage/query_client.zig",),
+    "local_query_abi": ("zig/pkg/antfly-embedded/src/storage/local_query_abi.zig",),
     "metal_jit_identity": ("zig/pkg/inference/tools/jit_identity.zig",),
     "ml": ("zig/lib/ml/src/root.zig",),
     "ml_tabular": ("zig/lib/ml/tabular/src/root.zig",),
@@ -335,7 +387,7 @@ SOURCE_MODULES = {
     "openai_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/openai_api/root.zig",
     ),
-    "pdf_standard_fonts": ("zig/pdf_standard_fonts.zig",),
+    "pdf_standard_fonts": ("zig/lib/pdf/src/agl_lookup.zig",),
     "pjrt": ("zig/lib/pjrt/src/root.zig",),
     "prometheus": ("zig/lib/prometheus/src/root.zig",),
     "protobuf": ("zig/lib/protobuf/src/root.zig",),

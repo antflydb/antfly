@@ -21,12 +21,64 @@ import base64
 import hashlib
 import json
 import math
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from managed_api import (
+    authorization_headers,
+    correlation_evidence,
+    open_request,
+    validate_backend,
+)
+
+
+# Match native inline capability bounds; reserve room for search controls.
+MAX_CURSOR_BYTES = 2 * 1024 * 1024 + 4096
+MAX_SEARCH_REQUEST_BYTES = MAX_CURSOR_BYTES + 8192
+
+
+def validate_cursor(cursor):
+    if (
+        not isinstance(cursor, str)
+        or not cursor.isascii()
+        or not 1 <= len(cursor) <= MAX_CURSOR_BYTES
+    ):
+        raise ValueError("Invalid cursor")
+
+
+class RateLimit:
+    """One bounded token bucket per gateway process, independent of client input."""
+
+    def __init__(self, rate, burst):
+        self.rate, self.burst = rate, burst
+        self.tokens, self.updated = float(burst), time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        with self.lock:
+            now = time.monotonic()
+            self.tokens = min(
+                self.burst, self.tokens + (now - self.updated) * self.rate
+            )
+            self.updated = now
+            if self.tokens < 1:
+                return False
+            self.tokens -= 1
+            return True
+
+
+def configure(server, backend, headers=None, concurrency=8, rate=2, burst=8):
+    server.backend = validate_backend(backend, bool(headers))
+    server.backend_headers = dict(headers or {})
+    server.searches = threading.BoundedSemaphore(concurrency)
+    server.rate_limit = RateLimit(rate, burst)
+    server.ready_lock = threading.Lock()
+    server.ready_until, server.ready_value = 0.0, False
 
 
 def search_request(value):
@@ -35,6 +87,10 @@ def search_request(value):
         "view",
         "cursor",
         "recent_since",
+        "type",
+        "sort",
+        "date_from",
+        "date_to",
     }:
         raise ValueError("Expected q, view and optional cursor")
     term = value.get("q")
@@ -44,6 +100,21 @@ def search_request(value):
     view = value.get("view", "all")
     if not isinstance(view, str) or view not in ("all", *tables):
         raise ValueError("Unknown search view")
+    item_type = value.get("type", "all")
+    sort = value.get("sort", "relevance")
+    if not isinstance(item_type, str) or item_type not in ("all", "story", "comment"):
+        raise ValueError("Unknown item type")
+    if not isinstance(sort, str) or sort not in ("relevance", "date"):
+        raise ValueError("Unknown sort order")
+    bounds = {}
+    for name, operator in (("date_from", "gte"), ("date_to", "lt")):
+        if name in value:
+            bound = value[name]
+            if type(bound) is not int or not 0 <= bound <= 253402300800:
+                raise ValueError("Invalid date boundary")
+            bounds[operator] = bound
+    if "gte" in bounds and "lt" in bounds and bounds["gte"] >= bounds["lt"]:
+        raise ValueError("Date range must start before it ends")
     query = {
         "full_text_search": {"match": term.strip(), "field": "body"},
         "full_text_index": "body_text",
@@ -60,10 +131,18 @@ def search_request(value):
         "order_by": [{"field": "_score", "desc": True}],
         "limit": 20,
     }
+    if sort == "date":
+        query["order_by"] = [
+            {"field": "created_at", "desc": True},
+            {"field": "hn_id", "desc": True},
+        ]
     if view == "all":
-        query.update(source={"saved": "hackernews"}, source_ranking="rrf")
+        query["source"] = {"saved": "hackernews"}
+        if sort == "relevance":
+            query["source_ranking"] = "rrf"
     else:
         query["table"] = tables[view]
+    predicates = []
     cursor = value.get("cursor")
     if view == "recent":
         since = value.get("recent_since")
@@ -73,12 +152,19 @@ def search_request(value):
             since = max(0, int(time.time()) - 365 * 86400)
         if type(since) is not int or not 0 <= since <= int(time.time()):
             raise ValueError("Invalid recent cutoff")
-        query["filter_query"] = {"range": {"path": "/created_at", "gte": since}}
+        predicates.append({"range": {"path": "/created_at", "gte": since}})
     elif "recent_since" in value:
         raise ValueError("Recent cutoff is only valid for the recent view")
+    if bounds:
+        predicates.append({"range": {"path": "/created_at", **bounds}})
+    if item_type != "all":
+        predicates.append({"term": {"path": "/item_type", "value": item_type}})
+    if predicates:
+        query["filter_query"] = (
+            predicates[0] if len(predicates) == 1 else {"conjuncts": predicates}
+        )
     if cursor is not None:
-        if not isinstance(cursor, str) or not 1 <= len(cursor) <= 65536:
-            raise ValueError("Invalid cursor")
+        validate_cursor(cursor)
         if view == "all":
             query["source_cursor"] = cursor
         else:
@@ -124,7 +210,10 @@ def cursor_query_key(query):
 
 def next_cursor(query, result):
     if "source" in query:
-        return result.get("next_source_cursor")
+        cursor = result.get("next_source_cursor")
+        if cursor is not None:
+            validate_cursor(cursor)
+        return cursor
     hits = result["hits"]["hits"]
     if len(hits) < query["limit"]:
         return None
@@ -134,7 +223,7 @@ def next_cursor(query, result):
         "after": hits[-1]["_sort"],
     }
     cursor = base64.urlsafe_b64encode(json.dumps(page).encode()).decode()
-    if len(cursor) > 65536:
+    if len(cursor) > MAX_CURSOR_BYTES:
         raise ValueError("Cursor too large")
     return cursor
 
@@ -144,12 +233,47 @@ class Gateway(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def respond(self, status, body, content_type="application/json"):
+    def upstream(self, path, body=None, timeout=15):
+        self.backend_correlation = {}
+        headers = {"Content-Type": "application/json"}
+        headers.update(getattr(self.server, "backend_headers", {}))
+        request = Request(
+            self.server.backend + path,
+            None if body is None else json.dumps(body).encode(),
+            headers,
+        )
+        try:
+            with open_request(request, timeout=timeout) as response:
+                self.backend_correlation = correlation_evidence(response.headers)
+                raw = response.read(4194305)
+        except HTTPError as error:
+            self.backend_correlation = correlation_evidence(error.headers)
+            raise
+        if len(raw) > 4194304:
+            raise ValueError("Search response too large")
+        return json.loads(raw)
+
+    def respond(
+        self, status, body, content_type="application/json", *, backend_seconds=None
+    ):
         payload = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if backend_seconds is not None:
+            # Includes the managed proxy, transport and response read. This is
+            # not an engine timer. Never forward arbitrary upstream headers.
+            self.send_header(
+                "Server-Timing", f"antfly_upstream;dur={backend_seconds * 1000:.3f}"
+            )
+            for field, header in (
+                ("request_id", "X-Antfly-Upstream-Request-ID"),
+                ("cf_ray", "X-Antfly-Upstream-CF-Ray"),
+            ):
+                value = getattr(self, "backend_correlation", {}).get(field)
+                if value:
+                    self.send_header(header, value)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header(
@@ -160,42 +284,81 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
+        # Search state lives in the browser's query string, not the asset route.
+        path = self.path.partition("?")[0]
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            "/search-state.mjs": ("search-state.mjs", "text/javascript; charset=utf-8"),
             "/app.css": ("app.css", "text/css; charset=utf-8"),
         }
-        if self.path in assets:
-            filename, content_type = assets[self.path]
+        if path in assets:
+            filename, content_type = assets[path]
             return self.respond(
                 200,
                 (Path(__file__).parent / "web" / filename).read_bytes(),
                 content_type,
             )
-        if self.path == "/healthz":
+        if path in ("/health", "/healthz"):
             return self.respond(200, {"ok": True})
-        if self.path == "/readyz":
-            try:
-                for table in ("hn_archive", "hn_current"):
-                    with urlopen(
-                        self.server.backend + f"/tables/{table}/indexes/body_text",
-                        timeout=3,
-                    ) as response:
-                        index = json.load(response)
-                    if (
-                        not index.get("status", {})
-                        .get("readiness", {})
-                        .get("queryable")
-                    ):
-                        return self.respond(503, {"ready": False})
-                with urlopen(
-                    self.server.backend + "/sources/hackernews", timeout=3
-                ) as response:
-                    json.load(response)
-                return self.respond(200, {"ready": True})
-            except (URLError, TimeoutError, ValueError):
-                return self.respond(503, {"ready": False})
+        if path in ("/ready", "/readyz"):
+            lock = getattr(self.server, "ready_lock", None)
+            if lock is None:
+                ready = self.check_readiness()
+            elif time.monotonic() < self.server.ready_until:
+                ready = self.server.ready_value
+            elif lock.acquire(blocking=False):
+                try:
+                    ready = self.check_readiness()
+                    self.server.ready_value = ready
+                    self.server.ready_until = time.monotonic() + 10
+                finally:
+                    lock.release()
+            else:
+                ready = False
+            return self.respond(200 if ready else 503, {"ready": ready})
         return self.respond(404, {"error": "Not found"})
+
+    def check_readiness(self):
+        try:
+            for table in ("hn_archive", "hn_current"):
+                index = self.upstream(f"/tables/{table}/indexes/body_text", timeout=3)
+                status = index.get("status") if isinstance(index, dict) else None
+                readiness = (
+                    status.get("readiness") if isinstance(status, dict) else None
+                )
+                if not isinstance(readiness, dict) or not readiness.get("queryable"):
+                    return False
+            self.upstream("/sources/hackernews", timeout=3)
+            return True
+        except HTTPError as error:
+            error.close()
+            return False
+        except (URLError, TimeoutError, ValueError):
+            return False
+
+    body_read_timeout_seconds = 10.0
+
+    def read_search_body(self, length):
+        # Socket timeouts bound idle time only. Recompute a monotonic deadline
+        # before each receive so trickled input cannot hold admitted capacity.
+        deadline = time.monotonic() + self.body_read_timeout_seconds
+        chunks = []
+        remaining = length
+        try:
+            while remaining:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("Search body deadline exceeded")
+                self.connection.settimeout(budget)
+                chunk = self.rfile.read1(min(65536, remaining))
+                if not chunk:
+                    raise ValueError("Incomplete search body")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            self.connection.settimeout(10)
 
     def do_POST(self):
         if self.path != "/api/search":
@@ -203,55 +366,93 @@ class Gateway(BaseHTTPRequestHandler):
         self.connection.settimeout(10)
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 131072 or self.headers.get("Transfer-Encoding"):
+            if not 0 < length <= MAX_SEARCH_REQUEST_BYTES or self.headers.get(
+                "Transfer-Encoding"
+            ):
                 raise ValueError("Invalid request length")
-            query = search_request(json.loads(self.rfile.read(length)))
         except (ValueError, TimeoutError):
             return self.respond(400, {"error": "Invalid search request"})
+        limiter = getattr(self.server, "rate_limit", None)
+        if limiter is not None and not limiter.acquire():
+            return self.respond(429, {"error": "Search rate reached; retry shortly"})
         if not self.server.searches.acquire(blocking=False):
             return self.respond(
                 429, {"error": "Search capacity reached; retry shortly"}
             )
         try:
-            request = Request(
-                self.server.backend
-                + (f"/tables/{query['table']}/query" if "table" in query else "/query"),
-                json.dumps({k: v for k, v in query.items() if k != "table"}).encode(),
-                {"Content-Type": "application/json"},
-            )
-            with urlopen(request, timeout=15) as response:
-                raw = response.read(4194305)
-            if len(raw) > 4194304:
-                return self.respond(502, {"error": "Search response too large"})
-            result = json.loads(raw)["responses"][0]
+            # Bound body allocation as well as backend work by admitted searches.
+            try:
+                query = search_request(json.loads(self.read_search_body(length)))
+            except (ValueError, TimeoutError):
+                return self.respond(400, {"error": "Invalid search request"})
+            started = time.monotonic()
+            result = self.upstream(
+                f"/tables/{query['table']}/query" if "table" in query else "/query",
+                {k: v for k, v in query.items() if k != "table"},
+            )["responses"][0]
+            backend_seconds = time.monotonic() - started
             output = {
                 "hits": result["hits"],
                 "cursor": next_cursor(query, result),
             }
-            if "filter_query" in query:
-                output["recent_since"] = query["filter_query"]["range"]["gte"]
-            return self.respond(200, output)
+            if query.get("table") == "hn_current":
+                predicate = query["filter_query"]
+                dates = predicate.get("range") or predicate["conjuncts"][0]["range"]
+                output["recent_since"] = dates["gte"]
+            return self.respond(200, output, backend_seconds=backend_seconds)
         except HTTPError as error:
+            error.close()
             if error.code in (409, 410):
                 return self.respond(
-                    409, {"error": "Search snapshot expired; start a new search"}
+                    409,
+                    {"error": "Search snapshot expired; start a new search"},
+                    backend_seconds=time.monotonic() - started,
                 )
-            return self.respond(503, {"error": "Search is temporarily unavailable"})
-        except (URLError, TimeoutError, ValueError, KeyError, IndexError):
-            return self.respond(503, {"error": "Search is temporarily unavailable"})
+            return self.respond(
+                503,
+                {"error": "Search is temporarily unavailable"},
+                backend_seconds=time.monotonic() - started,
+            )
+        except (URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
+            return self.respond(
+                503,
+                {"error": "Search is temporarily unavailable"},
+                backend_seconds=time.monotonic() - started,
+            )
         finally:
             self.server.searches.release()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", default="http://127.0.0.1:8877/db/v1")
+    parser.add_argument(
+        "--backend",
+        default=os.environ.get("ANTFLY_API_BASE", "http://127.0.0.1:8877/db/v1"),
+    )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--requests-per-second", type=float, default=2)
+    parser.add_argument("--burst", type=int, default=8)
+    parser.add_argument("--require-auth", action="store_true")
     args = parser.parse_args()
+    if not (
+        1 <= args.concurrency <= 32
+        and 0 < args.requests_per_second <= 100
+        and 1 <= args.burst <= 256
+    ):
+        parser.error("Invalid gateway capacity bounds")
+    try:
+        headers = authorization_headers()
+        if args.require_auth and not headers:
+            raise ValueError("Managed hosting requires Antfly authorization")
+        backend = validate_backend(args.backend, bool(headers))
+    except ValueError as error:
+        parser.error(str(error))
     server = ThreadingHTTPServer((args.host, args.port), Gateway)
-    server.backend = args.backend.rstrip("/")
-    server.searches = threading.BoundedSemaphore(8)
+    configure(
+        server, backend, headers, args.concurrency, args.requests_per_second, args.burst
+    )
     server.serve_forever()
 
 

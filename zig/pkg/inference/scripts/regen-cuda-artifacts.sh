@@ -196,7 +196,8 @@ tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX")"
 tmp_ptx="$tmp_root/kernels.ptx"
 tmp_fatbin="$tmp_root/kernels.fatbin"
 tmp_sm89="$tmp_root/kernels.sm89.cubin"
-trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
+tmp_symbols="$tmp_root/kernels.symbols"
+trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89" "$tmp_symbols"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
   antfly_audio_logmel_f32
@@ -334,6 +335,9 @@ required_symbols=(
   termite_primitive_concat_f32
   termite_primitive_slice_f32
   termite_gliner_gather_concat_relu_f32
+  termite_gliner_gru_combine_f32
+  termite_concat_lastdim_f32
+  termite_take_rows_f32
   termite_split_last_dim3_f32
   termite_qwen3vl_mrope_f32
   termite_qwen3vl_vision_rope_f32
@@ -440,6 +444,12 @@ required_symbols=(
   termite_activation_multiply_fused_gate_up_f32
   termite_rms_norm_add_weighted_embedding_i32_q6_k_f32
   termite_rms_norm_f32_bf16
+  antfly_rms_q8_1_2560_tile256
+  antfly_gemma4_e4b_head_prefetch_l2
+  antfly_gemma4_e4b_pair_prefetch_l2
+  antfly_gemma4_e4b_down_prefetch_l2
+  antfly_rms_add_q8_1_2560_tile256
+  antfly_rms_add_scale_q8_1_2560_tile256
   termite_rms_norm_add_f32_bf16
   termite_linear_q4_0_gated_down_f32_tile4_w4
   termite_linear_q4_0_activation_slice_last_dim_f32_tile4
@@ -511,8 +521,20 @@ required_symbols=(
 
 check_required_symbols() {
   local file="$1"
+  local symbol_source="$file"
+  case "$file" in
+    *.fatbin|*.cubin)
+      # Compressed images do not expose symbol names in their raw bytes.
+      if [ -z "$cuobjdump" ]; then
+        printf 'error: cuobjdump is required to validate binary CUDA artifacts\n' >&2
+        exit 1
+      fi
+      "$cuobjdump" --dump-elf-symbols "$file" > "$tmp_symbols"
+      symbol_source="$tmp_symbols"
+      ;;
+  esac
   for symbol in "${required_symbols[@]}"; do
-    if ! grep -a -q "$symbol" "$file"; then
+    if ! grep -a -F -w -q -- "$symbol" "$symbol_source"; then
       printf 'error: generated CUDA artifact is missing symbol %s\n' "$symbol" >&2
       exit 1
     fi
@@ -555,7 +577,8 @@ build_portable_ptx() {
 }
 
 build_fatbin() {
-  "$nvcc" -fatbin "$src" -o "$tmp_fatbin" \
+  # Compress all architecture images losslessly; CUDA owns decompression.
+  "$nvcc" -fatbin --compress-mode=size "$src" -o "$tmp_fatbin" \
     -gencode=arch=compute_75,code=sm_75 \
     -gencode=arch=compute_80,code=sm_80 \
     -gencode=arch=compute_89,code=sm_89 \

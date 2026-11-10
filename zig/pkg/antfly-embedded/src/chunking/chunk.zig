@@ -27,6 +27,12 @@ pub const ModelSource = union(enum) {
     media: struct { mime_type: []const u8, data: []const u8 },
 };
 
+/// Model-aware source fields may contain plain media locators. Keep this
+/// recognition shared with offline backup inspection; parsing never fetches.
+pub fn isRemoteModelLocator(value: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(value, "https://") or std.ascii.startsWithIgnoreCase(value, "http://") or std.ascii.startsWithIgnoreCase(value, "s3://") or std.ascii.startsWithIgnoreCase(value, "gs://");
+}
+
 pub fn modelSourceFromValue(field: std.json.Value) !ModelSource {
     if (field == .null) return .none;
     if (field == .string) return .{ .text = field.string };
@@ -108,6 +114,50 @@ pub const ProvenanceScope = enum {
     unit,
 };
 
+pub const NativeTextQualityProvenance = struct {
+    too_short: bool,
+    garbled: bool,
+    font_corrupted: bool,
+    replacement_corrupted: bool,
+    single_char_word_ratio: f64,
+    corrupted_line_ratio: f64,
+    replacement_char_ratio: f64,
+    trimmed_len: usize,
+    non_whitespace_chars: usize,
+};
+
+pub const NativeTextDiagnosticsProvenance = struct {
+    policy: []const u8,
+    extraction_complete: bool,
+    semantic_coverage: []const u8,
+    actual_text_replacements: usize,
+    outside_page_runs: usize,
+    invisible_runs: usize,
+    unaligned_runs: usize,
+    unsupported_ordering_runs: usize,
+    source_run_count: usize,
+    emitted_run_count: usize,
+    outside_page_spans: usize = 0,
+    invisible_spans: usize = 0,
+    unpositioned_spans: usize = 0,
+    actual_text_incomplete: bool = false,
+    outline_fallback: bool,
+    has_nontext_visual: bool,
+    has_unrendered_annotations: bool,
+};
+
+pub const RenderPolicyProvenance = struct {
+    version: u16,
+    sampling: []const u8,
+    resolved_profile: ?[]const u8,
+    resolution: []const u8,
+
+    pub fn from(policy: anytype) ?@This() {
+        const value = policy orelse return null;
+        return .{ .version = value.version, .sampling = @tagName(value.sampling), .resolved_profile = if (value.resolved_profile) |profile| @tagName(profile) else null, .resolution = @tagName(value.resolution) };
+    }
+};
+
 pub const ProvenanceOptions = struct {
     scope: ProvenanceScope = .document,
     parent_doc_key: ?[]const u8 = null,
@@ -122,9 +172,12 @@ pub const ProvenanceOptions = struct {
     extraction_method: ?[]const u8 = null,
     extraction_status: ?[]const u8 = null,
     confidence: ?f64 = null,
+    native_text_quality: ?NativeTextQualityProvenance = null,
+    native_text_diagnostics: ?NativeTextDiagnosticsProvenance = null,
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
+    ocr_render_policy: ?RenderPolicyProvenance = null,
     ocr_effective_render_dpi: ?u16 = null,
     ocr_rendered_width: ?u32 = null,
     ocr_rendered_height: ?u32 = null,
@@ -261,6 +314,13 @@ fn appendProvenanceFields(
         provenance.deinit(alloc);
     }
 
+    if (chunk.start_time_ms) |value| try putOwnedValue(alloc, &provenance, "start_time_ms", .{ .float = value });
+    if (chunk.end_time_ms) |value| try putOwnedValue(alloc, &provenance, "end_time_ms", .{ .float = value });
+    if (chunk.speaker_index) |index| {
+        var label_buf: [16]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "SPEAKER_{d:0>2}", .{index}) catch unreachable;
+        try putString(alloc, &provenance, "speaker", label);
+    }
     try putString(alloc, &provenance, "source_field", source_field);
     try putString(alloc, &provenance, "offset_basis", switch (options.scope) {
         .document => "document",
@@ -276,9 +336,12 @@ fn appendProvenanceFields(
     if (options.page_rotation) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
     if (options.extraction_status) |value| try putString(alloc, &provenance, "extraction_status", value);
     if (options.confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
+    if (options.native_text_quality) |value| try putStructJsonValue(alloc, &provenance, "native_text_quality", value);
+    if (options.native_text_diagnostics) |value| try putStructJsonValue(alloc, &provenance, "native_text_diagnostics", value);
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_render_policy) |value| try putStructJsonValue(alloc, &provenance, "ocr_render_policy", value);
     if (options.ocr_effective_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
     if (options.ocr_rendered_width) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
     if (options.ocr_rendered_height) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
@@ -328,7 +391,7 @@ fn appendFormatProvenance(
     provenance: *std.json.ObjectMap,
     options: ProvenanceOptions,
 ) !void {
-    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and options.ocr_failure_stage == null and options.ocr_failure_retryable == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and options.native_text_quality == null and options.native_text_diagnostics == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and options.ocr_failure_stage == null and options.ocr_failure_retryable == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
     var format = std.json.ObjectMap.empty;
     errdefer {
@@ -345,9 +408,12 @@ fn appendFormatProvenance(
     try putString(alloc, &format, "extraction_method", options.extraction_method orelse "mechanical_text");
     if (options.extraction_status) |value| try putString(alloc, &format, "extraction_status", value);
     if (options.confidence) |value| try format.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
+    if (options.native_text_quality) |value| try putStructJsonValue(alloc, &format, "native_text_quality", value);
+    if (options.native_text_diagnostics) |value| try putStructJsonValue(alloc, &format, "native_text_diagnostics", value);
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try format.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_render_policy) |value| try putStructJsonValue(alloc, &format, "ocr_render_policy", value);
     if (options.ocr_effective_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
     if (options.ocr_rendered_width) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
     if (options.ocr_rendered_height) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
@@ -370,8 +436,62 @@ fn appendFormatProvenance(
     try provenance.put(alloc, try alloc.dupe(u8, "format_provenance"), .{ .object = format });
 }
 
+fn putStructJsonValue(alloc: Allocator, object: *std.json.ObjectMap, key: []const u8, value: anytype) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const encoded = try structJsonValueAlloc(alloc, value);
+    errdefer freeJsonValue(alloc, encoded);
+    try object.put(alloc, owned_key, encoded);
+}
+
+fn provenanceScalarJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .optional => if (value) |item| try provenanceScalarJsonValueAlloc(alloc, item) else .null,
+        .bool => .{ .bool = value },
+        .int => .{ .integer = std.math.cast(i64, value) orelse return error.Overflow },
+        .float => .{ .float = value },
+        .pointer => |pointer| blk: {
+            if (pointer.size != .slice or pointer.child != u8) @compileError("unsupported provenance field");
+            break :blk .{ .string = try alloc.dupe(u8, value) };
+        },
+        else => @compileError("unsupported provenance field"),
+    };
+}
+
+fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
+    const T = @TypeOf(value);
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |struct_info| struct_info,
+        else => @compileError("expected provenance struct"),
+    };
+    var object = std.json.ObjectMap.empty;
+    errdefer {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        object.deinit(alloc);
+    }
+    inline for (info.field_names) |field_name| {
+        const encoded = try provenanceScalarJsonValueAlloc(alloc, @field(value, field_name));
+        errdefer freeJsonValue(alloc, encoded);
+        const key = try alloc.dupe(u8, field_name);
+        errdefer alloc.free(key);
+        try object.put(alloc, key, encoded);
+    }
+    return .{ .object = object };
+}
+
 fn putString(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try obj.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
+    try putOwnedValue(alloc, obj, key, .{ .string = try alloc.dupe(u8, value) });
+}
+
+fn putOwnedValue(alloc: Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
+    errdefer freeJsonValue(alloc, value);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try object.put(alloc, owned_key, value);
 }
 
 fn jsonFloatArrayAlloc(alloc: Allocator, values: []const f64) !std.json.Array {
@@ -486,6 +606,32 @@ test "append artifact fields stores unit-local and document-global provenance" {
         .page_rotation = 90,
         .extraction_method = "pdf_text",
         .confidence = 0.94,
+        .native_text_quality = .{
+            .too_short = false,
+            .garbled = false,
+            .font_corrupted = false,
+            .replacement_corrupted = false,
+            .single_char_word_ratio = 0.1,
+            .corrupted_line_ratio = 0,
+            .replacement_char_ratio = 0,
+            .trimmed_len = 5,
+            .non_whitespace_chars = 5,
+        },
+        .native_text_diagnostics = .{
+            .policy = "page",
+            .extraction_complete = true,
+            .semantic_coverage = "partial",
+            .actual_text_replacements = 1,
+            .outside_page_runs = 2,
+            .invisible_runs = 3,
+            .unaligned_runs = 1,
+            .unsupported_ordering_runs = 4,
+            .source_run_count = 5,
+            .emitted_run_count = 4,
+            .outline_fallback = false,
+            .has_nontext_visual = true,
+            .has_unrendered_annotations = false,
+        },
     });
     const provenance = obj.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
@@ -504,11 +650,60 @@ test "append artifact fields stores unit-local and document-global provenance" {
     try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
     try std.testing.expectEqual(@as(f64, 0.94), provenance.get("confidence").?.float);
     try std.testing.expectEqual(@as(f64, 0.94), format_provenance.get("confidence").?.float);
+    try std.testing.expectEqualStrings("page", provenance.get("native_text_diagnostics").?.object.get("policy").?.string);
+    try std.testing.expectEqual(@as(i64, 2), format_provenance.get("native_text_diagnostics").?.object.get("outside_page_runs").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("native_text_quality").?.object.get("trimmed_len").?.integer);
     try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
     try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);
     try std.testing.expectEqual(@as(i64, 105), provenance.get("document_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 110), provenance.get("document_char_end").?.integer);
+}
+
+fn exerciseNativeTextProvenanceOwnership(alloc: Allocator) !void {
+    var object = std.json.ObjectMap.empty;
+    defer {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        object.deinit(alloc);
+    }
+    try putStructJsonValue(alloc, &object, "native_text_quality", NativeTextQualityProvenance{
+        .too_short = false,
+        .garbled = false,
+        .font_corrupted = false,
+        .replacement_corrupted = false,
+        .single_char_word_ratio = 0.1,
+        .corrupted_line_ratio = 0,
+        .replacement_char_ratio = 0,
+        .trimmed_len = 5,
+        .non_whitespace_chars = 5,
+    });
+    try putStructJsonValue(alloc, &object, "native_text_diagnostics", NativeTextDiagnosticsProvenance{
+        .policy = "visible",
+        .extraction_complete = true,
+        .semantic_coverage = "text_only",
+        .actual_text_replacements = 2,
+        .outside_page_runs = 1,
+        .invisible_runs = 3,
+        .unaligned_runs = 0,
+        .unsupported_ordering_runs = 0,
+        .source_run_count = 6,
+        .emitted_run_count = 5,
+        .outside_page_spans = 2,
+        .invisible_spans = 3,
+        .unpositioned_spans = 4,
+        .outline_fallback = false,
+        .has_nontext_visual = false,
+        .has_unrendered_annotations = false,
+    });
+}
+
+test "native text neutral provenance owns nested JSON through allocation failure" {
+    try exerciseNativeTextProvenanceOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseNativeTextProvenanceOwnership, .{});
 }
 
 test "append artifact fields stores binary metadata and base64 payload" {
@@ -686,4 +881,88 @@ pub fn mediaWindowPayloadAlloc(a: Allocator, payload: []const u8, index: u32) ![
     try recipe.object.put(scratch, "descriptor", descriptor);
     try object.object.put(scratch, "_chunk", recipe);
     return std.json.Stringify.valueAlloc(a, object, .{});
+}
+
+// Unit spans are sorted and disjoint in byte coordinates. Retain only segments
+// overlapping this chunk: O(log S + K), rather than copying an entire recording's
+// timing inventory into every chunk. Coordinates remain relative to the unit.
+pub fn appendTranscriptSpans(alloc: Allocator, object: *std.json.ObjectMap, spans: anytype, chunk: Chunk) !void {
+    if (spans.len == 0) return;
+    const start = chunk.start_offset orelse return;
+    const end = chunk.end_offset orelse return;
+    if (end <= start) return;
+    var low: usize = 0;
+    var high: usize = spans.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (spans[mid].char_end <= start) low = mid + 1 else high = mid;
+    }
+    var stop = low;
+    while (stop < spans.len and spans[stop].char_start < end) : (stop += 1) {}
+    if (stop == low) return;
+    const provenance = object.getPtr("provenance") orelse return error.InvalidChunkSource;
+    if (provenance.* != .object) return error.InvalidChunkSource;
+    var selected = std.json.Array.init(alloc);
+    errdefer {
+        for (selected.items) |item| freeJsonValue(alloc, item);
+        selected.deinit();
+    }
+    for (spans[low..stop]) |span| {
+        var item = std.json.ObjectMap.empty;
+        errdefer freeJsonValue(alloc, .{ .object = item });
+        inline for (.{ "char_start", "char_end", "start_ms", "end_ms" }) |field| {
+            const integer = std.math.cast(i64, @field(span, field)) orelse return error.Overflow;
+            try putOwnedValue(alloc, &item, field, .{ .integer = integer });
+        }
+        if (span.speaker_index) |speaker| {
+            try putOwnedValue(alloc, &item, "speaker_index", .{ .integer = speaker });
+            var label_buf: [16]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "SPEAKER_{d:0>2}", .{speaker}) catch unreachable;
+            try putString(alloc, &item, "speaker", label);
+        }
+        try selected.append(.{ .object = item });
+    }
+    const key = try alloc.dupe(u8, "transcript_spans");
+    errdefer alloc.free(key);
+    try provenance.object.put(alloc, key, .{ .array = selected });
+}
+
+test "transcript chunk public provenance retains bounded timing and speakers" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Span = struct { char_start: u32, char_end: u32, start_ms: u64, end_ms: u64, speaker_index: ?u8 = null };
+    const spans = [_]Span{
+        .{ .char_start = 0, .char_end = 5, .start_ms = 100, .end_ms = 500, .speaker_index = 0 },
+        .{ .char_start = 6, .char_end = 12, .start_ms = 600, .end_ms = 900, .speaker_index = 1 },
+        .{ .char_start = 13, .char_end = 18, .start_ms = 1000, .end_ms = 1500, .speaker_index = 0 },
+    };
+    var object = std.json.ObjectMap.empty;
+    const chunk = Chunk{ .chunk_id = 0, .text = null, .start_offset = 3, .end_offset = 12, .start_time_ms = 100, .end_time_ms = 900 };
+    try appendArtifactFieldsWithProvenance(scratch, &object, "text", chunk, true, .{ .scope = .unit });
+    try appendTranscriptSpans(scratch, &object, &spans, chunk);
+    const provenance = object.get("provenance").?.object;
+    try std.testing.expectEqual(@as(f64, 100), provenance.get("start_time_ms").?.float);
+    const selected = provenance.get("transcript_spans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    try std.testing.expectEqual(@as(i64, 1), selected[1].object.get("speaker_index").?.integer);
+    try std.testing.expect(provenance.get("speaker") == null);
+    var single = std.json.ObjectMap.empty;
+    try appendArtifactFieldsWithProvenance(scratch, &single, "text", .{ .chunk_id = 1, .speaker_index = 1 }, false, .{});
+    try std.testing.expectEqualStrings("SPEAKER_01", single.get("provenance").?.object.get("speaker").?.string);
+}
+
+test "transcript chunk public provenance releases partial span allocations" {
+    const Probe = struct {
+        fn build(alloc: Allocator) !void {
+            var object = std.json.ObjectMap.empty;
+            defer freeJsonValue(alloc, .{ .object = object });
+            try putOwnedValue(alloc, &object, "provenance", .{ .object = std.json.ObjectMap.empty });
+            const Span = struct { char_start: u32, char_end: u32, start_ms: u64, end_ms: u64, speaker_index: ?u8 = null };
+            const spans = [_]Span{.{ .char_start = 0, .char_end = 5, .start_ms = 100, .end_ms = 500, .speaker_index = 0 }};
+            try appendTranscriptSpans(alloc, &object, &spans, .{ .chunk_id = 0, .start_offset = 0, .end_offset = 5 });
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.build, .{});
 }

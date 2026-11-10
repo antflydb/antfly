@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const native_link = b.option(bool, "native-link", "Use the native archive test linker") orelse false;
+    const early_provider = b.option(bool, "early-provider", "Attach provider metadata before consumer splitting") orelse false;
+    const strip = b.option(bool, "strip", "Qualify the stripped native link profile") orelse false;
     const filters = @import("build_test_filters.zig").select(b.allocator, buildArguments(b) orelse &.{}, &.{"fixture"});
     const error_logs = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
@@ -40,7 +42,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const metadata = if (b.option(bool, "metadata", "Qualify stable test metadata") orelse false)
+        @import("lib/build_info/build_support.zig").create(b, .{ .root = b.path("lib/build_info"), .target = target, .optimize = optimize, .version = b.option([]const u8, "release-version", "Release identity") orelse "first" })
+    else
+        null;
+    if (metadata) |info| {
+        provider.root_module.addImport("build_info", info.module);
+        consumer_module.addImport("build_info", info.module);
+    }
     consumer_module.addImport("antfly_test_error_logs", error_logs);
+    if (early_provider) consumer_module.linkLibrary(provider);
     if (native_link) @import("antfly_platform").addMacosSdkPaths(b, consumer_module, target);
     consumer_module.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{} });
     const consumer = linked.add(b, .{
@@ -50,6 +61,9 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     consumer.executable.root_module.linkLibrary(provider);
+    if (metadata) |info| info.linkTest(consumer.executable.root_module);
+    if (consumer.executable.root_module.import_table.count() != 0)
+        @panic("link-only test executable must not import a Zig root");
     const implementation = b.addTest(.{
         .name = "fixture-implementation",
         .root_module = b.createModule(.{
@@ -94,6 +108,7 @@ pub fn build(b: *std.Build) void {
         concurrent.dependOn(&child.step);
     }
     if (native_link) linked.finalizeNativeLinks(b);
+    if (strip) @import("build_support/embedded/shared_library.zig").stripBuildGraph(b);
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

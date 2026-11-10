@@ -79,6 +79,17 @@ pub const Context = struct {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_secrets(self.handle, store));
     }
+    /// Node-level default inference endpoint and unresolved credential
+    /// reference for storage-owned enrichment.
+    pub fn configureInferenceDefaults(self: *Context, api_url: ?[]const u8, api_key: ?[]const u8) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_inference_defaults(
+            self.handle,
+            .fromSlice(api_url orelse ""),
+            .fromSlice(api_key orelse ""),
+        ));
+    }
+
     pub fn configureNativeQueries(self: *Context, setup: []const u8) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_native_queries(self.handle, .fromSlice(setup)));
@@ -90,7 +101,7 @@ pub const Context = struct {
         const Adapter = struct {
             fn acquire(raw: *anyopaque, out: *abi.OwnedBytes) callconv(.c) abi.Status {
                 const facade: *const @import("antfly_scraping").RemoteContentConfig = @ptrCast(@alignCast(raw));
-                const bytes = @import("antfly_local_sources").common_config.remoteContentSecurityJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
+                const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
                     error.OutOfMemory => .out_of_memory,
                     error.Timeout => .timeout,
                     error.Canceled => .cancelled,
@@ -104,7 +115,7 @@ pub const Context = struct {
             }
         };
         const services = @import("kernel_runtime_services.zig");
-        const source = services.RemoteContentSource{ .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
+        const source = services.RemoteContentSource{ .version = 2, .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
         try self.ensure();
         try statusToError(services.antfly_storage_context_configure_remote_content_source(self.handle, &source));
     }
@@ -123,6 +134,13 @@ pub const Context = struct {
         try statusToError(abi.antfly_storage_context_metrics(self.handle, &result));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
         return result;
+    }
+
+    pub fn pipelineMetricsJson(self: *Context) !Response {
+        try self.ensure();
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_context_pipeline_metrics_json(self.handle, 1, &response.buffer));
+        return response;
     }
 
     pub fn invalidateCaches(self: *Context) !void {
@@ -224,25 +242,7 @@ pub const Response = struct {
     }
 };
 
-pub const QueryResponse = struct {
-    response: abi.QueryOwnedResponse = .{},
-
-    pub fn bytes(self: QueryResponse) []const u8 {
-        return self.response.buffer.slice();
-    }
-
-    pub fn identityReadGeneration(self: QueryResponse) ?u64 {
-        return if (self.response.has_identity_read_generation != 0)
-            self.response.identity_read_generation
-        else
-            null;
-    }
-
-    pub fn deinit(self: *QueryResponse) void {
-        abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
-        self.* = undefined;
-    }
-};
+pub const QueryResponse = @import("local_query_client").OwnedQueryResponse;
 
 pub const VersionedResponse = struct {
     response: abi.VersionedOwnedBytes = .{},
@@ -469,6 +469,18 @@ pub const Owner = struct {
             null,
             null,
         );
+    }
+
+    /// Experimental ordinary-document path. All input buffers are borrowed
+    /// until this synchronous call returns; no generic DB types cross the ABI.
+    pub fn batchBorrowedDocuments(self: *Owner, request: abi.BorrowedDocumentBatchRequest) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_batch_borrowed_documents(self.handle, &request, &response.buffer, &failure);
+        errdefer response.deinit();
+        try error_identity.validateFailureEnvelope(status, &failure, abi.abi_version);
+        try statusToError(status);
+        return response;
     }
 
     pub fn batchJsonWithDocumentChildRangeDispatcher(
@@ -706,40 +718,10 @@ pub const Owner = struct {
     }
 
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
-        var response: QueryResponse = .{};
-        var failure: abi.FailureIdentity = .{};
-        const status = abi.antfly_storage_owner_query_json(
-            self.handle,
-            &.{
-                .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
-                .execution_options = options.execution,
-            },
-            &response.response,
-            &failure,
-        );
-        error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
-            std.log.err(
-                "storage-owner query returned inconsistent failure identity status={s} identity_status={s} identity_boundary={s} identity_version={d} operation={d}",
-                .{ @tagName(status), @tagName(failure.status), @tagName(failure.boundary), failure.boundary_version, failure.operation },
-            );
-            return err;
-        };
-        if (status != .ok and failure.boundary != .storage_owner and failure.boundary != .local_query) {
-            std.log.err("storage-owner query returned failure from unexpected boundary={s}", .{@tagName(failure.boundary)});
-            return error.InvalidBoundaryFailureIdentity;
-        }
-        statusToError(status) catch |err| {
-            std.log.debug("storage-owner query rejected provider_error={s} boundary={s} operation={d}", .{ failure.errorName(), @tagName(failure.boundary), failure.operation });
-            if (status == .internal) {
-                std.log.err("storage-owner query failed provider_error={s} hash={x} operation={d}", .{
-                    failure.errorName(),
-                    failure.error_name_hash,
-                    failure.operation,
-                });
-            }
-            return err;
-        };
-        return response;
+        return @import("local_query_client").executeOwner(self.handle, .{
+            .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+            .execution_options = options.execution,
+        });
     }
 
     pub fn lookupJson(self: *Owner, table_name: []const u8, request_json: []const u8) !VersionedResponse {
@@ -1236,7 +1218,8 @@ fn acceptStorageOwnerFailure(
     failure: abi.FailureIdentity,
     label: []const u8,
 ) !void {
-    error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
+    const version = if (failure.boundary == .local_query) abi.query_abi_version else abi.abi_version;
+    error_identity.validateFailureEnvelope(status, &failure, version) catch |err| {
         std.log.err(
             "{s} returned inconsistent failure identity status={s} identity_status={s} boundary={s} version={d} operation={d} error={s} hash={x}",
             .{

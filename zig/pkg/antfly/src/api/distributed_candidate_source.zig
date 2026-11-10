@@ -52,6 +52,11 @@ pub const DistributedCandidateSource = struct {
     /// `read_index` keeps candidates consistent with committed writes; callers
     /// can relax this to `stale` to trade freshness for latency.
     consistency: raft_mod.ReadConsistency = .read_index,
+    /// A resolver holds its work turn while calling this adapter. Bound reads
+    /// so owner transitions can finish instead of waiting on a callback that
+    /// is itself waiting for that owner. Expiry retries the entire turn.
+    read_timeout_ns: u64 = 5 * std.time.ns_per_s,
+
     /// Serving callers supply a request-owned, authorized predicate for each
     /// pinned physical table. Background replay retains its independent grants.
     read_filter: ?struct {
@@ -61,6 +66,7 @@ pub const DistributedCandidateSource = struct {
 
     fn queryRequest(self: *@This(), a: std.mem.Allocator, physical: []const u8, input: db_mod.types.SearchRequest) !db_mod.types.SearchRequest {
         var req = input;
+        req.execution_deadline_ns = self.readDeadline();
         if (self.read_filter) |policy| {
             const filter = try policy.get(policy.ptr, a, physical);
             if (filter.len > 0) {
@@ -69,7 +75,6 @@ pub const DistributedCandidateSource = struct {
             }
         }
         if (self.request_context) |context| {
-            req.execution_deadline_ns = context.deadline_ns;
             req.cancellation = context.cancellation;
         }
         return req;
@@ -106,13 +111,19 @@ pub const DistributedCandidateSource = struct {
             return one.value;
         }
         var opts = options;
+        opts.execution_deadline_ns = self.readDeadline();
         if (self.request_context) |context| {
-            opts.execution_deadline_ns = context.deadline_ns;
             opts.cancellation = context.cancellation;
         }
         var row = (try self.reads.lookup(a, physical, key, opts, self.consistency)) orelse return null;
         defer row.deinit(a);
         return try a.dupe(u8, row.json);
+    }
+
+    fn readDeadline(self: *const DistributedCandidateSource) u64 {
+        const bounded = @import("antfly_platform").time.monotonicNs() +| self.read_timeout_ns;
+        if (self.request_context) |context| if (context.deadline_ns) |deadline| return @min(bounded, deadline);
+        return bounded;
     }
 
     pub fn candidateSource(self: *DistributedCandidateSource) CandidateSource {
@@ -177,7 +188,7 @@ pub const DistributedCandidateSource = struct {
             runtime.deinit();
             a.destroy(runtime);
         }
-        const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+        const deadline = try request.deadline(@import("antfly_platform").time.monotonicNs());
         var context = self.request_context orelse @import("antfly_local_sources").storage_db_enrichment_asset_producer.InvocationContext{};
         context.io = io;
         context.deadline_ns = if (context.deadline_ns) |caller| @min(caller, deadline) else deadline;
@@ -320,6 +331,7 @@ pub const DistributedCandidateSource = struct {
         defer allocator.free(upper);
 
         var scan_options: db_mod.types.ScanOptions = .{
+            .execution_deadline_ns = self.readDeadline(),
             .inclusive_from = true,
             .exclusive_to = true,
             .include_documents = true,
@@ -327,7 +339,6 @@ pub const DistributedCandidateSource = struct {
         };
         if (self.read_filter) |policy| scan_options.filter_query_json = try policy.get(policy.ptr, allocator, physical);
         if (self.request_context) |context| {
-            scan_options.execution_deadline_ns = context.deadline_ns;
             scan_options.cancellation = context.cancellation;
         }
         var resp = (try self.reads.scan(allocator, physical, prefix, upper, scan_options, self.consistency)) orelse return;
@@ -404,6 +415,7 @@ pub const DistributedCandidateSource = struct {
             .query = dense_query,
         }};
         const req = db_mod.types.SearchRequest{
+            .execution_deadline_ns = self.readDeadline(),
             .dense = if (query.index_name.len == 0) dense_query else null,
             .dense_queries = if (query.index_name.len == 0) &.{} else named_queries[0..],
             .limit = limit,
@@ -504,7 +516,7 @@ const FakeTableReadSource = struct {
         opts: db_mod.types.LookupOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?table_reads.LookupResponse {
-        _ = opts;
+        try testing.expect(opts.execution_deadline_ns != null);
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
@@ -522,6 +534,7 @@ const FakeTableReadSource = struct {
         opts: db_mod.types.ScanOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?table_reads.ScanResponse {
+        try testing.expect(opts.execution_deadline_ns != null);
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.expected_filter) |filter| try testing.expectEqualStrings(filter, opts.filter_query_json);
@@ -557,6 +570,7 @@ const FakeTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?@import("antfly_local_sources").api_query.QueryResponse {
         _ = consistency;
+        try testing.expect(req.execution_deadline_ns != null);
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.expected_filter) |filter| try testing.expectEqualStrings(filter, req.filter_query_json);
         if (!std.mem.eql(u8, table_name, self.table)) return null;

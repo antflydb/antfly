@@ -717,6 +717,7 @@ impl Default for types::CreateFullTextIndexRequest {
 impl Default for types::CreateEmbeddingsIndexRequest {
     fn default() -> Self {
         Self {
+            algorithm: None,
             chunk_size: 1024,
             chunker: None,
             coverage_policy: None,
@@ -728,10 +729,14 @@ impl Default for types::CreateEmbeddingsIndexRequest {
             enrichments: Vec::new(),
             execution: None,
             external: false,
+            external_vector_space: None,
             field: None,
+            leann: None,
             mem_only: None,
             min_weight: None,
             publication_policy: Some(types::IndexPublicationPolicy::Progressive),
+            quantization_bits: None,
+            quantization_refine: None,
             source_artifact_name: None,
             sources: None,
             sparse: false,
@@ -1216,3 +1221,13 @@ mod tests {
         );
     }
 }
+
+/// Optional client for the separately deployed source management service.
+#[cfg(feature = "sources")]
+pub mod sources;
+
+pub mod time_series;
+
+/// Simple-path helpers for the native agent memory API.
+pub mod memory;
+pub use memory::{MemorySpace, new_idempotency_key};

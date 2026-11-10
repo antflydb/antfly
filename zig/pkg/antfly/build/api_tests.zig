@@ -67,6 +67,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const privacy_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/privacy_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, privacy_mod, true, true);
+    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
+    const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
+    privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
     const public_api_parity_default_filters = [_][]const u8{
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
@@ -174,9 +183,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "api query contract parses direct JSON-pointer path aliases",
+        "api query contract scalar evidence preserves JSON-shaped plaintext bytes",
+        "api query contract structured dollar projection never exposes internal fields",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
+        "native member traversal requires producer and private parent admission",
+        "native member ancestry ignores payload source and unit identities",
+        "reshapeChunkBackedResult hydrates direct chunk ancestors",
+        "native member parent admission uses exact source candidates",
+        "native member value verification retains scan policy and work budgets",
+        "native member verification preserves candidate provenance after native filtering",
         "query max score preserves negative relevance scores",
         "query hit exposes relevance score and raw vector distance separately",
         "query merge orders pure dense results by descending relevance score",
@@ -830,7 +847,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
-            "aggregation domain",
             "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
@@ -968,7 +984,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, write_implementation_module, true, true);
+    var write_implementation_imports = test_imports;
+    write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
+    write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
@@ -1153,6 +1171,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read owner",
             "retained read RPC",
             "retained read client",
+            "privacy source vtables retain static lifetime",
             "api http client preserves public batch retry safety classifications",
             "relational row query response budget",
             "relational statement retries unavailable capture and releases fences before pages or deadline",
@@ -1164,6 +1183,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table reads translate request deadlines into the routing clock",
             "api query contract graph evaluation preserves base hit paging and shard windows",
             "distributed reranking widens retrieval and stays coordinator owned",
+            "retained single-carrier window moves short and empty cursor pages without merging",
+            "hosted retained local and remote carriers finalize short cursor windows once",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",
             "coordinator prunes the final score domain before paging",
@@ -1176,7 +1197,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
-            "aggregation domain",
             "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
@@ -1263,6 +1283,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_public_table_http_docid_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
+            "public artifact enrichment",
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
             "public table batch handler exposes pending HA durability without claiming rollback",
@@ -1458,7 +1479,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-derived-coverage-tests",
         .root_module = api_derived_coverage_test_mod,
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-derived-coverage-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024),
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
+            "artifact replacement repairs obsolete inline extraction",
+            "artifact replacement preserves inherited inline embedding producers",
             "live repair admission supersedes cached vector serviceability",
             // Own the complete status contract suite; table-write integration
             // borrows these contracts without collecting them a second time.
@@ -1645,7 +1668,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted index lifecycle durable wake repairs worker admission failure",
             "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "startup configured indexes separate physical indexes from reserved metadata",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -1680,10 +1703,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
+        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
+    // Pure domain tests have one small compiler owner, shared by manual API
+    // gates and the normal unit aggregate instead of repeated API roots.
+    inline for (.{ "antfly-api-aggregation-test", "antfly-api-table-read-test" }) |name|
+        b.top_level_steps.get(name).?.step.dependOn(&b.top_level_steps.get("aggregation-plan-test").?.step);
     const rewrite_admission_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },
@@ -1698,6 +1725,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-row-semantics-codec-test", "Verify fail-closed row semantics envelopes and allocation failure cleanup")
         .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
+    const cypher_transaction_contract_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "transaction graph effects", "Cypher write releases retained owner reads", "api index status" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-transaction-contract-test", "Verify graph transaction staging, receipts and principal identity").dependOn(&addFilteredTestRunArtifact(b, cypher_transaction_contract_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
@@ -1990,6 +2023,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-restore-provisioning-test", "Run private hidden owner reservation and writer-cache admission").dependOn(&restore_provisioning_tests.run(b).step);
+    const enrichment_provisioning_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-enrichment-provisioning-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{ "provisioning detects", "provisioning does not require" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("antfly-api-enrichment-provisioning-test", "Run asset-producer provisioning detection for enrichment configs").dependOn(&enrichment_provisioning_tests.run(b).step);
     const hosted_batch_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-hosted-batch-tests",
         .root_module = api_table_writes_docid_test_mod,
@@ -2153,11 +2193,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     pk_failure_identity_mod.addImport("runtime_failure_abi", pk_failure_abi_mod);
     const pk_failure_identity_tests = b.addTest(.{
         .root_module = pk_failure_identity_mod,
-        .filters = &.{"registered storage-kernel errors are unique and round trip without losing identity"},
+        .filters = &.{ "registered storage-kernel errors are unique and round trip without losing identity", "privacy committed Raft contention survives the active storage owner ABI" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const pk_failure_identity_run = addFilteredTestRunArtifact(b, pk_failure_identity_tests);
     b.step("antfly-api-pk-restore-error-identity-test", "Run exact native invalid-row restore error identity regression")
-        .dependOn(&addFilteredTestRunArtifact(b, pk_failure_identity_tests).step);
+        .dependOn(&pk_failure_identity_run.step);
+    privacy_step.dependOn(&pk_failure_identity_run.step);
     const sql_primary_key_rewrite_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_sql_primary_key_rewrite_test_root.zig"),
         .target = target,

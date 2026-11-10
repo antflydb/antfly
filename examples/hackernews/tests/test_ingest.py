@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 import sys
 
@@ -386,3 +387,44 @@ def test_lite_retries_busy_admission_and_preserves_unknown_outcomes(
     assert len(attempts) == 3
     assert state.get("maxitem") == "1"
     state.db.close()
+
+
+def test_supervised_worker_backups_have_separate_cadence_and_heartbeat(
+    tmp_path, monkeypatch
+):
+    clock, polls, backups = [0], [], []
+    monkeypatch.setattr(ingest.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ingest.State, "poll", lambda *args: polls.append(True) or 7)
+    monkeypatch.setattr(ingest, "publish", lambda *args: {"accepted": True})
+    monkeypatch.setattr(ingest, "backup_state", lambda *args: backups.append(clock[0]))
+
+    def sleep(_):
+        if len(polls) == 3:
+            raise InterruptedError("stop worker")
+        clock[0] += 60
+
+    monkeypatch.setattr(ingest.time, "sleep", sleep)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ingest.py",
+            "--state",
+            str(tmp_path),
+            "--warehouse",
+            tmp_path.as_uri(),
+            "--backup-root",
+            (tmp_path / "backups").as_uri(),
+            "--backup-interval",
+            "120",
+            "--publish-interval",
+            "60",
+            "run",
+        ],
+    )
+    with pytest.raises(InterruptedError, match="stop worker"):
+        ingest.main()
+    assert backups == [0, 120]
+    heartbeat = json.loads((tmp_path / "heartbeat.json").read_text())
+    assert heartbeat["fetched"] == 7 and heartbeat["published"]
+    assert heartbeat["completed_at"] > 0

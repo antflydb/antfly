@@ -91,6 +91,10 @@ const HttpResponseState = struct {
 };
 
 fn fail(err: anyerror) abi.Status {
+    // Error integers are archive-local. Preserve the originating name before
+    // an undeclared error becomes a generic boundary failure; never log inputs.
+    if (!@import("antfly_runtime_abi").error_abi.errorHasStableDetail(err))
+        std.log.warn("API owner returned undeclared error err={s}", .{@errorName(err)});
     return abi.statusFromError(err);
 }
 
@@ -186,6 +190,10 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    state.server.initializeDistributedSql() catch |err| {
+        state.server.deinit();
+        return fail(err);
+    };
     state.server.startPgwire() catch |err| {
         std.log.err("API pgwire listener startup failed: error.{s}", .{@errorName(err)});
         state.server.deinit();
@@ -798,7 +806,7 @@ test "linked API route manifest preserves internal scan response streaming" {
         }
     }
     try std.testing.expect(found_scan and found_query);
-    try std.testing.expectEqual(@as(usize, 24), gateway_routes);
+    try std.testing.expectEqual(@as(usize, 23), gateway_routes);
     try std.testing.expectEqual(@as(usize, 3), public_queries);
 }
 

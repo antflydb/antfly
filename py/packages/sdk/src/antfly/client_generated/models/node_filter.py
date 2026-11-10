@@ -17,12 +17,13 @@ T = TypeVar("T", bound="NodeFilter")
 
 @_attrs_define
 class NodeFilter:
-    """Filter nodes during graph traversal using existing query primitives
+    """Admission predicate applied to every start, target and intermediate node before returning or expanding it, for all
+    graph operations. Denied nodes cannot occur in result paths or expose descendants through traversal.
 
-    Attributes:
-        filter_query (LegacyGraphDocumentQuery | Unset): Deprecated free-form graph filter accepted by the v0.2
-            compatibility contract.
-        filter_prefix (str | Unset): Filter by key prefix
+        Attributes:
+            filter_query (LegacyGraphDocumentQuery | Unset): Deprecated free-form graph filter accepted by the v0.2
+                compatibility contract.
+            filter_prefix (str | Unset): Filter by key prefix
     """
 
     filter_query: LegacyGraphDocumentQuery | Unset = UNSET

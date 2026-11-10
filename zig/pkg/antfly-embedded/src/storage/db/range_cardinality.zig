@@ -42,6 +42,17 @@ pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
     return try decode(raw);
 }
 
+/// Missing counters are valid for a fresh empty store. Prove emptiness with
+/// one key-only seek in the caller's pinned revision, never a corpus count or
+/// a second live read. Any user key leaves a missing counter unknown.
+pub fn loadOrProveEmptyFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+    if (try loadFromTxn(txn)) |count| return count;
+    var cursor = try txn.openPhysicalKeyCursorAdapter();
+    defer cursor.close();
+    const row = (try cursor.seekAtOrAfter(&.{internal_keys.user_namespace})) orelse return 0;
+    return if (std.mem.startsWith(u8, row.key, &.{internal_keys.user_namespace})) null else 0;
+}
+
 /// Read the range-local result after appendIdentityTransitionAlloc, without
 /// confusing retained namespace-wide identities with owned primary rows. This
 /// is the authoritative empty/non-empty input for transactional table metadata.
@@ -60,24 +71,10 @@ pub fn afterIdentityTransition(alloc: Allocator, store: *docstore_mod.DocStore, 
 /// a missing counter unknown, including legacy documents without identity
 /// metadata and orphaned artifacts; never count a populated corpus here.
 pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
-    if (try load(alloc, store)) |count| return count;
-    const Probe = struct {
-        found: bool = false,
-        fn visit(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-            const probe: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            probe.found = true;
-            return .stop;
-        }
-    };
-    var probe = Probe{};
-    try store.scanWithContext(
-        &.{internal_keys.user_namespace},
-        &.{internal_keys.user_namespace + 1},
-        .{},
-        &probe,
-        Probe.visit,
-    );
-    return if (probe.found) null else 0;
+    _ = alloc;
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return loadOrProveEmptyFromTxn(&txn);
 }
 
 pub fn countPrimaryDocuments(

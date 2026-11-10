@@ -274,11 +274,7 @@ const vp8_default_luma4_probs = Vp8Luma4Probs{
     },
 };
 
-pub const DecodedImage = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-};
+pub const DecodedImage = @import("image_values").DecodedRgba;
 
 pub const Bitstream = enum {
     vp8,
@@ -514,24 +510,7 @@ const Vp8MacroblockGrid = struct {
     height: u32,
 };
 
-pub const Vp8FramePlanes = struct {
-    y: []u8,
-    u: []u8,
-    v: []u8,
-    width: u32,
-    height: u32,
-    y_stride: usize,
-    uv_stride: usize,
-    y_padded_height: usize,
-    uv_padded_height: usize,
-
-    pub fn deinit(self: *Vp8FramePlanes, alloc: Allocator) void {
-        alloc.free(self.y);
-        alloc.free(self.u);
-        alloc.free(self.v);
-        self.* = undefined;
-    }
-};
+pub const Vp8FramePlanes = @import("image_values").Vp8FramePlanes;
 
 const Vp8CoeffProbs = [vp8_coeff_type_count][vp8_coeff_band_count][vp8_coeff_context_count][vp8_coeff_proba_count]u8;
 
@@ -835,7 +814,7 @@ fn vp8PlanesToRgbaAlloc(alloc: Allocator, planes: Vp8FramePlanes) !DecodedImage 
 
     var y_pos: usize = 0;
     while (y_pos < height) : (y_pos += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         var x: usize = 0;
         while (x < width) : (x += 1) {
             const y_index = y_pos * planes.y_stride + x;
@@ -1114,7 +1093,7 @@ fn vp8ApplyLoopFilter(planes: *Vp8FramePlanes, syntax: Vp8FirstPartitionSyntax, 
 
     var mb_y: usize = 0;
     while (mb_y < grid_height) : (mb_y += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         var mb_x: usize = 0;
         while (mb_x < grid_width) : (mb_x += 1) {
             const info = infos[mb_y * grid_width + mb_x];
@@ -1169,7 +1148,7 @@ fn assembleVp8KeyframePlanes(
 
     var mb_y: usize = 0;
     while (mb_y < grid_height) : (mb_y += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const row_partition = try vp8TokenPartitionForRow(@intCast(mb_y), control.syntax.token_partition_count);
         var left_luma4_modes = @as([4]Vp8Luma4Mode, @splat(.dc));
         var left_token_context = Vp8MacroblockTokenContext{};
@@ -2446,8 +2425,12 @@ const PrefixCode = struct {
 
         var lengths = @as([max_vp8l_symbol_count]u8, @splat(0));
         var symbol_index: usize = 0;
-        var previous_nonzero: ?u8 = null;
-        while (symbol_index < max_symbol) {
+        // VP8L max_symbol limits encoded code-length symbols, not expanded
+        // alphabet entries: a single repeat code can fill many entries.
+        // The initial previous length is 8 (lossless bitstream spec 6.2.1).
+        var previous_nonzero: u8 = 8;
+        var codes_read: usize = 0;
+        while (symbol_index < alphabet_size and codes_read < max_symbol) : (codes_read += 1) {
             const code = try code_length_code.readSymbol(reader);
             switch (code) {
                 0...15 => {
@@ -2457,8 +2440,8 @@ const PrefixCode = struct {
                 },
                 16 => {
                     const repeat = 3 + try reader.readBits(2);
-                    const repeated_length = previous_nonzero orelse return error.WebpDecodeFailed;
-                    if (symbol_index + repeat > max_symbol) return error.WebpDecodeFailed;
+                    const repeated_length = previous_nonzero;
+                    if (symbol_index + repeat > alphabet_size) return error.WebpDecodeFailed;
                     for (0..repeat) |_| {
                         lengths[symbol_index] = repeated_length;
                         symbol_index += 1;
@@ -2466,12 +2449,12 @@ const PrefixCode = struct {
                 },
                 17 => {
                     const repeat = 3 + try reader.readBits(3);
-                    if (symbol_index + repeat > max_symbol) return error.WebpDecodeFailed;
+                    if (symbol_index + repeat > alphabet_size) return error.WebpDecodeFailed;
                     symbol_index += repeat;
                 },
                 18 => {
                     const repeat = 11 + try reader.readBits(7);
-                    if (symbol_index + repeat > max_symbol) return error.WebpDecodeFailed;
+                    if (symbol_index + repeat > alphabet_size) return error.WebpDecodeFailed;
                     symbol_index += repeat;
                 },
                 else => return error.WebpDecodeFailed,
@@ -3277,7 +3260,7 @@ fn decodeVp8lEntropyImage(alloc: Allocator, reader: *BitReader, width: u32, heig
     var next_control_pixel: usize = 0;
     while (pixel_index < pixel_count) {
         if (pixel_index >= next_control_pixel) {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             next_control_pixel = pixel_index +| 4096;
         }
         const group = try prefix_groups.groupForPixel(pixel_index, width);
@@ -3622,10 +3605,10 @@ fn testWriteNormalPrefixSingleSymbolWithZeroRepeat(writer: *TestBitWriter, alloc
     try writer.writeBits(alloc, 0, 3);
     try writer.writeBits(alloc, 1, 3);
 
-    const max_symbol: u32 = @as(u32, symbol) + 1;
+    // One zero-run symbol plus one literal code length.
     try writer.writeBits(alloc, 1, 1);
-    try writer.writeBits(alloc, 3, 3);
-    try writer.writeBits(alloc, max_symbol - 2, 8);
+    try writer.writeBits(alloc, 0, 3);
+    try writer.writeBits(alloc, 0, 2);
 
     try writer.writeBits(alloc, 1, 1);
     try writer.writeBits(alloc, @as(u32, symbol) - 11, 7);
@@ -5344,6 +5327,23 @@ test "decode vp8l two-symbol simple prefix literal pixels" {
     try std.testing.expectEqualSlices(u8, &second, decoded.rgba[4..8]);
 }
 
+test "decode pillow lossless vp8l with limited repeated code lengths" {
+    const alloc = std.testing.allocator;
+    const fixture = try @import("test_support.zig").readFixtureAlloc(alloc, std.testing.io, "webp/lossless/pillow-normal-prefix-129x97.webp");
+    defer alloc.free(fixture);
+    const decoded = try decodeRgba(alloc, fixture);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 129), decoded.width);
+    try std.testing.expectEqual(@as(u32, 97), decoded.height);
+    for (0..97) |y| {
+        for (0..129) |x| {
+            const expected = [4]u8{ @intCast((x * 3 + y) % 256), @intCast((x + y * 5) % 256), @intCast((x * 7 + y * 11) % 256), 255 };
+            const offset = (y * 129 + x) * 4;
+            try std.testing.expectEqualSlices(u8, &expected, decoded.rgba[offset..][0..4]);
+        }
+    }
+}
+
 test "decode vp8l normal prefix literal pixel" {
     const alloc = std.testing.allocator;
     const expected = [4]u8{ 0x23, 0x45, 0x67, 0x89 };
@@ -5372,6 +5372,67 @@ test "decode vp8l normal prefix repeat-code lengths" {
     try std.testing.expectEqualSlices(u8, &expected, decoded.rgba);
 }
 
+test "vp8l limited code-length budget counts encoded repeat symbols" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 8, 16 }) |alphabet_size| {
+        var bits = TestBitWriter{};
+        defer bits.deinit(alloc);
+        try bits.writeBits(alloc, 0, 1); // Normal code lengths.
+        try bits.writeBits(alloc, 0, 4); // Four code-length alphabet entries.
+        for ([_]u32{ 1, 0, 0, 1 }) |length| try bits.writeBits(alloc, length, 3); // Symbols 17 and 1.
+        try bits.writeBits(alloc, 1, 1); // Explicit encoded-symbol budget.
+        try bits.writeBits(alloc, 0, 3); // Two budget bits.
+        try bits.writeBits(alloc, 1, 2); // Three encoded symbols.
+        try bits.writeBits(alloc, 0, 1); // Length 1.
+        try bits.writeBits(alloc, 0, 1); // Length 1.
+        try bits.writeBits(alloc, 1, 1); // Repeat zero lengths.
+        try bits.writeBits(alloc, 3, 3); // Six zeros: eight expanded entries.
+        try bits.writeBits(alloc, 1, 1); // Following payload symbol; must not be consumed by the header.
+        var reader = BitReader.init(bits.bytes.items);
+        const code = try PrefixCode.read(&reader, alphabet_size);
+        try std.testing.expectEqual(@as(usize, 2), code.entry_count);
+        try std.testing.expectEqual(@as(u16, 1), try code.readSymbol(&reader));
+    }
+}
+
+test "vp8l repeat code before a literal uses default length eight" {
+    const alloc = std.testing.allocator;
+    var bits = TestBitWriter{};
+    defer bits.deinit(alloc);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 5, 4); // Nine entries include repeat symbol 16.
+    for (0..8) |_| try bits.writeBits(alloc, 0, 3);
+    try bits.writeBits(alloc, 1, 3); // Singleton code-length tree for symbol 16.
+    try bits.writeBits(alloc, 1, 1);
+    try bits.writeBits(alloc, 2, 3); // Six budget bits.
+    try bits.writeBits(alloc, 41, 6); // 43 encoded repeats.
+    for (0..42) |_| try bits.writeBits(alloc, 3, 2); // 252 entries of length 8.
+    try bits.writeBits(alloc, 1, 2); // Four more entries.
+    try bits.writeBits(alloc, 0x5a, 8);
+    var reader = BitReader.init(bits.bytes.items);
+    const code = try PrefixCode.read(&reader, 256);
+    try std.testing.expectEqual(@as(usize, 256), code.entry_count);
+    try std.testing.expectEqual(@as(u16, 0x5a), try code.readSymbol(&reader));
+}
+
+test "vp8l encoded-symbol budget still rejects alphabet overflow" {
+    const alloc = std.testing.allocator;
+    var bits = TestBitWriter{};
+    defer bits.deinit(alloc);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 0, 4);
+    for ([_]u32{ 1, 0, 0, 1 }) |length| try bits.writeBits(alloc, length, 3);
+    try bits.writeBits(alloc, 1, 1);
+    try bits.writeBits(alloc, 0, 3);
+    try bits.writeBits(alloc, 1, 2);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 1, 1);
+    try bits.writeBits(alloc, 4, 3); // Seven zeros plus two literals exceeds alphabet 8.
+    var reader = BitReader.init(bits.bytes.items);
+    try std.testing.expectError(error.WebpDecodeFailed, PrefixCode.read(&reader, 8));
+}
+
 test "decode vp8l rejects duplicate simple prefix symbols" {
     const alloc = std.testing.allocator;
     var bits = TestBitWriter{};
@@ -5383,7 +5444,7 @@ test "decode vp8l rejects duplicate simple prefix symbols" {
     try std.testing.expectError(error.WebpDecodeFailed, PrefixCode.read(&reader, 256));
 }
 
-test "decode vp8l rejects repeat-code length before previous nonzero length" {
+test "decode vp8l initial repeat-code lengths follow the default length" {
     const alloc = std.testing.allocator;
     var bits = TestBitWriter{};
     defer bits.deinit(alloc);
@@ -5397,7 +5458,8 @@ test "decode vp8l rejects repeat-code length before previous nonzero length" {
     try bits.writeBits(alloc, 1, 2);
 
     var reader = BitReader.init(bits.bytes.items);
-    try std.testing.expectError(error.WebpDecodeFailed, PrefixCode.read(&reader, 256));
+    const code = try PrefixCode.read(&reader, 256);
+    try std.testing.expectEqual(@as(usize, 256), code.entry_count);
 }
 
 test "decode vp8l lz77 backward reference copies previous pixel" {
@@ -5552,6 +5614,13 @@ test "probe rejects reserved vp8x feature bits" {
 /// after reconstruction, filtering and all retained allocations succeed. The
 /// allocator must remain valid until deinit; returned planes belong to caller.
 pub const Vp8Decoder = struct {
+    /// Native clients allocate opaque metadata in this long-lived allocator;
+    /// the source implementation keeps the same metadata inline.
+    pub fn init(metadata_allocator: Allocator) !Vp8Decoder {
+        _ = metadata_allocator;
+        return .{};
+    }
+
     /// Decoder-owned immutable pictures; slots naming the same picture alias.
     /// Returned decode planes remain independently owned and may be mutated.
     references: [3]?Vp8FramePlanes = .{ null, null, null },
@@ -5583,7 +5652,7 @@ pub const Vp8Decoder = struct {
         return total;
     }
     pub fn decode(self: *Vp8Decoder, a: Allocator, payload: []const u8, limits: DecodeLimits) !Vp8FramePlanes {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         if (payload.len < 3) return error.WebpDecodeFailed;
         const tag = @as(u32, payload[0]) | (@as(u32, payload[1]) << 8) | (@as(u32, payload[2]) << 16);
         const key = tag & 1 == 0;
@@ -5676,7 +5745,7 @@ pub const Vp8Decoder = struct {
             planes = try vp8VideoReconstruct(a, frame, syntax, entropy, &reader, token_slices[0..partitions], map, self.references, reference_probs, sign_bias, mv_probs, y_probs, uv_probs, &mode_counts, &split_counts);
         }
         errdefer planes.deinit(a);
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         // Reference-copy commands precede refresh commands. ALTREF copy is
         // applied before GOLDEN copy, which may name the newly copied ALTREF.
         var sources: [3]?Vp8FramePlanes = self.references;
@@ -5704,7 +5773,7 @@ pub const Vp8Decoder = struct {
         // No operation after this checkpoint may fail: references, entropy and
         // segmentation commit together, preserving retry after allocation or
         // cancellation failure even when several old slots share a picture.
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         vp8ReleaseReferences(a, self.references, retained);
         a.free(self.segments);
         if (refreshed) |picture| self.reference_copy_bytes +|= picture.y.len + picture.u.len + picture.v.len;
@@ -5907,7 +5976,7 @@ fn vp8VideoReconstruct(a: Allocator, frame: Vp8FrameHeader, syntax: Vp8FirstPart
     for (partitions, 0..) |p, i| tokens[i] = Vp8BoolReader.init(p);
     const matrices = vp8BuildSegmentQuantMatrices(syntax);
     for (0..grid.height) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         var left = Vp8MacroblockTokenContext{};
         for (0..width) |x| {
             const index = y * width + x;

@@ -60,7 +60,7 @@ dump_stacks() {
     local cmdline
     cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
     case "$cmdline" in
-      *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*"zig test "*|*"zig test-obj "*|*" make "*)
+      *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"-tests-local "*|*"-tests-local"|*"zig build"*|*"zig test "*|*"zig test-obj "*|*" make "*)
         # Ephemeral runner caches disappear with the pod. Keep the
         # test bytes and compiler response files even without ptrace.
         python3 zig/tools/retain_test_process.py "$pid" "$ANTFLY_TEST_LOG_DIR/hung" || true

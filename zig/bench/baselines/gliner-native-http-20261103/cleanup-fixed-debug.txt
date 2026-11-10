@@ -1,0 +1,9 @@
+quant kernel generated sources check: 69 files + Metal/CUDA runtime regions
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+inference-test
++- run test w
+1/40 architectures.deberta.test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures...OK
+2/40 architectures.gliner.boundary_engine.test.gliner boundary engine eager encoder host allocation cleanup on padded batch...OK
+2 selected; 2 passed; 0 skipped.
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/09d9fe0eed062d84d7e70206894bbfed/test --test-filter "DeBERTa native bucketed relative projections" --test-filter "gliner boundary engine eager encoder host allocation cleanup"
+

@@ -1,7 +1,7 @@
 "use client";
 
-import * as SheetPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { Dialog as SheetPrimitive } from "radix-ui";
 import type * as React from "react";
 
 import { cn } from "@/lib/utils";
@@ -128,7 +128,7 @@ function SheetTitle({ className, ...props }: React.ComponentProps<typeof SheetPr
   return (
     <SheetPrimitive.Title
       data-slot="sheet-title"
-      className={cn("text-foreground text-base font-medium leading-tight", className)}
+      className={cn("font-sans text-foreground text-base font-medium leading-tight", className)}
       {...props}
     />
   );

@@ -1,0 +1,6 @@
+........
+----------------------------------------------------------------------
+Ran 8 tests in 1.289s
+
+OK
+/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/tmpcl__02j0/False.json

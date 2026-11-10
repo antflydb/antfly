@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Opaque retained-cut envelopes bind the exact provider version without
-//! changing legacy content identities. Legacy filesystem tokens still decode.
+//! changing content identities. Filesystem tokens omit a provider version.
 const std = @import("std");
 const stores = @import("../serverless/artifacts/store.zig");
 const Token = @import("antfly_cancellation").CancellationToken;
@@ -72,7 +72,33 @@ pub fn read(store: *stores.ArtifactStore, envelope: Envelope, token: Token) ![]u
     }
     return store.getVerifiedAllocWithCancellation(envelope.id, envelope.bytes, try stores.sha256ChecksumFromArtifactId(envelope.id), token);
 }
-test "external lake global frontier retained envelopes preserve exact cloud selectors and legacy identities" {
+/// Durable immutable bytes are scoped to current credentials and the exact
+/// provider generation. Native authority and retention stay with the caller.
+pub fn readCached(store: *stores.ArtifactStore, envelope: Envelope, token: Token, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead) ![]u8 {
+    const cache = cached orelse return read(store, envelope, token);
+    try token.check();
+    try cache.context.ensureActive();
+    const identity = @import("lake_wal_image.zig").digest(.{ .format = "retained-versioned-bytes-v1", .ref = envelope });
+    const key = std.fmt.bytesToHex(identity, .lower);
+    const Loader = struct {
+        store: stores.ArtifactStore,
+        ref: Envelope,
+        token: Token,
+        fn load(raw: *anyopaque, a: A) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var backend = self.store;
+            backend.allocator = a;
+            return read(&backend, self.ref, self.token);
+        }
+    };
+    var loader: Loader = .{ .store = store.*, .ref = envelope, .token = token };
+    const value = try cache.cache.readImmutableAlloc(store.allocator, cache.scope, &key, envelope.bytes, try stores.sha256DigestFromChecksum(try stores.sha256ChecksumFromArtifactId(envelope.id)), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    errdefer store.allocator.free(value);
+    try token.check();
+    try cache.context.ensureActive();
+    return value;
+}
+test "external lake global frontier retained envelopes preserve exact cloud selectors and filesystem identities" {
     const a = std.testing.allocator;
     const scope: stores.UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
     const id = try scope.artifactId(&(@as([64]u8, @splat('a'))));
@@ -84,10 +110,43 @@ test "external lake global frontier retained envelopes preserve exact cloud sele
     try std.testing.expectEqualStrings(&id, envelope.id);
     try std.testing.expectEqualStrings("version/+one", envelope.generation.?);
     try std.testing.expectEqualStrings(&id, try artifactId("lake2:", token));
-    var legacy = metadata;
-    legacy.provider_version = null;
-    const old = try encode(a, "lake2:", legacy);
-    defer a.free(old);
-    try std.testing.expect((try decode(a, "lake2:", old, 42)).generation == null);
+    var filesystem = metadata;
+    filesystem.provider_version = null;
+    const unversioned = try encode(a, "lake2:", filesystem);
+    defer a.free(unversioned);
+    try std.testing.expect((try decode(a, "lake2:", unversioned, 42)).generation == null);
     try std.testing.expectError(error.InvalidQueryRequest, decode(a, "lake2:", token, 41));
+}
+
+test "external lake global frontier retained bytes reuse durable cache after restart and fence credentials" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("retained-byte-cache");
+    defer directory.cleanup();
+    const cache_path = try std.fs.path.join(a, &.{ directory.path(), "cache" });
+    defer a.free(cache_path);
+    var backend = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer backend.deinit();
+    var store = backend.artifactStore();
+    const scope = try stores.UploadScope.forPublication(@splat(1), 1, std.testing.io);
+    var ref = try store.putScoped(scope, "retained image", .none);
+    defer ref.deinit(a);
+    const envelope: Envelope = .{ .id = ref.artifact_id, .bytes = @intCast(ref.byte_len) };
+    const C = local.serverless_query_lake_serving_cache.Cache;
+    for (0..2) |pass| {
+        var cache = C.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(std.testing.io, cache_path, .{ .max_entries = 32, .max_total_bytes = 1024 * 1024, .protected_bytes = 0 }, .{});
+        const bytes = try readCached(&store, envelope, .none, .{ .cache = &cache, .scope = @splat(2), .context = .{ .io = std.testing.io } });
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("retained image", bytes);
+        if (pass == 1) {
+            try std.testing.expectEqual(@as(u64, 0), cache.snapshot().provider_reads);
+            try std.testing.expect(cache.snapshot().disk_hits != 0);
+            const alternate = try readCached(&store, envelope, .none, .{ .cache = &cache, .scope = @splat(3), .context = .{ .io = std.testing.io } });
+            defer a.free(alternate);
+            try std.testing.expectEqual(@as(u64, 1), cache.snapshot().provider_reads);
+        }
+        cache.persistent.?.flush();
+    }
 }

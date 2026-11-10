@@ -2366,7 +2366,7 @@ fn appendDecisionContext(
         }
         if (decision.approved) |approved| {
             try out.appendSlice(alloc, if (approved) "approved" else "rejected");
-        } else if (decision.answer) |answer| {
+        } else if (decision.answer.valueOrNull()) |answer| {
             try appendJsonValueText(alloc, &out, answer);
         } else {
             try out.appendSlice(alloc, "answered");
@@ -2707,6 +2707,20 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     };
 }
 
+test "query builder incomplete generation remains terminal across every specialist" {
+    const Fake = struct {
+        fn generate(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.InferenceOutputIncomplete;
+        }
+    };
+    const a = std.testing.allocator;
+    const request = metadata_openapi.QueryBuilderRequest{ .intent = "find evidence" };
+    const runner = GenerationRunner{ .ptr = undefined, .vtable = &.{ .execute_chain = Fake.generate } };
+    try std.testing.expectError(error.InferenceOutputIncomplete, buildGeneratedSemanticQueryBuilderAttemptFromMessages(a, request, "semantic", &.{}, &.{}, null, runner, &.{}, &.{}));
+    try std.testing.expectError(error.InferenceOutputIncomplete, buildGeneratedFullTextQueryBuilderAttemptFromMessages(a, request, &.{}, null, runner, &.{}, &.{}));
+    try std.testing.expectError(error.InferenceOutputIncomplete, buildGeneratedGraphQueryBuilderAttemptFromMessages(a, request, &.{}, &.{}, .{}, null, runner, &.{}, &.{}));
+}
+
 fn queryBuilderGeneratedSemanticIndexNames(
     alloc: std.mem.Allocator,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
@@ -2739,7 +2753,8 @@ fn buildGeneratedSemanticQueryBuilderAttemptFromMessages(
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
 ) !GeneratedSemanticQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err|
+        return if (err == error.InferenceOutputIncomplete) err else error.UnsupportedQueryBuilderGeneration;
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -2881,7 +2896,8 @@ fn buildGeneratedFullTextQueryBuilderAttemptFromMessages(
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
 ) !GeneratedFullTextQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err|
+        return if (err == error.InferenceOutputIncomplete) err else error.UnsupportedQueryBuilderGeneration;
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -2984,7 +3000,8 @@ fn buildGeneratedGraphQueryBuilderAttemptFromMessages(
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
 ) !GeneratedGraphQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err|
+        return if (err == error.InferenceOutputIncomplete) err else error.UnsupportedQueryBuilderGeneration;
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -6074,7 +6091,7 @@ fn queryBuilderDecisionStringSlice(
     defer out.deinit(alloc);
     for (values) |decision| {
         if (!std.mem.eql(u8, decision.question_id, question_id)) continue;
-        const answer = decision.answer orelse continue;
+        const answer = decision.answer.valueOrNull() orelse continue;
         switch (answer) {
             .string => |value| {
                 const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -6101,7 +6118,7 @@ fn queryBuilderDecisionString(
     const values = decisions orelse return null;
     for (values) |decision| {
         if (!std.mem.eql(u8, decision.question_id, question_id)) continue;
-        const answer = decision.answer orelse continue;
+        const answer = decision.answer.valueOrNull() orelse continue;
         const value = queryBuilderStringValue(answer) orelse continue;
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len > 0) return trimmed;
@@ -9667,7 +9684,7 @@ test "query builder auto uses strategy decision answer" {
         .max_user_clarifications = 1,
         .decisions = &.{.{
             .question_id = "select_query_strategy",
-            .answer = .{ .string = "full_text" },
+            .answer = .{ .value = .{ .string = "full_text" } },
         }},
     }, .{
         .embedding_index_metadata = &.{.{ .name = "body_embedding" }},
@@ -9727,7 +9744,7 @@ test "query builder uses semantic index decision answer" {
         .max_user_clarifications = 1,
         .decisions = &.{.{
             .question_id = "select_semantic_index",
-            .answer = .{ .string = "body_embedding" },
+            .answer = .{ .value = .{ .string = "body_embedding" } },
         }},
     }, null);
 
@@ -9769,7 +9786,7 @@ test "query builder uses text field decision answer" {
         .max_user_clarifications = 1,
         .decisions = &.{.{
             .question_id = "select_text_field",
-            .answer = .{ .string = "title" },
+            .answer = .{ .value = .{ .string = "title" } },
         }},
     }, null);
 
@@ -10302,7 +10319,7 @@ test "query builder uses tree index decision answer" {
         .max_user_clarifications = 1,
         .decisions = &.{.{
             .question_id = "select_tree_index",
-            .answer = .{ .string = "topic_graph" },
+            .answer = .{ .value = .{ .string = "topic_graph" } },
         }},
     }, .{
         .graph_index_metadata = &.{ .{ .name = "doc_hierarchy" }, .{ .name = "topic_graph" } },
@@ -10348,7 +10365,7 @@ test "query builder uses graph index decision answer" {
         .max_user_clarifications = 1,
         .decisions = &.{.{
             .question_id = "select_graph_index",
-            .answer = .{ .string = "topic_graph" },
+            .answer = .{ .value = .{ .string = "topic_graph" } },
         }},
     }, .{
         .graph_index_metadata = &.{ .{ .name = "doc_hierarchy" }, .{ .name = "topic_graph" } },
@@ -10455,7 +10472,7 @@ test "query builder uses table decision answer" {
         .constraints = constraints_tree.value,
         .decisions = &.{.{
             .question_id = "select_query_table",
-            .answer = .{ .string = "docs" },
+            .answer = .{ .value = .{ .string = "docs" } },
         }},
     }, null);
 

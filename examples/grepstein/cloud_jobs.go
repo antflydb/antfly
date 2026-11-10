@@ -17,9 +17,6 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"crypto/md5"
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,9 +28,6 @@ import (
 	"reflect"
 	"strings"
 	"time"
-
-	"github.com/antflydb/antfly/go/pkg/sources"
-	"golang.org/x/oauth2/google"
 )
 
 type cloudSourceJob struct {
@@ -46,56 +40,6 @@ type cloudSourceJob struct {
 	SourceConfig     map[string]any `json:"source_config"`
 	RunPolicy        string         `json:"run_policy"`
 	ScheduleInterval int            `json:"schedule_interval_seconds"`
-}
-
-func publishGrepProjection(ctx context.Context, snapshot, revision, bucket, connection, table, planFile string) error {
-	client, err := google.DefaultClient(ctx, "https://www.googleapis.com/auth/devstorage.read_write")
-	if err != nil {
-		return err
-	}
-	client.Timeout = 15 * time.Minute
-	return publishGrepProjectionWithClient(client, snapshot, revision, bucket, connection, table, planFile)
-}
-func publishGrepProjectionWithClient(client *http.Client, snapshot, revision, bucket, connection, table, planFile string) error {
-	partitions, err := os.ReadDir(snapshot)
-	if err != nil {
-		return err
-	}
-	jobs := []cloudSourceJob{}
-	for _, partition := range partitions {
-		if !partition.IsDir() {
-			return fmt.Errorf("unexpected snapshot entry")
-		}
-		prefix := "grep/v1/" + revision + "/" + partition.Name() + "/"
-		pages, err := os.ReadDir(filepath.Join(snapshot, partition.Name()))
-		if err != nil {
-			return err
-		}
-		if len(pages) > 10000 {
-			return fmt.Errorf("canonical page partition exceeds source job budget")
-		}
-		for _, file := range pages {
-			page, err := readGrepPage(filepath.Join(snapshot, partition.Name()), file.Name())
-			if err != nil {
-				return err
-			}
-			digest := md5.Sum([]byte(page.Content))
-			if _, err = putGCS(client, bucket, prefix+page.Item.Path, "text/plain; charset=utf-8", strings.NewReader(page.Content), int64(len(page.Content)), base64.StdEncoding.EncodeToString(digest[:])); err != nil {
-				return err
-			}
-		}
-		// An explicit max_objects selects a non-authoritative subset, even when
-		// the listing fits. Use the connector's existing hard ceiling so Colony
-		// can promote the complete snapshot and refresh its permission lease.
-		jobs = append(jobs, cloudSourceJob{Name: "grepstein-" + partition.Name(), ProviderAuthID: connection, TargetTable: table, Mode: "source", RunPolicy: "scheduled", ScheduleInterval: 3600, SourceConfig: map[string]any{"bucket": bucket, "prefix": prefix, "suffixes": []string{".txt"}, "permissions": sources.Permissions{Public: true}, "permission_ttl_seconds": 86400}})
-	}
-	// No jobs are created until the entire immutable projection is durable.
-	// Colony owns their publication/revocation, source IDs, and catalog freshness.
-	if err = atomicCorpusJSON(planFile, jobs); err != nil {
-		return err
-	}
-	fmt.Printf("Cloud GCS source job plan: %s\nApply with grepstein cloud-jobs --plan %s --jobs-url <instance import-jobs API URL>\n", planFile, planFile)
-	return nil
 }
 
 func cloudJobsCmd(args []string) error {
@@ -144,6 +88,7 @@ func cloudJobRequest(client *http.Client, method, endpoint, token string, body a
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "antfly-grepstein/1")
 	req.Header.Set("Authorization", "Bearer "+token)
 	response, err := client.Do(req)
 	if err != nil {

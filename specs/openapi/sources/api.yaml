@@ -1,0 +1,395 @@
+# Standalone antfly-source companion contract. Deliberately not joined into the
+# database OpenAPI: it has its own listener, operator token and credential scope.
+openapi: 3.0.3
+info:
+  title: Antfly Source Service
+  version: 1.0.0
+  description: >-
+    Single-operator runtime source registration and durable sync. The optional
+    antfly-source companion reuses the portable ingestion engine. SDK source
+    clients target this service, not the Antfly database or public inference API.
+security:
+  - operatorToken: []
+paths:
+  /v1/profile:
+    get:
+      operationId: getSourceProfile
+      responses:
+        '200':
+          description: Current profile; credentials are references only.
+          headers:
+            X-Antfly-Source-Preconditions:
+              description: Version of conditional source cutover support. Migration clients require this advertisement before copying.
+              schema: {type: string, enum: ['2']}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Profile'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/secrets/{key}:
+    parameters:
+      - {name: key, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}}
+    put:
+      operationId: putSourceSecret
+      description: >-
+        Store or rotate a secret in the encrypted source-service keystore.
+        Secrets are write-only and never returned or stored in profiles. Rotation
+        is rejected during sync. Bootstrap key changes require migrating secrets
+        and republishing media capabilities.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [value]
+              properties:
+                value: {type: string, minLength: 1, maxLength: 131072, writeOnly: true}
+      responses:
+        '200': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: revokeSourceSecret
+      description: Revoke future acquisition; cancels active sync without discarding its durable checkpoint.
+      responses:
+        '200': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/connections/{name}:
+    parameters:
+      - {name: name, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9_-]{1,128}$'}}
+    put:
+      operationId: putSourceConnection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Connection'}
+      responses:
+        '200':
+          description: Registered connection; provider authority is checked during sync and fetching.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Connection'}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: revokeSourceConnection
+      description: >-
+        Revoke future media reads and cancel active sync. Source definitions and
+        ownership remain durable so reconnecting preserves deletion tracking.
+      responses:
+        '200': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/sources/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+    put:
+      operationId: putSource
+      description: Reconfiguration is serialized with sync. The body id must equal the path id. Migration cutover supplies If-Match to reject a changed or removed source with HTTP 412.
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected source revision for conditional migration cutover.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping the two transfer connection names to their expected configuration digests; checked atomically with source mutation or sync admission. A mismatch returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Local-Migration
+          in: header
+          description: JSON LocalMigrationReceipt committed atomically with cutover. Requires both conditional headers. Post-cutover retries must match the durable receipt exactly; mismatches return HTTP 412.
+          schema: {type: string, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Source'}
+      responses:
+        '200': {$ref: '#/components/responses/PutSourceMutation'}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: removeSource
+      description: >-
+        Immediately revoke media capabilities. The next sync retires catalog
+        bindings. By default rows and ownership remain for recovery. With
+        purge=true, durably queue deletion of only this source's owned rows;
+        the next sync applies it without provider credentials. Interrupted
+        purges resume on retry. The source ID cannot be reused until purge finishes.
+      parameters:
+        - name: purge
+          in: query
+          schema: {type: boolean, default: false}
+      responses:
+        '200': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/sync:
+    post:
+      operationId: startSourceSync
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected revision of source_id at sync admission. A mismatch, missing source_id, or purge_only returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping both transfer connection names to expected configuration digests. Checked atomically at sync admission; a mismatch returns HTTP 412.
+          schema: {type: string}
+      description: >-
+        Start one durable sync of the full profile, or of one source with
+        source_id. Sync is serialized across the service, so another source's
+        active sync also returns 409. HTTP disconnect does not cancel it.
+        Concurrent sync returns 409. Restart discards a failed pinned selection,
+        retaining ownership. A service restart marks unfinished jobs interrupted;
+        POST again to resume through Runner's durable checkpoints. Only the most
+        recent job receipt is retained. purge_only runs deletion independently
+        of ingestion credentials. Full sync drains pending purges before
+        validating acquisition connections; purged_source_count reports completed
+        deletions even if subsequent acquisition fails. Ambiguous submission must be resolved by
+        reading the current job at GET /v1/jobs before resubmitting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                source_id: {type: string, format: uuid, description: Sync only this source.}
+                request_key: {type: string, description: Idempotency key; reuse with a different request returns 409.}
+                restart: {type: boolean, default: false}
+                purge_only: {type: boolean, default: false}
+      responses:
+        '202':
+          description: Accepted; poll Location.
+          headers:
+            Location: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SyncJob'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs:
+    get:
+      operationId: getCurrentSourceSyncJob
+      description: Inspect the latest receipt after an ambiguous sync submission, before retrying.
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: getSourceSyncJob
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: cancelSourceSyncJob
+      description: Request cancellation; poll until the job is terminal.
+      responses:
+        '202': {$ref: '#/components/responses/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/media/{id}/{signature}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{64}$'}}
+      - {name: signature, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{64}$'}}
+    get:
+      operationId: fetchSourceMedia
+      security: []
+      description: >-
+        Scoped bearer-capability URL emitted by media publication. Reads enforce
+        current source binding, connection authority, inventory membership,
+        provider version and exact length. Supports If-Match and byte ranges.
+        Treat the entire URL as private. At most four complete objects of up to
+        32 MiB are acquired concurrently; range responses currently acquire a
+        bounded complete object before serving the selected range.
+      responses:
+        '200': {description: Complete media bytes with strong ETag and exact Content-Length.}
+        '206': {description: Requested bytes with validated Content-Range.}
+        '410': {description: Capability retired or revoked.}
+        '412': {description: Source version changed or If-Match failed.}
+        '416': {description: Invalid or unsatisfiable range.}
+        '503': {description: Fetch concurrency exhausted; Retry-After is supplied.}
+        default: {$ref: '#/components/responses/Error'}
+    head:
+      operationId: inspectSourceMedia
+      security: []
+      responses:
+        '200': {description: Same verified metadata as GET without a response body.}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    operatorToken: {type: http, scheme: bearer}
+  responses:
+    Error:
+      description: Versioned error; 409 indicates active sync and 503 indicates temporary capacity pressure.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [version, code]
+            properties:
+              version: {type: integer, enum: [1]}
+              code: {type: string}
+    Mutation:
+      description: Mutation persisted.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [version, state]
+            properties:
+              version: {type: integer, enum: [1]}
+              state: {type: string}
+    Job:
+      description: Current job receipt.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/SyncJob'}
+    PutSourceMutation:
+      description: >-
+        Source configuration persisted. `rekeys` is true only when this source
+        had no namespace before this call and the call changed its connection
+        or config (including setting a namespace for the first time on a
+        populated source): the next sync re-keys every row of this source
+        exactly as it always did, because nothing before this field existed
+        separated identity from location. It is false whenever a namespace
+        was already set (identity already follows the namespace, not the
+        connection or config) and false for a source newly created in this
+        same call (it is assigned a namespace before any row exists, so
+        nothing is ever keyed before it has one).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [version, state, rekeys]
+            properties:
+              version: {type: integer, enum: [1]}
+              state: {type: string}
+              rekeys: {type: boolean}
+  schemas:
+    Connection:
+      type: object
+      additionalProperties: false
+      required: [provider]
+      properties:
+        provider: {type: string, enum: [github, google_workspace, gcs, s3, local, slack, discord]}
+        secret_refs:
+          type: object
+          additionalProperties: false
+          properties:
+            token: {type: string}
+            credentials: {type: string}
+            access_key_id: {type: string}
+            secret_access_key: {type: string}
+            session_token: {type: string}
+        services: {type: array, items: {type: string}}
+        token_env: {type: string}
+        credentials_env: {type: string}
+        access_key_env: {type: string}
+        secret_key_env: {type: string}
+        session_token_env: {type: string}
+        s3_endpoint: {type: string}
+        s3_insecure: {type: boolean}
+        local_root: {type: string, description: 'Absolute store directory for provider local, within ANTFLY_SOURCE_LOCAL_ROOTS.'}
+    Permissions:
+      type: object
+      required: [public, readers]
+      properties:
+        public: {type: boolean}
+        readers: {type: array, items: {type: string}}
+    SourceIdentity:
+      type: object
+      additionalProperties: false
+      properties:
+        namespace:
+          type: string
+          description: >-
+            Opaque prefix that scopes this source's row keys, independent of
+            its connection or config. Record keys are
+            sha256(namespace + "/" + relative_key), where relative_key is a
+            connector-reported key relative to the source's root (the
+            provider's native ID for providers without a path-like key, such
+            as Drive or GitHub, for which moving across providers is not
+            meaningful). Assigned automatically at source creation and
+            immutable afterward: it is set once, never edited, so that a
+            later connection or provider change never changes row identity.
+            Left unset on sources created before this field existed; such a
+            source keeps today's key formula (sha256 of its provider ID)
+            until something explicitly sets a namespace, at which point any
+            row whose key would change is re-keyed once.
+    Source:
+      type: object
+      additionalProperties: false
+      required: [id, connection, table, config, permissions]
+      properties:
+        id: {type: string, format: uuid}
+        alias: {type: string}
+        connection: {type: string}
+        table: {type: string}
+        config: {type: object, additionalProperties: true}
+        permissions: {$ref: '#/components/schemas/Permissions'}
+        permission_ttl_seconds: {type: integer}
+        publication: {type: string, enum: [native, text, media], default: native}
+        search_version: {type: integer, minimum: 1, maximum: 2}
+        streams:
+          type: array
+          maxItems: 64
+          items: {$ref: './management.yaml#/components/schemas/SearchStream'}
+        artifacts:
+          type: array
+          maxItems: 64
+          items: {$ref: './management.yaml#/components/schemas/ArtifactBinding'}
+        processing: {$ref: './management.yaml#/components/schemas/ProcessingDeclaration'}
+        identity: {$ref: '#/components/schemas/SourceIdentity'}
+    Profile:
+      type: object
+      required: [version, endpoint, connections, sources]
+      properties:
+        version: {type: integer, enum: [1]}
+        endpoint: {type: string}
+        catalog_table: {type: string}
+        data_plane_token_env: {type: string}
+        principals: {type: array, items: {type: string}}
+        connections: {type: object, additionalProperties: {$ref: '#/components/schemas/Connection'}}
+        sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+        local_migrations:
+          type: object
+          readOnly: true
+          additionalProperties: {$ref: '#/components/schemas/LocalMigrationReceipt'}
+    LocalMigrationReceipt:
+      type: object
+      readOnly: true
+      required: [version, source_id, table, namespace, from_connection, from_prefix, from_binding, to_connection, to_bucket, to_prefix, to_binding]
+      properties:
+        version: {type: integer, enum: [1]}
+        source_id: {type: string}
+        table: {type: string}
+        namespace: {type: string}
+        from_connection: {type: string}
+        from_prefix: {type: string}
+        from_binding: {type: string}
+        to_connection: {type: string}
+        to_bucket: {type: string}
+        to_prefix: {type: string}
+        to_binding: {type: string}
+    SyncJob:
+      type: object
+      required: [version, id, state, started_at]
+      properties:
+        version: {type: integer, enum: [1]}
+        id: {type: string}
+        state: {type: string, enum: [running, completed, failed, cancelled, interrupted]}
+        started_at: {type: integer, format: int64}
+        finished_at: {type: integer, format: int64}
+        code: {type: string}
+        operation: {type: string, enum: [sync, purge]}
+        purged_source_count: {type: integer, minimum: 0}
+        failure:
+          type: object
+          required: [phase, code, retryable]
+          properties:
+            source_id: {type: string, format: uuid}
+            phase: {type: string}
+            code: {type: string}
+            retryable: {type: boolean}
+    MediaReference:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkSourceReference'

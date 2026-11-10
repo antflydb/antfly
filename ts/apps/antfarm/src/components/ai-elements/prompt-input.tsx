@@ -24,6 +24,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
   Tooltip,
   TooltipContent,
   TooltipTrigger,
@@ -54,7 +55,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { Spinner } from "@/components/spinner";
 import { cn } from "@/lib/utils";
 
 // ============================================================================

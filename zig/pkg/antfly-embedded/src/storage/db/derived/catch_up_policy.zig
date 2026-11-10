@@ -77,6 +77,8 @@ pub const RecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.CapacityUnavailable,
+            error.CapacityObservationStale,
             error.PostingWalTooLarge,
             error.PostingRowBackpressure,
             error.PersistentDescriptorAdmissionExhausted,
@@ -112,6 +114,8 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
         error.WouldBlock,
         error.FileBusy,
         error.ResourceBudgetExceeded,
+        error.CapacityUnavailable,
+        error.CapacityObservationStale,
         error.PostingWalTooLarge,
         error.PostingRowBackpressure,
         error.PersistentDescriptorAdmissionExhausted,
@@ -306,6 +310,18 @@ fn denseReplayMaxItemsPerWindow() usize {
 
 fn replayMaxItemsPerWindow() usize {
     return envUsize("ANTFLY_DERIVED_REPLAY_MAX_ITEMS_PER_WINDOW", replay_default_max_items_per_window);
+}
+
+/// Bounded (background) full-text replay: subchunk size inside one record.
+/// Small enough that a 1024-key journal record can be split.
+pub fn boundedFullTextReplayMaxItems() usize {
+    return @max(1, envUsize("ANTFLY_LITE_FULL_TEXT_REPLAY_SUBCHUNK_ITEMS", 128));
+}
+
+/// Bounded full-text replay: time after which a turn stops between subchunks
+/// and resumes the record on the next turn.
+pub fn boundedFullTextReplayQuantumNs() u64 {
+    return @max(1, envU64("ANTFLY_LITE_FULL_TEXT_REPLAY_QUANTUM_MS", 100)) * std.time.ns_per_ms;
 }
 
 fn environmentValue(name: [:0]const u8) ?[]const u8 {
@@ -516,6 +532,12 @@ test "issue1015 transient storage contention uses bounded recoverable backoff" {
     }
     try std.testing.expectEqual(@as(u64, 3), counters.snapshot().writer_locked);
     try std.testing.expectEqual(@as(u64, 3), manager.derivedRecoverableRetryStats().writer_locked);
+    for ([_]anyerror{ error.CapacityUnavailable, error.CapacityObservationStale }) |err| {
+        try std.testing.expect(isRecoverableAdmissionError(err));
+        _ = recordRecoverableRetry(&counters, &manager, &backoff, err);
+    }
+    try std.testing.expectEqual(@as(u64, 2), counters.snapshot().resource_budget);
+    try std.testing.expectEqual(@as(u64, 2), manager.derivedRecoverableRetryStats().resource_budget);
     for (0..300) |_| try std.testing.expect(backoff.nextDelayNs() <= 250 * std.time.ns_per_ms);
     try std.testing.expect(!isRecoverableAdmissionError(error.InvalidData));
     try std.testing.expect(!isRecoverableAdmissionError(error.OutOfMemory));

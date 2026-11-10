@@ -60,32 +60,15 @@ pub fn taskForCategory(category: []const u8) ?Task {
     return null;
 }
 
-pub const Support = enum { unknown, unsupported, supported };
-pub const Capabilities = struct {
-    streaming: Support = .unknown,
-    tools: Support = .unknown,
-    structured_output: Support = .unknown,
-    images: Support = .unknown,
-    audio: Support = .unknown,
+const capability_contract = @import("inference_capabilities.zig");
+pub const Support = capability_contract.Support;
+pub const Capabilities = capability_contract.Capabilities;
 
-    pub fn require(self: Capabilities, request: Requirements) !void {
-        inline for (.{ "streaming", "tools", "structured_output", "images", "audio" }) |field| {
-            if (@field(request, field) and @field(self, field) != .supported)
-                return error.UnsupportedInferenceFeature;
-        }
-    }
-};
 fn typedDecisionCapabilities(images: bool) Capabilities {
-    return .{ .images = if (images) .supported else .unsupported, .audio = .unsupported, .streaming = .unsupported, .tools = .unsupported };
+    return .{ .images = if (images) .supported else .unsupported, .audio = .unsupported, .video = .unsupported, .streaming = .unsupported, .tools = .unsupported };
 }
 
-pub const Requirements = struct {
-    streaming: bool = false,
-    tools: bool = false,
-    structured_output: bool = false,
-    images: bool = false,
-    audio: bool = false,
-};
+pub const Requirements = capability_contract.Requirements;
 
 pub const Target = union(enum) {
     configured: struct { task: Task, name: []const u8, chain: bool = false },
@@ -177,7 +160,7 @@ pub const View = struct {
                     .decide => {
                         const cfg = try self.providers.getDeciderConfig(value.name);
                         out.backend_model = cfg.model;
-                        out.executor = @tagName(cfg.provider);
+                        out.executor = if (cfg.decision_method == .cascade) "cascade" else @tagName(cfg.provider);
                         out.model_identity = cfg.model_identity;
                         out.decision_method = @tagName(cfg.decision_method);
                         if (cfg.embedding_options) |options| out.calibration_id = options.calibration_id;
@@ -262,10 +245,32 @@ pub const View = struct {
         return declared;
     }
 
+    /// Configuration namespace is identity, not the public operation. Read can
+    /// execute a reader, an ASR binding or a multimodal generator binding.
+    pub fn readConfig(self: View, target: Target) !readers.Config {
+        if (target != .configured) return error.ModelNotFound;
+        const selected = target.configured;
+        switch (selected.task) {
+            .read => return self.readers.?.getConfig(selected.name),
+            .transcribe => {
+                const cfg = try self.transcribers.?.getConfig(selected.name);
+                if (cfg.provider != .antfly) return error.UnsupportedAudioReadCapability;
+                return .{ .provider = .antfly, .model = cfg.model, .base_url = cfg.base_url, .url = cfg.url, .api_url = cfg.api_url, .api_key = cfg.api_key, .bearer_token = cfg.bearer_token, .capability_token = cfg.capability_token, .capability_revision = cfg.capability_revision };
+            },
+            .generate => {
+                const cfg = try self.providers.getGeneratorConfig(selected.name);
+                if (cfg.provider != .antfly) return error.UnsupportedAudioReadCapability;
+                return .{ .provider = .antfly, .model = cfg.model, .api_url = if (cfg.url.len > 0) cfg.url else null, .api_key = cfg.api_key };
+            },
+            else => return error.ModelTaskMismatch,
+        }
+    }
+
     pub fn contains(self: View, task: Task, name: []const u8) bool {
         return switch (task) {
             .generate => self.providers.generator_configs.contains(name),
-            .decide => self.providers.decider_configs.contains(name),
+            // Cascade stages execute only through their cascade.
+            .decide => self.providers.decider_configs.contains(name) and !providers.Registry.isCascadeStageName(name),
             .embed => self.providers.embedder_configs.contains(name),
             .rerank => self.providers.reranker_configs.contains(name),
             .chunk => self.providers.chunker_configs.contains(name),
@@ -304,10 +309,21 @@ pub const View = struct {
         inline for (std.meta.tags(Task)) |candidate| {
             const prefix = candidate.namespace();
             if (std.mem.startsWith(u8, id, prefix) and id.len > prefix.len and id[prefix.len] == '/') {
-                if (candidate != task) return error.ModelTaskMismatch;
+                if (candidate != task and !(task == .read and (candidate == .transcribe or candidate == .generate))) return error.ModelTaskMismatch;
                 const name = id[prefix.len + 1 ..];
-                if (!self.contains(task, name)) return error.ModelNotFound;
-                return .{ .configured = .{ .task = task, .name = name } };
+                if (!self.contains(candidate, name)) return error.ModelNotFound;
+                return .{ .configured = .{ .task = candidate, .name = name } };
+            }
+        }
+        if (task == .read) {
+            var selected: ?Task = null;
+            for ([_]Task{ .read, .transcribe, .generate }) |candidate| if (self.contains(candidate, id)) {
+                if (selected != null) return error.AmbiguousModelIdentity;
+                selected = candidate;
+            };
+            if (selected) |candidate| {
+                for (raw_models) |model| if (std.mem.eql(u8, model, id)) return error.AmbiguousModelIdentity;
+                return .{ .configured = .{ .task = candidate, .name = id } };
             }
         }
         const configured = self.contains(task, id);
@@ -329,7 +345,10 @@ pub const View = struct {
         var out: std.ArrayList(Target) = .empty;
         errdefer out.deinit(a);
         inline for (.{ .{ Task.generate, "generator_configs" }, .{ Task.decide, "decider_configs" }, .{ Task.embed, "embedder_configs" }, .{ Task.rerank, "reranker_configs" }, .{ Task.chunk, "chunker_configs" }, .{ Task.extract, "extractor_configs" }, .{ Task.rewrite, "rewriter_configs" }, .{ Task.predict, "predictor_configs" } }) |entry| {
-            for (@field(self.providers, entry[1]).keys()) |name| try out.append(a, .{ .configured = .{ .task = entry[0], .name = name } });
+            for (@field(self.providers, entry[1]).keys()) |name| {
+                if (entry[0] == .decide and providers.Registry.isCascadeStageName(name)) continue;
+                try out.append(a, .{ .configured = .{ .task = entry[0], .name = name } });
+            }
         }
         for (self.providers.chains.keys()) |name| try out.append(a, .{ .configured = .{ .task = .generate, .name = name, .chain = true } });
         if (self.readers) |r| for (r.configs.keys()) |name| {
@@ -403,6 +422,49 @@ test "provider registry gateway resolves explicit task identities and preserves 
     const catalog = try view.catalog(a);
     defer a.free(catalog);
     try std.testing.expectEqual(@as(usize, 1), catalog.len);
+}
+
+test "provider registry gateway exposes decider cascades but hides their stages" {
+    const a = std.testing.allocator;
+    var r = try providers.Registry.parseFromSlice(a,
+        \\{"deciders":{"same-entity":{"decision_method":"cascade","cascade":{"stages":[
+        \\  {"name":"fast","decider":{"provider":"antfly","model":"fast"}},
+        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong"},"when":{"probability_between":[0.3,0.9]}}]}}}}
+    );
+    defer r.deinit();
+    const view = View{ .providers = &r };
+    try std.testing.expectEqualStrings("same-entity", (try view.resolve(.decide, "deciders/same-entity", &.{})).configured.name);
+    try std.testing.expectError(error.ModelNotFound, view.resolve(.decide, "deciders/same-entity#strong", &.{}));
+    const catalog = try view.catalog(a);
+    defer a.free(catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.len);
+    const descriptor = try view.describe(a, .{ .configured = .{ .task = .decide, .name = "same-entity" } });
+    defer a.free(descriptor.id);
+    try std.testing.expectEqualStrings("cascade", descriptor.executor);
+    try std.testing.expectEqualStrings("cascade", descriptor.decision_method.?);
+}
+
+test "provider registry gateway read resolves ASR and generator bindings without hiding collisions" {
+    const a = std.testing.allocator;
+    var registry = providers.Registry.init(a);
+    defer registry.deinit();
+    var reading = readers.Registry.init(a);
+    defer reading.deinit();
+    var asr = transcribing.Registry.init(a);
+    defer asr.deinit();
+    try asr.registerConfig("speech", .{ .provider = .antfly, .model = "whisper", .timestamps = true });
+    try registry.registerGeneratorConfig("multimodal", .{ .provider = .antfly, .model = "gemma4", .url = "" });
+    const view = View{ .providers = &registry, .readers = &reading, .transcribers = &asr };
+    const speech = try view.resolve(.read, "transcribers/speech", &.{});
+    try std.testing.expectEqual(Task.transcribe, speech.configured.task);
+    try std.testing.expectEqualStrings("whisper", (try view.readConfig(speech)).model.?);
+    const generator = try view.resolve(.read, "generators/multimodal", &.{});
+    try std.testing.expectEqualStrings("gemma4", (try view.readConfig(generator)).model.?);
+    try std.testing.expectEqual(Task.transcribe, (try view.resolve(.read, "speech", &.{})).configured.task);
+    try std.testing.expectError(error.AmbiguousModelIdentity, view.resolve(.read, "speech", &.{"speech"}));
+    try reading.registerConfig("speech", .{ .provider = .antfly, .model = "ocr" });
+    try std.testing.expectError(error.AmbiguousModelIdentity, view.resolve(.read, "speech", &.{}));
+    try std.testing.expectEqual(Task.read, (try view.resolve(.read, "readers/speech", &.{})).configured.task);
 }
 
 test "provider registry gateway requires known adapter support and bounded precommit attempts" {

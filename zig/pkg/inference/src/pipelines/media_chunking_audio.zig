@@ -24,10 +24,20 @@ pub const Lease = struct {
         if (self.owned) |samples| a.free(samples);
     }
 };
+pub const Fork = struct {
+    provider: Provider,
+    context: *anyopaque,
+    destroy: *const fn (*anyopaque) void,
+    pub fn deinit(self: Fork) void {
+        self.destroy(self.context);
+    }
+};
 pub const Provider = struct {
     context: *anyopaque,
     samples: usize,
     /// Unknown-length streams return a shorter final lease and publish EOF here.
+    rewind: ?*const fn (*anyopaque) anyerror!void = null,
+    fork: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Fork = null,
     final_samples: ?*const fn (*anyopaque) ?usize = null,
     probe: ?*const fn (*anyopaque, usize, usize) anyerror!?usize = null,
     sample_rate: u32,
@@ -169,8 +179,45 @@ pub const Stream = struct {
         self.received = total;
         self.eof = true;
     }
+    /// Analysis and chunk execution are separate bounded decode passes.
+    fn rewind(raw: *anyopaque) !void {
+        if (comptime @import("builtin").single_threaded or @import("builtin").cpu.arch.isWasm() or @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        self.queue.close(self.io);
+        self.join();
+        var item: [1][]f32 = undefined;
+        while (true) {
+            _ = self.queue.getUncancelable(self.io, &item, 1) catch break;
+            self.a.free(item[0]);
+        }
+        self.buffer.clearRetainingCapacity();
+        self.base = 0;
+        self.received = 0;
+        self.eof = false;
+        self.failure = null;
+        self.producer_rate = 0;
+        self.queue = .init(&self.storage);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        _ = self.queue.getUncancelable(self.io, &item, 1) catch {
+            self.join();
+            return self.failure orelse error.UnsupportedAudioFormat;
+        };
+        defer self.a.free(item[0]);
+        if (self.producer_rate != self.info.sample_rate) return error.UnsupportedAudioFormat;
+        try self.buffer.appendSlice(self.a, item[0]);
+        self.received = item[0].len;
+    }
+    fn fork(raw: *anyopaque, a: std.mem.Allocator) !Fork {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        const cloned = (try Stream.start(a, self.bytes, self.control)) orelse return error.UnsupportedAudioFormat;
+        return .{ .provider = cloned.provider(), .context = cloned, .destroy = destroyFork };
+    }
+    fn destroyFork(raw: *anyopaque) void {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        self.deinit();
+    }
     pub fn provider(self: *Stream) Provider {
-        return .{ .context = self, .samples = self.info.samples, .final_samples = finalSamples, .probe = probe, .sample_rate = self.info.sample_rate, .read = read };
+        return .{ .context = self, .samples = self.info.samples, .final_samples = finalSamples, .probe = probe, .rewind = rewind, .fork = fork, .sample_rate = self.info.sample_rate, .read = read };
     }
     fn probe(raw: *anyopaque, first: usize, last: usize) !?usize {
         const self: *Stream = @ptrCast(@alignCast(raw));
@@ -215,3 +262,52 @@ pub const Stream = struct {
         return .{ .pcm = .{ .samples = self.buffer.items[first - self.base .. stop - self.base], .sample_rate = self.info.sample_rate } };
     }
 };
+
+test "model aware media speaker analysis rewinds streaming PCM to the original sample clock" {
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const stream = (try Stream.start(a, bytes, .{})) orelse return error.SkipZigTest;
+    defer stream.deinit();
+    const provider = stream.provider();
+    const prefix = try provider.read(provider.context, a, 0, 1024);
+    const expected = try a.dupe(f32, prefix.pcm.samples);
+    defer a.free(expected);
+    var first: usize = 0;
+    while (true) {
+        const lease = try provider.read(provider.context, a, first, first + 4096);
+        if (lease.pcm.samples.len == 0) break;
+        first += lease.pcm.samples.len;
+    }
+    try std.testing.expect(provider.final_samples.?(provider.context).? > 1024);
+    try provider.rewind.?(provider.context);
+    try std.testing.expect(provider.final_samples.?(provider.context) == null);
+    const replayed = try provider.read(provider.context, a, 0, 1024);
+    try std.testing.expectEqualSlices(f32, expected, replayed.pcm.samples);
+    try std.testing.expectEqual(provider.sample_rate, replayed.pcm.sample_rate);
+}
+
+test "model aware media incremental analysis forks streaming decode without consuming chunk PCM" {
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const stream = (try Stream.start(a, bytes, .{})) orelse return error.SkipZigTest;
+    defer stream.deinit();
+    const main = stream.provider();
+    const analysis = try main.fork.?(main.context, a);
+    defer analysis.deinit();
+    const ahead = try analysis.provider.read(analysis.provider.context, a, 0, 8192);
+    const expected = try a.dupe(f32, ahead.pcm.samples);
+    defer a.free(expected);
+    try std.testing.expect(expected.len > 4096);
+    var position = expected.len;
+    while (true) {
+        const lease = try analysis.provider.read(analysis.provider.context, a, position, position + 4096);
+        if (lease.pcm.samples.len == 0) break;
+        position += lease.pcm.samples.len;
+    }
+    const first = try main.read(main.context, a, 0, 4096);
+    try std.testing.expectEqualSlices(f32, expected[0..4096], first.pcm.samples);
+    const next = try main.read(main.context, a, 4096, expected.len);
+    try std.testing.expectEqualSlices(f32, expected[4096..], next.pcm.samples);
+}

@@ -26,9 +26,28 @@ use crate::error::Error;
 use crate::ffi::path_has_suffix;
 use crate::status::TypedResult;
 
+/// Logical key/value payload, excluding physical headers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveByteCategory {
+    pub records: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+}
+
+/// Logical payload attribution from an explicit integrity check.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveByteAccounting {
+    pub metadata_catalog: LiveByteCategory,
+    pub index_catalog: LiveByteCategory,
+    pub control_documents: LiveByteCategory,
+    pub documents: LiveByteCategory,
+}
+
 /// The typed form of [`Database::check_json`] / [`crate::files::check_file_json`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct CheckReport {
+    #[serde(default)]
+    pub live_accounting: Option<LiveByteAccounting>,
     pub valid: bool,
     pub file_size: u64,
     pub valid_prefix_size: u64,

@@ -308,7 +308,9 @@ pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphE
     };
 }
 
-pub fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void {
+// This is an aggregate ownership boundary, including error unwinds. Do not
+// inline its collection walks into each exit of the mutation pipeline.
+pub noinline fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void {
     for (batch.documents) |doc| deinitDerivedDocument(alloc, doc);
     if (batch.documents.len > 0) alloc.free(batch.documents);
 

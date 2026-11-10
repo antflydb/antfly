@@ -33,7 +33,10 @@ pub const Descriptor = extern struct {
     dispatch: runtime.callback_abi.CallbackDispatch,
 };
 pub const method_layout = native.TypeContract.of(Method);
-pub const context_layout = native.TypeContract.of(aggregates.Context);
+pub const context_layout = blk: {
+    @setEvalBranchQuota(1_000_000);
+    break :blk native.TypeContract.of(aggregates.Context);
+};
 pub const index_manager_layout = blk: {
     @setEvalBranchQuota(1_000_000);
     break :blk native.TypeContract.of(@import("db/catalog/index_manager.zig").IndexManager);

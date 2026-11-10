@@ -94,7 +94,8 @@ def sync_detailed(
     source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
     deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
     Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+    Requires table write permission without a row filter and iceberg_writer policy. Catalog
+    initialization, file commits and maintenance require table admin permission.
 
     Args:
         table_name (str):
@@ -132,7 +133,8 @@ def sync(
     source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
     deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
     Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+    Requires table write permission without a row filter and iceberg_writer policy. Catalog
+    initialization, file commits and maintenance require table admin permission.
 
     Args:
         table_name (str):
@@ -165,7 +167,8 @@ async def asyncio_detailed(
     source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
     deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
     Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+    Requires table write permission without a row filter and iceberg_writer policy. Catalog
+    initialization, file commits and maintenance require table admin permission.
 
     Args:
         table_name (str):
@@ -201,7 +204,8 @@ async def asyncio(
     source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
     deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
     Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+    Requires table write permission without a row filter and iceberg_writer policy. Catalog
+    initialization, file commits and maintenance require table admin permission.
 
     Args:
         table_name (str):

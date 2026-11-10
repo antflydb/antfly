@@ -22,7 +22,22 @@
 
 const std = @import("std");
 
-pub const abi_version: u32 = 1;
+// The merged graph/document detail inventories share the original prefix and
+// append both extensions under one new independently compiled boundary.
+pub const abi_version: u32 = 2;
+
+test "proved aborted graph policy denial retains its stable boundary identity" {
+    const value = statusFromError(error.TransactionPrepareAbortedRowPolicyDenied);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), value.code);
+    try std.testing.expectEqual(error.TransactionPrepareAbortedRowPolicyDenied, errorFromStatus(value));
+}
+
+test "OCR truncation preserves terminal identity across runtime callbacks" {
+    const transported = statusFromError(error.ReadOutputTruncated);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+    try std.testing.expectEqual(error.ReadOutputTruncated, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.ReadOutputTruncated));
+}
 
 test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
@@ -51,6 +66,13 @@ test "metadata head races remain retryable across runtime callbacks" {
     try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
     try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(transported));
     try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
+}
+
+test "hierarchy cursor conflicts retain identity across runtime callbacks" {
+    const transported = statusFromError(error.HierarchyCursorStale);
+    try std.testing.expectEqual(@backingInt(Code.conflict), transported.code);
+    try std.testing.expectEqual(error.HierarchyCursorStale, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.HierarchyCursorStale));
 }
 
 pub const Code = enum(c_int) {
@@ -931,6 +953,156 @@ pub const Detail = enum(c_int) {
     cloudflare_inference_failed,
     invalid_cloudflare_response,
     document_token_limit_exceeded,
+    hierarchy_cursor_stale,
+    read_transient_failure,
+    read_request_failed,
+    invalid_gcs_url,
+    gcs_connection_not_found_or_out_of_scope,
+    ambiguous_gcs_connection,
+    invalid_connection_credentials,
+    pioneer_credential_missing,
+    unsupported_pioneer_schema,
+    unsupported_pioneer_input,
+    standalone_replication_sources_unsupported,
+    ha_catalog_replication_sources_unsupported,
+    // Append-only: numeric Detail values are part of the stable C ABI.
+    embed_admission_refused,
+    read_output_truncated,
+    invalid_document_extraction_config,
+    document_extraction_model_required,
+    conflicting_privacy_producer_options,
+    conflicting_privacy_producer_schema,
+    invalid_privacy_catalog,
+    invalid_privacy_categories,
+    invalid_privacy_category,
+    invalid_privacy_confidence,
+    invalid_privacy_document,
+    invalid_privacy_execution,
+    invalid_privacy_field_type,
+    invalid_privacy_fields,
+    invalid_privacy_offset_unit,
+    invalid_privacy_output,
+    invalid_privacy_output_cardinality,
+    invalid_privacy_producer,
+    invalid_privacy_receipt,
+    invalid_privacy_scan,
+    invalid_privacy_source,
+    invalid_privacy_span,
+    invalid_privacy_threshold,
+    invalid_privacy_token_geometry,
+    invalid_privacy_window_receipt,
+    privacy_embedding_producer_required,
+    privacy_evidence_mismatch,
+    privacy_external_embeddings_unsupported,
+    privacy_external_vectors_unsupported,
+    privacy_inspection_failed,
+    privacy_literal_credential,
+    privacy_managed_graph,
+    privacy_pending,
+    privacy_precondition_failed,
+    privacy_precondition_required,
+    privacy_producer_revision_mismatch,
+    privacy_producer_revision_required,
+    privacy_publication_pending,
+    privacy_read_fence_unavailable,
+    privacy_relational_storage_unsupported,
+    privacy_schema_exceeds_window,
+    privacy_stale,
+    privacy_synchronous_ingestion_required,
+    privacy_unknown_artifact_source,
+    privacy_unsupported_artifact_input,
+    privacy_unsupported_index_type,
+    privacy_unsupported_mutation,
+    privacy_unsupported_projection,
+    privacy_window_limit_exceeded,
+    privacy_window_token_limit_exceeded,
+    unknown_privacy_category,
+    sql_statement_read_unavailable,
+    unsupported_sql_execution,
+    // Append-only Cypher details preserve graph errors across owner callbacks.
+    cypher_aggregate_scope,
+    cypher_aggregate_wildcard,
+    cypher_ambiguous_search_table,
+    cypher_anchor_budget_exceeded,
+    cypher_create_requires_label,
+    cypher_deleted_entity,
+    cypher_derived_relationship_mutation,
+    cypher_division_by_zero,
+    cypher_duplicate_identity,
+    cypher_edge_budget_exceeded,
+    cypher_exists_mutation,
+    cypher_function_arity,
+    cypher_invalid_assignment,
+    cypher_invalid_backend_cursor,
+    cypher_invalid_backend_page,
+    cypher_invalid_backend_relationship,
+    cypher_invalid_create_relationship,
+    cypher_invalid_document,
+    cypher_invalid_grouping,
+    cypher_invalid_owner,
+    cypher_invalid_property_value,
+    cypher_invalid_range,
+    cypher_invalid_relationship,
+    cypher_invalid_relationship_metadata,
+    cypher_invalid_search_limit,
+    cypher_invalid_search_result,
+    cypher_invalid_shortest_path,
+    cypher_invalid_substring,
+    cypher_label_predicate_mismatch,
+    cypher_label_predicate_violation,
+    cypher_legacy_id_unavailable,
+    cypher_limit_exceeded,
+    cypher_memory_budget_exceeded,
+    cypher_mutations_unavailable,
+    cypher_node_has_relationships,
+    cypher_numeric_overflow,
+    cypher_observations_unavailable,
+    cypher_overlapping_owners,
+    cypher_owner_budget_exceeded,
+    cypher_path_budget_exceeded,
+    cypher_query_requires_return,
+    cypher_recursion_budget_exceeded,
+    cypher_regex_unavailable,
+    cypher_relationship_endpoint_mismatch,
+    cypher_remove_requires_property,
+    cypher_request_too_large,
+    cypher_response_too_large,
+    cypher_return_must_be_last,
+    cypher_return_predicate,
+    cypher_row_policy_unsupported,
+    cypher_search_after_write,
+    cypher_search_preparation_required,
+    cypher_search_table_outside_graph,
+    cypher_search_unavailable,
+    cypher_snapshot_not_ready,
+    cypher_snapshot_required,
+    cypher_state_budget_exceeded,
+    cypher_transaction_already_active,
+    cypher_transaction_conflict,
+    cypher_transaction_required,
+    cypher_type_mismatch,
+    cypher_union_column_mismatch,
+    cypher_value_depth_exceeded,
+    cypher_variable_conflict,
+    cypher_variable_type_conflict,
+    cypher_write_union_unsupported,
+    row_policy_unsupported,
+    row_policy_denied,
+    row_policy_authentication_required,
+    row_policy_authority_unavailable,
+    transaction_prepare_aborted_row_policy_denied,
+    retained_read_restart_required,
+    row_policy_mutation_unsupported,
+    cypher_invalid_regex,
+    schema_version_changed,
+    cypher_write_request_already_used,
+    invalid_cypher_parameters,
+    missing_cypher_parameter,
+    sql_write_capacity_unavailable,
+    invalid_external_source_inventory,
+    invalid_external_source_snapshot,
+    external_source_snapshot_too_large,
+    storage_owner_admission_pending,
 };
 
 pub const Status = extern struct {
@@ -948,6 +1120,63 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
+        error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
+        error.ConflictingPrivacyProducerOptions => status(.invalid_argument, .conflicting_privacy_producer_options),
+        error.ConflictingPrivacyProducerSchema => status(.invalid_argument, .conflicting_privacy_producer_schema),
+        error.InvalidPrivacyCatalog => status(.corrupt, .invalid_privacy_catalog),
+        error.InvalidPrivacyCategories => status(.invalid_argument, .invalid_privacy_categories),
+        error.InvalidPrivacyCategory => status(.invalid_argument, .invalid_privacy_category),
+        error.InvalidPrivacyConfidence => status(.invalid_argument, .invalid_privacy_confidence),
+        error.InvalidPrivacyDocument => status(.invalid_argument, .invalid_privacy_document),
+        error.InvalidPrivacyExecution => status(.invalid_argument, .invalid_privacy_execution),
+        error.InvalidPrivacyFieldType => status(.invalid_argument, .invalid_privacy_field_type),
+        error.InvalidPrivacyFields => status(.invalid_argument, .invalid_privacy_fields),
+        error.InvalidPrivacyOffsetUnit => status(.invalid_argument, .invalid_privacy_offset_unit),
+        error.InvalidPrivacyOutput => status(.invalid_argument, .invalid_privacy_output),
+        error.InvalidPrivacyOutputCardinality => status(.invalid_argument, .invalid_privacy_output_cardinality),
+        error.InvalidPrivacyProducer => status(.invalid_argument, .invalid_privacy_producer),
+        error.InvalidPrivacyReceipt => status(.corrupt, .invalid_privacy_receipt),
+        error.InvalidPrivacyScan => status(.invalid_argument, .invalid_privacy_scan),
+        error.InvalidPrivacySource => status(.invalid_argument, .invalid_privacy_source),
+        error.InvalidPrivacySpan => status(.invalid_argument, .invalid_privacy_span),
+        error.InvalidPrivacyThreshold => status(.invalid_argument, .invalid_privacy_threshold),
+        error.InvalidPrivacyTokenGeometry => status(.invalid_argument, .invalid_privacy_token_geometry),
+        error.InvalidPrivacyWindowReceipt => status(.invalid_argument, .invalid_privacy_window_receipt),
+        error.PrivacyEmbeddingProducerRequired => status(.invalid_argument, .privacy_embedding_producer_required),
+        error.PrivacyEvidenceMismatch => status(.conflict, .privacy_evidence_mismatch),
+        error.PrivacyExternalEmbeddingsUnsupported => status(.unsupported, .privacy_external_embeddings_unsupported),
+        error.PrivacyExternalVectorsUnsupported => status(.unsupported, .privacy_external_vectors_unsupported),
+        error.PrivacyInspectionFailed => status(.retryable, .privacy_inspection_failed),
+        error.PrivacyLiteralCredential => status(.invalid_argument, .privacy_literal_credential),
+        error.PrivacyManagedGraph => status(.invalid_argument, .privacy_managed_graph),
+        error.PrivacyPending => status(.retryable, .privacy_pending),
+        error.PrivacyPreconditionFailed => status(.conflict, .privacy_precondition_failed),
+        error.PrivacyPreconditionRequired => status(.invalid_argument, .privacy_precondition_required),
+        error.PrivacyProducerRevisionMismatch => status(.invalid_argument, .privacy_producer_revision_mismatch),
+        error.PrivacyProducerRevisionRequired => status(.invalid_argument, .privacy_producer_revision_required),
+        error.PrivacyPublicationPending => status(.retryable, .privacy_publication_pending),
+        error.PrivacyReadFenceUnavailable => status(.retryable, .privacy_read_fence_unavailable),
+        error.PrivacyRelationalStorageUnsupported => status(.unsupported, .privacy_relational_storage_unsupported),
+        error.PrivacySchemaExceedsWindow => status(.invalid_argument, .privacy_schema_exceeds_window),
+        error.PrivacyStale => status(.retryable, .privacy_stale),
+        error.PrivacySynchronousIngestionRequired => status(.unsupported, .privacy_synchronous_ingestion_required),
+        error.PrivacyUnknownArtifactSource => status(.invalid_argument, .privacy_unknown_artifact_source),
+        error.PrivacyUnsupportedArtifactInput => status(.unsupported, .privacy_unsupported_artifact_input),
+        error.PrivacyUnsupportedIndexType => status(.unsupported, .privacy_unsupported_index_type),
+        error.PrivacyUnsupportedMutation => status(.unsupported, .privacy_unsupported_mutation),
+        error.PrivacyUnsupportedProjection => status(.unsupported, .privacy_unsupported_projection),
+        error.PrivacyWindowLimitExceeded => status(.invalid_argument, .privacy_window_limit_exceeded),
+        error.PrivacyWindowTokenLimitExceeded => status(.invalid_argument, .privacy_window_token_limit_exceeded),
+        error.UnknownPrivacyCategory => status(.invalid_argument, .unknown_privacy_category),
+        error.InvalidDocumentExtractionConfig => status(.invalid_argument, .invalid_document_extraction_config),
+        error.DocumentExtractionModelRequired => status(.invalid_argument, .document_extraction_model_required),
+        error.ReadTransientFailure => status(.retryable, .read_transient_failure),
+        error.ReadRequestFailed => status(.invalid_argument, .read_request_failed),
+        error.InvalidGcsUrl => status(.invalid_argument, .invalid_gcs_url),
+        error.GcsConnectionNotFoundOrOutOfScope => status(.forbidden, .gcs_connection_not_found_or_out_of_scope),
+        error.AmbiguousGcsConnection => status(.invalid_argument, .ambiguous_gcs_connection),
+        error.InvalidConnectionCredentials => status(.invalid_argument, .invalid_connection_credentials),
         error.InvalidDocumentSource => status(.invalid_argument, .invalid_document_source),
         error.UnsupportedDocumentFormat => status(.invalid_argument, .unsupported_document_format),
         error.DocumentSourceLimitExceeded => status(.invalid_argument, .document_source_limit_exceeded),
@@ -965,6 +1194,11 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidCloudflareConfig => status(.invalid_argument, .invalid_cloudflare_config),
         error.UnsupportedCloudflareModel => status(.invalid_argument, .unsupported_cloudflare_model),
         error.UnsupportedCloudflareSchema => status(.invalid_argument, .unsupported_cloudflare_schema),
+        error.PioneerCredentialMissing => status(.invalid_argument, .pioneer_credential_missing),
+        error.UnsupportedPioneerSchema => status(.invalid_argument, .unsupported_pioneer_schema),
+        error.UnsupportedPioneerInput => status(.invalid_argument, .unsupported_pioneer_input),
+        error.StandaloneReplicationSourcesUnsupported => status(.invalid_argument, .standalone_replication_sources_unsupported),
+        error.HACatalogReplicationSourcesUnsupported => status(.invalid_argument, .ha_catalog_replication_sources_unsupported),
         error.CloudflareAuthenticationFailed => status(.unauthorized, .cloudflare_authentication_failed),
         error.InvalidExtractorResponse => status(.invalid_argument, .invalid_extractor_response),
         error.UnsupportedExtractionSchemaVersion => status(.invalid_argument, .unsupported_extraction_schema_version),
@@ -1039,6 +1273,86 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedConstrainedProbabilities => status(.unsupported, .unsupported_constrained_probabilities),
         error.UnsupportedConstrainedSchema => status(.unsupported, .unsupported_constrained_schema),
         error.UnsupportedGeneratedExtractionSchema => status(.unsupported, .unsupported_generated_extraction_schema),
+        error.SchemaVersionChanged => status(.conflict, .schema_version_changed),
+        error.CypherWriteRequestAlreadyUsed => status(.conflict, .cypher_write_request_already_used),
+        error.InvalidCypherParameters => status(.invalid_argument, .invalid_cypher_parameters),
+        error.MissingCypherParameter => status(.invalid_argument, .missing_cypher_parameter),
+        error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
+        error.CypherAggregateScope => status(.invalid_argument, .cypher_aggregate_scope),
+        error.CypherAggregateWildcard => status(.invalid_argument, .cypher_aggregate_wildcard),
+        error.CypherAmbiguousSearchTable => status(.invalid_argument, .cypher_ambiguous_search_table),
+        error.RowPolicyUnsupported => status(.invalid_argument, .row_policy_unsupported),
+        error.RowPolicyMutationUnsupported => status(.invalid_argument, .row_policy_mutation_unsupported),
+        error.CypherInvalidRegex => status(.invalid_argument, .cypher_invalid_regex),
+        error.RowPolicyDenied => status(.forbidden, .row_policy_denied),
+        error.RowPolicyAuthenticationRequired => status(.unauthorized, .row_policy_authentication_required),
+        error.RowPolicyAuthorityUnavailable => status(.unavailable, .row_policy_authority_unavailable),
+        error.TransactionPrepareAbortedRowPolicyDenied => status(.forbidden, .transaction_prepare_aborted_row_policy_denied),
+        error.RetainedReadRestartRequired => status(.retryable, .retained_read_restart_required),
+        error.CypherAnchorBudgetExceeded => status(.invalid_argument, .cypher_anchor_budget_exceeded),
+        error.CypherCreateRequiresLabel => status(.invalid_argument, .cypher_create_requires_label),
+        error.CypherDeletedEntity => status(.invalid_argument, .cypher_deleted_entity),
+        error.CypherDerivedRelationshipMutation => status(.invalid_argument, .cypher_derived_relationship_mutation),
+        error.CypherDivisionByZero => status(.invalid_argument, .cypher_division_by_zero),
+        error.CypherDuplicateIdentity => status(.invalid_argument, .cypher_duplicate_identity),
+        error.CypherEdgeBudgetExceeded => status(.invalid_argument, .cypher_edge_budget_exceeded),
+        error.CypherExistsMutation => status(.invalid_argument, .cypher_exists_mutation),
+        error.CypherFunctionArity => status(.invalid_argument, .cypher_function_arity),
+        error.CypherInvalidAssignment => status(.invalid_argument, .cypher_invalid_assignment),
+        error.CypherInvalidBackendCursor => status(.invalid_argument, .cypher_invalid_backend_cursor),
+        error.CypherInvalidBackendPage => status(.invalid_argument, .cypher_invalid_backend_page),
+        error.CypherInvalidBackendRelationship => status(.invalid_argument, .cypher_invalid_backend_relationship),
+        error.CypherInvalidCreateRelationship => status(.invalid_argument, .cypher_invalid_create_relationship),
+        error.CypherInvalidDocument => status(.invalid_argument, .cypher_invalid_document),
+        error.CypherInvalidGrouping => status(.invalid_argument, .cypher_invalid_grouping),
+        error.CypherInvalidOwner => status(.invalid_argument, .cypher_invalid_owner),
+        error.CypherInvalidPropertyValue => status(.invalid_argument, .cypher_invalid_property_value),
+        error.CypherInvalidRange => status(.invalid_argument, .cypher_invalid_range),
+        error.CypherInvalidRelationship => status(.invalid_argument, .cypher_invalid_relationship),
+        error.CypherInvalidRelationshipMetadata => status(.invalid_argument, .cypher_invalid_relationship_metadata),
+        error.CypherInvalidSearchLimit => status(.invalid_argument, .cypher_invalid_search_limit),
+        error.CypherInvalidSearchResult => status(.invalid_argument, .cypher_invalid_search_result),
+        error.CypherInvalidShortestPath => status(.invalid_argument, .cypher_invalid_shortest_path),
+        error.CypherInvalidSubstring => status(.invalid_argument, .cypher_invalid_substring),
+        error.CypherLabelPredicateMismatch => status(.invalid_argument, .cypher_label_predicate_mismatch),
+        error.CypherLabelPredicateViolation => status(.invalid_argument, .cypher_label_predicate_violation),
+        error.CypherLegacyIdUnavailable => status(.invalid_argument, .cypher_legacy_id_unavailable),
+        error.CypherLimitExceeded => status(.invalid_argument, .cypher_limit_exceeded),
+        error.CypherMemoryBudgetExceeded => status(.invalid_argument, .cypher_memory_budget_exceeded),
+        error.CypherMutationsUnavailable => status(.unavailable, .cypher_mutations_unavailable),
+        error.CypherNodeHasRelationships => status(.invalid_argument, .cypher_node_has_relationships),
+        error.CypherNumericOverflow => status(.invalid_argument, .cypher_numeric_overflow),
+        error.CypherObservationsUnavailable => status(.invalid_argument, .cypher_observations_unavailable),
+        error.CypherOverlappingOwners => status(.invalid_argument, .cypher_overlapping_owners),
+        error.CypherOwnerBudgetExceeded => status(.invalid_argument, .cypher_owner_budget_exceeded),
+        error.CypherPathBudgetExceeded => status(.invalid_argument, .cypher_path_budget_exceeded),
+        error.CypherQueryRequiresReturn => status(.invalid_argument, .cypher_query_requires_return),
+        error.CypherRecursionBudgetExceeded => status(.invalid_argument, .cypher_recursion_budget_exceeded),
+        error.CypherRegexUnavailable => status(.invalid_argument, .cypher_regex_unavailable),
+        error.CypherRelationshipEndpointMismatch => status(.invalid_argument, .cypher_relationship_endpoint_mismatch),
+        error.CypherRemoveRequiresProperty => status(.invalid_argument, .cypher_remove_requires_property),
+        error.CypherRequestTooLarge => status(.invalid_argument, .cypher_request_too_large),
+        error.CypherResponseTooLarge => status(.invalid_argument, .cypher_response_too_large),
+        error.CypherReturnMustBeLast => status(.invalid_argument, .cypher_return_must_be_last),
+        error.CypherReturnPredicate => status(.invalid_argument, .cypher_return_predicate),
+        error.CypherRowPolicyUnsupported => status(.invalid_argument, .cypher_row_policy_unsupported),
+        error.CypherSearchAfterWrite => status(.invalid_argument, .cypher_search_after_write),
+        error.CypherSearchPreparationRequired => status(.invalid_argument, .cypher_search_preparation_required),
+        error.CypherSearchTableOutsideGraph => status(.invalid_argument, .cypher_search_table_outside_graph),
+        error.CypherSearchUnavailable => status(.unavailable, .cypher_search_unavailable),
+        error.CypherSnapshotNotReady => status(.unavailable, .cypher_snapshot_not_ready),
+        error.CypherSnapshotRequired => status(.unavailable, .cypher_snapshot_required),
+        error.CypherStateBudgetExceeded => status(.invalid_argument, .cypher_state_budget_exceeded),
+        error.CypherTransactionAlreadyActive => status(.invalid_argument, .cypher_transaction_already_active),
+        error.CypherTransactionConflict => status(.conflict, .cypher_transaction_conflict),
+        error.CypherTransactionRequired => status(.invalid_argument, .cypher_transaction_required),
+        error.CypherTypeMismatch => status(.invalid_argument, .cypher_type_mismatch),
+        error.CypherUnionColumnMismatch => status(.invalid_argument, .cypher_union_column_mismatch),
+        error.CypherValueDepthExceeded => status(.invalid_argument, .cypher_value_depth_exceeded),
+        error.CypherVariableConflict => status(.invalid_argument, .cypher_variable_conflict),
+        error.CypherVariableTypeConflict => status(.invalid_argument, .cypher_variable_type_conflict),
+        error.CypherWriteUnionUnsupported => status(.invalid_argument, .cypher_write_union_unsupported),
+
         error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
         error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
         error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
@@ -1098,6 +1412,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
         error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
+        error.InvalidExternalSourceInventory => status(.invalid_argument, .invalid_external_source_inventory),
+        error.InvalidExternalSourceSnapshot => status(.invalid_argument, .invalid_external_source_snapshot),
+        error.ExternalSourceSnapshotTooLarge => status(.invalid_argument, .external_source_snapshot_too_large),
         error.ExternalLakeFieldIdentityChanged => status(.conflict, .external_lake_field_identity_changed),
         error.ExternalLakeObjectChanged => status(.conflict, .external_lake_object_changed),
         error.EmptyExternalSourceSnapshot => status(.invalid_argument, .empty_external_source_snapshot),
@@ -1212,6 +1529,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
         error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
         error.StorageBusy => status(.retryable, .storage_busy),
+        error.StorageOwnerAdmissionPending => status(.retryable, .storage_owner_admission_pending),
         error.MergeTransitionNotReady => status(.retryable, .merge_transition_not_ready),
         error.MergeReceiverProjectionNotReady => status(.retryable, .merge_receiver_projection_not_ready),
         error.MergeSourceProjectionNotReady => status(.retryable, .merge_source_projection_not_ready),
@@ -1392,7 +1710,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidArgument => status(.invalid_argument, .invalid_argument),
         error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
         error.InvalidRequest => status(.invalid_argument, .invalid_request),
-        error.InvalidQueryRequest => status(.invalid_argument, .invalid_query_request),
+        // Aggregations may run in either an owner or a coordinator. Transport
+        // their public query classes using existing details, including when
+        // they cross a callback before the HTTP boundary can normalize them.
+        error.InvalidQueryRequest, error.InvalidAggregation => status(.invalid_argument, .invalid_query_request),
         error.InvalidFilterQueryRequest => status(.invalid_argument, .invalid_filter_query_request),
         error.InvalidExclusionQueryRequest => status(.invalid_argument, .invalid_exclusion_query_request),
         error.InvalidBatchRequest => status(.invalid_argument, .invalid_batch_request),
@@ -1421,7 +1742,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
         error.Forbidden => status(.forbidden, .forbidden),
-        error.Unavailable => status(.unavailable, .unavailable),
+        // Capability barriers can be unavailable during provisioning or a
+        // rolling upgrade. They fail before batch proposal admission.
+        error.Unavailable, error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable => status(.unavailable, .unavailable),
         error.WriteUnavailable => status(.unavailable, .write_unavailable),
         error.ReadUnavailable => status(.unavailable, .read_unavailable),
         error.ReadRequiresPrimary => status(.unavailable, .read_requires_primary),
@@ -1487,7 +1810,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
-        error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => status(.unsupported, .unsupported_query_request),
         error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
@@ -1766,6 +2089,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
         error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
+        error.HierarchyCursorStale => status(.conflict, .hierarchy_cursor_stale),
         error.CrcMismatch => status(.corrupt, .crc_mismatch),
         error.InvalidData => status(.corrupt, .invalid_data),
         error.MappedArtifactUnsupported => status(.unsupported, .mapped_artifact_unsupported),
@@ -1789,7 +2113,21 @@ pub fn statusFromError(err: anyerror) Status {
         error.ReadScopeResetUnsupported => status(.unsupported, .read_scope_reset_unsupported),
         error.ReadSnapshotForkUnsupported => status(.unsupported, .read_snapshot_fork_unsupported),
         error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
-        else => status(.internal, .none),
+        // A local provider's admission refusal (the request never ran)
+        // distinct from a real provider transient failure. Keep this
+        // retryable like EmbedTransientFailure so callers that only check
+        // the Code still back off, while callers that need the distinct
+        // identity (the enrichment retry-budget exemption) can tell them
+        // apart by name.
+        error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
+        error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
+        else => blk: {
+            // Private error identities cannot cross this stable ABI. Retain
+            // the owning side's name in diagnostics instead of leaving an
+            // otherwise opaque RuntimeBoundaryFailure impossible to trace.
+            if (!@inComptime()) std.log.debug("runtime boundary unclassified error={s}", .{@errorName(err)});
+            break :blk status(.internal, .none);
+        },
     };
 }
 
@@ -1816,7 +2154,7 @@ fn status(code: Code, detail: Detail) Status {
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(30_000);
     const code = std.enums.fromInt(Code, value.code) orelse return error.RuntimeBoundaryFailure;
     if (code == .ok) return error.RuntimeBoundaryFailure;
     const detail = std.enums.fromInt(Detail, value.detail) orelse return error.RuntimeBoundaryFailure;
@@ -1850,6 +2188,11 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_cloudflare_config => "InvalidCloudflareConfig",
         .unsupported_cloudflare_model => "UnsupportedCloudflareModel",
         .unsupported_cloudflare_schema => "UnsupportedCloudflareSchema",
+        .pioneer_credential_missing => "PioneerCredentialMissing",
+        .unsupported_pioneer_schema => "UnsupportedPioneerSchema",
+        .unsupported_pioneer_input => "UnsupportedPioneerInput",
+        .standalone_replication_sources_unsupported => "StandaloneReplicationSourcesUnsupported",
+        .ha_catalog_replication_sources_unsupported => "HACatalogReplicationSourcesUnsupported",
         .cloudflare_authentication_failed => "CloudflareAuthenticationFailed",
         .invalid_extractor_response => "InvalidExtractorResponse",
         .unsupported_extraction_schema_version => "UnsupportedExtractionSchemaVersion",
@@ -1982,6 +2325,93 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .hierarchy_cursor_stale => "HierarchyCursorStale",
+        .read_transient_failure => "ReadTransientFailure",
+        .read_request_failed => "ReadRequestFailed",
+        .invalid_gcs_url => "InvalidGcsUrl",
+        .gcs_connection_not_found_or_out_of_scope => "GcsConnectionNotFoundOrOutOfScope",
+        .ambiguous_gcs_connection => "AmbiguousGcsConnection",
+        .invalid_connection_credentials => "InvalidConnectionCredentials",
+
+        .schema_version_changed => "SchemaVersionChanged",
+        .cypher_write_request_already_used => "CypherWriteRequestAlreadyUsed",
+        .invalid_cypher_parameters => "InvalidCypherParameters",
+        .missing_cypher_parameter => "MissingCypherParameter",
+        .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
+        .cypher_aggregate_scope => "CypherAggregateScope",
+        .cypher_aggregate_wildcard => "CypherAggregateWildcard",
+        .cypher_ambiguous_search_table => "CypherAmbiguousSearchTable",
+        .row_policy_unsupported => "RowPolicyUnsupported",
+        .row_policy_mutation_unsupported => "RowPolicyMutationUnsupported",
+        .cypher_invalid_regex => "CypherInvalidRegex",
+        .row_policy_denied => "RowPolicyDenied",
+        .row_policy_authentication_required => "RowPolicyAuthenticationRequired",
+        .row_policy_authority_unavailable => "RowPolicyAuthorityUnavailable",
+        .transaction_prepare_aborted_row_policy_denied => "TransactionPrepareAbortedRowPolicyDenied",
+        .retained_read_restart_required => "RetainedReadRestartRequired",
+        .cypher_anchor_budget_exceeded => "CypherAnchorBudgetExceeded",
+        .cypher_create_requires_label => "CypherCreateRequiresLabel",
+        .cypher_deleted_entity => "CypherDeletedEntity",
+        .cypher_derived_relationship_mutation => "CypherDerivedRelationshipMutation",
+        .cypher_division_by_zero => "CypherDivisionByZero",
+        .cypher_duplicate_identity => "CypherDuplicateIdentity",
+        .cypher_edge_budget_exceeded => "CypherEdgeBudgetExceeded",
+        .cypher_exists_mutation => "CypherExistsMutation",
+        .cypher_function_arity => "CypherFunctionArity",
+        .cypher_invalid_assignment => "CypherInvalidAssignment",
+        .cypher_invalid_backend_cursor => "CypherInvalidBackendCursor",
+        .cypher_invalid_backend_page => "CypherInvalidBackendPage",
+        .cypher_invalid_backend_relationship => "CypherInvalidBackendRelationship",
+        .cypher_invalid_create_relationship => "CypherInvalidCreateRelationship",
+        .cypher_invalid_document => "CypherInvalidDocument",
+        .cypher_invalid_grouping => "CypherInvalidGrouping",
+        .cypher_invalid_owner => "CypherInvalidOwner",
+        .cypher_invalid_property_value => "CypherInvalidPropertyValue",
+        .cypher_invalid_range => "CypherInvalidRange",
+        .cypher_invalid_relationship => "CypherInvalidRelationship",
+        .cypher_invalid_relationship_metadata => "CypherInvalidRelationshipMetadata",
+        .cypher_invalid_search_limit => "CypherInvalidSearchLimit",
+        .cypher_invalid_search_result => "CypherInvalidSearchResult",
+        .cypher_invalid_shortest_path => "CypherInvalidShortestPath",
+        .cypher_invalid_substring => "CypherInvalidSubstring",
+        .cypher_label_predicate_mismatch => "CypherLabelPredicateMismatch",
+        .cypher_label_predicate_violation => "CypherLabelPredicateViolation",
+        .cypher_legacy_id_unavailable => "CypherLegacyIdUnavailable",
+        .cypher_limit_exceeded => "CypherLimitExceeded",
+        .cypher_memory_budget_exceeded => "CypherMemoryBudgetExceeded",
+        .cypher_mutations_unavailable => "CypherMutationsUnavailable",
+        .cypher_node_has_relationships => "CypherNodeHasRelationships",
+        .cypher_numeric_overflow => "CypherNumericOverflow",
+        .cypher_observations_unavailable => "CypherObservationsUnavailable",
+        .cypher_overlapping_owners => "CypherOverlappingOwners",
+        .cypher_owner_budget_exceeded => "CypherOwnerBudgetExceeded",
+        .cypher_path_budget_exceeded => "CypherPathBudgetExceeded",
+        .cypher_query_requires_return => "CypherQueryRequiresReturn",
+        .cypher_recursion_budget_exceeded => "CypherRecursionBudgetExceeded",
+        .cypher_regex_unavailable => "CypherRegexUnavailable",
+        .cypher_relationship_endpoint_mismatch => "CypherRelationshipEndpointMismatch",
+        .cypher_remove_requires_property => "CypherRemoveRequiresProperty",
+        .cypher_request_too_large => "CypherRequestTooLarge",
+        .cypher_response_too_large => "CypherResponseTooLarge",
+        .cypher_return_must_be_last => "CypherReturnMustBeLast",
+        .cypher_return_predicate => "CypherReturnPredicate",
+        .cypher_row_policy_unsupported => "CypherRowPolicyUnsupported",
+        .cypher_search_after_write => "CypherSearchAfterWrite",
+        .cypher_search_preparation_required => "CypherSearchPreparationRequired",
+        .cypher_search_table_outside_graph => "CypherSearchTableOutsideGraph",
+        .cypher_search_unavailable => "CypherSearchUnavailable",
+        .cypher_snapshot_not_ready => "CypherSnapshotNotReady",
+        .cypher_snapshot_required => "CypherSnapshotRequired",
+        .cypher_state_budget_exceeded => "CypherStateBudgetExceeded",
+        .cypher_transaction_already_active => "CypherTransactionAlreadyActive",
+        .cypher_transaction_conflict => "CypherTransactionConflict",
+        .cypher_transaction_required => "CypherTransactionRequired",
+        .cypher_type_mismatch => "CypherTypeMismatch",
+        .cypher_union_column_mismatch => "CypherUnionColumnMismatch",
+        .cypher_value_depth_exceeded => "CypherValueDepthExceeded",
+        .cypher_variable_conflict => "CypherVariableConflict",
+        .cypher_variable_type_conflict => "CypherVariableTypeConflict",
+        .cypher_write_union_unsupported => "CypherWriteUnionUnsupported",
         .crc_mismatch => "CrcMismatch",
         .invalid_data => "InvalidData",
         .mapped_artifact_unsupported => "MappedArtifactUnsupported",
@@ -2010,6 +2440,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
         .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
+        .invalid_external_source_inventory => "InvalidExternalSourceInventory",
+        .invalid_external_source_snapshot => "InvalidExternalSourceSnapshot",
+        .external_source_snapshot_too_large => "ExternalSourceSnapshotTooLarge",
         .external_lake_field_identity_changed => "ExternalLakeFieldIdentityChanged",
         .external_lake_object_changed => "ExternalLakeObjectChanged",
         .empty_external_source_snapshot => "EmptyExternalSourceSnapshot",
@@ -2151,6 +2584,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .merge_source_projection_not_ready => "MergeSourceProjectionNotReady",
         .merge_source_projection_advanced => "MergeSourceProjectionAdvanced",
         .storage_busy => "StorageBusy",
+        .storage_owner_admission_pending => "StorageOwnerAdmissionPending",
         .invalid_online_source_command => "InvalidOnlineSourceCommand",
         .online_source_corrupt => "OnlineSourceCorrupt",
         .online_source_pin_missing => "OnlineSourcePinMissing",
@@ -2399,7 +2833,6 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .table_lifecycle_conflict => "TableLifecycleConflict",
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
         .generation_transition_active => "GenerationTransitionActive",
-        .index_rebuilding => "IndexRebuilding",
         .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .file_busy => "FileBusy",
@@ -2666,6 +3099,60 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_failed => "RuntimeFailed",
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
+        .embed_admission_refused => "EmbedAdmissionRefused",
+        .read_output_truncated => "ReadOutputTruncated",
+        .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
+        .document_extraction_model_required => "DocumentExtractionModelRequired",
+        .index_rebuilding => "IndexRebuilding",
+        .sql_statement_read_unavailable => "SqlStatementReadUnavailable",
+        .unsupported_sql_execution => "UnsupportedSqlExecution",
+        .conflicting_privacy_producer_options => "ConflictingPrivacyProducerOptions",
+        .conflicting_privacy_producer_schema => "ConflictingPrivacyProducerSchema",
+        .invalid_privacy_catalog => "InvalidPrivacyCatalog",
+        .invalid_privacy_categories => "InvalidPrivacyCategories",
+        .invalid_privacy_category => "InvalidPrivacyCategory",
+        .invalid_privacy_confidence => "InvalidPrivacyConfidence",
+        .invalid_privacy_document => "InvalidPrivacyDocument",
+        .invalid_privacy_execution => "InvalidPrivacyExecution",
+        .invalid_privacy_field_type => "InvalidPrivacyFieldType",
+        .invalid_privacy_fields => "InvalidPrivacyFields",
+        .invalid_privacy_offset_unit => "InvalidPrivacyOffsetUnit",
+        .invalid_privacy_output => "InvalidPrivacyOutput",
+        .invalid_privacy_output_cardinality => "InvalidPrivacyOutputCardinality",
+        .invalid_privacy_producer => "InvalidPrivacyProducer",
+        .invalid_privacy_receipt => "InvalidPrivacyReceipt",
+        .invalid_privacy_scan => "InvalidPrivacyScan",
+        .invalid_privacy_source => "InvalidPrivacySource",
+        .invalid_privacy_span => "InvalidPrivacySpan",
+        .invalid_privacy_threshold => "InvalidPrivacyThreshold",
+        .invalid_privacy_token_geometry => "InvalidPrivacyTokenGeometry",
+        .invalid_privacy_window_receipt => "InvalidPrivacyWindowReceipt",
+        .privacy_embedding_producer_required => "PrivacyEmbeddingProducerRequired",
+        .privacy_evidence_mismatch => "PrivacyEvidenceMismatch",
+        .privacy_external_embeddings_unsupported => "PrivacyExternalEmbeddingsUnsupported",
+        .privacy_external_vectors_unsupported => "PrivacyExternalVectorsUnsupported",
+        .privacy_inspection_failed => "PrivacyInspectionFailed",
+        .privacy_literal_credential => "PrivacyLiteralCredential",
+        .privacy_managed_graph => "PrivacyManagedGraph",
+        .privacy_pending => "PrivacyPending",
+        .privacy_precondition_failed => "PrivacyPreconditionFailed",
+        .privacy_precondition_required => "PrivacyPreconditionRequired",
+        .privacy_producer_revision_mismatch => "PrivacyProducerRevisionMismatch",
+        .privacy_producer_revision_required => "PrivacyProducerRevisionRequired",
+        .privacy_publication_pending => "PrivacyPublicationPending",
+        .privacy_read_fence_unavailable => "PrivacyReadFenceUnavailable",
+        .privacy_relational_storage_unsupported => "PrivacyRelationalStorageUnsupported",
+        .privacy_schema_exceeds_window => "PrivacySchemaExceedsWindow",
+        .privacy_stale => "PrivacyStale",
+        .privacy_synchronous_ingestion_required => "PrivacySynchronousIngestionRequired",
+        .privacy_unknown_artifact_source => "PrivacyUnknownArtifactSource",
+        .privacy_unsupported_artifact_input => "PrivacyUnsupportedArtifactInput",
+        .privacy_unsupported_index_type => "PrivacyUnsupportedIndexType",
+        .privacy_unsupported_mutation => "PrivacyUnsupportedMutation",
+        .privacy_unsupported_projection => "PrivacyUnsupportedProjection",
+        .privacy_window_limit_exceeded => "PrivacyWindowLimitExceeded",
+        .privacy_window_token_limit_exceeded => "PrivacyWindowTokenLimitExceeded",
+        .unknown_privacy_category => "UnknownPrivacyCategory",
     };
 }
 
@@ -2936,6 +3423,9 @@ test "external lake and spill errors retain exact identity across runtime archiv
         error.ExternalLakeSnapshotMismatch,
         error.ExternalLakeSchemaMismatch,
         error.ExternalLakeSchemaUnavailable,
+        error.InvalidExternalSourceInventory,
+        error.InvalidExternalSourceSnapshot,
+        error.ExternalSourceSnapshotTooLarge,
         error.ExternalLakeFieldIdentityChanged,
         error.ExternalLakeObjectChanged,
         error.EmptyExternalSourceSnapshot,
@@ -2951,6 +3441,13 @@ test "external lake and spill errors retain exact identity across runtime archiv
         error.UnsupportedIcebergDeleteFile,
         error.InvalidSqlSpill,
     }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "Cypher errors retain stable callback details" {
+    inline for (.{ error.CypherAnchorBudgetExceeded, error.CypherTransactionConflict, error.CypherMemoryBudgetExceeded, error.CypherObservationsUnavailable, error.SchemaVersionChanged, error.CypherWriteRequestAlreadyUsed, error.InvalidCypherParameters, error.MissingCypherParameter, error.SqlWriteCapacityUnavailable }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
@@ -2974,6 +3471,24 @@ test "storage callback boundaries retain capability integrity and bounded-read o
         const encoded = statusFromError(err);
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));
+    }
+}
+
+test "temporary SQL statement capture failure preserves retryable boundary identity" {
+    const transported = statusFromError(error.SqlStatementReadUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.SqlStatementReadUnavailable));
+}
+
+test "provisioning races retain metadata identity and canonical protocol availability" {
+    const metadata = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), metadata.code);
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(metadata));
+    for ([_]anyerror{ error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable }) |err| {
+        const wire = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.unavailable), wire.code);
+        try std.testing.expectEqual(error.Unavailable, errorFromStatus(wire));
     }
 }
 
@@ -3100,11 +3615,30 @@ test "grouped and constrained producer failures preserve callback identity and b
     try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedGeneratedExtractionSchema).code);
 }
 
-test "merged runtime error details preserve main wire identifiers" {
+test "merged runtime error details preserve the common prefix under ABI two" {
+    try std.testing.expectEqual(@as(u32, 2), abi_version);
     try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
+    try std.testing.expectEqual(@as(c_int, 779), @backingInt(Detail.graph_start_identity_required));
+    try std.testing.expectEqual(@as(c_int, 780), @backingInt(Detail.metadata_snapshot_head_mismatch));
+    try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.inference_endpoint_access_denied));
+    try std.testing.expectEqual(@as(c_int, 782), @backingInt(Detail.document_storage_not_configured));
+    try std.testing.expectEqual(@as(c_int, 825), @backingInt(Detail.document_token_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.hierarchy_cursor_stale));
+    try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.read_transient_failure));
+    try std.testing.expectEqual(@as(c_int, 832), @backingInt(Detail.invalid_connection_credentials));
+    try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.pioneer_credential_missing));
+    try std.testing.expectEqual(@as(c_int, 835), @backingInt(Detail.unsupported_pioneer_input));
+    try std.testing.expectEqual(@as(c_int, 836), @backingInt(Detail.standalone_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 837), @backingInt(Detail.ha_catalog_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 838), @backingInt(Detail.embed_admission_refused));
+    try std.testing.expectEqual(@as(c_int, 839), @backingInt(Detail.read_output_truncated));
+    try std.testing.expectEqual(@as(c_int, 840), @backingInt(Detail.invalid_document_extraction_config));
+    try std.testing.expectEqual(@as(c_int, 841), @backingInt(Detail.document_extraction_model_required));
+    try std.testing.expectEqual(@as(c_int, 891), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {
@@ -3151,6 +3685,11 @@ test "durable document policy errors retain identity across native runtime bound
         error.InvalidCloudflareConfig,
         error.UnsupportedCloudflareModel,
         error.UnsupportedCloudflareSchema,
+        error.PioneerCredentialMissing,
+        error.UnsupportedPioneerSchema,
+        error.UnsupportedPioneerInput,
+        error.StandaloneReplicationSourcesUnsupported,
+        error.HACatalogReplicationSourcesUnsupported,
         error.CloudflareAuthenticationFailed,
         error.InvalidExtractorResponse,
         error.UnsupportedExtractionSchemaVersion,
@@ -3174,4 +3713,78 @@ test "durable document policy errors retain identity across native runtime bound
     }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "reader failures preserve retry semantics and GCS failures preserve scope semantics" {
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.ReadTransientFailure).code);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ReadRequestFailed).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.GcsConnectionNotFoundOrOutOfScope).code);
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
+    }
+}
+
+test "invalid persisted extraction policy retains identity across storage callbacks" {
+    inline for (.{ error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired }) |expected| {
+        const transported = comptime statusFromError(expected);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(expected, errorFromStatus(transported));
+    }
+}
+
+test "privacy failures retain identity and retry classes across runtime callbacks" {
+    for ([_]anyerror{ error.IndexRebuilding, error.SqlStatementReadUnavailable, error.UnsupportedSqlExecution }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+    for ([_]anyerror{ error.ConflictingPrivacyProducerOptions, error.ConflictingPrivacyProducerSchema, error.InvalidPrivacyCatalog, error.InvalidPrivacyCategories, error.InvalidPrivacyCategory, error.InvalidPrivacyConfidence, error.InvalidPrivacyDocument, error.InvalidPrivacyExecution, error.InvalidPrivacyFieldType, error.InvalidPrivacyFields, error.InvalidPrivacyOffsetUnit, error.InvalidPrivacyOutput, error.InvalidPrivacyOutputCardinality, error.InvalidPrivacyProducer, error.InvalidPrivacyReceipt, error.InvalidPrivacyScan, error.InvalidPrivacySource, error.InvalidPrivacySpan, error.InvalidPrivacyThreshold, error.InvalidPrivacyTokenGeometry, error.InvalidPrivacyWindowReceipt, error.PrivacyEmbeddingProducerRequired, error.PrivacyEvidenceMismatch, error.PrivacyExternalEmbeddingsUnsupported, error.PrivacyExternalVectorsUnsupported, error.PrivacyInspectionFailed, error.PrivacyLiteralCredential, error.PrivacyManagedGraph, error.PrivacyPending, error.PrivacyPreconditionFailed, error.PrivacyPreconditionRequired, error.PrivacyProducerRevisionMismatch, error.PrivacyProducerRevisionRequired, error.PrivacyPublicationPending, error.PrivacyReadFenceUnavailable, error.PrivacyRelationalStorageUnsupported, error.PrivacySchemaExceedsWindow, error.PrivacyStale, error.PrivacySynchronousIngestionRequired, error.PrivacyUnknownArtifactSource, error.PrivacyUnsupportedArtifactInput, error.PrivacyUnsupportedIndexType, error.PrivacyUnsupportedMutation, error.PrivacyUnsupportedProjection, error.PrivacyWindowLimitExceeded, error.PrivacyWindowTokenLimitExceeded, error.UnknownPrivacyCategory }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.PrivacyStale).code);
+    try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
+}
+
+test "manifest client failures append stable details without changing released ordinals" {
+    try std.testing.expectEqual(@backingInt(Detail.sql_write_capacity_unavailable) + 1, @backingInt(Detail.invalid_external_source_inventory));
+    for ([_]anyerror{ error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot, error.ExternalSourceSnapshotTooLarge }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
+test "latest main error detail prefix remains append only across graph integration" {
+    @setEvalBranchQuota(30000);
+    var hash: u64 = 14695981039346656037;
+    var count: usize = 0;
+    inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |name, value| {
+        if (value <= 890) {
+            for (name) |byte| hash = (hash ^ byte) *% 1099511628211;
+            var encoded: [4]u8 = undefined;
+            std.mem.writeInt(u32, &encoded, @intCast(value), .little);
+            for (encoded) |byte| hash = (hash ^ byte) *% 1099511628211;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 891), count);
+    try std.testing.expectEqual(@as(u64, 16819601552131841023), hash);
+}
+
+test "time series aggregation callback failures use existing query identities" {
+    const invalid = statusFromError(error.InvalidAggregation);
+    try std.testing.expectEqualDeep(statusFromError(error.InvalidQueryRequest), invalid);
+    try std.testing.expectEqual(error.InvalidQueryRequest, errorFromStatus(invalid));
+    try std.testing.expect(errorHasStableDetail(error.InvalidAggregation));
+    const unsupported = statusFromError(error.UnsupportedAggregation);
+    try std.testing.expectEqualDeep(statusFromError(error.UnsupportedQueryRequest), unsupported);
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, errorFromStatus(unsupported));
+    try std.testing.expect(errorHasStableDetail(error.UnsupportedAggregation));
+}
+
+test "storage owner lease admission retains retryability across runtime callbacks" {
+    const wire = statusFromError(error.StorageOwnerAdmissionPending);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
+    try std.testing.expect(errorHasStableDetail(error.StorageOwnerAdmissionPending));
+    try std.testing.expectEqual(error.StorageOwnerAdmissionPending, errorFromStatus(wire));
 }

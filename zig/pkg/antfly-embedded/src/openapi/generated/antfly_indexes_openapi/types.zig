@@ -17,6 +17,10 @@ pub const AlgebraicAggregateConfig = struct {
     name: []const u8,
     op: []const u8,
     group_by: ?[]const []const u8 = null,
+    /// Schema datetime column used for temporal grouping. Requires bucket.
+    time: ?[]const u8 = null,
+    /// UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
+    bucket: ?[]const u8 = null,
     /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
     measure: ?[]const u8 = null,
 
@@ -25,6 +29,8 @@ pub const AlgebraicAggregateConfig = struct {
         .{ "name", "name", false },
         .{ "op", "op", false },
         .{ "group_by", "group_by", true },
+        .{ "time", "time", true },
+        .{ "bucket", "bucket", true },
         .{ "measure", "measure", true },
     };
 
@@ -44,6 +50,14 @@ pub const AlgebraicAggregateConfig = struct {
         try jw.write(self.op);
         if (self.group_by) |value| {
             try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.time) |value| {
+            try jw.objectField("time");
+            try jw.write(value);
+        }
+        if (self.bucket) |value| {
+            try jw.objectField("bucket");
             try jw.write(value);
         }
         if (self.measure) |value| {
@@ -732,6 +746,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
@@ -747,8 +763,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    /// LEANN tuning (dense only; requires algorithm=leann).
+    leann: ?LeannIndexConfig = null,
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
+    /// RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created. HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore candidates, which improves recall and reduces exact reranking at the cost of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation of vectors. LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits / 8 bytes per dimension.
+    quantization_bits: ?i64 = null,
+    quantization_refine: ?QuantizationRefine = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?antfly_embeddings_openapi.IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
@@ -771,6 +793,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -779,7 +802,11 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
+        .{ "quantization_bits", "quantization_bits", true },
+        .{ "quantization_refine", "quantization_refine", true },
         .{ "embedder", "embedder", false },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
@@ -823,6 +850,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
             try jw.write(value);
@@ -855,8 +886,24 @@ pub const CreateEmbeddingsIndexRequest = struct {
             try jw.objectField("distance_metric");
             try jw.write(value);
         }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.quantization_refine) |value| {
+            try jw.objectField("quantization_refine");
             try jw.write(value);
         }
         if (self.embedder) |value| {
@@ -1377,6 +1424,7 @@ pub const CreatedEmbeddingsIndex = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
+    external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
@@ -1388,6 +1436,8 @@ pub const CreatedEmbeddingsIndex = struct {
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    leann: ?LeannIndexConfig = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
@@ -1406,6 +1456,7 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -1414,6 +1465,8 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", false },
@@ -1460,6 +1513,10 @@ pub const CreatedEmbeddingsIndex = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
             try jw.write(value);
@@ -1490,6 +1547,14 @@ pub const CreatedEmbeddingsIndex = struct {
         }
         if (self.distance_metric) |value| {
             try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
             try jw.write(value);
         }
         if (self.mem_only) |value| {
@@ -1534,6 +1599,7 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
+    external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
@@ -1545,6 +1611,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    leann: ?LeannIndexConfig = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
@@ -1558,6 +1626,7 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -1566,6 +1635,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", false },
@@ -1595,6 +1666,10 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {
@@ -1627,6 +1702,14 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.distance_metric) |value| {
             try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
             try jw.write(value);
         }
         if (self.mem_only) |value| {
@@ -1674,6 +1757,8 @@ pub const CreatedEnrichmentConfig = struct {
     template: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
     expected_dims: ?i64 = null,
+    /// Effective embedding input mode; PDF pages are rasterized before embedding.
+    embedding_input: ?[]const u8 = null,
     /// Optional stable model/token-space identifier asserted for this embedding artifact.
     vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
@@ -1695,6 +1780,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "expected_dims", "expected_dims", true },
+        .{ "embedding_input", "embedding_input", true },
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
@@ -1742,6 +1828,10 @@ pub const CreatedEnrichmentConfig = struct {
         }
         if (self.expected_dims) |value| {
             try jw.objectField("expected_dims");
+            try jw.write(value);
+        }
+        if (self.embedding_input) |value| {
+            try jw.objectField("embedding_input");
             try jw.write(value);
         }
         if (self.vector_space) |value| {
@@ -2576,6 +2666,32 @@ pub const CreatedRelationalIndex = struct {
     }
 };
 
+/// Dense vector index algorithm (dense only). "hbc" (default) keeps quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ codes and recomputes exact distances for a few candidates per query, re-embedding them (see leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes do not yet support shard splits or native index backups.
+pub const DenseIndexAlgorithm = enum {
+    hbc,
+    leann,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .hbc => "hbc",
+            .leann => "leann",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "hbc", .hbc },
+            .{ "leann", .leann },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
 pub const DenseNativeStoragePhase = enum {
     legacy,
@@ -2855,6 +2971,675 @@ pub const DistanceMetric = enum {
             .{ "cosine", .cosine },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio. Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`. **Example:** ```json { "source": {"filename_field": "filename", "content_type_field": "mime_type"}, "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}}, "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}} } ```
+pub const DocumentExtractionConfig = struct {
+    source: ?DocumentExtractionSourceConfig = null,
+    /// Static filename used for content detection when the row has none.
+    filename: ?[]const u8 = null,
+    /// Static content type. Overrides the downloaded response's content type.
+    content_type: ?[]const u8 = null,
+    /// Static ETag recorded as source version metadata.
+    etag: ?[]const u8 = null,
+    /// Static checksum recorded as source version metadata.
+    checksum: ?[]const u8 = null,
+    /// Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+    checksum_algorithm: ?[]const u8 = null,
+    /// Static source version. Together with the other metadata it lets extraction skip unchanged sources.
+    version: ?[]const u8 = null,
+    /// Static last-modified timestamp recorded as source version metadata.
+    last_modified: ?[]const u8 = null,
+    /// Credential reference used to download the source URL.
+    credentials: ?[]const u8 = null,
+    /// Strip HTML markup from HTML sources before storing their text.
+    html_strip_tags: ?bool = null,
+    native_text: ?DocumentExtractionNativeTextConfig = null,
+    ocr: ?DocumentExtractionOcrConfig = null,
+    transcription: ?DocumentExtractionTranscriptionConfig = null,
+    /// How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
+    route_preset: ?[]const u8 = null,
+    /// Routes evaluated in order before the preset. The first route whose match applies selects the extractor.
+    routes: ?[]const DocumentExtractionRoute = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "source", "source", true },
+        .{ "filename", "filename", true },
+        .{ "content_type", "content_type", true },
+        .{ "etag", "etag", true },
+        .{ "checksum", "checksum", true },
+        .{ "checksum_algorithm", "checksum_algorithm", true },
+        .{ "version", "version", true },
+        .{ "last_modified", "last_modified", true },
+        .{ "credentials", "credentials", true },
+        .{ "html_strip_tags", "html_strip_tags", true },
+        .{ "native_text", "native_text", true },
+        .{ "ocr", "ocr", true },
+        .{ "transcription", "transcription", true },
+        .{ "route_preset", "route_preset", true },
+        .{ "routes", "routes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.filename) |value| {
+            try jw.objectField("filename");
+            try jw.write(value);
+        }
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.etag) |value| {
+            try jw.objectField("etag");
+            try jw.write(value);
+        }
+        if (self.checksum) |value| {
+            try jw.objectField("checksum");
+            try jw.write(value);
+        }
+        if (self.checksum_algorithm) |value| {
+            try jw.objectField("checksum_algorithm");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.last_modified) |value| {
+            try jw.objectField("last_modified");
+            try jw.write(value);
+        }
+        if (self.credentials) |value| {
+            try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        if (self.html_strip_tags) |value| {
+            try jw.objectField("html_strip_tags");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
+        if (self.ocr) |value| {
+            try jw.objectField("ocr");
+            try jw.write(value);
+        }
+        if (self.transcription) |value| {
+            try jw.objectField("transcription");
+            try jw.write(value);
+        }
+        if (self.route_preset) |value| {
+            try jw.objectField("route_preset");
+            try jw.write(value);
+        }
+        if (self.routes) |value| {
+            try jw.objectField("routes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+pub const DocumentExtractionNativeTextConfig = struct {
+    /// `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+    policy: ?[]const u8 = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
+pub const DocumentExtractionOcrConfig = struct {
+    reader: ?DocumentExtractionReaderConfig = null,
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
+    mode: ?[]const u8 = null,
+    /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
+    prompt: ?[]const u8 = null,
+    render: ?DocumentExtractionRenderConfig = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reader", "reader", true },
+        .{ "generator", "generator", false },
+        .{ "mode", "mode", true },
+        .{ "prompt", "prompt", true },
+        .{ "render", "render", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.reader) |value| {
+            try jw.objectField("reader");
+            try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.render) |value| {
+            try jw.objectField("render");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt.
+pub const DocumentExtractionReaderConfig = struct {
+    provider: []const u8,
+    /// Reader model, such as `lightonai/LightOnOCR-3-0.8B`.
+    model: ?[]const u8 = null,
+    /// Provider-level prompt. Hosted readers send their own read instruction when it is omitted.
+    prompt: ?[]const u8 = null,
+    /// Maximum output tokens per page.
+    max_tokens: ?i64 = null,
+    /// Reader endpoint URL.
+    api_url: ?[]const u8 = null,
+    /// Reader endpoint URL; takes precedence over `api_url`.
+    url: ?[]const u8 = null,
+    /// Provider API base URL.
+    base_url: ?[]const u8 = null,
+    /// API key, normally a `${secret:...}` reference.
+    api_key: ?[]const u8 = null,
+    /// Bearer token, normally a `${secret:...}` reference.
+    bearer_token: ?[]const u8 = null,
+    /// Capability token for an Antfly inference endpoint.
+    capability_token: ?[]const u8 = null,
+    /// Revision of the capability token.
+    capability_revision: ?[]const u8 = null,
+    /// Cloudflare account ID. Required for `cloudflare`.
+    account_id: ?[]const u8 = null,
+    /// Cloudflare AI Gateway ID.
+    gateway_id: ?[]const u8 = null,
+    /// Google Cloud project for `vertex`.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for `vertex`.
+    location: ?[]const u8 = null,
+    /// Path to Google Cloud credentials for `vertex`.
+    credentials_path: ?[]const u8 = null,
+    /// Apple Vision recognition languages. Defaults to `en-US`.
+    recognition_languages: ?[]const []const u8 = null,
+    /// Apple Vision recognition level.
+    recognition_level: ?[]const u8 = null,
+    /// Apple Vision language correction.
+    uses_language_correction: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "prompt", "prompt", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "api_url", "api_url", true },
+        .{ "url", "url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "bearer_token", "bearer_token", true },
+        .{ "capability_token", "capability_token", true },
+        .{ "capability_revision", "capability_revision", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "recognition_languages", "recognition_languages", true },
+        .{ "recognition_level", "recognition_level", true },
+        .{ "uses_language_correction", "uses_language_correction", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.bearer_token) |value| {
+            try jw.objectField("bearer_token");
+            try jw.write(value);
+        }
+        if (self.capability_token) |value| {
+            try jw.objectField("capability_token");
+            try jw.write(value);
+        }
+        if (self.capability_revision) |value| {
+            try jw.objectField("capability_revision");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.recognition_languages) |value| {
+            try jw.objectField("recognition_languages");
+            try jw.write(value);
+        }
+        if (self.recognition_level) |value| {
+            try jw.objectField("recognition_level");
+            try jw.write(value);
+        }
+        if (self.uses_language_correction) |value| {
+            try jw.objectField("uses_language_correction");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// How PDF pages are rasterized for OCR.
+pub const DocumentExtractionRenderConfig = struct {
+    /// PDF image sampling, separate from model resizing and normalization. `auto` smooths continuous-tone images while preserving one-bit scan coverage during minification. `pdf` honors the PDF's interpolation declarations. `smooth` uses bilinear sampling even for one-bit images (except stencil masks), which can soften fine lines. Effective policy, version, resolution, DPI and geometry are recorded in unit provenance.
+    sampling: ?[]const u8 = null,
+    /// Render resolution in dots per inch.
+    dpi: ?i64 = null,
+    /// `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
+    resolution: ?[]const u8 = null,
+    /// Maximum pixels per rendered page.
+    max_pixels: ?i64 = null,
+    /// Maximum width or height of a rendered page.
+    max_dimension: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "sampling", "sampling", true },
+        .{ "dpi", "dpi", true },
+        .{ "resolution", "resolution", true },
+        .{ "max_pixels", "max_pixels", true },
+        .{ "max_dimension", "max_dimension", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.sampling) |value| {
+            try jw.objectField("sampling");
+            try jw.write(value);
+        }
+        if (self.dpi) |value| {
+            try jw.objectField("dpi");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.max_pixels) |value| {
+            try jw.objectField("max_pixels");
+            try jw.write(value);
+        }
+        if (self.max_dimension) |value| {
+            try jw.objectField("max_dimension");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DocumentExtractionRoute = struct {
+    match: ?DocumentExtractionRouteMatch = null,
+    extractor: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "match", "match", true },
+        .{ "extractor", "extractor", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.match) |value| {
+            try jw.objectField("match");
+            try jw.write(value);
+        }
+        try jw.objectField("extractor");
+        try jw.write(self.extractor);
+        try jw.endObject();
+    }
+};
+
+/// Conditions a source must meet. Every condition given must match.
+pub const DocumentExtractionRouteMatch = struct {
+    /// Exact content type.
+    content_type: ?[]const u8 = null,
+    /// Content type prefix, such as `image/`.
+    content_type_prefix: ?[]const u8 = null,
+    /// Filename extension or list of extensions.
+    extension: ?std.json.Value = null,
+    /// Leading bytes or list of leading-byte prefixes.
+    magic_prefix: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content_type", "content_type", true },
+        .{ "content_type_prefix", "content_type_prefix", true },
+        .{ "extension", "extension", true },
+        .{ "magic_prefix", "magic_prefix", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.content_type_prefix) |value| {
+            try jw.objectField("content_type_prefix");
+            try jw.write(value);
+        }
+        if (self.extension) |value| {
+            try jw.objectField("extension");
+            try jw.write(value);
+        }
+        if (self.magic_prefix) |value| {
+            try jw.objectField("magic_prefix");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Names of row fields that carry source metadata. Each overrides the matching static field.
+pub const DocumentExtractionSourceConfig = struct {
+    /// Row field holding the source filename.
+    filename_field: ?[]const u8 = null,
+    /// Row field holding the source content type.
+    content_type_field: ?[]const u8 = null,
+    /// Row field holding the source ETag.
+    etag_field: ?[]const u8 = null,
+    /// Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field.
+    checksum_field: ?[]const u8 = null,
+    /// Row field holding the source version.
+    version_field: ?[]const u8 = null,
+    /// Row field holding the source last-modified timestamp.
+    last_modified_field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "filename_field", "filename_field", true },
+        .{ "content_type_field", "content_type_field", true },
+        .{ "etag_field", "etag_field", true },
+        .{ "checksum_field", "checksum_field", true },
+        .{ "version_field", "version_field", true },
+        .{ "last_modified_field", "last_modified_field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.filename_field) |value| {
+            try jw.objectField("filename_field");
+            try jw.write(value);
+        }
+        if (self.content_type_field) |value| {
+            try jw.objectField("content_type_field");
+            try jw.write(value);
+        }
+        if (self.etag_field) |value| {
+            try jw.objectField("etag_field");
+            try jw.write(value);
+        }
+        if (self.checksum_field) |value| {
+            try jw.objectField("checksum_field");
+            try jw.write(value);
+        }
+        if (self.version_field) |value| {
+            try jw.objectField("version_field");
+            try jw.write(value);
+        }
+        if (self.last_modified_field) |value| {
+            try jw.objectField("last_modified_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
+pub const DocumentExtractionTextQualityConfig = struct {
+    /// Minimum non-whitespace Unicode characters before text passes the length check.
+    min_chars: ?i64 = null,
+    /// Minimum words before the garbled-text check applies.
+    garbled_min_words: ?i64 = null,
+    /// Words sampled by the garbled-text check.
+    garbled_sample_words: ?i64 = null,
+    /// Maximum ratio of single-character words before text counts as garbled.
+    max_single_char_word_ratio: ?f64 = null,
+    /// Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+    min_line_chars: ?i64 = null,
+    /// Maximum ratio of corrupted lines.
+    max_corrupted_line_ratio: ?f64 = null,
+    /// Font corruption score above which a substantial line counts as corrupted.
+    max_font_corruption: ?f64 = null,
+    /// Maximum ratio of Unicode replacement characters.
+    max_replacement_ratio: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "min_chars", "min_chars", true },
+        .{ "garbled_min_words", "garbled_min_words", true },
+        .{ "garbled_sample_words", "garbled_sample_words", true },
+        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
+        .{ "min_line_chars", "min_line_chars", true },
+        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
+        .{ "max_font_corruption", "max_font_corruption", true },
+        .{ "max_replacement_ratio", "max_replacement_ratio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
+            try jw.write(value);
+        }
+        if (self.garbled_min_words) |value| {
+            try jw.objectField("garbled_min_words");
+            try jw.write(value);
+        }
+        if (self.garbled_sample_words) |value| {
+            try jw.objectField("garbled_sample_words");
+            try jw.write(value);
+        }
+        if (self.max_single_char_word_ratio) |value| {
+            try jw.objectField("max_single_char_word_ratio");
+            try jw.write(value);
+        }
+        if (self.min_line_chars) |value| {
+            try jw.objectField("min_line_chars");
+            try jw.write(value);
+        }
+        if (self.max_corrupted_line_ratio) |value| {
+            try jw.objectField("max_corrupted_line_ratio");
+            try jw.write(value);
+        }
+        if (self.max_font_corruption) |value| {
+            try jw.objectField("max_font_corruption");
+            try jw.write(value);
+        }
+        if (self.max_replacement_ratio) |value| {
+            try jw.objectField("max_replacement_ratio");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Transcribes audio units.
+pub const DocumentExtractionTranscriptionConfig = struct {
+    transcriber: antfly_audio_openapi.STTConfig,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "transcriber", "transcriber", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("transcriber");
+        try jw.write(self.transcriber);
+        try jw.endObject();
     }
 };
 
@@ -3165,13 +3950,15 @@ pub const EmbeddingSourceCoverageStatus = struct {
     }
 };
 
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index; `algorithm` selects HBC (default) or LEANN. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
@@ -3187,8 +3974,14 @@ pub const EmbeddingsIndexConfig = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    /// LEANN tuning (dense only; requires algorithm=leann).
+    leann: ?LeannIndexConfig = null,
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
+    /// RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created. HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore candidates, which improves recall and reduces exact reranking at the cost of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation of vectors. LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits / 8 bytes per dimension.
+    quantization_bits: ?i64 = null,
+    quantization_refine: ?QuantizationRefine = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?antfly_embeddings_openapi.IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
@@ -3207,6 +4000,7 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
@@ -3215,7 +4009,11 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
+        .{ "quantization_bits", "quantization_bits", true },
+        .{ "quantization_refine", "quantization_refine", true },
         .{ "embedder", "embedder", false },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
@@ -3244,6 +4042,10 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.external) |value| {
             try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
             try jw.write(value);
         }
         if (self.sparse) |value| {
@@ -3278,8 +4080,24 @@ pub const EmbeddingsIndexConfig = struct {
             try jw.objectField("distance_metric");
             try jw.write(value);
         }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.quantization_refine) |value| {
+            try jw.objectField("quantization_refine");
             try jw.write(value);
         }
         if (self.embedder) |value| {
@@ -3830,6 +4648,8 @@ pub const EnrichmentConfig = struct {
     template: ?[]const u8 = null,
     /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor).
     source_artifact_name: ?[]const u8 = null,
+    /// pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
+    embedding_input: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
     /// Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
@@ -3866,6 +4686,7 @@ pub const EnrichmentConfig = struct {
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
+        .{ "embedding_input", "embedding_input", true },
         .{ "expected_dims", "expected_dims", true },
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
@@ -3913,6 +4734,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.source_artifact_name) |value| {
             try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.embedding_input) |value| {
+            try jw.objectField("embedding_input");
             try jw.write(value);
         }
         if (self.expected_dims) |value| {
@@ -6518,7 +7343,7 @@ pub const GraphMatch = struct {
     }
 };
 
-/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
+/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     from: antfly_graph_identifier_openapi.GraphIdentifier,
@@ -8028,8 +8853,11 @@ pub const GraphQueryParams = struct {
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
+    /// Global result-entry limit shared by all starts; root-specific path entries each consume one slot.
     max_results: ?i64 = null,
+    /// Deduplicate nodes per root when include_paths is true, otherwise across all starts.
     deduplicate_nodes: ?bool = null,
+    /// Preserve independent paths per start; the first path node identifies the root. max_depth is measured from each root.
     include_paths: ?bool = null,
     weight_mode: ?PathWeightMode = null,
     k: ?i64 = null,
@@ -8209,7 +9037,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     field: []const u8,
     op: []const u8,
     /// Non-null scalar comparison value. Omit for is_null and is_not_null.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Datetime compares RFC3339 instants rather than string ordering.
     value_type: ?[]const u8 = null,
 
@@ -8217,7 +9045,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "field", "field", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "value_type", "value_type", true },
     };
 
@@ -8235,9 +9063,16 @@ pub const GraphRelationshipPropertyPredicate = struct {
         try jw.write(self.field);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.value_type) |value| {
             try jw.objectField("value_type");
@@ -8256,7 +9091,7 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+    /// Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
     decider: antfly_common_openapi.DeciderConfig,
     /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,
@@ -9017,7 +9852,7 @@ pub const GraphShortestPathQuery = struct {
 /// A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
-/// Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
+/// Breadth-first traversal by exact table-qualified node identity. With include_paths, visited state and deduplication are independent per start node, preserving paths between roots and overlapping root provenance. The first node in each path identifies its root. Without include_paths, result nodes are deduplicated across starts. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
 pub const GraphTraversal = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     start: GraphNodeSelector,
@@ -9025,11 +9860,11 @@ pub const GraphTraversal = struct {
     direction: ?EdgeDirection = null,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
-    /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
+    /// Maximum hop depth measured independently from each start. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
-    /// Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+    /// With include_paths, return each node once per start, preserving a separate path for every reaching root. Without include_paths, return each node once across all starts. Set false with include_paths to enumerate reaching paths within a root. Depth, result, and shared request work limits still bound enumeration.
     deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
@@ -9193,6 +10028,7 @@ pub const GraphWhereExpression = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "and",
         })) {
@@ -9322,6 +10158,8 @@ pub const IndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
@@ -9333,6 +10171,12 @@ pub const IndexConfig = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    /// LEANN tuning (dense only; requires algorithm=leann).
+    leann: ?LeannIndexConfig = null,
+    /// RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created. HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore candidates, which improves recall and reduces exact reranking at the cost of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation of vectors. LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits / 8 bytes per dimension.
+    quantization_bits: ?i64 = null,
+    quantization_refine: ?QuantizationRefine = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?antfly_embeddings_openapi.IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
@@ -9389,12 +10233,17 @@ pub const IndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
+        .{ "quantization_bits", "quantization_bits", true },
+        .{ "quantization_refine", "quantization_refine", true },
         .{ "embedder", "embedder", false },
         .{ "chunker", "chunker", false },
         .{ "top_k", "top_k", true },
@@ -9480,6 +10329,10 @@ pub const IndexConfig = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
             try jw.write(value);
@@ -9502,6 +10355,22 @@ pub const IndexConfig = struct {
         }
         if (self.distance_metric) |value| {
             try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.quantization_refine) |value| {
+            try jw.objectField("quantization_refine");
             try jw.write(value);
         }
         if (self.embedder) |value| {
@@ -10094,6 +10963,69 @@ pub const IndexType = enum {
     }
 };
 
+/// Tuning for algorithm=leann dense indexes. All fields are optional.
+pub const LeannIndexConfig = struct {
+    /// Graph degree cap M. Most nodes keep M/5 neighbors after pruning; hubs keep up to M.
+    max_degree: ?i64 = null,
+    /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
+    quantizer: ?[]const u8 = null,
+    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    vector_storage: ?[]const u8 = null,
+    /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
+    search_ef: ?i64 = null,
+    /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
+    bound_scale: ?f32 = null,
+    /// Candidates recomputed per batch. 0 uses k.
+    batch_size: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_degree", "max_degree", true },
+        .{ "quantizer", "quantizer", true },
+        .{ "vector_storage", "vector_storage", true },
+        .{ "search_ef", "search_ef", true },
+        .{ "bound_scale", "bound_scale", true },
+        .{ "batch_size", "batch_size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_degree) |value| {
+            try jw.objectField("max_degree");
+            try jw.write(value);
+        }
+        if (self.quantizer) |value| {
+            try jw.objectField("quantizer");
+            try jw.write(value);
+        }
+        if (self.vector_storage) |value| {
+            try jw.objectField("vector_storage");
+            try jw.write(value);
+        }
+        if (self.search_ef) |value| {
+            try jw.objectField("search_ef");
+            try jw.write(value);
+        }
+        if (self.bound_scale) |value| {
+            try jw.objectField("bound_scale");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
 pub const LegacyGraphDocumentQuery = std.json.ArrayHashMap(std.json.Value);
 
@@ -10436,12 +11368,14 @@ pub const MediaOutputCoverageCounts = struct {
     embedding: ?MediaOutputCoverageValues = null,
     transcribe: ?MediaOutputCoverageValues = null,
     classify: ?MediaOutputCoverageValues = null,
+    diarize: ?MediaOutputCoverageValues = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "embedding", "embedding", true },
         .{ "transcribe", "transcribe", true },
         .{ "classify", "classify", true },
+        .{ "diarize", "diarize", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10464,6 +11398,10 @@ pub const MediaOutputCoverageCounts = struct {
         }
         if (self.classify) |value| {
             try jw.objectField("classify");
+            try jw.write(value);
+        }
+        if (self.diarize) |value| {
+            try jw.objectField("diarize");
             try jw.write(value);
         }
         try jw.endObject();
@@ -10588,7 +11526,7 @@ pub const MergeStrategy = enum {
     }
 };
 
-/// Filter nodes during graph traversal using existing query primitives
+/// Admission predicate applied to every start, target and intermediate node before returning or expanding it, for all graph operations. Denied nodes cannot occur in result paths or expose descendants through traversal.
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
     filter_query: ?LegacyGraphDocumentQuery = null,
@@ -11164,6 +12102,32 @@ pub const Pruner = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// How an HBC dense index with quantization_bits above 1 uses its extended codes (not allowed with algorithm=leann). near_cutoff scores with 1-bit codes and rescores only candidates that could still enter the result candidates; all rescores every scanned vector.
+pub const QuantizationRefine = enum {
+    near_cutoff,
+    all,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .near_cutoff => "near_cutoff",
+            .all => "all",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "near_cutoff", .near_cutoff },
+            .{ "all", .all },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

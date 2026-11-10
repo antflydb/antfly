@@ -21,3 +21,6 @@ pub const table_reads = struct {};
 pub const table_writes = struct {};
 
 pub const storage_engine = @import("storage/engine.zig");
+
+pub const read_session_types = @import("storage/read_session_types.zig");
+pub const read_session_source_types = @import("storage/read_session_source_types.zig");

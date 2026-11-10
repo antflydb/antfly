@@ -77,7 +77,9 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     self.arena = .init(self.budget.allocator());
     errdefer self.destroy();
     const alloc = self.arena.allocator();
-    const payload = try page.decodePagePayloadAlloc(alloc, header, try parquet.compressionCodecForColumnChunk(chunk), encoded);
+    // Projection framing outlives the fetched RangeLease. Retain an owned
+    // payload in this arena; ordinary synchronous decoders borrow that lease.
+    const payload = try (try page.decodePagePayloadAlloc(alloc, header, try parquet.compressionCodecForColumnChunk(chunk), encoded)).intoOwned(alloc);
     var data: []const u8 = payload.bytes;
     var present: usize = 0;
     if (chunk.nullable) {
@@ -445,11 +447,14 @@ test "lake SQL selected page owns framing borrows strings and preserves nullable
         fn run(a: A) !void {
             // Nullable V1 levels: present, NULL, present. Only one wide value
             // survives; the other stays as an immutable wire slice.
-            const payload = [_]u8{ 6, 0, 0, 0, 2, 1, 2, 0, 2, 1, 3, 0, 0, 0, 'o', 'n', 'e', 3, 0, 0, 0, 't', 'w', 'o' };
+            var payload = [_]u8{ 6, 0, 0, 0, 2, 1, 2, 0, 2, 1, 3, 0, 0, 0, 'o', 'n', 'e', 3, 0, 0, 0, 't', 'w', 'o' };
             const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = payload.len, .uncompressed_page_size = payload.len, .value_count = 3, .encoding = .plain };
             const chunk: Chunk = .{ .column_id = @constCast("s"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("byte_array"), .nullable = true };
             const selected = (try create(a, chunk, header, &payload, null, 65536)).?;
             defer selected.destroy();
+            // The fetch lease may be released/reused before deferred framing
+            // or selected strings are read, including nullable level indexes.
+            @memset(&payload, 0xff);
             var output = std.heap.ArenaAllocator.init(a);
             defer output.deinit();
             const encoded_evidence = (try selected.evidence(output.allocator(), 0, 3)).?;
@@ -499,6 +504,7 @@ test "lake SQL encoded numeric predicate runs preserve exact integers selections
     const chunk: Chunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("int64") };
     const selected = (try create(a, chunk, header, &payload, null, 65536)).?;
     defer selected.destroy();
+    @memset(&payload, 0xff);
     var unsupported = chunk;
     unsupported.logical_type = @constCast("int8");
     try std.testing.expect((try create(a, unsupported, header, &payload, null, 65536)) == null);

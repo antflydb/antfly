@@ -31,10 +31,12 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
-        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout", "async_context_layout", "enrichment_runtime_layout", "relationalReader_layout", "relationalSession_layout", "documentSession_layout", "index_manager_layout", "algebraic_index_layout", "docstore_layout", "rewrite_program_layout", "enrichment_set_layout", "backup_snapshot_layout", "resolution_runtime_layout", "promotion_runtime_layout", "pinned_snapshot_layout", "staged_generation_layout", "generation_manager_layout", "native_manifest_layout", "writer_layout" }) |field| {
-            const actual = @field(descriptor, field);
-            const expected = @field(engine, field);
-            std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
+        inline for (@typeInfo(engine.Descriptor).@"struct".field_names, @typeInfo(engine.Descriptor).@"struct".field_types) |field, T| {
+            if (comptime T == @TypeOf(engine.table_layout)) {
+                const actual = @field(descriptor, field);
+                const expected = @field(engine, field);
+                if (!actual.matches(expected)) std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
+            }
         }
         for (descriptor.index_manager_fields[0..descriptor.index_manager_field_count], engine.index_manager_fields) |actual, expected| {
             if (!std.mem.eql(u8, std.mem.span(actual.type_name), std.mem.span(expected.type_name)) or actual.offset != expected.offset)
@@ -374,7 +376,8 @@ fn exerciseRelationalLifetime(alloc: std.mem.Allocator, root: []const u8, io: st
     };
     var filter: Filter = .{};
     var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"n"}, .row_filter = .{ .context = &filter, .matches = Filter.matches } });
-    defer reader.deinit();
+    var reader_open = true;
+    defer if (reader_open) reader.deinit();
     var page = try reader.nextTypedPage(alloc, io, .{ .rows = 1 });
     defer page.deinit();
     if (page.rows.len != 1) return error.SharedStorageQueryFailed;
@@ -382,6 +385,10 @@ fn exerciseRelationalLifetime(alloc: std.mem.Allocator, root: []const u8, io: st
     defer second.deinit();
     if (second.rows.len != 1) return error.SharedStorageQueryFailed;
     if (filter.visits != 2) return error.SharedStorageQueryFailed;
+    reader.deinit();
+    reader_open = false;
+    // Complete owner pages retain their own storage after reader close.
+    if (page.owner_release == null or second.owner_release == null or page.rows[0].typed == null) return error.SharedStorageQueryFailed;
     var failing = try db.beginRelationalRows(alloc, .{ .fields = &.{"n"}, .row_filter = .{ .context = &filter, .matches = Filter.matches } });
     defer failing.deinit();
     filter.fail = true;
@@ -391,11 +398,27 @@ fn exerciseRelationalLifetime(alloc: std.mem.Allocator, root: []const u8, io: st
         return error.SharedStorageErrorIdentityLost;
     } else |err| if (err != error.TestWindowFailed) return error.SharedStorageErrorIdentityLost;
     try db.catchUpPendingDerivedReplay();
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":9007199254740993}" }} });
+    // Exercise the actual CAPI SQL SearchCursor while this independent unit
+    // uses client-mode storage: ranking and delayed hydration use capabilities.
+    const sql = client.sql_binding;
+    var adapter = sql.Adapter(client.capi.antfly){ .db = db, .table_name = "rows" };
+    var compiled = try sql.compiler.compile(alloc, "SELECT n FROM antfly_search('rows', '{}', 10) ORDER BY n DESC", .{});
+    defer compiled.deinit();
+    var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    if (result.output.rows.len != 2) return error.SharedStorageQueryFailed;
+    const exact = switch (result.output.rows[0][0]) {
+        .integer => |value| value == 9007199254740993,
+        .string => |value| std.mem.eql(u8, value, "9007199254740993"),
+        else => false,
+    };
+    if (!exact) return error.SharedStorageQueryFailed;
 }
 
 fn exerciseFactoryAggregationBackup(alloc: std.mem.Allocator, database: *db_mod.DB, root: []const u8, physical: []const u8, io: std.Io) !void {
     const write = client.antfly_sources.local_write;
-    var enrichment = try write.createManagedDbEnrichments(alloc, "{}", database.backend_runtime, null, null, null, "", null, null);
+    var enrichment = try write.createManagedDbEnrichments(alloc, "{}", database.backend_runtime, null, null, null, null, "", null, null);
     defer enrichment.deinit(alloc);
     if (enrichment.generated) return error.SharedStorageInvalidBatchAccepted;
     var result = try database.search(alloc, .{ .include_stored = true });

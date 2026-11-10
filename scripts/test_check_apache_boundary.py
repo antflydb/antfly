@@ -220,6 +220,45 @@ class ApacheBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(any("unreviewed module" in error for error in errors))
 
+    def test_cypher_modules_traverse_regex_and_reject_server_dependencies(self):
+        graph = "zig/lib/cypher/root.zig"
+        regex = "zig/lib/regex/src/captures.zig"
+        sources = {
+            graph: 'const regex = @import("cypher_regex_capture");',
+            regex: "",
+        }
+        seen, errors = self.check_fixture('const graph = @import("cypher");', sources)
+        self.assertIn(graph, seen)
+        self.assertIn(regex, seen)
+        self.assertEqual([], errors)
+        sources[regex] = 'const server = @import("../../../pkg/antfly/src/main.zig");'
+        _, errors = self.check_fixture('const graph = @import("cypher");', sources)
+        self.assertTrue(any("server dependency" in error for error in errors))
+
+    def test_generating_traverses_chat_context_and_rejects_server_dependencies(self):
+        generating = "zig/lib/generating/src/mod.zig"
+        adapter = "zig/lib/generating/src/context_management.zig"
+        planner = "zig/lib/chat_context/root.zig"
+        preparation = "zig/lib/chat_context/preparation.zig"
+        sources = {
+            generating: 'const context = @import("context_management.zig");',
+            adapter: 'const planner = @import("antfly_chat_context");',
+            planner: 'pub const preparation = @import("preparation.zig");',
+            preparation: 'const planner = @import("root.zig");',
+        }
+        seen, errors = self.check_fixture(
+            'const generating = @import("antfly_generating");', sources
+        )
+        self.assertEqual([], errors)
+        self.assertTrue(set(sources).issubset(seen))
+        sources[preparation] = (
+            'const server = @import("../../pkg/antfly/src/main.zig");'
+        )
+        _, errors = self.check_fixture(
+            'const generating = @import("antfly_generating");', sources
+        )
+        self.assertTrue(any("server dependency" in error for error in errors))
+
     def test_rejects_server_only_generated_api(self):
         for module in (
             "antfly_admin_openapi",

@@ -365,7 +365,7 @@ design, prompt contract, parity qualification, performance, and limits are in
   configs as readers.
 - The `/read` prompt is the question in upstream's
   `<image>...Question: {q}\n\nAnswer: ` template; an empty prompt asks
-  `Describe this image.`. Answers go through the existing Moondream parser:
+  `Transcribe all text in this image.`, matching the OCR default of the other readers. Answers go through the existing Moondream parser:
   `text` always, `fields` and the structured payload when the answer is JSON.
 - The model-gated `/api/read` e2e
   (`test_read_moondream_model_exposes_optional_fields`) runs without any

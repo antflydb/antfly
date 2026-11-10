@@ -758,6 +758,7 @@ fn mergeHierarchyChildrenSearchResults(
                     // retry rather than blaming the request with a 400.
                     return error.StorageReadTemporarilyUnavailable;
                 }
+                if (req.hierarchy_children.?.artifact_name != null and existing.stored_data != null and hit.stored_data != null and !std.mem.eql(u8, existing.stored_data.?, hit.stored_data.?)) return error.StorageReadTemporarilyUnavailable;
                 if (existing.stored_data == null and hit.stored_data != null) {
                     var richer = try hit.clone(alloc);
                     errdefer richer.deinit(alloc);
@@ -787,6 +788,7 @@ fn mergeHierarchyChildrenSearchResults(
     // Preserve direct/internal shard behavior by leaving deferred requests as
     // empty partial plans for their caller to merge.
     if (!req.defer_hierarchy_child_hydration and
+        req.hierarchy_children.?.artifact_name == null and
         req.search_after.len > 0 and
         total_hits == 0 and
         candidates.items.len == 0)
@@ -1406,6 +1408,8 @@ fn artifactRefRetainedBytes(artifact: db_mod.types.ArtifactRef) usize {
     var total: usize = @sizeOf(db_mod.types.ArtifactRef);
     retainedAdd(&total, artifact.document_id.len);
     retainedAdd(&total, artifact.name.len);
+    if (artifact.revision) |value| retainedAdd(&total, value.len);
+    if (artifact.derivation_revision) |value| retainedAdd(&total, value.len);
     if (artifact.unit_id) |unit_id| retainedAdd(&total, unit_id.len);
     if (artifact.source) |source| {
         retainedAdd(&total, @sizeOf(db_mod.types.ArtifactSourceRef));
@@ -5438,7 +5442,7 @@ fn consumerTests() type {
         }
 
         test "query merge preserves graph table provenance under allocation failure" {
-            try std.testing.checkAllAllocationFailures(
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(
                 std.testing.allocator,
                 expectGraphTableProvenanceMerge,
                 .{},

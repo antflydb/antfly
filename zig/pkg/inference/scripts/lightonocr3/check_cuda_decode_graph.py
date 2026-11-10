@@ -35,7 +35,7 @@ parser.add_argument("--artifact", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 cli = parser.parse_args()
 Params = oracle.Params
-assert c.sizeof(Params) == 17264
+assert c.sizeof(Params) == 17520
 D = Driver(cli.artifact)
 results = []
 functions = {}
@@ -74,11 +74,13 @@ graph = None
 try:
     torch.set_num_threads(4)
     for heads, kh in [(8, 2), (16, 4)]:
-        for batch in [2, 16, 64, 66, 128]:
+        for batch in [2, 4, 16, 64, 66, 128]:
             for chunk in [32, 128]:
                 torch.manual_seed(152)
                 page_size = 16
                 lengths = ([31, 32, 63, 127, 255, 432, 554, 662] * 16)[:batch]
+                if batch in (2, 4):
+                    lengths = [1914, 2697, 4096, 8192][:batch]
                 replays = 5
                 counts = [math.ceil((n + replays * 2) / page_size) for n in lengths]
                 blocks = sum(counts)
@@ -140,14 +142,20 @@ try:
                             graph_progress=progress.data_ptr(),
                             graph_step=step,
                         )
+                        block_cursor = 0
                         for row in range(items):
                             i = offset + row
                             p.pages[row] = oracle.Page(
                                 lengths[i] + step,
                                 lengths[i] + step - 1,
                                 counts[i],
-                                (c.c_uint32 * 64)(*tables[i]),
+                                block_cursor,
                             )
+                            p.blocks[block_cursor : block_cursor + counts[i]] = tables[
+                                i
+                            ]
+                            block_cursor += counts[i]
+                            assert block_cursor <= 4096
                         step_packets.append(p)
                     packets.append(step_packets)
                     outputs.append(output)

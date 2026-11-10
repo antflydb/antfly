@@ -422,6 +422,11 @@ configuration that materializes into a normal enrichment catalog entry. This
 matches dense/sparse AKNN behavior: the index depends on an enrichment, and the
 enrichment produces artifacts.
 
+Neighbor context can sample an entity table's local graph. Point a
+conceptualizer at a context graph whose sources are independent of that
+conceptualizer; the catalog rejects producer feedback cycles. Generated `is_a`
+edges can live in a separate taxonomy graph on the same table.
+
 The shorthand shape should reuse Antfly's public enrichment config fields:
 
 ```json
@@ -913,6 +918,11 @@ Result semantics should preserve existing graph behavior:
   independent relationship identity and producing-document ownership.
 - Frontier nodes may be deduplicated for expansion.
 - Path state should preserve the edge sequence used to reach a result.
+
+A traversal supports `direction: "both"`, `max_depth: 2`, `include_documents`
+and `include_paths`, including starts from `$query_results`. In Lite, set
+`deduplicate_nodes: false` to retain distinct paths from multiple seeds.
+Traversal depth, result and work limits still apply.
 
 ## Recovery And Rebuild
 

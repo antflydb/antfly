@@ -865,7 +865,12 @@ writes. Events include their originating branch, so consumers can fetch the corr
 record view. Private branch heads further restrict the indexed audience, independently
 of a record's team visibility. Each target is checked against its current branch
 root and source grants. Events carry IDs/revisions, never claim text, judge explanations or source
-payloads. Separate team/private and curator audience indexes bound page work.
+payloads. Pins/unpins and retained outcome-signal changes also publish targetless
+context invalidations. Team pins reach the branch's readers; private pins and
+outcomes keep the private owner's audience. Cleanup and signal backfill retain
+the originating branch. Legacy outcomes without branch metadata conservatively
+invalidate the owner's context through the trunk. Separate team/private and
+curator audience indexes bound page work.
 Current source grants and retention are rechecked on every target. An unavailable
 or forgotten target becomes a generic `context_invalidated` event with no target
 ID. An event is not a read lease. Agents, UIs or approval routers may poll this feed;
@@ -1019,6 +1024,25 @@ server-owned keystore/environment references. Pattern maintenance follows primar
 provider documentation such as [GitHub's supported secret patterns](https://docs.github.com/en/code-security/reference/secret-security/supported-secret-scanning-patterns),
 [AWS access-key guidance](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html),
 and [Slack token types](https://docs.slack.dev/authentication/tokens/).
+
+## Session brief, consolidation review and outcome utility
+
+These follow the layer model in Anthropic's [components of agent memory](https://www.anthropic.com/research/components-of-agent-memory) (issue #1565): evidence is the transcript layer, assertions are notes, entity views are linked representations, and the brief is the small injected-context layer. Consolidation, which the article calls dreaming, maintains the layers offline.
+
+- **Brief.** `brief` (`GET|POST /memory/v1/spaces/{space}/brief`) is a read that returns at most 64 compact items (id, statement, kind, subject, predicate, scope, stability, valid_from, pinned, score, utility) and the eight most-referenced canonical subjects. The whole rendered response fits `token_budget` (default 1024, at most `max_recall_tokens`). It uses the bounded current-memory scan: pinned ids first, then at most 4,096 primary assertion rows, through `recallHit`, so authorization, `known_at`, time, retention, evidence visibility and canonical subjects match recall. Only `active` claims enter, unless pinned. Provisional claims are excluded unless `include_provisional` is set. Restated claims collapse as in recall. The score is a fixed kind weight (constraint and preference 3, procedural and lesson 2.5, decision 2, summary 1.5, semantic and rationale 1, otherwise 0.5), plus 1 if settled, plus 0.25 if observed, minus 1 if hypothesized, plus twice the utility, plus 100 if pinned. Ties break on id.
+- **Pins.** `pin` (`POST .../pins`) writes or removes `brief-pin/<sha256(branch,id)>`. Pins are branch-local raw rows and are not inherited by forks; a space holds at most 256. A pin of a team-visible assertion requires curator access, and a pin of a private assertion requires the owner. Reads recheck the pinned assertion. Pin reasons pass through the configured credential screening policy. Unpinning remains available after evidence expires; maintenance removes pins after forgetting, expiry, or removal of the assertion.
+- **Outcome utility.** `outcome` writes two reverse bindings per used memory: an administrator lane, `outcome-use/<sha256(branch)>/<sha256(memory)>/<sha256(outcome)>`, and an owner lane, `outcome-owner-use/<sha256(branch)>/<sha256(owner)>/<sha256(memory)>/<sha256(outcome)>`. Utility reads at most 64 bindings per memory within the selected branch and authorized audience. Ordinary callers scan only their owner lane, so another owner’s private feedback cannot consume their read cap; administrators use the all-owner lane. It rechecks retention of every outcome input before counting it and excludes outcomes recorded after `known_at`. It counts only outcomes the caller owns, or outcomes an administrator is currently authorized to read. Utility hydrates compact `outcome-signal/<sha256(outcome)>` metadata, never task/detail payloads; shared signals and retention decisions are decoded once per request. A request admits at most 4 MiB of signal JSON, 4,096 reverse bindings and 4,096 outcome input references. Budget exhaustion or missing legacy metadata sets `utility.complete=false`. Explicit entity-seeded graph recall applies utility after graph propagation and reorders assertion results without changing graph topology. The score is `(s - f) / (s + f + 2)`. Recall applies it only when `utility_weight` is in (0, 1]; the field is omitted from encodings at 0, so pinned evaluation inputs keep their bytes. Maintenance checks outcome retention while visiting each reverse binding, so retiring an outcome input cannot strand bindings that sort before the outcome row. A branch prefix keeps outcomes in unrelated branches out of the bounded scan. A dedicated maintenance migration backfills both reverse indexes and compact signals for existing outcomes, in pages of at most 16 outcomes and 1,024 input bindings, including outcomes that predate reverse bindings. Each migration page shares its retention turn with ordinary cleanup and resource checks, so a large feedback history cannot starve retention. The lane is selected before advancing migration state and remains fixed through commit; publishing the final page cannot invoke models under a retention budget. Its control-row cursor commits atomically with the index writes; concurrent outcome writes populate both indexes even when their keys precede the cursor. Utility reads report `utility.complete=false` until this migration completes; ordinary reads never fall back to a mixed-owner scan. Legacy branchless outcomes enter the main lane. Cleanup removes retired bindings from both indexes. Policy evaluation pins a feedback revision as well as knowledge/configuration revisions and cancels on feedback changes.
+- **Consolidation review.** `consolidate` (`POST .../consolidation`) is a resumable read. It visits claims and then canonical entities in deterministic record order, ordering findings by kind/id within each claim. Each request performs at most 256 root/posting work steps and emits at most `limit` findings (1–256). Follow `next_cursor` until `complete=true`, including pages with no findings. Cursors bind principal, branch, space revision and staleness window, preserve the initial review time, and resume within a claim when its findings overflow. Sum per-page `stats` for visible current-memory totals; `omitted` reports known findings deferred within the current claim. Duplicate probes use indexed postings across pages and canonical aliases. Orphans are emitted only after every identity dependency posting is checked. Alternative support dependencies are checked for dangling links. Denied source access is not irreversible retirement. Similarity never authorizes belief changes.
+- **Proposal preparation.** `prepare_consolidation` consumes at most 32 review findings. Each pair uses metadata projections for support, retention and authority traversal. Only explicit current/frozen pin hydration loads complete claims, including procedure steps, preconditions and expected outcomes, into reusable pair-local scratch storage. A complete-record read bypasses and upgrades any cached metadata projection, including a dependency that later becomes a pin; full payloads never enter the shared metadata proof cache. Policy/support hydration shares an 8 MiB read budget across the prepared page; exhaustion rejects the transaction atomically with `MemoryWorkLimit`, allowing a retry with a smaller limit. Only compact proposal/index writes, owned IDs and private policy proofs survive each pair. A request-local cache retains at most 64 encoded proofs and 1 MiB of proof JSON; it memoizes fingerprints computed from complete claims and validates complete frozen records once per admitted claim. It retains no procedure/vector payloads or public ClaimViews. Cache admission stops at either bound and excess entries use the same uncached scratch path. Source and control fences cover all cached proofs, and each new preparation request rebuilds them. Fingerprints stream the same JSON bytes into SHA-256 without retaining serialized payload buffers; full frozen pins and final source fences remain mandatory. Every existing-proposal path, including legacy IDs and receipt-stable collision alternatives, checks branch, configuration, claim IDs, revisions, fingerprints, frozen records and retained provenance before reuse. An explicit ID collision cannot reuse a foreign decision or remove another branch’s open entry. Collision retries are bounded at 32 candidates and fail atomically if exhausted.
+- **Bounded metadata hydration.** Brief, consolidation and inspection stream authoritative records through shared reusable scratch readers. Brief retains only compact top candidates; consolidation retains only requested findings, and inspection retains counts. Native and routed adapters project all policy metadata while omitting steps, preconditions, expected-outcome text and vector payloads before transport for all three reads. A 512 KiB page workspace adaptively reduces batch size; a single oversized record may spill into reusable scratch storage. An 8 MiB initial read budget bounds hydration and source checks; exhaustion sets `complete=false`. Consolidation and inspection commit progress only after a complete root step, so continuation retries any unfinished record without losing findings or double-counting statistics. A first record exceeding the work/read budget returns `MemoryWorkLimit`. Final source fences recheck each unique resource with reusable scratch storage. Small proof rows share a 1 MiB cache, while large payloads are discarded per record. Source validation retains payload hashes and owned routing metadata, then rechecks sources at the final read fence. The response budget remains independent of working storage. Pins participate in the evaluation feedback/context revision so policy runs cannot mix different brief pin sets.
+- **Verification and access.** Explicit `correct` to active/settled records `last_verified_at`; staleness starts there, falling back to `recorded_from`. The unset timestamp is omitted to preserve pre-upgrade claim fingerprints. Forgetting correction provenance hides its verification timestamp. Reads remain side-effect free. `access` (`POST .../accesses`, `{memory_ids:[...]}`) records IDs actually consumed, once per distinct ID, with durable operation-key deduplication. `usage` (`GET .../memories/{id}/usage`) returns the caller's branch-local `recalls`, `last_recalled_at`, `last_verified_at` and retained outcome utility. Access rows are private to the principal/branch; maintenance removes retired records.
+- **Growth inspection.** `inspect` (`GET .../{space}?limit=256&cursor=...`) includes `statistics`: retained memory totals by kind, lifecycle, stability and producer, pins, entities, `scanned`, `next_cursor` and `complete`. Follow continuation and sum per-page counts to track retained space growth, including superseded/retracted records. Historical revision rows are not separate memories. Authorization and retention remain live; writes invalidate cursors.
+- **Write-time signals and proposals.** Observation/assertion receipts expose `duplicate_ids` from a bounded exact-restatement probe (32 postings, at most eight peers). `near_duplicate_ids` adds advisory lexical matches (coverage at least 0.8) from subject/predicate postings under a separate 32-posting/eight-peer budget. Neither signal claims exhaustive coverage or invokes inference. Deeper semantic/lexical matches remain available through supersession candidates. Curators call `prepare_consolidation` (`POST .../consolidation-proposals`) to create up to 32 deterministic revision-pinned proposals from a review page; continue with the receipt's `review_cursor`. `proposal_ids` enter the existing attributed, fenced supersession verdict flow. Each newly staged proposal emits one curator-scoped `proposal_opened` change with a supersession-proposal target; reusing an existing proposal emits no duplicate event. Disputed pairs can be proposed and reviewed under the same native authority constraints. Proposal identities include the normalized claim IDs, current authorized view fingerprints and chosen direction; incoming/previous selection prefers a replacement allowed by native validity and authority policy. A `consolidation-current/<hash>` point binding retires obsolete open-queue entries when views change, preserving the immutable old proposal for audit; retention cleanup reclaims the binding. Only still-open proposals are returned. Matching legacy pins retain their existing reviewed state; retired deferred-review provenance allocates a fresh receipt-stable attempt without bypassing forgotten-proposal fences. Dispute findings identify one current eligible peer pair each, with continuation inside a wide dispute, so a retired peer cannot poison a preparation batch or hide its remaining pairs. Managed generation merges bounded duplicate diagnostics into its original receipt and projects them through advance responses. Legacy spaces backfill restatement postings in maintenance quanta of 64 assertions before consolidation is available, then backfill outcome signals through cleanup.
+- **Scoped SDK evidence.** `remember` sends `scoped_evidence_ids=true` for generated IDs. Native admission hashes authenticated principal, branch and local ID and atomically remaps assertion/support/entity/mention citations. Explicit IDs keep their original semantics. Receipts return canonical `evidence_ids` for later evidence reads. An explicit operation key makes retries stable across processes.
+- **Evaluation policy.** Retrieval cases support `policy.retrieval` of `recall` (default), `brief` or `none`. Brief accepts `policy.brief` filters/budgets and reports rendered context bytes; no-memory returns an empty ranking and zero context bytes. Default recall encodings omit additive policy fields to preserve existing pinned evaluation fingerprints.
+- **Agent MCP profile.** `/memory/v1/mcp/agent` lists `brief`, `recall`, `observe`, `correct`, `forget`, `outcome`, `get` and `explain` with purpose-oriented descriptions. Mutating agent tools accept an omitted `idempotency_key` and derive `agent:<sha256(action, space, branch, id, body)>`, so identical retries replay the first receipt. Automatically keyed requests canonicalize JSON object order in both the key and service body, including nested objects; array order remains significant. Receipt identities for these content-derived keys are HMAC-bound to the private space digest key, so redacted credentials do not leave public offline-guessable hashes. Legacy receipts remain replayable. `/memory/v1/mcp` keeps the full catalog.
+
+Consolidation review is model-free. Proposal preparation and explicit access recording are separate durable mutations, available through native, HTTP, MCP and all four first-party SDKs.
 
 ## Public operations and bounded execution
 
@@ -1885,7 +1909,7 @@ Derived summaries must not disclose inaccessible inputs. Removing a source's acc
 
 Record retrieval candidates, selected evidence, citations, policy/model versions, token costs, and task outcomes. Learn usefulness separately from truth: a previously successful procedure can become invalid when its preconditions change.
 
-Begin with offline ablations and simple utility-aware reranking. Later investigate memory-operation policies and counterfactual credit using isolated evaluation copies. A cited memory is evidence of use, not proof that it caused success. Do not run destructive credit-assignment interventions against production memory.
+Begin with offline ablations and simple utility-aware reranking. The opt-in `utility_weight` recall boost and the brief's utility term are that first reranking step; they count retained, readable outcomes only. Later investigate memory-operation policies and counterfactual credit using isolated evaluation copies. A cited memory is evidence of use, not proof that it caused success. Do not run destructive credit-assignment interventions against production memory.
 
 Defer parametric consolidation of tenant knowledge until external memory semantics are reliable and editability, attribution, privacy, and deletion tradeoffs are understood.
 
@@ -2666,6 +2690,99 @@ Pin membership maintenance consumes bounded native edit journals. Pin edits repa
 only changed boundaries; routing edits repair affected root membership and path
 shortcuts. New edits coalesce into persistent repair queues. Unaffected roots can
 retain indexed serving under a bounded current-head proof while affected roots
-use exact fallback. A single new pair with 6,000 unrelated pins requires nine
+use exact fallback. A single new pair with 6,000 unrelated pins requires 13
 owner writes, rather than clearing and rebuilding the entire profile. The shared
 metadata/Lite contracts retain source, head, visibility and final grant fences.
+
+Resolver dependency projection follow-up: static consumers use shared projection
+format 5. Reverse-parent dependencies scope a leaf correction to its affected
+paths. The bounded journal maintains deduplicated key invalidations; compact
+full-SHA digests are deduplicated once and sorted before unaffected-root proofs.
+Adaptive summaries store small roots inline and larger roots in bounded sorted
+fingerprint leaves, with full-SHA verification after every positive. Reference
+counts preserve collisions during deletion. Durable ingestion and next-work
+queues preserve active repair/walk progress under unrelated edits, with one
+scratch decode per event. Configured parent guards cover masked-edge unmerge.
+Owner-built coverage includes all configured nodes and only their reachable
+native paths. A shared latest-version native-tail index fences newly incoming
+paths without copying an entire native namespace into every profile. Unreferenced
+native paths are pruned even if native declarations survive. Native memory
+identities without static consumers create neither this projection nor its
+journal. Membership backfill merge-seeks configured nodes and native pin counts,
+with resumable cursors for either sparse direction. Event and per-item lookup
+scratch have separate lifetimes, so large canonical keys do not accumulate
+throughout an event. Exact native-tail terminals reuse the shared bounded routing
+cache under profile, journal-origin and source keys. Edited routing sources are
+intersected with published and in-flight profile coverage before walking; all
+routing edits remain journaled so later connections through previously flat
+edges cannot evade the fence. Cached results retain full-SHA path dependencies
+and survive unrelated routing edits after bounded ancestry and changed-key
+validation. Actual dependency changes invalidate reuse immediately. Small-root
+summaries search the sorted change set instead of probing every changed digest
+per root, and every fingerprint hit still requires full-SHA verification.
+Fallback canonicalization decodes each hop in resettable scratch and keeps only
+bounded digest history, so valid long-key paths work with cached membership or
+streaming fallback. Source and final grant fences remain independent. These
+changes preserve projection format 5; the new journal contract advances Lite to
+reader 29, topology to 68, metadata bootstrap to v21 and Lite enrollment to v9.
+See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.
+
+Recent routing-source discovery intersects a frozen sorted digest set from the
+bounded recent journal with profile coverage. It never walks old retained source
+versions merely because a small new burst exceeds a point-lookup threshold.
+Canonical cache hits can provide validated suffix dependencies to a bounded local
+memo; membership probes binary-search the borrowed sorted dependencies without
+materializing whole cached paths, including repeated multi-entry pages.
+Accepted canonical proofs advance synchronized, compare-checked sequence/graph/
+routing checkpoints, so unrelated heads validate the new history suffix without
+replaying the entry's lifetime. The immutable paths and dependencies retain their
+existing cache ownership and accounting. No root-set, source or grant decision
+enters the shared certificate. Failed dependency/ancestry checks and barriers
+still force fallback, and older snapshots cannot overwrite newer checkpoints.
+The operation-count regressions and concurrency contracts are in `RESOLUTION.md`.
+
+Legacy native namespaces must qualify their complete base content before sharing
+native graph data. A bounded owner migration hashes stable record pages, fences
+publication on the exact head, and publishes a qualified lineage without changing
+the logical curation revision. Ordinary edits preserve an unqualified state;
+read-only queries remain exact and perform no migration writes. This also covers
+older nonzero fingerprints derived from unknown zero-fingerprint bases. The
+qualification marker and resumable work use Lite reader 29, topology 68, metadata
+bootstrap v21 and Lite enrollment v9; projection format remains 5.
+
+Immutable invalidation preparation is shared across candidate pages at the same
+qualified baseline/current head pair. It uses the existing decoded cache budget
+and lease accounting, and keeps root decisions, native masks and grants outside
+the cache. Denied admission retains exact streaming behavior. Together with
+borrowed sorted suffix dependencies, this removes repeated journal preparation
+and path-length memo fills while preserving final source and authorization fences.
+
+
+Shared resolver routing proofs also reuse immutable sorted full-SHA routing-change
+plans, including each source's latest mutation sequence, under the existing
+48-MiB decoded-profile budget. Plans are qualified by namespace ancestry and the
+exact sequence window. Recent-source discovery borrows them directly; extension
+for older terminal checkpoints uses private scratch. Root verdicts, source
+coverage, native masks and authorization remain fresh. Cache denial preserves
+bounded streaming fallback; no additional cache budget or durable format is added.
+
+
+Fresh resolver coverage uses adaptive, byte-bounded request-local pages. Dense
+intersections reuse up to 128 rows within 1 MiB of existing scratch; sparse gaps
+retain galloping seeks. Allocation exhaustion shrinks the page width rather than
+truncating matches. Pages are independent of frozen history and event I/O and do
+not survive the request. Both native point reads and scan calls are measured:
+the 128-event/20-query fixture retains 380 point reads while scans drop from
+6,480 to 280, with coverage seeks dropping from 6,340 to 140.
+
+
+Legacy qualification now preserves progress during continuous edits. A version-2
+control row tracks processed records through a bounded Antfly SHA-256 transcript;
+mutations behind the cursor fold in full old/new values and exact byte deltas,
+while later records are read at their current values. The cursor and fence update
+atomically with each native edit, without a foreground namespace scan or an
+unbounded catch-up queue. Final publication still fences the exact current head.
+Untracked cuts restart safely; historical v1 work is retired rather than trusted.
+The 256-record upgrade fixture qualifies in three owner turns under ongoing edits,
+instead of repeatedly hashing the same prefix. The durable gates are reader 29,
+topology 68, metadata bootstrap v21 and Lite enrollment v9.

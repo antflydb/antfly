@@ -194,13 +194,9 @@ const CompactBindings = struct {
     }
 };
 /// Expand the bounded v2 wire directory once; every binding borrows the same
-/// immutable space/map descriptors. V1 certificate bytes remain unchanged.
+/// immutable space/map descriptors.
 pub fn decode(a: A, encoded: []const u8) !Root {
     var root = try std.json.parseFromSliceLeaky(Root, a, encoded, .{ .allocate = .alloc_always });
-    if (root.version == 1) {
-        if (root.coordinate_spaces.len != 0 or root.index_bindings.len != 0) return error.InvalidLogicalRowIdentity;
-        return root;
-    }
     if (root.version != metadata_version or root.reused.len != 0 or root.index_bindings.len > local.metadata_lake_index_catalog.max_directory_artifacts or root.coordinate_spaces.len > root.index_bindings.len) return error.InvalidLogicalRowIdentity;
     const bindings = try a.alloc(ReusedIndex, root.index_bindings.len);
     var positions: std.AutoHashMapUnmanaged(u32, usize) = .empty;
@@ -238,29 +234,14 @@ pub const Root = struct {
     coordinate_spaces: []const CoordinateSpace = &.{},
     index_bindings: []const IndexBinding = &.{},
     pub fn jsonStringify(self: Root, writer: anytype) !void {
-        if (self.version == 2) {
-            if (self.definition) |definition| {
-                try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .definition = definition, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
-                return;
-            }
-            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
+        if (self.definition) |definition| {
+            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .definition = definition, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
             return;
         }
-        if (self.native_space) |space| {
-            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .reused = self.reused, .native_space = space });
-            return;
-        }
-        // Keep the original certificate payload for maps predating typed hashes.
-        if (self.values_format == 1) {
-            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate });
-        } else if (self.reused.len == 0) {
-            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate });
-        } else {
-            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .reused = self.reused });
-        }
+        try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
     }
     pub fn validate(self: Root, a: A) !void {
-        if ((self.values_format != 1 and self.values_format != 2 and self.values_format != cohort_values_format) or (self.version != 1 and self.version != metadata_version) or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
+        if ((self.values_format != 1 and self.values_format != 2 and self.values_format != cohort_values_format) or self.version != metadata_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
         if (self.definition) |definition| if (self.version != 2 or std.mem.allEqual(u8, &definition, 0)) return error.InvalidLogicalRowIdentity;
         try self.current.validate();
         if ((self.values_format == cohort_values_format) != self.current.compact) return error.InvalidLogicalRowIdentity;
@@ -440,7 +421,7 @@ pub fn validateRoots(backing: A, store: *stores.ArtifactStore, root: Root, token
         // generation repair hint. Health polling never performs an archive walk.
         if (value.bytes > reads) return;
         _ = scratch.reset(.retain_capacity);
-        var page = tree.readPage(scratch.allocator(), pages.store(), value) catch |err| return derivedReadFailure(err);
+        var page = tree.readNavigationPage(scratch.allocator(), pages.store(), value) catch |err| return derivedReadFailure(err);
         page.deinit(scratch.allocator());
     }
     var navigation_seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -670,7 +651,7 @@ pub fn publish(a: A, store: *stores.ArtifactStore, root: Root, token: Token) !Re
     return .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = id, .checksum = checksum, .byte_len = upload.byte_len };
 }
 pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidLogicalRowIdentity;
+    if (ref.kind != .doc_values or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidLogicalRowIdentity;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
     const root = try decode(a, bytes);
@@ -953,7 +934,10 @@ const TestRows = struct {
 };
 
 test "external lake logical row maps spill verify value equivalence and flatten arbitrary rewrites" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var memory: local.sql_memory_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
     const ma = memory.allocator();
     var marker: u8 = 0;
@@ -1135,12 +1119,9 @@ test "external lake shared identity spaces keep thousands of declarations inside
     try std.testing.expect(reopened.reused[0].space.source.ptr == reopened.reused[1023].space.source.ptr);
     try std.testing.expectEqualStrings(encoded, try std.json.Stringify.valueAlloc(out, reopened, .{}));
     root.version = 1;
-    try root.reseal(a);
-    try root.validate(a);
-    const historical = try std.json.Stringify.valueAlloc(out, root, .{});
-    try std.testing.expect(historical.len > max_root_bytes);
-    const old = try decode(out, historical);
-    try old.validate(a);
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, root.validate(a));
+    const obsolete = try std.json.Stringify.valueAlloc(out, root, .{});
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, decode(out, obsolete));
 }
 
 test "external lake batched file dictionaries share navigation beyond the scalar cache" {

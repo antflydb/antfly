@@ -77,6 +77,10 @@ pub fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: boo
     var index_it = value.object.iterator();
     while (index_it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (@import("index_metadata.zig").isOpaqueEntry(entry.key_ptr.*)) {
+            if (!trusted_catalog) return error.InvalidCreateTableRequest;
+            continue;
+        }
         if (trusted_catalog) {
             coverage_policy_mod.validateStoredIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
         } else {
@@ -180,10 +184,18 @@ pub fn schemaDerivedAlgebraicIndexValueAlloc(
                 if (entry.value_ptr.* == .null) continue;
                 try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValueAlloc(alloc, entry.value_ptr.*));
             }
+            if (object.get("bucket")) |bucket| {
+                const normalized = algebraic_mod.cylinder.canonicalBucketName(bucket.string) orelse return error.InvalidCreateTableRequest;
+                try object.put(alloc, "bucket", .{ .string = try alloc.dupe(u8, normalized) });
+            }
             try canonical.append(.{ .object = object });
         }
         try derived.object.put(alloc, "aggregates", .{ .array = canonical });
         try derived.object.put(alloc, "materializations", .{ .array = canonical });
+        const config_contract = @import("../storage/db/algebraic/index_config.zig");
+        var effective = try std.json.parseFromValue(config_contract.Config, alloc, derived, .{ .ignore_unknown_fields = true });
+        defer effective.deinit();
+        config_contract.validateConfig(effective.value) catch return error.InvalidCreateTableRequest;
     }
     return derived;
 }
@@ -206,7 +218,7 @@ pub fn validatePublicAggregateRecipes(value: std.json.Value) !void {
         if (recipe != .object) return error.InvalidCreateTableRequest;
         var fields = recipe.object.iterator();
         while (fields.next()) |entry| {
-            if (!std.mem.eql(u8, entry.key_ptr.*, "name") and !std.mem.eql(u8, entry.key_ptr.*, "op") and !std.mem.eql(u8, entry.key_ptr.*, "group_by") and !std.mem.eql(u8, entry.key_ptr.*, "measure")) return error.InvalidCreateTableRequest;
+            if (!std.mem.eql(u8, entry.key_ptr.*, "name") and !std.mem.eql(u8, entry.key_ptr.*, "op") and !std.mem.eql(u8, entry.key_ptr.*, "group_by") and !std.mem.eql(u8, entry.key_ptr.*, "measure") and !std.mem.eql(u8, entry.key_ptr.*, "time") and !std.mem.eql(u8, entry.key_ptr.*, "bucket")) return error.InvalidCreateTableRequest;
         }
         const name = recipe.object.get("name") orelse return error.InvalidCreateTableRequest;
         const op = recipe.object.get("op") orelse return error.InvalidCreateTableRequest;
@@ -227,6 +239,15 @@ pub fn validatePublicAggregateRecipes(value: std.json.Value) !void {
                     for (groups.array.items[0..key_index]) |previous| if (std.mem.eql(u8, previous.string, key.string)) return error.InvalidCreateTableRequest;
                 }
             }
+        }
+        const time = recipe.object.get("time");
+        const bucket = recipe.object.get("bucket");
+        const has_time = time != null and time.? != .null;
+        const has_bucket = bucket != null and bucket.? != .null;
+        if (has_time != has_bucket) return error.InvalidCreateTableRequest;
+        if (has_time) {
+            if (time.? != .string or time.?.string.len == 0 or bucket.? != .string) return error.InvalidCreateTableRequest;
+            if (algebraic_mod.cylinder.Bucket.parse(bucket.?.string) == null) return error.InvalidCreateTableRequest;
         }
         for (value.array.items[0..index]) |previous| if (std.mem.eql(u8, previous.object.get("name").?.string, name.string)) return error.InvalidCreateTableRequest;
     }
@@ -323,4 +344,45 @@ test "lake catalog admission bounds recipes across indexes before commit" {
     _ = configs.orderedRemove("index64");
     const accepted = try std.json.Stringify.valueAlloc(aa, std.json.Value{ .object = configs }, .{});
     try validateLakeIndexCapacity(a, schema, accepted);
+}
+
+test "privacy restored catalogs accept opaque state only at trusted validation" {
+    const a = std.testing.allocator;
+    var root = try std.json.parseFromSlice(std.json.Value, a, "{\"_privacy\":{\"coverage\":{}},\"full_text_index_v0\":{\"type\":\"full_text\"}}", .{});
+    defer root.deinit();
+    try validateIndexesValue(root.value, true);
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexesValue(root.value, false));
+}
+
+test "time series public aggregate recipe validates the temporal pair" {
+    const a = std.testing.allocator;
+    var valid = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"name":"temperature","op":"avg","measure":"value","group_by":["device_id"],"time":"ts","bucket":"5m"}]
+    , .{});
+    defer valid.deinit();
+    try validatePublicAggregateRecipes(valid.value);
+    for ([_][]const u8{
+        "[{\"name\":\"n\",\"op\":\"count\",\"time\":\"ts\"}]",
+        "[{\"name\":\"n\",\"op\":\"count\",\"bucket\":\"5m\"}]",
+        "[{\"name\":\"n\",\"op\":\"count\",\"time\":\"ts\",\"bucket\":\"0s\"}]",
+    }) |text| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, validatePublicAggregateRecipes(invalid.value));
+    }
+}
+
+test "time series temporal recipe admission proves schema field coverage" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"default_type":"reading","document_schemas":{"reading":{"schema":{"type":"object","properties":{"ts":{"type":"string","x-antfly-field":{"type":"date","sortable":true}},"value":{"type":"number"}}}}}}
+    ;
+    const valid = try expandSchemaDerivedAlgebraicIndexAlloc(a, "readings",
+        \\{"type":"algebraic","derive_from_schema":true,"aggregates":[{"name":"average","op":"avg","measure":"value","time":"ts","bucket":"5m"}]}
+    , schema);
+    defer a.free(valid);
+    try std.testing.expect(std.mem.indexOf(u8, valid, "\"time_fields\":[{\"name\":\"ts\"") != null);
+    try std.testing.expectError(error.InvalidCreateTableRequest, expandSchemaDerivedAlgebraicIndexAlloc(a, "readings",
+        \\{"type":"algebraic","derive_from_schema":true,"aggregates":[{"name":"average","op":"avg","measure":"missing","time":"ts","bucket":"5m"}]}
+    , schema));
 }

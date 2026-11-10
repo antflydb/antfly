@@ -40,8 +40,9 @@ pub const Response = struct {
 pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, expected_id: ?u64, identity: ?server_api.AuthenticatedIdentity, context: operation.RequestContext, request: Request) !Response {
     const mutation = request.action == .create or request.action == .commit or request.action == .changes or request.action == .maintenance or request.action == .reconcile;
     if (identity) |value| {
-        if (!server_api.permissionsAllow(value.permissions, .table, physical, if (mutation) .admin else .read)) return error.Forbidden;
-        // Catalog writes are table-wide file commits, not row-policy mutations.
+        if (!server_api.permissionsAllow(value.permissions, .table, physical, if (request.action == .changes) .write else if (mutation) .admin else .read)) return error.Forbidden;
+        // CDC accepts row mutations, while catalog/maintenance writes require
+        // table administration. Neither path evaluates per-row write policies.
         if (mutation and server_api.effectiveRowFilterJson(value, physical) != null) return error.Forbidden;
     }
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
@@ -51,7 +52,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (request.expected_table_id) |id| if (id != table.table_id) return error.TableGenerationChanged;
     var source = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.InvalidLakeCatalog;
     defer source.deinit(a);
-    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    const options = try @import("lake_source_owner.zig").options(a, server, table.*, context);
     const lake_context: catalog.types.Context = .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = if (context.cancellation.ptr != null and context.cancellation.is_cancelled_fn != null) .{ .ptr = context.cancellation.ptr.?, .is_cancelled_fn = context.cancellation.is_cancelled_fn.? } else null };
     if (request.action == .reconcile and source.binding.catalog == null) {
         try server.prepareLakeCache();
@@ -68,7 +69,10 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
         return .{ .status = 200, .body = result.body };
     }
     if (request.action == .changes) {
-        const lsn = try @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body);
+        const lsn = @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body) catch |err| switch (err) {
+            error.LakeCommitOutcomeUnknown => return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "unknown", .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) },
+            else => return err,
+        };
         server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
         return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .read_receipt = @import("antfly_local_sources").sql_read_requirements.Receipt{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = lsn }, .wal_lsn = lsn, .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) };
     }
@@ -81,7 +85,10 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (!mutation) {
         const call: configured.CatalogOperation = if (request.action == .load) .load else .{ .resolve = .{ .id = request.commit_id, .hash = request.request_hash } };
         if (request.action == .resolve and (request.commit_id.len == 0 or request.commit_id.len > 256 or request.request_hash.len != 64)) return error.InvalidLakeCommit;
-        var result = try configured.executeLakeCatalogAlloc(a, source.binding, options, lake_context, call);
+        var result = configured.executeLakeCatalogAlloc(a, source.binding, options, lake_context, call) catch |err| switch (err) {
+            error.LakeCommitOutcomeUnknown => return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "unknown", .commit_id = request.commit_id, .request_hash = request.request_hash, .searchable = false }, .{}) },
+            else => return err,
+        };
         defer result.deinit(a);
         if (request.action == .resolve and result == .outcome and result.outcome == .committed) {
             server.notifyLakeCommit(physical) catch |err| std.log.warn("lake publication wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });

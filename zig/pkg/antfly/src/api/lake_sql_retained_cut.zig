@@ -23,8 +23,36 @@ const A = std.mem.Allocator;
 const prefix = "sql-lake1:";
 pub const ttl_ms: u64 = std.time.ms_per_hour;
 pub const max_bytes = 40 * 1024 * 1024;
+/// Pointer-free read authority. Allocation owners and runtime caches never
+/// enter a retained capability; source/schema fields are immutable views.
+pub const ReadTable = struct {
+    id: u64,
+    physical_name: []const u8,
+    schema_version: u32,
+    columns: []const catalog.Column,
+    scope: ?catalog.Table.Scope,
+    external_indexes: ?catalog.Table.ExternalIndexes,
+    binding: local.serverless_external_source_catalog_binding.Binding,
+    external_table_id: []const u8,
+    source_uri: []const u8,
+    credential_ref_id: ?[]const u8,
+    credential_scope: ?[]const u8,
+    snapshot_value: ?[]const u8,
+    schema_fingerprint: []const u8,
+    pub fn from(table: catalog.Table) ReadTable {
+        const source = table.external_base_source.?;
+        return .{ .id = table.id, .physical_name = table.physical_name, .schema_version = table.schema_version, .columns = table.columns, .scope = table.scope, .external_indexes = table.external_indexes, .binding = source.binding, .external_table_id = source.table_id, .source_uri = source.source_uri, .credential_ref_id = source.credential_ref_id, .credential_scope = source.credential_scope, .snapshot_value = source.snapshot_value, .schema_fingerprint = source.schema_fingerprint };
+    }
+    pub fn view(self: ReadTable) catalog.Table {
+        return .{ .id = self.id, .physical_name = self.physical_name, .schema_version = self.schema_version, .columns = self.columns, .scope = self.scope, .external_indexes = self.external_indexes, .external_base_source = .{ .binding = self.binding, .table_id = @constCast(self.external_table_id), .source_uri = @constCast(self.source_uri), .credential_ref_id = if (self.credential_ref_id) |v| @constCast(v) else null, .credential_scope = if (self.credential_scope) |v| @constCast(v) else null, .snapshot_value = if (self.snapshot_value) |v| @constCast(v) else null, .schema_fingerprint = @constCast(self.schema_fingerprint) } };
+    }
+};
 pub const Descriptor = struct {
     version: u16 = 1,
+    /// Issued only by an authenticated SQL admission owner. The immutable
+    /// artifact's domain, digest, expiry and opaque scope bind this read grant;
+    /// workers cannot replace its schema or source binding through a ticket.
+    authorization: ?struct { scope: [64]u8, table: ReadTable } = null,
     name: ?local.sql_ast.Name = null,
     table_id: u64,
     schema_version: u32,
@@ -35,8 +63,131 @@ pub const Descriptor = struct {
     table_uuid: []const u8,
     snapshot_id: []const u8,
     pending: @import("../serverless/lake_ingestion.zig").Pending,
+    paged: ?Paged = null,
+    pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(Descriptor).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "authorization")) {
+                if (self.authorization) |grant| {
+                    try jw.objectField(field);
+                    try jw.write(grant);
+                }
+            } else {
+                try jw.objectField(field);
+                try jw.write(@field(self, field));
+            }
+        }
+        try jw.endObject();
+    }
 };
-fn domain(table: u64, identity: [32]u8) [32]u8 {
+pub const ChangePage = struct { begin: u32, count: u32, token: []const u8 };
+pub const KeyPage = struct { first: [64]u8, last: [64]u8, token: []const u8 };
+pub const Paged = struct { count: u32, bytes: u64, changes: []const ChangePage, keys: []const KeyPage, bloom: []const u8, key_bytes: u8 = 64 };
+pub const distributed_rows = 128;
+pub const Saved = struct {
+    token: []const u8,
+    rows: u64 = 0,
+    bytes: u64 = 0,
+    paged: bool = false,
+    pub fn minimumSplits(self: Saved) u32 {
+        return if (self.paged) @intCast(@max(1, (self.rows + distributed_rows - 1) / distributed_rows)) else 1;
+    }
+};
+fn savePage(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, bytes: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    const scope = try artifacts.UploadScope.forPublication(domain(descriptor.table_id, identity), descriptor.expires_ms, io);
+    var object = try store.putScoped(scope, bytes, cancellation);
+    defer object.deinit(store.allocator);
+    return @import("lake_generation_envelope.zig").encode(a, "sql-page1:", object);
+}
+pub fn readPage(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, descriptor: Descriptor, token: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    const envelope = try @import("lake_generation_envelope.zig").decode(a, "sql-page1:", token, max_bytes);
+    defer if (envelope.generation) |generation| a.free(generation);
+    const scope = (try artifacts.uploadScopeFromArtifactId(envelope.id)) orelse return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &scope.domain, &domain(descriptor.table_id, identity)) or scope.fencingToken() != descriptor.expires_ms) return error.CatalogGenerationChanged;
+    var scoped = store.*;
+    scoped.allocator = a;
+    return @import("lake_generation_envelope.zig").read(&scoped, envelope, cancellation);
+}
+pub fn bloomBit(key: [64]u8, bits: usize, seed: u64) usize {
+    return @intCast(std.hash.Wyhash.hash(seed, &key) % bits);
+}
+pub fn saveDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, cancellation: @import("antfly_cancellation").CancellationToken) !Saved {
+    // Reclaim publication scratch even when the result allocator is a query
+    // arena. Keep accounting through the statement memory budget.
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer arena.deinit();
+    var publisher = store.*;
+    publisher.allocator = local.sql_memory_budget.reclaimingAllocator(a);
+    const saved = try publishDistributed(arena.allocator(), &publisher, identity, io, descriptor, cancellation);
+    return .{ .token = try a.dupe(u8, saved.token), .rows = saved.rows, .bytes = saved.bytes, .paged = saved.paged };
+}
+fn encodedSize(value: anytype) !usize {
+    var buffer: [4096]u8 = undefined;
+    var count = std.Io.Writer.Discarding.init(&buffer);
+    try std.json.Stringify.value(value, .{}, &count.writer);
+    return @intCast(count.fullCount());
+}
+fn publishDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, cancellation: @import("antfly_cancellation").CancellationToken) !Saved {
+    const pending = try descriptor.pending.materialized(a);
+    const encoded_len = try encodedSize(pending.changes);
+    if (encoded_len <= 64 * 1024) return .{ .token = try save(a, store, identity, io, descriptor, cancellation), .rows = pending.changes.len, .bytes = encoded_len };
+    if (encoded_len > max_bytes) return error.QueryCandidateBudgetExceeded;
+    const table = (descriptor.authorization orelse return error.SqlExecutionUnauthorized).table.view();
+    const normalized = try @import("lake_sql_overlay.zig").Cut.normalizeForTable(a, pending, table);
+    const digests = try a.alloc([64]u8, normalized.pending.changes.len);
+    var key_arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer key_arena.deinit();
+    for (normalized.pending.changes, digests) |change, *key| {
+        _ = key_arena.reset(.retain_capacity);
+        key.* = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(key_arena.allocator(), pending.key_fields, change.row, normalized.kinds));
+    }
+    std.mem.sort([64]u8, digests, {}, struct {
+        fn less(_: void, l: [64]u8, r: [64]u8) bool {
+            return std.mem.order(u8, &l, &r) == .lt;
+        }
+    }.less);
+    const bloom = try a.alloc(u8, @min(@as(usize, 256 * 1024), @max(@as(usize, 64), digests.len * 2)));
+    @memset(bloom, 0);
+    for (digests) |key| for (0..4) |seed| {
+        const bit = bloomBit(key, bloom.len * 8, seed);
+        bloom[bit / 8] |= @as(u8, 1) << @as(u3, @intCast(bit % 8));
+    };
+    var keys: std.ArrayList(KeyPage) = .empty;
+    var begin: usize = 0;
+    while (begin < digests.len) {
+        const end = @min(digests.len, begin + 4096);
+        const page_allocator = local.sql_memory_budget.reclaimingAllocator(a);
+        const bytes = try page_allocator.alloc(u8, (end - begin) * 32);
+        defer page_allocator.free(bytes);
+        for (digests[begin..end], 0..) |key, index| _ = try std.fmt.hexToBytes(bytes[index * 32 ..][0..32], &key);
+        try keys.append(a, .{ .first = digests[begin], .last = digests[end - 1], .token = try savePage(a, store, identity, io, descriptor, bytes, cancellation) });
+        begin = end;
+    }
+    var changes: std.ArrayList(ChangePage) = .empty;
+    begin = 0;
+    while (begin < normalized.pending.changes.len) {
+        var end = begin;
+        var bytes: usize = 2;
+        while (end < normalized.pending.changes.len and end - begin < 4096) {
+            const row_len = try encodedSize(normalized.pending.changes[end]);
+            if (row_len > max_bytes) return error.QueryCandidateBudgetExceeded;
+            if (end != begin and bytes + row_len + 1 > 32 * 1024) break;
+            bytes += row_len + 1;
+            end += 1;
+        }
+        const page_allocator = local.sql_memory_budget.reclaimingAllocator(a);
+        const body = try std.json.Stringify.valueAlloc(page_allocator, normalized.pending.changes[begin..end], .{});
+        defer page_allocator.free(body);
+        try changes.append(a, .{ .begin = @intCast(begin), .count = @intCast(end - begin), .token = try savePage(a, store, identity, io, descriptor, body, cancellation) });
+        begin = end;
+    }
+    var root = descriptor;
+    root.pending = normalized.pending;
+    root.pending.changes = &.{};
+    root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded_len, .changes = changes.items, .keys = keys.items, .key_bytes = 32, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
+    return .{ .token = try save(a, store, identity, io, root, cancellation), .rows = normalized.pending.changes.len, .bytes = encoded_len, .paged = true };
+}
+pub fn domain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("accepted-sql-transaction-cut-v1");
     hash.update(&identity);
@@ -57,8 +208,23 @@ pub fn save(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io,
     return @import("lake_generation_envelope.zig").encode(a, prefix, object);
 }
 pub fn load(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table: catalog.Table, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
-    const value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
+    var value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
     if (value.schema_version != table.schema_version or value.object_generation != (if (table.external_indexes) |indexes| indexes.object_generation else 0)) return error.CatalogGenerationChanged;
+    if (value.paged) |index| {
+        const changes = try a.alloc(@import("../serverless/lake_ingestion.zig").Batch.Change, index.count);
+        var cursor: usize = 0;
+        for (index.changes) |page| {
+            if (page.begin != cursor) return error.CatalogGenerationChanged;
+            const bytes = try readPage(a, store, identity, value, page.token, cancellation);
+            const rows = try std.json.parseFromSliceLeaky([]const @import("../serverless/lake_ingestion.zig").Batch.Change, a, bytes, .{ .allocate = .alloc_always });
+            if (rows.len != page.count or page.begin > changes.len or rows.len > changes.len - page.begin) return error.CatalogGenerationChanged;
+            @memcpy(changes[page.begin..][0..rows.len], rows);
+            cursor += rows.len;
+        }
+        if (cursor != changes.len) return error.CatalogGenerationChanged;
+        value.pending.changes = changes;
+        value.paged = null;
+    }
     return value;
 }
 pub fn loadDescriptor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table_id: u64, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {

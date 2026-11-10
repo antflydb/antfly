@@ -25,6 +25,24 @@ const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
 
+pub const CredentialSource = enum { default, bearer_token, service_account };
+
+pub const Credentials = struct {
+    source: CredentialSource = .default,
+    bearer_token: ?[]u8 = null,
+    service_account_json: ?[]u8 = null,
+    credentials_path: ?[]u8 = null,
+    scope: ?[]u8 = null,
+
+    pub fn deinit(self: *Credentials, alloc: std.mem.Allocator) void {
+        if (self.bearer_token) |value| alloc.free(value);
+        if (self.service_account_json) |value| alloc.free(value);
+        if (self.credentials_path) |value| alloc.free(value);
+        if (self.scope) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 test "standalone objectstore wires Google credential identity dependencies" {
     var manager = google_auth.CredentialManager.init(std.testing.allocator, std.testing.io);
     defer manager.deinit();
@@ -62,11 +80,11 @@ pub const Auth = union(enum) {
         self.* = undefined;
     }
 
-    fn authorizationValueAlloc(self: *Auth, alloc: Allocator) !?[]u8 {
+    fn authorizationValueAlloc(self: *Auth, alloc: Allocator, control: google_auth.RequestControl) !?[]u8 {
         return switch (self.*) {
             .none => null,
             .bearer_token => |token| try std.fmt.allocPrint(alloc, "Bearer {s}", .{token}),
-            .google_token_source => |source| try source.authorizationValueAlloc(alloc),
+            .google_token_source => |source| try source.authorizationValueAllocWithControl(alloc, control),
         };
     }
 };
@@ -79,6 +97,10 @@ pub const JsonApiConfig = struct {
     /// Optional end-to-end HTTP deadline. Object transfers leave this unset;
     /// control-plane probes set a bounded deadline explicitly.
     request_timeout_ms: ?u64 = null,
+    /// Absolute operation budget, including authentication and metadata probes.
+    request_deadline_ns: ?u64 = null,
+    /// Borrowed transport policy for scoped content downloads.
+    http_client_config: ?httpx.ClientConfig = null,
     /// Optional borrowed application runtime. When absent, the client owns a
     /// threaded fallback for standalone library use.
     io: ?std.Io = null,
@@ -152,7 +174,13 @@ const HttpxTransport = struct {
     io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
+    deadline_ns: ?u64 = null,
+
     fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+        return initConfigured(alloc, request_timeout_ms, shared_io, null);
+    }
+
+    fn initConfigured(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io, configured: ?httpx.ClientConfig) !HttpxTransport {
         const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
             const owned = try alloc.create(std.Io.Threaded);
             owned.* = std.Io.Threaded.init(alloc, .{});
@@ -162,14 +190,13 @@ const HttpxTransport = struct {
             owned.deinit();
             alloc.destroy(owned);
         };
-        var client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
-            .timeouts = .{
-                .connect_ms = timeout_ms,
-                .read_ms = timeout_ms,
-                .write_ms = timeout_ms,
-                .request_ms = timeout_ms,
-            },
-        } else .{};
+        var client_config: httpx.ClientConfig = configured orelse .{};
+        if (request_timeout_ms) |timeout_ms| client_config.timeouts = .{
+            .connect_ms = timeout_ms,
+            .read_ms = timeout_ms,
+            .write_ms = timeout_ms,
+            .request_ms = timeout_ms,
+        };
         // Small immutable objects still need room for provider error envelopes
         // so HTTP status mapping preserves missing, denied and transient errors.
         client_config.max_error_response_size = 4096;
@@ -211,9 +238,12 @@ const HttpxTransport = struct {
             try request_headers.append(alloc, .{ "Content-Type", value });
         }
 
+        const control = google_auth.RequestControl{ .deadline_ns = self.deadline_ns };
+        try control.check();
         var response = self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
+            .timeout_ms = try control.remainingTimeoutMs(),
             .max_response_size = max_response_size,
             .cancellation = if (cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
@@ -289,7 +319,8 @@ pub const JsonApiClient = struct {
     pub fn init(alloc: Allocator, cfg: JsonApiConfig) !JsonApiClient {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
+        transport.* = try HttpxTransport.initConfigured(alloc, cfg.request_timeout_ms, cfg.io, cfg.http_client_config);
+        transport.deadline_ns = cfg.request_deadline_ns;
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -327,7 +358,7 @@ pub const JsonApiClient = struct {
         return .{
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = &vtable,
+            .vtable = if (self.owned_httpx != null) &parallel_vtable else &vtable,
         };
     }
 
@@ -382,6 +413,71 @@ pub const JsonApiClient = struct {
         };
     }
 
+    /// ETags from JSON metadata and media responses can differ. Bind either
+    /// representation to a captured generation before conditional publication.
+    /// Compatibility verification is bounded; large callers must pass a typed
+    /// revision rather than rereading an unbounded existing object.
+    fn legacyRevision(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, expected: []const u8, version: ?[]const u8, cancellation: ?types.CancellationToken) !types.ObjectRevision {
+        if (expected.len == 0) return error.InvalidArgument;
+        var metadata = try self.statObjectVersion(alloc, bucket, key, version, cancellation);
+        defer metadata.deinit(alloc);
+        if (metadata.etag == null or !std.mem.eql(u8, expected, metadata.etag.?)) {
+            if (metadata.content_length > 64 * 1024) return error.ObjectOperationUnsupported;
+            var verified = try self.getObject(alloc, bucket, key, .{ .version_id = metadata.version_id orelse return error.MissingObjectRevision, .if_match_etag = expected, .skip_metadata_probe = true, .max_response_bytes = 64 * 1024, .cancellation = cancellation });
+            defer verified.deinit(alloc);
+            if (!verified.conditional_etag_verified) return error.ConditionalReadUnsupported;
+        }
+        return (metadata.writeRevision() orelse return error.MissingObjectRevision).clone(alloc);
+    }
+
+    fn putAtRevision(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, revision: types.ObjectRevision, opts: types.PutOptions) !types.PutResult {
+        const generation = switch (revision) {
+            .generation => |value| value,
+            else => return error.ObjectOperationUnsupported,
+        };
+        try validateGeneration(generation);
+        if (opts.if_match_etag != null or opts.if_none_match or opts.guard != null or opts.checksum_sha256_hex != null or opts.checksum_sha256_base64 != null) return error.ObjectOperationUnsupported;
+        if (opts.cancellation) |token| try token.check();
+        const base = try uploadMediaUrlAlloc(alloc, self.cfg, bucket, key, .{});
+        defer alloc.free(base);
+        const url = try std.fmt.allocPrint(alloc, "{s}&ifGenerationMatch={s}", .{ base, generation });
+        defer alloc.free(url);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .POST, url, &.{}, body, opts.content_type orelse "application/octet-stream", 64 * 1024, opts.cancellation);
+        defer response.deinit(alloc);
+        switch (response.status) {
+            200, 201 => {},
+            else => return mapUnexpectedStatus(response.status),
+        }
+        var metadata = try parseObjectMetadataResponse(alloc, bucket, response.body);
+        defer metadata.deinit(alloc);
+        if (metadata.version_id == null) return error.MissingObjectRevision;
+        return putResultFromMetadata(alloc, metadata);
+    }
+    fn deleteAtRevision(self: *JsonApiClient, bucket: []const u8, key: []const u8, revision: types.ObjectRevision, opts: types.DeleteOptions) !void {
+        const generation = switch (revision) {
+            .generation => |value| value,
+            else => return error.ObjectOperationUnsupported,
+        };
+        try validateGeneration(generation);
+        if (opts.cancellation) |token| try token.check();
+        const base = try objectMetadataUrlWithGenerationAlloc(self.alloc, self.cfg, bucket, key, opts.version_id);
+        defer self.alloc.free(base);
+        const url = try std.fmt.allocPrint(self.alloc, "{s}{s}ifGenerationMatch={s}", .{ base, if (opts.version_id != null) "&" else "?", generation });
+        defer self.alloc.free(url);
+        var response = try self.performWithResponseLimitAndCancellation(.DELETE, url, &.{}, null, null, 64 * 1024, opts.cancellation);
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200, 204 => {},
+            404 => return error.FileNotFound,
+            else => return mapUnexpectedStatus(response.status),
+        }
+    }
+    fn validateGeneration(value: []const u8) !void {
+        if (value.len == 0 or value.len > 20) return error.InvalidArgument;
+        for (value) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidArgument;
+        if ((std.fmt.parseInt(u64, value, 10) catch return error.InvalidArgument) == 0) return error.InvalidArgument;
+    }
+
     fn putObject(
         self: *JsonApiClient,
         alloc: Allocator,
@@ -391,6 +487,17 @@ pub const JsonApiClient = struct {
         opts: types.PutOptions,
     ) !types.PutResult {
         if (opts.cancellation) |token| try token.check();
+        // Compatibility for ETag callers: bind a verified ETag to its captured
+        // generation, then let GCS atomically enforce that generation. The
+        // typed revision path avoids this additional metadata request.
+        if (opts.if_match_etag) |expected| {
+            if (opts.if_none_match) return error.InvalidArgument;
+            var revision = try self.legacyRevision(alloc, bucket, key, expected, null, opts.cancellation);
+            defer revision.deinit(alloc);
+            var conditional = opts;
+            conditional.if_match_etag = null;
+            return self.putAtRevision(alloc, bucket, key, body, revision, conditional);
+        }
         if (opts.checksum_sha256_hex) |checksum| {
             if (body.len != 0) return try self.putObjectWithSha256Metadata(alloc, bucket, key, body, opts, checksum);
         }
@@ -658,6 +765,7 @@ pub const JsonApiClient = struct {
             errdefer alloc.free(owned_bucket);
             const owned_key = try alloc.dupe(u8, key);
             break :blk types.ObjectMetadata{
+                .revision_kind = .generation,
                 .bucket = owned_bucket,
                 .key = owned_key,
                 .content_length = 0,
@@ -804,6 +912,13 @@ pub const JsonApiClient = struct {
     }
 
     fn deleteObject(self: *JsonApiClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.if_match_etag) |expected| {
+            var revision = try self.legacyRevision(self.alloc, bucket, key, expected, opts.version_id, opts.cancellation);
+            defer revision.deinit(self.alloc);
+            var conditional = opts;
+            conditional.if_match_etag = null;
+            return self.deleteAtRevision(bucket, key, revision, conditional);
+        }
         const url = try objectMetadataUrlWithGenerationAlloc(self.alloc, self.cfg, bucket, key, opts.version_id);
         defer self.alloc.free(url);
 
@@ -936,8 +1051,18 @@ pub const JsonApiClient = struct {
         defer merged.deinit(alloc);
         try merged.appendSlice(alloc, headers);
 
-        const auth_value = try self.cfg.auth.authorizationValueAlloc(alloc);
+        const control = google_auth.RequestControl{
+            .deadline_ns = self.cfg.request_deadline_ns orelse if (self.cfg.request_timeout_ms) |ms|
+                (if (ms == 0) null else platform.time.monotonicNs() +| (ms *| std.time.ns_per_ms))
+            else
+                null,
+            .cancellation = if (cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+        };
+        try control.check();
+        const auth_value = self.cfg.auth.authorizationValueAlloc(alloc, control) catch |err|
+            return if (err == error.Cancelled) error.Canceled else err;
         defer if (auth_value) |value| alloc.free(value);
+        try control.check();
         if (auth_value) |value| try merged.append(alloc, .{ "Authorization", value });
 
         return try self.request_fn(
@@ -982,7 +1107,14 @@ pub const JsonApiClient = struct {
         return self.providerTime(alloc, bucket, token);
     }
 
+    const parallel_vtable: client_mod.Client.VTable = blk: {
+        var result = vtable;
+        result.supports_concurrent_requests = true;
+        break :blk result;
+    };
     const vtable: client_mod.Client.VTable = .{
+        .put_at_revision = erasedPutAtRevision,
+        .delete_at_revision = erasedDeleteAtRevision,
         // Bucket/Object Retention protects generations, not live names.
         // Artifact references must pin generations before this provider can
         // supply immutable-name closure evidence (including after toggling
@@ -1016,6 +1148,15 @@ pub const JsonApiClient = struct {
     fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !void {
         const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
         try self.makeBucket(bucket, opts);
+    }
+
+    fn erasedPutAtRevision(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, revision: types.ObjectRevision, opts: types.PutOptions) !types.PutResult {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return self.putAtRevision(alloc, bucket, key, body, revision, opts);
+    }
+    fn erasedDeleteAtRevision(ptr: *anyopaque, bucket: []const u8, key: []const u8, revision: types.ObjectRevision, opts: types.DeleteOptions) !void {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return self.deleteAtRevision(bucket, key, revision, opts);
     }
 
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
@@ -1136,8 +1277,10 @@ pub fn jsonApiConfigAlloc(alloc: Allocator, bucket: []const u8) !Config {
 }
 
 pub fn jsonApiClientConfigAlloc(alloc: Allocator) !JsonApiConfig {
+    const endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1");
+    errdefer alloc.free(endpoint);
     return .{
-        .endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1"),
+        .endpoint = endpoint,
         .upload_endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/upload/storage/v1"),
         .auth = .none,
     };
@@ -1152,6 +1295,86 @@ pub fn jsonApiClientConfigWithBearerTokenAlloc(
     errdefer cfg.deinit(alloc);
     cfg.auth = .{ .bearer_token = try alloc.dupe(u8, bearer_token) };
     if (project_id) |value| cfg.project_id = try alloc.dupe(u8, value);
+    return cfg;
+}
+
+/// Shared authentication/transport construction for every GCS connection user.
+pub fn clientConfigForCredentialsAlloc(
+    alloc: Allocator,
+    credentials: Credentials,
+    project_id: ?[]const u8,
+    endpoint_override: ?[]const u8,
+    upload_endpoint: ?[]const u8,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
+) !JsonApiConfig {
+    var cfg = switch (credentials.source) {
+        .default => try jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
+            alloc,
+            credentials.scope,
+            network_io,
+            filesystem_io,
+        ),
+        .bearer_token => try jsonApiClientConfigWithBearerTokenAlloc(
+            alloc,
+            credentials.bearer_token orelse return error.InvalidConnectionCredentials,
+            project_id,
+        ),
+        .service_account => blk: {
+            var account = if (credentials.service_account_json) |raw|
+                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
+            else
+                try google_auth.serviceAccountFromFileAllocWithIo(alloc, credentials.credentials_path orelse return error.InvalidConnectionCredentials, filesystem_io);
+            var account_owned = true;
+            errdefer if (account_owned) account.deinit(alloc);
+            const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
+            defer if (account_project_id) |value| alloc.free(value);
+            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
+                alloc,
+                account,
+                credentials.scope orelse google_auth.default_scope,
+            );
+            account_owned = false;
+            var auth_owned = true;
+            errdefer if (auth_owned) auth_cfg.deinit(alloc);
+            const source = try alloc.create(google_auth.CachedTokenSource);
+            var source_allocation_owned = true;
+            errdefer if (source_allocation_owned) alloc.destroy(source);
+            source.* = try google_auth.CachedTokenSource.initWithAuthorities(
+                alloc,
+                auth_cfg,
+                network_io,
+                filesystem_io,
+            );
+            auth_owned = false;
+            var source_owned = true;
+            errdefer if (source_owned) source.deinit();
+            var value = try jsonApiClientConfigAlloc(alloc);
+            value.auth = .{ .google_token_source = source };
+            source_owned = false;
+            source_allocation_owned = false;
+            errdefer value.deinit(alloc);
+            if (project_id orelse account_project_id) |selected_project_id| value.project_id = try alloc.dupe(u8, selected_project_id);
+            break :blk value;
+        },
+    };
+    errdefer cfg.deinit(alloc);
+    cfg.io = network_io;
+    if (endpoint_override) |endpoint| {
+        const owned = try alloc.dupe(u8, endpoint);
+        alloc.free(cfg.endpoint);
+        cfg.endpoint = owned;
+    }
+    if (upload_endpoint) |endpoint| {
+        const owned = try alloc.dupe(u8, endpoint);
+        alloc.free(cfg.upload_endpoint);
+        cfg.upload_endpoint = owned;
+    }
+    if (project_id) |configured_project_id| {
+        const owned = try alloc.dupe(u8, configured_project_id);
+        if (cfg.project_id) |previous| alloc.free(previous);
+        cfg.project_id = owned;
+    }
     return cfg;
 }
 
@@ -1439,7 +1662,7 @@ fn objectListUrlAlloc(alloc: Allocator, cfg: JsonApiConfig, bucket: []const u8, 
 fn putResultFromMetadata(alloc: Allocator, metadata: types.ObjectMetadata) !types.PutResult {
     const etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null;
     errdefer if (etag) |value| alloc.free(value);
-    return .{ .etag = etag, .version_id = if (metadata.version_id) |value| try alloc.dupe(u8, value) else null };
+    return .{ .etag = etag, .revision_kind = .generation, .version_id = if (metadata.version_id) |value| try alloc.dupe(u8, value) else null };
 }
 fn parseVersionRetention(alloc: Allocator, body: []const u8, date: ?[]const u8, generation: []const u8, key: []const u8) !?types.VersionRetention {
     const time = @import("retention_time.zig");
@@ -1507,6 +1730,7 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
         .key = key,
         .etag = etag,
         .version_id = version_id,
+        .revision_kind = .generation,
         .checksum = checksum,
         .content_length = content_length,
         .content_type = content_type,
@@ -2315,7 +2539,15 @@ test "json api client round-trips against env-configured endpoint" {
     }
     try std.testing.expect(found);
 
-    try client.deleteObject(bucket, key, .{});
+    const captured = get.metadata.writeRevision() orelse return error.MissingObjectRevision;
+    var updated = try client.compareAndPut(bucket, key, "updated-gcs", captured, .{});
+    defer updated.deinit(alloc);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut(bucket, key, "lost-update", captured, .{}));
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndDelete(bucket, key, captured, .{}));
+    var current = try client.getObject(bucket, key, .{});
+    defer current.deinit(alloc);
+    try std.testing.expectEqualStrings("updated-gcs", current.body);
+    try client.compareAndDelete(bucket, key, current.metadata.writeRevision() orelse return error.MissingObjectRevision, .{});
 }
 
 fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8) !void {
@@ -2488,4 +2720,151 @@ test "gcs version listing qualifies opaque pagination bounded responses and tran
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, client.listObjectVersions("bucket", .{ .cancellation = token }));
     try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
+test "gcs revision publication and deletion use one generation conditional request and preserve conflicts" {
+    const a = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), headers.len);
+            try std.testing.expect(std.mem.endsWith(u8, url, "ifGenerationMatch=123"));
+            if (method == .POST) {
+                try std.testing.expectEqualStrings("next", body.?);
+                return .{ .status = if (self.calls == 1) 200 else 412, .body = try alloc.dupe(u8, "{\"name\":\"HEAD\",\"generation\":\"124\",\"etag\":\"unrelated-http-etag\",\"size\":\"4\"}") };
+            }
+            try std.testing.expectEqual(HttpMethod.DELETE, method);
+            return .{ .status = 204, .body = try alloc.dupe(u8, "") };
+        }
+    };
+    var state: State = .{};
+    var provider = JsonApiClient.initWithRequestFn(a, .{ .endpoint = try a.dupe(u8, "https://gcs.test/storage/v1"), .upload_endpoint = try a.dupe(u8, "https://gcs.test/upload/storage/v1") }, &state, State.request);
+    defer provider.deinit();
+    var client = provider.client();
+    const revision: types.ObjectRevision = .{ .generation = "123" };
+    var written = try client.compareAndPut("bucket", "HEAD", "next", revision, .{});
+    defer written.deinit(a);
+    try std.testing.expectEqualStrings("124", written.version_id.?);
+    try std.testing.expect(written.writeRevision().? == .generation);
+    try std.testing.expectEqualStrings("124", written.writeRevision().?.generation);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut("bucket", "HEAD", "next", revision, .{}));
+    try client.compareAndDelete("bucket", "HEAD", revision, .{});
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+    for ([_][]const u8{ "", "0", "1&unconditional=true", "18446744073709551616" }) |invalid| try std.testing.expectError(error.InvalidArgument, client.compareAndPut("bucket", "HEAD", "next", .{ .generation = invalid }, .{}));
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+    var metadata = try parseObjectMetadataResponse(a, "bucket", "{\"name\":\"HEAD\",\"generation\":\"123\",\"etag\":\"not-a-generation\"}");
+    defer metadata.deinit(a);
+    try std.testing.expectEqualStrings("123", metadata.writeRevision().?.generation);
+}
+
+test "gcs legacy ETag publication resolves a generation and cannot overwrite a concurrent replacement" {
+    const a = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), headers.len);
+            if (self.calls % 2 == 1) {
+                try std.testing.expectEqual(HttpMethod.GET, method);
+                return .{ .status = 200, .body = try alloc.dupe(u8, "{\"name\":\"HEAD\",\"etag\":\"http-etag\",\"generation\":\"5\",\"size\":\"3\"}") };
+            }
+            try std.testing.expect(method == .POST or method == .DELETE);
+            try std.testing.expect(std.mem.endsWith(u8, url, "ifGenerationMatch=5"));
+            // Another writer replaced generation 5 after the metadata GET.
+            return .{ .status = 412, .body = try alloc.dupe(u8, "") };
+        }
+    };
+    var state: State = .{};
+    var provider = JsonApiClient.initWithRequestFn(a, .{ .endpoint = try a.dupe(u8, "https://gcs.test/storage/v1"), .upload_endpoint = try a.dupe(u8, "https://gcs.test/upload/storage/v1") }, &state, State.request);
+    defer provider.deinit();
+    var client = provider.client();
+    try std.testing.expectError(error.PreconditionFailed, client.putObject("bucket", "HEAD", "new", .{ .if_match_etag = "http-etag" }));
+    try std.testing.expectError(error.PreconditionFailed, client.deleteObject("bucket", "HEAD", .{ .if_match_etag = "http-etag" }));
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+}
+
+test "gcs response-only control read captures its publication generation in one GET" {
+    const a = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expect(std.mem.endsWith(u8, url, "?alt=media"));
+            return .{ .status = 200, .body = try alloc.dupe(u8, "captured"), .etag = try alloc.dupe(u8, "media-http-etag"), .generation = try alloc.dupe(u8, "123"), .content_type = try alloc.dupe(u8, "application/json") };
+        }
+    };
+    var state: State = .{};
+    var provider = JsonApiClient.initWithRequestFn(a, .{ .endpoint = try a.dupe(u8, "https://gcs.test/storage/v1"), .upload_endpoint = try a.dupe(u8, "https://gcs.test/upload/storage/v1") }, &state, State.request);
+    defer provider.deinit();
+    var client = provider.client();
+    var captured = try client.getObject("bucket", "HEAD", .{ .skip_metadata_probe = true, .max_response_bytes = 4096 });
+    defer captured.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqualStrings("captured", captured.body);
+    try std.testing.expectEqualStrings("123", captured.metadata.writeRevision().?.generation);
+    try std.testing.expectEqualStrings("application/json", captured.metadata.content_type.?);
+}
+
+test "gcs legacy media ETag is verified against a bounded captured generation before publication" {
+    const a = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            switch (self.calls) {
+                1 => {
+                    try std.testing.expectEqual(HttpMethod.GET, method);
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "{\"name\":\"HEAD\",\"etag\":\"json-etag\",\"generation\":\"5\",\"size\":\"3\"}") };
+                },
+                2 => {
+                    try std.testing.expectEqual(HttpMethod.GET, method);
+                    try std.testing.expect(std.mem.endsWith(u8, url, "?generation=5&alt=media"));
+                    try std.testing.expectEqual(@as(?usize, 64 * 1024), limit);
+                    try expectHeader(headers, "If-Match", "media-etag");
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "old"), .generation = try alloc.dupe(u8, "5"), .etag = try alloc.dupe(u8, "media-etag") };
+                },
+                3 => {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.endsWith(u8, url, "ifGenerationMatch=5"));
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "{\"name\":\"HEAD\",\"etag\":\"next\",\"generation\":\"6\",\"size\":\"3\"}") };
+                },
+                else => return error.UnexpectedCall,
+            }
+        }
+    };
+    var state: State = .{};
+    var provider = JsonApiClient.initWithRequestFn(a, .{ .endpoint = try a.dupe(u8, "https://gcs.test/storage/v1"), .upload_endpoint = try a.dupe(u8, "https://gcs.test/upload/storage/v1") }, &state, State.request);
+    defer provider.deinit();
+    var client = provider.client();
+    var written = try client.putObject("bucket", "HEAD", "new", .{ .if_match_etag = "media-etag" });
+    defer written.deinit(a);
+    try std.testing.expectEqualStrings("6", written.version_id.?);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+}
+
+test "GCS shared credential factory rolls back every allocation failure" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var cfg = try clientConfigForCredentialsAlloc(a, .{ .source = .bearer_token, .bearer_token = @constCast("fixture-token") }, "project", "https://storage.example/storage/v1", "https://storage.example/upload/storage/v1", null, null);
+            defer cfg.deinit(a);
+            try std.testing.expectEqualStrings("project", cfg.project_id.?);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "GCS expired operation deadline fails before transport dispatch" {
+    var cfg = try jsonApiClientConfigWithBearerTokenAlloc(std.testing.allocator, "fixture-token", null);
+    cfg.request_deadline_ns = 1;
+    var client = try JsonApiClient.init(std.testing.allocator, cfg);
+    defer client.deinit();
+    var store = client.client();
+    try std.testing.expectError(error.Timeout, store.getObject("bucket", "doc", .{ .version_id = "123", .skip_metadata_probe = true }));
 }

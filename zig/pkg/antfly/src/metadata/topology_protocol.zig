@@ -93,11 +93,41 @@ const std = @import("std");
 /// Version 60 backfills and maintains root-scoped resolver pin projections.
 /// Version 61 resumes bounded pin paths and backfills static root membership.
 /// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
-pub const current_version: u16 = 62;
+/// Version 63 adds dependency-scoped pin repair and indexed invalidation proofs.
+/// Version 64 adds deletable dependency summaries and forward-only pin repair.
+/// Version 65 scopes native paths and adds paged fingerprint dependency summaries.
+/// Version 66 indexes routing sources for dependency-validated canonical proofs.
+/// Version 67 qualifies legacy resolver content before native cache admission.
+/// Version 68 tracks bounded edits during resumable resolver qualification.
+/// Version 69 retains consumer-owned SQL completion references.
+/// Version 70 qualifies routed SQL completion ownership across every peer.
+/// Version 71 retains managed completion producer retirement checkpoints.
+/// Version 72 requires pre-execution transaction proof handoff on all issuers.
+/// Version 73 prepares metadata-owned SQL completion consumers before admission.
+/// Version 74 retires unpublished completion subscriptions after issuer restart.
+/// Version 75 binds HTTP SQL handles to issuers and observes DDL submission.
+/// Version 76 requires attempt-aware commit proofs and joined connection refusals.
+/// Version 77 isolates issuer outboxes in shared transaction stores.
+/// Version 78 requires backend-wide coordination of shared session mutations.
+/// Version 79 admits privacy-owned consumer graphs and serving fences.
+/// Version 80 stores private range checkpoints as immutable, owner-fenced blobs.
+/// Version 81 accounts retained checkpoint bytes through final reclamation.
+/// Version 82 requires compact, authoritative privacy read bindings.
+/// Version 83 decodes independent durable query-artifact store ownership and
+/// its restartable cleanup frontier, including the global composed-cursor row.
+/// Version 84 adds graph definitions and transaction sessions.
+pub const current_version: u16 = 84;
+pub const sql_completion_admission_version: u16 = 78;
+pub const sql_completion_owner_version: u16 = 71;
+pub const sql_completion_reference_version: u16 = 69;
+pub const privacy_version: u16 = 82;
+pub fn usesPrivacy(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
+}
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 62;
+pub const resolver_namespaces_version: u16 = 68;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {
@@ -107,11 +137,15 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
+/// Version 84 adds graph definitions and transaction sessions alongside main's
+/// resolver namespace and document job formats, preserving command tags 0..80.
+pub const transaction_sessions_version: u16 = 84;
+pub const graph_definition_version: u16 = 84;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
-pub const lake_index_catalog_version: u16 = 29;
+pub const lake_index_catalog_version: u16 = 83;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.

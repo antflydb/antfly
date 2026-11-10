@@ -51,6 +51,59 @@ fn recordDigest(selected: *const Key, raw: []const u8) publication.Digest {
     return result;
 }
 
+// Protocol-only activation keeps one bounded certificate namespace. This
+// catalog-bound anchor is committed atomically with the new authority; source,
+// output revision and database-root checks remain mandatory for every read.
+const epoch_prefix = "\x00\x00__artifact_publication__:authored-epoch:";
+fn epochKey(namespace: [24]u8) [epoch_prefix.len + 24]u8 {
+    return epoch_prefix.* ++ namespace;
+}
+fn epochChecksum(selected: []const u8, body: []const u8) publication.Digest {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(selected);
+    hash.update(body);
+    var result: publication.Digest = undefined;
+    hash.final(&result);
+    return result;
+}
+pub fn acceptanceAuthority(txn: anytype, authority: publication.Authority) !publication.Authority {
+    const selected = epochKey(authority.namespace);
+    const raw = txn.get(&selected) catch |err| if (err == error.NotFound) return authority else return err;
+    if (raw.len != 84 or !std.mem.eql(u8, raw[0..4], "AAE1") or
+        !std.mem.eql(u8, raw[52..84], &epochChecksum(&selected, raw[0..52]))) return error.ArtifactCatalogCorrupt;
+    if (std.mem.readInt(u64, raw[4..12], .big) != authority.epoch or
+        !std.mem.eql(u8, raw[12..44], &authority.catalog_digest)) return authority;
+    var result = authority;
+    result.epoch = std.mem.readInt(u64, raw[44..52], .big);
+    if (result.epoch == 0 or result.epoch > authority.epoch) return error.ArtifactCatalogCorrupt;
+    return result;
+}
+pub fn stageCatalogTransition(txn: anytype, command: anytype, active: ?publication.Authority) !void {
+    if (command.binding.effect_protocol < 17) return;
+    var epoch = command.binding.epoch;
+    if (active) |old| if (command.previous) |previous| {
+        if (previous.epoch == old.epoch and command.binding.epoch > old.epoch and
+            command.binding.effect_protocol > previous.effect_protocol and
+            std.mem.eql(u8, &old.namespace, &command.namespace) and
+            std.mem.eql(u8, &previous.digest, &old.catalog_digest) and
+            std.mem.eql(u8, &command.binding.digest, &old.catalog_digest))
+            epoch = (try acceptanceAuthority(txn, old)).epoch;
+    };
+    var raw: [84]u8 = undefined;
+    @memcpy(raw[0..4], "AAE1");
+    std.mem.writeInt(u64, raw[4..12], command.binding.epoch, .big);
+    @memcpy(raw[12..44], &command.binding.digest);
+    std.mem.writeInt(u64, raw[44..52], epoch, .big);
+    const selected = epochKey(command.namespace);
+    @memcpy(raw[52..84], &epochChecksum(&selected, raw[0..52]));
+    try txn.put(&selected, &raw);
+}
+const EpochRetention = struct {
+    pub fn epoch(txn: anytype, authority: publication.Authority) !u64 {
+        return (try acceptanceAuthority(txn, authority)).epoch;
+    }
+};
+
 const Vector = struct {
     document: []const u8,
     artifact: []const u8,
@@ -108,8 +161,7 @@ pub const Prepared = struct {
                 const source = final.get(primary) orelse continue;
                 const ttl = try keys.ttlKeyAlloc(a, parsed.doc_key);
                 const timestamp_bytes = final.get(ttl) orelse continue;
-                if (timestamp_bytes.len != 8) return error.InvalidBatchRequest;
-                const timestamp = std.mem.readInt(u64, timestamp_bytes[0..8], .little);
+                const timestamp = @import("../ttl.zig").writeVersion(timestamp_bytes) orelse return error.InvalidBatchRequest;
                 if (timestamp == 0) return error.InvalidBatchRequest;
                 try seen.put(scratch.allocator(), write.key, {});
                 const source_digest = try result.remember(a, primary, source);
@@ -157,10 +209,11 @@ pub const Prepared = struct {
     }
 
     /// Called ONLY by input capture after it stamps revisions for the actual
-    /// physical transaction. No payload hashing or reads in the commit hook.
+    /// physical transaction. No vector payload hashing or reads in the commit hook.
     pub fn stage(self: *const Prepared, txn: anytype, authority: publication.Authority, position: publication.Position) !void {
-        if (self.root == 0) return;
+        if (self.root == 0 or self.vectors.len == 0) return;
         const encoded_position = try position.encode();
+        const acceptance = try acceptanceAuthority(txn, authority);
         for (self.vectors) |vector| {
             if (!self.postimages.get(vector.primary).?.matched or !self.postimages.get(vector.ttl).?.matched or
                 !self.postimages.get(vector.artifact).?.matched) continue;
@@ -174,7 +227,7 @@ pub const Prepared = struct {
             @memcpy(raw[141..173], &vector.output_digest);
             const revision_key = publication.artifactRevisionKey(authority.namespace, vector.artifact);
             @memcpy(raw[173..205], revision_key[revision_key.len - 32 ..]);
-            const selected = key(authority, self.root, vector.artifact);
+            const selected = key(acceptance, self.root, vector.artifact);
             @memcpy(raw[checksum_offset..], &recordDigest(&selected, raw[0..checksum_offset]));
             try txn.put(&selected, &raw);
         }
@@ -200,7 +253,7 @@ pub const Accepted = struct {
 pub fn collectObsoletePage(alloc: std.mem.Allocator, store: anytype, root: u128) !bool {
     var identity: [16]u8 = undefined;
     std.mem.writeInt(u128, &identity, root, .big);
-    return @import("artifact_producer_obligations.zig").collectObsoleteEpochPageForIdentity(alloc, store, prefix, 48, 48, if (root == 0) null else &identity);
+    return @import("artifact_producer_obligations.zig").collectObsoleteEpochPageForIdentityWithRetention(alloc, store, prefix, 48, 48, if (root == 0) null else &identity, EpochRetention);
 }
 
 /// Reads local acceptance, not transferable provenance. The caller retains
@@ -208,7 +261,7 @@ pub fn collectObsoletePage(alloc: std.mem.Allocator, store: anytype, root: u128)
 pub fn readCurrent(txn: anytype, root: u128, document: []const u8, artifact: []const u8) !?Accepted {
     if (root == 0) return null;
     const authority = (try publication.authority(txn)) orelse return null;
-    const selected = key(authority, root, artifact);
+    const selected = key(try acceptanceAuthority(txn, authority), root, artifact);
     const raw = txn.get(&selected) catch |err| if (err == error.NotFound) return null else return err;
     try validateRecord(&selected, raw);
     const revision_key = publication.artifactRevisionKey(authority.namespace, artifact);
@@ -353,7 +406,7 @@ pub fn prepareRetirementPage(alloc: std.mem.Allocator, store: anytype, root: u12
     const expected = try loadGcCursor(&read);
     const current_stamp = try mutationStamp(&read, authority);
     var sweep_stamp = current_stamp;
-    var start = key(authority, root, "");
+    var start = key(try acceptanceAuthority(&read, authority), root, "");
     const scope = start[0 .. start.len - 32];
     var has_after = false;
     if (expected) |previous| {
@@ -649,12 +702,15 @@ test "ordered artifact inventory authored retirement cache binds owner clock epo
     }
 }
 
-test "ordered artifact inventory authored acceptance requires exact physical writer and postimages" {
+test "ordered artifact inventory authored acceptance requires exact physical writer and postimages including time series" {
     const alloc = std.testing.allocator;
     const docstore = @import("../docstore.zig");
     const owner = @import("../source_authority.zig");
+    const inventory = @import("artifact_inventory.zig");
+    const catalogs = inventory.Catalogs{};
     const namespace: publication.Namespace = @splat(7);
-    const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = @splat(3) };
+    const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = catalogs.digest() };
+    const previous: inventory.Binding = .{ .epoch = 1, .digest = authority.catalog_digest, .semantic_digest = try catalogs.semanticDigest(alloc), .effect_protocol = 15 };
     for ([_]owner.Kind{ .native, .raft }) |kind| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -665,12 +721,12 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         var store = try docstore.DocStore.open(alloc, path, .{});
         defer store.close();
         {
-            var batch = try store.beginWriteBatch();
-            errdefer batch.abort();
-            var txn = batch.asTxn();
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
             try owner.bind(&txn, kind, namespace);
+            try inventory.stageOrdered(alloc, &txn, .{ .namespace = namespace, .binding = previous, .catalogs = catalogs }, 1);
             try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
-            try batch.commit();
+            try txn.commit();
         }
         const primary = try keys.documentKeyAlloc(alloc, "doc");
         defer alloc.free(primary);
@@ -683,8 +739,9 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         else
             try codec.encodeAuthoredSparseEmbeddingAlloc(alloc, &.{ 3, 8 }, &.{ 1, 2 });
         defer alloc.free(value);
-        var timestamp: [8]u8 = undefined;
-        std.mem.writeInt(u64, &timestamp, 17, .little);
+        var timestamp: [24]u8 = undefined;
+        std.mem.writeInt(u64, timestamp[0..8], 17, .little);
+        std.mem.writeInt(i128, timestamp[8..24], -1_000_000_000, .little);
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 1, .little);
@@ -735,6 +792,26 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
             defer read.abort();
             try std.testing.expectError(error.ArtifactCatalogCorrupt, readCurrent(&read, 42, "doc", artifact));
         }
+        // A protocol-only activation advances authority without changing the
+        // meaning of explicit vectors. Preserve the bounded certificate domain
+        // across GC, reopen, and subsequent explicit ingress.
+        {
+            const transition: inventory.Command = .{ .namespace = namespace, .previous = previous, .catalogs = catalogs, .binding = .{ .epoch = 2, .digest = authority.catalog_digest, .semantic_digest = previous.semantic_digest, .effect_protocol = 17 } };
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                try inventory.stageOrdered(alloc, &txn, transition, 2);
+            }
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(authority, try acceptanceAuthority(&read, authority));
+            }
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try inventory.stageOrdered(alloc, &txn, transition, 2);
+            try txn.commit();
+        }
         var collected = false;
         for (0..8) |_| {
             if (try collectObsoletePage(alloc, &store, 41)) {
@@ -749,10 +826,30 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
             try std.testing.expect((try readCurrent(&read, 41, "doc", artifact)) != null);
             try std.testing.expect((try readCurrent(&read, 42, "doc", artifact)) == null);
         }
+        store.close();
+        store = try docstore.DocStore.open(alloc, path, .{});
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect((try readCurrent(&read, 41, "doc", artifact)) != null);
+            const current = (try publication.authority(&read)).?;
+            try std.testing.expectEqual(@as(u64, 2), current.epoch);
+            try std.testing.expectEqual(@as(u64, 1), (try acceptanceAuthority(&read, current)).epoch);
+            var changed = current;
+            changed.catalog_digest = @splat(99);
+            try std.testing.expectEqual(changed, try acceptanceAuthority(&read, changed));
+        }
+        std.mem.writeInt(u64, marker[8..16], 3, .little);
+        try store.putBatchWithReplayAndParticipant(null, actual, &.{}, null, .{}, prepared.participant());
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect((try readCurrent(&read, 41, "doc", artifact)) != null);
+        }
         // An aborted attempt must not leak observed postimages into a retry.
         prepared.reset();
         for (actual) |write| prepared.observe(write.key, write.value);
-        std.mem.writeInt(u64, marker[8..16], 3, .little);
+        std.mem.writeInt(u64, marker[8..16], 4, .little);
         const partial = [_]docstore.KVPair{ writes[2], writes[3] };
         try store.putBatchWithReplayAndParticipant(null, partial[0..@as(usize, if (kind == .raft) 2 else 1)], &.{}, null, .{}, prepared.participant());
         {
@@ -760,11 +857,11 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
             defer read.abort();
             try std.testing.expect((try readCurrent(&read, 41, "doc", artifact)) == null);
         }
-        std.mem.writeInt(u64, marker[8..16], 4, .little);
+        std.mem.writeInt(u64, marker[8..16], 5, .little);
         try store.putBatchWithReplayAndParticipant(null, actual, &.{}, null, .{}, prepared.participant());
         // Primary-only replacement invalidates acceptance without scanning
         // vectors or rewriting their acceptance records.
-        std.mem.writeInt(u64, marker[8..16], 5, .little);
+        std.mem.writeInt(u64, marker[8..16], 6, .little);
         const changed = [_]docstore.KVPair{ .{ .key = primary, .value = "{\"changed\":true}" }, writes[3] };
         try store.putBatch(changed[0..@as(usize, if (kind == .raft) 2 else 1)], &.{});
         {
@@ -779,7 +876,7 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         defer manager.deinit();
         const transaction_id: transactions.TxnId = @splat(9);
         try manager.initTransaction(transaction_id, 100);
-        std.mem.writeInt(u64, marker[8..16], 6, .little);
+        std.mem.writeInt(u64, marker[8..16], 7, .little);
         var failing: FailingParticipant = .{ .inner = prepared.participant() };
         try std.testing.expectError(error.InjectedAcceptanceFailure, manager.resolveIntentsWithExtraBatch(transaction_id, .committed, 101, .{
             .writes = actual,
@@ -805,7 +902,7 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         }
         // Lost-reply retry after a newer primary write cannot replay old
         // postimages or attach their participant to the terminal decision.
-        std.mem.writeInt(u64, marker[8..16], 7, .little);
+        std.mem.writeInt(u64, marker[8..16], 8, .little);
         try store.putBatch(changed[0..@as(usize, if (kind == .raft) 2 else 1)], &.{});
         prepared.reset();
         const retried = try manager.resolveIntentsWithExtraBatch(transaction_id, .committed, 101, .{
@@ -818,6 +915,37 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
             var read = try store.beginReadTxn();
             defer read.abort();
             try std.testing.expectEqualSlices(u8, changed[0].value, try read.get(primary));
+            try std.testing.expect((try readCurrent(&read, 41, "doc", artifact)) == null);
+        }
+        {
+            const selected = epochKey(namespace);
+            const saved = try store.get(alloc, &selected);
+            defer alloc.free(saved);
+            var corrupt: [84]u8 = saved[0..84].*;
+            corrupt[44] ^= 1;
+            try store.put(&selected, &corrupt);
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.ArtifactCatalogCorrupt, acceptanceAuthority(&read, (try publication.authority(&read)).?));
+            }
+            try store.put(&selected, saved);
+        }
+        // An actual catalog edit resets the namespace instead of adopting
+        // certificates with different output semantics.
+        {
+            const next_catalogs = inventory.Catalogs{ .indexes = "AIDX\x02\x00\x00\x00\x00\x00\x00\x00" };
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const current = (try inventory.load(alloc, &txn)).?;
+            defer current.deinit();
+            try inventory.stageOrdered(alloc, &txn, .{ .namespace = namespace, .previous = current.value.command.binding, .binding = .{ .epoch = 3, .digest = next_catalogs.digest(), .semantic_digest = try next_catalogs.semanticDigest(alloc), .effect_protocol = 17 }, .catalogs = next_catalogs }, 3);
+            try txn.commit();
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const active = (try publication.authority(&read)).?;
+            try std.testing.expectEqual(active, try acceptanceAuthority(&read, active));
+            try std.testing.expectEqual(@as(u64, 3), active.epoch);
             try std.testing.expect((try readCurrent(&read, 41, "doc", artifact)) == null);
         }
     }

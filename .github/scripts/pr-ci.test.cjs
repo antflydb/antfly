@@ -8,6 +8,22 @@ const config = require('./pr-ci-config.json');
 const SHA = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
 
+test('main qualification completes while newer PR and merge queue revisions supersede old work', () => {
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../workflows/zig-tests.yml'), 'utf8');
+  const block = workflow.match(/^concurrency:\n([\s\S]*?)(?=^jobs:)/m)[1];
+  assert.match(block, /group: zig-\$\{\{ inputs.pr_number \|\| github.ref \}\}/);
+  const expression = block.match(/cancel-in-progress: \$\{\{ (.*?) \}\}/)[1];
+  const cancel = new Function('inputs', 'github', `return (${expression});`);
+  for (const [ref, pr, expected] of [
+    ['refs/heads/main', '', false],
+    ['refs/heads/main', '1358', true],
+    ['refs/heads/fix/example', '', true],
+    ['refs/heads/gh-readonly-queue/main/pr-1', '', true],
+  ]) {
+    assert.equal(cancel({pr_number:pr}, {ref}), expected, `${ref} PR ${pr}`);
+  }
+});
+
 function fixture() {
   const repository = {full_name: 'acme/project', default_branch: 'main'};
   const pr = {number: 7, state: 'open', draft: false, labels: [],
@@ -371,7 +387,9 @@ test('large diffs select all standard suites; renamed paths are considered', asy
   const g=fixture();
   const target=config.suites.find(s=>s.paths);
   if (target) {
-    const filename=target.paths.some(p=>new RegExp(p).test('go/pkg/old.go'))?'go/pkg/old.go':'docs/moved.txt';
+    const filename = ['go/pkg/old.go', 'docs/moved.txt', 'examples/dictation/Sources/App.swift']
+      .find(file => target.paths.some(pattern => new RegExp(pattern).test(file)));
+    assert.ok(filename, `missing rename fixture for ${target.id}`);
     g.files([{filename:'docs/moved.txt',previous_filename:filename}]); await g.call();
     assert.ok(JSON.parse(g.checks[0].output.text).suites.includes(target.id));
   }
@@ -388,6 +406,27 @@ test('path selection matches repository CI owners and does not enable optional t
     assert.deepEqual(selectSuites(['ts/apps/dashboard/test.ts'],f.pr,config),['policy','vitest','playwright']);
     assert.ok(selectSuites(['ts/apps/www-antfly/app/page.tsx'],f.pr,config).includes('www'));
     assert.deepEqual(selectSuites(['README.md'],f.pr,config),['policy']);
+  }
+});
+
+test('dictation source checks require admission and retain narrow path selection', () => {
+  if (!config.suites.some(s => s.id === 'dictation')) return;
+  const f = fixture();
+  for (const file of ['examples/dictation/Sources/App.swift',
+    'examples/dictation/Tests/ClientTests.swift', 'examples/dictation/Assets/icon.png',
+    'examples/dictation/presets/default.json', 'examples/dictation/Package.swift',
+    'examples/dictation/test.sh', 'examples/dictation/Package.resolved',
+    'examples/dictation/Info.plist', 'examples/dictation/antfly.yaml',
+    '.github/workflows/dictation-example.yml',
+    'examples/dictation/release/policy.json',
+    'scripts/release/objectstore_channel.py',
+    'scripts/release/requirements.lock',
+    '.github/workflows/dictation-release.yml']) {
+    assert.ok(selectSuites([file], f.pr, config).includes('dictation'), file);
+  }
+  for (const file of ['examples/dictation/README.md', 'docs/guides/inference.mdx',
+    'zig/build.zig', 'examples/another-app/Package.swift']) {
+    assert.ok(!selectSuites([file], f.pr, config).includes('dictation'), file);
   }
 });
 
@@ -423,7 +462,7 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     const text=fs.readFileSync(path.join(root,file),'utf8');
     // The license boundary is a lightweight, read-only source check. Main
     // runs it directly on PRs; expensive suites still require admission.
-    if (!['pr-ci-controller.yml', 'apache-license.yml'].includes(file)) {
+    if (!['pr-ci-controller.yml', 'apache-license.yml', 'docs-design-approval.yml'].includes(file)) {
       assert.doesNotMatch(text,/^  pull_request(?:_target)?:/m,file);
     }
     if (file.startsWith('pr-ci')) {
@@ -709,9 +748,9 @@ test('PR result maps expanded suites to their single execution job', () => {
   const workflow = fs.readFileSync(path.resolve(__dirname, '../workflows/pr-ci.yml'), 'utf8');
   const script = workflow.split('const needs = JSON.parse(process.env.RESULTS);')[1].split('\n  publish:')[0];
   const check = new Function('process', `const needs = JSON.parse(process.env.RESULTS);${script}`);
-  const results = {approve: {result: 'success', outputs: {suites: JSON.stringify(['zig', 'full', 'vopr', 'soak'])}}, zig: {result: 'success'}, vopr: {result: 'success'}};
+  const results = {approve: {result: 'success', outputs: {suites: JSON.stringify(['zig', 'full', 'vopr', 'soak'])}}, zig: {result: 'success'}, vopr: {result: 'success'}, 'operation-owners': {result: 'success'}};
   check({env: {RESULTS: JSON.stringify(results)}});
-  for (const job of ['zig', 'vopr']) {
+  for (const job of ['zig', 'vopr', 'operation-owners']) {
     for (const result of ['failure', 'skipped', 'cancelled']) {
       assert.throws(() => check({env: {RESULTS: JSON.stringify({...results, [job]: {result}})}}), /did not pass/);
     }

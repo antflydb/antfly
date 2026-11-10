@@ -250,6 +250,11 @@ const Registry = struct {
     /// Build epoch. Always `>= 1` so that `gen == 0` (the bit pattern of fresh
     /// OS pages) unambiguously means "never written".
     gen: u32,
+    // Track ever-touched buckets across reset generations. Cleanup must not
+    // fault/scan a large zero-backed registry for a tiny vocabulary.
+    touched_words: []usize,
+    touched_order: []usize,
+    touched_count: usize = 0,
 
     const RegistryCell = struct {
         addr: usize = 0,
@@ -267,23 +272,61 @@ const Registry = struct {
         // in ReleaseFast and produce a slice longer than the actual mapping.
         const n = std.math.mul(usize, table_size, mru_size) catch return error.RegistryTooLarge;
         const table = try mapZeroTable(alloc, n);
+        errdefer unmapZeroTable(alloc, table);
+        const bits = @bitSizeOf(usize);
+        const words_len = if (n == 0) 0 else table_size / bits + @intFromBool(table_size % bits != 0);
+        const touched_words = try alloc.alloc(usize, words_len);
+        errdefer alloc.free(touched_words);
+        @memset(touched_words, 0);
+        const touched_order = try alloc.alloc(usize, words_len);
         return .{
             .alloc = alloc,
             .table = table,
             .table_size = table_size,
             .mru_size = mru_size,
             .gen = 1,
+            .touched_words = touched_words,
+            .touched_order = touched_order,
         };
     }
 
     pub fn deinit(self: *Registry) void {
-        for (self.table) |*cell| {
-            // Skip cells that have never been written: their `node` field is
-            // pristine kernel-zeroed memory we mustn't interpret as ?BuilderNode.
-            if (cell.gen == 0) continue;
-            if (cell.node) |*n| n.deinit(self.alloc);
-        }
+        self.clearTouched();
+        self.alloc.free(self.touched_words);
+        self.alloc.free(self.touched_order);
         unmapZeroTable(self.alloc, self.table);
+    }
+
+    fn touch(self: *Registry, bucket: usize) void {
+        const bits = @bitSizeOf(usize);
+        const index = bucket / bits;
+        const mask = @as(usize, 1) << @intCast(bucket % bits);
+        const old = self.touched_words[index];
+        if (old & mask != 0) return;
+        if (old == 0) {
+            self.touched_order[self.touched_count] = index;
+            self.touched_count += 1;
+        }
+        self.touched_words[index] = old | mask;
+    }
+
+    fn clearTouched(self: *Registry) void {
+        for (self.touched_order[0..self.touched_count]) |word_index| {
+            var word = self.touched_words[word_index];
+            while (word != 0) {
+                const bit = @ctz(word);
+                const bucket = word_index * @bitSizeOf(usize) + bit;
+                const start = bucket * self.mru_size;
+                for (self.table[start..][0..self.mru_size]) |*cell| {
+                    if (cell.gen == 0) continue;
+                    if (cell.node) |*node| node.deinit(self.alloc);
+                    cell.* = .{};
+                }
+                word &= word - 1;
+            }
+            self.touched_words[word_index] = 0;
+        }
+        self.touched_count = 0;
     }
 
     fn mapZeroTable(alloc: Allocator, n: usize) ![]RegistryCell {
@@ -322,11 +365,7 @@ const Registry = struct {
     /// nodes so the next build can't get a phantom hit on a stale cell.
     fn reset(self: *Registry) void {
         if (self.gen == std.math.maxInt(u32)) {
-            for (self.table) |*cell| {
-                if (cell.gen == 0) continue;
-                if (cell.node) |*n| n.deinit(self.alloc);
-                cell.* = .{}; // initialize via Zig assignment, not raw bytes
-            }
+            self.clearTouched();
             self.gen = 1;
         } else {
             self.gen += 1;
@@ -356,6 +395,7 @@ const Registry = struct {
         if (self.table.len == 0) return .{ .found = false, .addr = 0, .cell_idx = null };
 
         const bucket = self.hash(node);
+        self.touch(bucket);
         const start = self.mru_size * bucket;
         const end = start + self.mru_size;
 
@@ -1442,6 +1482,30 @@ test "registry tolerates eviction with a tiny table" {
     }
 }
 
+test "sparse registry cleanup tracks only touched words across resets" {
+    const a = std.testing.allocator;
+    var builder = try Builder.init(a, .{ .registry_table_size = 65_536 });
+    defer builder.deinit();
+    for ([_][]const u8{ "first", "other", "third" }) |key| {
+        try builder.insert(key, 7);
+    }
+    a.free(try builder.finish());
+    const touched = builder.registry.touched_count;
+    try std.testing.expect(touched != 0 and touched < 32);
+    try builder.reset();
+    try builder.insert("different", 9);
+    const bytes = try builder.finish();
+    defer a.free(bytes);
+    const fst = try FST.load(bytes);
+    try std.testing.expect((try fst.get("different")).found);
+    try std.testing.expect(!(try fst.get("first")).found);
+    // Rollover must also reclaim buckets left over from earlier builds.
+    builder.registry.gen = std.math.maxInt(u32);
+    try builder.reset();
+    try std.testing.expectEqual(@as(usize, 0), builder.registry.touched_count);
+    for (builder.registry.table) |cell| try std.testing.expectEqual(@as(u32, 0), cell.gen);
+}
+
 test "registry rollover sweep frees stale nodes" {
     // Force the rare gen-rollover path so the full-table sweep runs at least
     // once under the testing allocator's leak detector.
@@ -1466,6 +1530,7 @@ test "registry rollover sweep frees stale nodes" {
     builder.registry.gen = std.math.maxInt(u32);
     try builder.reset();
     try std.testing.expectEqual(@as(u32, 1), builder.registry.gen);
+    try std.testing.expectEqual(@as(usize, 0), builder.registry.touched_count);
 
     try builder.insert("xx", 100);
     {

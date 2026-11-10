@@ -72,6 +72,42 @@ pub const ValidatedRanges = struct {
             if (!cache.scopes.covers(cache.scope_ids[slot], required)) return false;
             return advance(scanner, entry.len);
         }
+        /// Syntax was checked for this immutable input before publication.
+        /// Copy only default-encoder canonical string spellings; other strings
+        /// retain the ordinary decoder/encoder. This grants no container/key
+        /// shortcut and cannot authorize bytes from another source or scope.
+        pub fn copyCanonicalString(self: @This(), scanner: *std.json.Scanner, writer: *std.Io.Writer) !bool {
+            const input = scanner.input;
+            const start = scanner.cursor;
+            if (scanner.diagnostics != null or start >= input.len or input[start] != '"' or !self.proof.contains(input[start..][0..1])) return false;
+            var cursor = start + 1;
+            while (std.mem.indexOfAnyPos(u8, input, cursor, "\"\\")) |at| {
+                if (input[at] == '"') {
+                    const raw = input[start .. at + 1];
+                    if (raw.len < 256 or !self.proof.contains(raw)) return false;
+                    _ = try advance(scanner, raw.len);
+                    try writer.writeAll(raw);
+                    return true;
+                }
+                if (input.len - at < 2) return false;
+                switch (input[at + 1]) {
+                    '"', '\\', 'b', 'f', 'n', 'r', 't' => cursor = at + 2,
+                    'u' => {
+                        if (input.len - at < 6 or input[at + 2] != '0' or input[at + 3] != '0' or input[at + 4] < '0' or input[at + 4] > '1') return false;
+                        const last = input[at + 5];
+                        const low: u8 = if (last >= '0' and last <= '9') last - '0' else if (last >= 'a' and last <= 'f') last - 'a' + 10 else return false;
+                        const value = (input[at + 4] - '0') * 16 + low;
+                        switch (value) {
+                            8, 9, 10, 12, 13 => return false,
+                            else => {},
+                        }
+                        cursor = at + 6;
+                    },
+                    else => return false,
+                }
+            }
+            return false;
+        }
         fn advance(scanner: *std.json.Scanner, len: usize) !bool {
             const input = scanner.input;
             const cursor = scanner.cursor;
@@ -162,6 +198,15 @@ pub const ValidatedRanges = struct {
     /// independently owned records so publishing never mutates an older proof.
     pub fn publish(self: *@This(), raw: []const u8, all_keys: bool) !?*const Ref {
         const value = self.validated(raw, all_keys) orelse return null;
+        return try self.publishRef(value);
+    }
+    /// The caller has just validated the complete immutable input. Plain large
+    /// objects need a syntax receipt too, even without cached fanout extents.
+    /// This allocates no range table and leaves structural skip admission intact.
+    pub fn publishSyntax(self: *@This(), raw: []const u8, all_keys: bool) !*const Ref {
+        return self.publishRef(.{ .cache = self, .proof = .{ .source = raw, .all_keys = all_keys } });
+    }
+    fn publishRef(self: *@This(), value: Ref) !*const Ref {
         if (self.primary == null) {
             self.primary = value;
             return &self.primary.?;

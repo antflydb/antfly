@@ -96,16 +96,23 @@ jobs:
           name: antfly-release-ledger
           path: dist/release-ledger
 
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-release-runtime-archives
+          tag: ${{ inputs.tag_name }}
+          commit: ${{ inputs.source_commit }}
+          ledger-sha256: ${{ inputs.ledger_sha256 }}
+          scope: runtime
           path: dist/release-archives
 
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
 

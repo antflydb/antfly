@@ -74,7 +74,57 @@ pub const CatalogFlags = struct {
 };
 
 pub fn isHelpArg(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help");
+    return isHelpFlag(arg) or std.mem.eql(u8, arg, "help");
+}
+
+pub fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+/// Reports whether a command line asks for help. `--help` and `-h` count
+/// anywhere before `--`. The bare word `help` counts only in a subcommand
+/// slot, before any flag, so it never shadows a flag value such as
+/// `--table help` or a positional argument after options.
+pub fn helpRequestedIn(args: anytype) bool {
+    var probe = args;
+    var saw_flag = false;
+    while (probe.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (isHelpFlag(arg)) return true;
+        if (std.mem.startsWith(u8, arg, "-")) {
+            saw_flag = true;
+            continue;
+        }
+        if (!saw_flag and std.mem.eql(u8, arg, "help")) return true;
+    }
+    return false;
+}
+
+const TestArgs = struct {
+    items: []const []const u8,
+    index: usize = 0,
+    fn next(self: *TestArgs) ?[]const u8 {
+        if (self.index >= self.items.len) return null;
+        defer self.index += 1;
+        return self.items[self.index];
+    }
+};
+
+test "help is a request only as a flag or in a subcommand slot" {
+    const cases = [_]struct { args: []const []const u8, help: bool }{
+        .{ .args = &.{"help"}, .help = true },
+        .{ .args = &.{ "wait", "help" }, .help = true },
+        .{ .args = &.{ "wait", "--help" }, .help = true },
+        .{ .args = &.{ "wait", "--table", "docs", "-h" }, .help = true },
+        .{ .args = &.{ "wait", "--table", "help" }, .help = false },
+        .{ .args = &.{ "wait", "--table", "help", "--index", "vectors" }, .help = false },
+        .{ .args = &.{ "create", "--name=help" }, .help = false },
+        .{ .args = &.{ "insert", "--", "--help" }, .help = false },
+        .{ .args = &.{ "wait", "--table", "docs" }, .help = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.help, helpRequestedIn(TestArgs{ .items = case.args }));
+    }
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
@@ -171,14 +221,14 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\
     \\  agents retrieval [--table <table>] [--web-search-connection <name>] (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
     \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
-    \\                            --max-context-tokens <n> --streaming|--no-streaming
+    \\                            --context-management <json> --max-context-tokens <n> --streaming|--no-streaming
     \\                            --classify --reasoning --generate --followup --confidence
     \\                            --max-internal-iterations <0..20> (default: 8 for intent; 0 for explicit queries)
     \\  agents research --query <text> --generator <json> (--table <table>|--web-search-connection <name>) [options]
     \\  agents research options: --full-text-search <query> --semantic-search <text> --indexes <names> --fields <names> --limit <n>
     \\                           --fetch-allowed-hosts <hosts> --agent-knowledge <text> --outline <headings> --instructions <text>
     \\                           --max-rounds <1..5> --max-sub-questions <1..8> --max-parallel <1..4> --researcher-iterations <1..20>
-    \\                           --max-llm-calls <n> --deadline-ms <ms> --verify --streaming|--no-streaming
+    \\                           --context-management <json> --max-llm-calls <n> --deadline-ms <ms> --verify --streaming|--no-streaming
     \\                           --job (durable job, advanced phase by phase) | --resume-job <id>
     \\  agents query-builder --intent <text> --generator <json> [--table <table>]
     \\                       [--fields <names>] [--mode <mode>] [--max-internal-iterations <0..20>]

@@ -281,6 +281,33 @@ class ShardTests(unittest.TestCase):
         self.assertIn("| `shared` | 3.00 | 8.00 | 10.00 |", text)
         self.assertIn("| teardown | 10.00 |", text)
 
+    def test_full_api_suite_uses_every_planned_lane_without_raising_parallelism(self):
+        import re
+
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"
+        ).read_text()
+        full = workflow.split("  e2e-full-tests:\n", 1)[1].split("  e2e-full:\n", 1)[0]
+        choices = re.findall(r"'(\[[^'\n]+\])'", full.split("    env:\n", 1)[0])
+        suites = json.loads(choices[-1])
+        lanes = {
+            name.removeprefix("antfly-")
+            for name in suites
+            if name.startswith("antfly-")
+        }
+        self.assertEqual(
+            lanes, {name for name in shards.SHARDS if name not in {"all", "ordinary"}}
+        )
+        self.assertIn("max-parallel: 2", full)
+        self.assertIn("--antfly-ci-plan", full)
+        self.assertIn('--antfly-ci-shard "${suite#antfly-}"', full)
+        self.assertIn("ANTFLY_E2E_FULL_LAKE", full)
+        self.assertNotIn("base-marker", full)
+        self.assertIn("antfly-e2e-full-timings-", full)
+        self.assertIn(
+            'test "$PLAN_RESULT" = "success"', workflow.split("  e2e-full:\n", 1)[1]
+        )
+
     def test_workflow_requires_all_shards_plan_and_fd_lane(self):
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"
@@ -315,12 +342,26 @@ class ShardTests(unittest.TestCase):
         self.assertIn("/failure-diagnostics.json", low_fd)
         self.assertIn("*.log", low_fd)
         gate = workflow.split("  e2e-base:\n")[1].split("  e2e-full-build:\n")[0]
-        self.assertIn(
-            "e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
-            gate,
+        needs = next(
+            line for line in gate.splitlines() if line.strip().startswith("needs:")
+        )
+        dependencies = {
+            name.strip() for name in needs.split("[", 1)[1].split("]", 1)[0].split(",")
+        }
+        self.assertTrue(
+            {
+                "e2e-base-plan",
+                "e2e-base-tests",
+                "e2e-base-low-fd",
+                "embedded-sdk-native",
+                "pgwire-driver-conformance",
+                "better-auth",
+            }
+            <= dependencies
         )
         self.assertIn('test "$LOW_FD_RESULT" = "success"', gate)
         self.assertIn('test "$PLAN_RESULT" = "success"', gate)
+        self.assertIn('test "$BETTER_AUTH_RESULT" = "success"', gate)
         for block in workflow.split('if ! "$helper"')[1:3]:
             paths = shlex.split(
                 block.split("\n          then", 1)[0]

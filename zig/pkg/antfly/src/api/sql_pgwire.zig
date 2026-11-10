@@ -53,7 +53,7 @@ pub const Listener = struct {
     server: @import("../pgwire/server.zig").Server,
 
     pub fn start(api: *http.ApiHttpServer, config: @import("antfly_local_sources").common_config.Config.PgwireConfig) !*Listener {
-        if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
+        if (api.cfg.user_manager == null and (api.cfg.trusted_principal_secret == null or api.cfg.trusted_principal_issuer == null)) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
         const io = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
         const self = try api.owner_alloc.create(Listener);
@@ -148,7 +148,7 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect, .completion_safe = completionSafe, .pin_completion = pinCompletion, .reserve_completion = reserveCompletion, .completion_ready = completionReady } };
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -249,14 +249,30 @@ pub const Adapter = struct {
         try job.dispatch();
     }
 
+    fn refresh(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, token: []const u8) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const current: *Credential = @ptrCast(@alignCast(identity.context));
+        if (current.trusted_server != self.server) return error.Unauthorized;
+        const next = try Credential.authenticateTrusted(alloc, self.server, self.server.cfg.user_manager, token);
+        defer Credential.release(next, alloc);
+        // Renewal never changes the owner of prepared statements or transactions.
+        if (!std.mem.eql(u8, current.principal, next.principal) or !std.mem.eql(u8, current.username, next.username)) return error.Unauthorized;
+        std.mem.swap(?http.AuthenticatedIdentity, &current.trusted_identity, &next.trusted_identity);
+        std.mem.swap(?[]u8, &current.trusted_issuer, &next.trusted_issuer);
+        current.verifier_mac = next.verifier_mac;
+        current.trusted_expires = next.trusted_expires;
+    }
+
     fn authenticate(raw: *anyopaque, alloc: std.mem.Allocator, username: []const u8, password: []const u8) !wire.Identity {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         // A password callback is mandatory even if HTTP auth is disabled.
         // Neither a startup username nor database name creates authority.
-        const manager = self.server.cfg.user_manager orelse return error.Unauthorized;
+        const manager = self.server.cfg.user_manager;
         if (username.len == 0 or username.len > 256 or password.len > 4096) return error.Unauthorized;
-        const credential = try Credential.authenticate(alloc, manager, username, password);
-        return .{ .context = credential, .release = Credential.release };
+        const credential = if (std.mem.eql(u8, username, trusted_principal_username)) blk: {
+            break :blk try Credential.authenticateTrusted(alloc, self.server, manager, password);
+        } else try Credential.authenticate(alloc, manager orelse return error.Unauthorized, username, password);
+        return .{ .context = credential, .release = Credential.release, .renewable = credential.trusted_server != null };
     }
 
     fn describe(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !wire.Description {
@@ -273,10 +289,34 @@ pub const Adapter = struct {
         return job.result.?;
     }
 
+    fn completionReady(raw: *anyopaque) bool {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        return @import("sql_completion.zig").capableJoined(self.server, self.server.sharedApiNetworkIo() orelse return false);
+    }
+    fn reserveCompletion(raw: *anyopaque, completion: *@import("../pgwire/completion.zig").Completion, desired: usize) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        try @import("sql_completion.zig").reserveJoined(self.server, completion, desired, self.server.sharedApiNetworkIo() orelse return error.SqlWriteCapacityUnavailable);
+    }
+    fn pinCompletion(raw: *anyopaque, alloc: std.mem.Allocator, completion: *@import("../pgwire/completion.zig").Completion) void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const network = self.server.sharedApiNetworkIo() orelse {
+            completion.unknown = true;
+            return;
+        };
+        @import("sql_completion.zig").pinJoined(self.server, alloc, completion, network);
+    }
+
+    fn completionSafe(_: *anyopaque, identity: wire.Identity) bool {
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        return credential.session_cleanup_complete;
+    }
+
     fn disconnect(raw: *anyopaque, identity: wire.Identity, session_id: ?[]const u8) void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        const id = @import("distributed_txn.zig").parseTxnIdHex(session_id orelse return) catch return;
+        const encoded = session_id orelse return;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        credential.session_cleanup_complete = false;
+        const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return;
         const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return;
         const network_io = self.server.sharedApiNetworkIo() orelse return;
         const Cleanup = struct {
@@ -285,17 +325,22 @@ pub const Adapter = struct {
             id: [16]u8,
             completion_io: std.Io,
             done: std.Io.Event = .unset,
+            credential: *Credential,
 
             fn run(job: *@This()) void {
                 defer job.done.set(job.completion_io);
                 const access = job.server.txn_sessions.principalAccess(job.server.alloc, job.id, job.principal) catch return;
+                if (access == .missing) {
+                    job.credential.session_cleanup_complete = true;
+                    return;
+                }
                 if (access != .allowed) return;
                 // Never erase a started distributed decision; durable session
                 // maintenance retains it after this connection disappears.
-                _ = job.server.txn_sessions.removeBeforeExecution(job.server.alloc, job.id);
+                job.credential.session_cleanup_complete = job.server.txn_sessions.removeBeforeExecution(job.server.alloc, job.id);
             }
         };
-        var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io };
+        var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io, .credential = credential };
         var future = io.concurrent(Cleanup.run, .{&job}) catch return;
         job.done.waitUncancelable(network_io);
         @import("protected_future.zig").wait(io, &future);
@@ -442,6 +487,8 @@ const OwnedRead = struct {
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
+        self.native_adapter.graph_parameters = parameters;
+        self.native_adapter.graph_parameter_cells = request.parameter_cells;
         var stream_backend = self.guarded.backend();
         stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
@@ -464,6 +511,11 @@ const OwnedRead = struct {
         self.native_adapter.shared_receipt_wait_budget = null;
         self.authority.request.read_receipt_budget = null;
         self.stream = opened.?;
+        // Future lazy graph opens borrow the stream-owned canonical frame,
+        // rather than the request's transient native cell slice.
+        if (self.stream.parameter_invocation) |invocation| if (invocation.frame) |frame| {
+            self.native_adapter.graph_parameter_cells = frame.values;
+        };
         errdefer self.stream.close();
         if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
@@ -691,16 +743,25 @@ const StreamJob = struct {
     }
 };
 
+/// Reserved proxy login. A username alone never grants access: the password
+/// must be a valid token signed with this instance's configured HTTP authority.
+pub const trusted_principal_username = "__antfly_trusted_principal__";
+
 const Credential = struct {
-    manager: *usermgr.UserManager,
+    manager: ?*usermgr.UserManager,
     username: []u8,
     principal: []u8,
     verifier_mac: [Mac.mac_length]u8,
+    trusted_server: ?*http.ApiHttpServer = null,
+    trusted_identity: ?http.AuthenticatedIdentity = null,
+    trusted_issuer: ?[]u8 = null,
+    trusted_expires: i64 = 0,
+    session_cleanup_complete: bool = true,
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
         // Durable Basic SQL sessions use the username across mixed-version
         // rollouts. Credential-scoped caches and grants still use `principal`.
-        return self.username;
+        return if (self.trusted_identity != null) self.principal else self.username;
     }
 
     fn authenticate(alloc: std.mem.Allocator, manager: *usermgr.UserManager, username: []const u8, password: []const u8) !*Credential {
@@ -724,14 +785,58 @@ const Credential = struct {
         return self;
     }
 
+    fn authenticateTrusted(alloc: std.mem.Allocator, server: *http.ApiHttpServer, manager: ?*usermgr.UserManager, token: []const u8) !*Credential {
+        if (token.len == 0 or token.len > 4096) return error.Unauthorized;
+        var admitted = try server.authenticateRequest(.{ .trusted_principal = token });
+        defer admitted.deinit(server.alloc);
+        if (admitted.is_internal_service) return error.Unauthorized;
+        var parts = std.mem.splitScalar(u8, token, '.');
+        _ = parts.next() orelse return error.Unauthorized;
+        const encoded = parts.next() orelse return error.Unauthorized;
+        const decoded = try alloc.alloc(u8, std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded) catch return error.Unauthorized);
+        defer alloc.free(decoded);
+        std.base64.url_safe_no_pad.Decoder.decode(decoded, encoded) catch return error.Unauthorized;
+        var payload = try std.json.parseFromSlice(std.json.Value, alloc, decoded, .{});
+        defer payload.deinit();
+        const exp = payload.value.object.get("exp") orelse return error.Unauthorized;
+        if (exp != .integer) return error.Unauthorized;
+        const self = try alloc.create(Credential);
+        errdefer alloc.destroy(self);
+        const username = try alloc.dupe(u8, admitted.username);
+        errdefer alloc.free(username);
+        const principal = try alloc.dupe(u8, admitted.credential_principal);
+        errdefer alloc.free(principal);
+        var owned_identity = (try http.cloneCatalogIdentity(alloc, admitted)).?;
+        errdefer owned_identity.deinit(alloc);
+        const issuer = try alloc.dupe(u8, server.cfg.trusted_principal_issuer orelse return error.Unauthorized);
+        errdefer alloc.free(issuer);
+        var fingerprint: [Mac.mac_length]u8 = undefined;
+        Mac.create(&fingerprint, credential_domain, server.cfg.trusted_principal_secret orelse return error.Unauthorized);
+        self.* = .{ .manager = manager, .username = username, .principal = principal, .verifier_mac = fingerprint, .trusted_server = server, .trusted_identity = owned_identity, .trusted_issuer = issuer, .trusted_expires = exp.integer };
+        return self;
+    }
+
     pub fn validate(self: *const Credential) !void {
-        const current = self.manager.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
+        if (self.trusted_server) |server| {
+            // Fast page/work checkpoint: expiry and authority rotation never
+            // take the native user-manager lock or decode the immutable JWT.
+            const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
+            if (now >= self.trusted_expires) return error.Unauthorized;
+            if (!std.mem.eql(u8, self.trusted_issuer.?, server.cfg.trusted_principal_issuer orelse return error.Unauthorized)) return error.Unauthorized;
+            var current: [Mac.mac_length]u8 = undefined;
+            Mac.create(&current, credential_domain, server.cfg.trusted_principal_secret orelse return error.Unauthorized);
+            if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
+            return;
+        }
+        const current = self.manager.?.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
     }
 
     fn release(raw: *anyopaque, alloc: std.mem.Allocator) void {
         const self: *Credential = @ptrCast(@alignCast(raw));
         std.crypto.secureZero(u8, &self.verifier_mac);
+        if (self.trusted_identity) |*cached| cached.deinit(alloc);
+        if (self.trusted_issuer) |issuer| alloc.free(issuer);
         alloc.free(self.username);
         alloc.free(self.principal);
         alloc.destroy(self);
@@ -739,21 +844,22 @@ const Credential = struct {
 
     fn identity(self: *Credential, alloc: std.mem.Allocator) !http.AuthenticatedIdentity {
         try self.validate();
-        var lease = try self.manager.acquireSnapshotLease();
+        if (self.trusted_identity) |cached| return (try http.cloneCatalogIdentity(alloc, cached)).?;
+        var lease = try self.manager.?.acquireSnapshotLease();
         // Copy credentials and policies under one lease without recursively
         // acquiring the user-manager mutex or retaining a login-time grant.
         const result = blk: {
             defer lease.release();
             var user = try lease.getUser(self.username);
-            defer user.deinit(self.manager.alloc);
-            const permissions = try self.manager.getPermissionsForUser(self.username);
-            defer http.freePermissions(self.manager.alloc, permissions);
-            const filters = try self.manager.getRowFilters(self.username);
-            defer http.freeRowFilters(self.manager.alloc, filters);
-            const roles = try self.manager.getRolesForUser(self.username);
+            defer user.deinit(self.manager.?.alloc);
+            const permissions = try self.manager.?.getPermissionsForUser(self.username);
+            defer http.freePermissions(self.manager.?.alloc, permissions);
+            const filters = try self.manager.?.getRowFilters(self.username);
+            defer http.freeRowFilters(self.manager.?.alloc, filters);
+            const roles = try self.manager.?.getRolesForUser(self.username);
             defer {
-                for (roles) |role| self.manager.alloc.free(role);
-                self.manager.alloc.free(roles);
+                for (roles) |role| self.manager.?.alloc.free(role);
+                self.manager.?.alloc.free(roles);
             }
             break :blk (try http.cloneCatalogIdentity(alloc, .{
                 .username = user.username,
@@ -762,7 +868,7 @@ const Credential = struct {
                 .row_filter = filters,
                 .metadata_json = user.metadata_json,
                 .roles = roles,
-                .live_user_manager = self.manager,
+                .live_user_manager = self.manager.?,
             })).?;
         };
         var owned = result;
@@ -1145,6 +1251,7 @@ const Authority = struct {
         // above still rejects expired requests and explicit cancellation.
         const deadline = std.math.cast(u64, self.request.deadline.raw.nanoseconds);
         const native_context: operation.RequestContext = .{
+            .sql_completion = if (self.request.completion != null) .{ .ptr = self, .prepare_transaction = prepareTransaction, .prepare_metadata = prepareMetadata, .reject_metadata = rejectMetadata } else null,
             .deadline_ns = deadline,
             .deadline_io = if (deadline != null) io_abi.Borrow.init(&self.request.io) else null,
             .fanout_io = io_abi.Borrow.init(&self.request.io),
@@ -1160,6 +1267,18 @@ const Authority = struct {
         return native_context.platformDeadline();
     }
 
+    fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
+        const self: *Authority = @ptrCast(@alignCast(raw));
+        try @import("sql_completion.zig").prepareTransaction(self.credential.trusted_server orelse return error.DurabilityUnavailable, self.request.completion_allocator orelse return error.InvalidArgument, self.request.completion.?, id);
+    }
+    fn prepareMetadata(raw: *anyopaque, owner: operation.SQLCompletionOwner) !void {
+        const self: *Authority = @ptrCast(@alignCast(raw));
+        try @import("sql_completion.zig").prepareMetadata(self.credential.trusted_server orelse return error.DurabilityUnavailable, self.request.completion_allocator orelse return error.InvalidArgument, self.request.completion.?, owner);
+    }
+    fn rejectMetadata(raw: *anyopaque, owner: operation.SQLCompletionOwner) !void {
+        const self: *Authority = @ptrCast(@alignCast(raw));
+        try @import("sql_completion.zig").rejectMetadata(self.credential.trusted_server orelse return error.DurabilityUnavailable, self.request.completion_allocator orelse return error.InvalidArgument, self.request.completion.?, owner);
+    }
     fn allowsWrite(raw: *const anyopaque, table: []const u8) bool {
         const self: *const Authority = @ptrCast(@alignCast(raw));
         self.credential.validate() catch return false;
@@ -1175,8 +1294,48 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
+    }
+    fn resolveGraph(raw: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
+        const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        try checkpoint(raw);
+        const resolve_graph = self.native.vtable.resolve_graph orelse return error.UnsupportedSqlExecution;
+        const table = try resolve_graph(self.native.ptr, alloc, definition);
+        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        try self.checkTableRead(table);
+        return table;
+    }
+    fn checkTableRead(self: *GuardedCatalog, table: catalog.Table) !void {
+        if (table.graph) |binding| {
+            try checkpoint(self);
+            if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .graph, binding.graph.name, .read)) return error.Forbidden;
+            for (binding.dependencies) |dependency| try self.checkRead(dependency.physical_name);
+        } else try self.checkRead(table.physical_name);
+    }
+    fn copyDependencies(alloc: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+        if (names.len == 0) return &.{};
+        const copied = try alloc.alloc([]u8, names.len);
+        errdefer alloc.free(copied);
+        var count: usize = 0;
+        errdefer for (copied[0..count]) |name| alloc.free(name);
+        for (names, copied) |name, *out| {
+            out.* = try alloc.dupe(u8, name);
+            count += 1;
+        }
+        return copied;
+    }
+    fn dependencies(alloc: std.mem.Allocator, table: catalog.Table) ![][]u8 {
+        const binding = table.graph orelse return &.{};
+        const names = try alloc.alloc([]const u8, binding.dependencies.len);
+        defer alloc.free(names);
+        for (binding.dependencies, names) |dependency, *name| name.* = dependency.physical_name;
+        return copyDependencies(alloc, names);
+    }
+    fn freeDependencies(alloc: std.mem.Allocator, names: [][]u8) void {
+        if (names.len == 0) return;
+        for (names) |name| alloc.free(name);
+        alloc.free(names);
     }
     fn generateRowId(raw: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1186,7 +1345,7 @@ const GuardedCatalog = struct {
     }
     fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table.physical_name);
+        try self.checkTableRead(table);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
         return resolve_owners(self.native.ptr, alloc, scratch_alloc, table, target, mutations);
@@ -1206,7 +1365,7 @@ const GuardedCatalog = struct {
     }
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table.physical_name);
+        try self.checkTableRead(table);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
     }
     fn checkRead(self: *GuardedCatalog, table: []const u8) !void {
@@ -1218,22 +1377,60 @@ const GuardedCatalog = struct {
         alloc: std.mem.Allocator,
         guard: *GuardedCatalog,
         table: []u8,
+        is_graph: bool = false,
+        graph_dependencies: [][]u8 = &.{},
         inner: catalog.Cursor,
 
+        fn checkAuthority(self: *@This()) !void {
+            if (!self.is_graph) return self.guard.checkRead(self.table);
+            try GuardedCatalog.checkpoint(self.guard);
+            if (!try http.resourcePermissionCurrentlyAllowed(self.guard.authority.identity.*, .graph, self.table, .read)) return error.Forbidden;
+            for (self.graph_dependencies) |name| try self.guard.checkRead(name);
+        }
+        fn releaseFields(self: *@This()) void {
+            self.alloc.free(self.table);
+            GuardedCatalog.freeDependencies(self.alloc, self.graph_dependencies);
+        }
         fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.next(self.inner.ptr, alloc, limit);
         }
         fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.next_columns.?(self.inner.ptr, alloc, limit);
         }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.count_rows.?(self.inner.ptr);
+        }
+        fn enableWeights(raw: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_weights.?(self.inner.ptr, multiplicity);
+            try self.checkAuthority();
+            return enabled;
+        }
+        fn checkGroups(ptr: *anyopaque, _: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAuthority();
+        }
+        fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("antfly_local_sources").sql_operators.Grouped) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_groups.?(self.inner.ptr, requests, orders, grouped);
+            if (enabled) try @import("sql_group_guard.zig").wrap(self.alloc, grouped, .{ .ptr = self, .call = checkGroups });
+            try self.checkAuthority();
+            return enabled;
+        }
+        fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_aggregate_weights.?(self.inner.ptr, requests);
+            try self.checkAuthority();
+            return enabled;
         }
         fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1242,7 +1439,7 @@ const GuardedCatalog = struct {
         }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.set_dynamic_filter.?(self.inner.ptr, filter);
         }
         fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize) !?[]catalog.Cursor {
@@ -1253,7 +1450,7 @@ const GuardedCatalog = struct {
         }
         fn splitImpl(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize, ordered: bool) !?[]catalog.Cursor {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             const split = if (ordered) self.inner.split_ordered.? else self.inner.split_scan.?;
             const children = (try split(self.inner.ptr, alloc, workers)) orelse return null;
             defer alloc.free(children);
@@ -1265,8 +1462,10 @@ const GuardedCatalog = struct {
             for (children, cursors) |child, *out| {
                 const name = try alloc.dupe(u8, self.table);
                 errdefer alloc.free(name);
+                const deps = try GuardedCatalog.copyDependencies(alloc, self.graph_dependencies);
+                errdefer GuardedCatalog.freeDependencies(alloc, deps);
                 const owner = try alloc.create(ReadCursor);
-                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .inner = child };
+                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .is_graph = self.is_graph, .graph_dependencies = deps, .inner = child };
                 out.* = owner.cursor(close);
                 wrapped += 1;
             }
@@ -1283,6 +1482,9 @@ const GuardedCatalog = struct {
                 .close = release,
                 .next_columns = if (self.inner.next_columns != null) nextColumns else null,
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
+                .enable_weights = if (self.inner.enable_weights != null) enableWeights else null,
+                .enable_groups = if (self.inner.enable_groups != null) enableGroups else null,
+                .enable_aggregate_weights = if (self.inner.enable_aggregate_weights != null) enableAggregateWeights else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
                 .wants_exact_filter = if (self.inner.wants_exact_filter != null) wantsExactFilter else null,
                 .split_scan = if (self.inner.split_scan != null) splitScan else null,
@@ -1292,20 +1494,22 @@ const GuardedCatalog = struct {
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
-            self.alloc.free(self.table);
+            self.releaseFields();
             self.alloc.destroy(self);
         }
     };
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table.physical_name);
+        try self.checkTableRead(table);
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
         errdefer inner.close(inner.ptr);
         const name = try alloc.dupe(u8, table.physical_name);
         errdefer alloc.free(name);
+        const deps = try dependencies(alloc, table);
+        errdefer freeDependencies(alloc, deps);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .inner = inner };
+        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .is_graph = table.graph != null, .graph_dependencies = deps, .inner = inner };
         // Materialized execution closes before returning; streaming execution
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
@@ -1342,7 +1546,7 @@ const GuardedCatalog = struct {
         fn close(raw: *anyopaque) void {
             const self: *StatementRead = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
-            for (self.wrappers) |wrapper| self.alloc.free(wrapper.table);
+            for (self.wrappers) |*wrapper| wrapper.releaseFields();
             self.alloc.free(self.wrappers);
             self.alloc.free(self.cursors);
             self.alloc.destroy(self);
@@ -1351,7 +1555,7 @@ const GuardedCatalog = struct {
 
     fn openStatement(raw: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        for (scans) |scan_request| try self.checkRead(scan_request.table.physical_name);
+        for (scans) |scan_request| try self.checkTableRead(scan_request.table);
         const open = self.native.vtable.open_statement orelse return error.SqlStatementSnapshotRequired;
         const inner = try open(self.native.ptr, alloc, scans);
         errdefer inner.close(inner.ptr);
@@ -1363,9 +1567,11 @@ const GuardedCatalog = struct {
         const cursors = try alloc.alloc(catalog.Cursor, scans.len);
         errdefer alloc.free(cursors);
         var count: usize = 0;
-        errdefer for (wrappers[0..count]) |wrapper| alloc.free(wrapper.table);
+        errdefer for (wrappers[0..count]) |*wrapper| wrapper.releaseFields();
         for (scans, inner.cursors, wrappers, cursors) |scan_request, cursor, *wrapper, *out| {
-            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try alloc.dupe(u8, scan_request.table.physical_name), .inner = cursor };
+            const deps = try dependencies(alloc, scan_request.table);
+            errdefer freeDependencies(alloc, deps);
+            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try alloc.dupe(u8, scan_request.table.physical_name), .is_graph = scan_request.table.graph != null, .graph_dependencies = deps, .inner = cursor };
             count += 1;
             out.* = wrapper.cursor(StatementRead.borrowedClose);
         }
@@ -1833,4 +2039,115 @@ test "SQL pgwire native frozen JSON renders exact numbers without scalar deliver
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL pgwire native trusted principals preserve scoped permissions and expire" {
+    const alloc = std.testing.allocator;
+    var manager: usermgr.UserManager = undefined; // borrowed, unused by trusted authentication
+    var server = http.ApiHttpServer.init(alloc, .{
+        .user_manager = &manager,
+        .trusted_principal_secret = "cloud-test-authority",
+        .trusted_principal_issuer = "cloudaf",
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const payload = "{\"iss\":\"cloudaf\",\"sub\":\"cloud-key-1\",\"tenant\":\"instance-1\",\"tables\":[\"docs\"],\"operations\":[\"read\"],\"row_filter\":{\"docs\":{\"term\":{\"tenant_id\":\"t1\"}}},\"exp\":4102444800}";
+    const token = try testTrustedToken(alloc, "cloud-test-authority", payload);
+    defer alloc.free(token);
+    var adapter: Adapter = .{ .server = &server };
+    const authenticated = try Adapter.authenticate(&adapter, alloc, trusted_principal_username, token);
+    defer authenticated.release(authenticated.context, alloc);
+    const credential: *Credential = @ptrCast(@alignCast(authenticated.context));
+    var identity = try credential.identity(alloc);
+    defer identity.deinit(alloc);
+    try std.testing.expectEqualStrings("cloud-key-1", identity.username);
+    try std.testing.expectEqualStrings("trusted:cloudaf:cloud-key-1", credential.sessionPrincipal());
+    try std.testing.expect(http.permissionsAllow(identity.permissions, .table, "docs", .read));
+    try std.testing.expect(!http.permissionsAllow(identity.permissions, .table, "other", .read));
+    try std.testing.expect(!http.permissionsAllow(identity.permissions, .table, "docs", .write));
+    try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
+    server.cfg.trusted_principal_secret = "rotated";
+    try std.testing.expectError(error.Unauthorized, credential.validate());
+    try std.testing.expectError(error.Unauthorized, credential.identity(alloc));
+    server.cfg.trusted_principal_secret = "cloud-test-authority";
+    credential.trusted_expires = 0;
+    try std.testing.expectError(error.Unauthorized, credential.validate());
+    try std.testing.expectError(error.Unauthorized, Adapter.authenticate(&adapter, alloc, trusted_principal_username, "not-a-token"));
+    server.cfg.trusted_principal_secret = null;
+    try std.testing.expectError(error.Unauthorized, Adapter.authenticate(&adapter, alloc, trusted_principal_username, token));
+}
+
+fn testTrustedToken(alloc: std.mem.Allocator, secret: []const u8, payload: []const u8) ![]u8 {
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const h = try alloc.alloc(u8, encoder.calcSize(header.len));
+    defer alloc.free(h);
+    _ = encoder.encode(h, header);
+    const p = try alloc.alloc(u8, encoder.calcSize(payload.len));
+    defer alloc.free(p);
+    _ = encoder.encode(p, payload);
+    const input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ h, p });
+    defer alloc.free(input);
+    var mac: [Mac.mac_length]u8 = undefined;
+    Mac.create(&mac, input, secret);
+    var signature: [43]u8 = undefined;
+    _ = encoder.encode(&signature, &mac);
+    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ input, signature });
+}
+
+test "SQL pgwire native trusted-only renewal preserves owners without native bootstrap or repeated token decoding" {
+    const a = std.testing.allocator;
+    var server = http.ApiHttpServer.init(a, .{ .trusted_principal_secret = "renewal-key", .trusted_principal_issuer = "cloudaf" }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    try std.testing.expectError(error.PgwireRequiresBackendRuntime, Listener.start(&server, .{ .enabled = true }));
+    var adapter: Adapter = .{ .server = &server };
+    try std.testing.expectError(error.Unauthorized, Adapter.authenticate(&adapter, a, "admin", "password"));
+    const payload = "{\"iss\":\"cloudaf\",\"sub\":\"key-1\",\"tables\":[\"docs\"],\"operations\":[\"read\"],\"row_filter\":{\"docs\":{\"term\":{\"tenant\":\"t1\"}}},\"exp\":4102444800}";
+    const token = try testTrustedToken(a, "renewal-key", payload);
+    defer a.free(token);
+    const authenticated = try Adapter.authenticate(&adapter, a, trusted_principal_username, token);
+    defer authenticated.release(authenticated.context, a);
+    try std.testing.expect(authenticated.renewable);
+    const credential: *Credential = @ptrCast(@alignCast(authenticated.context));
+    // The API allocator would fail any new JWT decode. Cached identity reads
+    // need only the caller's allocator, so this still succeeds.
+    var no_decode = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    server.alloc = no_decode.allocator();
+    {
+        defer server.alloc = a;
+        var snapshot = try credential.identity(a);
+        defer snapshot.deinit(a);
+        try std.testing.expect(http.permissionsAllow(snapshot.permissions, .table, "docs", .read));
+        try std.testing.expectEqual(@as(usize, 1), snapshot.row_filter.len);
+        try std.testing.expect(!no_decode.has_induced_failure);
+    }
+    credential.trusted_expires = 0;
+    try std.testing.expectError(error.Unauthorized, credential.validate());
+    try Adapter.refresh(&adapter, a, authenticated, token);
+    try credential.validate();
+    try std.testing.expectEqualStrings("trusted:cloudaf:key-1", credential.sessionPrincipal());
+    const other = try testTrustedToken(a, "renewal-key", "{\"iss\":\"cloudaf\",\"sub\":\"key-2\",\"admin\":true,\"exp\":4102444800}");
+    defer a.free(other);
+    try std.testing.expectError(error.Unauthorized, Adapter.refresh(&adapter, a, authenticated, other));
+    try std.testing.expectEqualStrings("trusted:cloudaf:key-1", credential.sessionPrincipal());
+    server.cfg.trusted_principal_issuer = "rotated";
+    try std.testing.expectError(error.Unauthorized, credential.validate());
+}
+
+test "SQL pgwire native trusted credential and identity allocation failures release owned snapshots" {
+    const a = std.testing.allocator;
+    var server = http.ApiHttpServer.init(a, .{ .trusted_principal_secret = "allocation-key", .trusted_principal_issuer = "cloudaf" }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const token = try testTrustedToken(a, "allocation-key", "{\"iss\":\"cloudaf\",\"sub\":\"key-1\",\"tables\":[\"docs\"],\"operations\":[\"read\"],\"exp\":4102444800}");
+    defer a.free(token);
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator, api: *http.ApiHttpServer, jwt: []const u8) !void {
+            const credential = try Credential.authenticateTrusted(alloc, api, null, jwt);
+            defer Credential.release(credential, alloc);
+            var snapshot = try credential.identity(alloc);
+            defer snapshot.deinit(alloc);
+            var adapter: Adapter = .{ .server = api };
+            try Adapter.refresh(&adapter, alloc, .{ .context = credential, .release = Credential.release, .renewable = true }, jwt);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ &server, token });
 }

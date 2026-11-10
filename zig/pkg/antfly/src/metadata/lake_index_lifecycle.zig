@@ -19,13 +19,24 @@
 const std = @import("std");
 const catalog = @import("antfly_local_sources").metadata_lake_index_catalog;
 const A = std.mem.Allocator;
+pub const source_admission = @import("lake_source_admission.zig");
+pub const SourceScope = struct { object_generation: u64, desired: catalog.Digest, owner: catalog.Token };
 pub const max_bytes = 1024 * 1024;
 pub const max_publications = 256;
 pub const max_readers = 256;
 pub const lease_ms: u64 = 10 * 60 * 1000;
 pub const grace_ms: u64 = 30 * 1000;
 pub const Reader = struct { token: catalog.Token, generation: u64, expires_ms: u64 };
-pub const StoreBinding = struct { identity: catalog.Digest, locator: catalog.StoreLocator, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null };
+pub const StoreBinding = struct {
+    identity: catalog.Digest,
+    locator: catalog.StoreLocator,
+    vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null,
+    // Query ownership is independent of index publications and survives DROP.
+    // Clear only after the writer horizon and a complete auxiliary sweep.
+    query_until_ms: u64 = 0,
+    query_gc_phase: u8 = 0,
+    query_gc_receipt: ?catalog.Token = null,
+};
 pub const Collection = struct {
     token: catalog.Token,
     store: catalog.Digest,
@@ -41,13 +52,11 @@ pub const Collection = struct {
 };
 pub const State = struct {
     version: u16 = 1,
+    source_owner: ?source_admission.State = null,
     revision: u64 = 0,
     generation: u64 = 0,
     namespace: ?catalog.Digest = null,
     stores: []const StoreBinding = &.{},
-    /// Uploads before this fence may have unleased rolling-upgrade readers.
-    /// They remain protected until an independent drain proof can retire them.
-    reader_upload_floor: ?u64 = null,
     current: ?u64 = null,
     pending: ?catalog.Attempt = null,
     checkpoint: ?catalog.Publication = null,
@@ -73,8 +82,21 @@ pub const State = struct {
         return false;
     }
     pub fn validate(self: State) !void {
-        if (self.version != 1 or self.publications.len > max_publications or self.readers.len > max_readers or self.stores.len > 64) return error.InvalidLakeIndexLifecycle;
+        if ((self.version != 1 and self.version != 2) or (self.source_owner != null and self.version != 2) or self.publications.len > max_publications or self.readers.len > max_readers or self.stores.len > 64) return error.InvalidLakeIndexLifecycle;
+        if (self.source_owner) |owner| {
+            try owner.validate();
+            if (self.dropped and owner.enabled) return error.InvalidLakeIndexLifecycle;
+            if (owner.current) |cut| {
+                const publication = self.findPublication(cut.generation) orelse return error.InvalidLakeIndexLifecycle;
+                if (self.current != cut.generation or self.retired(cut.generation) or !std.mem.eql(u8, &cut.store, &publication.signature.store) or !std.mem.eql(u8, &cut.desired, &publication.signature.desired)) return error.InvalidLakeIndexLifecycle;
+                const protected = for (self.readers) |reader| {
+                    if (std.mem.eql(u8, &reader.token, &cut.reader_token) and reader.generation == cut.generation and reader.expires_ms >= cut.expires_ms) break true;
+                } else false;
+                if (!protected) return error.InvalidLakeIndexLifecycle;
+            }
+        }
         for (self.stores, 0..) |store, index| {
+            if (store.query_gc_phase >= 6) return error.InvalidLakeIndexLifecycle;
             try store.locator.validate();
             if (store.vacuum) |cut| {
                 try cut.validate();
@@ -83,7 +105,6 @@ pub const State = struct {
             if (std.mem.allEqual(u8, &store.identity, 0)) return error.InvalidLakeIndexLifecycle;
             for (self.stores[0..index]) |other| if (std.mem.eql(u8, &store.identity, &other.identity)) return error.InvalidLakeIndexLifecycle;
         }
-        if (self.reader_upload_floor) |floor| if (floor == 0 or floor > self.generation) return error.InvalidLakeIndexLifecycle;
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexLifecycle;
         if (self.checkpoint) |saved| {
             try saved.validate();
@@ -130,15 +151,10 @@ pub const State = struct {
         next.pending = catalog_state.pending;
         next.checkpoint = catalog_state.checkpoint;
         if (catalog_state.checkpoint) |saved| if (saved.store_locator) |locator| try next.retainStore(a, saved.signature.store, locator);
-        if (next.reader_upload_floor == null) {
-            if (catalog_state.pending) |pending| if (pending.reader_protocol >= 24) {
-                next.reader_upload_floor = pending.generation;
-            };
-            if (next.reader_upload_floor == null) if (catalog_state.published) |publication| if (publication.reader_protocol >= 24) {
-                next.reader_upload_floor = publication.generation;
-            };
-        }
         next.current = if (catalog_state.published) |publication| publication.generation else null;
+        if (next.source_owner) |owner| if (owner.current) |cut| if (next.current != cut.generation) {
+            next.source_owner = try owner.invalidate();
+        };
         if (catalog_state.pending) |pending| if (pending.store_locator) |locator| try next.retainStore(a, pending.signature.store, locator);
         if (catalog_state.published) |publication| if (publication.store_locator) |locator| try next.retainStore(a, publication.signature.store, locator);
         if (catalog_state.published) |publication| {
@@ -171,9 +187,53 @@ pub const State = struct {
         all[self.stores.len] = .{ .identity = identity, .locator = locator };
         self.stores = all;
     }
+    pub fn retainQueryStore(self: State, a: A, binding: StoreBinding, until: u64) !State {
+        if (until == 0) return error.InvalidLakeIndexLifecycle;
+        var next = try self.advance();
+        const owned = try a.dupe(StoreBinding, self.stores);
+        next.stores = owned;
+        try next.retainStore(a, binding.identity, binding.locator);
+        for (@constCast(next.stores)) |*store| if (std.mem.eql(u8, &store.identity, &binding.identity)) {
+            store.query_until_ms = @max(store.query_until_ms, until);
+        };
+        try next.validate();
+        return next;
+    }
+    pub fn queryProgress(self: State, a: A, m: QueryProgress) !State {
+        if (m.phase >= 6 or m.now_ms == 0 or std.mem.allEqual(u8, &m.token, 0)) return error.InvalidLakeIndexLifecycle;
+        var next = try self.advance();
+        var bindings: std.ArrayList(StoreBinding) = .empty;
+        for (self.stores) |value| {
+            var store = value;
+            if (std.mem.eql(u8, &store.identity, &m.store)) {
+                store.query_gc_phase = m.phase;
+                store.query_gc_receipt = m.token;
+                // A concurrent writer renewal is never consumed by an older
+                // collector. The revision CAS also fences index retirement.
+                if (m.release and store.query_until_ms == m.observed_until_ms and m.now_ms > store.query_until_ms) {
+                    store.query_until_ms = 0;
+                    const index_owned = (if (self.collection) |c| std.mem.eql(u8, &c.store, &store.identity) else false) or
+                        (if (self.pending) |v| std.mem.eql(u8, &v.signature.store, &store.identity) else false) or
+                        (if (self.checkpoint) |v| std.mem.eql(u8, &v.signature.store, &store.identity) else false) or
+                        for (self.publications) |v| {
+                            if (std.mem.eql(u8, &v.signature.store, &store.identity)) break true;
+                        } else false;
+                    if (!index_owned and store.vacuum == null) continue;
+                }
+            }
+            try bindings.append(a, store);
+        }
+        next.stores = try bindings.toOwnedSlice(a);
+        try next.validate();
+        return next;
+    }
     pub fn drop(self: State) !State {
         var next = try self.advance();
         next.dropped = true;
+        if (next.source_owner) |owner| {
+            next.source_owner = try owner.invalidate();
+            next.source_owner.?.enabled = false;
+        }
         next.checkpoint = null;
         next.current = null;
         next.pending = null;
@@ -191,6 +251,9 @@ pub const State = struct {
         try active.append(a, .{ .token = token, .generation = generation, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle });
         var next = try self.advance();
         next.readers = try active.toOwnedSlice(a);
+        if (next.source_owner) |owner| if (owner.current) |cut| if (cut.expires_ms <= now) {
+            next.source_owner = try owner.invalidate();
+        };
         try next.validate();
         return next;
     }
@@ -210,6 +273,7 @@ pub const State = struct {
         return error.LakeIndexReaderLeaseExpired;
     }
     pub fn release(self: State, a: A, token: catalog.Token) !State {
+        if (self.source_owner) |owner| if (owner.current) |cut| if (std.mem.eql(u8, &cut.reader_token, &token)) return error.LakeIndexReaderTokenReused;
         var readers: std.ArrayList(Reader) = .empty;
         for (self.readers) |reader| if (!std.mem.eql(u8, &reader.token, &token)) try readers.append(a, reader);
         var next = try self.advance();
@@ -231,7 +295,7 @@ pub const State = struct {
         }
         var retired_generations: std.ArrayList(u64) = .empty;
         for (self.publications) |publication| {
-            if (publication.reader_protocol < 24 or !std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &store) or self.current == publication.generation) continue;
+            if (!std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &store) or self.current == publication.generation) continue;
             const protected = for (self.readers) |reader| {
                 if (reader.generation == publication.generation and reader.expires_ms +| grace_ms >= now) break true;
             } else false;
@@ -241,7 +305,7 @@ pub const State = struct {
         var next = try self.advance();
         var cutoff = if (self.pending) |pending| pending.generation else self.generation +| 1;
         if (self.checkpoint) |saved| cutoff = @min(cutoff, saved.generation);
-        next.collection = .{ .token = token, .store = store, .namespace = self.namespace, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle, .upload_cutoff = cutoff, .upload_floor = self.reader_upload_floor orelse cutoff, .retired = try retired_generations.toOwnedSlice(a) };
+        next.collection = .{ .token = token, .store = store, .namespace = self.namespace, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle, .upload_cutoff = cutoff, .upload_floor = 1, .retired = try retired_generations.toOwnedSlice(a) };
         try next.validate();
         return next;
     }
@@ -287,24 +351,113 @@ pub const State = struct {
                 if (std.mem.eql(u8, &publication.signature.store, &store.identity)) break true;
             } else false;
             const has_pending = if (next.pending) |pending| std.mem.eql(u8, &pending.signature.store, &store.identity) else false;
-            if (retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
+            if (store.query_until_ms != 0 or retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
         }
         next.stores = try stores.toOwnedSlice(a);
         try next.validate();
         return next;
     }
 };
+pub const QueryProgress = struct { store: catalog.Digest, observed_until_ms: u64, phase: u8, release: bool, now_ms: u64, token: catalog.Token };
 pub const Mutation = union(enum) {
+    configure_source: struct { scope: SourceScope, state: source_admission.State },
+    activate_source: SourceScope,
+    acknowledge_source: struct { scope: SourceScope, lsn: u64 },
+    invalidate_source: struct { scope: SourceScope, epoch: u64 },
+    admit_source: struct { scope: SourceScope, epoch: u64, source_uuid: []const u8, cut: source_admission.Cut, now_ms: u64 },
+    retain_reader: struct { token: catalog.Token, now_ms: u64, until_ms: u64 },
+    retain_query_store: struct { binding: StoreBinding, until_ms: u64 },
+    query_gc_progress: QueryProgress,
     acquire: struct { token: catalog.Token, generation: u64, now_ms: u64 },
     renew: struct { token: catalog.Token, now_ms: u64 },
     release: catalog.Token,
     begin_collection: struct { token: catalog.Token, store: catalog.Digest, now_ms: u64 },
     checkpoint_collection: struct { token: catalog.Token, previous: ?[]const u8 = null, progress: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef, now_ms: u64 },
     finish_collection: struct { token: catalog.Token, now_ms: u64, retain_store: bool = false, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null },
+    pub fn sourceScope(self: Mutation) ?SourceScope {
+        return switch (self) {
+            .configure_source => |m| m.scope,
+            .activate_source => |m| m,
+            .acknowledge_source => |m| m.scope,
+            .invalidate_source => |m| m.scope,
+            .admit_source => |m| m.scope,
+            else => null,
+        };
+    }
+    /// Decoded Raft commands own every JSON string independently of the input.
+    pub fn deinitOwned(self: *Mutation, a: A) void {
+        switch (self.*) {
+            .configure_source => |m| m.state.deinitOwned(a),
+            .admit_source => |m| {
+                a.free(m.source_uuid);
+                m.cut.deinitOwned(a);
+            },
+            .retain_query_store => |m| {
+                inline for (.{ "bucket", "prefix", "root" }) |name| a.free(@field(m.binding.locator, name));
+                if (m.binding.locator.connection) |name| a.free(name);
+            },
+            .checkpoint_collection => |m| {
+                if (m.previous) |previous| a.free(previous);
+                inline for (.{ "name", "artifact_id", "checksum" }) |name| a.free(@field(m.progress, name));
+            },
+            else => {},
+        }
+        self.* = undefined;
+    }
+    pub fn cloneOwned(self: Mutation, a: A) !Mutation {
+        return switch (self) {
+            .configure_source => |m| .{ .configure_source = .{ .scope = m.scope, .state = try m.state.cloneOwned(a) } },
+            .admit_source => |m| blk: {
+                var next = m;
+                next.source_uuid = try a.dupe(u8, m.source_uuid);
+                errdefer a.free(next.source_uuid);
+                next.cut = try m.cut.cloneOwned(a);
+                break :blk .{ .admit_source = next };
+            },
+            .retain_query_store => |m| blk: {
+                var next = m;
+                const locator = m.binding.locator;
+                next.binding.locator.bucket = try a.dupe(u8, locator.bucket);
+                errdefer a.free(next.binding.locator.bucket);
+                next.binding.locator.prefix = try a.dupe(u8, locator.prefix);
+                errdefer a.free(next.binding.locator.prefix);
+                next.binding.locator.root = try a.dupe(u8, locator.root);
+                errdefer a.free(next.binding.locator.root);
+                next.binding.locator.connection = if (locator.connection) |name| try a.dupe(u8, name) else null;
+                break :blk .{ .retain_query_store = next };
+            },
+            .checkpoint_collection => |m| blk: {
+                var next = m;
+                next.previous = if (m.previous) |previous| try a.dupe(u8, previous) else null;
+                errdefer if (next.previous) |previous| a.free(previous);
+                next.progress.name = try a.dupe(u8, m.progress.name);
+                errdefer a.free(next.progress.name);
+                next.progress.artifact_id = try a.dupe(u8, m.progress.artifact_id);
+                errdefer a.free(next.progress.artifact_id);
+                next.progress.checksum = try a.dupe(u8, m.progress.checksum);
+                break :blk .{ .checkpoint_collection = next };
+            },
+            else => self,
+        };
+    }
     /// Receipt observation may see a later reader mutation. Unique tokens and
     /// monotonic deadlines prove this command's effect without replaying it.
     pub fn observed(self: Mutation, state: State) bool {
         return switch (self) {
+            .configure_source => |m| if (state.source_owner) |owner| std.mem.eql(u8, &owner.owner, &m.state.owner) else false,
+            .activate_source => |m| if (state.source_owner) |owner| owner.enabled and std.mem.eql(u8, &owner.owner, &m.owner) else false,
+            .acknowledge_source => |m| if (state.source_owner) |owner| owner.accepted_lsn >= m.lsn and std.mem.eql(u8, &owner.owner, &m.scope.owner) else false,
+            .invalidate_source => |m| if (state.source_owner) |owner| owner.epoch > m.epoch and std.mem.eql(u8, &owner.owner, &m.scope.owner) else false,
+            .admit_source => |m| if (state.source_owner) |owner| owner.epoch == m.epoch and owner.current != null and std.mem.eql(u8, owner.current.?.state.id, m.cut.state.id) else false,
+            .retain_reader => |m| for (state.readers) |reader| {
+                if (std.mem.eql(u8, &reader.token, &m.token) and reader.expires_ms >= m.until_ms) break true;
+            } else false,
+            .retain_query_store => |m| for (state.stores) |store| {
+                if (std.mem.eql(u8, &store.identity, &m.binding.identity) and store.query_until_ms >= m.until_ms) break true;
+            } else false,
+            .query_gc_progress => |m| for (state.stores) |store| {
+                if (std.mem.eql(u8, &store.identity, &m.store)) break if (store.query_gc_receipt) |token| std.mem.eql(u8, &token, &m.token) else false;
+            } else m.release,
             .acquire => |m| for (state.readers) |reader| {
                 if (std.mem.eql(u8, &reader.token, &m.token) and reader.generation == m.generation and reader.expires_ms >= m.now_ms +| lease_ms) break true;
             } else false,
@@ -321,7 +474,63 @@ pub const Mutation = union(enum) {
     }
     pub fn apply(self: Mutation, a: A, state: State) !State {
         try state.validate();
+        if (self.sourceScope()) |scope| if (self != .configure_source) {
+            const owner = state.source_owner orelse return error.CatalogGenerationChanged;
+            if (owner.object_generation != scope.object_generation or !std.mem.eql(u8, &owner.owner, &scope.owner)) return error.CatalogGenerationChanged;
+        };
         return switch (self) {
+            .configure_source => |m| blk: {
+                if (state.source_owner != null or state.dropped or m.state.enabled or m.state.current != null or m.state.object_generation != m.scope.object_generation or !std.mem.eql(u8, &m.state.owner, &m.scope.owner)) return error.CatalogGenerationChanged;
+                try m.state.validate();
+                var next = try state.advance();
+                next.version = 2;
+                next.source_owner = m.state;
+                break :blk next;
+            },
+            .activate_source => blk: {
+                var next = try state.advance();
+                next.source_owner.?.enabled = true;
+                break :blk next;
+            },
+            .acknowledge_source => |m| blk: {
+                var next = try state.advance();
+                next.source_owner = try state.source_owner.?.acknowledge(m.lsn);
+                break :blk next;
+            },
+            .invalidate_source => |m| blk: {
+                if (state.source_owner.?.epoch != m.epoch) return error.CatalogGenerationChanged;
+                var next = try state.advance();
+                next.source_owner = try state.source_owner.?.invalidate();
+                break :blk next;
+            },
+            .admit_source => |m| blk: {
+                if (state.dropped or state.current != m.cut.generation or !std.mem.eql(u8, &m.cut.desired, &m.scope.desired) or !m.cut.canIssue(m.now_ms, m.cut.cursor_ttl_ms)) return error.CatalogGenerationChanged;
+                var next = try state.advance();
+                const readers = try a.dupe(Reader, state.readers);
+                const found = for (readers) |*reader| {
+                    if (std.mem.eql(u8, &reader.token, &m.cut.reader_token) and reader.generation == m.cut.generation and reader.expires_ms > m.now_ms) {
+                        reader.expires_ms = @max(reader.expires_ms, m.cut.expires_ms);
+                        break true;
+                    }
+                } else false;
+                if (!found) return error.LakeIndexReaderLeaseExpired;
+                next.readers = readers;
+                next.source_owner = try state.source_owner.?.admit(m.epoch, m.source_uuid, m.cut);
+                try next.validate();
+                break :blk next;
+            },
+            .retain_reader => |m| blk: {
+                if (m.until_ms <= m.now_ms or m.until_ms - m.now_ms > 2 * source_admission.max_cursor_ms + source_admission.refresh_margin_ms) return error.InvalidLakeIndexLifecycle;
+                var next = try state.renew(a, m.token, m.now_ms);
+                const readers = try a.dupe(Reader, next.readers);
+                for (readers) |*reader| if (std.mem.eql(u8, &reader.token, &m.token)) {
+                    reader.expires_ms = @max(reader.expires_ms, m.until_ms);
+                };
+                next.readers = readers;
+                break :blk next;
+            },
+            .retain_query_store => |m| state.retainQueryStore(a, m.binding, m.until_ms),
+            .query_gc_progress => |m| state.queryProgress(a, m),
             .acquire => |m| state.acquire(a, m.token, m.generation, m.now_ms),
             .renew => |m| state.renew(a, m.token, m.now_ms),
             .release => |token| state.release(a, token),
@@ -366,7 +575,7 @@ pub fn parse(a: A, bytes: []const u8) !State {
 }
 pub fn encode(a: A, state: State) ![]u8 {
     try state.validate();
-    const bytes = try std.json.Stringify.valueAlloc(a, state, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, state, .{ .emit_null_optional_fields = false });
     errdefer a.free(bytes);
     if (bytes.len > max_bytes) return error.LakeIndexRetentionBackpressure;
     return bytes;
@@ -374,7 +583,7 @@ pub fn encode(a: A, state: State) ![]u8 {
 
 fn testPublication(generation: u64) catalog.Publication {
     return .{
-        .reader_protocol = 24,
+        .reader_protocol = catalog.native_reader_protocol,
         .generation = generation,
         .token = @splat(@intCast(generation)),
         .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) },
@@ -430,22 +639,12 @@ test "external lake native collection preserves pending uploads and cannot switc
     try std.testing.expectError(error.LakeIndexCollectionStoreMismatch, state.beginCollection(a, @splat(6), @splat(5), state.collection.?.expires_ms));
 }
 
-test "external lake native collection protects unleased legacy upload generations during upgrade" {
+test "external lake native collection rejects obsolete reader authority" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-    var legacy = testPublication(5);
-    legacy.reader_protocol = 0;
-    var state = try (State{}).synchronize(a, .{ .generation = 5, .published = legacy });
-    state = try state.synchronize(a, .{ .generation = 6, .published = legacy, .pending = .{ .reader_protocol = 24, .generation = 6, .token = @splat(6), .signature = legacy.signature, .started_at_ms = 1, .lease_expires_at_ms = 100 } });
-    state = try state.synchronize(a, .{ .generation = 6, .published = testPublication(6) });
-    state = try state.drop();
-    state = try state.beginCollection(a, @splat(7), @splat(4), 101);
-    try std.testing.expectEqual(@as(u64, 6), state.collection.?.upload_floor);
-    try std.testing.expectEqualSlices(u64, &.{6}, state.collection.?.retired);
-    state = try state.finishCollection(a, @splat(7), 102);
-    try std.testing.expectEqual(@as(usize, 1), state.publications.len);
-    try std.testing.expectEqual(@as(u64, 5), state.publications[0].generation);
+    var obsolete = testPublication(5);
+    obsolete.reader_protocol = 0;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, (State{}).synchronize(arena.allocator(), .{ .generation = 5, .published = obsolete }));
 }
 
 test "external lake collection retains failed upload stores through DROP and rotation" {
@@ -535,4 +734,64 @@ test "external lake resumable checkpoint is fenced and protected without becomin
     lifecycle = try lifecycle.beginCollection(ca, @splat(5), saved.signature.store, 200);
     try std.testing.expectEqual(@as(u64, 2), lifecycle.collection.?.upload_cutoff);
     try std.testing.expect((try lifecycle.drop()).checkpoint == null);
+}
+
+test "external lake query ownership survives DROP rotation restart and stale cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const locator: catalog.StoreLocator = .{ .protocol = .filesystem, .bucket = "indexes", .prefix = "", .root = "/artifacts" };
+    const old: StoreBinding = .{ .identity = @splat(4), .locator = locator };
+    var state = try (State{}).retainQueryStore(a, old, 100);
+    try std.testing.expect(state.namespace == null);
+    state = try state.retainQueryStore(a, .{ .identity = @splat(5), .locator = locator }, 200);
+    state = try state.drop();
+    state = try parse(a, try encode(a, state));
+    state = try state.queryProgress(a, .{ .store = old.identity, .observed_until_ms = 100, .phase = 4, .release = false, .now_ms = 101, .token = @splat(1) });
+    state = try parse(a, try encode(a, state));
+    try std.testing.expectEqual(@as(u8, 4), state.stores[0].query_gc_phase);
+    // A writer renews after discovery. A stale collector cannot consume it.
+    state = try state.retainQueryStore(a, old, 300);
+    state = try state.queryProgress(a, .{ .store = old.identity, .observed_until_ms = 100, .phase = 5, .release = true, .now_ms = 201, .token = @splat(2) });
+    try std.testing.expectEqual(@as(u64, 300), state.stores[0].query_until_ms);
+    state = try state.queryProgress(a, .{ .store = old.identity, .observed_until_ms = 300, .phase = 0, .release = true, .now_ms = 301, .token = @splat(3) });
+    try std.testing.expectEqual(@as(usize, 1), state.stores.len);
+    try std.testing.expectEqual(@as([32]u8, @splat(5)), state.stores[0].identity);
+    state = try state.queryProgress(a, .{ .store = @splat(5), .observed_until_ms = 200, .phase = 0, .release = true, .now_ms = 301, .token = @splat(4) });
+    try std.testing.expectEqual(@as(usize, 0), state.stores.len);
+}
+
+test "external lake index collection cannot forget independent query work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const locator: catalog.StoreLocator = .{ .protocol = .filesystem, .bucket = "indexes", .prefix = "", .root = "/artifacts" };
+    var building = try (catalog.State{ .namespace = @splat(8) }).begin(testPublication(1).signature, @splat(1), 1, 100);
+    building.pending.?.store_locator = locator;
+    var state = try (State{}).synchronize(a, building);
+    state = try state.retainQueryStore(a, state.stores[0], 1000);
+    state = try state.drop();
+    state = try state.beginCollection(a, @splat(7), state.stores[0].identity, 3);
+    state = try state.finishCollection(a, @splat(7), 4);
+    try std.testing.expectEqual(@as(usize, 1), state.stores.len);
+    try std.testing.expectEqual(@as(u64, 1000), state.stores[0].query_until_ms);
+}
+
+test "external lake lifecycle command ownership unwinds every allocation failure" {
+    const Probe = struct {
+        fn run(a: A, mutation: Mutation) !void {
+            var owned = try mutation.cloneOwned(a);
+            defer owned.deinitOwned(a);
+        }
+    };
+    const scope: SourceScope = .{ .object_generation = 3, .desired = @splat(4), .owner = @splat(5) };
+    const reference: source_admission.Reference = .{ .id = "state-image", .bytes = 42, .generation = "gcs-generation" };
+    const cut: source_admission.Cut = .{ .desired = @splat(4), .store = @splat(6), .generation = 1, .reader_token = @splat(7), .state = reference, .manifest = reference, .wal_lsn = 10, .base_lsn = 8, .created_ms = 1, .refresh_after_ms = 2, .expires_ms = 3, .cursor_ttl_ms = 1 };
+    // Exercise every nested string, even a rejected configure frame containing
+    // a current image: decode ownership must unwind before/after validation.
+    const owner: source_admission.State = .{ .kind = .managed_iceberg, .owner = scope.owner, .signing_key = @splat(8), .object_generation = scope.object_generation, .source = @splat(9), .source_uuid = "source-uuid", .current = cut };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .configure_source = .{ .scope = scope, .state = owner } }});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .admit_source = .{ .scope = scope, .epoch = 1, .source_uuid = "source-uuid", .cut = cut, .now_ms = 1 } }});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .retain_query_store = .{ .binding = .{ .identity = @splat(4), .locator = .{ .protocol = .s3, .connection = "artifacts", .bucket = "bucket", .prefix = "prefix", .root = "https://objects.example" } }, .until_ms = 100 } }});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .checkpoint_collection = .{ .token = @splat(7), .previous = "previous", .progress = .{ .kind = .doc_values, .name = "checkpoint", .artifact_id = "artifact", .byte_len = 42, .checksum = "checksum" }, .now_ms = 100 } }});
 }

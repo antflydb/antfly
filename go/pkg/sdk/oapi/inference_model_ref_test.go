@@ -22,7 +22,19 @@ func TestInferencePreloadUsesAutomaticLoadingPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schema := doc.Components.Schemas["InferenceModelRef"].Value
+	server := doc.Components.Schemas["InferenceConfig"]
+	if server == nil || server.Value == nil {
+		t.Fatal("missing inference server configuration schema")
+	}
+	execution := server.Value.Properties["inference"]
+	if execution == nil || execution.Value == nil {
+		t.Fatal("missing canonical inference execution section")
+	}
+	preload := execution.Value.Properties["preload"]
+	if preload == nil || preload.Value == nil || preload.Value.Items == nil || preload.Value.Items.Value == nil {
+		t.Fatal("missing canonical inference preload schema")
+	}
+	schema := preload.Value.Items.Value
 	model := map[string]any{"kind": "generator", "name": "gemma-a4b", "backend": "cuda"}
 	if err := schema.VisitJSON(model); err != nil {
 		t.Fatalf("ordinary CUDA preload rejected: %v", err)

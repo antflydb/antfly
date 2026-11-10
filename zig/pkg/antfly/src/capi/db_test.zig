@@ -889,7 +889,7 @@ test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
     // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
     // handle admits one index at a time, so registerLiteIndexResolvers
     // harvests the graph config's own "resolvers" array — the shape
-    // examples/dogfood's knowledgeGraphIndexJSON declares. Re-adding the
+    // examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON declares. Re-adding the
     // same index must be idempotent (upsertResolver observes an unchanged
     // config), matching the enrichment path's contract.
     var test_tmp = try TestDirectory.init("capi");
@@ -6502,13 +6502,17 @@ test "capi native replacement wait observes its background owner without rebuild
     };
     const before = try Reservation.bytes(a, handle);
     defer a.free(before);
+    const rounds_before = owner.publication_stats.maintenance_rounds;
     try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":1000},"edge_types":[{"name":"R","field":"links"}]}
     )));
     const after = try Reservation.bytes(a, handle);
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
+    // Foreground status/waits do not impersonate a background scheduler round.
+    try std.testing.expectEqual(rounds_before, owner.publication_stats.maintenance_rounds);
     for (0..32) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expect(owner.publication_stats.maintenance_rounds > rounds_before);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
     )));
@@ -6910,8 +6914,8 @@ test "capi native bounded admission coalesces allocator proof outside publicatio
     };
     var probe = Probe{ .owner = owner, .path = path, .second = second };
     defer if (probe.worker) |worker| worker.join();
-    owner.test_capacity_wait = .{ .ptr = &probe, .notify = Probe.onWait };
-    defer owner.test_capacity_wait = null;
+    owner.test_allocator_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_allocator_wait = null;
     owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
     defer owner.test_after_allocator_capture = null;
     {
@@ -7216,6 +7220,9 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         }
         const manager = owner.current.?.db.core.index_manager;
         std.debug.print("idle maintenance did not settle: debt={f} lsm_hint={d} lsm_score={d} stats={f}\n", .{ std.json.fmt(debts, .{}), manager.lsmMaintenanceDebtHint(), manager.lsmMaintenanceScore(), std.json.fmt(owner.publication_stats, .{}) });
+        for (manager.text_indexes.items) |entry| {
+            std.debug.print("idle index={s} maintenance={f}\n", .{ entry.config.name, std.json.fmt(entry.persistent.snapshotLsmMaintenanceStats(), .{}) });
+        }
     }
     try std.testing.expect(settled);
     owner.wake.reset();
@@ -7473,6 +7480,71 @@ test "capi lite inference producer retry is visible in graph replacement status"
     const row = parsed.value.object.get("replacements").?.array.items[0].object;
     try std.testing.expect(row.get("blocked_reason").? == .null);
     try std.testing.expect(row.get("upstream_last_error").? == .null);
+}
+
+test "capi SQL detached index publication rejects a recreated table namespace" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-named-publication-fence");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE docs (body TEXT)");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const table = &guard.handle.embedded_tables.get("docs").?.db;
+        try table.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    }
+    const Probe = struct {
+        handle: ?*anyopaque,
+        failure: ?anyerror = null,
+        rejected: bool = false,
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check(root) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This(), root: *shared.Handle) !void {
+            const table = &root.embedded_tables.get("docs").?.db;
+            const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/body_text/prepared.bin", .{table.core.index_manager.base_path});
+            defer std.testing.allocator.free(file);
+            try sqlFkRecoveryStatement(self.handle, "DROP TABLE docs");
+            try sqlFkRecoveryStatement(self.handle, "CREATE TABLE docs (body TEXT)");
+            table.core.index_manager.text_lsm_storage.?.writeFileAbsolute(file, "old namespace") catch |err| {
+                try std.testing.expect(err == error.EnrichmentWaitCanceled);
+                self.rejected = true;
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    var probe: Probe = .{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_capture = null;
+    owner.maintenance_table_cursor = 1;
+    owner.maintenance_pending = true;
+    _ = try owner.maintenanceTurnForTest();
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.rejected);
 }
 
 test "capi SQL visibility waits for physical graph indexes and normalized vector text filters" {
@@ -7919,4 +7991,106 @@ test "storage owner remote content source refreshes policy and retains in-flight
     const recovered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
     defer alloc.free(recovered);
     try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
+}
+
+test "capi storage owner candidate batches release native views through their owning adapter" {
+    const Fixture = struct {
+        source: db_mod.CandidateSource = undefined,
+        invalid: bool = false,
+        released: usize = 0,
+        reads: usize = 0,
+        fn legacyGet(_: ?*anyopaque, _: kernel_owner_abi.BorrowedBytes, _: kernel_owner_abi.BorrowedBytes, _: ?*anyopaque, _: kernel_owner_abi.ResolutionCandidateConsumeFn) callconv(.c) kernel_owner_abi.Status {
+            return .ok;
+        }
+        fn nativeGet(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return null;
+        }
+        fn release(ptr: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.released += 1;
+        }
+        fn begin(ptr: ?*anyopaque, _: ?[*]const kernel_owner_abi.BorrowedBytes, _: u64, output: *kernel_owner_abi.ResolutionCandidateConfig) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const bytes = std.mem.asBytes(&self.source);
+            output.* = .{
+                .callback_ctx = self,
+                .native_view = .fromSlice(if (self.invalid) bytes[0..1] else bytes),
+                .native_view_contract = .fromSlice(db_mod.CandidateSource.nativeContractBytes()),
+                .release_fn = release,
+            };
+            return .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |invalid| {
+        var fixture: Fixture = .{ .invalid = invalid };
+        fixture.source = .{ .ptr = &fixture, .vtable = &.{ .get = Fixture.nativeGet } };
+        var hooks: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .callback_ctx = &fixture, .get_fn = Fixture.legacyGet, .begin_batch_fn = Fixture.begin } }, .group_id = 1 };
+        const source = (try server_api.test_support.candidateSource(&hooks)).?;
+        if (invalid) {
+            try std.testing.expectError(error.InvalidAbiVersion, source.beginBatch(std.testing.allocator, &.{"entities"}));
+        } else {
+            const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+            defer batch.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&fixture)), batch.source.ptr);
+            try std.testing.expect(batch.release_context.? != batch.source.ptr);
+            try std.testing.expectEqual(@as(?[]u8, null), try batch.source.get(std.testing.allocator, "entities", "key"));
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.released);
+    }
+    var fallback: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .get_fn = Fixture.legacyGet } }, .group_id = 1 };
+    const source = (try server_api.test_support.candidateSource(&fallback)).?;
+    const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expect(batch.release == null);
+}
+
+test "storage owner remote content source preserves scoped GCS connections and snapshot lifetime" {
+    const Source = struct {
+        config: *@import("antfly_local_sources").common_config.Config,
+        fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.testing.allocator, &self.config.remote_content.?) catch return .out_of_memory;
+            out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+            return .ok;
+        }
+        fn release(_: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            std.testing.allocator.free(bytes.slice());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var config = try @import("antfly_local_sources").common_config.Config.parseFromSlice(alloc,
+        \\{"connections":{"archive":{"kind":"external_io","capabilities":["content.fetch"],"external_io":{"protocol":"gcs","buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"bearer_token","bearer_token":"${secret:missing-gcs-reader}"}}}}}
+    );
+    defer config.deinit();
+    var source = Source{ .config = &config };
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = server_api.kernel_runtime_services.RemoteContentSource{ .version = 2, .context = &source, .acquire = Source.acquire, .release = Source.release };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks));
+    const owner = asStorageOwnerContext(context).?;
+    owner.acquire();
+    defer owner.release();
+    const facade = owner.remoteContent().?;
+    var before = try facade.acquire();
+    defer before.deinit();
+    const connection = before.config.gcs_connections.get("archive").?;
+    try std.testing.expectEqualStrings("originals", connection.buckets[0]);
+    try std.testing.expectEqualStrings("objects/sha256", connection.prefix.?);
+    try std.testing.expectEqualStrings("${secret:missing-gcs-reader}", connection.credentials.bearer_token.?);
+    const remote = @import("antfly_local_sources").template_remote;
+    const render_config = remote.RenderConfig{ .remote_content = facade, .io = std.testing.io };
+    // Scope rejection must precede resolution of the deliberately missing secret.
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/elsewhere/doc.pdf?generation=123", "archive"));
+    // An authorized locator reaches credential resolution through the owner facade.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
+    config.remote_content.?.gcs_connections.clearRetainingCapacity();
+    var after = try facade.acquire();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.config.gcs_connections.count());
+    try std.testing.expectEqualStrings("objects/sha256", before.config.gcs_connections.get("archive").?.prefix.?);
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
 }

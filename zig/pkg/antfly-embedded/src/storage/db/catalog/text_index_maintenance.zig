@@ -139,7 +139,7 @@ pub fn applyPlannedMerge(
     }
 
     var merged = merger_mod.mergeSegmentsBounded(alloc, snap, planned, .{
-        .target_segment_bytes = @intCast(target_segment_bytes),
+        .target_segment_bytes = target_segment_bytes,
     }) catch |err| {
         logErr(merge_error_prefix, err);
         return err;

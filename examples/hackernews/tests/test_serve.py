@@ -16,6 +16,7 @@
 """Public input cannot select private APIs, arbitrary sources or DSL options."""
 
 import json
+import pytest
 from pathlib import Path
 import sys
 import threading
@@ -25,7 +26,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from serve import Gateway, next_cursor, search_request
+from serve import (
+    Gateway,
+    MAX_CURSOR_BYTES,
+    MAX_SEARCH_REQUEST_BYTES,
+    next_cursor,
+    search_request,
+)
 
 
 class SearchGatewayTest(unittest.TestCase):
@@ -106,6 +113,7 @@ class SearchGatewayTest(unittest.TestCase):
         self.assertIsNone(next_cursor(first, {"hits": {"hits": []}}))
 
     def test_wire_views_route_to_their_query_owner_and_resume(self):
+        composed_cursor = "source3:" + "a" * 200_000
         pages = []
         owner = self
 
@@ -115,6 +123,16 @@ class SearchGatewayTest(unittest.TestCase):
 
             def do_POST(self):
                 query = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if query.get("full_text_search", {}).get("match") == "fail":
+                    self.send_response(500)
+                    self.send_header("Server-Timing", "private;desc=server-only")
+                    self.send_header(
+                        "X-Request-ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                    )
+                    self.send_header("CF-Ray", "0123456789abcdef-SJC")
+                    self.end_headers()
+                    self.wfile.write(b"server-only")
+                    return
                 pages.append((self.path, query))
                 # A table source at /query is deliberately unsupported.
                 valid = (
@@ -132,7 +150,7 @@ class SearchGatewayTest(unittest.TestCase):
                 self.end_headers()
                 result = owner.page()
                 if self.path == "/db/v1/query":
-                    result["next_source_cursor"] = "composed-page"
+                    result["next_source_cursor"] = composed_cursor
                 elif "search_after" in query:
                     result["hits"]["hits"] = []
                 self.wfile.write(json.dumps({"responses": [result]}).encode())
@@ -157,6 +175,10 @@ class SearchGatewayTest(unittest.TestCase):
                     ),
                     timeout=2,
                 ) as response:
+                    self.assertRegex(
+                        response.headers["Server-Timing"],
+                        r"^antfly_upstream;dur=\d+\.\d{3}$",
+                    )
                     return json.load(response)
 
             for view, table in (("history", "hn_archive"), ("recent", "hn_current")):
@@ -173,7 +195,24 @@ class SearchGatewayTest(unittest.TestCase):
             first = call({"q": "database"})
             call({"q": "database", "cursor": first["cursor"]})
             self.assertEqual(pages[-1][0], "/db/v1/query")
-            self.assertEqual(pages[-1][1]["source_cursor"], "composed-page")
+            self.assertEqual(pages[-1][1]["source_cursor"], composed_cursor)
+            from qualify_gateway import probe
+
+            result, evidence = probe(
+                f"http://127.0.0.1:{gateway.server_port}",
+                "/api/search",
+                {"q": "fail"},
+            )
+            self.assertIsNone(result)
+            self.assertEqual(evidence["status"], 503)
+            self.assertGreaterEqual(evidence["backend_seconds"], 0)
+            self.assertEqual(
+                evidence["upstream_request_id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+            self.assertEqual(evidence["upstream_cf_ray"], "0123456789abcdef-SJC")
+            self.assertGreater(evidence["started_at"], 0)
+            self.assertGreaterEqual(evidence["headers_seconds"], 0)
+            self.assertNotIn("server-only", json.dumps(evidence))
         finally:
             for server in (gateway, backend):
                 server.shutdown()
@@ -191,10 +230,103 @@ class SearchGatewayTest(unittest.TestCase):
             {"q": "database", "statement": "DELETE FROM private"},
             {"q": "database", "view": []},
             {"q": "database", "cursor": {}},
-            {"q": "database", "cursor": "x" * 65537},
+            {"q": "database", "cursor": "x" * (MAX_CURSOR_BYTES + 1)},
+            {"q": "database", "cursor": "非ASCII"},
         ):
             with self.subTest(value=str(value)[:80]), self.assertRaises(ValueError):
                 search_request(value)
+
+    def test_backend_cursor_bound_is_checked_before_returning_a_page(self):
+        query = search_request({"q": "database"})
+        for cursor in ({}, "x" * (MAX_CURSOR_BYTES + 1), "非ASCII"):
+            with self.assertRaises(ValueError):
+                next_cursor(query, {"next_source_cursor": cursor})
+
+    def test_body_deadline_and_truncated_upload_release_capacity(self):
+        import socket
+        import time
+
+        class ShortDeadline(Gateway):
+            body_read_timeout_seconds = 0.2
+
+            def log_message(self, *args):
+                pass
+
+            def upstream(self, *args, **kwargs):
+                return {"responses": [{"hits": {"hits": []}}]}
+
+        for truncated in (False, True):
+            with self.subTest(truncated=truncated):
+                server = ThreadingHTTPServer(("127.0.0.1", 0), ShortDeadline)
+                server.searches = threading.BoundedSemaphore(1)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                client = socket.create_connection(server.server_address, timeout=2)
+                stop = threading.Event()
+
+                def trickle():
+                    while not stop.wait(0.03):
+                        try:
+                            client.sendall(b" ")
+                        except OSError:
+                            return
+
+                writer = threading.Thread(target=trickle, daemon=True)
+                try:
+                    started = time.monotonic()
+                    client.sendall(
+                        b"POST /api/search HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\n{"
+                    )
+                    if truncated:
+                        client.shutdown(socket.SHUT_WR)
+                    else:
+                        writer.start()
+                    with client.makefile("rb") as response:
+                        self.assertIn(b" 400 ", response.readline())
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    stop.set()
+                    self.assertTrue(server.searches.acquire(timeout=1))
+                    server.searches.release()
+                    with urlopen(
+                        Request(
+                            f"http://127.0.0.1:{server.server_port}/api/search",
+                            json.dumps({"q": "database"}).encode(),
+                        ),
+                        timeout=2,
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+                finally:
+                    stop.set()
+                    if writer.ident is not None:
+                        writer.join()
+                    client.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join()
+
+    def test_saturated_gateway_rejects_before_waiting_for_request_body(self):
+        from http.client import HTTPConnection
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+        server.searches = threading.BoundedSemaphore(1)
+        server.searches.acquire()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.putrequest("POST", "/api/search")
+            connection.putheader("Content-Length", str(MAX_SEARCH_REQUEST_BYTES))
+            connection.endheaders()
+            # Deliberately do not send a body: admission must reject first.
+            response = connection.getresponse()
+            self.assertEqual(response.status, 429)
+            response.read()
+        finally:
+            connection.close()
+            server.searches.release()
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_wire_routes_do_not_proxy_administration_or_invalid_input(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
@@ -217,7 +349,14 @@ class SearchGatewayTest(unittest.TestCase):
                     "frame-ancestors 'none'",
                     response.headers["Content-Security-Policy"],
                 )
-                self.assertIn(b"Hacker News search", response.read())
+                self.assertIn(b"Hacker News Search", response.read())
+            with urlopen(
+                root + "/?q=database&type=comment&sort=date", timeout=2
+            ) as response:
+                self.assertIn(b'type="module"', response.read())
+            with urlopen(root + "/search-state.mjs", timeout=2) as response:
+                self.assertIn("javascript", response.headers["Content-Type"])
+                self.assertIn(b"export function requestFor", response.read())
         finally:
             server.shutdown()
             server.server_close()
@@ -256,12 +395,13 @@ def test_public_views_against_native_query_contract(tmp_path):
     )
     backend = f"http://127.0.0.1:{port}/db/v1"
 
-    def call(path, body=None):
+    def call(path, body=None, method=None):
         with urlopen(
             Request(
                 backend + path,
                 None if body is None else json.dumps(body).encode(),
                 {"Content-Type": "application/json"},
+                method=method,
             ),
             timeout=30,
         ) as response:
@@ -369,6 +509,73 @@ def test_public_views_against_native_query_contract(tmp_path):
                     } == {"hn_archive" if view == "history" else "hn_current"}
                 else:
                     assert len(second["hits"]["hits"]) == 20
+            # Exercise the same filtered, ordered API against a real saved overlay,
+            # including numeric tie-breaking and continuation across both tables.
+            call("/sources/hackernews", method="DELETE")
+            call(
+                "/sources/hackernews",
+                {
+                    "source": {
+                        "overlay": {
+                            "base": {"table": "hn_archive"},
+                            "changes": {"table": "hn_current"},
+                            "key": ["hn_id"],
+                        }
+                    }
+                },
+            )
+            cutoff = int(time.time()) - 60
+            for table in ("hn_archive", "hn_current"):
+                call(
+                    f"/tables/{table}/batch",
+                    {
+                        "inserts": {
+                            f"{table}-comment-{i}": {
+                                "hn_id": 100 + i,
+                                "body": "database comment",
+                                "title": table,
+                                "created_at": cutoff + i,
+                                "points": i,
+                                "author": "tester",
+                                "item_type": "comment",
+                            }
+                            for i in range(25)
+                        },
+                        "sync_level": "full_index",
+                    },
+                )
+            for view in ("history", "recent", "all"):
+                body = {
+                    "q": "database",
+                    "view": view,
+                    "type": "comment",
+                    "sort": "date",
+                    "date_from": cutoff,
+                    "date_to": cutoff + 86400,
+                }
+                first = search(body)
+                assert len(first["hits"]["hits"]) == 20
+                assert first["cursor"]
+                if view == "recent":
+                    body["recent_since"] = first["recent_since"]
+                second = search(dict(body, cursor=first["cursor"]))
+                hits = first["hits"]["hits"] + second["hits"]["hits"]
+                assert [hit["_source"]["hn_id"] for hit in hits] == list(
+                    range(124, 99, -1)
+                )
+                assert all(hit["_source"]["item_type"] == "comment" for hit in hits)
+                empty = search(
+                    dict(body, date_from=cutoff - 172800, date_to=cutoff - 86400)
+                )
+                assert empty["hits"]["hits"] == []
+                window = search(dict(body, date_from=cutoff + 5, date_to=cutoff + 10))
+                assert [hit["_source"]["hn_id"] for hit in window["hits"]["hits"]] == [
+                    109,
+                    108,
+                    107,
+                    106,
+                    105,
+                ]
         finally:
             if gateway is not None:
                 gateway.shutdown()
@@ -380,3 +587,68 @@ def test_public_views_against_native_query_contract(tmp_path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+
+def test_public_type_date_filters_and_ordering_are_backend_predicates():
+    for view in ("all", "history", "recent"):
+        value = {
+            "q": "database",
+            "view": view,
+            "type": "comment",
+            "sort": "date",
+            "date_from": 1700000000,
+            "date_to": 1800000000,
+        }
+        if view == "recent":
+            value["recent_since"] = 1750000000
+        query = search_request(value)
+        assert query["order_by"] == [
+            {"field": "created_at", "desc": True},
+            {"field": "hn_id", "desc": True},
+        ]
+        assert "source_ranking" not in query
+        predicates = query["filter_query"]["conjuncts"]
+        assert predicates[-1] == {"term": {"path": "/item_type", "value": "comment"}}
+        assert {
+            "range": {"path": "/created_at", "gte": 1700000000, "lt": 1800000000}
+        } in predicates
+        if view == "recent":
+            assert predicates[0] == {
+                "range": {"path": "/created_at", "gte": 1750000000}
+            }
+        if view != "all":
+            cursor = next_cursor(query, SearchGatewayTest.page())
+            assert (
+                search_request(dict(value, cursor=cursor))["remote_snapshot"]
+                == "native2:retained"
+            )
+            for change in (
+                {"type": "story"},
+                {"sort": "relevance"},
+                {"date_from": 1700000001},
+                {"date_to": 1800000001},
+            ):
+                with pytest.raises(ValueError):
+                    search_request({**value, **change, "cursor": cursor})
+    assert search_request({"q": "db", "type": "story"})["filter_query"] == {
+        "term": {"path": "/item_type", "value": "story"}
+    }
+
+
+def test_invalid_public_filters_cannot_inject_a_query():
+    import pytest
+
+    for change in (
+        {"type": ["story"]},
+        {"type": "admin"},
+        {"sort": "_id"},
+        {"sort": None},
+        {"date_from": True},
+        {"date_to": -1},
+        {"date_from": 1.5},
+        {"date_from": 30, "date_to": 20},
+        {"date_to": 253402300801},
+        {"order_by": [{"field": "_id"}]},
+    ):
+        with pytest.raises(ValueError):
+            search_request({"q": "db", **change})

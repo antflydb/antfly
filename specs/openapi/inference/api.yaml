@@ -336,6 +336,12 @@ paths:
       responses:
         '200':
           description: Embeddings generated successfully
+          headers:
+            X-Antfly-Model-Revision:
+              description: The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
           content:
             application/json:
               schema:
@@ -369,6 +375,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: The model identity or immutable revision pin does not match the acquired model.
+          headers:
+            X-Antfly-Capability-Stale:
+              description: Present with value true for a stale model revision. Refresh capabilities and replan before retrying.
+              schema:
+                type: string
+                enum: ['true']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '413':
           description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit
           content:
@@ -393,7 +411,7 @@ paths:
     post:
       summary: Chunk content with optional model-aware embeddings
       description: |
-        Splits content into chunks. Without `embedding`, the fixed chunker and
+        Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
         legacy response remain unchanged. With `embedding`, the resolved target
         model constrains boundaries for text, PDF pages, images or explicit tiles,
         composited GIF frames, audio windows and consecutive video windows.
@@ -406,6 +424,18 @@ paths:
         terminal record must not be treated as complete source coverage.
         Continuations bind the original source version and semantic plan;
         retries may deterministically recompute and must deduplicate chunk IDs.
+
+        Named `outputs` independently embed, transcribe, classify, or diarize
+        each source. A `diarize` target returns source-scoped `speaker_spans`
+        without ASR. On transcription outputs, `diarize: true` enables the same
+        source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+        with a diarization-enabled boundary target to split audio at detected
+        turns while respecting model limits. Speaker analysis runs before the
+        first chunk only as far as that chunk requires; matching outputs share
+        embeddings and timelines. Continuations reuse cached speaker state and
+        boundary directories, with durable checkpoints for recovery. Adding speaker
+        annotations alone preserves parent IDs; enabling speaker boundaries
+        binds the speaker model revision and settings into the plan.
 
         ## Models
 
@@ -585,12 +615,12 @@ paths:
 
         Downloaded and inline encoded media is limited cumulatively across the request
         to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-        `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+        `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity (derived from request concurrency when omitted). A zero configured
         download limit disables nonempty media. Remote URL byte potential is reserved before
         fetch; inline sources reserve their actual encoded size without adding it to the
         existing request-body reservation. Accepted image headers are then validated and
         decoded source pixels are admitted at a conservative 16 bytes per pixel against
-        the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero
+        the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
         concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
         limits each source edge. Malformed images return 400, while dimension or aggregate
         excess returns 413 before model loading. Initial capacity admission occurs before
@@ -882,18 +912,23 @@ paths:
           $ref: '#/components/responses/TransientCapacity'
   /read:
     post:
-      summary: Read text from images (OCR/document understanding)
+      summary: Read text from images, documents, or audio
       description: |
-        Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+        Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
+
+        Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same document service and read envelope. Whisper supports language control, timestamps, diarization and long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio options. Supported video
+        containers are transcribed from their audio track. Results report truncation;
+        generated text does not imply word alignment or speaker identification.
 
         ## Models
 
         Models are auto-discovered from `models_dir/readers/` at startup.
         Use the `/ai/v1/models` endpoint to list available models.
 
-        - **TrOCR**: Pure OCR for printed/handwritten text
+        - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+        - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+        - **PaddleOCR**: Text detection and recognition with page-space regions
         - **Donut**: Document understanding with structured output (receipts, forms)
-        - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
         - **Pix2Struct**: Visual question answering with natural-language prompts
         - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened fields
 
@@ -912,11 +947,11 @@ paths:
         weighted capacity unit and at least one unit per two declared images. The effective
         ceiling is the minimum of the configured per-image limit times image count, the
         read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-        `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
+        `resources.inference.admission.max_work_units`. Admission happens before model resolution or download.
 
         After download, image headers are validated before model loading. Decoded source
         pixels are admitted at a conservative 16 bytes per pixel against the lower of
-        512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+        512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work capacity
         setting still uses the finite 512 MiB ceiling. The reservation grows atomically
         from downloaded-byte admission before inference. `max_image_dimension` limits
         each source edge; malformed images return 400 and dimension or aggregate excess
@@ -977,80 +1012,6 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
-  /transcribe:
-    post:
-      summary: Transcribe audio to text (speech-to-text)
-      description: |
-        Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
-
-        ## Models
-
-        Models are auto-discovered from `models_dir/transcribers/` at startup.
-        Use the `/api/models` endpoint to list available models.
-
-        - **Whisper**: OpenAI's Whisper models (multilingual, automatic language detection)
-        - **Wav2Vec2**: Facebook's Wav2Vec 2.0 models (English-focused)
-        - **HuBERT**: Facebook's HuBERT models (self-supervised)
-
-        ## Audio Input
-
-        Audio data should be base64-encoded. Supported formats depend on the model:
-        - WAV (recommended - raw PCM)
-        - MP3
-        - FLAC
-        - M4A/AAC
-
-        ## Example
-
-        ```json
-        {
-          "model": "openai/whisper-tiny",
-          "audio": "UklGRi..."
-        }
-        ```
-
-        With language hint:
-        ```json
-        {
-          "model": "openai/whisper-tiny",
-          "audio": "UklGRi...",
-          "language": "en"
-        }
-        ```
-      operationId: transcribeAudio
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TranscribeRequest'
-      responses:
-        '200':
-          description: Audio transcribed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TranscribeResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          $ref: '#/components/responses/TransientCapacity'
   /dictate:
     post:
       summary: Dictate speech into clean written text
@@ -1061,6 +1022,28 @@ paths:
         punctuation and paragraphing are added, and preferred spellings from
         `dictionary` are applied. Clips longer than the 30 s Whisper window
         are transcribed in windows cut at the quietest pause near the boundary.
+
+        Database nodes also accept named transcribers such as
+        `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+        for recorded clips and requires an Apple-provider build, macOS 26+, and
+        installed locale assets. Select a named cleanup generator with its bare
+        name or `generators/name`; this shares cleanup with named Whisper
+        transcribers. The standalone runtime continues to accept local Whisper
+        and generator model names.
+
+        Named non-Whisper providers apply `dictionary` during cleanup; they reject
+        Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+        Apple does not support live transcription sessions. For provider-backed
+        cleanup, a delta may contain the entire cleaned result; the raw transcript
+        is delivered before cleanup starts. Missing token usage remains absent.
+
+        Empty recognition is a successful empty result and does not run cleanup.
+        Cleanup must confirm a complete text response: token-limited, filtered,
+        tool-only, empty, and unconfirmed outputs fail rather than replacing the
+        transcript. In streaming mode the error follows `dictation.transcript`
+        and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+        to natural completion within context, deadline, and bounded output bytes;
+        macOS 27+ also verifies measured output tokens against the token budget.
 
         Set `cleanup_model` to the generator that rewrites the transcript.
         Without it, or with `style: verbatim`, the response carries the raw
@@ -1092,6 +1075,11 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/DictateRequest'
+          application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+              description: AFATT001 envelope with DictateRequest metadata, audio set to attachment:0, and exactly one audio attachment.
       responses:
         '200':
           description: |
@@ -1658,7 +1646,7 @@ paths:
         ## Readers
 
         - Vision2Seq models from `models_dir/readers/`
-        - TrOCR, Donut, Florence-2 for OCR and document understanding
+        - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document understanding
 
         ## Transcribers
 
@@ -1718,6 +1706,12 @@ paths:
       responses:
         '200':
           description: Embedding response
+          headers:
+            X-Antfly-Model-Revision:
+              description: The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses.
+              schema:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
           content:
             application/json:
               schema:
@@ -1747,6 +1741,18 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The model identity or immutable revision pin does not match the acquired model.
+          headers:
+            X-Antfly-Capability-Stale:
+              description: Present with value true for a stale model revision. Refresh capabilities and replan before retrying.
+              schema:
+                type: string
+                enum: ['true']
           content:
             application/json:
               schema:
@@ -2174,6 +2180,10 @@ components:
         - model
         - input
       properties:
+        model_revision:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements.
         model_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'
@@ -2945,17 +2955,62 @@ components:
           description: Token classification predictions sorted by score descending.
           items:
             $ref: '#/components/schemas/DocumentTokenClassificationPrediction'
+    AudioReadCapabilities:
+      type: object
+      required: [forced_language, detected_language, timestamps, diarization, windowing]
+      properties:
+        forced_language: {type: boolean}
+        detected_language: {type: boolean}
+        timestamps: {type: boolean}
+        diarization: {type: boolean}
+        windowing: {type: boolean}
+        max_duration_ms: {type: integer, format: int64, nullable: true, description: Maximum duration for this backend in milliseconds. Null means windowed recognition bounded by source and execution budgets.}
+    AudioReadOptions:
+      $ref: '../ai/extraction.yaml#/components/schemas/AudioReadOptions'
+    AudioReadSegment:
+      type: object
+      required: [text, start_ms, end_ms, text_start, text_end]
+      properties:
+        text: {type: string}
+        granularity: {type: string, nullable: true, enum: [phrase, window], description: "phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified."}
+        start_ms: {type: integer, format: int64, minimum: 0, description: Start in milliseconds relative to the original recording.}
+        end_ms: {type: integer, format: int64, minimum: 0, description: Exclusive end in milliseconds relative to the original recording.}
+        text_start: {type: integer, format: int64, minimum: 0, description: Start UTF-8 byte offset in the containing read result text.}
+        text_end: {type: integer, format: int64, minimum: 0, description: Exclusive end UTF-8 byte offset in the containing read result text.}
+        speaker: {type: string, nullable: true, description: Speaker label when diarization was requested and established.}
+    AudioReadMetadata:
+      type: object
+      required: [duration_ms]
+      description: Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
+      properties:
+        duration_ms: {type: integer, format: int64, nullable: true, x-go-type: "*int64", minimum: 0, description: Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.}
+        language: {type: string, nullable: true}
+        language_source: {type: string, enum: [forced, detected, unknown]}
+        segments:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/AudioReadSegment'}
+        speakers:
+          type: array
+          nullable: true
+          items: {type: string}
     ReadRequest:
       type: object
       required:
         - model
-      description: Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
-      x-antfly-exactly-one-of: [images, documents]
+      description: Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only.
+      x-antfly-exactly-one-of: [images, documents, audio]
       properties:
         model:
           type: string
-          description: Name of reader model from models_dir/readers/
-          example: microsoft/trocr-base-printed
+          description: Explicit reader, ASR, audio-capable generator, named target, or composed document model. ASR storage remains models_dir/transcribers/.
+          example: lightonai/LightOnOCR-3-0.8B
+        audio_options:
+          $ref: '#/components/schemas/AudioReadOptions'
+        audio:
+          type: string
+          minLength: 1
+          description: Base64-encoded audio, a data URI, or a supported source URL, mutually exclusive with images and documents. Audio tracks in supported video containers are transcribed; frames are not captioned. Whisper preserves long-recording windowing; Gemma is bounded to 30 seconds. All audio reads use document orchestration, artifacts and durable jobs.
         retain_artifact:
           type: boolean
           default: false
@@ -2983,7 +3038,6 @@ components:
           type: string
           description: |
             Optional task prompt for document understanding models.
-            - TrOCR: Not used (pure OCR)
             - Donut CORD: "<s_cord-v2>" for receipt parsing
             - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
             - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
@@ -2992,10 +3046,14 @@ components:
           example: What type of document is this?
         max_tokens:
           type: integer
-          description: Maximum tokens to generate
+          description: |
+            Maximum output tokens per page. When omitted, the selected reader
+            model supplies its default, bounded by deployment limits. Explicit
+            values override the model default and must fit model and server limits.
+            Audio generator backends accept this option; Whisper uses its recognition
+            and execution budgets and rejects an explicit max_tokens.
           minimum: 1
-          maximum: 1024
-          default: 256
+          maximum: 8192
           example: 256
     TextRegion:
       type: object
@@ -3062,6 +3120,11 @@ components:
       required:
         - text
       properties:
+        audio:
+          allOf:
+            - $ref: '#/components/schemas/AudioReadMetadata'
+          nullable: true
+          x-go-type-skip-optional-pointer: false
         source_id:
           type: string
           description: Original document source ID.
@@ -3071,7 +3134,7 @@ components:
           description: One-based original page or slide number.
         kind:
           type: string
-          enum: [page, slide, image]
+          enum: [page, slide, image, audio]
         inherited_parts:
           type: array
           items:
@@ -3169,7 +3232,10 @@ components:
           type: string
           description: Name of model used for reading
         usage:
-          $ref: '#/components/schemas/GenerateUsage'
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
+          nullable: true
+          description: Token measurements and any explicit unmeasured document allowances, or null when neither is available.
         execution:
           $ref: '#/components/schemas/BatchExecutionReport'
           description: Observed execution path. Omitted by older compatible servers.
@@ -3188,89 +3254,6 @@ components:
             index:
               type: integer
               description: Original input image index.
-    TranscribeRequest:
-      type: object
-      required:
-        - model
-        - audio
-      properties:
-        model:
-          type: string
-          minLength: 1
-          description: Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
-          example: openai/whisper-tiny
-        audio:
-          type: string
-          format: byte
-          description: Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
-        language:
-          type: string
-          description: Force specific language for transcription (optional, model-dependent)
-          example: en
-        timestamps:
-          type: boolean
-          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
-        diarization:
-          type: boolean
-          description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
-    TranscribeResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TranscribeObject'
-          description: Transcription result objects.
-        model:
-          type: string
-          description: Name of model used for transcription
-        usage:
-          $ref: '#/components/schemas/GenerateUsage'
-    TranscribeObject:
-      type: object
-      required:
-        - object
-        - index
-        - text
-      properties:
-        object:
-          type: string
-          enum:
-            - transcription
-        index:
-          type: integer
-          description: Input audio index.
-        text:
-          type: string
-          description: Transcribed text from the audio
-          example: Hello, how are you today?
-        language:
-          type: string
-          description: Detected or forced language
-          example: en
-        duration_ms:
-          type: integer
-          description: Decoded clip duration in milliseconds.
-        segments:
-          type: array
-          items:
-            $ref: '#/components/schemas/DictationSegment'
-          description: Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
-        speakers:
-          type: array
-          items:
-            type: string
-          description: Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
     DictationStyle:
       type: string
       description: |
@@ -3298,13 +3281,21 @@ components:
           type: string
           format: byte
           description: Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+        transcript_text:
+          type: string
+          maxLength: 65536
+          description: |
+            Clean an already finalized recognition segment without running recognition
+            again. Supported by named transcribers advertising text_cleanup. Set
+            audio to the empty string and omit attachments and recognition hints.
+            Partial hypotheses must never be submitted as finalized segments.
         language:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.
           example: en
         timestamps:
           type: boolean
-          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+          description: Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
@@ -3745,6 +3736,8 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        audio_read:
+          $ref: '#/components/schemas/AudioReadCapabilities'
         chunking_limits:
           type: object
           additionalProperties:
@@ -3780,6 +3773,10 @@ components:
               format: int64
               minimum: 1
               maximum: 4294967295
+        model_revision_pinning:
+          type: boolean
+          default: false
+          description: The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
         model_revision:
           type: string
           minLength: 64
@@ -3793,6 +3790,30 @@ components:
             including backend, supported features and min/max geometry.
             Runtime admission revalidates artifact identity and resource limits.
             Omitted for artifacts without a qualification receipt.
+        compatibility:
+          type: string
+          enum: [compatible, unknown, incompatible]
+          description: |
+            Whether this artifact can run in the current build. `incompatible`
+            artifacts are rejected before load; a model whose directory cannot
+            be read is listed as `incompatible` with `error` set.
+        invocable:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: |
+            False when this deployment rejects public execution
+            (`public_inference_enabled: false`); the model is installed and
+            listed, but public calls return 403. Omitted when it can be invoked.
+        error:
+          type: object
+          description: Why the model is unusable, set when its directory could not be read. Other models still list.
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Error identifier, for example `MissingGlinerSpanEncoderConfig`.
+            message:
+              type: string
         capabilities:
           type: array
           items:
@@ -3833,7 +3854,7 @@ components:
         public_inference_enabled:
           x-go-type-skip-optional-pointer: false
           type: boolean
-          description: Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
+          description: "Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy."
         object:
           type: string
           enum:
@@ -4399,6 +4420,13 @@ components:
         facts:
           type: string
           description: Compacted evidence attributed to this completed tool call.
+        source_ids:
+          x-go-type-skip-optional-pointer: false
+          maxItems: 4096
+          type: array
+          items:
+            type: string
+          description: Exact source identities attributed to this tool result. Optional for legacy checkpoints; summaries must preserve server-supplied identities without shortening or substitution.
     ContextUnresolvedToolCall:
       type: object
       additionalProperties: false
@@ -4782,6 +4810,14 @@ components:
         native_items:
           type: integer
           minimum: 0
+        max_native_step_items:
+          type: integer
+          minimum: 0
+          description: |
+            Largest successfully executed native decoder step observed by these
+            items, including peers from other requests. Zero or absent means
+            unobserved, one means singleton execution. This is measured at
+            execution, never inferred from native_items or request cardinality.
         serial_items:
           type: integer
           minimum: 0
@@ -4873,7 +4909,11 @@ components:
           description: Number of tokens in the completion
         total_tokens:
           type: integer
-          description: Total tokens used (prompt + completion)
+          description: Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances).
+        unmeasured_tokens:
+          type: integer
+          minimum: 0
+          description: Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage.
         model_calls:
           type: integer
           minimum: 0
@@ -5164,205 +5204,10 @@ components:
             Idle time-to-live for prompt KV cache entries. Refreshed on every cache
             hit, so only entries left unused for this duration expire.
           default: 300000
-    AdmissionConfig:
-      type: object
-      additionalProperties: false
-      description: Process-local foreground request admission settings.
-      properties:
-        inference:
-          $ref: '#/components/schemas/RequestAdmissionConfig'
-    RequestAdmissionConfig:
-      type: object
-      additionalProperties: false
-      properties:
-        max_concurrent_requests:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          description: |
-            Maximum concurrent inference requests in this process. The same
-            value also sizes the weighted work budget shared by every executing
-            inference endpoint: each request consumes one request slot and at
-            least one unit, while request body size, generation workload, and
-            image byte/count reservations can consume more than one unit. The
-            request count can therefore never exceed this value, while expensive
-            requests may exhaust weighted capacity sooner. Read and
-            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
-            per unit and at least one unit per two images. A positive capacity also
-            clamps each such request's downloaded-image ceiling to 16 MiB times
-            this value. When either ceiling is exhausted, new HTTP requests are
-            rejected immediately with 503 Service Unavailable and Retry-After: 1;
-            they are not retained
-            in an in-process queue. Set to 0 to disable both ceilings, admission
-            unit accounting, and the capacity-derived clamp. The default is 32.
-          minimum: 0
-          maximum: 4294967295
-          default: 32
-          example: 32
     Config:
-      allOf:
-        - $ref: '#/components/schemas/RuntimeConfig'
-        - type: object
-          properties:
-            admission:
-              $ref: '#/components/schemas/AdmissionConfig'
+      $ref: './config.yaml#/components/schemas/InferenceServerConfig'
     RuntimeConfig:
-      type: object
-      properties:
-        max_concurrent_requests:
-          type: integer
-          minimum: 0
-          maximum: 4294967295
-          deprecated: true
-          description: |
-            Deprecated compatibility alias for
-            `admission.inference.max_concurrent_requests`. New configurations
-            should use the process-level admission setting. If both spellings
-            are supplied, they must have the same value.
-          example: 32
-        api_url:
-          type: string
-          format: uri
-          description: |
-            URL of an out-of-process Antfly inference service that the Antfly
-            server should call for embedding, chunking, reranking, and
-            generation. Omit it to use the in-process inference runtime
-            (the default in standalone mode). `antfly inference run` ignores
-            this field; it configures the client side only.
-          example: http://localhost:8080
-        api_key:
-          type: string
-          description: API key used when calling an authenticated shared Antfly inference API.
-        models_dir:
-          type: string
-          description: |
-            Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
-            - `{models_dir}/embedders/` - Embedding models
-            - `{models_dir}/rerankers/` - Reranking models
-            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
-
-            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
-            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
-            chunker needs no models.
-          example: ~/.antfly/inference/models
-        ml_dir:
-          type: string
-          description: |
-            Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
-            API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
-
-            Defaults to ~/.antfly/inference/ml.
-          example: ~/.antfly/inference/ml
-        content_security:
-          $ref: '#/components/schemas/ContentSecurityConfig'
-          description: Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-        s3_credentials:
-          $ref: '#/components/schemas/Credentials'
-          description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-        keep_alive:
-          type: string
-          description: |
-            How long to keep models loaded in memory after last use (Ollama-compatible).
-            Models are automatically unloaded after this duration of inactivity.
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
-            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
-            still be evicted under resource pressure or to enforce max_loaded_models.
-          default: 5m
-          example: 5m
-        max_loaded_models:
-          type: integer
-          description: |
-            Maximum total models loaded across all registry types (embedders, rerankers,
-            generators, chunkers, etc.). When the limit is reached, the least-recently-used
-            idle model from any registry is evicted to make room. Set to 0 for unlimited.
-            Defaults to 10.
-          default: 10
-          example: 3
-        pool_size:
-          type: integer
-          description: |
-            Legacy compatibility field. The current Zig inference runtime does not
-            create per-model pipeline pools from this setting; configuring it has no effect.
-          deprecated: true
-        prompt_cache:
-          $ref: '#/components/schemas/PromptCacheConfig'
-          description: Native generator prompt KV cache settings.
-        backend_priority:
-          type: array
-          items:
-            $ref: '#/components/schemas/BackendPriorityEntry'
-          description: |
-            Legacy compatibility field. The current Zig inference runtime selects a
-            backend from model metadata, explicit preload settings, and compiled capabilities;
-            configuring this list has no effect.
-          deprecated: true
-        max_queue_size:
-          type: integer
-          description: |
-            Legacy Go-runtime queue setting. The current Zig runtime does not retain
-            excess inference requests in memory and ignores this field.
-          deprecated: true
-        request_timeout:
-          type: string
-          description: |
-            Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
-            this field; its HTTP listener applies a separate fixed transport timeout.
-          deprecated: true
-        preload:
-          type: array
-          description: |
-            Models to preload and warm at startup. Generators run a tiny generation
-            request so native/Metal weights, KV setup, and kernels use the same
-            budgeted path as request-time generation. Other model kinds use the
-            best available warm path for that kind.
-          items:
-            $ref: '#/components/schemas/ModelRef'
-          example:
-            - kind: generator
-              name: antflydb/gemma-e2b
-              backend: metal
-              format: gguf
-              quantization: q4_k
-        max_memory_mb:
-          type: integer
-          description: |
-            Legacy compatibility field. The current Zig runtime uses explicit host,
-            backend, combined, KV, and scratch budgets instead and ignores this field.
-          deprecated: true
-        model_strategies:
-          type: object
-          additionalProperties:
-            type: string
-            enum:
-              - eager
-              - lazy
-              - bounded
-          description: |
-            Per-model loading strategy overrides. Maps model names to their loading strategy.
-            Models not in this map load on demand. keep_alive controls their idle
-            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
-
-            When a model has strategy "eager" in this map:
-            - It is loaded at startup through the same startup warmup path
-            - It is never unloaded, even when keep_alive>0 (pinned in memory)
-
-            This allows mixing eager and lazy models in the same pool.
-          example:
-            BAAI/bge-small-en-v1.5: eager
-            mirth/chonky-mmbert-small-multilingual-1: lazy
-        allow_downloads:
-          type: boolean
-          description: |
-            Legacy compatibility field controlling whether dashboards show model
-            download commands. It defaults to true for standalone deployments;
-            managed deployments historically set it to false. Download-command
-            availability is a build-time setting in the current Zig runtime, so
-            configuring this field has no effect.
-          default: true
-          deprecated: true
-        log:
-          $ref: '#/components/schemas/schemas-Config'
+      $ref: './config.yaml#/components/schemas/RuntimeConfig'
     BackendRuntimes:
       type: object
       description: Runtime backends compiled into this inference server.

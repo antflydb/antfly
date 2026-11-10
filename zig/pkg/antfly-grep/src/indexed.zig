@@ -17,11 +17,16 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const document = @import("document.zig");
+const record_view = @import("record_view.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
+const descriptors = @import("image_descriptor.zig");
+const CachedIdentity = struct { id: []const u8, identity: []const u8 };
+const MediaField = struct { field: []const u8, mode: ?enum { identity } = null, if_match: []const CachedIdentity = &.{} };
+const MediaSelection = struct { fields: []const MediaField };
 const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { search_version: u32 = 1, artifacts: []const std.json.Value = &.{}, fields: ?record_view.Fields = null, streams: []const record_view.Stream = &.{}, selected_stream: ?record_view.Stream = null, published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
@@ -41,6 +46,7 @@ pub const Config = struct {
     max_page_memory: usize = 64 * 1024 * 1024,
 };
 pub fn run(search: anytype) !void {
+    if (search.options.media == .images and search.options.ask != null) search.decider.prepareCache();
     const file_bytes = if (search.options.table_config) |path| try std.Io.Dir.cwd().readFileAlloc(search.io, path, search.a, .limited(1024 * 1024)) else null;
     defer if (file_bytes) |bytes| search.a.free(bytes);
     const bytes = search.options.table_config_json orelse file_bytes orelse return error.TableConfigRequired;
@@ -51,8 +57,23 @@ pub fn run(search: anytype) !void {
     if (execution.max_documents == 0 or execution.max_bytes == 0 or execution.max_regex_work == 0 or execution.max_documents > std.math.maxInt(i64) or execution.max_bytes > std.math.maxInt(i64) or execution.max_regex_work > std.math.maxInt(i64)) return error.InvalidTableConfig;
     if (config.version != 1 or config.tables.len == 0 or config.page_size == 0 or config.page_size > 1000 or config.max_response_bytes < 1024 or config.max_response_bytes > 256 * 1024 * 1024 or config.max_page_memory < 4096 or config.max_page_memory > 1024 * 1024 * 1024) return error.InvalidTableConfig;
     try @import("providers.zig").validateCustom(config.endpoint);
+    if (search.options.indexed_media_transport == .source) {
+        const tables = try std.Uri.parse(config.endpoint);
+        const inference = try std.Uri.parse(search.options.endpoint);
+        const table_host = tables.host orelse return error.InvalidTableConfig;
+        const inference_host = inference.host orelse return error.InvalidTableConfig;
+        const table_port = tables.port orelse @as(u16, if (std.ascii.eqlIgnoreCase(tables.scheme, "https")) 443 else 80);
+        const inference_port = inference.port orelse @as(u16, if (std.ascii.eqlIgnoreCase(inference.scheme, "https")) 443 else 80);
+        if (!std.ascii.eqlIgnoreCase(tables.scheme, inference.scheme) or !std.ascii.eqlIgnoreCase(table_host.percent_encoded, inference_host.percent_encoded) or table_port != inference_port) return error.ConflictingMediaOptions;
+    }
     for (config.tables, 0..) |table, i| {
-        if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
+        if (table.search_version > 2) return error.UnsupportedSearchVersion;
+        if (table.search_version < 2) for (table.streams) |stream| {
+            if (stream.retrieval != null or stream.resource_field != null) return error.UnsupportedSearchVersion;
+        };
+        if (table.fields) |fields| try record_view.validate(fields, table.streams);
+        if (table.fields == null and table.streams.len > 0) return error.InvalidSourceFields;
+        if (table.name.len == 0 or (table.fields == null and table.document_field.len == 0) or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
         if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
         if (table.alias) |alias| if (alias.len == 0) return error.InvalidTableConfig;
         for (config.tables[0..i]) |prior| {
@@ -63,6 +84,17 @@ pub fn run(search: anytype) !void {
     const selectors = if (search.options.sourced()) search.options.sources.items else search.options.tables.items;
     const selected_tables = try resolveTableSelection(search.a, config.tables, selectors, search.options.sourced());
     defer search.a.free(selected_tables);
+    for (search.options.artifacts.items) |requested| {
+        var found = false;
+        for (config.tables, selected_tables) |table, selected| {
+            if (!selected) continue;
+            for (table.streams) |stream| if (record_view.selected(stream, &.{requested}, false)) {
+                found = true;
+                break;
+            };
+        }
+        if (!found) return error.UnknownArtifactStream;
+    }
     const original_source = search.provenance;
     defer search.provenance = original_source;
     search.provenance = .{ .backend = .antfly, .freshness = .indexed };
@@ -75,10 +107,265 @@ pub fn run(search: anytype) !void {
     for (config.tables, selected_tables) |table, selected| {
         if (search.stopped()) break;
         if (!selected) continue;
-        scan(search, &http, config, table, &count, &seen) catch |err| {
-            try search.reportError(table.alias orelse table.name, err);
-        };
+        if (table.fields != null and !metadataListing(search.options)) {
+            var selected_count: usize = 0;
+            for (table.streams) |declared| {
+                const stream = record_view.exact(declared) orelse {
+                    if (search.options.artifacts.items.len > 0 and record_view.selected(declared, search.options.artifacts.items, search.options.all_artifacts)) try search.reportError(table.alias orelse table.name, error.RepresentationDoesNotSupportExactSearch);
+                    continue;
+                };
+                if (!record_view.selected(stream, search.options.artifacts.items, search.options.all_artifacts)) continue;
+                selected_count += 1;
+                var bound = table;
+                bound.selected_stream = stream;
+                scanStream(search, &http, config, bound, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
+                if (search.stopped()) break;
+            }
+            if (selected_count == 0 and search.options.artifacts.items.len == 0) try search.reportError(table.alias orelse table.name, error.NoSearchableTextStreams);
+        } else {
+            scan(search, &http, config, table, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
+        }
     }
+}
+// A readable index can still contain only a prefix of an extraction. Check
+// convergence on both sides of a retained scan, including its catalog identity.
+fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
+    const stream = table.selected_stream orelse return error.InvalidArtifactStream;
+    if (stream.artifact == null) return scan(search, http, config, table, count, seen);
+    const before = try streamReadiness(search, http, config, table, stream);
+    defer search.a.free(before);
+    try scanArtifacts(search, http, config, table, count, seen);
+    const after = try streamReadiness(search, http, config, table, stream);
+    defer search.a.free(after);
+    if (!std.mem.eql(u8, before, after)) return error.ArtifactDefinitionChanged;
+}
+fn scanArtifacts(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
+    const stream = table.selected_stream.?;
+    var setup = std.heap.ArenaAllocator.init(search.a);
+    defer setup.deinit();
+    const a = setup.allocator();
+    if (table.status) |status| if (!std.mem.eql(u8, status, "searchable")) return error.SourceNotSearchable;
+    const url = try std.fmt.allocPrint(a, "{s}/tables/{s}/query", .{ std.mem.trimEnd(u8, config.endpoint, "/"), try escape(a, table.table orelse table.name) });
+    const extra = if (search.options.table_filter) |raw| try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) else null;
+    const user = if (table.source_filter) |source| (if (extra) |filter| try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ source, filter } }, .{}), .{}) else source) else extra;
+    // Original-content trigrams do not certify generated or extracted text.
+    const filter = user;
+    var discovery = @import("discovery.zig").Discovery{ .a = search.a, .io = search.io, .options = search.options };
+    defer discovery.deinit();
+    try discovery.prepareOverrides();
+    var parent_table = table;
+    parent_table.selected_stream = null;
+    var parents = Fetch{ .table = parent_table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .http = http, .fields = try record_view.parentFields(a, table.fields.?) };
+    defer search.summary.index_requests += parents.summary.index_requests;
+    var children = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = null, .http = http, .fields = try tableProjectionFields(a, search.options, table) };
+    defer search.summary.index_requests += children.summary.index_requests;
+    var continuation = std.heap.ArenaAllocator.init(search.a);
+    defer continuation.deinit();
+    var cursor: ?[]const std.json.Value = null;
+    var snapshot: ?[]const u8 = null;
+    var parent_count: usize = 0;
+    while (!search.stopped()) {
+        const page = try parents.load(.{ .cursor = cursor, .snapshot = snapshot, .page_size = @min(config.page_size, 100) });
+        defer page.deinit(search.a);
+        const result = try responseResult(page.parsed.value);
+        const cut = try document.string(result, "remote_snapshot");
+        if (cut.len == 0 or (snapshot != null and !std.mem.eql(u8, snapshot.?, cut))) return error.IndexSnapshotChanged;
+        const hits = document.at(result, "hits.hits") orelse return error.InvalidIndexResponse;
+        if (hits != .array or hits.array.items.len > page.page_size) return error.InvalidIndexResponse;
+        var previous_parent = cursor;
+        var selected: std.ArrayList([]const u8) = .empty;
+        defer selected.deinit(search.a);
+        var sources = std.StringHashMap(std.json.Value).init(search.a);
+        defer sources.deinit();
+        for (hits.array.items) |parent| {
+            const parent_sort = document.field(parent, "_sort") orelse return error.InvalidIndexCursor;
+            const parent_key = try document.string(parent, "_id");
+            if (parent_sort != .array or parent_sort.array.items.len != 1 or parent_sort.array.items[0] != .string or !std.mem.eql(u8, parent_key, parent_sort.array.items[0].string)) return error.InvalidIndexCursor;
+            if (previous_parent) |prior| if (std.mem.order(u8, prior[0].string, parent_key) != .lt) return error.InvalidIndexCursor;
+            previous_parent = parent_sort.array.items;
+            if (search.stopped()) return;
+            parent_count += 1;
+            if (parent_count > search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+            const source = document.field(parent, "_source") orelse return error.InvalidIndexResponse;
+            const path = document.at(source, table.fields.?.path) orelse return error.MissingSourceField;
+            if (path != .string) return error.MissingSourceField;
+            const value = try record_view.view(page.arena.allocator(), source, table.fields.?, "");
+            if (!try discovery.indexedAllowed(path.string) or (search.options.cloud_session == null and !document.allowed(value, config.principals))) {
+                search.skipped();
+                continue;
+            }
+            try selected.append(search.a, parent_key);
+            try sources.put(parent_key, source);
+        }
+        if (selected.items.len != 0) {
+            children.artifact_parents = selected.items;
+            var child_state = std.heap.ArenaAllocator.init(search.a);
+            defer child_state.deinit();
+            var child_cursor: ?[]const std.json.Value = null;
+            while (!search.stopped()) {
+                const members = try children.load(.{ .cursor = child_cursor, .snapshot = cut, .page_size = @min(config.page_size, 100) });
+                defer members.deinit(search.a);
+                const response = try responseResult(members.parsed.value);
+                if (!std.mem.eql(u8, cut, try document.string(response, "remote_snapshot"))) return error.IndexSnapshotChanged;
+                const rows = document.at(response, "hits.hits") orelse return error.InvalidIndexResponse;
+                if (rows != .array or rows.array.items.len > members.page_size) return error.InvalidIndexResponse;
+                var previous = child_cursor;
+                for (rows.array.items) |hit| {
+                    if (search.stopped()) return;
+                    if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+                    count.* += 1;
+                    const id = try document.string(hit, "_id");
+                    const sort = document.field(hit, "_sort") orelse return error.InvalidIndexCursor;
+                    if (sort != .array or sort.array.items.len != 2 or sort.array.items[0] != .string or sort.array.items[1] != .string or !std.mem.eql(u8, id, sort.array.items[1].string)) return error.InvalidIndexCursor;
+                    if (previous) |prior| if (std.mem.order(u8, prior[0].string, sort.array.items[0].string) != .lt) return error.InvalidIndexCursor;
+                    previous = sort.array.items;
+                    const parent_id = try document.string(document.field(hit, "hierarchy") orelse return error.MissingArtifactSource, "parent_doc_key");
+                    const source = sources.get(parent_id) orelse return error.MissingArtifactSource;
+                    const artifact = document.at(hit, "hierarchy.artifact") orelse return error.MissingArtifactIdentity;
+                    if (!std.mem.eql(u8, stream.artifact.?, try document.string(artifact, "name"))) return error.ArtifactIndexBindingChanged;
+                    const member = document.field(hit, "_source") orelse if (metadataListing(search.options)) std.json.Value{ .object = .empty } else return error.InvalidIndexResponse;
+                    const content = if (metadataListing(search.options)) "" else try record_view.text(member, stream.field);
+                    const value = try record_view.view(members.arena.allocator(), source, table.fields.?, content);
+                    var doc = if (metadataListing(search.options)) try document.Document.parseListing(value, table.table orelse table.name, id, cut, std.Io.Clock.real.now(search.io).toSeconds()) else try document.Document.parse(value, table.table orelse table.name, id, cut, std.Io.Clock.real.now(search.io).toSeconds());
+                    doc.provenance.purpose = stream.purpose;
+                    doc.provenance.generated = stream.generated;
+                    doc.provenance.text_field = stream.field;
+                    doc.provenance.boundary = stream.boundary;
+                    doc.provenance.document_id = parent_id;
+                    doc.provenance.artifact_key = id;
+                    doc.provenance.artifact = artifact;
+                    doc.provenance.artifact_revision = try document.string(artifact, "revision");
+                    if (doc.provenance.artifact_revision.?.len == 0) return error.MissingArtifactRevision;
+                    doc.provenance.location = document.at(member, stream.location_field orelse "provenance");
+                    if (search.options.cloud_session == null and !document.allowed(value, config.principals)) {
+                        search.skipped();
+                        continue;
+                    }
+                    var identity = std.crypto.hash.sha2.Sha256.init(.{});
+                    for ([_][]const u8{ table.table orelse table.name, stream.name, id }) |part| {
+                        var length: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &length, part.len, .little);
+                        identity.update(&length);
+                        identity.update(part);
+                    }
+                    var key: [32]u8 = undefined;
+                    identity.final(&key);
+                    if ((try seen.getOrPut(key)).found_existing) continue;
+                    doc.cache_scope = try sourceCacheScope(members.arena.allocator(), search.options, config, table, id, value);
+                    doc.path = try std.fmt.allocPrint(members.arena.allocator(), "{s}::{s}{s}/{s}", .{ doc.path, stream.name, if (stream.generated) "[generated]" else "", id });
+                    search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
+                }
+                if (rows.array.items.len < members.page_size) break;
+                var fresh = std.heap.ArenaAllocator.init(search.a);
+                errdefer fresh.deinit();
+                child_cursor = (try std.json.parseFromSlice([]const std.json.Value, fresh.allocator(), try std.json.Stringify.valueAlloc(members.arena.allocator(), previous orelse return error.InvalidIndexCursor, .{}), .{ .allocate = .alloc_always })).value;
+                child_state.deinit();
+                child_state = fresh;
+            }
+        }
+        if (hits.array.items.len < page.page_size) return;
+        const last = hits.array.items[hits.array.items.len - 1];
+        const sort = document.field(last, "_sort") orelse return error.InvalidIndexCursor;
+        if (sort != .array or sort.array.items.len != 1 or sort.array.items[0] != .string) return error.InvalidIndexCursor;
+        if (cursor) |prior| if (std.mem.order(u8, prior[0].string, sort.array.items[0].string) != .lt) return error.InvalidIndexCursor;
+        var fresh = std.heap.ArenaAllocator.init(search.a);
+        errdefer fresh.deinit();
+        cursor = (try std.json.parseFromSlice([]const std.json.Value, fresh.allocator(), try std.json.Stringify.valueAlloc(page.arena.allocator(), sort.array.items, .{}), .{ .allocate = .alloc_always })).value;
+        snapshot = try fresh.allocator().dupe(u8, cut);
+        continuation.deinit();
+        continuation = fresh;
+    }
+}
+fn responseResult(value: std.json.Value) !std.json.Value {
+    const responses = document.field(value, "responses") orelse return error.InvalidIndexResponse;
+    if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
+    const result = responses.array.items[0];
+    if (document.field(result, "error") != null) return error.IndexQueryFailed;
+    return result;
+}
+
+fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: Table, stream: record_view.Stream) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(search.a);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const url = try std.fmt.allocPrint(a, "{s}/tables/{s}/indexes/{s}", .{ std.mem.trimEnd(u8, config.endpoint, "/"), try escape(a, table.table orelse table.name), try escape(a, stream.index orelse return error.InvalidArtifactStream) });
+    var refreshed = false;
+    var response = retry: while (true) {
+        if (!Limits.reserve(&search.limits.requests, 1, search.options.max_requests)) return error.RequestBudgetExceeded;
+        search.summary.index_requests += 1;
+        var headers: std.ArrayList([2][]const u8) = .empty;
+        const credential = if (search.options.cloud_session) |session| session.token() else search.options.table_token;
+        if (credential) |token| try headers.append(a, .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{token}) });
+        if (table.source_id) |id| {
+            try headers.append(a, .{ "X-Antfly-Source-ID", id });
+            const proof = if (search.options.cloud_session) |session| session.sourceProof(id) else table.access_id;
+            if (proof) |value| try headers.append(a, .{ "X-Antfly-Source-Access", value });
+            if (search.options.cloud_session) |session| if (session.sourcePublication(id)) |fence| try headers.append(a, .{ "X-Antfly-Source-Publication", fence });
+        }
+        var result = try http.get(url, .{ .headers = headers.items, .timeout_ms = search.options.timeout_ms, .max_response_size = config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+        if (result.status.code == 401 and !refreshed) if (search.options.cloud_session) |session| {
+            result.deinit();
+            refreshed = true;
+            try session.refresh(credential.?);
+            continue :retry;
+        };
+        break :retry result;
+    };
+    defer response.deinit();
+    if (response.status.code == 401 or response.status.code == 403) return error.IndexAuthorizationFailed;
+    if (response.status.code == 409) {
+        if (response.header("x-antfly-source-publication")) |fence| if (std.mem.eql(u8, fence, "changed")) return error.SourcePublicationChanged;
+        if (response.header("x-antfly-source-access")) |proof| if (std.mem.eql(u8, proof, "changed")) return error.CloudSourceAccessChanged;
+        if (response.header("x-antfly-source-state") != null) return error.SourceNotSearchable;
+    }
+    if (!response.ok()) return error.ArtifactReadinessUnavailable;
+    if (search.options.cloud_session) |session| {
+        try session.checkSource(table.source_id orelse return error.InvalidCloudSourcePolicy, response.header("x-antfly-subject"), response.header("x-antfly-source-access"), response.header("x-antfly-source-publication"));
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.InvalidIndexResponse, .{});
+    const index_config = document.field(parsed.value, "config") orelse return error.ArtifactIndexBindingChanged;
+    const index_type = try document.string(index_config, "type");
+    if (!std.mem.eql(u8, index_type, "full_text")) return error.ArtifactIndexBindingChanged;
+    const configured_sources = document.field(index_config, "sources") orelse return error.ArtifactIndexBindingChanged;
+    if (configured_sources != .array) return error.ArtifactIndexBindingChanged;
+    var matching_field = false;
+    for (configured_sources.array.items) |binding| {
+        if (!std.mem.eql(u8, try document.string(binding, "artifact"), stream.artifact.?)) continue;
+        const field = document.field(binding, "field") orelse document.field(index_config, "field");
+        if (field) |value| {
+            if (value == .string and std.mem.eql(u8, value.string, stream.field)) matching_field = true;
+            if (value == .string and std.mem.eql(u8, value.string, "text") and std.mem.eql(u8, stream.field, "$")) {
+                if (document.field(index_config, "enrichments")) |enrichments| if (enrichments == .array) {
+                    for (enrichments.array.items) |enrichment| {
+                        const name = document.string(enrichment, "name") catch continue;
+                        const kind = document.string(enrichment, "kind") catch continue;
+                        const mime = document.string(enrichment, "content_type") catch continue;
+                        if (std.mem.eql(u8, name, stream.artifact.?) and std.mem.eql(u8, kind, "asset") and std.mem.eql(u8, mime, "text/plain")) matching_field = true;
+                    }
+                };
+            }
+            if (value == .null and std.mem.eql(u8, stream.field, "$")) matching_field = true;
+        } else if (std.mem.eql(u8, stream.field, "$")) matching_field = true;
+    }
+    if (!matching_field) return error.ArtifactIndexBindingChanged;
+    const readiness = document.at(parsed.value, "status.readiness") orelse return error.ArtifactReadinessUnavailable;
+    const queryable = document.field(readiness, "queryable") orelse return error.ArtifactStreamIncomplete;
+    if (queryable != .bool or !queryable.bool) return error.ArtifactStreamIncomplete;
+    const sources = document.field(readiness, "sources") orelse return error.ArtifactReadinessUnavailable;
+    if (sources != .array) return error.InvalidIndexResponse;
+    var found = false;
+    for (sources.array.items) |source| {
+        const name = try document.string(source, "artifact");
+        if (!std.mem.eql(u8, name, stream.artifact.?)) continue;
+        found = true;
+        const complete = document.field(source, "complete") orelse return error.ArtifactStreamIncomplete;
+        if (complete != .bool or !complete.bool) return error.ArtifactStreamIncomplete;
+    }
+    if (!found) return error.ArtifactIndexBindingChanged;
+    const incarnation = document.field(readiness, "incarnation") orelse return error.ArtifactReadinessUnavailable;
+    const target = document.field(readiness, "target_revision") orelse return error.ArtifactReadinessUnavailable;
+    const published = document.field(readiness, "published_revision") orelse return error.ArtifactReadinessUnavailable;
+    return std.json.Stringify.valueAlloc(search.a, .{ .incarnation = incarnation, .target = target, .published = published }, .{});
 }
 // Resolve user-facing selectors once to a set of physical source identities.
 // Cloud IDs take precedence over aliases. Manual configs select alias-or-name
@@ -146,9 +433,14 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const filter_arena = filters.allocator();
     const extra_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
     const user_filter: ?std.json.Value = if (table.source_filter) |source_filter| (if (extra_filter) |extra| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ source_filter, extra } }, .{}), .{}) else source_filter) else extra_filter;
-    const text_query = try contentQuery(filter_arena, search, table);
-    const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    // Candidate certificates describe indexed terms, while user filters may
+    // contain storage-only predicates. Compose acceleration with the text
+    // query so it uses the indexed-term executor without rewriting ACL filters.
+    const content_query = try contentQuery(filter_arena, search, table);
+    const candidates = try candidateQuery(filter_arena, search, table);
+    const text_query = if (content_query) |content| (if (candidates) |candidate| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ content, candidate } }, .{}), .{}) else content) else candidates;
+    const filter = user_filter;
+    var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try tableProjectionFields(filter_arena, search.options, table) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -159,7 +451,20 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     defer fetcher.finish();
     const Search = @typeInfo(@TypeOf(search)).pointer.child;
     const Lane = Search.IndexedLane;
-    const Job = struct { lane: *Lane, resolver: AssetResolver(@TypeOf(search)) = undefined, sequence: usize = 0, page: ?*Page = null };
+    const Job = struct {
+        lane: *Lane,
+        resolver: AssetResolver(@TypeOf(search)) = undefined,
+        sequence: usize = 0,
+        page: ?*Page = null,
+        // Document strings and projection shapes borrow this manifest.
+        manifest: ?*Page = null,
+        fn release(self: *@This(), a: A) void {
+            if (self.page) |page| page.deinit(a);
+            if (self.manifest) |page| page.deinit(a);
+            self.page = null;
+            self.manifest = null;
+        }
+    };
     // Finite evaluation budgets and early-selection modes retain discovery order.
     const parallel = search.options.media == .images and (!budgeted_decisions or !search.options.max_requests_explicit) and
         search.options.max_regions == std.math.maxInt(usize) and search.options.max_source_bytes == std.math.maxInt(usize) and
@@ -204,10 +509,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 self.failed = true;
                 self.root.limits.cancel.store(true, .release);
             }
-            defer if (job.page) |page| {
-                page.deinit(self.root.a);
-                job.page = null;
-            };
+            defer job.release(self.root.a);
             for (&self.completed) |*slot| if (slot.* == null) {
                 slot.* = .{ .sequence = job.sequence, .result = try job.lane.take(self.root) };
                 try self.emit();
@@ -253,9 +555,16 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 self.pool.waitForCompletion();
             }
         }
+        fn pendingRequestBound(self: *@This()) usize {
+            var pending_work: usize = 0;
+            for (self.jobs[0..self.initialized]) |job| if (job.lane.handle != null) {
+                pending_work +|= job.lane.doc.evidence.len *| 8 *| (self.root.options.retries +| 1);
+            };
+            return pending_work;
+        }
         fn discard(self: *@This()) void {
-            // Page-scope cleanup must join borrowers here, before manifest
-            // arenas retire; the outer scheduler destructor is too late.
+            // Join all borrowers before releasing their independently owned
+            // manifest and asset pages, including partially launched jobs.
             for (self.jobs[0..self.initialized]) |*job| {
                 if (job.lane.handle != null) {
                     if (job.lane.take(self.root)) |value| {
@@ -263,10 +572,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                         result.deinit(self.root);
                     } else |_| {}
                 }
-                if (job.page) |page| {
-                    page.deinit(self.root.a);
-                    job.page = null;
-                }
+                job.release(self.root.a);
             }
             for (&self.completed) |*slot| if (slot.*) |*entry| {
                 entry.result.deinit(self.root);
@@ -301,7 +607,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                         } else |_| {}
                     }
                 } else job.lane.finish(self.root) catch {};
-                if (job.page) |page| page.deinit(self.root.a);
+                job.release(self.root.a);
                 job.lane.deinit(self.root);
             }
             for (&self.completed) |*slot| if (slot.*) |*entry| entry.result.deinit(self.root);
@@ -356,25 +662,24 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             state.deinit();
             state = fresh;
         }
-        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents and prefetchHeadroom(search, table, hits.array.items)) {
+        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents and prefetchHeadroom(search, table, hits.array.items, scheduler.pendingRequestBound())) {
             fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
             pending = true;
         }
-        var materialized: ?Materialized = null;
+        var materialized: ?MaterializationWindow = null;
         var window_end: usize = 0;
-        defer if (materialized) |group| group.page.deinit(search.a);
-        // Drain every borrowed page before its arena is released, including
-        // cancellation, projection failures and output-budget errors.
-        defer scheduler.finish() catch {};
+        defer if (materialized) |window| window.deinit(search.a);
+        // Active jobs retain their own pages, so discovery can advance while
+        // an earlier ordered result is pending. The scheduler bounds leases.
         for (hits.array.items, 0..) |hit, hit_index| {
             if (search.stopped()) return;
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
             if (lane_count > 1 and hit_index == window_end) {
                 _ = try scheduler.vacant(lane_count);
-                if (materialized) |group| group.page.deinit(search.a);
+                if (materialized) |window| window.deinit(search.a);
                 materialized = null;
                 window_end = @min(hits.array.items.len, hit_index + @min(lane_count, search.options.max_index_documents - count.*));
-                materialized = try prefetchAssets(search, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
+                materialized = try prefetchAssets(search, &pool, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
                 if (materialized) |group| window_end = hit_index + group.covered_hits;
             }
             if (search.stopped()) return;
@@ -382,17 +687,53 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             count.* += 1;
             const id = try document.string(hit, "_id");
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
-            const value = document.at(source, table.document_field) orelse return error.MissingGrepDocument;
+            const binary_inline = if (table.selected_stream) |stream| stream.artifact == null and document.at(source, stream.field) == null and document.at(source, "content.resource") != null else false;
+            if (table.selected_stream) |stream| if (stream.artifact) |expected| {
+                const actual = document.at(hit, "hierarchy.artifact.name") orelse return error.MissingArtifactIdentity;
+                if (actual != .string) return error.MissingArtifactIdentity;
+                if (!std.mem.eql(u8, actual.string, expected)) continue;
+            };
+            const value = if (table.fields) |fields| mapped: {
+                var parent = source;
+                if (table.selected_stream) |stream| if (stream.artifact != null) {
+                    parent = document.at(hit, "hierarchy.ancestors.source.document") orelse return error.MissingArtifactSource;
+                };
+                const content = if (metadataListing(search.options) or binary_inline) "" else if (table.selected_stream) |stream| try record_view.text(source, stream.field) else "";
+                break :mapped try record_view.view(a, parent, fields, content);
+            } else document.at(source, table.document_field) orelse return error.MissingGrepDocument;
             var doc = if (metadataListing(search.options))
                 try document.Document.parseListing(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
             else
                 try document.Document.parse(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
+            if (table.selected_stream) |stream| {
+                doc.provenance.purpose = stream.purpose;
+                doc.provenance.generated = stream.generated;
+                doc.provenance.text_field = stream.field;
+                doc.provenance.boundary = stream.boundary;
+                if (stream.artifact != null) {
+                    const hierarchy = document.field(hit, "hierarchy") orelse return error.MissingArtifactSource;
+                    doc.provenance.artifact_key = id;
+                    doc.provenance.artifact = document.field(hierarchy, "artifact");
+                    if (doc.provenance.artifact == null) return error.MissingArtifactIdentity;
+                    const revision = document.at(hierarchy, "artifact.revision") orelse return error.MissingArtifactRevision;
+                    if (revision != .string or revision.string.len == 0) return error.MissingArtifactRevision;
+                    doc.provenance.artifact_revision = revision.string;
+                    if (document.field(hierarchy, "parent_doc_key")) |parent| if (parent == .string) {
+                        doc.provenance.document_id = parent.string;
+                    };
+                    doc.provenance.location = document.at(source, stream.location_field orelse "provenance");
+                }
+            }
             if (search.options.cloud_session == null and !document.allowed(value, config.principals)) {
                 search.skipped();
                 continue;
             }
             if (!try discovery.indexedAllowed(doc.path)) {
                 search.skipped();
+                continue;
+            }
+            if (binary_inline) {
+                if (requiresNativeStreamCheck(search.options, table)) return error.NativeArtifactStreamRequired;
                 continue;
             }
             if (search.options.sourced()) {
@@ -406,6 +747,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                     identity.update(&length);
                     identity.update(part);
                 }
+                if (table.selected_stream) |stream| if (stream.artifact != null) {
+                    identity.update(stream.name);
+                    identity.update(id);
+                };
                 if (document.field(value, "evidence")) |units| identity.update(try std.json.Stringify.valueAlloc(a, units, .{}));
                 var key: [32]u8 = undefined;
                 identity.final(&key);
@@ -414,44 +759,31 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             // Scope evidence by the current authorized revision and endpoint.
             // Authorization is rechecked on every scan before any cached data
             // can be used; snapshots are deliberately not cache identities.
-            if (search.options.ask != null and !search.options.no_cache and search.options.cache_dir != null) {
-                var scope = std.crypto.hash.sha2.Sha256.init(.{});
-                const permissions = try std.json.Stringify.valueAlloc(a, document.field(value, "permissions").?, .{});
-                for ([_][]const u8{ config.endpoint, search.options.table_token orelse "", table.name, id, doc.provenance.uri.?, doc.provenance.revision.?, permissions }) |part| {
-                    var length: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &length, part.len, .little);
-                    scope.update(&length);
-                    scope.update(part);
-                }
-                for (config.principals) |principal| {
-                    var length: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &length, principal.len, .little);
-                    scope.update(&length);
-                    scope.update(principal);
-                }
-                var scope_digest: [32]u8 = undefined;
-                scope.final(&scope_digest);
-                doc.cache_scope = scope_digest;
-            }
-            var resolver: AssetResolver(@TypeOf(search)) = .{ .search = search, .http = http, .config = config, .table = table, .url = url, .id = id, .revision = doc.provenance.revision.?, .filter = user_filter };
+            doc.cache_scope = try sourceCacheScope(a, search.options, config, table, id, value);
+            var resolver: AssetResolver(@TypeOf(search)) = .{ .search = search, .http = http, .config = config, .table = table, .url = url, .id = id, .revision = doc.provenance.revision.?, .manifest = value, .path = doc.path, .filter = user_filter };
             if (search.options.media == .images) {
                 const units = document.field(value, "evidence");
                 if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
-                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .materialize_many = AssetResolver(@TypeOf(search)).materializeMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
             }
+            if (table.selected_stream) |stream| if (stream.artifact != null) {
+                doc.path = try std.fmt.allocPrint(a, "{s}::{s}{s}/{s}", .{ doc.path, stream.name, if (stream.generated) "[generated]" else "", id });
+            };
             if (lane_count > 1) {
                 const slot = try scheduler.vacant(lane_count);
                 const job = &scheduler.jobs[slot];
                 job.resolver = resolver;
-                job.resolver.materialized = materialized;
+                job.resolver.materialized = if (materialized) |window| window.find(id) else null;
                 job.resolver.wave_page = &job.page;
-                if (materialized) |group| {
+                if (job.resolver.materialized) |group| {
                     group.page.retain();
                     job.page = group.page;
                 }
                 job.sequence = scheduler.sequence;
+                loaded.retain();
+                job.manifest = loaded;
                 job.resolver.search = &job.lane.search;
-                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .materialize_many = AssetResolver(@TypeOf(search)).materializeMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
                 // Wave memory admission bounds active parents; the shared
                 // provider semaphore bounds nested batches across all lanes.
                 job.lane.search.decider.allow_parallel = true;
@@ -463,17 +795,20 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 scheduler.sequence += 1;
             } else search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
-        try scheduler.finish();
-        if (!has_next) return;
+        if (!has_next) {
+            try scheduler.finish();
+            return;
+        }
     }
+    try scheduler.finish();
 }
 /// Speculation must not steal the last request from the current image page.
-/// Bound complete field/provider split trees and every retry, not just batches
-/// expected to succeed. Text stages have no comparable finite structural bound.
-fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value) bool {
+/// Bound complete field/provider split trees and every retry for both the new
+/// page and older leased manifests, not just batches expected to succeed. Text stages have no comparable finite structural bound.
+fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value, pending_work: usize) bool {
     if (search.options.max_requests == std.math.maxInt(usize)) return true;
     if (search.options.max_requests_explicit or search.options.media != .images) return false;
-    var foreground: usize = 0;
+    var foreground: usize = pending_work;
     for (hits) |hit| {
         const source = document.field(hit, "_source") orelse return false;
         const value = document.at(source, table.document_field) orelse return false;
@@ -485,15 +820,97 @@ fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value)
     return foreground +| (search.options.retries +| 1) < remaining;
 }
 
-const Materialized = struct { page: *Page, fields: []const []const u8, covered_hits: usize };
+fn sourceCacheScope(a: A, options: *const @import("options.zig").Options, config: Config, table: Table, id: []const u8, value: std.json.Value) !?[32]u8 {
+    if (options.ask == null or options.no_cache or options.cache_dir == null) return null;
+    var scope = std.crypto.hash.sha2.Sha256.init(.{});
+    const permissions = try std.json.Stringify.valueAlloc(a, document.field(value, "permissions").?, .{});
+    for ([_][]const u8{ config.endpoint, options.table_token orelse "", table.name, id, try document.string(value, "uri"), try document.string(value, "revision"), permissions }) |part| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, part.len, .little);
+        scope.update(&length);
+        scope.update(part);
+    }
+    for (config.principals) |principal| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, principal.len, .little);
+        scope.update(&length);
+        scope.update(principal);
+    }
+    var scope_digest: [32]u8 = undefined;
+    scope.final(&scope_digest);
+    return scope_digest;
+}
 
-/// Group only equal projection shapes. Unioning unrelated per-parent fields
-/// would multiply payloads on every row and defeat the byte bound.
-fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: Table, url: []const u8, filter: ?std.json.Value, a: A, hits: []const std.json.Value, discovery: anytype) !?Materialized {
+/// Cache probes guide wire admission only. Current point reads still authorize
+/// and verify identities before any score or descriptor reaches result output.
+fn plannedRecords(search: anytype, a: A, config: Config, table: Table, id: []const u8, parent: std.json.Value, path: []const u8, units: []const @import("antfly_source_evidence").Unit) ![16]?descriptors.Record {
+    var out: [16]?descriptors.Record = @splat(null);
+    if (search.options.indexed_media_transport == .source or search.options.ask == null or search.options.model == null or !descriptors.enabled(search.options) or (search.shared_limits orelse &search.limits).select_unsupported.load(.acquire)) return out;
+    var arena = std.heap.ArenaAllocator.init(search.a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const media = @import("antfly_source_evidence");
+    var records: [16]?descriptors.Record = @splat(null);
+    var any = false;
+    for (units, 0..) |unit, i| {
+        records[i] = descriptors.load(temp, search.io, search.options, .{ .endpoint = config.endpoint, .token = search.options.table_token orelse "", .table = table.name, .id = id }, unit);
+        any = any or records[i] != null;
+    }
+    if (!any) return out;
+    const decision = @import("decision.zig");
+    var probe = decision.Client.init(search.a, search.io, search.options);
+    defer probe.deinit();
+    probe.shareCache(&search.decider);
+    probe.cache_scope = try sourceCacheScope(temp, search.options, config, table, id, parent);
+    var inputs: [16]decision.Input = undefined;
+    var scores: [16]f64 = undefined;
+    for (units, 0..) |unit, i| {
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, unit.asset.sha256);
+        const image: media.Image = .{ .data_url = "", .sha256 = digest, .mime_type = unit.asset.mime_type, .width = 0, .height = 0, .bytes = unit.asset.byte_length };
+        inputs[i] = try decision.visualInput(temp, path, unit, image);
+    }
+    try probe.probeScores(temp, inputs[0..units.len], scores[0..units.len]);
+    for (records[0..units.len], scores[0..units.len], 0..) |record, score, i| if (record != null and std.math.isFinite(score)) {
+        var retained = record.?;
+        retained.identity = try a.dupe(u8, retained.identity);
+        retained.mime_type = try a.dupe(u8, retained.mime_type);
+        out[i] = retained;
+    };
+    return out;
+}
+
+const PlannedParent = struct { id: []const u8, records: []const ?descriptors.Record };
+const Materialized = struct { page: *Page, fields: []const []const u8, covered_hits: usize, records: []const PlannedParent };
+const MaterializationWindow = struct {
+    groups: []const Materialized,
+    covered_hits: usize,
+    fn find(self: @This(), id: []const u8) ?Materialized {
+        for (self.groups) |group| for (group.records) |parent| {
+            if (std.mem.eql(u8, parent.id, id)) return group;
+        };
+        return null;
+    }
+    fn deinit(self: @This(), a: A) void {
+        for (self.groups) |group| group.page.deinit(a);
+    }
+};
+
+/// Bucket equal projection shapes within one bounded discovery window, rather
+/// than stopping at the first alternating shape. Never union unrelated fields:
+/// a sparse/wide collection must not multiply payloads across every parent.
+fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http: *httpx.Client, config: Config, table: Table, url: []const u8, filter: ?std.json.Value, a: A, hits: []const std.json.Value, discovery: anytype) !?MaterializationWindow {
     const media = @import("antfly_source_evidence");
     if (search.options.max_count == 0 or search.options.max_regions_per_file == 0) return null;
-    var ids: std.ArrayList([]const u8) = .empty;
-    var shape: std.ArrayList([]const u8) = .empty;
+    if (hits.len > 8) return error.InvalidIndexResponse;
+    const Plan = struct {
+        shape: []const []const u8,
+        ids: std.ArrayList([]const u8) = .empty,
+        parents: std.ArrayList(PlannedParent) = .empty,
+        estimated: usize = 0,
+    };
+    var plans: [8]Plan = undefined;
+    var plan_count: usize = 0;
     var estimated: usize = 0;
     var covered_hits = hits.len;
     for (hits, 0..) |hit, hit_index| {
@@ -508,7 +925,7 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
         if (raw != .array or raw.array.items.len > media.max_units) return null;
         if (raw.array.items.len == 0) continue;
         var fields: std.ArrayList([]const u8) = .empty;
-        var bytes: usize = 65536;
+        var selected: [16]media.Unit = undefined;
         var wave_bytes: usize = 0;
         var wave: usize = 0;
         const width = @min(raw.array.items.len, @min(@as(usize, 16), @min(search.options.decisionBatchSize() *| search.options.providerJobs(), @min(search.options.max_count, search.options.max_regions_per_file))));
@@ -522,20 +939,33 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
             wave_bytes +|= cost;
             // Projection transfer and decoded/provider scratch are separate
             // stages. Do not multiply HTTP requests by charging both here.
-            bytes +|= unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| path.len *| 8 +| 65536;
+            selected[wave] = unit;
             wave += 1;
             const present = for (fields.items) |field| {
                 if (std.mem.eql(u8, field, unit.asset.field)) break true;
             } else false;
             if (!present) try fields.append(a, unit.asset.field);
         }
-        if (ids.items.len == 0) try shape.appendSlice(a, fields.items) else {
-            const equal = if (shape.items.len == fields.items.len) for (shape.items, fields.items) |old, current| {
-                if (!std.mem.eql(u8, old, current)) break false;
-            } else true else false;
-            if (!equal) {
-                covered_hits = hit_index;
-                break;
+        std.mem.sort([]const u8, fields.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        const records = try plannedRecords(search, a, config, table, id, value, path, selected[0..wave]);
+        var bytes: usize = 65536;
+        for (selected[0..wave], records[0..wave]) |unit, expected| {
+            bytes +|= if (expected != null or search.options.indexed_media_transport == .source) @as(usize, 256) else unit.asset.byte_length *| 2;
+        }
+        const field_records = try a.alloc(?descriptors.Record, fields.items.len);
+        for (fields.items, field_records) |field, *record| {
+            record.* = null;
+            for (selected[0..wave], records[0..wave]) |unit, expected| {
+                if (!std.mem.eql(u8, field, unit.asset.field)) continue;
+                if (expected == null) {
+                    record.* = null;
+                    break;
+                }
+                record.* = expected;
             }
         }
         if (bytes > @min(@as(usize, 8 * 1024 * 1024), config.max_response_bytes) -| estimated) {
@@ -543,21 +973,134 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
             break;
         }
         estimated +|= bytes;
-        try ids.append(a, id);
+        const slot = for (plans[0..plan_count], 0..) |plan, i| {
+            const equal = if (plan.shape.len == fields.items.len) for (plan.shape, fields.items) |left, right| {
+                if (!std.mem.eql(u8, left, right)) break false;
+            } else true else false;
+            if (equal) break i;
+        } else new: {
+            plans[plan_count] = .{ .shape = fields.items };
+            plan_count += 1;
+            break :new plan_count - 1;
+        };
+        plans[slot].estimated +|= bytes;
+        try plans[slot].ids.append(a, id);
+        try plans[slot].parents.append(a, .{ .id = id, .records = field_records });
     }
-    if (ids.items.len < 2) return null;
-    var fields: std.ArrayList([]const u8) = .empty;
-    try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{table.document_field}));
-    try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
-    try fields.appendSlice(a, shape.items);
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
-    var fetch: Fetch = .{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
-    defer search.summary.index_requests += fetch.summary.index_requests;
-    const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
-        error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
-        else => return err,
+    const GroupFetch = struct {
+        fetch: Fetch,
+        size: usize,
+        shape: []const []const u8,
+        parents: []const PlannedParent,
+        page: ?*Page = null,
+        failure: ?anyerror = null,
+        handle: ?@import("worker_pool.zig").Handle = null,
+        fn run(self: *@This()) void {
+            self.page = self.fetch.load(.{ .cursor = null, .snapshot = null, .page_size = self.size }) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+        fn join(self: *@This()) void {
+            if (self.handle) |handle| handle.join();
+            self.handle = null;
+        }
     };
-    return .{ .page = page, .fields = shape.items, .covered_hits = covered_hits };
+    var jobs: [8]GroupFetch = undefined;
+    var started: usize = 0;
+    defer for (jobs[0..started]) |*job| {
+        job.join();
+        search.summary.index_requests += job.fetch.summary.index_requests;
+        if (job.page) |page| page.deinit(search.a);
+    };
+    var group_count: usize = 0;
+    var total_estimated: usize = 0;
+    for (plans[0..plan_count]) |plan| if (plan.ids.items.len >= 2) {
+        group_count += 1;
+        total_estimated +|= plan.estimated;
+    };
+    for (plans[0..plan_count]) |plan| {
+        // Singletons use the normal point loader, avoiding speculative work.
+        if (plan.ids.items.len < 2) continue;
+        // Reserve proportional page budgets BEFORE dispatch. Concurrent groups
+        // cannot each spend the whole page budget; skewed shapes retain a fair
+        // share by estimated transfer size. Rounding only reduces the total.
+        var group_config = config;
+        group_config.max_page_memory = @intCast((@as(u128, config.max_page_memory) * plan.estimated) / total_estimated);
+        group_config.max_response_bytes = @min(group_config.max_response_bytes, group_config.max_page_memory);
+        if (group_config.max_page_memory == 0) continue;
+        const ids = plan.ids;
+        const shape = plan.shape;
+        const planned = plan.parents;
+        var fields: std.ArrayList([]const u8) = .empty;
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{table.document_field}));
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
+        try fields.appendSlice(a, shape);
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
+        var projected: std.ArrayList(MediaField) = .empty;
+        for (shape, 0..) |field, i| {
+            var conditions: std.ArrayList(CachedIdentity) = .empty;
+            for (planned.items) |parent| if (parent.records[i]) |record| {
+                try conditions.append(a, .{ .id = parent.id, .identity = record.identity });
+            };
+            try projected.append(a, .{ .field = field, .mode = if (search.options.indexed_media_transport == .source) .identity else null, .if_match = conditions.items });
+        }
+        const job = &jobs[started];
+        job.* = .{
+            .fetch = .{ .table = table, .valid_until = table.valid_until, .source_id = table.source_id, .access_id = table.access_id, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = group_config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .media_selection = if (search.options.indexed_media_transport == .source or descriptors.enabled(search.options)) .{ .fields = projected.items } else null },
+            .size = ids.items.len,
+            .shape = shape,
+            .parents = planned.items,
+        };
+        started += 1;
+        if (group_count == 1) {
+            job.run();
+        } else job.handle = pool.launch(GroupFetch.run, job) catch fallback: {
+            job.run();
+            break :fallback null;
+        };
+    }
+    var groups: std.ArrayList(Materialized) = .empty;
+    errdefer for (groups.items) |group| group.page.deinit(search.a);
+    for (jobs[0..started]) |*job| {
+        job.join();
+        if (job.failure) |err| switch (err) {
+            error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => continue,
+            else => return err,
+        };
+        const page = job.page orelse return error.InvalidIndexResponse;
+        try groups.append(a, .{ .page = page, .fields = job.shape, .covered_hits = covered_hits, .records = job.parents });
+        job.page = null;
+    }
+    if (groups.items.len == 0) return null;
+    return .{ .groups = groups.items, .covered_hits = covered_hits };
+}
+
+/// Stable internal aliases keep source paths separate from computed names.
+fn mediaAlias(a: A, path: []const u8, suffix: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+    return std.fmt.allocPrint(a, "media_{s}_{s}", .{ std.fmt.bytesToHex(digest[0..8].*, .lower), suffix });
+}
+fn mediaSelect(a: A, media: MediaSelection) !std.json.Value {
+    const V = std.json.Value;
+    var selected: std.json.ObjectMap = .empty;
+    for (media.fields) |field| {
+        const path = try std.json.Stringify.valueAlloc(a, field.field, .{});
+        const identity_name = try mediaAlias(a, field.field, "identity");
+        const identity_ref = try std.json.Stringify.valueAlloc(a, identity_name, .{});
+        try selected.put(a, identity_name, try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"call\":\"value_identity\",\"args\":[{{\"field\":{s}}}]}}", .{path}), .{}));
+        try selected.put(a, try mediaAlias(a, field.field, "missing"), try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"call\":\"is_missing\",\"args\":[{{\"field\":{s}}}]}}", .{path}), .{}));
+        if (field.mode != null) continue;
+        var known: std.json.ObjectMap = .empty;
+        for (field.if_match) |condition| try known.put(a, condition.id, .{ .string = condition.identity });
+        const known_json = try std.json.Stringify.valueAlloc(a, V{ .object = known }, .{});
+        const changed_name = try mediaAlias(a, field.field, "changed");
+        try selected.put(a, changed_name, try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"is_distinct_from\":[{{\"ref\":{s}}},{{\"call\":\"jsonb_extract_path_text\",\"args\":[{{\"literal\":{s}}},{{\"field\":\"_id\"}}]}}]}}", .{ identity_ref, known_json }), .{}));
+        const changed_ref = try std.json.Stringify.valueAlloc(a, changed_name, .{});
+        try selected.put(a, try mediaAlias(a, field.field, "value"), try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"case\":[{{\"when\":{{\"ref\":{s}}},\"then\":{{\"field\":{s}}}}}],\"else\":{{\"literal\":null}}}}", .{ changed_ref, path }), .{}));
+    }
+    return .{ .object = selected };
 }
 
 const Page = struct {
@@ -595,6 +1138,8 @@ const Fetch = struct {
     text_query: ?std.json.Value = null,
     fields: []const []const u8,
     ordered: bool = true,
+    artifact_parents: ?[]const []const u8 = null,
+    media_selection: ?MediaSelection = null,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
     cancel: std.atomic.Value(bool) = .init(false),
@@ -688,7 +1233,20 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const conditional = self.media_selection != null and !self.limits.select_unsupported.load(.acquire);
+            const selected = if (conditional) try mediaSelect(a, self.media_selection.?) else null;
+            var source_fields: std.ArrayList([]const u8) = .empty;
+            for (self.fields) |field| {
+                const computed = if (conditional) for (self.media_selection.?.fields) |image| {
+                    if (std.mem.eql(u8, field, image.field)) break true;
+                } else false else false;
+                if (!computed) try source_fields.append(a, field);
+            }
+            const artifact = if (self.table.selected_stream) |stream| stream.artifact != null else false;
+            const full_text_index = if (self.table.selected_stream) |stream| stream.index else null;
+            const root_text = if (self.table.selected_stream) |stream| artifact and std.mem.eql(u8, stream.field, "$") else false;
+            const hierarchy = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .ancestors = .{ .source = .{ .fields = try record_view.parentFields(a, self.table.fields.?) } } }, .{}), .{}) else null;
+            const body = if (self.artifact_parents) |parents| try std.json.Stringify.valueAlloc(a, .{ .hierarchy = .{ .children = .{ .parent = .{ .level = "source", .ids = parents }, .level = "member", .artifact = self.table.selected_stream.?.artifact.? } }, .fields = if (root_text) @as(?[]const []const u8, null) else source_fields.items, .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_hierarchy.position", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false }) else try std.json.Stringify.valueAlloc(a, .{ .full_text_index = full_text_index, .hierarchy = hierarchy, .full_text_search = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}) else null, .select = selected, .query = if (artifact) @as(?std.json.Value, null) else self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = if (root_text) @as(?[]const []const u8, null) else source_fields.items, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             var refreshed = false;
             var attempt: usize = 0;
             const parsed = retry: while (true) {
@@ -701,7 +1259,7 @@ const Fetch = struct {
                 var headers: std.ArrayList([2][]const u8) = .empty;
                 try headers.append(a, .{ "Content-Type", "application/json" });
                 if (auth) |value| try headers.append(a, .{ "Authorization", value });
-                if (self.options.sourced()) {
+                if (self.source_id != null) {
                     if (self.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
                     const proof = if (self.options.cloud_session) |session| (if (self.source_id) |id| session.sourceProof(id) else null) else self.access_id;
                     if (proof) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });
@@ -722,6 +1280,12 @@ const Fetch = struct {
                 var transferred = false;
                 defer if (!transferred) response.deinit();
                 const status = response.status.code;
+                if ((status == 400 or status == 422) and conditional) {
+                    // Older servers may reject unsupported expressions. Retry
+                    // ordinary source fields once without changing filters.
+                    self.limits.select_unsupported.store(true, .release);
+                    continue :resize;
+                }
                 if (status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
@@ -772,6 +1336,25 @@ const Fetch = struct {
                 const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
                 if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
                 const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
+                if ((result_status == 400 or result_status == 422) and conditional) {
+                    self.limits.select_unsupported.store(true, .release);
+                    continue :resize;
+                }
+                if (conditional and result_status >= 200 and result_status < 300) {
+                    const rows = document.at(envelope.array.items[0], "hits.hits");
+                    if (rows) |list| if (list == .array) for (list.array.items) |hit| {
+                        const computed = document.field(hit, "_computed");
+                        const complete = if (computed) |map| for (selected.?.object.keys()) |alias| {
+                            if (document.field(map, alias) == null) break false;
+                        } else true else false;
+                        if (!complete) {
+                            // Some older servers ignore unknown request members.
+                            // Never interpret absent CASE output as a cache hit.
+                            self.limits.select_unsupported.store(true, .release);
+                            continue :resize;
+                        }
+                    };
+                }
                 if (result_status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (result_status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
@@ -814,11 +1397,15 @@ fn backoff(search: anytype, attempt: usize, requested: u64) !void {
 /// Representation selection and exact containment verification belong to Antfly.
 /// The complete CLI matcher still owns final grep/PCRE semantics.
 fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
+    if (table.selected_stream) |stream| if (stream.artifact != null) return null;
     if (!canPrune(search.options)) return null;
     const literals = (try search.matcher.requiredLiterals(a)) orelse return null;
     if (literals.len == 0) return null;
-    const field = try std.fmt.allocPrint(a, "{s}.content", .{table.document_field});
+    const field = if (table.selected_stream) |stream| stream.field else try std.fmt.allocPrint(a, "{s}.content", .{table.document_field});
     var alternatives: std.ArrayList(std.json.Value) = .empty;
+    // Do not let necessary text literals hide unbound binary originals. Their
+    // metadata must reach the same ACL/path checks and completeness guard.
+    if (requiresNativeStreamCheck(search.options, table)) try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"equals\":\"source\",\"field\":\"content.resource.type\"}", .{}));
     for (literals) |literal| {
         const encoded = try std.json.Stringify.valueAlloc(a, .{ .contains = literal, .field = field, .case_sensitive = true }, .{});
         try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
@@ -829,15 +1416,19 @@ fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
 fn canPrune(o: *const @import("options.zig").Options) bool {
     return o.media == .text and !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));
 }
-fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
-    const index = table.candidate_index orelse return user_filter;
+fn candidateQuery(a: A, search: anytype, table: Table) !?std.json.Value {
+    if (table.selected_stream) |stream| if (stream.artifact != null) return null;
+    const index = table.candidate_index orelse return null;
     const o = search.options;
-    if (!canPrune(o)) return user_filter;
-    const literals = (try search.matcher.requiredLiterals(a)) orelse return user_filter;
+    if (!canPrune(o)) return null;
+    const literals = (try search.matcher.requiredLiterals(a)) orelse return null;
     var grams: std.ArrayList(std.json.Value) = .empty;
     const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .term = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
     const certificate = (try std.json.parseFromSlice(std.json.Value, a, certificate_bytes, .{ .allocate = .alloc_always })).value;
     var alternatives: std.ArrayList(std.json.Value) = .empty;
+    // A text certificate never certifies the availability of binary extraction.
+    // Preserve its completeness check while retaining trigram pruning for text.
+    if (requiresNativeStreamCheck(search.options, table)) try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"equals\":\"source\",\"field\":\"content.resource.type\"}", .{}));
     for (literals) |literal| {
         grams.clearRetainingCapacity();
         const n = @min(@as(usize, 8), literal.len - 2);
@@ -867,17 +1458,41 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
     // This permits incremental backfills without dropping legacy revisions.
     const candidates_bytes = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = .{
         .{ .conjuncts = .{ certificate, union_value } },
-        .{ .must_not = .{ .disjuncts = .{certificate} } },
+        .{ .bool = .{ .must_not = .{certificate} } },
     } }, .{});
-    const candidates = (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;
-    if (user_filter == null) return candidates;
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ user_filter.?, candidates } }, .{});
-    return (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).value;
+    return (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;
+}
+
+fn requiresNativeStreamCheck(o: *const @import("options.zig").Options, table: Table) bool {
+    const stream = table.selected_stream orelse return false;
+    if (table.fields == null or stream.artifact != null or o.artifacts.items.len != 0) return false;
+    // Unselected declarations cannot establish coverage of binary originals.
+    for (table.streams) |candidate| {
+        if (candidate.artifact != null and record_view.selected(candidate, o.artifacts.items, o.all_artifacts)) return false;
+    }
+    return true;
 }
 
 fn metadataListing(o: *const @import("options.zig").Options) bool {
     return o.media == .images or (o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize);
 }
+fn tableProjectionFields(a: A, o: *const @import("options.zig").Options, table: Table) ![]const []const u8 {
+    const fields = table.fields orelse return projectionFields(a, o, table.document_field);
+    if (table.selected_stream) |stream| if (stream.artifact != null) {
+        var result: std.ArrayList([]const u8) = .empty;
+        try result.append(a, stream.field);
+        try result.append(a, stream.location_field orelse "provenance");
+        return result.toOwnedSlice(a);
+    };
+    var result: std.ArrayList([]const u8) = .empty;
+    try result.appendSlice(a, try record_view.parentFields(a, fields));
+    if (!metadataListing(o)) if (table.selected_stream) |stream| {
+        try result.append(a, stream.field);
+        try result.append(a, "content.resource.type");
+    };
+    return result.toOwnedSlice(a);
+}
+
 fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []const u8) ![]const []const u8 {
     // Project the complete v1 contract, not arbitrary sibling payloads. Keep
     // all logical input/validation/provenance fields for JSON and decision
@@ -951,10 +1566,24 @@ fn AssetResolver(comptime SearchType: type) type {
         url: []const u8,
         id: []const u8,
         revision: []const u8,
+        manifest: std.json.Value,
+        path: []const u8,
         filter: ?std.json.Value,
         materialized: ?Materialized = null,
         wave_page: ?*?*Page = null,
-        point_pages: [16]?*Page = @splat(null),
+        point_pages: [32]?*Page = @splat(null),
+        force_full: bool = false,
+        fn descriptorContext(self: *@This()) descriptors.Context {
+            return .{ .endpoint = self.config.endpoint, .token = self.search.options.table_token orelse "", .table = self.table.name, .id = self.id };
+        }
+        fn materializeMany(raw: *anyopaque, a: A, units: []const media.Unit, output: []media.Loaded) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.force_full;
+            self.force_full = true;
+            defer self.force_full = previous;
+            self.materialized = null;
+            try loadMany(raw, a, units, output);
+        }
         fn releaseWave(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             for (&self.point_pages) |*slot| if (slot.*) |page| {
@@ -983,6 +1612,12 @@ fn AssetResolver(comptime SearchType: type) type {
             std.debug.assert(units.len == output.len and units.len <= 16);
             if (self.search.stopped()) return error.Canceled;
             loadGroup(self, a, units, output) catch |err| {
+                // A racing cache eviction is an ordinary full-value fallback.
+                // Do not retire sibling pages during a recursively split load.
+                if (err == error.ImageMaterializationRequired and !self.force_full) {
+                    try materializeMany(raw, a, units, output);
+                    return;
+                }
                 const distinct_fields = for (units[1..]) |unit| {
                     if (!std.mem.eql(u8, unit.asset.field, units[0].asset.field)) break true;
                 } else false;
@@ -1019,19 +1654,39 @@ fn AssetResolver(comptime SearchType: type) type {
             }
             if (fields.items.len == 2) return;
             const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
-            var fetch: Fetch = .{ .table = self.table, .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .access_id = self.table.access_id, .source_id = self.table.source_id, .valid_until = self.table.valid_until, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
-            defer self.search.summary.index_requests += fetch.summary.index_requests;
-            // Point reads deliberately omit ordering/cursors. They reauthorize
-            // current rows without creating a durable pagination snapshot.
             const borrowed = if (self.materialized) |group| blk: {
                 for (fields.items[2..]) |field| {
-                    const present = for (group.fields) |projected| {
-                        if (std.mem.eql(u8, field, projected)) break true;
+                    const present = for (group.fields) |projected_field| {
+                        if (std.mem.eql(u8, field, projected_field)) break true;
                     } else false;
                     if (!present) break :blk false;
                 }
                 break :blk true;
             } else false;
+            var projected: std.ArrayList(MediaField) = .empty;
+            const records = if (!self.force_full and !borrowed) try plannedRecords(self.search, a, self.config, self.table, self.id, self.manifest, self.path, units) else @as([16]?descriptors.Record, @splat(null));
+            for (fields.items[2..]) |field| {
+                var expected: ?[]const u8 = null;
+                for (units, records[0..units.len]) |unit, record| {
+                    if (!std.mem.eql(u8, unit.asset.field, field)) continue;
+                    if (record == null) {
+                        expected = null;
+                        break;
+                    }
+                    expected = record.?.identity;
+                }
+                var conditions: []const CachedIdentity = &.{};
+                if (expected) |identity| {
+                    const condition = try a.create(CachedIdentity);
+                    condition.* = .{ .id = self.id, .identity = identity };
+                    conditions = @as(*[1]CachedIdentity, @ptrCast(condition));
+                }
+                try projected.append(a, .{ .field = field, .mode = if (self.search.options.indexed_media_transport == .source) .identity else null, .if_match = conditions });
+            }
+            var fetch: Fetch = .{ .table = self.table, .valid_until = self.table.valid_until, .source_id = self.table.source_id, .access_id = self.table.access_id, .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false, .media_selection = if (self.search.options.indexed_media_transport == .source or descriptors.enabled(self.search.options)) .{ .fields = projected.items } else null };
+            defer self.search.summary.index_requests += fetch.summary.index_requests;
+            // Point reads deliberately omit ordering/cursors. They reauthorize
+            // current rows without creating a durable pagination snapshot.
             const page = if (borrowed) self.materialized.?.page else try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
             var transferred = false;
             defer if (!borrowed and !transferred) page.deinit(self.search.a);
@@ -1072,7 +1727,52 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .image = image };
                     continue;
                 }
-                const payload = document.at(source, unit.asset.field) orelse continue;
+                const projection = document.field(hit, "_computed");
+                const alias = try mediaAlias(a, unit.asset.field, "identity");
+                const actual_identity = if (projection) |map| document.field(map, alias) else null;
+                const identity = if (actual_identity) |value| if (value == .string) value.string else "" else "";
+                const missing = if (projection) |map| document.field(map, try mediaAlias(a, unit.asset.field, "missing")) else null;
+                const changed = if (projection) |map| document.field(map, try mediaAlias(a, unit.asset.field, "changed")) else null;
+                const state_name: []const u8 = if (missing != null and missing.? == .bool and missing.?.bool) "missing" else if (self.search.options.indexed_media_transport == .source and actual_identity != null) "reference" else if (changed != null and changed.? == .bool) (if (changed.?.bool) "value" else "unchanged") else "";
+                if (self.search.options.indexed_media_transport == .source) {
+                    if (std.mem.eql(u8, state_name, "missing")) continue;
+                    if (!std.mem.eql(u8, state_name, "reference") or !descriptors.validIdentity(identity) or document.at(source, unit.asset.field) != null) return error.InvalidEvidenceIdentity;
+                    var digest: [32]u8 = undefined;
+                    _ = try std.fmt.hexToBytes(&digest, unit.asset.sha256);
+                    item.* = .{ .image = .{ .data_url = "", .sha256 = digest, .mime_type = unit.asset.mime_type, .bytes = unit.asset.byte_length, .width = 0, .height = 0, .table_source = .{
+                        .table = self.table.name,
+                        .document_id = self.id,
+                        .field = unit.asset.field,
+                        .revision_field = try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}),
+                        .revision = self.revision,
+                        .permissions_field = try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}),
+                        .principals = self.config.principals,
+                        .filter_query = self.filter,
+                        .identity = identity,
+                        .sha256 = unit.asset.sha256,
+                        .mime_type = unit.asset.mime_type,
+                        .byte_length = unit.asset.byte_length,
+                        .max_pixels = self.search.options.max_image_pixels,
+                    } } };
+                    continue;
+                }
+                if (std.mem.eql(u8, state_name, "unchanged")) {
+                    if (self.force_full or !descriptors.validIdentity(identity) or document.at(source, unit.asset.field) != null) return error.InvalidEvidenceIdentity;
+                    const retained = if (borrowed) retained: {
+                        const group = self.materialized.?;
+                        for (group.records) |parent_plan| {
+                            if (!std.mem.eql(u8, parent_plan.id, self.id)) continue;
+                            for (group.fields, parent_plan.records) |field, record| if (std.mem.eql(u8, field, unit.asset.field)) break :retained record;
+                        }
+                        break :retained null;
+                    } else records[i];
+                    const record = retained orelse return error.ImageMaterializationRequired;
+                    if (!descriptors.matches(self.search.options, unit, record) or !std.mem.eql(u8, identity, record.identity)) return error.InvalidEvidenceIdentity;
+                    item.* = .{ .image = record.image() };
+                    continue;
+                }
+                if (projection == null) (self.search.shared_limits orelse &self.search.limits).select_unsupported.store(true, .release);
+                const payload = if (projection) |map| document.field(map, try mediaAlias(a, unit.asset.field, "value")) orelse document.at(source, unit.asset.field) orelse continue else document.at(source, unit.asset.field) orelse continue;
                 if (payload != .string) {
                     item.* = .{ .failed = error.InvalidEvidenceAsset };
                     continue;
@@ -1081,6 +1781,8 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .failed = err };
                     continue;
                 };
+                if (std.mem.eql(u8, state_name, "value") and descriptors.validIdentity(identity))
+                    descriptors.store(a, self.search.io, self.search.options, self.descriptorContext(), unit, image, identity);
                 // Both grouped and split point responses are pinned through
                 // the wave; no second base64 URL allocation is needed.
                 item.* = .{ .image = image };

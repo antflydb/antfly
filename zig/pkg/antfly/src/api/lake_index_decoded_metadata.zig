@@ -86,9 +86,13 @@ pub fn acquireInterpreted(comptime T: type, cached: artifacts.CachedRead, store:
 pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T) !Owned(T) {
     return acquireInterpretedBoundedInner(T, cached, store, ref, cancellation, interpretation, arguments, load, limit, fallback, null);
 }
-fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
-    try cached.context.ensureActive();
-    try cancellation.check();
+/// Successful required values share immutable identity across admission limits.
+/// A reader still checks the retained footprint against its own allowance;
+/// failed loads are not published and cannot poison a wider reader's retry.
+pub fn acquireRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize) !Owned(T) {
+    return acquireInterpretedBoundedInner(T, cached, store, ref, cancellation, interpretation, arguments, load, limit, null, error.SqlMemoryLimitExceeded);
+}
+fn interpretedKey(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef, interpretation: []const u8, limit: ?usize) ![32]u8 {
     var key = try cacheKey(T, cached, ref);
     if (interpretation.len != 0) {
         var hash = std.crypto.hash.Blake3.init(.{});
@@ -96,14 +100,32 @@ fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead
         hash.update(interpretation);
         hash.final(&key);
     }
-    if (fallback != null or decline_error != null) {
+    if (limit) |bounded| {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&key);
         var encoded_limit: [8]u8 = undefined;
-        std.mem.writeInt(u64, &encoded_limit, limit, .little);
+        std.mem.writeInt(u64, &encoded_limit, bounded, .little);
         hash.update(&encoded_limit);
         hash.final(&key);
     }
+    return key;
+}
+pub fn lookupRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, limit: usize) !?Owned(T) {
+    try token.check();
+    try cached.context.ensureActive();
+    const held = cached.cache.decoded.lookup(try interpretedKey(T, cached, ref, interpretation, null)) orelse return null;
+    errdefer held.release();
+    try token.check();
+    try cached.context.ensureActive();
+    if (held.item.budget.live > limit) return error.SqlMemoryLimitExceeded;
+    return .{ .lease = held, .value = @ptrCast(@alignCast(held.item.payload.extension)) };
+}
+fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
+    try cached.context.ensureActive();
+    try cancellation.check();
+    // Optional size-decline values depend on policy. Required successful
+    // interpretations do not: only their immutable content belongs in the key.
+    const key = try interpretedKey(T, cached, ref, interpretation, if (fallback != null) limit else null);
     var loader = struct {
         store: stores.ArtifactStore,
         ref: local.serverless_manifest_artifact_ref.ArtifactRef,
@@ -145,6 +167,9 @@ fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead
     var context = cached.context;
     context.checkpoint = .{ .ptr = &check, .check = Check.check };
     const lease = try cached.cache.decoded.acquire(key, limit, context, .{ .ptr = &loader, .load = @TypeOf(loader).decode });
+    errdefer lease.release();
+    try Check.check(&check);
+    if (decline_error != null and lease.item.budget.live > limit) return decline_error.?;
     return .{ .lease = lease, .value = @ptrCast(@alignCast(lease.item.payload.extension)) };
 }
 
@@ -325,4 +350,44 @@ test "external lake decoded metadata remembers local interpretation size decline
     Transient.calls = 0;
     for (0..2) |_| try std.testing.expectError(error.OutOfMemory, acquireInterpretedBounded(Value, cached, undefined, ref, .none, "transient-failure", {}, Transient.load, 4096, .{}));
     try std.testing.expectEqual(@as(usize, 2), Transient.calls);
+}
+
+test "external lake bounded window profiles required decoded interpretations reuse across limits without weakening admission" {
+    const a = std.testing.allocator;
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const Value = struct { bytes: []const u8 };
+    const Loader = struct {
+        fn load(alloc: std.mem.Allocator, _: stores.ArtifactStore, _: local.serverless_manifest_artifact_ref.ArtifactRef, _: @import("antfly_cancellation").CancellationToken, _: artifacts.CachedRead, calls: *usize) !Value {
+            calls.* += 1;
+            const bytes = try alloc.alloc(u8, 32 * 1024);
+            @memset(bytes, 'v');
+            return .{ .bytes = bytes };
+        }
+    };
+    const scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    const checksum = std.fmt.bytesToHex(@as([32]u8, @splat(3)), .lower);
+    const id = try scope.artifactId(&checksum);
+    const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .ordered_row_index, .artifact_id = &id, .checksum = &checksum, .byte_len = 8 };
+    var cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+    var calls: usize = 0;
+    const first = try acquireRequiredInterpretedBounded(Value, cached, undefined, ref, .none, "stripe", &calls, Loader.load, 256 * 1024);
+    defer first.release();
+    const second = try acquireRequiredInterpretedBounded(Value, cached, undefined, ref, .none, "stripe", &calls, Loader.load, 128 * 1024);
+    defer second.release();
+    const looked_up = (try lookupRequiredInterpretedBounded(Value, cached, ref, .none, "stripe", 512 * 1024)).?;
+    defer looked_up.release();
+    try std.testing.expect(first.value == second.value and first.value == looked_up.value);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectError(error.SqlMemoryLimitExceeded, lookupRequiredInterpretedBounded(Value, cached, ref, .none, "stripe", 256));
+    try std.testing.expectError(error.SqlMemoryLimitExceeded, acquireRequiredInterpretedBounded(Value, cached, undefined, ref, .none, "stripe", &calls, Loader.load, 256));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    // A failed cold policy is not a cached value or a failure for wider readers.
+    try std.testing.expectError(error.SqlMemoryLimitExceeded, acquireRequiredInterpretedBounded(Value, cached, undefined, ref, .none, "cold", &calls, Loader.load, 256));
+    const retry = try acquireRequiredInterpretedBounded(Value, cached, undefined, ref, .none, "cold", &calls, Loader.load, 128 * 1024);
+    defer retry.release();
+    try std.testing.expectEqual(@as(usize, 3), calls);
+    cached.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, lookupRequiredInterpretedBounded(Value, cached, ref, .none, "stripe", 512 * 1024));
+    std.debug.print("DECODED_POLICY limits=3 successful_decodes=1 narrow_rejected=true\n", .{});
 }

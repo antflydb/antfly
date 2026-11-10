@@ -241,14 +241,7 @@ fn runConfigured(init: std.process.Init, command: []const u8, args: *std.process
 }
 
 fn helpRequested(args: *std.process.Args.Iterator) bool {
-    var probe = args.*;
-    var first = true;
-    while (probe.next()) |arg| {
-        if (cli.isHelpArg(arg)) return true;
-        if (first and std.mem.eql(u8, arg, "help")) return true;
-        first = false;
-    }
-    return false;
+    return cli.helpRequestedIn(args.*);
 }
 
 test "client runtime recognizes help without consuming arguments" {
@@ -256,6 +249,15 @@ test "client runtime recognizes help without consuming arguments" {
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expect(helpRequested(&args));
     try std.testing.expectEqualStrings("--table", args.next().?);
+}
+
+test "client runtime treats help as a flag value when it follows an option" {
+    var argv = [_][*:0]const u8{ "wait", "--table", "help", "--index", "vectors" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(!helpRequested(&args));
+    var sub_argv = [_][*:0]const u8{"help"};
+    var sub_args = std.process.Args.Iterator.init(.{ .vector = sub_argv[0..] });
+    try std.testing.expect(helpRequested(&sub_args));
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

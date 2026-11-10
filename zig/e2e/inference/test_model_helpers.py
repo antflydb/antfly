@@ -988,12 +988,16 @@ def test_diarization_missing_dependency_pulls_speaker_model(monkeypatch):
     response.status_code = 422
     response.headers["content-type"] = "application/json"
     response._content = b'{"error":"SPEAKER_MODEL_UNAVAILABLE"}'
-    payload = {"model": "openai/whisper-tiny", "diarization": True}
-    assert models.maybe_pull_missing_model("/ai/v1/transcribe", payload, response)
+    payload = {
+        "model": "openai/whisper-tiny",
+        "audio": "AAAA",
+        "audio_options": {"diarization": True},
+    }
+    assert models.maybe_pull_missing_model("/ai/v1/read", payload, response)
     assert pulled == [models.SPEAKER_MODEL]
     assert not models.maybe_pull_missing_model(
-        "/ai/v1/transcribe", {"model": "openai/whisper-tiny"}, response
+        "/ai/v1/read", {"model": "openai/whisper-tiny"}, response
     )
     monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "0")
-    assert not models.maybe_pull_missing_model("/ai/v1/transcribe", payload, response)
+    assert not models.maybe_pull_missing_model("/ai/v1/read", payload, response)
     assert pulled == [models.SPEAKER_MODEL]

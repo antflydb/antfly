@@ -1,0 +1,8 @@
+{
+  "sdk_version": "2.3.0",
+  "sdk_commit": "202db72c87d7c6eaa72129c67ce67fd343a3a20c",
+  "sdk_source": "https://github.com/anthropics/anthropic-sdk-python/tree/v2.3.0/src/anthropic/types",
+  "api_version": "2026-10-21",
+  "pydantic_version": "2.13.4",
+  "spec_sha256": "ef53ac7870af5e2f383e5b93c4e23d59c7b568f46492230edf4f9a5c536def93"
+}

@@ -25,7 +25,7 @@ const std = @import("std");
 const error_abi = @import("runtime_error_abi.zig");
 const native_abi = @import("runtime_native_abi.zig");
 
-test "boundary dispatcher preserves graph metric readiness and storage contention across runtime units" {
+test "boundary dispatcher preserves readiness and storage contention across runtime units" {
     const VTable = struct {
         query: *const fn (*const anyerror) anyerror!u64,
     };
@@ -44,8 +44,9 @@ test "boundary dispatcher preserves graph metric readiness and storage contentio
             return TestBoundary.local_dispatch(contract, callback, args, output);
         }
     };
-    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock }) |err| {
+    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock, error.SqlStatementReadUnavailable }) |err| {
         try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
+        try std.testing.expectError(err, TestBoundary.callRemote("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
     }
 }
 
@@ -78,19 +79,33 @@ fn BoundaryImpl(comptime VTable: type) type {
             callback: anytype,
             args: anytype,
         ) CallReturn(@TypeOf(callback)) {
+            // Only source-local callbacks need the local Zig error fast path.
+            // Foreign engine consumers must not instantiate this dispatcher's
+            // methods and native layouts merely to compare its address.
+            if (dispatch == local_dispatch) {
+                const Args = std.meta.ArgsTuple(functionType(@TypeOf(callback)));
+                const typed_args: Args = args;
+                return @call(.auto, callback, typed_args);
+            }
+            return callRemote(field_name, dispatch, callback, args);
+        }
+
+        /// Caller-only half of a compiled boundary. Unlike `call`, this never
+        /// references local_dispatch, so only the invoked method's contracts
+        /// and argument/result adapters are analyzed in foreign consumers.
+        pub fn callRemote(
+            comptime field_name: []const u8,
+            dispatch: Dispatch,
+            callback: anytype,
+            args: anytype,
+        ) CallReturn(@TypeOf(callback)) {
             const Callback = @TypeOf(callback);
             const Function = functionType(Callback);
             const Args = std.meta.ArgsTuple(Function);
             const Payload = payloadType(Callback);
-            _ = std.meta.fieldIndex(VTable, field_name) orelse
+            if (!@hasField(VTable, field_name))
                 @compileError("unknown boundary vtable field: " ++ field_name);
             var typed_args: Args = args;
-
-            // A vtable created and consumed in this compilation unit retains
-            // normal Zig error and return semantics. Only a dispatcher owned
-            // by another runtime unit takes the C ABI path below.
-            if (dispatch == local_dispatch)
-                return @call(.auto, callback, typed_args);
 
             if (Payload == void) {
                 const contract = native_abi.CallContract.of(field_name, Callback, Args, Payload);
@@ -398,4 +413,23 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         error.InvalidArgument,
         TestBoundary.call("value", &callbacks.rejectingDispatch, &callbacks.value, .{ &base, 2 }),
     );
+}
+
+test "time series callback transport canonicalizes aggregation query failures" {
+    const VTable = struct { query: *const fn (*const anyerror) anyerror!u64 };
+    const TestBoundary = Boundary(VTable);
+    const Callbacks = struct {
+        fn query(failure: *const anyerror) anyerror!u64 {
+            return failure.*;
+        }
+    };
+    const cases = [_]struct { original: anyerror, expected: anyerror }{
+        .{ .original = error.InvalidAggregation, .expected = error.InvalidQueryRequest },
+        .{ .original = error.UnsupportedAggregation, .expected = error.UnsupportedQueryRequest },
+        .{ .original = error.OutOfMemory, .expected = error.OutOfMemory },
+        .{ .original = error.Timeout, .expected = error.Timeout },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, TestBoundary.callRemote("query", TestBoundary.local_dispatch, &Callbacks.query, .{&case.original}));
+    }
 }

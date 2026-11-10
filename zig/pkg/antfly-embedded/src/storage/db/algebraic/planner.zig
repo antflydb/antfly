@@ -2296,7 +2296,9 @@ fn materializationMatches(
     if (!measureMatches(index, mat, op, query_measure_field)) return false;
     if (!groupFieldsMatch(index, mat.group_by, query_group_fields)) return false;
     if (!timeMatches(index, mat.time, query_time_field)) return false;
-    if (!optionalStringMatches(mat.bucket, query_bucket)) return false;
+    if (mat.bucket) |bucket| {
+        if (query_bucket == null or !@import("cylinder.zig").equivalentBucketNames(bucket, query_bucket.?)) return false;
+    } else if (query_bucket != null) return false;
     return true;
 }
 
@@ -2326,7 +2328,9 @@ fn materializationMatchesMetric(
     if (mat_op != op) return false;
     if (!measureMatches(index, mat, op, query_measure_field)) return false;
     if (!timeMatches(index, mat.time, query_time_field)) return false;
-    if (!optionalStringMatches(mat.bucket, query_bucket)) return false;
+    if (mat.bucket) |bucket| {
+        if (query_bucket == null or !@import("cylinder.zig").equivalentBucketNames(bucket, query_bucket.?)) return false;
+    } else if (query_bucket != null) return false;
     return true;
 }
 
@@ -2337,9 +2341,10 @@ fn materializationGroupCoversConstraints(
     bucket_group_field: ?[]const u8,
     bucket_group_fields: []const []const u8,
 ) bool {
-    const bucket_count = if (bucket_group_fields.len > 0) bucket_group_fields.len else @intFromBool(bucket_group_field != null);
-    if (mat.group_by.len < constraints.len + bucket_count) return false;
+    // Grouped dimensions and fixed constraints may refer to the same axis.
+    // Prove membership rather than adding their lengths.
     for (constraints) |constraint| {
+        if (constraint.time_range != null) return false;
         const field = index.fieldConfig(constraint.field, .group) orelse return false;
         if (fieldPosition(mat.group_by, field.name) == null) return false;
     }

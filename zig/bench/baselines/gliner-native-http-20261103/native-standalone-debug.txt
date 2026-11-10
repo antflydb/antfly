@@ -1,0 +1,8 @@
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 69 files + Metal/CUDA runtime regions
+inference-test
++- run test w
+1/39 architectures.deberta.test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures...OK
+1 selected; 1 passed; 0 skipped.
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/4bb7be5dc69ff7580983a265143afaae/test --test-filter "DeBERTa native bucketed relative projections"
+

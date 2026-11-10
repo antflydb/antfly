@@ -77,6 +77,7 @@ pub fn executeRequest(
     request: http_common.HttpRequest,
     config: ?Config,
 ) !http_common.HttpResponse {
+    if (request.delivery_tracker) |tracker| tracker.markNotSent();
     const signing = config orelse return executor.execute(alloc, request);
     if (!requestTargetsInternalApi(request.uri)) return executor.execute(alloc, request);
 
@@ -256,4 +257,47 @@ test "runtime config requires an isolated production-strength credential" {
         error.InvalidInternalServiceRolloutMode,
         parseRolloutMode("disabled"),
     );
+}
+
+/// Strict service-only verifier for runtimes without the public principal
+/// parser. It deliberately accepts neither SQL-policy nor legacy credentials.
+pub fn verifyToken(alloc: std.mem.Allocator, token: []const u8, config: Config, now_seconds: i64) !void {
+    if (token.len > 4096 or config.secret.len < minimum_secret_bytes or config.issuer.len == 0) return error.Unauthorized;
+    var parts = std.mem.splitScalar(u8, token, '.');
+    const header = parts.next() orelse return error.Unauthorized;
+    const payload = parts.next() orelse return error.Unauthorized;
+    const signature = parts.next() orelse return error.Unauthorized;
+    if (parts.next() != null or header.len == 0 or payload.len == 0) return error.Unauthorized;
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, token[0 .. header.len + 1 + payload.len], config.secret);
+    var actual: [32]u8 = undefined;
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    if ((decoder.calcSizeForSlice(signature) catch return error.Unauthorized) != actual.len) return error.Unauthorized;
+    decoder.decode(&actual, signature) catch return error.Unauthorized;
+    if (!std.crypto.timing_safe.eql([32]u8, mac, actual)) return error.Unauthorized;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try a.alloc(u8, decoder.calcSizeForSlice(header) catch return error.Unauthorized);
+    decoder.decode(h, header) catch return error.Unauthorized;
+    const Header = struct { alg: []const u8, typ: []const u8 };
+    const parsed_header = std.json.parseFromSliceLeaky(Header, a, h, .{}) catch return error.Unauthorized;
+    if (!std.mem.eql(u8, parsed_header.alg, "HS256") or !std.mem.eql(u8, parsed_header.typ, "JWT")) return error.Unauthorized;
+    const p = try a.alloc(u8, decoder.calcSizeForSlice(payload) catch return error.Unauthorized);
+    decoder.decode(p, payload) catch return error.Unauthorized;
+    const Payload = struct { iss: []const u8, sub: []const u8, aud: []const u8, principal_kind: []const u8, admin: bool, iat: i64, exp: i64 };
+    const parsed = std.json.parseFromSliceLeaky(Payload, a, p, .{}) catch return error.Unauthorized;
+    if (!std.mem.eql(u8, parsed.iss, config.issuer) or !std.mem.eql(u8, parsed.aud, audience) or !std.mem.eql(u8, parsed.principal_kind, principal_kind) or parsed.sub.len == 0 or !parsed.admin or parsed.exp < now_seconds or parsed.iat > now_seconds +| 60 or parsed.exp < parsed.iat or parsed.exp -| parsed.iat > token_ttl_seconds) return error.Unauthorized;
+}
+
+test "internal service strict verifier rejects expired wrong issuer and modified credentials" {
+    const a = std.testing.allocator;
+    const config: Config = .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "workers" };
+    const token = try tokenAlloc(a, config, 1000);
+    defer a.free(token);
+    try verifyToken(a, token, config, 1020);
+    try std.testing.expectError(error.Unauthorized, verifyToken(a, token, config, 1061));
+    try std.testing.expectError(error.Unauthorized, verifyToken(a, token, .{ .secret = config.secret, .issuer = "other" }, 1020));
+    token[token.len - 5] = if (token[token.len - 5] == 'a') 'b' else 'a';
+    try std.testing.expectError(error.Unauthorized, verifyToken(a, token, config, 1020));
 }

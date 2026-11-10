@@ -476,6 +476,13 @@ def main():
     )
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument(
+        "--backup-interval",
+        type=int,
+        default=86400,
+        help="Full Lite checkpoint interval in seconds when --backup-root is set",
+    )
+    parser.add_argument("--require-seeded", action="store_true")
+    parser.add_argument(
         "--publish-interval",
         type=int,
         default=3600,
@@ -484,6 +491,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     backfill = sub.add_parser("backfill")
     backfill.add_argument("parquet", type=Path, nargs="+")
+    seed = sub.add_parser("seed-current")
+    seed.add_argument("--recent-since", type=int, required=True)
+    seed.add_argument("parquet", type=Path, nargs="+")
     sub.add_parser("poll")
     sub.add_parser("publish")
     sub.add_parser("backup")
@@ -496,11 +506,19 @@ def main():
         parser.error("creation-time cohorts require --native-rows")
     if args.native_rows and not args.native_endpoint:
         parser.error("--native-rows requires --native-endpoint")
+    if args.command == "seed-current" and (
+        not args.native_rows
+        or args.created_before is not None
+        or args.created_after is not None
+    ):
+        parser.error(
+            "seed-current requires native rows without persistent creation-time cohorts"
+        )
     if args.native_rows and args.batch_size > 16384:
         parser.error("native transaction batches are limited to 16384 changes")
     if args.batch_size < 1:
         parser.error("batch size must be positive")
-    if args.interval < 1 or args.publish_interval < 1:
+    if args.interval < 1 or args.publish_interval < 1 or args.backup_interval < 1:
         parser.error("interval must be positive")
     if args.command in ("backup", "restore") and not args.backup_root:
         parser.error("backup/restore requires --backup-root")
@@ -521,6 +539,45 @@ def main():
             return
         state = State(args.state / "ingestion.aflite")
         try:
+            if args.command == "seed-current":
+                from seed_current import seed_current
+
+                result = seed_current(
+                    state,
+                    args.parquet,
+                    args.recent_since,
+                    lambda: publish(
+                        state,
+                        args.state,
+                        args.warehouse,
+                        args.project,
+                        args.native_endpoint,
+                        args.native_table,
+                        True,
+                        args.batch_size,
+                    ),
+                    args.batch_size,
+                )
+                if args.backup_root:
+                    backup_state(
+                        state,
+                        args.state,
+                        args.backup_root,
+                        args.warehouse,
+                        args.project,
+                        args.native_endpoint,
+                        args.native_table,
+                    )
+                print(json.dumps(result))
+                return
+            if (
+                args.command == "run"
+                and args.require_seeded
+                and not state.get("initial_current_seed_complete", "")
+            ):
+                raise RuntimeError(
+                    "Run seed-current with the frozen archive inventory before enabling this producer"
+                )
             if state.get("publication", "") or state.get("native_changes_request", ""):
                 publish(
                     state,
@@ -551,6 +608,7 @@ def main():
                 return
             if args.command == "run":
                 next_publication = 0.0
+                next_backup = 0.0
                 while True:
                     done = state.poll(firebase, args.batch_size)
                     result = None
@@ -568,6 +626,29 @@ def main():
                             args.created_after,
                         )
                         next_publication = time.monotonic() + args.publish_interval
+                    if args.backup_root and time.monotonic() >= next_backup:
+                        backup_state(
+                            state,
+                            args.state,
+                            args.backup_root,
+                            args.warehouse,
+                            args.project,
+                            args.native_endpoint,
+                            args.native_table,
+                        )
+                        next_backup = time.monotonic() + args.backup_interval
+                    # A completed-poll heartbeat, not proof of searchable freshness.
+                    temporary = args.state / "heartbeat.tmp"
+                    temporary.write_text(
+                        json.dumps(
+                            {
+                                "completed_at": time.time(),
+                                "fetched": done,
+                                "published": result is not None,
+                            }
+                        )
+                    )
+                    temporary.replace(args.state / "heartbeat.json")
                     print(
                         json.dumps({"fetched": done, "publication": result}), flush=True
                     )

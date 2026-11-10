@@ -35,6 +35,7 @@ pub fn route(method: []const u8, path: []const u8) !Route {
         if (id == null) return .{ .space = space, .action = .list };
         if (parts.next()) |suffix| {
             if (parts.next() != null) return error.MemoryRouteNotFound;
+            if (std.mem.eql(u8, suffix, "usage") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .id = id.?, .action = .usage };
             if (std.mem.eql(u8, suffix, "explain") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .explain };
             if (std.mem.eql(u8, suffix, "supersession-candidates") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .supersession_candidates };
             if (!std.mem.eql(u8, suffix, "history") or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
@@ -132,11 +133,40 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     if (id != null) return error.MemoryRouteNotFound;
     if (std.mem.eql(u8, resource, "entity-corrections") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .action = .curate_entity };
     if (std.mem.eql(u8, resource, "entities") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .entities };
+    if (std.mem.eql(u8, resource, "brief")) return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST")) .brief else return error.MethodNotAllowed };
     if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
-    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance } }) |entry| {
+    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance }, .{ "consolidation", memory.Action.consolidate }, .{ "pins", memory.Action.pin }, .{ "accesses", memory.Action.access }, .{ "consolidation-proposals", memory.Action.prepare_consolidation } }) |entry| {
         if (std.mem.eql(u8, resource, entry[0])) return .{ .space = space, .action = entry[1] };
     }
     return error.MemoryRouteNotFound;
+}
+
+/// Describes a request-body JSON error without echoing request content.
+/// Returns null for errors that are not JSON shape or syntax failures.
+pub fn jsonErrorDescription(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.SyntaxError => "syntax error",
+        error.UnexpectedEndOfInput => "request body ended unexpectedly",
+        error.UnexpectedToken => "a field has the wrong type",
+        error.MissingField => "a required field is missing",
+        error.UnknownField => "unknown field",
+        error.DuplicateField => "a field appears more than once",
+        error.InvalidEnumTag => "a field has an unsupported value",
+        error.InvalidNumber, error.Overflow, error.InvalidCharacter => "invalid number",
+        error.LengthMismatch => "an array has the wrong length",
+        else => null,
+    };
+}
+
+/// Human-readable `error` text for a MemoryError response; `code` keeps the
+/// stable error name.
+pub fn errorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        // Number errors can come from non-JSON code paths; only name them
+        // when they are unambiguous JSON shape failures.
+        error.Overflow, error.InvalidCharacter, error.InvalidNumber => @errorName(err),
+        else => if (jsonErrorDescription(err)) |description| description else @errorName(err),
+    };
 }
 
 pub fn status(err: anyerror) u16 {
@@ -157,6 +187,16 @@ pub fn status(err: anyerror) u16 {
     };
 }
 
+test "memory route exposes brief, consolidation and pins" {
+    try std.testing.expectEqual(memory.Action.brief, (try route("GET", "/memory/v1/spaces/team/brief")).action);
+    try std.testing.expectEqual(memory.Action.brief, (try route("POST", "/memory/v1/spaces/team/brief")).action);
+    try std.testing.expectError(error.MethodNotAllowed, route("DELETE", "/memory/v1/spaces/team/brief"));
+    try std.testing.expectEqual(memory.Action.consolidate, (try route("POST", "/memory/v1/spaces/team/consolidation")).action);
+    try std.testing.expectEqual(memory.Action.pin, (try route("POST", "/memory/v1/spaces/team/pins")).action);
+    try std.testing.expectError(error.MethodNotAllowed, route("GET", "/memory/v1/spaces/team/pins"));
+    try std.testing.expectEqual(memory.Action.create, (try route("PUT", "/memory/v1/spaces/team")).action);
+}
+
 test "memory route separates native operations and rejects unknown paths" {
     try std.testing.expectEqual(memory.Action.observe, (try route("POST", "/memory/v1/spaces/team/observations")).action);
     try std.testing.expectEqual(memory.Action.history, (try route("GET", "/memory/v1/spaces/team/memories/a/history")).action);
@@ -172,3 +212,12 @@ pub const Request = struct {
     body: std.json.Value = .{ .object = .empty },
     idempotency_key: []const u8 = "",
 };
+
+test "native memory routes expose access usage and reviewed consolidation" {
+    try std.testing.expectEqual(memory.Action.access, (try route("POST", "/memory/v1/spaces/team/accesses")).action);
+    const usage = try route("GET", "/memory/v1/spaces/team/memories/a/usage");
+    try std.testing.expectEqual(memory.Action.usage, usage.action);
+    try std.testing.expectEqualStrings("a", usage.id);
+    try std.testing.expectEqual(memory.Action.prepare_consolidation, (try route("POST", "/memory/v1/spaces/team/consolidation-proposals")).action);
+    try std.testing.expectError(error.MethodNotAllowed, route("GET", "/memory/v1/spaces/team/accesses"));
+}

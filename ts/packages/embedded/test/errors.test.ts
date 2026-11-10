@@ -35,6 +35,7 @@ import {
   VersionConflictError,
 } from "../src/errors.js";
 import { AntflyOpenOptions, loadNative } from "../src/native.js";
+import { SqlError } from "../src/sql-types.js";
 import { SUPPORTED_ABI_VERSION, THREADING_SERIALIZED } from "../src/types.js";
 import { describeWithLibrary } from "./helpers.js";
 
@@ -124,5 +125,30 @@ describeWithLibrary("native ABI cross-checks", () => {
   it("antfly_open_options_size() agrees with the compiled struct size", () => {
     const native = loadNative();
     expect(native.openOptionsSize()).toBe(koffi.sizeof(AntflyOpenOptions));
+  });
+});
+
+describe("outcome receipts (pure)", () => {
+  const receipt = "or1:000102030405060708090a0b0c0d0e0f:3";
+
+  it("OutcomeUnknownError carries an optional receipt", () => {
+    const err = new OutcomeUnknownError(undefined, receipt);
+    expect(err).toBeInstanceOf(AntflyError);
+    expect(err.code).toBe(ErrorCode.OutcomeUnknown);
+    expect(err.outcomeReceipt).toBe(receipt);
+    expect(new OutcomeUnknownError().outcomeReceipt).toBeUndefined();
+    expect(
+      (errorFromCode(ErrorCode.OutcomeUnknown) as OutcomeUnknownError).outcomeReceipt
+    ).toBeUndefined();
+  });
+
+  it("SqlError carries an optional receipt", () => {
+    const err = new SqlError(
+      { code: "40003", message: "commit outcome unknown" },
+      undefined,
+      receipt
+    );
+    expect(err.outcomeReceipt).toBe(receipt);
+    expect(new SqlError({ code: "40001", message: "retry" }).outcomeReceipt).toBeUndefined();
   });
 });

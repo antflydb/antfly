@@ -47,9 +47,13 @@ pub const InferenceAdmission = struct {
     capacity: usize,
 
     pub fn init(capacity: usize) InferenceAdmission {
+        return initWithLimits(capacity, capacity);
+    }
+
+    pub fn initWithLimits(requests: usize, work_units: usize) InferenceAdmission {
         return .{
-            .max_concurrent_requests = capacity,
-            .capacity = capacity,
+            .max_concurrent_requests = requests,
+            .capacity = work_units,
         };
     }
 
@@ -318,4 +322,14 @@ test "inference admission synchronizes embedded and HTTP callers" {
 
     try std.testing.expectEqual(@as(usize, 0), q.inFlightRequests());
     try std.testing.expectEqual(@as(usize, 0), q.inFlightUnits());
+}
+
+test "independent request and weighted work limits retain one request with eight units" {
+    var admission = InferenceAdmission.initWithLimits(1, 8);
+    try admission.acquireRequestSlot();
+    defer admission.releaseRequestSlot();
+    try admission.reserveUnits(5);
+    defer admission.releaseReservedUnits(5);
+    try std.testing.expectError(error.QueueFull, admission.acquireRequestSlot());
+    try std.testing.expectEqual(@as(usize, 5), admission.inFlightUnits());
 }

@@ -37,7 +37,7 @@ pub fn artifactKeyAllowed(source: Source, key_bytes: []const u8) bool {
     if (!binding.valid()) return false;
     return @import("online_vector_artifacts.zig").isKey(key_bytes) or
         (binding.effect_protocol >= 15 and @import("online_graph_artifacts.zig").isKey(key_bytes)) or
-        (binding.effect_protocol == 16 and @import("group_source_transfer.zig").isKey(key_bytes));
+        (binding.effect_protocol >= 16 and @import("group_source_transfer.zig").isKey(key_bytes));
 }
 
 pub fn validateArtifactEffect(source: Source, key_bytes: []const u8, value: ?[]const u8) !void {
@@ -60,6 +60,8 @@ pub const Chunk = struct {
     payload: ChunkPayload = .row,
     row_key: []const u8,
     timestamp: u64,
+    /// Exact signed source, encoded as little-endian i128 bytes on the private wire.
+    ttl_source: ?[16]u8 = null,
     total_bytes: u64,
     row_digest: Digest,
     offset: u64,
@@ -151,6 +153,11 @@ pub const Command = struct {
     digest: Digest,
     /// Original metadata for each sorted row; never synthesized at replay time.
     timestamps: []const u64 = &.{},
+    /// Optional aligned source sidecars. Empty preserves the legacy page format.
+    ttl_sources: []const ?[16]u8 = &.{},
+    /// Monotonic allocator floor from authenticated snapshot metadata or retained
+    /// document afterimages (including tombstones). Applied atomically with progress.
+    document_version_floor: u64 = 0,
     tail: ?Tail = null,
     chunk: ?Chunk = null,
     /// Native, already-keyed claim/reference/job afterimages. They never pass
@@ -268,6 +275,10 @@ pub fn commandDigest(request: anytype) Digest {
         hash.update(&buffer);
     }
     hash.update(&command.source.pin_digest);
+    if (command.document_version_floor != 0) {
+        bytes(&hash, "document-version-floor-v1");
+        hashCount(&hash, command.document_version_floor);
+    }
     if (command.source.provenance_required) bytes(&hash, "source-provenance-required-v1");
     if (command.source.artifact_catalog) |binding| {
         bytes(&hash, "ordered-artifact-catalog-v1");
@@ -319,6 +330,10 @@ pub fn commandDigest(request: anytype) Digest {
         });
         bytes(&hash, chunk.row_key);
         hashCount(&hash, chunk.timestamp);
+        if (chunk.ttl_source) |source| {
+            bytes(&hash, "signed-ttl-source-v1");
+            hash.update(&source);
+        }
         hashCount(&hash, chunk.total_bytes);
         hash.update(&chunk.row_digest);
         hashCount(&hash, chunk.offset);
@@ -331,6 +346,14 @@ pub fn commandDigest(request: anytype) Digest {
         var buffer: [8]u8 = undefined;
         std.mem.writeInt(u64, &buffer, timestamp, .little);
         hash.update(&buffer);
+    }
+    if (command.ttl_sources.len != 0) {
+        bytes(&hash, "signed-ttl-sources-v1");
+        hashCount(&hash, command.ttl_sources.len);
+        for (command.ttl_sources) |source| {
+            hash.update(&.{@intFromBool(source != null)});
+            if (source) |value| hash.update(&value);
+        }
     }
     bytes(&hash, "writes");
     hashCount(&hash, request.writes.len);
@@ -423,7 +446,8 @@ pub fn RowChunks(comptime Request: type) type {
             result.merge_page.?.artifact_effects = &.{};
             result.merge_page.?.provenance_effects = &.{};
             result.merge_page.?.timestamps = &.{};
-            result.merge_page.?.chunk = .{ .payload = if (proof) .provenance else if (vector) .artifact else .row, .row_key = row.key, .timestamp = if (proof or vector) 0 else self.base.merge_page.?.timestamps[0], .total_bytes = row.value.len, .row_digest = self.row_digest, .offset = offset, .data = data, .chunk_digest = checksum };
+            result.merge_page.?.ttl_sources = &.{};
+            result.merge_page.?.chunk = .{ .payload = if (proof) .provenance else if (vector) .artifact else .row, .row_key = row.key, .timestamp = if (proof or vector) 0 else self.base.merge_page.?.timestamps[0], .ttl_source = if (self.base.merge_page.?.ttl_sources.len == 0) null else self.base.merge_page.?.ttl_sources[0], .total_bytes = row.value.len, .row_digest = self.row_digest, .offset = offset, .data = data, .chunk_digest = checksum };
             result.merge_page.?.digest = commandDigest(result);
             try validateRequest(result);
             return result;
@@ -448,6 +472,7 @@ pub fn validateRequest(request: anytype) !void {
         request.relational_index_maintenance != null or request.relational_repair)
         return error.InvalidMergePage;
     try command.source.validate();
+    if (command.document_version_floor != 0 and command.phase != .rows and command.phase != .tail) return error.InvalidMergePage;
     if (command.artifact_effects.len != 0 and !@import("online_vector_artifacts.zig").isEnabled()) return error.InvalidMergePage;
     if (command.artifact_effects.len != 0 and (command.source.artifact_catalog == null or command.source.retention == null or
         (command.phase != .artifacts and command.phase != .tail) or (if (command.chunk) |chunk| chunk.payload != .artifact else false) or request.merge_artifacts.len != 0)) return error.InvalidMergePage;
@@ -455,7 +480,16 @@ pub fn validateRequest(request: anytype) !void {
     if (command.next_snapshot_position) |position| if (command.source.retention == null or (command.phase != .rows and command.phase != .artifacts) or position.offset < 4) return error.InvalidMergePage;
     if (command.integrity.len != 0 and (command.source.integrity == null or (command.phase != .cleanup_integrity and command.phase != .artifacts and command.phase != .tail) or request.merge_artifacts.len != 0 or command.chunk != null)) return error.InvalidMergePage;
     if (request.timestamp_ns != 0 or (command.chunk == null and command.timestamps.len != request.writes.len)) return error.InvalidMergePage;
+    if (command.ttl_sources.len != 0) {
+        if (command.chunk != null or command.ttl_sources.len != request.writes.len or (command.phase != .rows and command.phase != .tail)) return error.InvalidMergePage;
+        var present = false;
+        for (command.ttl_sources) |source| if (source != null) {
+            present = true;
+        };
+        if (!present) return error.InvalidMergePage;
+    }
     if (command.chunk) |chunk| {
+        if (chunk.ttl_source != null and (chunk.payload != .row or (command.phase != .rows and command.phase != .tail))) return error.InvalidMergePage;
         if (chunk.payload == .provenance) {
             if (command.phase != .artifacts or !command.source.provenance_required or command.next_snapshot_position == null or
                 request.writes.len != 0 or command.integrity.len != 0 or command.artifact_effects.len != 0 or

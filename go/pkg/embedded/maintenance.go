@@ -19,18 +19,34 @@ package embedded
 
 import "encoding/json"
 
+// LiveByteCategory counts logical key/value payload, excluding physical headers.
+type LiveByteCategory struct {
+	Records    uint64 `json:"records"`
+	KeyBytes   uint64 `json:"key_bytes"`
+	ValueBytes uint64 `json:"value_bytes"`
+}
+
+// LiveByteAccounting attributes the logical payload visited by integrity checks.
+type LiveByteAccounting struct {
+	MetadataCatalog  LiveByteCategory `json:"metadata_catalog"`
+	IndexCatalog     LiveByteCategory `json:"index_catalog"`
+	ControlDocuments LiveByteCategory `json:"control_documents"`
+	Documents        LiveByteCategory `json:"documents"`
+}
+
 // CheckReport is the typed form of CheckJSON.
 type CheckReport struct {
-	Valid            bool    `json:"valid"`
-	FileSize         uint64  `json:"file_size"`
-	ValidPrefixSize  uint64  `json:"valid_prefix_size"`
-	TailBytes        uint64  `json:"tail_bytes"`
-	RecordCount      uint64  `json:"record_count"`
-	LiveFileCount    uint64  `json:"live_file_count"`
-	LiveBytes        uint64  `json:"live_bytes"`
-	CompactSize      uint64  `json:"compact_size"`
-	ReclaimableBytes uint64  `json:"reclaimable_bytes"`
-	Issue            *string `json:"issue,omitempty"`
+	LiveAccounting   *LiveByteAccounting `json:"live_accounting,omitempty"`
+	Valid            bool                `json:"valid"`
+	FileSize         uint64              `json:"file_size"`
+	ValidPrefixSize  uint64              `json:"valid_prefix_size"`
+	TailBytes        uint64              `json:"tail_bytes"`
+	RecordCount      uint64              `json:"record_count"`
+	LiveFileCount    uint64              `json:"live_file_count"`
+	LiveBytes        uint64              `json:"live_bytes"`
+	CompactSize      uint64              `json:"compact_size"`
+	ReclaimableBytes uint64              `json:"reclaimable_bytes"`
+	Issue            *string             `json:"issue,omitempty"`
 }
 
 // VacuumReport is the typed form of VacuumJSON.

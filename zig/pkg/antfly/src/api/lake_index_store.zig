@@ -26,6 +26,7 @@ pub const Store = struct {
     opened: local.serverless_object_store_support.OpenedObjectStore,
     implementation: artifacts.ObjectStore,
     identity: local.metadata_lake_index_catalog.Digest,
+    cache_identity: local.metadata_lake_index_catalog.Digest,
     locator: local.metadata_lake_index_catalog.StoreLocator,
     cloud_binding: ?@import("lake_cloud_publication.zig").Binding = null,
     reopen_options: ?Reopen = null,
@@ -50,7 +51,7 @@ pub const Store = struct {
         errdefer opened.deinit();
         // The configured opener already enforces create-if-missing policy.
         // This wrapper must never add bucket provisioning authority.
-        var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only, .filesystem = opened.fs_client });
+        var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only, .skip_bucket_probe = true, .filesystem = opened.fs_client });
         errdefer implementation.deinit();
         implementation.cloud_retention_qualified = if (config) |value| value.lake_indexes.cloud_generations.qualified_retention else false;
         const encoded = try std.json.Stringify.valueAlloc(a, .{
@@ -71,9 +72,9 @@ pub const Store = struct {
             } else null,
         }, .{});
         defer a.free(encoded);
-        var identity: local.metadata_lake_index_catalog.Digest = undefined;
-        std.crypto.hash.sha2.Sha256.hash(encoded, &identity, .{});
-        implementation.cloud_cache_scope = identity;
+        var cache_identity: local.metadata_lake_index_catalog.Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &cache_identity, .{});
+        implementation.cloud_cache_scope = cache_identity;
         const locator: local.metadata_lake_index_catalog.StoreLocator = .{
             .protocol = if (opened.fs_client != null) .filesystem else if (opened.s3_client != null) .s3 else .gcs,
             .connection = storage.artifacts.connection,
@@ -83,7 +84,11 @@ pub const Store = struct {
             .tls = if (opened.s3_client) |s3| s3.cfg.credentials.use_ssl else true,
         };
         try locator.validate();
-        return .{ .opened = opened, .implementation = implementation, .identity = identity, .locator = locator, .reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir } };
+        const physical = try std.json.Stringify.valueAlloc(a, .{ .domain = "native-lake-artifact-location-v2", .locator = locator }, .{});
+        defer a.free(physical);
+        var identity: local.metadata_lake_index_catalog.Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(physical, &identity, .{});
+        return .{ .opened = opened, .implementation = implementation, .identity = identity, .cache_identity = cache_identity, .locator = locator, .reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir } };
     }
     /// Reopen a retained namespace with currently authorized credentials. A
     /// connection can rotate keys, but cannot silently redirect old collection
@@ -103,6 +108,12 @@ pub const Store = struct {
         if (opened.locator.protocol != locator.protocol or opened.locator.tls != locator.tls or !std.mem.eql(u8, opened.locator.root, locator.root) or !std.mem.eql(u8, opened.locator.bucket, locator.bucket) or !std.mem.eql(u8, opened.locator.prefix, locator.prefix)) return error.NativeArtifactStoreLocationChanged;
         return opened;
     }
+    /// A synchronous execution lease borrows only configuration and immutable
+    /// identity values. The receiving owner reconstructs its own clients.
+    pub fn executionDescriptor(self: *const Store) !@import("lake_execution_values.zig").StoreDescriptor {
+        const options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
+        return .{ .config = options.config, .secrets = options.secrets, .deployment = options.deployment, .local_base_dir = options.local_base_dir, .locator = self.locator, .identity = self.identity, .cloud_vacuum = self.implementation.cloud_vacuum };
+    }
     /// Reopen independent client ownership for a query-local lazy selector.
     /// Both physical location and current credential scope must still match.
     pub fn reopenReadOnly(self: *const Store, a: A) !Store {
@@ -113,6 +124,7 @@ pub const Store = struct {
             try openNative(a, null, options.secrets, true, options.deployment, options.local_base_dir);
         errdefer result.deinit();
         if (!std.mem.eql(u8, &result.identity, &self.identity)) return error.ExternalLakeIndexStoreChanged;
+        if (!std.mem.eql(u8, &result.cache_identity, &self.cache_identity)) return error.ExternalLakeIndexCredentialsChanged;
         return result;
     }
     pub fn bindPublication(self: *Store, publication: local.metadata_lake_index_catalog.Publication, token: @import("antfly_cancellation").CancellationToken) !void {
@@ -173,4 +185,38 @@ test "external lake native artifact storage survives reopen and excludes read ca
     try std.testing.expectError(error.NativeArtifactStoreLocationChanged, Store.openRetained(a, &config, null, wrong, true));
     config.deployment_mode = .distributed;
     try std.testing.expectError(error.NativeArtifactStorageRequired, Store.open(a, &config, null, false));
+}
+
+test "external lake native artifact identity survives credential rotation while caches remain scoped" {
+    const a = std.testing.allocator;
+    const Config = local.common_config.Config;
+    const Fixture = struct {
+        fn config(alloc: A, token: []const u8, prefix_: []const u8) !Config {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+                .deployment_mode = "standalone",
+                .storage = .{ .engine = "local", .local = .{ .base_dir = "." }, .artifacts = .{ .connection = "artifacts", .bucket = "bucket", .prefix = prefix_ } },
+                .connections = .{ .artifacts = .{ .kind = "external_io", .capabilities = .{"storage.primary"}, .external_io = .{ .protocol = "gcs", .buckets = .{"bucket"}, .prefix = "tenant", .bucket_provisioning = "require_existing", .credentials = .{ .source = "bearer_token", .bearer_token = token } } } },
+            }, .{});
+            defer alloc.free(bytes);
+            return Config.parseFromSlice(alloc, bytes);
+        }
+    };
+    var first_config = try Fixture.config(a, "test-token-before", "tenant/indexes");
+    defer first_config.deinit();
+    var next_config = try Fixture.config(a, "test-token-after", "tenant/indexes");
+    defer next_config.deinit();
+    var moved_config = try Fixture.config(a, "test-token-after", "tenant/other");
+    defer moved_config.deinit();
+    // Opening configured adapters must perform no provider I/O. These are
+    // deliberately fake tokens: only the identity calculation is exercised.
+    var first = try Store.open(a, &first_config, null, true);
+    defer first.deinit();
+    var next = try Store.open(a, &next_config, null, true);
+    defer next.deinit();
+    var moved = try Store.open(a, &moved_config, null, true);
+    defer moved.deinit();
+    try std.testing.expectEqual(first.identity, next.identity);
+    try std.testing.expect(!std.mem.eql(u8, &first.cache_identity, &next.cache_identity));
+    try std.testing.expect(!std.mem.eql(u8, &first.identity, &moved.identity));
+    try std.testing.expectEqual(first.cache_identity, first.implementation.cloud_cache_scope);
 }

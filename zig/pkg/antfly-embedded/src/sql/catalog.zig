@@ -18,6 +18,9 @@
 //! and schema together. This is not another durable catalog or storage engine.
 const std = @import("std");
 const ast = @import("ast.zig");
+pub const graph_relation = @import("graph_relation.zig");
+pub const Count = @import("cypher").multiplicity.Count;
+pub const Multiplicity = @import("cypher").runtime.Multiplicity;
 
 pub const Column = struct {
     name: []const u8,
@@ -111,6 +114,7 @@ pub const Table = struct {
             return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
         }
     };
+    graph: ?*const @import("graph_relation.zig").Binding = null,
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
@@ -165,6 +169,9 @@ pub const Condition = struct {
     }
 };
 pub const Scan = struct {
+    pub const GraphCondition = struct { column: []const u8, op: @FieldType(Condition, "op"), operand: @import("scalar.zig").Program };
+    pub const GraphPredicate = union(enum) { comparison: GraphCondition, all: []const GraphPredicate, any: []const GraphPredicate };
+    pub const GraphFilter = union(enum) { comparison: Condition, all: []const GraphFilter, any: []const GraphFilter };
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {
         name: []const u8,
@@ -179,11 +186,30 @@ pub const Scan = struct {
     };
     pub const Search = struct { expression: ast.Search, request_text: ?[]const u8 = null, limit: ?u32 = null };
     search: ?*const Search = null,
+    /// SQL slots used inside a shared graph fragment retain their bound SQL
+    /// types; graph-only unknown slots use JSON data semantics.
+    graph_parameter_types: []const ?ast.ColumnType = &.{},
+    /// Immutable row-local predicates selected by relational binding. Operands
+    /// bind at execution, so prepared invocations never mutate the scan plan.
+    graph_conditions: []const GraphCondition = &.{},
+    /// Boolean optimization hints bind once per invocation. SQL retains the
+    /// complete residual predicate; unsupported arms decline an entire hint.
+    graph_predicates: []const GraphPredicate = &.{},
+    graph_filters: []const GraphFilter = &.{},
+    graph_source_ordinals: bool = false,
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},
     /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
     /// Absent when residual selectivity is unknown. Page size remains limit.
     row_goal: ?u64 = null,
+    /// Explicit consumer proof of an exact finite ordered prefix. A provider
+    /// may truncate only when it also attests order_satisfied. Advisory row_goal
+    /// alone never grants this capability.
+    ordered_window: ?u64 = null,
+    /// Complete outer SQL predicate, bound per invocation. A graph provider
+    /// may cap a prefix only after translating every arm exactly. SQL retains
+    /// its residual evaluation even when this certificate is consumed.
+    exact_graph_filter: ?GraphFilter = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.
@@ -231,7 +257,8 @@ pub const Row = struct {
         values: []const Cell = &.{},
         presence: ?[]const bool = null,
         /// Shared immutable column blocks, owned by the enclosing page lease.
-        columnar: ?struct { blocks: []const @import("spill.zig").ColumnarBlock, row: usize } = null,
+        columnar: ?Columnar = null,
+        pub const Columnar = struct { blocks: []const @import("spill.zig").ColumnarBlock, row: usize };
         pub fn count(self: TypedCells) usize {
             if (self.columnar != null) return self.layout.names.len;
             return self.values.len;
@@ -408,14 +435,90 @@ pub const Row = struct {
         return result;
     }
 };
+pub const AggregateInput = @import("cypher").statistic.Input;
 pub const Page = struct {
     rows: []const Row,
+    /// Optional bag weights, negotiated by aggregate consumers before pulling.
+    /// Ordinary SQL rows carry no per-row storage overhead.
+    multiplicities: ?[]const u64 = null,
+    /// Promoted exact counts override the compact weights for this page.
+    exact_multiplicities: ?[]const Count = null,
+    /// Only after enable_aggregate_weights: this page contributes to these
+    /// reducer slots, not to an ordinary logical SQL row stream.
+    aggregate_slots: ?[]const usize = null,
+    /// Certified arguments aligned with rows, each tagged with its reducer slot.
+    /// Slots must belong to the negotiated aggregate_slots for this page.
+    /// Ordinary pages allocate no argument vector or row metadata.
+    aggregate_inputs: ?[]const ?AggregateInput = null,
     owned_arena: ?std.heap.ArenaAllocator = null,
     storage_page: ?@import("../storage/relational_read_view.zig").View.Page = null,
     /// Exclusive native continuation; null proves exhaustion. Implementations
     /// must not report a short filtered page as exhaustion without that proof.
     after: ?[]const u8 = null,
 
+    pub fn counted(a: std.mem.Allocator, rows: []const Row, counts: []const Count, slots: ?[]const usize, after: ?[]const u8) !Page {
+        if (rows.len != counts.len) return error.InvalidSqlBackendResponse;
+        const weights = try a.alloc(u64, counts.len);
+        var promoted = false;
+        for (counts, weights) |count, *out| {
+            out.* = count.cap(std.math.maxInt(u64));
+            promoted = promoted or count.exact() == null;
+        }
+        return .{ .rows = rows, .multiplicities = weights, .exact_multiplicities = if (promoted) counts else null, .aggregate_slots = slots, .after = after };
+    }
+    pub fn validateWeights(self: Page) !void {
+        if (self.aggregate_inputs) |inputs| {
+            if (inputs.len != self.rows.len or self.aggregate_slots == null or self.multiplicities == null) return error.InvalidSqlBackendResponse;
+            var licensed = std.StaticBitSet(256).empty;
+            for (self.aggregate_slots.?) |slot| {
+                if (slot >= 256) return error.InvalidSqlBackendResponse;
+                licensed.set(slot);
+            }
+            for (inputs) |input| if (input) |argument| {
+                if (argument.batch.len != 0) {
+                    if (argument.batch.len > 256 or argument.support != null) return error.InvalidSqlBackendResponse;
+                    var seen = std.StaticBitSet(256).empty;
+                    for (argument.batch) |part| {
+                        if (part.slot >= 256 or !licensed.isSet(part.slot) or seen.isSet(part.slot) or !part.valid()) return error.InvalidSqlBackendResponse;
+                        seen.set(part.slot);
+                    }
+                } else {
+                    if (argument.slot >= 256 or !licensed.isSet(argument.slot)) return error.InvalidSqlBackendResponse;
+                    if (argument.support) |support| if (!support.valid()) return error.InvalidSqlBackendResponse;
+                }
+            };
+        }
+        if (self.multiplicities) |weights| {
+            if (weights.len != self.rows.len) return error.InvalidSqlBackendResponse;
+            for (weights) |weight_value| if (weight_value == 0) return error.InvalidSqlBackendResponse;
+        }
+        if (self.exact_multiplicities) |counts| {
+            const weights = self.multiplicities orelse return error.InvalidSqlBackendResponse;
+            if (counts.len != weights.len) return error.InvalidSqlBackendResponse;
+            for (counts, weights) |count, compact| if (count.cap(std.math.maxInt(u64)) != compact) return error.InvalidSqlBackendResponse;
+        }
+    }
+    pub fn weight(self: Page, index: usize) Count {
+        return if (self.exact_multiplicities) |weights| weights[index] else Count.init(if (self.multiplicities) |weights| weights[index] else 1);
+    }
+    pub fn cloneAggregateInputs(self: Page, a: std.mem.Allocator) !?[]const ?AggregateInput {
+        const inputs = self.aggregate_inputs orelse return null;
+        const owned = try a.alloc(?AggregateInput, inputs.len);
+        errdefer a.free(owned);
+        var initialized: usize = 0;
+        errdefer for (owned[0..initialized]) |input| if (input) |argument| argument.deinitOwned(a);
+        for (inputs, owned) |input, *out| {
+            out.* = if (input) |argument| try argument.clone(a) else null;
+            initialized += 1;
+        }
+        return owned;
+    }
+    pub fn cloneWeights(self: Page, a: std.mem.Allocator) !?[]const Count {
+        const counts = self.exact_multiplicities orelse return null;
+        const owned = try a.alloc(Count, counts.len);
+        for (owned, counts) |*out, count| out.* = try count.clone(a);
+        return owned;
+    }
     pub fn deinit(self: Page) void {
         if (self.storage_page) |owned| {
             var page = owned;
@@ -521,6 +624,30 @@ pub const ColumnPage = struct {
 
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
+/// A summary field is read only by an integer affine, non-DISTINCT COUNT/SUM/AVG/MIN/MAX.
+/// Invariants name dependencies of grouping, filtering and other observations;
+/// their values must be constant within each compressed bag.
+/// Adapters must clear it whenever a filter, expression or barrier observes its
+/// distribution. Exact integer representative bags may preserve its statistics.
+/// Each alternative names one varying marginal and every dependency that
+/// must be constant inside its bag. Alternatives are disjunctive, never merged.
+pub const SummaryCertificate = struct {
+    field: []const u8,
+    invariants: []const []const u8 = &.{},
+    /// A consumer obligation over several private length columns. The graph
+    /// producer checks every observed projection against its own geometry;
+    /// this never asserts correlation between arbitrary public columns.
+    joint: bool = false,
+    /// Request-local scalar certificate. Legacy checks negotiate marginal
+    /// moments; statistic callbacks negotiate integer costs, cross moments or
+    /// support sets. The producer independently certifies geometry and totality.
+    /// Context and parameter slots stay pinned for this query, never a cached
+    /// prepared plan or an external transport.
+    linear: ?@import("cypher").linear_bounds.Check = null,
+};
+/// Exact finite prefix of group keys; negotiated only by total scalar reducers.
+pub const ObserverWindow = struct { descending: []const bool, maximum: u64, prefix_skip: u64 = 0, retained_bytes: usize = 0 };
+pub const AggregateWeight = struct { observer_window: ?ObserverWindow = null, observer_reducer_filter: ?Scan.GraphFilter = null, observer_field: ?[]const u8 = null, observer_keys: []const []const u8 = &.{}, observer_filter: ?Scan.GraphFilter = null, observer: ?@import("cypher").runtime.NodeCursor.ScalarObserver = null, fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for
 /// optimizer statistics; absent fields remain unknown. Frequencies and hashes
 /// describe semantic equality keys, and are advisory rather than pruning proof.
@@ -630,7 +757,38 @@ pub const StatisticsSketch = struct {
         return result;
     }
 };
+/// Durable, authorized external read identity exported from an already pinned
+/// statement cursor. It must never acquire a newer snapshot or WAL cut.
+pub const BucketLayout = struct { column: []const u8, count: u32 };
+pub const ReadCapability = struct {
+    bucket: ?BucketLayout = null,
+    /// Minimum parallelism for bounded retained WAL images, independent of
+    /// the committed base scan row budget.
+    min_splits: u32 = 1,
+    token: []const u8,
+    schema: [64]u8,
+    snapshot: []const u8,
+    wal_cut: u64,
+    expires_ms: u64,
+    estimated_bytes: u64,
+    estimated_rows: u64,
+};
+/// Result batches borrow the producer's current page until the next pull or
+/// close. A pull may return fewer than maximum rows at a physical page boundary;
+/// only an empty batch marks EOF. Retaining consumers copy before advancing.
+pub const RelationCursor = struct {
+    ptr: *anyopaque,
+    next: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!@import("execution_batch.zig").Batch,
+    close: *const fn (*anyopaque) void,
+};
+pub const DistributedJoin = struct {
+    ptr: *anyopaque,
+    /// A local lowering port. The provider must emit its own versioned IR;
+    /// relation nodes and captured cursor pointers never cross the transport.
+    open: *const fn (*anyopaque, std.mem.Allocator, *const @import("relation_binding.zig").Node, []const StatementScan, []const Cursor, []const std.json.Value, @import("../api/operation.zig").RequestContext) anyerror!?RelationCursor,
+};
 pub const Cursor = struct {
+    export_snapshot: ?struct { ptr: *anyopaque, export_cut: *const fn (*anyopaque, std.mem.Allocator) anyerror!?ReadCapability } = null,
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
@@ -670,6 +828,19 @@ pub const Cursor = struct {
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
+    /// Before the first pull, negotiate exact bags, duplicate-insensitive
+    /// presence, or capped lower bounds for finite windows. Capped counts must
+    /// never be consumed as exact numeric aggregate multiplicities. Other
+    /// consumers receive ordinary logical rows.
+    enable_weights: ?*const fn (*anyopaque, Multiplicity) anyerror!bool = null,
+    /// Global aggregate consumers may negotiate serial dependency partitions
+    /// before the first pull. A successful provider shares the read cut and
+    /// work/memory quotas across all passes; each page identifies reducer slots.
+    /// Other consumers must never receive partitioned pages.
+    /// Complete, ordered groups over certified idempotent scalar observers.
+    /// Borrowed from this cursor until close; SQL evaluates HAVING and outputs.
+    enable_groups: ?*const fn (*anyopaque, []const AggregateWeight, []const @import("cypher").runtime.NodeCursor.GroupOrder, *@import("operators.zig").Grouped) anyerror!bool = null,
+    enable_aggregate_weights: ?*const fn (*anyopaque, []const AggregateWeight) anyerror!bool = null,
 };
 
 /// Planning-only metadata. Estimates may be stale and never establish an
@@ -818,6 +989,8 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    distributed_join: ?DistributedJoin = null,
+    distributed_context: @import("../api/operation.zig").RequestContext = .{},
     error_context: ?*@import("errors.zig").Context = null,
     /// Execution-local only: never store this owner in an immutable plan.
     regex_execution: ?*@import("regex_execution.zig") = null,
@@ -882,6 +1055,7 @@ pub const Backend = struct {
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,
+        resolve_graph: ?*const fn (*anyopaque, std.mem.Allocator, ast.GraphTable) anyerror!Table = null,
         scan: *const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!Page,
         /// null means this provider cannot retain a statement snapshot. Never
         /// substitute a collection of independently refreshed shard pages.
@@ -1057,4 +1231,111 @@ test "SQL durable planner sketches merge duplicate keys nulls widths and bounded
     var malformed = left.encode();
     malformed[48] = 60;
     try std.testing.expectError(error.InvalidSqlBackendResponse, StatisticsSketch.decode(&malformed));
+}
+
+test "SQL certified aggregate arguments require aligned negotiated reducer slots" {
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    const inputs = [_]?AggregateInput{.{ .slot = 0, .value = 7 }};
+    var page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{0}, .aggregate_inputs = &inputs };
+    try page.validateWeights();
+    const cloned = (try page.cloneAggregateInputs(std.testing.allocator)).?;
+    defer std.testing.allocator.free(cloned);
+    try std.testing.expectEqualDeep(inputs[0], cloned[0]);
+    page.aggregate_slots = null;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    page.aggregate_slots = &.{ 0, 1 };
+    try page.validateWeights();
+    page.aggregate_slots = &.{1};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    page.aggregate_slots = &.{0};
+    page.aggregate_inputs = &.{};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    page.aggregate_inputs = &inputs;
+    page.multiplicities = null;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+}
+
+test "SQL bitmap aggregate pages own cloned words and reject invalid supports" {
+    const a = std.testing.allocator;
+    var words = [_]u64{0b10101};
+    var inputs = [_]?AggregateInput{.{ .slot = 0, .support = .{ .value = .{ .low = -1, .words = &words }, .offset = 10000000000 } }};
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    const page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{0}, .aggregate_inputs = &inputs };
+    try page.validateWeights();
+    const cloned = (try page.cloneAggregateInputs(a)).?;
+    defer a.free(cloned);
+    defer a.free(cloned[0].?.support.?.value.words);
+    words[0] = 0;
+    try std.testing.expectEqual(@as(u64, 0b10101), cloned[0].?.support.?.value.words[0]);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    words[0] = 3;
+    inputs[0].?.support.?.value.low = std.math.maxInt(i64);
+    inputs[0].?.support.?.offset = 0;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+}
+
+fn cloneBitmapInputs(a: std.mem.Allocator) !void {
+    const inputs = [_]?AggregateInput{
+        .{ .slot = 0, .support = .{ .value = .{ .words = &.{ 1, 3 } } } },
+        null,
+        .{ .slot = 0, .support = .{ .value = .{ .words = &.{5} } } },
+    };
+    const page: Page = .{ .rows = &.{}, .aggregate_inputs = &inputs };
+    const cloned = (try page.cloneAggregateInputs(a)).?;
+    defer a.free(cloned);
+    defer for (cloned) |input| if (input) |argument| a.free(argument.support.?.value.words);
+    for (inputs, cloned) |input, copy| try std.testing.expectEqualDeep(input, copy);
+}
+
+test "SQL bitmap page clones release partially initialized arguments" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneBitmapInputs, .{});
+}
+
+fn cloneStatisticBatch(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const big = try Count.parse(arena.allocator(), "1000000000000000000000000000000");
+    var words = [_]u64{5};
+    const Argument = @import("cypher").statistic.Argument;
+    const arguments = [_]Argument{
+        .{ .slot = 1, .value = 3, .weight = big, .extra = .{ .value = 4, .weight = big } },
+        .{ .slot = 7, .support = .{ .value = .{ .words = &words } } },
+    };
+    const inputs = [_]?AggregateInput{.{ .batch = &arguments }};
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    var page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{ 1, 7 }, .aggregate_inputs = &inputs };
+    try page.validateWeights();
+    const cloned = (try page.cloneAggregateInputs(a)).?;
+    defer a.free(cloned);
+    defer cloned[0].?.deinitOwned(a);
+    words[0] = 0;
+    try std.testing.expectEqual(@as(u64, 5), cloned[0].?.batch[1].support.?.value.words[0]);
+    try std.testing.expectEqual(std.math.Order.eq, cloned[0].?.batch[0].weight.order(big));
+    page.aggregate_slots = &.{1};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+}
+
+test "SQL statistic batches deeply own promoted weights and bitmap arguments" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneStatisticBatch, .{});
+}
+
+test "SQL statistic batches reject duplicate slots and malformed bin/support payloads" {
+    const Argument = @import("cypher").statistic.Argument;
+    var arguments = [_]Argument{ .{ .slot = 0 }, .{ .slot = 0 } };
+    const inputs = [_]?AggregateInput{.{ .batch = &arguments }};
+    const rows = [_]Row{.{ .id = "r", .version = 0, .value = .null }};
+    const page: Page = .{ .rows = &rows, .multiplicities = &.{1}, .aggregate_slots = &.{ 0, 1 }, .aggregate_inputs = &inputs };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].slot = 1;
+    try page.validateWeights();
+    arguments[1].extra = .{ .value = 1, .weight = Count.init(0) };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].extra = .{ .value = 1, .weight = Count.one };
+    arguments[1].support = .{ .value = .{ .words = &.{1} } };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].extra = null;
+    arguments[1].support.?.value.words = &.{0};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validateWeights());
+    arguments[1].support.?.value.words = &.{1};
+    try page.validateWeights();
 }

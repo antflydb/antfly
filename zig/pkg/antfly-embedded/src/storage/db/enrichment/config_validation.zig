@@ -37,11 +37,22 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
     return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
 }
 
+/// PDF input consumes a URI selected from the source document. Both literal
+/// fields and rendered URI templates are supported; text chunking is not.
+/// Share this check with storage admission to avoid accepting definitions that
+/// cannot be installed after metadata publication.
+pub fn validateEmbeddingInput(kind: types.EnrichmentKind, input: @import("enrichment_types.zig").EmbeddingInput, source_artifact_name: []const u8, chunk_size: u32, chunker_json: []const u8) !void {
+    if (input == .text) return;
+    if (kind != .embedding) return error.InvalidEnrichmentConfig;
+    try @import("enrichment_types.zig").validateEmbeddingInputShape(input, source_artifact_name.len == 0, chunk_size != 0 or chunker_json.len != 0);
+}
+
 /// Validates the context-free portion of a public enrichment definition.
 /// Dependency edges are validated by the catalog-aware caller, while this
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
     if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+    try validateEmbeddingInput(cfg.kind, cfg.embedding_input, cfg.source_artifact_name, cfg.chunk_size, cfg.chunker_json);
     if (cfg.kind == .group) {
         const source = cfg.source orelse return error.InvalidEnrichmentConfig;
         try source.validate();
@@ -92,7 +103,6 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
             if ((source_producer.type == .vector_labels or source_producer.type == .media_output) and cfg.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
             if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
             if (cfg.source_artifact_name.len > 0) {
-                if (cfg.field.len > 0 or cfg.template.len > 0) return error.InvalidEnrichmentConfig;
                 try validateUpstreamAssetProducer(alloc, cfg.producer_json);
             }
         },
@@ -205,7 +215,7 @@ pub fn transcriberShorthandProducerJsonAlloc(alloc: Allocator, transcriber: std.
     return try std.json.Stringify.valueAlloc(alloc, .{
         .type = "document_extraction",
         .config = .{
-            .transcription = .{ .enabled = true, .config = transcriber },
+            .transcription = .{ .transcriber = transcriber },
         },
     }, .{});
 }
@@ -219,7 +229,7 @@ test "transcriber shorthand expands to a document extraction producer" {
     const producer_json = try transcriberShorthandProducerJsonAlloc(alloc, parsed.value);
     defer alloc.free(producer_json);
     try std.testing.expectEqualStrings(
-        "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+        "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
         producer_json,
     );
     // The expansion is accepted by the same admission check as a hand-written producer.
@@ -249,7 +259,7 @@ test "public enrichment validation rejects invalid execution and producer config
         .name = "units",
         .kind = .asset,
         .field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":20},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
         .name = "chunks",
@@ -344,26 +354,56 @@ test "producer JSON equality ignores object key order" {
 /// looking artifacts with weaker semantics. Fence it before storing the catalog.
 pub fn requiredReaderVersion(alloc: Allocator, cfg: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig) !u32 {
     const catalog = @import("../catalog/resolver_catalog.zig");
-    if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) return catalog.grouped_sources_reader_version;
-    if (cfg.kind != .asset or cfg.producer_json.len == 0) return 1;
+    const baseline: u32 = if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) catalog.grouped_sources_reader_version else 1;
+    if (cfg.kind != .asset or cfg.producer_json.len == 0) return baseline;
     var producer = try asset_producer.parseProducerConfig(alloc, cfg.producer_json);
     defer producer.deinit(alloc);
     if (producer.type == .generator) {
         var config = try @import("../../../generating/producer_config.zig").parse(alloc, producer.config_json);
         defer config.deinit(alloc);
-        if (config.output_schema != null) return catalog.generated_producers_reader_version;
+        if (config.output_schema != null) return @max(baseline, catalog.generated_producers_reader_version);
     } else if (producer.type == .extractor) {
-        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return catalog.generated_producers_reader_version;
+        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return @max(baseline, catalog.generated_producers_reader_version);
     } else if (producer.type == .decision) {
         const spec = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
         defer spec.deinit();
-        if (spec.value.decider.decision_method == .generated) return catalog.generated_producers_reader_version;
+        if (spec.value.decider.decision_method == .cascade) return @max(baseline, if (@import("antfly_decisions").cascade.requiresAgreement(spec.value.decider.cascade.?)) catalog.cascade_agreement_reader_version else catalog.decider_cascade_reader_version);
+        if (spec.value.decider.decision_method == .generated) return @max(baseline, catalog.generated_producers_reader_version);
     }
-    return 1;
+    return baseline;
 }
 
 pub fn priorSharesGroup(configs: anytype, name: []const u8, prior: []const u8) bool {
     const current_root = @import("enrichment_types.zig").groupRoot(configs, name) orelse return false;
     const prior_root = @import("enrichment_types.zig").groupRoot(configs, prior) orelse return false;
     return std.mem.eql(u8, current_root, prior_root);
+}
+
+/// Shared admission for a media-output projection's edge into a model pass.
+/// API normalization and local installation must accept the same recipes.
+pub fn validateMediaOutputSource(alloc: Allocator, producer_json: []const u8, chunker_json: []const u8, upstream_source: []const u8) !void {
+    if (upstream_source.len != 0 or chunker_json.len == 0) return error.InvalidEnrichmentConfig;
+    var chunker = try @import("../../../chunking/types.zig").parseConfigFromSlice(alloc, chunker_json);
+    defer chunker.deinit(alloc);
+    if (!chunker.isModelAware() or chunker.outputs_json.len == 0) return error.InvalidEnrichmentConfig;
+    var outputs = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, alloc, chunker.outputs_json, .{});
+    defer outputs.deinit();
+    var producer = try asset_producer.parseProducerConfig(alloc, producer_json);
+    defer producer.deinit(alloc);
+    if (producer.type != .media_output) return error.InvalidEnrichmentConfig;
+    var consumer = try @import("media_output.zig").parse(alloc, producer.config_json);
+    defer consumer.deinit();
+    for (outputs.value.targets) |target| {
+        if (std.mem.eql(u8, target.name, consumer.value.output_name)) return;
+    }
+    return error.InvalidEnrichmentConfig;
+}
+
+/// A media-output asset is the root of an ordinary asset-bytes chain. Its
+/// separate edge into the model pass is validated by validateMediaOutputSource;
+/// consumers must not reinterpret that chunk name as another asset name.
+pub fn assetSourceChainEndsHere(alloc: Allocator, producer_json: []const u8) !bool {
+    var producer = try asset_producer.parseProducerConfig(alloc, producer_json);
+    defer producer.deinit(alloc);
+    return producer.type == .media_output;
 }

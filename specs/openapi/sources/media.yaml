@@ -1,0 +1,60 @@
+openapi: 3.0.3
+info:
+  title: Source Media Delivery Protocol
+  version: 1.0.0
+  description: >-
+    Shared Go-server and Colony media delivery. References contain an opaque,
+    private capability URL issued by the hosting runtime, never a management
+    token or provider credential. Consumers use the published URL verbatim.
+    Standalone media_base_url is its /v1/media prefix. Hosted media_base_url
+    includes organization/instance scope and a signing-key version. Authentication,
+    current source/object authority and protected credential resolution belong
+    to the runtime; streaming/range/version semantics are shared Go code.
+servers:
+  - url: '{media_base_url}'
+    variables:
+      media_base_url:
+        default: https://sources.example/v1/media
+paths:
+  /{receipt_id}/{signature}:
+    parameters:
+      - {name: receipt_id, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{64}$'}}
+      - {name: signature, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{64}$'}}
+      - {name: If-Match, in: header, schema: {type: string}, description: Published strong representation ETag.}
+      - {name: If-None-Match, in: header, schema: {type: string}}
+      - {name: Range, in: header, schema: {type: string}, description: Byte ranges over the selected original representation. Multipart work is bounded.}
+      - {name: If-Range, in: header, schema: {type: string}}
+    get:
+      operationId: fetchSourceMedia
+      description: >-
+        Resolve current authority and provider version before serving. Exact
+        byte length and selected revision are enforced. Stale historical bytes
+        fail instead of being replaced by newer content. A streamed response
+        interrupted by provider/version failure must not be accepted as complete.
+        Capability URLs must be redacted in logs and kept private. Browser
+        execution is disabled with attachment, sandbox and nosniff headers.
+      responses:
+        '200':
+          description: Complete selected representation with exact Content-Length, MIME and strong ETag.
+          content: {application/octet-stream: {schema: {type: string, format: binary}}}
+        '206':
+          description: Selected bytes with validated Content-Range and representation ETag.
+          content: {application/octet-stream: {schema: {type: string, format: binary}}}
+        '304': {description: Authorized representation unchanged.}
+        '404': {description: Invalid capability or unknown verification key.}
+        '410': {description: Media authority retired or revoked.}
+        '412': {description: Selected provider version or If-Match no longer matches.}
+        '416': {description: Invalid or unsatisfiable range.}
+        '502': {description: Provider fetch failed.}
+        '503': {description: Authority unavailable or capacity exhausted; capacity responses include Retry-After.}
+        '504': {description: Fetch deadline expired.}
+    head:
+      operationId: inspectSourceMedia
+      description: Current authorization/version-checked metadata without downloading the body.
+      responses:
+        '200': {description: Exact Content-Length, MIME and strong ETag, without response body.}
+        '304': {description: Authorized representation unchanged.}
+        '404': {description: Invalid capability.}
+        '410': {description: Media authority retired or revoked.}
+        '412': {description: Selected representation changed.}
+        '503': {description: Authority unavailable or capacity exhausted.}

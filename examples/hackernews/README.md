@@ -68,7 +68,7 @@ publication/count, remove only that state's cache, and start before measuring.
 
 ## October 7 results
 
-`qualification.json` records observations from a local Debug build against GCS.
+`docs/operations/hackernews/history/qualification.json` records observations from a local Debug build against GCS.
 
 | 10,000-row sample | First highlighted query | Repeat | After restart | Exact ordered filter |
 |---|---:|---:|---:|---|
@@ -157,7 +157,7 @@ Debug timings use a different platform and optimization level.
 
 ### October 8 results
 
-[regional-qualification.json](regional-qualification.json) records two runs per
+[regional-qualification.json](../../docs/operations/hackernews/history/regional-qualification.json) records two runs per
 mode on one `us-central1` worker, using main `d2e9138f3f` and a Linux `fast` build.
 All five metadata indexes published, with exact filter totals/ranked pages
 matching residual evaluation before and after restart. HN IDs and scores also
@@ -193,7 +193,7 @@ only and about 38 KB with metadata indexes, rather than downloading megabytes.
 
 ### Automatic predicate planner results
 
-[planner-qualification.json](planner-qualification.json) records the follow-up
+[planner-qualification.json](../../docs/operations/hackernews/history/planner-qualification.json) records the follow-up
 on `10e36b97f1`, using the same raw export, GKE node, Linux `fast` optimization,
 and pod resources. Each mode ran twice with five warm samples per filter in
 each cycle. The table pools those ten samples per filter:
@@ -631,7 +631,7 @@ The temporary bucket is unsuitable for the public service's durable storage.
 
 ### October 10 full-archive results
 
-[archive-results-20261010.json](archive-results-20261010.json) records the pinned
+[archive-results-20261010.json](../../docs/operations/hackernews/history/archive-results-20261010.json) records the pinned
 47,717,307-row raw export and the merged-main Linux `fast` attempt. Registration
 took 49.6 seconds, then publication failed with `ParquetRowGroupTooLarge` before
 SQL counts or search timings could be measured. The temporary pod and its 36
@@ -739,7 +739,7 @@ without erasing original reservations or failed attempts:
 ```sh
 python examples/hackernews/archive_budget.py \
   --ledger /private/tmp/hn-archive-budget.json \
-  --evidence examples/hackernews/archive-reconciliation-20261011.json
+  --evidence docs/operations/hackernews/history/archive-reconciliation-20261011.json
 ```
 
 Evidence must identify a deleted pod, the matching ledger run, closure and export
@@ -774,7 +774,7 @@ historical/current replacement semantics, and restart/cursor correctness passed.
 Restart searches took 703–712 ms. Cold highlighted queries still took 15.9–18.0
 seconds, and early deep cursor pages exceeded the 2-second p95 gate. This is a
 **failed** one-file performance qualification; see
-`publication-stored-source-20261012.json`. The owned pod and all 7,429 derived
+`docs/operations/hackernews/history/publication-stored-source-20261012.json`. The owned pod and all 7,429 derived
 objects were removed with generation conditions; source data was preserved.
 
 The harness exposes health metrics only on the daemon's loopback host at the
@@ -789,7 +789,7 @@ the public HTTP recovery tests. An incomplete local cut directory now validates
 as a cache miss and opens the same authenticated remote generation; loss of
 remote authority still fails closed. Malformed manifests, missing sealed files,
 and active-reader admission are covered by engine units. Exact validation layers
-and binary provenance are in `native-recovery-qualification-20261012.json`.
+and binary provenance are in `docs/operations/hackernews/history/native-recovery-qualification-20261012.json`.
 
 New seekable text publications can bundle their opening metadata pages into one
 authenticated object per segment. The bundle stays below 1 MiB and below half of
@@ -809,7 +809,7 @@ The metadata bundle binary at revision `89ccd33a2f` passed both public native
 recovery profiles and completed two regional cycles. Cold searches improved to
 12.1–13.9 seconds but still missed the 10-second gate; early cursor pages also
 missed their latency gate. Restart search took roughly half a second. See
-`publication-metadata-qualification-20261012.json`; this remains failed
+`docs/operations/hackernews/history/publication-metadata-qualification-20261012.json`; this remains failed
 performance evidence. Phase counters placed most residual cold time in ranking
 and initial deep-page time in hydration.
 
@@ -873,7 +873,7 @@ replacement suppression, saved visibility and mutable composed cursor restart
 checks passed. Initial publication took 449.62 seconds plus 1.64 seconds of
 registration; reopening the same publication took 0.22 seconds.
 
-See `publication-ordinal-qualification-20261012.json` for binary and harness
+See `docs/operations/hackernews/history/publication-ordinal-qualification-20261012.json` for binary and harness
 provenance, gate thresholds, sample summaries and retained-report hashes. The
 first attempt lost its Kubernetes output stream and supplied only partial evidence;
 the detached supervised replacement supplied the complete passing verdict. The
@@ -969,7 +969,7 @@ IDs and scores while reducing provider reads from 397 to 314 (20.91%) and bytes
 from 53,487,307 to 46,458,677 (13.14%). These are provider counters, not an HTTP
 request trace. Native physical layouts can differ from the x86 layouts.
 
-See `local-search-comparison-20261012.json` for provenance, samples and limits.
+See `docs/operations/hackernews/history/local-search-comparison-20261012.json` for provenance, samples and limits.
 The host had unrelated concurrent work; these timings are diagnostic rather than
 a production guarantee. OS file caches were not flushed. Antfly cleared its
 serving cache before each restart; startup created one cache file, and measured
@@ -990,6 +990,11 @@ It is recorded separately in the evidence and is not an indexed BM25 comparison
 or a production latency qualification.
 
 ### Qualification after #1063
+
+For the current matched local/GCS investigation, source-storage settings, tail
+samples and the resumable comparison matrix, see
+[Remote serving performance qualification](../../docs/operations/hackernews/remote-serving-performance.md)
+and [issue #1471](https://github.com/antflydb/antfly/issues/1471).
 
 Rebuild publications with the merged routing/statistics formats before comparing
 against the earlier results. Use `--build-only` first, and run query measurements
@@ -1059,7 +1064,7 @@ sample. That diagnostic remains a separate SQL qualification finding; successful
 composition does not imply that SQL shape has been qualified.
 
 The combined implementation is recorded in
-[`combined-main-search-qualification-20261012.json`](combined-main-search-qualification-20261012.json).
+[`docs/operations/hackernews/history/combined-main-search-qualification-20261012.json`](../../docs/operations/hackernews/history/combined-main-search-qualification-20261012.json).
 On the raw 142,577-row sample, final empty-serving-cache searches took
 32.25–78.91 ms, warm p95 7.87–9.03 ms, and restart searches 29.61–38.56 ms.
 After default readiness warmup, first searches took 30.74–49.13 ms; 42 planning
@@ -1120,7 +1125,7 @@ readers before publishing this format. See the deployment qualification plan for
 bounds and separate correctness/performance evidence.
 
 
-The [October 13 optimized local comparison](lake-scalability-qualification-20261013.json)
+The [October 13 optimized local comparison](../../docs/operations/hackernews/history/lake-scalability-qualification-20261013.json)
 uses 1,024 source files and 128 serving runs. Two cycles preserve exact ranked
 IDs/scores and reduce first-search provider reads from 1,461 to 405 and bytes from
 50.85 MB to 24.33 MB. First highlighted search is 136–240 ms, warm p95 51–55 ms,
@@ -1153,3 +1158,90 @@ leaks, including the thirteen composed-query regressions. Runtime HTTP timings
 are a separate qualification gate, followed by an immutable release and actual
 Antfly Cloud tenant recovery/credential checks. The standalone storage scaffold
 and its retained disk are not prerequisites for the managed deployment.
+
+For the managed Cloud deployment, staged provider/table plans, authenticated gateway,
+resumable initial seed and supervised Lite producer, see [DEPLOYMENT.md](DEPLOYMENT.md).
+The production target reuses Colony’s `antfly-showcases` hosting foundation; the
+standalone renderer is a qualification tool. Managed deployment and archive-scale
+acceptance remain deployment gates.
+
+For continuous writable Iceberg changes, publication visibility, catalog-history
+growth and concurrent vacuum, see [Continuous writable-lake qualification](CONTINUOUS_LAKE.md).
+This is a separate bounded workload from the static archive search timings.
+
+
+The composed query path now reuses pinned text/scalar lake readers within each
+request, adapts bounded overlay batches to suppression, and materializes durable
+cut capabilities only when returning a continuation. Replacement keys
+still use indexed probes, and public cursors retain their restart-safe protocol.
+See [remote serving performance](../../docs/operations/hackernews/remote-serving-performance.md#composed-reader-lifetime-and-immutable-hn-tables)
+for the lifetime/fencing contract, live immutable-table migration, measurements
+and remaining release qualification.
+
+
+### Native owner serving cuts (candidate)
+
+For deployments where Antfly owns the complete write path, the candidate adds
+`lake_indexes.serving_cuts.enabled: true`. Enable it only after every writer,
+maintenance worker and reader runs the compatible release. Activation records
+staged native ownership and conditionally claims both the managed Iceberg catalog
+and WAL heads. A complete first cut atomically enables native reads; until then,
+queries retain strict publication reads. This is a durable protocol transition: switching the option off does
+not remove ownership or permit older writers. Shared REST catalogs and mutable
+prefix inventories retain their existing strict remote checks.
+
+The historical table must use an immutable `*.parquet-manifest.json` inventory;
+`object_mutability: immutable` on a prefix alone does not seal membership. The
+current table uses managed Iceberg with immutable files. Accepted WAL positions,
+publication generations and retained image references live in native metadata.
+Queries issue signed `lake3:` and `source3:` capabilities to images built during
+publication/write acceptance, avoiding query-time cursor uploads for these cuts.
+The gateway transports opaque cursors in POST bodies, bounds them to the native
+encoded capability limit, and acquires capacity before reading a request body.
+A ten-second absolute upload deadline releases that capacity even when a client
+keeps trickling bytes below the socket's idle timeout.
+If remote commitment succeeds but native acknowledgment is unconfirmed, the
+changes API returns `state: unknown` without a read receipt. The producer keeps
+its exact pending transaction and checkpoint for retry; it advances only after
+an explicit accepted response with a WAL position.
+
+A node still fetches immutable blocks on cache misses. Background warming is
+bounded and optional, uses the same verified memory/disk caches as foreground
+reads, and does not copy the whole archive or establish authority. Retention
+protects each prepared image and its publication reader for the complete cursor
+horizon. Existing generation, metadata and WAL bounds continue to apply and
+can impose explicit backpressure at high publication rates. Authenticated retained
+state, row-group and sealed-manifest bytes use the same credential-scoped durable
+cache as search blocks, so process restarts can reuse them without provider GETs.
+The exact provider generation and content checksum remain part of verification;
+a cache hit never establishes read authority.
+
+Set `ANTFLY_E2E_COMPOSED_CONCURRENT_WRITES=1` when running
+`zig/e2e/antfly/test_composed_lake_readers.py` to qualify searches during managed
+publication and three accepted write batches, including continuation stability.
+
+This candidate requires qualification before deployment. Do not interpret the
+older reader-sharing measurements as measurements of owner serving cuts.
+
+
+To prepare a sealed archive from an existing `archive_inventory.py` result:
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/seal_archive.py \
+  --inventory /absolute/path/archive-inventory.json \
+  --source-id hn-archive \
+  --output /absolute/path/manifest-output
+```
+
+The source ID must exactly match the historical table's `base_source.table_id`.
+The command prints the immutable manifest URI. Add `--upload` to verify the
+pinned live inventory and create its metadata objects under the existing archive
+prefix. Register the historical table against that URI with immutable objects;
+the current table remains a separate managed Iceberg source. Changing an
+existing prefix binding to a manifest requires a new verified publication.
+
+`cloud_plan.py native --owned-serving --archive-prefix archive/_snapshots/.../NAME.parquet-manifest.json`
+prepares separate historical/current object-table definitions and a
+`native-serving-config.json` engine configuration fragment. Rendering does not
+apply it or change the pinned Cloud runtime. Enable that fragment only on the
+compatible released engine, after reviewing the writer-credential contract.

@@ -36,6 +36,36 @@ SPEC.loader.exec_module(launcher)
 
 
 class BoundedZigBuildTest(unittest.TestCase):
+    def test_measured_build_persists_progress_and_failure_accounting(self):
+        import json
+        import check_storage_compilation as measurement
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "reports/build.json"
+
+            def measured(command, cwd, *, timeout_seconds, progress):
+                self.assertEqual(command, ["zig", "build"])
+                self.assertEqual(timeout_seconds, 7200)
+                progress(
+                    {
+                        "active_processes": [{"artifact": "antfly-runtime-api_kernel"}],
+                        "wall_seconds": 30,
+                    }
+                )
+                self.assertEqual(json.loads(report.read_text())[0]["status"], "running")
+                return 3, "compiler failed\n", {"wall_seconds": 31, "cpu_seconds": 29}
+
+            with (
+                mock.patch.object(measurement, "measured_build", side_effect=measured),
+                mock.patch("sys.stdout", new=io.StringIO()) as output,
+            ):
+                self.assertEqual(launcher.execute_build(["zig", "build"], report), 3)
+                self.assertIn("compiler failed", output.getvalue())
+            final = json.loads(report.read_text())[0]
+            self.assertEqual(final["status"], "failed")
+            self.assertEqual(final["returncode"], 3)
+            self.assertEqual(final["cpu_seconds"], 29)
+
     def test_unit_inventory_failure_never_launches_the_unit_build(self):
         monitor = SCRIPT.parents[2] / "scripts/ci/run-zig-unit-tests.sh"
         with tempfile.TemporaryDirectory() as temporary:
@@ -82,7 +112,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             [
                 os.environ.get("ZIG", "zig"),
                 "test",
-                "pkg/antfly/build/runtime_memory.zig",
+                "build_memory_profile_test.zig",
             ],
             cwd=SCRIPT.parents[1],
             check=True,
@@ -118,6 +148,27 @@ class BoundedZigBuildTest(unittest.TestCase):
             self.assertEqual(int(outer.group(1)), 120)
             self.assertLess(defaults["IDLE"], defaults["HARD"])
             self.assertLess(defaults["HARD"], int(outer.group(1)) * 60)
+
+    def test_base_benchmark_gate_uses_qualified_compiler_and_memory_admission(self):
+        workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text()
+        job = workflow.split("  zig-base-tests:\n", 1)[1].split(
+            "  zig-full-tests:\n", 1
+        )[0]
+        compiler = job.split("      - name: Install glibc-linked Zig\n", 1)[1].split(
+            "      - name:", 1
+        )[0]
+        self.assertIn("steps.toolchain.outputs.zig_nix_attribute", compiler)
+        self.assertIn("steps.toolchain.outputs.zig_version", compiler)
+        self.assertIn("dynamically linked", compiler)
+        benchmark = job.split(
+            "      - name: Compile consolidated storage and graph benchmark contracts\n",
+            1,
+        )[1].split("      - name:", 1)[0]
+        self.assertIn("python3 tools/run_bounded_zig_build.py", benchmark)
+        self.assertIn("--build-file ./build.zig", benchmark)
+        self.assertIn("antfly-storage-bench antfly-graph-bench", benchmark)
+        self.assertIn("-Doptimize=debug -Dcpu=baseline", benchmark)
+        self.assertNotIn("-j1", benchmark)
 
     def test_ci_scheduler_caps_admit_the_storage_compile_claim(self):
         # Production runtime construction owns the reservation. The root build

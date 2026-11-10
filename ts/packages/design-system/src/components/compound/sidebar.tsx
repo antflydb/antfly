@@ -1,8 +1,8 @@
 "use client";
 
-import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import { PanelLeft } from "lucide-react";
+import { Slot } from "radix-ui";
 import * as React from "react";
 
 import { Button } from "@/components/ui/button";
@@ -392,7 +392,7 @@ function SidebarGroupLabel({
   asChild = false,
   ...props
 }: React.ComponentProps<"div"> & { asChild?: boolean }) {
-  const Comp = asChild ? Slot : "div";
+  const Comp = asChild ? Slot.Root : "div";
 
   return (
     <Comp
@@ -400,8 +400,8 @@ function SidebarGroupLabel({
       data-sidebar="group-label"
       className={cn(
         // mono kicker — matches form labels, table headers, dropdown labels
-        "ring-sidebar-ring flex h-8 shrink-0 items-center rounded-none px-2",
-        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
+        "ring-sidebar-ring flex h-8 shrink-0 items-center rounded-md px-2",
+        "font-sans text-xs font-medium text-muted-foreground",
         "outline-hidden transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",
         className
@@ -416,14 +416,14 @@ function SidebarGroupAction({
   asChild = false,
   ...props
 }: React.ComponentProps<"button"> & { asChild?: boolean }) {
-  const Comp = asChild ? Slot : "button";
+  const Comp = asChild ? Slot.Root : "button";
 
   return (
     <Comp
       data-slot="sidebar-group-action"
       data-sidebar="group-action"
       className={cn(
-        "text-sidebar-foreground ring-sidebar-ring hover:bg-sidebar-accent hover:text-sidebar-accent-foreground absolute top-3.5 right-3 flex aspect-square w-5 items-center justify-center rounded-none p-0 outline-hidden transition-transform focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        "text-sidebar-foreground ring-sidebar-ring hover:bg-sidebar-accent hover:text-sidebar-accent-foreground absolute top-3.5 right-3 flex aspect-square w-5 items-center justify-center rounded-md p-0 outline-hidden transition-transform focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         // Increases the hit area of the button on mobile.
         "after:absolute after:-inset-2 md:after:hidden",
         "group-data-[collapsible=icon]:hidden",
@@ -470,18 +470,15 @@ function SidebarMenuItem({ className, ...props }: React.ComponentProps<"li">) {
 const sidebarMenuButtonVariants = cva(
   cn(
     "peer/menu-button flex w-full items-center gap-3 overflow-hidden p-2 text-left outline-hidden ring-sidebar-ring",
-    // mono readout voice — matches Tabs / Dropdown / Button
-    "font-mono text-[13px] text-muted-foreground rounded-none",
-    // 2px transparent left rail — keeps content from jittering when active state lights up
-    "border-l-2 border-transparent",
-    "transition-[width,padding,color,border-color,background-color] duration-200 ease-in-out",
+    "font-sans text-sm text-muted-foreground rounded-md",
+    "transition-[width,padding,color,background-color] duration-200 ease-in-out",
     "hover:bg-sidebar-accent hover:text-foreground",
     "focus-visible:ring-2",
     "active:bg-sidebar-accent active:text-foreground",
     "disabled:pointer-events-none disabled:opacity-50",
     "group-has-data-[sidebar=menu-action]/menu-item:pr-8 aria-disabled:pointer-events-none aria-disabled:opacity-50",
-    // active: amber left rail + foreground text, no background fill
-    "data-[active=true]:border-amber-500 data-[active=true]:text-foreground",
+    // active: filled rounded row + foreground text (amber stays reserved for brand actions)
+    "data-[active=true]:bg-sidebar-accent data-[active=true]:font-medium data-[active=true]:text-foreground",
     "data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-foreground",
     "group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2!",
     "[&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0"
@@ -519,7 +516,7 @@ function SidebarMenuButton({
   isActive?: boolean;
   tooltip?: string | React.ComponentProps<typeof TooltipContent>;
 } & VariantProps<typeof sidebarMenuButtonVariants>) {
-  const Comp = asChild ? Slot : "button";
+  const Comp = asChild ? Slot.Root : "button";
   const { isMobile, state } = useSidebar();
 
   const button = (
@@ -565,14 +562,14 @@ function SidebarMenuAction({
   asChild?: boolean;
   showOnHover?: boolean;
 }) {
-  const Comp = asChild ? Slot : "button";
+  const Comp = asChild ? Slot.Root : "button";
 
   return (
     <Comp
       data-slot="sidebar-menu-action"
       data-sidebar="menu-action"
       className={cn(
-        "text-sidebar-foreground ring-sidebar-ring hover:bg-sidebar-accent hover:text-sidebar-accent-foreground peer-hover/menu-button:text-sidebar-accent-foreground absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-none p-0 outline-hidden transition-transform focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        "text-sidebar-foreground ring-sidebar-ring hover:bg-sidebar-accent hover:text-sidebar-accent-foreground peer-hover/menu-button:text-sidebar-accent-foreground absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md p-0 outline-hidden transition-transform focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         // Increases the hit area of the button on mobile.
         "after:absolute after:-inset-2 md:after:hidden",
         "peer-data-[size=sm]/menu-button:top-1",
@@ -594,10 +591,10 @@ function SidebarMenuBadge({ className, ...props }: React.ComponentProps<"div">) 
       data-slot="sidebar-menu-badge"
       data-sidebar="menu-badge"
       className={cn(
-        // mono uppercase pill — matches Badge outline treatment
+        // count chip — matches Badge
         "text-muted-foreground pointer-events-none absolute right-1 flex h-5 min-w-5 items-center justify-center px-1.5 select-none",
-        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium tabular-nums",
-        "border-(length:--border-width) border-border rounded-none",
+        "font-sans text-xs font-medium tabular-nums",
+        "border-(length:--border-width) border-border rounded-md",
         "peer-hover/menu-button:text-foreground peer-data-[active=true]/menu-button:text-foreground",
         "peer-data-[size=sm]/menu-button:top-1",
         "peer-data-[size=default]/menu-button:top-1.5",
@@ -625,10 +622,10 @@ function SidebarMenuSkeleton({
     <div
       data-slot="sidebar-menu-skeleton"
       data-sidebar="menu-skeleton"
-      className={cn("flex h-8 items-center gap-2 rounded-none px-2", className)}
+      className={cn("flex h-8 items-center gap-2 rounded-md px-2", className)}
       {...props}
     >
-      {showIcon && <Skeleton className="size-4 rounded-none" data-sidebar="menu-skeleton-icon" />}
+      {showIcon && <Skeleton className="size-4 rounded-sm" data-sidebar="menu-skeleton-icon" />}
       <Skeleton
         className="h-4 max-w-(--skeleton-width) flex-1"
         data-sidebar="menu-skeleton-text"
@@ -679,7 +676,7 @@ function SidebarMenuSubButton({
   size?: "sm" | "md";
   isActive?: boolean;
 }) {
-  const Comp = asChild ? Slot : "a";
+  const Comp = asChild ? Slot.Root : "a";
 
   return (
     <Comp
@@ -688,15 +685,14 @@ function SidebarMenuSubButton({
       data-size={size}
       data-active={isActive}
       className={cn(
-        // mono sub-readout — slightly smaller than parent menu
         "text-muted-foreground ring-sidebar-ring [&>svg]:text-muted-foreground",
         "flex h-7 min-w-0 -translate-x-px items-center gap-2 overflow-hidden px-2",
-        "font-mono rounded-none outline-hidden",
+        "font-sans rounded-md outline-hidden",
         "hover:bg-sidebar-accent hover:text-foreground active:bg-sidebar-accent active:text-foreground",
         "focus-visible:ring-2 disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50",
         "[&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0",
         "data-[active=true]:text-foreground data-[active=true]:bg-sidebar-accent",
-        size === "sm" && "text-[11px]",
+        size === "sm" && "text-xs",
         size === "md" && "text-[13px]",
         "group-data-[collapsible=icon]:hidden",
         className

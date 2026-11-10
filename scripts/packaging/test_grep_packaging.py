@@ -52,6 +52,7 @@ class GrepPackagingTests(unittest.TestCase):
             with tarfile.open(archives[0]) as archive:
                 for name in [
                     "antfly-grep.exe",
+                    "install.sh",
                     "LICENSE",
                     "THIRD_PARTY_NOTICES.md",
                     "LICENSES/Apache-2.0.txt",
@@ -73,6 +74,39 @@ class GrepPackagingTests(unittest.TestCase):
                     manifest["sha256"], hashlib.sha256(binary.read_bytes()).hexdigest()
                 )
                 self.assertEqual(manifest["binary"], "antfly-grep.exe")
+
+    def test_release_identity_survives_cli_packaging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "antfly-grep"
+            binary.write_bytes(b"cross target")
+            archive = root / "release.tar.gz"
+            command = [
+                "python3",
+                str(ROOT / "scripts/packaging/package_grep_release.py"),
+                "--source-root",
+                str(ROOT),
+                "--binary",
+                str(binary),
+                "--output",
+                str(archive),
+                "--version",
+                "0.1.0-rc.1",
+                "--target",
+                "aarch64-macos.15.0",
+                "--commit",
+                "a" * 40,
+            ]
+            subprocess.run(command, check=True)
+            with tarfile.open(archive) as tar:
+                metadata = json.load(tar.extractfile("./share/antfly-grep/build.json"))
+                self.assertEqual(metadata["version"], "0.1.0-rc.1")
+                self.assertEqual(metadata["target"], "aarch64-macos.15.0")
+                self.assertEqual(metadata["source_commit"], "a" * 40)
+                self.assertEqual(tar.getmember("./install.sh").mode, 0o755)
+            incomplete = subprocess.run(command[:-2], capture_output=True, text=True)
+            self.assertNotEqual(incomplete.returncode, 0)
+            self.assertIn("release identity requires", incomplete.stderr)
 
 
 if __name__ == "__main__":

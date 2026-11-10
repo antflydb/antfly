@@ -199,6 +199,13 @@ export interface NativeLibrary {
   bufferFree: KoffiFunc<(buffer: object) => void>;
 
   dbSqlJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  dbGraphCatalogJson?: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  dbCypherJson?: KoffiFunc<
+    (handle: unknown, graph: object, request: object, out: object) => number
+  >;
+  dbGraphWriteStatusJson?: KoffiFunc<
+    (handle: unknown, transactionId: object, out: object) => number
+  >;
   dbOpenTable: KoffiFunc<(handle: unknown, name: object, out: unknown[]) => number>;
   dbCreateTableJson: KoffiFunc<(handle: unknown, name: object, schema: object) => number>;
   dbDropTable: KoffiFunc<(handle: unknown, name: object) => number>;
@@ -261,7 +268,34 @@ export interface NativeLibrary {
       syncLevel: number
     ) => number
   >;
+  /** Struct batch that returns the outcome receipt in the same call. */
+  dbBatchWithReceipt: KoffiFunc<
+    (
+      handle: unknown,
+      writes: object[] | null,
+      writeCount: number,
+      predicates: object[] | null,
+      predicateCount: number,
+      timestampNs: number | bigint,
+      syncLevel: number,
+      receiptOut: object
+    ) => number
+  >;
   dbBatchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  /** Batch JSON that returns the outcome receipt in the same call. */
+  dbBatchJsonWithReceipt: KoffiFunc<
+    (handle: unknown, request: object, out: object, receiptOut: object) => number
+  >;
+  /**
+   * Thread-local: valid only on the OS thread that ran the failed call, so
+   * it cannot follow an async (worker-thread) call. SQL error bodies carry
+   * the same receipt as "outcome_receipt".
+   */
+  lastErrorOutcomeReceipt: KoffiFunc<(out: object) => number>;
+  dbOutcomeReceiptStatus: KoffiFunc<
+    (handle: unknown, receipt: object, outStatus: number[]) => number
+  >;
+  dbOutcomeReceiptForget: KoffiFunc<(handle: unknown, receipt: object) => number>;
   dbBeginTransactionWithId: KoffiFunc<
     (
       handle: unknown,
@@ -392,7 +426,6 @@ export interface NativeLibrary {
   inferenceDecideJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceExtractJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceReadJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
-  inferenceTranscribeJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceListModelsJson: KoffiFunc<(handle: unknown, out: object) => number>;
   inferencePullJson: KoffiFunc<
     (
@@ -460,6 +493,31 @@ function buildNative(): NativeLibrary {
   const handle = koffi.load(resolved.path);
 
   const f = handle.func.bind(handle);
+  let dbGraphCatalogJson: NativeLibrary["dbGraphCatalogJson"];
+  let dbCypherJson: NativeLibrary["dbCypherJson"];
+  let dbGraphWriteStatusJson: NativeLibrary["dbGraphWriteStatusJson"];
+  try {
+    dbGraphCatalogJson = f("antfly_db_graph_catalog_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]);
+    dbCypherJson = f("antfly_db_cypher_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]);
+    dbGraphWriteStatusJson = f("antfly_db_graph_write_status_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]);
+  } catch {
+    dbGraphCatalogJson = undefined;
+    dbCypherJson = undefined;
+    dbGraphWriteStatusJson = undefined;
+  }
 
   return {
     handle,
@@ -489,6 +547,9 @@ function buildNative(): NativeLibrary {
     bufferFree: f("antfly_buffer_free", "void", [koffi.pointer(AntflyBuffer)]),
 
     dbSqlJson: f("antfly_db_sql_json", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
+    dbGraphCatalogJson,
+    dbCypherJson,
+    dbGraphWriteStatusJson,
     dbOpenTable: f("antfly_db_open_table", "uint32_t", [PAntflyDb, AntflySlice, PAntflyDbOut]),
     dbCreateTableJson: f("antfly_db_create_table_json", "uint32_t", [
       PAntflyDb,
@@ -573,7 +634,33 @@ function buildNative(): NativeLibrary {
       "uint64_t",
       "uint8_t",
     ]),
+    dbBatchWithReceipt: f("antfly_db_batch_with_receipt", "uint32_t", [
+      PAntflyDb,
+      PAntflyWriteIntentArray,
+      "size_t",
+      PAntflyVersionPredicateArray,
+      "size_t",
+      "uint64_t",
+      "uint8_t",
+      PAntflyBufferOut,
+    ]),
     dbBatchJson: f("antfly_db_batch_json", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
+    dbBatchJsonWithReceipt: f("antfly_db_batch_json_with_receipt", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+      PAntflyBufferOut,
+    ]),
+    lastErrorOutcomeReceipt: f("antfly_last_error_outcome_receipt", "uint32_t", [PAntflyBufferOut]),
+    dbOutcomeReceiptStatus: f("antfly_db_outcome_receipt_status", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PUint8Out,
+    ]),
+    dbOutcomeReceiptForget: f("antfly_db_outcome_receipt_forget", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+    ]),
     dbBeginTransactionWithId: f("antfly_db_begin_transaction_with_id", "uint32_t", [
       PAntflyDb,
       "const uint8_t *",
@@ -852,11 +939,6 @@ function buildNative(): NativeLibrary {
       PAntflyBufferOut,
     ]),
     inferenceReadJson: f("antfly_inference_read_json", "uint32_t", [
-      PAntflyInference,
-      AntflySlice,
-      PAntflyBufferOut,
-    ]),
-    inferenceTranscribeJson: f("antfly_inference_transcribe_json", "uint32_t", [
       PAntflyInference,
       AntflySlice,
       PAntflyBufferOut,

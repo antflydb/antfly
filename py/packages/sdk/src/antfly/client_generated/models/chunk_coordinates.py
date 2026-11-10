@@ -19,6 +19,8 @@ class ChunkCoordinates:
 
     Attributes:
         kind (ChunkCoordinatesKind):
+        speaker_index (int | Unset): Source-scoped speaker of a chunk made with audio_speaker_turns; omitted for
+            unassigned intervals.
         start_byte (int | Unset):
         end_byte (int | Unset):
         page (int | Unset):
@@ -47,6 +49,7 @@ class ChunkCoordinates:
     """
 
     kind: ChunkCoordinatesKind
+    speaker_index: int | Unset = UNSET
     start_byte: int | Unset = UNSET
     end_byte: int | Unset = UNSET
     page: int | Unset = UNSET
@@ -71,6 +74,8 @@ class ChunkCoordinates:
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
+
+        speaker_index = self.speaker_index
 
         start_byte = self.start_byte
 
@@ -127,6 +132,8 @@ class ChunkCoordinates:
                 "kind": kind,
             }
         )
+        if speaker_index is not UNSET:
+            field_dict["speaker_index"] = speaker_index
         if start_byte is not UNSET:
             field_dict["start_byte"] = start_byte
         if end_byte is not UNSET:
@@ -175,6 +182,8 @@ class ChunkCoordinates:
         d = dict(src_dict)
         kind = ChunkCoordinatesKind(d.pop("kind"))
 
+        speaker_index = d.pop("speaker_index", UNSET)
+
         start_byte = d.pop("start_byte", UNSET)
 
         end_byte = d.pop("end_byte", UNSET)
@@ -222,6 +231,7 @@ class ChunkCoordinates:
 
         chunk_coordinates = cls(
             kind=kind,
+            speaker_index=speaker_index,
             start_byte=start_byte,
             end_byte=end_byte,
             page=page,

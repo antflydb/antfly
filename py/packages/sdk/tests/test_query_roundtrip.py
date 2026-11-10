@@ -81,3 +81,50 @@ def test_canonical_boolean_threshold_roundtrip(minimum, field):
         }
     }
     assert QueryRequest.from_dict(body).to_dict() == body
+
+
+def test_projection_preserves_string_fields_and_nested_case_roundtrip():
+    body = {
+        "fields": ["path", "revision"],
+        "params": {"cached": "opaque", "empty": None},
+        "select": {
+            "identity": {"call": "value_identity", "args": [{"field": "image"}]},
+            "image": {
+                "case": [
+                    {
+                        "when": {"is_distinct_from": [{"ref": "identity"}, {"param": "cached"}]},
+                        "then": {"field": "image"},
+                    }
+                ],
+                "else": {"literal": None},
+            },
+        },
+    }
+    assert QueryRequest.from_dict(body).to_dict() == body
+
+
+def test_decision_message_roundtrip_with_table_image_inside_content_array():
+    from antfly.client_generated.models.decision_evidence_message import DecisionEvidenceMessage
+
+    body = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Is this an error?"},
+            {
+                "type": "input_image",
+                "source": {
+                    "table": "docs",
+                    "document_id": "a",
+                    "field": "image",
+                    "revision_field": "revision",
+                    "revision": "r1",
+                    "sha256": "a" * 64,
+                    "mime_type": "image/png",
+                    "byte_length": 68,
+                    "max_pixels": 16,
+                },
+            },
+        ],
+    }
+    parsed = DecisionEvidenceMessage.from_dict(body)
+    assert parsed.to_dict() == body

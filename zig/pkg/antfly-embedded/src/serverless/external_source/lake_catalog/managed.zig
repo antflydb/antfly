@@ -21,9 +21,16 @@ const types = @import("types.zig");
 const metadata = @import("metadata.zig");
 const A = std.mem.Allocator;
 const retired = @import("retirement_index.zig");
+const reachability = @import("reachability.zig");
+pub const ReferenceRequest = struct {
+    objects: []const []const u8,
+    /// Zero only looks up an existing proof and never advances bootstrap.
+    max_steps: usize = types.max_reference_steps,
+};
 pub const Retirement = struct { id: []const u8, expected_metadata_location: []const u8, expected_version: []const u8, objects: []const []const u8 };
 
 pub const Record = struct {
+    native_owner: ?[16]u8 = null,
     retirement_root: ?retired.Digest = null,
     format: u8 = 1,
     commit_id: []const u8,
@@ -35,6 +42,7 @@ pub const Record = struct {
     previous_version: ?[]const u8 = null,
 };
 pub const Managed = struct {
+    native_owner: ?[16]u8 = null,
     client: storage.Client,
     bucket: []const u8,
     prefix: []const u8,
@@ -71,7 +79,7 @@ pub const Managed = struct {
         try self.context.ensureActive();
         var client = self.client;
         client.allocator = a;
-        return client.getObject(self.bucket, key_, .{ .max_response_bytes = limit, .cancellation = self.token() }) catch |err| switch (err) {
+        return client.getObject(self.bucket, key_, .{ .skip_metadata_probe = true, .max_response_bytes = limit, .cancellation = self.token() }) catch |err| switch (err) {
             error.ObjectNotFound, error.FileNotFound => null,
             else => {
                 try self.context.ensureActive();
@@ -103,7 +111,7 @@ pub const Managed = struct {
         var data = (try self.get(a, r.metadata_key, types.max_metadata_bytes)) orelse return error.InvalidLakeCatalog;
         defer data.deinit(a);
         if (!std.mem.eql(u8, &types.digestHex(data.body), r.metadata_hash)) return error.InvalidLakeCatalog;
-        const version = head.metadata.etag orelse return error.LakeCatalogConditionalWritesRequired;
+        const version = (head.metadata.writeRevision() orelse return error.LakeCatalogConditionalWritesRequired).token();
         const location = try a.dupe(u8, r.metadata_location);
         errdefer a.free(location);
         const body = try a.dupe(u8, data.body);
@@ -188,6 +196,31 @@ pub const Managed = struct {
         defer p.deinit();
         return self.loadCommitted(a, p.value);
     }
+    fn referencesFor(self: *const Managed, a: A, table: types.Table, objects: []const []const u8, max_steps: usize) !types.References {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = try self.artifactUri(scratch), .context = self.context };
+        var builder = reachability.Builder.init(scratch, files, try self.catalogKey(scratch, "reachability"), try self.catalogKey(scratch, "head.json"));
+        defer builder.deinit();
+        const proof = try builder.step(scratch, table, max_steps);
+        const flags = try a.alloc(bool, if (proof.ready) objects.len else 0);
+        errdefer a.free(flags);
+        if (proof.ready) {
+            for (objects, flags) |uri, *flag| flag.* = try builder.contains(proof.members, uri);
+        }
+        // The public wrapper owns table; internal retirement borrows it.
+        return .{ .table = table, .ready = proof.ready, .referenced = flags, .steps = proof.steps };
+    }
+    pub fn references(self: *const Managed, a: A, objects: []const []const u8) !types.References {
+        return self.referencesBounded(a, .{ .objects = objects });
+    }
+    pub fn referencesBounded(self: *const Managed, a: A, request: ReferenceRequest) !types.References {
+        if (request.objects.len > 4096 or request.max_steps > types.max_reference_steps) return error.InvalidLakeRetirement;
+        var table = try self.load(a);
+        errdefer table.deinit(a);
+        return self.referencesFor(a, table, request.objects, request.max_steps);
+    }
     /// Atomically publish irreversible retirements through the same HEAD CAS
     /// as ordinary commits. A writer that read before this CAS must conflict;
     /// a writer that reads afterward validates against the new immutable root.
@@ -214,19 +247,30 @@ pub const Managed = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var selected: std.StringHashMapUnmanaged(void) = .empty;
         const allowed = try std.fmt.allocPrint(scratch, "{s}/", .{std.mem.trimEnd(u8, try self.artifactUri(scratch), "/")});
         for (request.objects) |uri| {
             if (uri.len > 4096 or !std.mem.startsWith(u8, uri, allowed) or std.mem.indexOf(u8, uri[allowed.len..], "..") != null) return error.InvalidLakeRetirement;
-            try selected.put(scratch, uri, {});
         }
         var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
         defer index.deinit();
-        // The authority independently checks every current root, including
-        // named branches. A coordinator's earlier mark set is not evidence.
-        try self.checkReferences(scratch, table.metadata_json, null, &index, null, &selected);
-        var root = table.retirement_root;
-        for (request.objects) |uri| root = try index.insert(root, uri);
+        // Only catalog-owned, exact-metadata proofs authorize retirement.
+        // Deadline-bound retirement only consumes an already prepared proof.
+        while (true) {
+            var work = std.heap.ArenaAllocator.init(a);
+            defer work.deinit();
+            const refs = try self.referencesFor(work.allocator(), table, request.objects, if (self.context.deadline_ns != null) 0 else types.max_reference_steps);
+            if (refs.ready) {
+                for (refs.referenced) |referenced| if (referenced) return error.LakeObjectStillReferenced;
+                break;
+            }
+            if (self.context.deadline_ns != null) return error.LakeReachabilityPending;
+            // A synchronous caller must not keep rebuilding an obsolete
+            // target after another writer advances HEAD during bootstrap.
+            var current = try self.load(work.allocator());
+            defer current.deinit(work.allocator());
+            if (current.version == null or !std.mem.eql(u8, current.version.?, request.expected_version)) return error.LakeCommitConflict;
+        }
+        const root = try index.insertMany(table.retirement_root, request.objects);
         // Keep the metadata bytes unchanged. The catalog version nevertheless
         // advances and the immutable history retains receipt recovery proof.
         const head_key = try self.catalogKey(scratch, "head.json");
@@ -257,14 +301,13 @@ pub const Managed = struct {
         const scratch = arena.allocator();
         var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
         defer index.deinit();
-        try self.checkReferences(scratch, candidate, parent.metadata_json, &index, parent.retirement_root, null);
+        try self.checkReferences(scratch, candidate, parent.metadata_json, &index, parent.retirement_root);
     }
-    fn checkUri(uri: []const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
+    fn checkUri(uri: []const u8, index: *retired.Index, root: ?retired.Digest) !void {
         try index.context.ensureActive();
-        if (selected) |set| if (set.contains(uri)) return error.LakeObjectStillReferenced;
         if (try index.contains(root, uri)) return error.LakeObjectRetired;
     }
-    fn checkReferences(self: *const Managed, a: A, candidate: []const u8, parent: ?[]const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
+    fn checkReferences(self: *const Managed, a: A, candidate: []const u8, parent: ?[]const u8, index: *retired.Index, root: ?retired.Digest) !void {
         const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = try self.artifactUri(a), .context = self.context };
         const next = try metadata.parse(a, candidate);
         const before = if (parent) |bytes_| try metadata.parse(a, bytes_) else null;
@@ -273,16 +316,18 @@ pub const Managed = struct {
         inline for (.{ "statistics", "partition-statistics" }) |kind| {
             if (next.object.get(kind)) |entries| {
                 if (entries != .array) return error.InvalidLakeMetadata;
-                for (entries.array.items) |entry| try checkUri(try metadata.str(try metadata.get(entry, "statistics-path")), index, root, selected);
+                for (entries.array.items) |entry| try checkUri(try metadata.str(try metadata.get(entry, "statistics-path")), index, root);
             }
         }
+        // Index the parent's snapshot IDs once. Comparing every candidate
+        // snapshot against every parent snapshot made each commit O(S^2).
+        var parent_ids: std.AutoHashMapUnmanaged(i64, void) = .empty;
         if (before) |previous| {
+            const parent_snapshots = (try metadata.get(previous, "snapshots")).array.items;
+            try parent_ids.ensureTotalCapacity(a, @intCast(parent_snapshots.len));
+            for (parent_snapshots) |original| parent_ids.putAssumeCapacity(try metadata.int(try metadata.get(original, "snapshot-id")), {});
             const has_new = for ((try metadata.get(next, "snapshots")).array.items) |snapshot| {
-                const id = try metadata.int(try metadata.get(snapshot, "snapshot-id"));
-                const existed = for ((try metadata.get(previous, "snapshots")).array.items) |original| {
-                    if (try metadata.int(try metadata.get(original, "snapshot-id")) == id) break true;
-                } else false;
-                if (!existed) break true;
+                if (!parent_ids.contains(try metadata.int(try metadata.get(snapshot, "snapshot-id")))) break true;
             } else false;
             if (!has_new) return;
         }
@@ -301,13 +346,9 @@ pub const Managed = struct {
         };
         for ((try metadata.get(next, "snapshots")).array.items) |snapshot| {
             try self.context.ensureActive();
-            const id = try metadata.int(try metadata.get(snapshot, "snapshot-id"));
-            const old = if (before) |previous| for ((try metadata.get(previous, "snapshots")).array.items) |original| {
-                if (try metadata.int(try metadata.get(original, "snapshot-id")) == id) break true;
-            } else false else false;
-            if (old) continue;
+            if (parent_ids.contains(try metadata.int(try metadata.get(snapshot, "snapshot-id")))) continue;
             const list_uri = try metadata.str(try metadata.get(snapshot, "manifest-list"));
-            try checkUri(list_uri, index, root, selected);
+            try checkUri(list_uri, index, root);
             const list_bytes = try @import("row_commit.zig").readLimited(a, files, list_uri, @min(budget, 16 * 1024 * 1024));
             budget -= list_bytes.len;
             const list = try @import("../iceberg_avro.zig").parseManifestListAlloc(a, list_bytes);
@@ -316,11 +357,11 @@ pub const Managed = struct {
                 // contain retired files. Verify new manifests only; an append
                 // must not rescan the full archive after every vacuum turn.
                 if (existing_manifests.contains(entry.manifest_path)) continue;
-                try checkUri(entry.manifest_path, index, root, selected);
+                try checkUri(entry.manifest_path, index, root);
                 const manifest_bytes = try @import("row_commit.zig").readLimited(a, files, entry.manifest_path, @min(budget, 16 * 1024 * 1024));
                 budget -= manifest_bytes.len;
                 const manifest = try @import("../iceberg_avro.zig").parseDataManifestAlloc(a, manifest_bytes);
-                for (manifest.entries) |file| if (file.status != .deleted) try checkUri(file.file_path, index, root, selected);
+                for (manifest.entries) |file| if (file.status != .deleted) try checkUri(file.file_path, index, root);
             }
         }
     }
@@ -345,7 +386,7 @@ pub const Managed = struct {
         const uri = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, self.source_uri, "/"), relative });
         defer a.free(uri);
         try self.immutable(a, data_key, bytes);
-        const r: Record = .{ .format = if (previous != null and previous.?.retirement_root != null) 2 else 1, .retirement_root = if (previous) |p| p.retirement_root else null, .commit_id = c.id, .request_hash = &types.commitHash(c), .metadata_location = uri, .metadata_key = data_key, .metadata_hash = &types.digestHex(bytes), .previous_record = if (previous) |p| p.record_key else null, .previous_version = if (previous) |p| p.version else null };
+        const r: Record = .{ .native_owner = self.native_owner, .format = if (previous != null and previous.?.retirement_root != null) 2 else 1, .retirement_root = if (previous) |p| p.retirement_root else null, .commit_id = c.id, .request_hash = &types.commitHash(c), .metadata_location = uri, .metadata_key = data_key, .metadata_hash = &types.digestHex(bytes), .previous_record = if (previous) |p| p.record_key else null, .previous_version = if (previous) |p| p.version else null };
         const record_bytes = try std.json.Stringify.valueAlloc(a, r, .{ .emit_null_optional_fields = false });
         errdefer a.free(record_bytes);
         const record_key = try self.recordKey(a, record_bytes);
@@ -356,6 +397,36 @@ pub const Managed = struct {
         try self.immutable(a, intent, record_bytes);
         return record_bytes;
     }
+    pub fn claimNativeOwner(self: *const Managed, a: A, owner: [16]u8) !void {
+        if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidLakeCatalog;
+        const head_key = try self.catalogKey(a, "head.json");
+        defer a.free(head_key);
+        for (0..8) |_| {
+            var current = (try self.get(a, head_key, 64 * 1024)) orelse return error.LakeTableNotFound;
+            defer current.deinit(a);
+            var parsed = try record(a, current.body);
+            defer parsed.deinit();
+            if (parsed.value.native_owner) |previous| {
+                if (!std.mem.eql(u8, &previous, &owner)) return error.LakeSourceOwnerRequired;
+                return;
+            }
+            parsed.value.native_owner = owner;
+            const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{ .emit_null_optional_fields = false });
+            defer a.free(bytes);
+            const record_key = try self.recordKey(a, bytes);
+            defer a.free(record_key);
+            try self.immutable(a, record_key, bytes);
+            var client = self.client;
+            client.allocator = a;
+            var result = client.compareAndPut(self.bucket, head_key, bytes, current.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .content_type = "application/json", .cancellation = self.token() }) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            result.deinit(a);
+            return;
+        }
+        return error.LakeCommitConflict;
+    }
     fn publish(self: *const Managed, a: A, bytes: []const u8) !void {
         const p = try record(a, bytes);
         defer p.deinit();
@@ -364,7 +435,21 @@ pub const Managed = struct {
         defer a.free(head);
         var current = try self.get(a, head, 64 * 1024);
         defer if (current) |*value| value.deinit(a);
-        const expected_matches = if (current) |value| if (r.previous_version) |expected| if (value.metadata.etag) |actual| std.mem.eql(u8, expected, actual) else false else false else r.previous_version == null;
+        if (current) |value| {
+            var bound = try record(a, value.body);
+            defer bound.deinit();
+            if (!std.meta.eql(bound.value.native_owner, self.native_owner)) return error.LakeSourceOwnerRequired;
+        }
+        if (!std.meta.eql(r.native_owner, self.native_owner)) {
+            // Activation may follow an already committed legacy intent. Its
+            // authenticated retry is safe; an uncommitted old intent cannot
+            // acquire the new writer's authority or publish through its fence.
+            switch (try self.resolve(a, r.commit_id, r.request_hash)) {
+                .committed => return,
+                else => return error.LakeSourceOwnerRequired,
+            }
+        }
+        const expected_matches = if (current) |value| if (r.previous_version) |expected| if (value.metadata.writeRevision()) |actual| std.mem.eql(u8, expected, actual.token()) else false else false else r.previous_version == null;
         if (!expected_matches) switch (try self.resolve(a, r.commit_id, r.request_hash)) {
             .committed => return,
             .unknown => return error.LakeCommitOutcomeUnknown,
@@ -373,7 +458,7 @@ pub const Managed = struct {
         var client = self.client;
         client.allocator = a;
         try self.context.ensureActive();
-        var result = client.putObject(self.bucket, head, bytes, .{ .if_match_etag = r.previous_version, .if_none_match = r.previous_version == null, .content_type = "application/json", .cancellation = self.token() }) catch |err| {
+        var result = client.compareAndPut(self.bucket, head, bytes, if (current) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .content_type = "application/json", .cancellation = self.token() }) catch |err| {
             // A canceled caller can inspect this same intent after restart.
             try self.context.ensureActive();
             return switch (try self.resolve(a, r.commit_id, r.request_hash)) {

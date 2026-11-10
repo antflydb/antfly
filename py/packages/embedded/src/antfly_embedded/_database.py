@@ -58,6 +58,13 @@ class TxnStatus(enum.IntEnum):
     ABORTED = 2
 
 
+class OutcomeReceiptStatus(enum.IntEnum):
+    """The resolved outcome of an ANTFLY_OUTCOME_UNKNOWN write receipt."""
+
+    APPLIED = 1
+    NOT_APPLIED = 2
+
+
 class GraphDirection(enum.IntEnum):
     """Graph edge traversal direction, as used by edges()/neighbors()."""
 
@@ -252,6 +259,59 @@ class Database:
 
         return SQLSession(self)
 
+    def graph_catalog_json(self, request: JSONInput, *, raw: bool = False) -> Any:
+        """Get/list/put/drop a graph; replacements require expected_revision."""
+        return self._graph_call(None, request, raw=raw)
+
+    def cypher_json(self, graph: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute Cypher with lossless tagged values and typed parameters."""
+        return self._graph_call(graph, request, raw=raw)
+
+    def graph_write_status(self, transaction_id: str, *, raw: bool = False) -> Any:
+        """Reconcile a durable receipt without replaying the graph statement."""
+        handle = self._acquire()
+        try:
+            data, _keep = _ffi.make_slice(encode_text(transaction_id))
+            out = _ffi.AntflyBuffer()
+            native_call = getattr(self._lib, "antfly_db_graph_write_status_json", None)
+            if native_call is None:
+                raise errors.UnsupportedError(message="This native library does not expose graph write receipts")
+            code = native_call(ctypes.c_void_p(handle), data, ctypes.byref(out))
+            body = _ffi.take_buffer(out)
+            if code:
+                diagnostic = decode_json_response(body, False) if body else None
+                if isinstance(diagnostic, dict) and "code" in diagnostic:
+                    raise errors.GraphError(code, diagnostic)
+                errors.raise_for_code(code)
+            return decode_json_response(body, raw)
+        finally:
+            self._release()
+
+    def _graph_call(self, graph: str | None, request: JSONInput, *, raw: bool) -> Any:
+        handle = self._acquire()
+        try:
+            request_slice, _request_keep = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            native_call = getattr(
+                self._lib, "antfly_db_graph_catalog_json" if graph is None else "antfly_db_cypher_json", None
+            )
+            if native_call is None:
+                raise errors.UnsupportedError(message="This native library does not expose Cypher graphs")
+            if graph is None:
+                code = native_call(ctypes.c_void_p(handle), request_slice, ctypes.byref(out))
+            else:
+                graph_slice, _graph_keep = _ffi.make_slice(encode_text(graph))
+                code = native_call(ctypes.c_void_p(handle), graph_slice, request_slice, ctypes.byref(out))
+            data = _ffi.take_buffer(out)
+            if code:
+                diagnostic = decode_json_response(data, False) if data else None
+                if isinstance(diagnostic, dict) and "code" in diagnostic:
+                    raise errors.GraphError(code, diagnostic)
+                errors.raise_for_code(code)
+            return decode_json_response(data, raw)
+        finally:
+            self._release()
+
     def sql_cursor(self, statement: str, parameters: Sequence[Any] = ()):
         from ._sql import SQLCursor
 
@@ -363,14 +423,50 @@ class Database:
                 ctypes.c_uint64(timestamp),
                 ctypes.c_uint8(0),
             )
-            errors.raise_for_code(code)
+            errors.raise_for_outcome_code(code)
         finally:
             self._release()
 
     def batch_json(self, request: JSONInput, *, raw: bool = False) -> Any:
         """Apply a public Antfly batch request (e.g. {"inserts": {...},
-        "deletes": [...]})."""
-        return self._json_call(self._lib.antfly_db_batch_json, request, raw=raw)
+        "deletes": [...]}).
+
+        An OutcomeUnknownError carries the write's `outcome_receipt`."""
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_outcome_code(
+                self._lib.antfly_db_batch_json(ctypes.c_void_p(handle), sl, ctypes.byref(out))
+            )
+            data = _ffi.take_buffer(out)
+        finally:
+            self._release()
+        return decode_json_response(data, raw)
+
+    def outcome_receipt_status(self, receipt: str) -> OutcomeReceiptStatus:
+        """Resolve an outcome receipt from an OutcomeUnknownError (or a
+        SQLStateError's `outcome_receipt`) on any handle for the same database.
+
+        Raises StalledError while the uncertain commit is not reconciled yet:
+        retry on a Lite database; for a directory database, close the issuing
+        handle and reopen first.
+        """
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(encode_text(receipt))
+            status = ctypes.c_uint8(0)
+            errors.raise_for_code(
+                self._lib.antfly_db_outcome_receipt_status(ctypes.c_void_p(handle), sl, ctypes.byref(status))
+            )
+            return OutcomeReceiptStatus(status.value)
+        finally:
+            self._release()
+
+    def forget_outcome_receipt(self, receipt: str) -> None:
+        """Remove a resolved receipt's durable marker; afterwards the receipt
+        can no longer be resolved."""
+        self._with_input(self._lib.antfly_db_outcome_receipt_forget, encode_text(receipt))
 
     def lookup(self, key: str, *, raw: bool = False) -> Any:
         data = self._with_input_output(self._lib.antfly_db_lookup_json, encode_text(key))

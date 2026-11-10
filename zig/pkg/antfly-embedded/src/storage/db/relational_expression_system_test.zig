@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const db_mod = @import("mod.zig");
-const rows = @import("relational_rows.zig");
+const rows = @import("read_session_backend").RelationalRows;
 const mapper = @import("document_mapper.zig");
 const alloc = std.testing.allocator;
 

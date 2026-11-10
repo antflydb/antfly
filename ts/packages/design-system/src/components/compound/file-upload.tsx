@@ -120,7 +120,7 @@ function FileUpload({
           onChange={handleInputChange}
         />
         <div className="space-y-1">
-          <div className="font-mono font-medium text-[13px] text-foreground">{label}</div>
+          <div className="font-sans font-medium text-sm text-foreground">{label}</div>
           {description ? <div className="text-muted-foreground text-sm">{description}</div> : null}
           {accept ? <div className="text-muted-foreground text-xs">Accepted: {accept}</div> : null}
         </div>

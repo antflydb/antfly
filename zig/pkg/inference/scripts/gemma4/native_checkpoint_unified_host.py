@@ -237,9 +237,11 @@ def unified_server(args, label, evidence, scripts):
     data_dir = args.output.resolve().with_suffix(f".{label}.data")
     data_dir.mkdir(exist_ok=False)
     config = {
-        "admission": {
+        "resources": {
             "inference": {
-                "max_concurrent_requests": qualification_admission_capacity(args)
+                "admission": {
+                    "max_concurrent_requests": qualification_admission_capacity(args)
+                }
             }
         }
     }

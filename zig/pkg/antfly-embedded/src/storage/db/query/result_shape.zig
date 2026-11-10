@@ -62,6 +62,14 @@ pub const ChunkParentResultShaper = struct {
         alloc: Allocator,
         key: []const u8,
     ) anyerror!?[]u8 = null,
+    /// Resolve derivation identity using the same pinned storage view as the
+    /// member payload. External stores need not expose native DB state keys.
+    artifact_derivation_digest: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        ref: types.ArtifactRef,
+        payload: []const u8,
+    ) anyerror!?[32]u8 = null,
     load_many_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -174,6 +182,14 @@ pub const SearchResultPostprocessor = struct {
         alloc: Allocator,
         key: []const u8,
     ) anyerror!?[]u8,
+    /// Resolve derivation identity using the same pinned storage view as the
+    /// member payload. External stores need not expose native DB state keys.
+    artifact_derivation_digest: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        ref: types.ArtifactRef,
+        payload: []const u8,
+    ) anyerror!?[32]u8 = null,
     load_many_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -901,7 +917,7 @@ const ChunkAncestorInfo = struct {
 };
 
 fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) !?[]u8 {
-    if (artifact_ref.kind == .chunk) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+    if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
     if (artifact_ref.kind != .embedding) return null;
     const source = artifact_ref.source orelse return null;
     if (source.kind != .chunk) return null;
@@ -1000,6 +1016,7 @@ fn hydrateDirectChunkAncestors(
         }
     }
 
+    try hydrateArtifactRevisions(alloc, &owned, chunk_payloads, shaper);
     if (!req.hierarchy_include_source and !req.hierarchy_include_unit) return owned;
 
     var source_count: usize = 0;
@@ -1025,6 +1042,82 @@ fn hydrateDirectChunkAncestors(
     }
 
     return owned;
+}
+
+// Capture content and derivation identity from the same storage view as the
+// member and its parent. These opaque revisions are not traversal cursors.
+fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, payloads: []const ?[]u8, shaper: ChunkParentResultShaper) !void {
+    if (shaper.load_stored == null and shaper.artifact_derivation_digest == null) return;
+    // A document may have thousands of members but one producer state.
+    // Hash that state once per pinned query view, retaining only its digest.
+    var states = std.StringHashMapUnmanaged(?[32]u8).empty;
+    defer {
+        var keys = states.keyIterator();
+        while (keys.next()) |key| alloc.free(key.*);
+        states.deinit(alloc);
+    }
+    for (result.hits, 0..) |*hit, i| {
+        const ref = if (hit.artifact_ref) |*ref| ref else continue;
+        const payload = payloads[i] orelse hit.stored_data orelse continue;
+        const state_digest: ?[32]u8 = if (shaper.artifact_derivation_digest) |resolve|
+            // Source units can have different inputs under the same parent and
+            // producer. The storage port owns its derivation/cache identity.
+            try resolve(shaper.ctx, alloc, ref.*, payload)
+        else native_state: {
+            const load = shaper.load_stored orelse break :native_state null;
+            var state_key = std.ArrayListUnmanaged(u8).empty;
+            defer state_key.deinit(alloc);
+            try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
+            try state_key.append(alloc, internal_keys.asset_state_kind);
+            // An embedding hit reports its source chunk (see reconcileArtifactRef),
+            // and its payload above is that chunk's: fingerprint the chunk
+            // producer's state too, so both revisions describe the reported member.
+            const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
+                ref.source.?.name
+            else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
+                ref.source.?.name
+            else
+                ref.name;
+            try internal_keys.appendEncodedComponent(&state_key, alloc, producer);
+            break :native_state if (states.getEntry(state_key.items)) |cached| cached.value_ptr.* else blk: {
+                const state = try load(shaper.ctx, alloc, state_key.items);
+                defer if (state) |value| alloc.free(value);
+                var digest: ?[32]u8 = null;
+                if (state) |value| {
+                    var bytes: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(value, &bytes, .{});
+                    digest = bytes;
+                }
+                const key = try alloc.dupe(u8, state_key.items);
+                errdefer alloc.free(key);
+                try states.put(alloc, key, digest);
+                break :blk digest;
+            };
+        };
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-artifact-member-revision-v1");
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, payload.len, .little);
+        hash.update(&length);
+        hash.update(payload);
+        if (state_digest) |value| {
+            hash.update(&.{1});
+            hash.update(&value);
+        } else hash.update(&.{0});
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        const revision = try std.fmt.allocPrint(alloc, "sha256:{s}", .{std.fmt.bytesToHex(&digest, .lower)});
+        errdefer alloc.free(revision);
+        const derivation = if (state_digest) |value|
+            try std.fmt.allocPrint(alloc, "sha256:{s}", .{std.fmt.bytesToHex(&value, .lower)})
+        else
+            null;
+        // Commit the pair only after every fallible allocation succeeds.
+        if (ref.revision) |old| alloc.free(old);
+        if (ref.derivation_revision) |old| alloc.free(old);
+        ref.revision = revision;
+        ref.derivation_revision = derivation;
+    }
 }
 
 fn loadDirectChunkPayloads(
@@ -1088,30 +1181,30 @@ fn loadDirectChunkPayloads(
 }
 
 fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: []const u8) !ChunkAncestorInfo {
+    var decoded = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse return error.InvalidChunkArtifact;
+    defer decoded.deinit(alloc);
+    // Native keys own source identity. Generic asset payloads are application
+    // data and may legitimately contain fields named parent_doc_key.
+    const parent_doc_key = try alloc.dupe(u8, decoded.document_id);
+    errdefer alloc.free(parent_doc_key);
+    if (decoded.kind == .asset) return .{
+        .parent_doc_key = parent_doc_key,
+        .unit_key = if (decoded.unit_id) |unit| try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, decoded.name, unit) else null,
+    };
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidChunkArtifact;
     const object = parsed.value.object;
-    const parent_doc_key = if (try jsonObjectStringDupe(alloc, object, "_parent_doc_key")) |key|
-        key
-    else if (try jsonObjectStringDupe(alloc, object, "parent_doc_key")) |key|
-        key
-    else
-        return error.InvalidChunkArtifact;
-    errdefer alloc.free(parent_doc_key);
-
     const source_artifact_name = try jsonObjectStringDupe(alloc, object, "_source_artifact_name");
     defer if (source_artifact_name) |name| alloc.free(name);
-    const parent_unit_id = try jsonObjectStringDupe(alloc, object, "_parent_unit_id");
-    defer if (parent_unit_id) |unit_id| alloc.free(unit_id);
+    const parent_unit_id = decoded.unit_id;
 
     const unit_key = if (source_artifact_name != null and parent_unit_id != null)
         try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, source_artifact_name.?, parent_unit_id.?)
     else blk: {
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse break :blk null;
-        defer artifact_ref.deinit(alloc);
-        const unit_id = artifact_ref.unit_id orelse break :blk null;
-        break :blk try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, "document_units_v1", unit_id);
+        const unit_id = decoded.unit_id orelse break :blk null;
+        const producer = if (decoded.kind == .asset) decoded.name else if (decoded.source) |source| source.name else break :blk null;
+        break :blk try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, producer, unit_id);
     };
 
     return .{
@@ -1401,6 +1494,29 @@ fn loadParentStoredForGroupedHits(
     }
 }
 
+// Verification over an exact, bounded key set is not table enumeration. Check
+// the actual result identities too; a bare result-size limit is not a proof.
+fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.SearchHit) graph_exec.CompiledPatternFilter.VerificationInput {
+    var single: [1][]const u8 = undefined;
+    const keys = if (req.value_search_candidate_keys.len != 0)
+        req.value_search_candidate_keys
+    else if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0)
+        req.filter_doc_ids
+    else if (req.hierarchy_children) |children| blk: {
+        if (children.artifact_name == null or req.hierarchy_parent_admitted) return .scan;
+        single[0] = children.parent_id;
+        break :blk if (children.parent_ids.len != 0) children.parent_ids else &single;
+    } else return .scan;
+    if (keys.len > types.max_canonical_hierarchy_groups or hits.len > keys.len) return .scan;
+    for (hits) |hit| {
+        const included = for (keys) |key| {
+            if (std.mem.eql(u8, hit.id, key)) break true;
+        } else false;
+        if (!included) return .scan;
+    }
+    return .known_keys;
+}
+
 pub fn applyStoredSearchPatternFilters(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -1461,6 +1577,15 @@ pub fn applyStoredSearchPatternFilters(
     else
         null;
 
+    var local_value_work: @import("../../../search/value_query.zig").Work = .{};
+    defer local_value_work.deinit(alloc);
+    const value_work = req.value_search_work orelse &local_value_work;
+    const verification_input = storedValueVerificationInput(req, result.hits);
+    if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+    if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+
+    const logical_verification = (if (compiled_filter) |compiled| compiled.hasLogicalValues() else false) or
+        (if (compiled_exclusion) |compiled| compiled.hasLogicalValues() else false);
     const filter_needs_stored = if (compiled_filter) |compiled| compiled.needsStoredDoc() else false;
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
@@ -1556,6 +1681,11 @@ pub fn applyStoredSearchPatternFilters(
                 continue;
             };
             defer if (!parent_aware and hit.stored_data == null and loaded_many == null) alloc.free(stored);
+            if (logical_verification) {
+                const values = @import("../../../search/value_query.zig");
+                try values.Work.charge(&value_work.documents, 1, req.value_search_execution.max_documents);
+                try values.Work.charge(&value_work.bytes, @intCast(stored.len), req.value_search_execution.max_bytes);
+            }
             break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
         } else null;
 
@@ -1693,6 +1823,7 @@ pub fn postprocessTextSearchResult(
             .load_parent_stored_many = processor.load_many_parent_stored,
             .load_stored = processor.load_stored,
             .load_many_stored = processor.load_many_stored,
+            .artifact_derivation_digest = processor.artifact_derivation_digest,
             .load_projected_stored = processor.load_projected_stored,
             .load_many_projected_stored = processor.load_many_projected_stored,
         });
@@ -1740,6 +1871,7 @@ pub fn postprocessVectorSearchResult(
             .load_parent_stored_many = processor.load_many_parent_stored,
             .load_stored = processor.load_stored,
             .load_many_stored = processor.load_many_stored,
+            .artifact_derivation_digest = processor.artifact_derivation_digest,
             .load_projected_stored = processor.load_projected_stored,
             .load_many_projected_stored = processor.load_many_projected_stored,
         });
@@ -1796,16 +1928,67 @@ pub fn resolveChunkParentId(
     return try alloc.dupe(u8, parent.string);
 }
 
+const ArtifactIdentityMatch = enum {
+    /// The hit already carries exactly the resolved artifact.
+    same,
+    /// The hit carries the embedding it matched, whose source is the resolved
+    /// artifact (a dense hit on a chunk): report the source artifact.
+    embedding_of_resolved,
+};
+
+fn verifyArtifactIdentity(alloc: Allocator, existing: types.ArtifactRef, resolved: types.ArtifactRef) !ArtifactIdentityMatch {
+    const b = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, resolved);
+    defer alloc.free(b);
+    const a = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, existing);
+    defer alloc.free(a);
+    if (std.mem.eql(u8, a, b)) return .same;
+    if (existing.kind == .embedding and resolved.kind != .embedding) if (existing.source) |source| {
+        const base = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
+            .document_id = existing.document_id,
+            .name = source.name,
+            .kind = source.kind,
+            .chunk_id = source.chunk_id,
+            .unit_id = source.unit_id,
+            .window_index = source.window_index,
+        });
+        defer alloc.free(base);
+        if (std.mem.eql(u8, base, b)) return .embedding_of_resolved;
+    };
+    return error.InvalidChunkArtifact;
+}
+
+/// Keep a hit's artifact reference when it names the resolved artifact; use
+/// the resolved one when the hit carried that artifact's embedding.
+fn reconcileArtifactRef(alloc: Allocator, slot: *?types.ArtifactRef, resolved: types.ArtifactRef) !void {
+    if (slot.*) |*existing| {
+        switch (try verifyArtifactIdentity(alloc, existing.*, resolved)) {
+            .same => return,
+            .embedding_of_resolved => {
+                var replacement = try resolved.clone(alloc);
+                // Member hydration computed both revisions for the source
+                // artifact (its payload and its producer's state): they
+                // describe the reported artifact. Move them across.
+                if (replacement.revision) |value| alloc.free(value);
+                if (replacement.derivation_revision) |value| alloc.free(value);
+                replacement.revision = existing.revision;
+                replacement.derivation_revision = existing.derivation_revision;
+                existing.revision = null;
+                existing.derivation_revision = null;
+                existing.deinit(alloc);
+                slot.* = replacement;
+            },
+        }
+    } else slot.* = try resolved.clone(alloc);
+}
+
 fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
     var resolved = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, hit.id);
     defer resolved.deinit(alloc);
 
+    const id = try alloc.dupe(u8, resolved.id);
     alloc.free(hit.id);
-    hit.id = try alloc.dupe(u8, resolved.id);
-    if (resolved.artifact_ref) |artifact_ref| {
-        if (hit.artifact_ref) |*existing| existing.deinit(alloc);
-        hit.artifact_ref = try artifact_ref.clone(alloc);
-    }
+    hit.id = id;
+    if (resolved.artifact_ref) |artifact_ref| try reconcileArtifactRef(alloc, &hit.artifact_ref, artifact_ref);
 
     for (hit.chunk_hits) |*chunk_hit| {
         try externalizeChunkHitIdentity(alloc, chunk_hit);
@@ -1816,10 +1999,15 @@ fn externalizeChunkHitIdentity(alloc: Allocator, hit: *types.ChunkHit) !void {
     var resolved = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, hit.id);
     defer resolved.deinit(alloc);
 
+    const id = try alloc.dupe(u8, resolved.id);
     alloc.free(hit.id);
-    hit.id = try alloc.dupe(u8, resolved.id);
-    if (hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
-    hit.artifact_ref = if (resolved.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+    hit.id = id;
+    if (resolved.artifact_ref) |artifact_ref| {
+        try reconcileArtifactRef(alloc, &hit.artifact_ref, artifact_ref);
+    } else {
+        if (hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+        hit.artifact_ref = null;
+    }
 }
 
 fn paginateParentChunkHits(
@@ -2513,6 +2701,36 @@ test "applyStoredSearchPatternFilters matches member-mode chunk hits against the
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a#0", result.hits[0].id);
     try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+}
+
+test "native member logical filters use parent values and shared verification budgets" {
+    const alloc = std.testing.allocator;
+    for ([_]u64{ 1, 10 }) |limit| {
+        var hits = try alloc.alloc(types.SearchHit, 2);
+        hits[0] = .{ .id = try alloc.dupe(u8, "doc:a#0") };
+        hits[1] = .{ .id = try alloc.dupe(u8, "doc:b#0") };
+        var loader = TestParentFieldFilterLoader{};
+        const filtered = applyStoredSearchPatternFilters(alloc, .{
+            .return_mode = .member,
+            .value_search_execution = .{ .allow_scan = true, .max_documents = limit },
+            .filter_query_json = "{\"value\":{\"kind\":\"equals\",\"field\":\"category\",\"text\":\"garden\"}}",
+        }, .{ .alloc = alloc, .hits = hits, .total_hits = 2 }, .{
+            .ctx = &loader,
+            .load_stored = TestParentFieldFilterLoader.loadStored,
+            .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+            .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+        });
+        if (limit == 1) {
+            try std.testing.expectError(error.ValueSearchLimitExceeded, filtered);
+            var original: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = 2 };
+            original.deinit();
+        } else {
+            var result = try filtered;
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqualStrings("doc:a#0", result.hits[0].id);
+        }
+    }
 }
 
 test "applyStoredSearchPatternFilters drops member-mode chunk hits via parent-row exclusion_query (#931)" {
@@ -3441,4 +3659,286 @@ test "external lake chunk postprocessing owns parent and member hydration failur
         const req: types.SearchRequest = .{ .return_mode = mode, .include_stored = true };
         if (vector) try std.testing.expectError(error.TestStoredLoadFailure, postprocessVectorSearchResult(a, req, raw, true, processor)) else try std.testing.expectError(error.TestStoredLoadFailure, postprocessTextSearchResult(a, req, raw, true, processor));
     };
+}
+
+test "native asset members hydrate source authority and revision identity" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const Loader = struct {
+                key: []const u8,
+                state: []const u8,
+                state_reads: usize = 0,
+                fn load(raw: ?*anyopaque, a: Allocator, key: []const u8) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    if (std.mem.eql(u8, key, self.key)) return try a.dupe(u8, "{\"text\":\"generated summary\"}");
+                    if (std.mem.eql(u8, key, self.state)) {
+                        self.state_reads += 1;
+                        return try a.dupe(u8, "producer-and-input-state");
+                    }
+                    if (std.mem.eql(u8, key, "doc:a")) return try parent(raw, a, .{}, key);
+                    return null;
+                }
+                fn parent(_: ?*anyopaque, a: Allocator, _: types.SearchRequest, key: []const u8) !?[]u8 {
+                    if (!std.mem.eql(u8, key, "doc:a")) return error.TestUnexpectedResult;
+                    return try a.dupe(u8, "{\"permissions\":{\"public\":false,\"readers\":[\"user:self\"]}}");
+                }
+            };
+            const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary");
+            defer alloc.free(key);
+            var state = std.ArrayListUnmanaged(u8).empty;
+            defer state.deinit(alloc);
+            try internal_keys.appendDocumentPrefix(&state, alloc, "doc:a");
+            try state.append(alloc, internal_keys.asset_state_kind);
+            try internal_keys.appendEncodedComponent(&state, alloc, "summary");
+            var loader = Loader{ .key = key, .state = state.items };
+            const hits = try alloc.alloc(types.SearchHit, 2);
+            var initialized: usize = 0;
+            var owns_hits = true;
+            errdefer if (owns_hits) {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            };
+            for (hits) |*hit| {
+                const id = try alloc.dupe(u8, key);
+                errdefer alloc.free(id);
+                const ref = try artifact_ids.decodeArtifactRefAlloc(alloc, key);
+                hit.* = .{ .id = id, .artifact_ref = ref };
+                initialized += 1;
+            }
+            owns_hits = false;
+            var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true, .hierarchy_include_source = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 2 }, .{ .ctx = &loader, .load_stored = Loader.load, .load_parent_stored = Loader.parent, .resolve_parent_id = TestChunkParentShaper.resolveParentId });
+            defer result.deinit();
+            try externalizeSearchResultArtifactIds(alloc, &result);
+            try std.testing.expectEqual(@as(usize, 1), loader.state_reads);
+            try std.testing.expectEqualStrings(result.hits[0].artifact_ref.?.revision.?, result.hits[1].artifact_ref.?.revision.?);
+            try std.testing.expect(result.hits[0].ancestor_source_data != null);
+            try std.testing.expectEqual(@as(usize, 71), result.hits[0].artifact_ref.?.revision.?.len);
+            try std.testing.expectEqual(@as(usize, 71), result.hits[0].artifact_ref.?.derivation_revision.?.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "a dense chunk member reports its chunk with the chunk's revisions" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        chunk: []const u8,
+        state: []const u8,
+        fn load(raw: ?*anyopaque, a: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.eql(u8, key, self.chunk)) return try a.dupe(u8, "{\"_parent_doc_key\":\"doc:a\",\"text\":\"chunk words\"}");
+            if (std.mem.eql(u8, key, self.state)) return try a.dupe(u8, "chunk-producer-state");
+            if (std.mem.eql(u8, key, "doc:a")) return try a.dupe(u8, "{}");
+            return null;
+        }
+        fn parent(_: ?*anyopaque, a: Allocator, _: types.SearchRequest, key: []const u8) !?[]u8 {
+            if (!std.mem.eql(u8, key, "doc:a")) return error.TestUnexpectedResult;
+            return try a.dupe(u8, "{}");
+        }
+    };
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
+    var state = std.ArrayListUnmanaged(u8).empty;
+    defer state.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&state, alloc, "doc:a");
+    try state.append(alloc, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&state, alloc, "body_chunks_v1");
+    var loader = Loader{ .chunk = chunk_key, .state = state.items };
+
+    // The same chunk, once as a text member and once as the dense member that
+    // carries the embedding it matched.
+    const hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, chunk_key), .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key) };
+    hits[1] = .{ .id = try alloc.dupe(u8, chunk_key), .artifact_ref = .{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "body_dense_v1"),
+        .kind = .embedding,
+        .source = .{ .kind = .chunk, .name = try alloc.dupe(u8, "body_chunks_v1"), .chunk_id = 0 },
+    } };
+    var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 2 }, .{ .ctx = &loader, .load_stored = Loader.load, .load_parent_stored = Loader.parent, .resolve_parent_id = TestChunkParentShaper.resolveParentId });
+    defer result.deinit();
+    try externalizeSearchResultArtifactIds(alloc, &result);
+    for (result.hits) |hit| try std.testing.expectEqual(types.ArtifactKind.chunk, hit.artifact_ref.?.kind);
+    const text_ref = result.hits[0].artifact_ref.?;
+    const dense_ref = result.hits[1].artifact_ref.?;
+    try std.testing.expect(text_ref.derivation_revision != null);
+    try std.testing.expectEqualStrings(text_ref.revision.?, dense_ref.revision.?);
+    try std.testing.expectEqualStrings(text_ref.derivation_revision.?, dense_ref.derivation_revision.?);
+}
+
+test "native unit ancestry uses its configured producer name" {
+    const alloc = std.testing.allocator;
+    const key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "interview_transcripts", "speech:1");
+    defer alloc.free(key);
+    var info = try parseChunkAncestorInfoAlloc(alloc, key, "{\"_parent_doc_key\":\"doc:a\",\"text\":\"spoken words\"}");
+    defer info.deinit(alloc);
+    try std.testing.expectEqualStrings(key, info.unit_key.?);
+}
+
+test "native member value verification retains scan policy and work budgets" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        fn unused(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedLoad;
+        }
+    };
+    for ([_]enum { keys, provenance, parent, unbounded, outside, budget }{ .keys, .provenance, .parent, .unbounded, .outside, .budget }) |mode| {
+        const hits = try alloc.alloc(types.SearchHit, 1);
+        hits[0] = .{ .id = try alloc.dupe(u8, if (mode == .outside) "outside" else "doc"), .stored_data = try alloc.dupe(u8, "{\"source_id\":\"selected\"}") };
+        var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+        defer result.deinit();
+        var req: types.SearchRequest = .{ .filter_query_json = "{\"value\":{\"kind\":\"equals\",\"field\":\"source_id\",\"text\":\"selected\"}}" };
+        if (mode == .provenance) {
+            req.value_search_candidate_keys = &.{"doc"};
+        } else if (mode == .parent) {
+            req.hierarchy_children = .{ .parent_id = "doc", .artifact_name = "summary" };
+            req.return_mode = .member;
+        } else if (mode != .unbounded) {
+            req.filter_doc_ids = &.{"doc"};
+            req.filter_doc_ids_positive = true;
+        }
+        if (mode == .budget) req.value_search_execution.max_bytes = 1;
+        const executor: StoredPatternFilterExecutor = .{ .ctx = null, .load_stored = Loader.unused };
+        if (mode == .unbounded or mode == .outside) {
+            try std.testing.expectError(error.ValueSearchRequiresScan, applyStoredSearchPatternFilters(alloc, req, result, executor));
+        } else if (mode == .budget) {
+            try std.testing.expectError(error.ValueSearchLimitExceeded, applyStoredSearchPatternFilters(alloc, req, result, executor));
+        } else {
+            result = try applyStoredSearchPatternFilters(alloc, req, result, executor);
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        }
+        try std.testing.expect(!req.value_search_execution.allow_scan);
+    }
+}
+
+test "native member ancestry ignores payload source and unit identities" {
+    const a = std.testing.allocator;
+    const payload = "{\"_parent_doc_key\":\"secret\",\"parent_doc_key\":\"secret\",\"_parent_unit_id\":\"wrong-unit\",\"_source_artifact_name\":\"wrong-producer\"}";
+    const asset = try internal_keys.documentUnitArtifactKeyAlloc(a, "allowed", "speech", "segment-1");
+    defer a.free(asset);
+    var info = try parseChunkAncestorInfoAlloc(a, asset, payload);
+    defer info.deinit(a);
+    try std.testing.expectEqualStrings("allowed", info.parent_doc_key);
+    try std.testing.expectEqualStrings(asset, info.unit_key.?);
+    const root = try internal_keys.artifactNamedPrefixAlloc(a, "allowed", "asset", "summary");
+    defer a.free(root);
+    var scalar = try parseChunkAncestorInfoAlloc(a, root, payload);
+    defer scalar.deinit(a);
+    try std.testing.expectEqualStrings("allowed", scalar.parent_doc_key);
+    try std.testing.expect(scalar.unit_key == null);
+}
+
+test "artifact identity reports the source of a dense hit's embedding and keeps its revisions" {
+    const alloc = std.testing.allocator;
+    const chunk = struct {
+        fn ref(a: Allocator, doc: []const u8) !types.ArtifactRef {
+            return .{ .document_id = try a.dupe(u8, doc), .name = try a.dupe(u8, "body_chunks_v1"), .kind = .chunk, .chunk_id = 0 };
+        }
+    }.ref;
+    var resolved = try chunk(alloc, "doc:a");
+    defer resolved.deinit(alloc);
+
+    // A dense hit carries its embedding, sourced from the resolved chunk, with
+    // revisions that member hydration computed from the chunk payload.
+    var slot: ?types.ArtifactRef = .{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "body_dense_v1"),
+        .kind = .embedding,
+        .source = .{ .kind = .chunk, .name = try alloc.dupe(u8, "body_chunks_v1"), .chunk_id = 0 },
+        .revision = try alloc.dupe(u8, "sha256:member"),
+        .derivation_revision = try alloc.dupe(u8, "sha256:state"),
+    };
+    defer if (slot) |*ref| ref.deinit(alloc);
+    try reconcileArtifactRef(alloc, &slot, resolved);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, slot.?.kind);
+    try std.testing.expectEqualStrings("body_chunks_v1", slot.?.name);
+    try std.testing.expectEqualStrings("sha256:member", slot.?.revision.?);
+    try std.testing.expectEqualStrings("sha256:state", slot.?.derivation_revision.?);
+
+    // An exact match is kept as is.
+    try reconcileArtifactRef(alloc, &slot, resolved);
+    try std.testing.expectEqualStrings("sha256:member", slot.?.revision.?);
+
+    // Anything else is still refused.
+    var other: ?types.ArtifactRef = try chunk(alloc, "doc:b");
+    defer if (other) |*ref| ref.deinit(alloc);
+    try std.testing.expectError(error.InvalidChunkArtifact, reconcileArtifactRef(alloc, &other, resolved));
+}
+
+test "external lake archive and pending members use pinned derivation port without native state reads" {
+    const a = std.testing.allocator;
+    const Loader = struct {
+        keys: [2][]const u8,
+        derivation_calls: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            for (self.keys, 0..) |candidate, i| if (std.mem.eql(u8, key, candidate)) {
+                return try alloc.dupe(u8, if (i == 0) "{\"text\":\"archive chunk\"}" else "{\"text\":\"pending chunk\"}");
+            };
+            // Lake stores support row/artifact identities, never native DB's
+            // synthesized document-prefix/asset-state key namespace.
+            return error.TestUnexpectedNativeStateLookup;
+        }
+        fn parent(_: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, _: []const u8) !?[]u8 {
+            return try alloc.dupe(u8, "{}");
+        }
+        fn resolve(_: ?*anyopaque, alloc: Allocator, hit: types.SearchHit) ![]u8 {
+            return alloc.dupe(u8, hit.artifact_ref.?.document_id);
+        }
+        fn derivation(raw: ?*anyopaque, _: Allocator, ref: types.ArtifactRef, payload: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.derivation_calls += 1;
+            const pending = std.mem.startsWith(u8, ref.document_id, "wal1:");
+            if (std.mem.indexOf(u8, payload, if (pending) "pending chunk" else "archive chunk") == null) return error.TestWrongPinnedPayload;
+            return @as([32]u8, @splat(if (pending) 2 else 1));
+        }
+    };
+    const archive = try internal_keys.chunkArtifactKeyAlloc(a, "lake1:archive-parent", "body_chunks", 0);
+    defer a.free(archive);
+    const pending = try internal_keys.chunkArtifactKeyAlloc(a, "wal1:pending-parent", "body_chunks", 0);
+    defer a.free(pending);
+    var loader = Loader{ .keys = .{ archive, pending } };
+    var previous: [2]?[]u8 = @splat(null);
+    defer for (previous) |revision| if (revision) |bytes| a.free(bytes);
+    // Text and vector paths must both propagate the port; repeated hydration
+    // produces identical revisions from the same pinned view.
+    for ([_]bool{ false, true }) |vector| {
+        const hits = try a.alloc(types.SearchHit, 2);
+        var initialized: usize = 0;
+        var transferred = false;
+        errdefer if (!transferred) {
+            for (hits[0..initialized]) |*hit| hit.deinit(a);
+            a.free(hits);
+        };
+        for (loader.keys, hits) |key, *hit| {
+            const id = try a.dupe(u8, key);
+            errdefer a.free(id);
+            hit.* = .{ .id = id, .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(a, key) };
+            initialized += 1;
+        }
+        const processor: SearchResultPostprocessor = .{
+            .ctx = &loader,
+            .is_visible = TestPostprocessor.isVisible,
+            .resolve_parent_id = Loader.resolve,
+            .load_parent_stored = Loader.parent,
+            .load_stored = Loader.load,
+            .artifact_derivation_digest = Loader.derivation,
+        };
+        const raw: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 2 };
+        const req: types.SearchRequest = .{ .return_mode = .member, .include_stored = true };
+        transferred = true;
+        var result = if (vector) try postprocessVectorSearchResult(a, req, raw, true, processor) else try postprocessTextSearchResult(a, req, raw, true, processor);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        for (result.hits, 0..) |hit, i| {
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, if (i == 0) "archive chunk" else "pending chunk") != null);
+            const ref = hit.artifact_ref.?;
+            try std.testing.expectEqualStrings(if (i == 0) "lake1:archive-parent" else "wal1:pending-parent", ref.document_id);
+            try std.testing.expectEqual(@as(usize, 71), ref.revision.?.len);
+            try std.testing.expectEqual(@as(usize, 71), ref.derivation_revision.?.len);
+            if (previous[i]) |revision| try std.testing.expectEqualStrings(revision, ref.revision.?) else previous[i] = try a.dupe(u8, ref.revision.?);
+        }
+        try std.testing.expect(!std.mem.eql(u8, result.hits[0].artifact_ref.?.derivation_revision.?, result.hits[1].artifact_ref.?.derivation_revision.?));
+    }
+    try std.testing.expectEqual(@as(usize, 4), loader.derivation_calls);
 }

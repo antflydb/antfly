@@ -90,17 +90,18 @@
         "ANTFLY_LIGHTONOCR3_PHYSICAL128": "1",
         "ANTFLY_LIGHTONOCR3_COMPACT_KV": "1",
         "ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS": "1",
-        "ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH": "4"
+        "ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH": "4",
+        "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE": "bf16_vision"
       },
-      "qualification": "Experimental CUDA profile with original F32 recurrent state, compact attention-layer KV ownership and a bounded 128-row cohort; transport packets stay at most 64 rows. Full-output qualification covers three synthetic fixtures."
+      "qualification": "Experimental CUDA profile with original F32 recurrent state, compact attention-layer KV ownership and a bounded 128-row cohort; transport packets stay at most 64 rows. Full-output qualification covers three synthetic fixtures. SM12.1 keeps vision-block activations BF16; patch embedding, final merger, decode outputs and recurrent state remain F32. Set ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32 for the original vision path."
     },
     "lighton4b": {
       "extends": "lighton08",
       "environment": {
-        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128": "1",
         "ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS": "8",
-        "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "256"
+        "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "256",
+        "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE": "f32"
       },
       "qualification": "Experimental CUDA profile with original F32 recurrent state, compact attention-layer KV ownership and a bounded 128-row cohort; transport packets stay at most 64 rows. Full-output qualification covers three synthetic fixtures."
     },

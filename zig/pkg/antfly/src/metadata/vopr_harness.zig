@@ -6908,6 +6908,9 @@ pub const MetadataAdminVoprSource = struct {
             // VOPR's public catalog façade does not own the private
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
+            .resolver_authority_mutate,
+            .native_memory_create,
+            .lake_source_owner_read,
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
@@ -6921,6 +6924,10 @@ pub const MetadataAdminVoprSource = struct {
             .policy_publication_mutate,
             .fk_generation_publication_begin,
             .fk_generation_publication_mutate,
+            .sql_completion_ready,
+            .sql_completion_reference,
+            .sql_completion_reference_mutate,
+            .fk_publication_completion,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
@@ -6945,6 +6952,11 @@ pub const MetadataAdminVoprSource = struct {
                 .metadata_epoch = try store.writeValidationRevision(group_id),
             }, .{}),
             .write_validation => |name| try store.tableWriteValidation(alloc, group_id, name),
+            .table_record_read => |name| blk: {
+                const table = try store.tableByName(alloc, group_id, name);
+                defer if (table) |value| metadata_table_manager.freeTable(alloc, value);
+                break :blk try std.json.Stringify.valueAlloc(alloc, table, .{});
+            },
             .query_definition => |name| blk: {
                 const definition = try store.queryTableDefinition(alloc, group_id, name);
                 defer if (definition) |value| value.deinit(alloc);
@@ -6966,6 +6978,7 @@ pub const MetadataAdminVoprSource = struct {
                 break :blk try std.json.Stringify.valueAlloc(alloc, value.value, .{});
             },
             .export_snapshot => try store.exportSystemCatalog(alloc, group_id),
+            .graph_authority => |request| try std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, group_id, request), .{}),
             .read => |request| try store.systemCatalogRead(alloc, group_id, request),
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),

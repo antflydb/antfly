@@ -20,7 +20,104 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
+    if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
+    if (privacyMutationBodyLimit(path)) |limit| return limit;
     return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+}
+
+/// Metadata's ordinary listener cap is smaller than document admission. Keep
+/// privacy control parity with the public API without widening other routes.
+pub fn privacyMutationBodyLimit(raw_path: []const u8) ?usize {
+    if (!privacyPath(raw_path, "/privacy", true) and !privacyPath(raw_path, "/privacy/scans", true)) return null;
+    return @import("antfly_public_limits").max_request_body_bytes;
+}
+
+test "privacy mutation body budgets are shared by public and internal registrars" {
+    const limit = @import("antfly_public_limits").max_request_body_bytes;
+    for ([_][]const u8{ "/db/v1/tables/:tableName/privacy/scans", "/internal/v1/tables/:table_name/privacy/scans" }) |path| try std.testing.expectEqual(@as(?usize, limit), publicPostBodyLimit(path));
+    for ([_][]const u8{ "/db/v1/tables/docs/privacy", "/internal/v1/tables/table%3A123/privacy" }) |path| try std.testing.expectEqual(@as(?usize, limit), privacyMutationBodyLimit(path));
+    for ([_][]const u8{ "/internal/v1/tables/docs/other", "/internal/v1/tables/docs/extra/privacy/scans", "/tables/docs/privacy/findings" }) |path| try std.testing.expect(privacyMutationBodyLimit(path) == null);
+}
+
+/// Internal keys remain in JSON bodies; only group/table identities enter URLs.
+pub const DocumentReadRequest = struct {
+    pub const Operation = enum { lookup, manifest, manifests };
+    operation: Operation,
+    key_base64: []const u8,
+    query: []const u8 = "",
+    artifact_name: []const u8 = "",
+
+    pub fn encode(a: std.mem.Allocator, op: Operation, key: []const u8, query: []const u8, artifact: []const u8) ![]u8 {
+        if (key.len > @import("antfly_public_limits").max_internal_document_key_bytes) return error.InvalidArgument;
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const encoded = try a.alloc(u8, encoder.calcSize(key.len));
+        defer a.free(encoded);
+        _ = encoder.encode(encoded, key);
+        return std.json.Stringify.valueAlloc(a, @This(){ .operation = op, .key_base64 = encoded, .query = query, .artifact_name = artifact }, .{});
+    }
+    pub fn decodeKey(self: @This(), a: std.mem.Allocator) ![]u8 {
+        const maximum = @import("antfly_public_limits").max_internal_document_key_bytes;
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        if (self.key_base64.len > std.base64.url_safe_no_pad.Encoder.calcSize(maximum)) return error.InvalidArgument;
+        const size = decoder.calcSizeForSlice(self.key_base64) catch return error.InvalidArgument;
+        if (size > maximum) return error.InvalidArgument;
+        const decoded = try a.alloc(u8, size);
+        errdefer a.free(decoded);
+        decoder.decode(decoded, self.key_base64) catch return error.InvalidArgument;
+        return decoded;
+    }
+};
+pub fn isInternalDocumentReadPath(path: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    const group = pieces.next() orelse return false;
+    if (group.len == 0 or !std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    return std.mem.eql(u8, pieces.next() orelse return false, "document-read") and pieces.next() == null;
+}
+
+pub fn isPrivacyFindingsPath(path: []const u8) bool {
+    return privacyPath(path, "/privacy/findings", false);
+}
+
+// Match both public table address forms without allocation or percent decoding.
+// Encoded slashes remain one name component; extra/empty segments never match.
+fn privacyPath(raw: []const u8, suffix: []const u8, internal: bool) bool {
+    const path = if (std.mem.startsWith(u8, raw, "/db/v1/")) raw[6..] else if (internal and std.mem.startsWith(u8, raw, "/internal/v1/")) raw[12..] else raw;
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    var parts = std.mem.splitScalar(u8, path[0 .. path.len - suffix.len], '/');
+    if (!std.mem.eql(u8, parts.next() orelse return false, "")) return false;
+    const kind = parts.next() orelse return false;
+    if (std.mem.eql(u8, kind, "databases")) {
+        if ((parts.next() orelse return false).len == 0) return false;
+        if (!std.mem.eql(u8, parts.next() orelse return false, "namespaces")) return false;
+        if ((parts.next() orelse return false).len == 0) return false;
+        if (!std.mem.eql(u8, parts.next() orelse return false, "tables")) return false;
+    } else if (!std.mem.eql(u8, kind, "tables")) return false;
+    return (parts.next() orelse return false).len != 0 and parts.next() == null;
+}
+
+test "scoped privacy body admission preserves mutation and findings budgets" {
+    const limits = @import("antfly_public_limits");
+    for ([_][]const u8{ "/db/v1/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", "/databases/d%2Fb/namespaces/n%20s/tables/t%2F1" }) |base| {
+        var buffer: [256]u8 = undefined;
+        try std.testing.expectEqual(@as(?usize, limits.max_request_body_bytes), privacyMutationBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy", .{base})));
+        try std.testing.expectEqual(@as(?usize, limits.max_request_body_bytes), publicPostBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy/scans", .{base})));
+        try std.testing.expectEqual(@as(?usize, limits.max_privacy_findings_body_bytes), publicPostBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy/findings", .{base})));
+        try std.testing.expect(publicPostBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy/preview", .{base})) == null);
+    }
+    for ([_][]const u8{ "/databases//namespaces/n/tables/t/privacy", "/databases/d/namespaces//tables/t/privacy", "/databases/d/namespaces/n/tables//privacy", "/databases/d/namespaces/n/tables/t/extra/privacy", "/databases/d/tables/t/privacy" }) |path| {
+        try std.testing.expect(privacyMutationBodyLimit(path) == null);
+    }
+}
+
+test "privacy findings body admission covers cursor and filters without enlarging other routes" {
+    const limit = @import("antfly_public_limits").max_privacy_findings_body_bytes;
+    try std.testing.expectEqual(@as(?usize, limit), publicPostBodyLimit("/db/v1/tables/:tableName/privacy/findings"));
+    try std.testing.expect(publicPostBodyLimit("/db/v1/tables/docs/privacy/preview") == null);
+    try std.testing.expect(!isPrivacyFindingsPath("/tables/docs/privacy/findings/extra"));
 }
 
 pub const Routes = struct {
@@ -45,6 +142,8 @@ pub const Routes = struct {
     pub const agents_research_jobs = "/agents/research/jobs";
     pub const mcp_v1 = "/mcp/v1";
     pub const memory_mcp_v1 = "/memory/v1/mcp";
+    /// Small purpose-oriented memory toolset for agents working inside a task.
+    pub const memory_mcp_v1_agent = "/memory/v1/mcp/agent";
     pub const mcp_v1_prefix = "/mcp/v1/";
     pub const mcp_v1_extensions = "/mcp/v1/extensions";
     pub const mcp_v1_extensions_prefix = "/mcp/v1/extensions/";
@@ -79,6 +178,8 @@ pub const Routes = struct {
     pub const backups = "/backups";
     pub const tables = "/tables";
     pub const tables_prefix = "/tables/";
+    pub const privacy_control_pattern = "/internal/v1/tables/:table_name/privacy";
+    pub const privacy_scan_control_pattern = privacy_control_pattern ++ "/scans";
     pub const transactions = "/transactions";
     pub const transactions_begin = "/transactions/begin";
     pub const transactions_commit = "/transactions/commit";
@@ -1736,4 +1837,20 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_observe_merge.group_id);
     const group_execute = Routes.matchGroupShardExecute("/internal/v1/groups/7/shard-ops/execute").?;
     try std.testing.expectEqual(@as(u64, 7), group_execute.group_id);
+}
+
+test "privacy internal document body limits are scoped to exact read routes" {
+    const limits = @import("antfly_public_limits");
+    try std.testing.expectEqual(@as(?usize, limits.max_document_read_body_bytes), publicPostBodyLimit("/internal/v1/groups/:group_id/tables/:table_name/document-read"));
+    try std.testing.expectEqual(@as(?usize, limits.max_document_read_body_bytes), publicPostBodyLimit("/internal/v1/groups/7/tables/docs/document-read"));
+    try std.testing.expect(publicPostBodyLimit("/internal/v1/groups/7/tables/docs/document-read/extra") == null);
+    try std.testing.expect(publicPostBodyLimit("/internal/v1/groups/7/tables/docs/query") == null);
+}
+
+test "privacy internal key codec rejects malformed base64 before dispatch" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "!", "a" }) |bad| {
+        const request = DocumentReadRequest{ .operation = .lookup, .key_base64 = bad };
+        try std.testing.expectError(error.InvalidArgument, request.decodeKey(a));
+    }
 }

@@ -71,7 +71,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     var artifacts = store.artifactStore();
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
-    const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.identity, .context = context } else null;
+    const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.cache_identity, .context = context } else null;
     var inventory_lease: ?@import("lake_index_decoded_metadata.zig").Owned(InventoryMetadata) = null;
     errdefer if (inventory_lease) |owned| owned.release();
     var owned_inventory: ?InventoryMetadata = null;
@@ -80,7 +80,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         owned.inventory.deinit(a);
     };
     var pinned_delete_objects: catalog.Digest = undefined;
-    if (published.reader_protocol >= 47 and published.source_navigation != null) {
+    if (published.source_navigation != null) {
         // Fresh source discovery remains mandatory. The publication contributes
         // a compact authenticated proof, not another archive-sized inventory.
         const navigation = @import("lake_source_navigation.zig");
@@ -99,7 +99,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         const immutable_proof = source.immutable_objects and source.plan_identity != null and root.coverage != null and
             root.coverage.?.plan != null and std.mem.eql(u8, &source.plan_identity.?, &root.coverage.?.plan.?) and
             reader != null and cached != null and store.reopen_options != null;
-        const data = if (immutable_proof) root.coverage.?.data else coverage.dataDigest(if (published.reader_protocol >= 53) try coverage.pinData(source, context, null, null) else try coverage.pinDataLegacy(source, context, null, null));
+        const data = if (immutable_proof) root.coverage.?.data else coverage.dataDigest(try coverage.pinData(source, context, null, null));
         // Delete object versions are always freshly qualified, including when
         // the data census is inherited from an identical immutable plan.
         const pinned = try coverage.finishReadDigest(source, context, data);
@@ -122,6 +122,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             hash.update(&published.signature.source);
             hash.update(&published.signature.credentials);
             hash.update(&published.signature.store);
+            hash.update(&store.cache_identity);
             hash.update(published.inventory.artifact_id);
             hash.update(published.inventory.checksum);
             var result: [32]u8 = undefined;
@@ -132,8 +133,9 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         defer if (proof_lease) |lease| lease.release();
         const data = if (proof_lease) |lease|
             @as(*const coverage.DataProof, @ptrCast(@alignCast(lease.item.payload.extension))).*
-        else if (published.reader_protocol >= 53) try coverage.pinData(source, context, inventory, &metadata.by_id) else try coverage.pinDataLegacy(source, context, inventory, &metadata.by_id);
-        const pinned = if (published.reader_protocol < 47) try coverage.finishLegacy(source, context, data) else try coverage.finishReadDigest(source, context, coverage.dataDigest(data));
+        else
+            try coverage.pinData(source, context, inventory, &metadata.by_id);
+        const pinned = try coverage.finishReadDigest(source, context, coverage.dataDigest(data));
         if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
         if (proof_lease == null) {
             if (inventory.files.len != source.inventory.files.len) return error.InvalidExternalLakeIndexCoverage;
@@ -241,7 +243,7 @@ test "external lake navigation distinguishes stale source cuts from invalid publ
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, validateNavigationIdentity(root, root.domain, changed, 2));
 }
 
-test "external lake legacy coverage proofs bind immutable plans publications and fresh request authority" {
+test "external lake inventory coverage proofs bind immutable plans publications and fresh request authority" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("coverage-proof-selection");
     defer directory.cleanup();
@@ -277,8 +279,8 @@ test "external lake legacy coverage proofs bind immutable plans publications and
     defer a.free(published);
     var parsed = try catalog.parse(a, published);
     defer parsed.deinit();
-    // Retained protocol-46 publications keep the original signature preimage
-    // and inventory-backed proof memo even after protocol-47 publication.
+    // Exercise the current inventory-backed proof memo independently of
+    // optional source-navigation admission.
     const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
     defer a.free(legacy_inventory_bytes);
     var legacy_store = artifact_store;
@@ -287,9 +289,8 @@ test "external lake legacy coverage proofs bind immutable plans publications and
     defer legacy_inventory.deinit(a);
     parsed.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
     parsed.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
-    parsed.value.published.?.reader_protocol = 46;
     parsed.value.published.?.source_navigation = null;
-    parsed.value.published.?.signature.source = (try coverage.finishLegacy(&source, .{}, try coverage.pinDataLegacy(&source, .{}, null, null))).source;
+    parsed.value.published.?.signature.source = (try coverage.finish(&source, .{}, try coverage.pinData(&source, .{}, null, null))).source;
     const legacy_json = try catalog.encode(a, parsed.value);
     defer a.free(legacy_json);
     const sql_table: sql.Table = .{ .id = 9, .physical_name = "lake", .schema_version = 1, .columns = &.{}, .external_base_source = binding, .external_indexes = .{ .catalog_json = legacy_json, .indexes_json = table.indexes_json, .schema_json = schema_json, .desired = parsed.value.published.?.signature.desired } };

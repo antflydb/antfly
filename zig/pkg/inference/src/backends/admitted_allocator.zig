@@ -24,9 +24,15 @@ pub const AdmittedAllocator = struct {
     session: ?sessions.Session = null,
     admission_context: ?*anyopaque = null,
     admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
+    /// Refund auxiliary ledgers when a successful custom admission cannot be
+    /// adopted because reservation metadata allocation fails.
+    rollback_admission: ?*const fn (*anyopaque, usize) void = null,
     trim_on_free: bool = false,
     live_bytes: usize = 0,
     reserved_bytes: usize = 0,
+    /// Borrowed from a live execution permit. Its owner must outlive every
+    /// allocation and must not reduce the permit while this credit is bound.
+    prepaid_host_bytes: usize = 0,
     metadata_bytes: usize = 0,
     admission_error: ?anyerror = null,
     blocks: ?*Header = null,
@@ -48,20 +54,75 @@ pub const AdmittedAllocator = struct {
     fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
+        // Separate chunk leases still belong to one request. Its own retained
+        // bytes cannot turn an intrinsically oversized request into contention.
+        if (session.run_admission) |admission| {
+            const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
+            const total = std.math.add(usize, owned, amount) catch return error.ResourceLimitExceeded;
+            try admission.validateOwnedHostScratch(total);
+        }
         return (try session.admitHostPreprocess(amount)).lease;
+    }
+
+    /// Execution borrows this permit's workspace. On exit, adopt its lease
+    /// before returning unused capacity, so surviving outputs never lose their
+    /// admission and no fresh reservation is required during cleanup.
+    pub const RunScope = struct {
+        permit: sessions.RunPermit,
+        owner: ?*AdmittedAllocator = null,
+        reservation: ?*Reservation = null,
+
+        pub fn deinit(self: *@This()) void {
+            if (self.owner) |owner| {
+                const node = self.reservation.?;
+                node.* = .{ .next = owner.reservations, .lease = self.permit.lease, .bytes = owner.prepaid_host_bytes };
+                owner.reservations = node;
+                owner.reserved_bytes += owner.prepaid_host_bytes;
+                owner.prepaid_host_bytes = 0;
+                self.permit.lease = null;
+                // A failed external reduction conservatively keeps its lease.
+                // Later phases retry trim; final teardown always releases it.
+                owner.trim() catch {};
+            }
+            self.permit.deinit();
+            self.owner = null;
+        }
+    };
+
+    pub fn admitRun(self: *@This(), request: sessions.RunRequest) !RunScope {
+        const session = self.session orelse return error.InvalidAdmissionLeaseReduction;
+        const admission = session.run_admission orelse return .{ .permit = try session.admit(request) };
+        if (self.admit != null or self.prepaid_host_bytes != 0 or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
+        const amounts = try admission.estimateRequest(request, session.outputInfo());
+        if (amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
+        if (amounts.host_scratch_bytes < @sizeOf(Reservation)) return .{ .permit = try session.admit(request) };
+        try self.trim();
+        try admission.validateOwnedHostScratch(std.math.add(usize, self.reserved_bytes, amounts.host_scratch_bytes) catch return error.ResourceLimitExceeded);
+        var permit = try session.admit(request);
+        errdefer permit.deinit();
+        // The execution lease covers this node too. Allocate it now so cleanup
+        // can transfer retained outputs without allocation or reacquisition.
+        const node = try self.backing.create(Reservation);
+        self.metadata_bytes += @sizeOf(Reservation);
+        self.prepaid_host_bytes = amounts.host_scratch_bytes;
+        return .{ .permit = permit, .owner = self, .reservation = node };
     }
 
     pub fn ensureCapacity(self: *@This(), extra: usize) !void {
         const needed = try std.math.add(usize, try std.math.add(usize, self.live_bytes, self.metadata_bytes), extra);
-        if (needed <= self.reserved_bytes) return;
-        const minimum = try std.math.add(usize, needed - self.reserved_bytes, @sizeOf(Reservation));
+        const capacity = try std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes);
+        if (needed <= capacity) return;
+        const minimum = try std.math.add(usize, needed - capacity, @sizeOf(Reservation));
         var amount = @max(minimum, quantum);
         var lease = self.reserve(amount) catch |err| blk: {
-            if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable)) return err;
+            if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable and err != error.MemoryBudgetExceeded)) return err;
             amount = minimum; // Slack must not reject requests fitting tight limits.
             break :blk try self.reserve(amount);
         };
-        errdefer if (lease) |*active| active.release();
+        errdefer {
+            if (lease) |*active| active.release();
+            if (self.rollback_admission) |rollback| rollback(self.admission_context.?, amount);
+        }
         const reservation = try self.backing.create(Reservation);
         reservation.* = .{ .next = self.reservations, .lease = lease, .bytes = amount };
         self.reservations = reservation;
@@ -84,7 +145,7 @@ pub const AdmittedAllocator = struct {
         }
         var link = &self.reservations;
         while (link.*) |reservation| {
-            const spare = self.reserved_bytes - self.live_bytes - self.metadata_bytes;
+            const spare = (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes);
             const reduction = @min(spare, reservation.bytes);
             if (reduction != 0) {
                 if (reservation.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = reservation.bytes - reduction });
@@ -162,7 +223,7 @@ pub const AdmittedAllocator = struct {
         if (header.next) |next| next.prev = header.prev;
         self.live_bytes -= header.bytes;
         self.backing.rawFree(base[0..header.bytes], header.alignment, ra);
-        if (self.trim_on_free and (self.live_bytes == 0 or self.reserved_bytes - self.live_bytes - self.metadata_bytes >= quantum)) self.trim() catch {};
+        if (self.trim_on_free and (self.live_bytes == 0 or (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes) >= quantum)) self.trim() catch {};
     }
 };
 
@@ -211,4 +272,149 @@ test "model aware media adaptive admission shares capacity grows and releases id
     first.deinit();
     second.deinit();
     try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().host_scratch_bytes);
+}
+
+test "admission Gemma temporary ceiling does not reserve unused half gigabyte" {
+    const MiB = 1024 * 1024;
+    const limits = memory.Limits{ .host_limit_bytes = 2 * 1024 * MiB, .scratch_limit_bytes = 341 * MiB };
+    var controller: memory.AdmissionController = .{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = limits,
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(512 * MiB));
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer admitted.deinit();
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = admitted.allocator(), .limit = 512 * MiB };
+    const bytes = try bounded.allocator().alloc(u8, MiB);
+    try std.testing.expect(controller.snapshot().host_scratch_bytes < 2 * MiB);
+    var execution = try session.admitHostPreprocess(256 * MiB);
+    execution.deinit();
+    bounded.allocator().free(bytes);
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    try std.testing.expectError(error.OutOfMemory, bounded.allocator().alloc(u8, 400 * MiB));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceLimitExceeded), admitted.admission_error);
+    var held = try session.admitHostPreprocess(320 * MiB);
+    try std.testing.expectError(error.OutOfMemory, bounded.allocator().alloc(u8, 32 * MiB));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceTemporarilyUnavailable), admitted.admission_error);
+    held.deinit();
+    const recovered = try bounded.allocator().alloc(u8, MiB);
+    bounded.allocator().free(recovered);
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "admission native encoder allocations consume prepaid workspace and retain outputs across cohorts" {
+    const MiB = 1024 * 1024;
+    const Info = struct {
+        fn outputs(_: *anyopaque) []const @import("tensor.zig").TensorInfo {
+            return &.{};
+        }
+    };
+    var vtable: sessions.Session.VTable = undefined;
+    vtable.outputInfo = Info.outputs;
+    var controller: memory.AdmissionController = .{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = &vtable, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .host_limit_bytes = 2048 * MiB, .scratch_limit_bytes = 341 * MiB },
+        .static_workspace_bytes = 128 * MiB,
+        .check_live_memory = false,
+    } };
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer admitted.deinit();
+    const a = admitted.allocator();
+    var prep: ?[]u8 = try a.alloc(u8, 64 * 1024);
+    defer if (prep) |values| a.free(values);
+    var outputs: [3]?[]f32 = @splat(null);
+    defer for (outputs) |vector| if (vector) |values| a.free(values);
+    for ([_]usize{ 135, 263, 391 }, 0..) |rows, index| {
+        {
+            var scope = try admitted.admitRun(try @import("../pipelines/embedding_gemma2_admission.zig").nativeTextEncoderRequest(4096, rows, 768));
+            defer scope.deinit();
+            const charged = controller.snapshot().host_scratch_bytes;
+            const compute = try a.alloc(u8, 80 * MiB);
+            defer a.free(compute);
+            try std.testing.expectEqual(charged, controller.snapshot().host_scratch_bytes);
+            outputs[index] = try a.alloc(f32, 768);
+            @memset(outputs[index].?, @as(f32, @floatFromInt(index + 1)));
+        }
+        // Every earlier vector stays live, admitted and unchanged while the
+        // next cohort reuses encoder workspace and returns its own output.
+        try std.testing.expect(controller.snapshot().host_scratch_bytes >= admitted.live_bytes);
+        try std.testing.expect(controller.snapshot().host_scratch_bytes < MiB);
+        for (outputs[0 .. index + 1], 0..) |vector, prior| {
+            for (vector.?) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(prior + 1)), value);
+        }
+    }
+    for (&outputs) |*vector| {
+        a.free(vector.*.?);
+        vector.* = null;
+    }
+    a.free(prep.?);
+    prep = null;
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "admission cumulative request scratch distinguishes intrinsic limits from other requests" {
+    var controller: memory.AdmissionController = .{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .scratch_limit_bytes = 1024 * 1024 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer admitted.deinit();
+    const a = admitted.allocator();
+    const first = try a.alloc(u8, 600 * 1024);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 600 * 1024));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceLimitExceeded), admitted.admission_error);
+    a.free(first);
+    try admitted.trim();
+    var peer = try session.admitHostPreprocess(600 * 1024);
+    defer peer.deinit();
+    const small = try a.alloc(u8, 100 * 1024);
+    defer a.free(small);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 400 * 1024));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceTemporarilyUnavailable), admitted.admission_error);
+}
+
+test "admission prepaid workspace grows only its deficit and rolls back failed scope construction" {
+    const Info = struct {
+        fn outputs(_: *anyopaque) []const @import("tensor.zig").TensorInfo {
+            return &.{};
+        }
+    };
+    var vtable: sessions.Session.VTable = undefined;
+    vtable.outputInfo = Info.outputs;
+    var controller: memory.AdmissionController = .{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = &vtable, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .scratch_limit_bytes = 256 * 1024 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var rejected = AdmittedAllocator{ .backing = failing.allocator(), .session = session };
+    defer rejected.deinit();
+    try std.testing.expectError(error.OutOfMemory, rejected.admitRun(.{ .workspace_bytes = 32 * 1024, .output_bytes = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session, .trim_on_free = true };
+    defer admitted.deinit();
+    var scope = try admitted.admitRun(.{ .workspace_bytes = 32 * 1024, .output_bytes = 0 });
+    const a = admitted.allocator();
+    const payload = try a.alloc(u8, 80 * 1024);
+    try std.testing.expect(controller.snapshot().host_scratch_bytes >= admitted.live_bytes);
+    try std.testing.expect(controller.snapshot().host_scratch_bytes < 128 * 1024);
+    a.free(payload);
+    scope.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }

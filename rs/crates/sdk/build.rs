@@ -27,6 +27,7 @@ fn main() {
     // Progenitor doesn't support multiple media types per operation or
     // heterogeneous response schemas. Adapt the generator input below.
     strip_non_json_media_types(&mut spec);
+    preserve_query_request_properties(&mut spec);
     expand_sql_default_error_responses(&mut spec);
     unify_error_response_schemas(&mut spec);
     normalize_mutation_success_transport(&mut spec);
@@ -50,6 +51,37 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("client.rs");
     fs::write(&out_path, code).expect("failed to write generated client");
+}
+
+// Typify's handling of negative query admission constraints can narrow the
+// generated request to only the fields common to the negated alternatives,
+// silently dropping filters and aggregations during serde roundtrips. Keep the
+// server's wire schema unchanged; omit these server-side validation assertions
+// only from generator input so all declared request properties remain available.
+fn preserve_query_request_properties(spec: &mut serde_yaml::Value) {
+    fn remove_negation(value: &mut serde_yaml::Value) {
+        match value {
+            serde_yaml::Value::Mapping(map) => {
+                map.remove(serde_yaml::Value::String("not".into()));
+                for value in map.values_mut() {
+                    remove_negation(value);
+                }
+            }
+            serde_yaml::Value::Sequence(values) => {
+                for value in values {
+                    remove_negation(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    for name in [
+        "QueryRequest",
+        "StatefulQueryRequest",
+        "GlobalStatefulQueryRequest",
+    ] {
+        remove_negation(&mut spec["components"]["schemas"][name]);
+    }
 }
 
 // Progenitor includes `default` in its success response set, so a typed 200

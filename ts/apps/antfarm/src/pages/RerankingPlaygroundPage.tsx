@@ -10,9 +10,10 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -313,7 +314,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Reranking Playground</DashboardPageTitle>
+          <DashboardPageTitle>Reranking Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Rerank documents by relevance to a query using cross-encoder models
           </DashboardPageDescription>
@@ -340,8 +341,8 @@ const RerankingPlaygroundPage: React.FC = () => {
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
-            <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="model">Model</FieldLabel>
               <Select
                 value={selectedModel}
                 onValueChange={setSelectedModel}
@@ -366,18 +367,18 @@ const RerankingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
             {/* Query */}
-            <div className="space-y-2">
-              <Label htmlFor="query">Query</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="query">Query</FieldLabel>
               <Input
                 id="query"
                 placeholder="Enter your search query..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
-            </div>
+            </Field>
           </div>
           <FormActions>
             <AIWorkflowSubmitButton
@@ -404,7 +405,7 @@ const RerankingPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -443,9 +444,11 @@ const RerankingPlaygroundPage: React.FC = () => {
           <CardContent className="flex-1 space-y-3 max-h-[600px] overflow-y-auto">
             {documents.map((doc, index) => (
               // biome-ignore lint/suspicious/noArrayIndexKey: document inputs identified by position
-              <div key={index} className="space-y-1">
+              <Field key={index} className="gap-1">
                 <div className="flex items-center justify-between">
-                  <Label className="text-xs text-muted-foreground">Document {index + 1}</Label>
+                  <FieldLabel className="text-xs text-muted-foreground">
+                    Document {index + 1}
+                  </FieldLabel>
                   <Button
                     variant="ghost"
                     size="sm"
@@ -462,7 +465,7 @@ const RerankingPlaygroundPage: React.FC = () => {
                   value={doc}
                   onChange={(e) => updateDocument(index, e.target.value)}
                 />
-              </div>
+              </Field>
             ))}
           </CardContent>
         </Card>
@@ -480,7 +483,7 @@ const RerankingPlaygroundPage: React.FC = () => {
                   const barWidth = maxScore > 0 ? Math.max(2, (doc.score / maxScore) * 100) : 0;
 
                   return (
-                    <div key={doc.index} className="p-3 bg-muted/30 rounded-none border space-y-2">
+                    <div key={doc.index} className="p-3 bg-muted/30 rounded-lg border space-y-2">
                       <div className="flex items-center gap-2">
                         <span className="flex items-center justify-center w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                           {doc.rank}
