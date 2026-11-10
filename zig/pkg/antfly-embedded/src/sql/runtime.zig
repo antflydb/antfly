@@ -9489,6 +9489,40 @@ test "SQL protected ordinary mutations use one command including zero-row statem
     }
 }
 
+test "SQL protected INSERT SELECT streams simple singleton and derived sources under one command" {
+    const Case = struct { sql: []const u8, rows: usize };
+    const cases = [_]Case{
+        .{ .sql = "INSERT INTO things (_id,id) SELECT _id||':copy',id FROM things RETURNING id", .rows = 2 },
+        .{ .sql = "INSERT INTO things (_id,id) SELECT _id||':copy',id FROM things WHERE false RETURNING id", .rows = 0 },
+        .{ .sql = "INSERT INTO things (_id,id) SELECT 'copy',7 RETURNING id", .rows = 1 },
+        .{ .sql = "INSERT INTO things (_id,id) SELECT * FROM (VALUES ('copy',7),('next',8)) AS v(k,n) RETURNING id", .rows = 2 },
+        .{ .sql = "INSERT INTO things (_id,id) SELECT DISTINCT _id||':copy',id FROM things RETURNING id", .rows = 2 },
+        .{ .sql = "INSERT INTO things (_id,id) SELECT _id||':copy',id FROM things WINDOW w AS (ORDER BY id) RETURNING id", .rows = 2 },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |triggers| {
+        var provider: EffectTestBackend = .{ .protected_mutation = !triggers, .triggered_mutation = triggers };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{ .page_rows = 64 }) catch |err| {
+            std.debug.print("protected source shape failed sql={s} err={s}\n", .{ case.sql, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(case.rows, result.output.rows_affected);
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        try std.testing.expectEqual(case.rows, provider.published);
+        try std.testing.expectEqual(@as(usize, 1), provider.begins);
+        try std.testing.expectEqual(@as(usize, 1), provider.statement_begins);
+        try std.testing.expectEqual(@as(usize, 1), provider.statement_ends);
+        try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+        try std.testing.expect(!provider.active);
+        try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_finishes);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_closes);
+        try std.testing.expectEqual(provider.point_opens, provider.point_closes);
+    };
+}
+
 test "SQL protected ordinary zero-row triggers finish once and failed completion publishes no effects" {
     for ([_]bool{ false, true }) |fail| {
         var provider: EffectTestBackend = .{ .base = .{ .row_count = 0 }, .triggered_mutation = true, .fail_finish = fail };

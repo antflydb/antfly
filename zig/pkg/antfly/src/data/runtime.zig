@@ -30615,8 +30615,11 @@ const RemoteMetadataSource = struct {
             fn diagnoseHeadChange(ctx: *@This(), before: antfly.metadata_api.MetadataHead, after: antfly.metadata_api.MetadataHead) void {
                 ctx.remote.diagnoseMismatch(.pair_head_changed, before, after, "captured_head", before.metadata_epoch, after.metadata_epoch);
             }
-            fn invalidate(ctx: *@This()) void {
-                ctx.remote.invalidateCache();
+            fn invalidate(_: *@This()) void {
+                // Every retry fetches a fresh head and dedicated public/private
+                // captures. It has no cached candidate to invalidate. Changing
+                // the shared fence here would instead reject unrelated SQL
+                // captures without making this pair any fresher.
             }
         };
         var capture: Capture = .{ .remote = self, .node_id = node_id };
@@ -38715,7 +38718,7 @@ fn consumerTests() type {
             try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
         }
 
-        test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
+        test "time series optional revision upgrade preserves the mandatory protocol floor of a mixed group" {
             const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{}" }} };
             const next = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
             try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 0, 0, 100));
@@ -52668,6 +52671,7 @@ fn implementationTests() type {
                 captures: usize = 0,
                 private_captures: usize = 0,
                 heads: usize = 0,
+                mismatch_private_once: bool = false,
                 fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (request.method == .GET and std.mem.endsWith(u8, request.uri, @import("../metadata/http_routes.zig").Routes.head)) {
@@ -52676,7 +52680,9 @@ fn implementationTests() type {
                     }
                     if (request.method == .POST and std.mem.endsWith(u8, request.uri, @import("../metadata/http_routes.zig").Routes.internal_provisioning_snapshot)) {
                         self.private_captures += 1;
-                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, staging.ProvisioningSnapshot{ .node_id = 7, .metadata_group_id = self.head.metadata_group_id, .metadata_incarnation = self.head.metadata_incarnation.?, .metadata_epoch = self.head.metadata_epoch, .catalog = .{ .tables = &.{}, .ranges = &.{}, .jobs_json = &.{} } }, .{}) };
+                        const epoch = if (self.mismatch_private_once) self.head.metadata_epoch - 1 else self.head.metadata_epoch;
+                        self.mismatch_private_once = false;
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, staging.ProvisioningSnapshot{ .node_id = 7, .metadata_group_id = self.head.metadata_group_id, .metadata_incarnation = self.head.metadata_incarnation.?, .metadata_epoch = epoch, .catalog = .{ .tables = &.{}, .ranges = &.{}, .jobs_json = &.{} } }, .{}) };
                     }
                     if (request.method != .POST or !std.mem.endsWith(u8, request.uri, transfer.path)) return error.UnexpectedProvisioningPairRequest;
                     var parsed = try std.json.parseFromSlice(transfer.Request, alloc, request.body, .{});
@@ -52724,6 +52730,21 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 2), fake.heads);
             try std.testing.expectEqual(fence, source.snapshot_fence_generation);
             try std.testing.expectEqual(@as(u64, 7), source.cached_head.?.metadata_epoch);
+            // Force a real private-cut rejection through the production HTTP
+            // adapter. Its bounded retry must leave concurrent SQL cache
+            // captures and their publication fence intact.
+            const cached_table_id = source.cached_snapshot.?.tables[0].table_id;
+            fake.mismatch_private_once = true;
+            var repaired = try source.fetchProvisionedRootPair(7);
+            defer repaired.deinit(a);
+            try std.testing.expectEqualDeep(content_head, repaired.head);
+            try std.testing.expectEqual(@as(u64, 2), repaired.snapshot.tables[0].table_id);
+            try std.testing.expectEqual(@as(usize, 4), fake.captures);
+            try std.testing.expectEqual(@as(usize, 3), fake.private_captures);
+            try std.testing.expectEqual(@as(usize, 5), fake.heads);
+            try std.testing.expectEqual(fence, source.snapshot_fence_generation);
+            try std.testing.expectEqual(@as(u64, 7), source.cached_head.?.metadata_epoch);
+            try std.testing.expectEqual(cached_table_id, source.cached_snapshot.?.tables[0].table_id);
         }
 
         test "provisioned root re-pairs a changed metadata head without publishing mixed snapshots" {

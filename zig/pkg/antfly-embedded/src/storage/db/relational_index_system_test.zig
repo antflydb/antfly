@@ -104,7 +104,7 @@ const NullabilityJobFixture = struct {
         return (try source.load(&read)).?.sequence;
     }
     fn configure(db: *db_mod.DB, schema_json: []const u8, indexes_json: []const u8, historical: bool) !bool {
-        return @import("../write.zig").configureStorageKernelOwnerDbAtOpen(alloc, db, "rows", schema_json, indexes_json, null, null, null, null, null, historical);
+        return @import("../write.zig").configureStorageKernelOwnerDbAtOpen(alloc, db, "rows", schema_json, indexes_json, null, null, null, null, .{}, null, @intFromBool(historical));
     }
     fn completeAudit(db: *db_mod.DB, expected: job.Binding, inputs: []const u8, budget: rows.Budget, path: []const u8, signing_root: u128) !@import("relational_schema_audit_checkpoint.zig").Result {
         for (0..128) |_| {
@@ -2791,7 +2791,7 @@ test "relational index system nullability job native metadata journal preserves 
                 try std.testing.expect(try F.configure(database, F.before, "{}", false));
                 try std.testing.expect(try F.configure(database, F.after, "{}", false));
                 try std.testing.expect(database.hasIndex("old"));
-                const maintained = try @import("../write.zig").reconcileStorageKernelOwnerDb(alloc, database, "rows", F.after, "{}", "old", true, null, null, null);
+                const maintained = try @import("../write.zig").reconcileStorageKernelOwnerDb(alloc, database, "rows", F.after, "{}", "old", true, null, null, .{}, null);
                 try std.testing.expect(maintained.state == .busy);
                 try std.testing.expectEqualDeep(catalog_cut, try database.observeNativeSchemaOwner(binding, .{}));
             }

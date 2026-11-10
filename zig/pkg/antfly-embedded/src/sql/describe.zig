@@ -449,6 +449,16 @@ pub fn copyRead(allocator: std.mem.Allocator, backend: catalog.Backend, compiled
 /// Internal plans retain full typed descriptors. Wire validation belongs only
 /// at the public statement boundary, never at a derived relation boundary.
 pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    return bindWithQueryShape(allocator, backend, compiled, explicit_parameter_types, .adaptive);
+}
+
+const QueryShape = enum { adaptive, cursor };
+
+/// Mutation producers require a pullable complete query, including singleton
+/// and single-table inputs. Bind that shape once while preserving the ordinary
+/// authorization, parameter inference and lowering path. Public simple SELECTs
+/// retain their direct execution shape.
+fn bindWithQueryShape(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType, shape: QueryShape) anyerror!BoundStatement {
     // Locking is an execution capability, not a decoration on a read. Keep
     // every lowering path closed until the provider can retain native grants.
     if (compiled.statement == .select and compiled.statement.select.locking != null) return @import("locking.zig").bind(allocator, backend, compiled, explicit_parameter_types);
@@ -479,7 +489,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
         if (invocation.named_type_resolver == null) invocation.named_type_resolver = backend.named_type_resolver;
         try invocation.mergeCoarse(explicit_parameter_types);
     }
-    var result = try bindImpl(allocator, statement_backend, compiled, explicit_parameter_types);
+    var result = try bindImpl(allocator, statement_backend, compiled, explicit_parameter_types, shape);
     result.parameter_invocation = statement_backend.parameter_invocation;
     if (statement_backend.parameter_invocation) |invocation| {
         try invocation.mergeCoarse(result.parameter_types);
@@ -488,7 +498,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
     return result;
 }
 
-fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_input: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_input: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType, shape: QueryShape) anyerror!BoundStatement {
     if (compiled_input.statement == .effect_block) return @import("statement_effects.zig").bind(allocator, backend, compiled_input, explicit_parameter_types);
     if (compiled_input.statement == .call) {
         const parameters = try allocator.alloc(?ast.ColumnType, compiled_input.parameter_count);
@@ -514,7 +524,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
     if (compiled.statement == .select and compiled.statement.select.distinct != null) {
         var lowered = compiled.*;
         lowered.statement = .{ .select = try @import("distinct_lowering.zig").lower(allocator, backend, compiled, explicit_parameter_types) };
-        return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
+        return bindWithQueryShape(allocator, backend, &lowered, explicit_parameter_types, shape);
     }
     if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
     if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !(backend.statement_ctes != null or @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver)) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
@@ -530,15 +540,15 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
             prepared.* = .{ .name = name, .relation = resolved };
             var pinned = backend;
             pinned.prepared_read = prepared;
-            return bindInternal(allocator, pinned, &rewritten, explicit_parameter_types);
+            return bindWithQueryShape(allocator, pinned, &rewritten, explicit_parameter_types, shape);
         }
         var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = resolved.table };
-        return bindInternal(allocator, adapter.iface(), compiled, explicit_parameter_types);
+        return bindWithQueryShape(allocator, adapter.iface(), compiled, explicit_parameter_types, shape);
     }
     if (compiled.statement == .select and @import("subquery_lowering.zig").accepts(compiled.statement.select) and !@import("subquery_lowering.zig").needsProjectionDomain(compiled.statement.select)) {
         var lowered = compiled.*;
         lowered.statement = .{ .select = try @import("subquery_lowering.zig").lower(allocator, compiled.statement.select) };
-        return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
+        return bindWithQueryShape(allocator, backend, &lowered, explicit_parameter_types, shape);
     }
     // A mutation scalar subquery needs the same captured, decorrelated source
     // plan as joined DML. Route target-only UPDATE/DELETE through that planner
@@ -559,7 +569,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
             mutation.source = source;
             var lowered = compiled.*;
             lowered.statement = .{ .update = mutation };
-            return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
+            return bindWithQueryShape(allocator, backend, &lowered, explicit_parameter_types, shape);
         }
     }
     if (compiled.statement == .delete and compiled.statement.delete.source == null) {
@@ -571,10 +581,10 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
             mutation.source = source;
             var lowered = compiled.*;
             lowered.statement = .{ .delete = mutation };
-            return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
+            return bindWithQueryShape(allocator, backend, &lowered, explicit_parameter_types, shape);
         }
     }
-    if (compiled.statement == .select and (backend.statement_ctes != null or @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver))) {
+    if (compiled.statement == .select and (backend.statement_ctes != null or @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver) or (shape == .cursor and !compiled.statement.select.catalog_calls_bound and compiled.statement.select.windows.len == 0))) {
         const relations = @import("relation_binding.zig");
         const parameters = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
         @memset(parameters, null);
@@ -619,10 +629,10 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         query.windows = &.{};
         query.count_all = false;
         query.order_by = &.{};
-        const validated = try bindInternal(allocator, pinned, &validation, explicit_parameter_types);
+        const validated = try bindWithQueryShape(allocator, pinned, &validation, explicit_parameter_types, shape);
         var executable = compiled.*;
         executable.statement.select.windows = &.{};
-        return bindInternal(allocator, pinned, &executable, validated.parameter_types);
+        return bindWithQueryShape(allocator, pinned, &executable, validated.parameter_types, shape);
     }
     if (@import("ddl_runtime.zig").accepts(compiled.statement)) {
         if (compiled.statement == .catalog_ddl) if (compiled.statement.catalog_ddl.population) |intent| {
@@ -862,14 +872,6 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
             }
             source_query.columns = projections;
         }
-        // Source-aware RETURNING must capture simple INSERT SELECT inputs in
-        // the same read set as its own physical subqueries, too.
-        if (relational_returning and source_query.source == null) if (source_query.table) |name| {
-            const relation = try allocator.create(ast.Relation);
-            relation.* = .{ .table = .{ .name = name } };
-            source_query.source = relation;
-            source_query.table = null;
-        };
         // Assignment context supplies the type of otherwise-untyped positional
         // parameters. The SELECT binder retains all source authorization and
         // immutable catalog identities separately from the target binding.
@@ -891,7 +893,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         try @import("relation_binding.zig").inferExpectedTypes(allocator, backend, source_query, parameters, expected_types);
         const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = source_query }, .parameter_count = compiled.parameter_count };
         const bound = try allocator.create(BoundStatement);
-        bound.* = try bindInternal(allocator, backend, &lowered, parameters);
+        bound.* = try bindWithQueryShape(allocator, backend, &lowered, parameters, .cursor);
         if (bound.columns.len != expected.len) return error.InvalidSqlParameters;
         for (bound.columns[0..insertion.columns.len], insertion.columns) |source_column, name| {
             const destination = try table.column(name);

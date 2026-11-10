@@ -7746,7 +7746,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     antfly_imports.configureEmbedded(b, sql_revision_codec_mod, true);
     antfly_imports.storage_boundary.configureSources(sql_revision_codec_mod, false, false);
-    const sql_revision_codec_filters: []const []const u8 = &.{ "row policy publication Raft codec", "SQL domain internal preparation handoffs", "time series document revision wire", "time series merge revision floor", "time series staged timestamp wire", "range tracking activation codec", "ordered artifact inventory private batch roundtrip", "artifact publication upload control", "internal batch topology control", "SQL relation lifetime frozen native lock controls" };
+    const sql_revision_codec_filters: []const []const u8 = &.{ "public batch rejects every privileged command field", "row policy publication Raft codec", "SQL domain internal preparation handoffs", "time series document revision wire", "time series merge revision floor", "time series staged timestamp wire", "range tracking activation codec", "ordered artifact inventory private batch roundtrip", "artifact publication upload control", "internal batch topology control", "SQL relation lifetime frozen native lock controls" };
     const sql_revision_codec_tests = b.addTest(.{
         .root_module = sql_revision_codec_mod,
         .filters = sql_revision_codec_filters,

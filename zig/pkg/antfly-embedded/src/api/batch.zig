@@ -62,7 +62,16 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
 pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBatchRequest {
     if (value != .object) return error.InvalidBatchRequest;
     const root = value.object;
-    for (private_fields) |field| if (root.get(field) != null) return error.InvalidBatchRequest;
+    for (private_fields) |field| {
+        if (root.contains(field)) return error.InvalidBatchRequest;
+        // Private wire names also reserve their storage-facing spelling. An
+        // unknown-field policy must not silently turn an owner command into a
+        // successful empty public write. These two graph names are explicitly
+        // public; their underscored forms carry private normalized effects.
+        if (field[0] == '_' and !std.mem.eql(u8, field[1..], "graph_writes") and
+            !std.mem.eql(u8, field[1..], "graph_deletes") and root.contains(field[1..]))
+            return error.InvalidBatchRequest;
+    }
     var owned: OwnedBatchRequest = .{};
     errdefer owned.deinit(alloc);
     if (root.get("inserts")) |item| if (item != .null) {
@@ -534,8 +543,13 @@ test "public batch rejects every privileged command field and preserves null def
         const body = try std.fmt.allocPrint(a, "{{\"{s}\":null}}", .{field});
         defer a.free(body);
         try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, body));
+        if (field[0] == '_' and !std.mem.eql(u8, field[1..], "graph_writes") and !std.mem.eql(u8, field[1..], "graph_deletes")) {
+            const alias = try std.fmt.allocPrint(a, "{{\"{s}\":null}}", .{field[1..]});
+            defer a.free(alias);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, alias));
+        }
     }
-    var empty = try parseBatchRequest(a, "{\"inserts\":null,\"deletes\":null,\"transforms\":null,\"sync_level\":null}");
+    var empty = try parseBatchRequest(a, "{\"inserts\":null,\"deletes\":null,\"transforms\":null,\"graph_writes\":null,\"graph_deletes\":null,\"sync_level\":null}");
     defer empty.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), empty.req.writes.len);
     try std.testing.expectEqual(mutation.SyncLevel.propose, empty.req.sync_level);
