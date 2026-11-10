@@ -23093,6 +23093,25 @@ pub const DB = struct {
             };
         };
         try cancellation.check();
+        if (physical_primary) {
+            // A physical (`antfly-lsm-checkpoint`) primary is restored by
+            // reusing its LSM files directly, with no per-key import --
+            // including whatever replay-journal bookkeeping those files
+            // already carry under the format and key layout active when
+            // they were captured. A released backup predating this tree's
+            // replay-journal key relocation (`internal_keys.zig`'s
+            // `GlobalReplayKind.next_sequence` moved off 0x02 for WS5's
+            // journal-sharing work) or its credit-ledger format carries
+            // that watermark somewhere `DocStore.lastReplaySequence`'s
+            // current key lookup never looks. Re-seed it at the
+            // authoritative value the backup itself recorded, under this
+            // build's current key and format, exactly as a split
+            // destination's inherited watermark is re-seeded via
+            // `ensureReplayFloor` -- a floor-only raise, so it is a no-op
+            // for a primary already carrying this value under the
+            // current layout.
+            try opened_primary.store.ensureReplayNextSequenceAtLeast(native_manifest.?.capture_target_sequence + 1);
+        }
         if (purpose == .historical_table)
             try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, cancellation);
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);

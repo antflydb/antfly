@@ -3881,6 +3881,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // WithOptions` -> `applyBatchWritesLocked` call takes, so the two
             // are already mutually exclusive without needing `!hasWorkers()`
             // as a proxy for "no concurrent worker apply".
+            //
+            // `opts.transaction_resolution == null`, matching text's/
+            // graph's/sparse's/dense's own gates above: a transaction-
+            // resolution commit below stages only `authored_acceptance`'s
+            // participant into `resolveTransactionIntentsWithExtraBatchStaged`
+            // (not `combined_commit_participant`), so a publication prepared
+            // here would never have `stage` run and would still be installed
+            // by the unconditional install loop further down -- tripping
+            // `InlineAlgebraicPublication.install`'s `apply_guard == null`
+            // assertion, since only `stage`'s own `defer` clears it.
             var inline_algebraic_publications: [2]?*InlineAlgebraicPublication = @splat(null);
             var inline_algebraic_handled_names: [2][]const u8 = undefined;
             var inline_algebraic_publication_count: usize = 0;
@@ -3888,7 +3898,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (maybe_prepared) |prepared| prepared.abort();
             };
             if (append_derived_replay and effective_req.sync_level == .full_index and
-                materialized_derived_batch != null)
+                opts.transaction_resolution == null and materialized_derived_batch != null)
             {
                 for (sync_targets.all_indexes) |target_name| {
                     if (inline_algebraic_publication_count >= inline_algebraic_publications.len) break;
