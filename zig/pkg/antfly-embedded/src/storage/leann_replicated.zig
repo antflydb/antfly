@@ -59,6 +59,8 @@ pub const VectorLoader = struct {
     /// Optional batch form (see `leann_replica.VectorLoader.load_batch`).
     load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
     load_batch_timed: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void = null,
+    /// Validate an indexed digest without re-embedding the source.
+    validate_digest: ?*const fn (ctx: *anyopaque, alloc: Allocator, metadata: []const u8, digest: u64) anyerror!bool = null,
 };
 
 pub const Options = struct {
@@ -570,7 +572,13 @@ pub const ReplicatedState = struct {
         reembed_ns: ?*u64 = null,
 
         fn keyLoader(self: *KeyLoader) replica_mod.VectorLoader {
-            return .{ .ctx = self, .load = load, .load_batch = if (self.loader.load_batch != null or self.loader.load_batch_timed != null) loadBatch else null };
+            return .{ .ctx = self, .load = load, .validate_digest = if (self.loader.validate_digest != null) validateDigest else null, .load_batch = if (self.loader.load_batch != null or self.loader.load_batch_timed != null) loadBatch else null };
+        }
+
+        fn validateDigest(raw: *anyopaque, alloc: Allocator, key: []const u8, digest: u64) anyerror!bool {
+            const self: *KeyLoader = @ptrCast(@alignCast(raw));
+            if (!self.state.bindings.contains(key)) return false;
+            return self.loader.validate_digest.?(self.loader.ctx, alloc, key, digest);
         }
 
         fn loadBatch(raw: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void {

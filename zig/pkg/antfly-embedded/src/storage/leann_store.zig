@@ -92,6 +92,8 @@ pub const VectorLoader = struct {
     /// id. Entries with empty metadata are skipped (left not found).
     load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
     load_batch_timed: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void = null,
+    /// Validate an indexed digest without re-embedding the source.
+    validate_digest: ?*const fn (ctx: *anyopaque, alloc: Allocator, metadata: []const u8, digest: u64) anyerror!bool = null,
 };
 
 const ElideNode = struct {
@@ -337,7 +339,7 @@ pub const LeannStore = struct {
 
     pub fn setLoader(self: *LeannStore, loader: VectorLoader) void {
         self.loader = loader;
-        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch, .load_batch_timed = loader.load_batch_timed };
+        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch, .load_batch_timed = loader.load_batch_timed, .validate_digest = loader.validate_digest };
     }
 
     pub fn isReplicated(self: *const LeannStore) bool {

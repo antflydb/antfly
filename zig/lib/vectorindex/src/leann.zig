@@ -145,6 +145,9 @@ pub const EmbeddingSource = struct {
     ctx: *anyopaque,
     recompute_fn: *const fn (ctx: *anyopaque, ids: []const u32, out: []f32) anyerror!void,
 
+    /// Proves that a retained exact vector still matches its current source.
+    validate_retained_fn: ?*const fn (ctx: *anyopaque, id: u32) anyerror!bool = null,
+
     pub fn recompute(self: EmbeddingSource, ids: []const u32, out: []f32) !void {
         return self.recompute_fn(self.ctx, ids, out);
     }
@@ -1586,7 +1589,9 @@ pub const Index = struct {
                 const p = pool.items[i];
                 if (p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
-                if (!opts.verify_source and !opts.exhaustive and self.upper_vectors.contains(p.id)) {
+                if (!opts.exhaustive and self.upper_vectors.contains(p.id) and
+                    (!opts.verify_source or (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false)))
+                {
                     const c = Cand{ .dist = p.lower, .id = p.id };
                     if (top.len() < k) try top.push(alloc, c) else if (c.dist < top.top().dist) top.replaceTop(c);
                     continue;
@@ -3507,6 +3512,51 @@ test "leann: stored upper vectors avoid recomputing upper nodes" {
     const undo = try index.applyDeltaUndoable(delta);
     index.revertDelta(delta, undo);
     try testing.expectEqual(before, index.upper_vectors.count());
+}
+
+test "leann: retained vector validation avoids inference and rejects stale identities" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq, .store_upper = true }, fx.data);
+    defer index.deinit();
+    const Verified = struct {
+        index: *const Index,
+        vectors: []const f32,
+        valid: bool = true,
+        validations: usize = 0,
+        upper_recomputes: usize = 0,
+
+        fn validate(raw: *anyopaque, _: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.validations += 1;
+            return self.valid;
+        }
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (ids, 0..) |id, i| {
+                if (self.index.upper_vectors.contains(id)) self.upper_recomputes += 1;
+                @memcpy(out[i * 16 ..][0..16], self.vectors[id * 16 ..][0..16]);
+            }
+        }
+        fn source(self: *@This()) EmbeddingSource {
+            return .{ .ctx = self, .recompute_fn = recompute, .validate_retained_fn = validate };
+        }
+    };
+    var src = Verified{ .index = &index, .vectors = fx.data };
+    var first = try index.search(alloc, src.source(), fx.query(0), .{ .k = 400, .ef = 400, .verify_source = true });
+    defer first.deinit(alloc);
+    try testing.expect(src.validations > 0);
+    try testing.expectEqual(@as(usize, 0), src.upper_recomputes);
+    src.valid = false;
+    var second = try index.search(alloc, src.source(), fx.query(0), .{ .k = 400, .ef = 400, .verify_source = true });
+    defer second.deinit(alloc);
+    try testing.expect(src.upper_recomputes > 0);
+    try testing.expectEqual(first.results.len, second.results.len);
+    for (first.results, second.results) |a, b| {
+        try testing.expectEqual(a.id, b.id);
+        try testing.expectApproxEqAbs(a.distance, b.distance, 0.00001);
+    }
 }
 
 test "leann: rebuild from codes keeps codes and live nodes" {

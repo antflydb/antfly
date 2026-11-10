@@ -598,8 +598,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (chunk_texts.items.len == 0) return;
 
-            const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, chunk_texts.items, request.expected_dims);
+            const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder.withTextGeneration(generation), embedding_name, chunk_texts.items, request.expected_dims);
             defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
             if (vectors.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
             for (source_indexes.items, vectors) |source_index, vector| {
@@ -615,7 +617,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // Inline text chunks re-embed by re-chunking the parent;
                     // stored chunk inputs cannot.
                     if (request.input_kind == .inline_chunks and !source.has_metadata)
-                        EmbeddingArtifactOrigin{ .generated_text = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) }
+                        EmbeddingArtifactOrigin{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision) }
                     else
                         EmbeddingArtifactOrigin{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
                     vector,
@@ -646,13 +648,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (sources.items.len == 0) return;
             defer clearChunkEmbeddingSourceList(alloc, sources);
 
+            const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = dense_embedder.withTextGeneration(generation);
             var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
             defer chunk_texts.deinit(alloc);
             var source_indexes = std.ArrayListUnmanaged(usize).empty;
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
                 if (skip_unchanged_artifacts) {
@@ -667,7 +674,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try source_indexes.append(alloc, i);
             }
 
-            try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+            try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
         }
 
         pub fn flushGeneratedDenseMemoJobs(

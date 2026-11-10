@@ -24092,6 +24092,7 @@ pub const IndexManager = struct {
                     if (leann_store.loader) |base| {
                         var batched = base;
                         batched.load_batch_timed = loadDenseVectorsForLeann;
+                        batched.validate_digest = validateLeannRetainedDigest;
                         leann_store.setLoader(batched);
                     }
                     // A replica that crashed between persisting records and
@@ -33455,6 +33456,23 @@ pub const IndexManager = struct {
             .distance = try exactVectorBlockDistance(value, query, query_measure, metric, decode_scratch),
             .error_bound = 0,
         };
+    }
+
+    fn validateLeannRetainedDigest(ctx: *anyopaque, alloc: Allocator, metadata: []const u8, digest: u64) anyerror!bool {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const manager = loader.manager;
+        const store = manager.primary_store orelse return false;
+        const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
+        const embedding_name = entry.embedding_name orelse return false;
+        if (try leannStubIdentity(alloc, store, metadata, embedding_name)) |identity| return identity.digest == digest;
+        // Stored vectors need no inference. Checking their digest also fences
+        // replacements that have not yet reached this graph generation.
+        const vector = manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, embedding_name, null) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer alloc.free(vector);
+        return leann_store_mod.vectorDigest(vector) == digest;
     }
 
     /// LEANN batch loader: reads stored vectors, then re-embeds every

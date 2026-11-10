@@ -63,6 +63,7 @@ pub const VectorLoader = struct {
     /// `found[i]`. Search recomputes go through it when present, so a source
     /// that re-embeds documents makes one embedder call per batch.
     load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
+    validate_digest: ?*const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8, digest: u64) anyerror!bool = null,
 };
 
 /// Fetches the bytes of a generation whose install record did not inline
@@ -828,7 +829,14 @@ pub const Replica = struct {
         strict: bool = false,
 
         fn source(self: *PlanSource) leann.EmbeddingSource {
-            return .{ .ctx = self, .recompute_fn = recompute };
+            return .{ .ctx = self, .recompute_fn = recompute, .validate_retained_fn = if (self.loader.validate_digest != null) validateRetained else null };
+        }
+
+        fn validateRetained(raw: *anyopaque, id: u32) anyerror!bool {
+            const self: *PlanSource = @ptrCast(@alignCast(raw));
+            const key = self.replica.keys.items[id];
+            const digest = self.replica.liveDigest(key) orelse return false;
+            return self.loader.validate_digest.?(self.loader.ctx, self.replica.alloc, key, digest);
         }
 
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
