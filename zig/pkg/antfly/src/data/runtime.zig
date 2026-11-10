@@ -2199,7 +2199,7 @@ const RaftTableApplyStateMachine = struct {
     }
 
     fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
-        return err == error.RaftApplyWriterUnavailable;
+        return err == error.RaftApplyWriterUnavailable or err == error.StorageOwnerAdmissionPending;
     }
 
     fn applyReady(
@@ -2252,7 +2252,7 @@ const RaftTableApplyStateMachine = struct {
                         // publishing the same typed outcome to the proposer.
                         if (batchRequiresDocumentDbApply(decoded.batch.req)) {
                             self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null) catch |err| switch (err) {
-                                error.RaftApplyWriterUnavailable, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+                                error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
                                 else => return err,
                             };
                         }
@@ -2295,6 +2295,7 @@ const RaftTableApplyStateMachine = struct {
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
+                            err == error.StorageOwnerAdmissionPending or
                             err == error.ArtifactCatalogDrift or
                             err == error.RetainedEffectsFull or
                             err == error.RowPolicyReadersActive or
@@ -9554,7 +9555,7 @@ pub const DataServer = struct {
 
     fn handleRaftProgressError(err: anyerror) !void {
         switch (err) {
-            error.RaftApplyWriterUnavailable => return,
+            error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending => return,
             else => return err,
         }
     }
@@ -49635,7 +49636,7 @@ fn implementationTests() type {
             );
             try std.testing.expectEqual(@as(u64, 3), apply_sm.writer_unavailable_retries_total.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 2), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
-            for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable }) |admission_error| {
+            for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.StorageOwnerAdmissionPending }) |admission_error| {
                 apply_sm.test_faults.storage_admission_once = .{ .index = 2, .err = admission_error };
                 try std.testing.expectError(
                     error.RaftApplyWriterUnavailable,
@@ -49646,13 +49647,15 @@ fn implementationTests() type {
                 try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = group_id, .index = 2 }).?.outcome);
                 try std.testing.expect(apply_sm.stateMachine().isApplyRetryable(group_id, error.RaftApplyWriterUnavailable));
             }
+            try std.testing.expect(apply_sm.stateMachine().isApplyRetryable(group_id, error.StorageOwnerAdmissionPending));
             try DataServer.handleRaftProgressError(error.RaftApplyWriterUnavailable);
+            try DataServer.handleRaftProgressError(error.StorageOwnerAdmissionPending);
             try std.testing.expectError(error.OutOfMemory, DataServer.handleRaftProgressError(error.OutOfMemory));
 
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &extended_entries, &.{});
             try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-            try std.testing.expectEqual(@as(usize, 8), apply_sm.test_faults.document_apply_attempts);
+            try std.testing.expectEqual(@as(usize, 9), apply_sm.test_faults.document_apply_attempts);
             try std.testing.expectEqual(@as(usize, 3), apply_sm.test_faults.document_apply_successes);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 2).?);
@@ -49688,7 +49691,7 @@ fn implementationTests() type {
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &shifted_entries, &.{});
             try std.testing.expectEqual(@as(u64, 5), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-            try std.testing.expectEqual(@as(usize, 10), apply_sm.test_faults.document_apply_attempts);
+            try std.testing.expectEqual(@as(usize, 11), apply_sm.test_faults.document_apply_attempts);
             try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_successes);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);

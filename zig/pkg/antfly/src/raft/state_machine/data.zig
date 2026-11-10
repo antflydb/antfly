@@ -98,9 +98,9 @@ pub const DataStateMachine = struct {
     }
 
     fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
-        // Both durable projection admission and the document delegate normalize
-        // replay-safe capacity/owner contention to this boundary.
-        return err == error.RaftApplyWriterUnavailable;
+        // Prepared-owner admission may yield before the ordered adapter runs.
+        // Both that contract and normalized writer contention are replay-safe.
+        return err == error.RaftApplyWriterUnavailable or err == error.StorageOwnerAdmissionPending;
     }
 
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {

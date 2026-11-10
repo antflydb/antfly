@@ -609,6 +609,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .pdf_standard_fonts_mod = pdf_standard_fonts_mod,
         .font_mod = font_mod,
         .platform_mod = platform_mod,
+        .filters = buildArguments(b) orelse &.{},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
     const documents_tests = b.addTest(.{ .root_module = inference_runtime_build.sourceDocumentsModule(b, b.modules.get("antfly_documents").?, shared.pdf_mod) });
