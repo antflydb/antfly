@@ -293,6 +293,7 @@ pub const Resolver = struct {
     arena: std.heap.ArenaAllocator,
     table: []const u8,
     key_template: []const u8,
+    candidate_key_prefix: []const u8 = "",
     aliases: []const KeyAlias = &.{},
     curation_index: curation.Index = .{},
     curation_enabled: bool = false,
@@ -332,6 +333,7 @@ pub const Resolver = struct {
         const key_template = try a.dupe(u8, jsonString(obj.get("key_template") orelse return error.MissingKeyTemplate) orelse
             return error.MissingKeyTemplate);
 
+        const candidate_key_prefix = if (obj.get("candidate_key_prefix")) |v| try a.dupe(u8, jsonString(v) orelse return error.InvalidResolverConfig) else "";
         var type_must_match = true;
         if (obj.get("type_must_match")) |v| {
             if (v == .bool) type_must_match = v.bool;
@@ -385,6 +387,7 @@ pub const Resolver = struct {
             .arena = arena,
             .table = table,
             .key_template = key_template,
+            .candidate_key_prefix = candidate_key_prefix,
             .aliases = aliases,
             .alias_index = redirects,
             .curation_enabled = obj.contains("suppress") or obj.contains("curation"),
@@ -526,6 +529,13 @@ pub const Resolver = struct {
         return renderKey(gpa, self.key_template, entity);
     }
 
+    pub fn permitsRef(self: *const Resolver, ref: DocRef) bool {
+        return self.candidate_key_prefix.len == 0 or (std.mem.eql(u8, ref.table, self.table) and std.mem.startsWith(u8, ref.key, self.candidate_key_prefix));
+    }
+    pub fn permitsCandidate(self: *const Resolver, candidate: Candidate) bool {
+        return self.permitsRef(candidate.doc_ref) and self.permitsRef(candidate.resolved_doc_ref orelse candidate.doc_ref);
+    }
+
     /// Resolve every mention. `candidates[i]` holds candidates for `entities[i]`
     /// (an empty top-level slice means deterministic minting only). The returned
     /// `Resolution` owns its memory; `gpa` is also used as transient scoring
@@ -557,6 +567,7 @@ pub const Resolver = struct {
                 value.doc_ref.key = try a.dupe(u8, canonical);
                 if (!std.mem.eql(u8, before, canonical)) value.redirected_from = before;
             }
+            if (value.decision != .suppressed and !self.permitsRef(value.doc_ref)) return error.InvalidResolverConfig;
             if (value.decision != .suppressed and self.curation_enabled) value.rendered_key = try renderKey(a, self.key_template, entity);
             try resolved.append(a, value);
         }
@@ -604,6 +615,7 @@ pub const Resolver = struct {
             .surface_form = try a.dupe(u8, entity.text),
         };
         for (candidates) |candidate| {
+            if (!self.permitsCandidate(candidate)) continue;
             if (!std.mem.eql(u8, candidate.doc_ref.table, self.table) or
                 !std.mem.eql(u8, candidate.doc_ref.key, minted_key)) continue;
             if (self.type_must_match and !std.mem.eql(u8, candidate.label, entity.label)) continue;
@@ -631,6 +643,7 @@ pub const Resolver = struct {
                 var best: ?usize = null;
                 var best_outcome: matcher.Outcome = .no_match;
                 for (candidates, 0..) |cand, ci| {
+                    if (!self.permitsCandidate(cand)) continue;
                     if (self.type_must_match and !std.mem.eql(u8, cand.label, entity.label)) continue;
                     const target = cand.resolved_doc_ref orelse cand.doc_ref;
                     if (self.curation_index.keySuppressed(cand.doc_ref.key) or self.curation_index.keySuppressed(target.key) or
@@ -2457,6 +2470,14 @@ pub const ResolutionStage = struct {
             }
         }
 
+        // Scope also applies to injected providers and retained candidate work,
+        // before query policy or adjudication can inspect those records.
+        if (self.resolver.candidate_key_prefix.len > 0) for (lists) |*list| {
+            var scoped: std.ArrayListUnmanaged(Candidate) = .empty;
+            for (list.*) |candidate| if (self.resolver.permitsCandidate(candidate)) try scoped.append(a, candidate);
+            list.* = scoped.items;
+        };
+
         if (self.query_policy) |policy| try policy.prepare(policy.ptr, parsed.arena.allocator(), current.?, parsed.entities, lists);
 
         // Refetched candidates can still reuse features: only their consumed
@@ -2568,6 +2589,7 @@ pub const ResolutionStage = struct {
             };
             resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
         }
+        for (resolution.entities) |entity| if (entity.decision != .suppressed and !self.resolver.permitsRef(entity.doc_ref)) return error.InvalidResolverConfig;
         return try resolution.toJson(gpa);
     }
 
@@ -6107,4 +6129,24 @@ test "REVIEW maximum historical dependency receipts can still retract a veto" {
     try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
     try testing.expectEqualStrings(positive, map.map.get("resolution").?);
     try testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "candidate namespace fences fuzzy matches and curated redirects" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"source/ours/{{ slug _entity.text }}","candidate_key_prefix":"source/ours/","scorer":{"comparisons":[],"combine":{"bias":20},"decision":{"match":0.9}}}
+    );
+    defer resolver.deinit();
+    const candidates = [_]Candidate{
+        .{ .doc_ref = .{ .table = "entities", .key = "source/foreign/alice" }, .label = "person", .record = .{ .fields = &.{} } },
+        .{ .doc_ref = .{ .table = "entities", .key = "source/ours/curated" }, .label = "person", .record = .{ .fields = &.{} } },
+    };
+    var result = try resolver.resolve(a, 1, &.{.{ .local_id = "one", .label = "person", .text = "Alice" }}, &.{&candidates});
+    defer result.deinit();
+    try testing.expectEqualStrings("source/ours/curated", result.entities[0].doc_ref.key);
+    const redirected = Candidate{ .doc_ref = candidates[1].doc_ref, .label = "person", .record = .{ .fields = &.{} }, .resolved_doc_ref = .{ .table = "foreign", .key = "source/ours/curated" } };
+    try testing.expect(!resolver.permitsCandidate(redirected));
+    resolver.aliases = &.{.{ .key = "source/ours/alice", .target = "source/foreign/alice" }};
+    resolver.alias_index = null;
+    try testing.expectError(error.InvalidResolverConfig, resolver.resolve(a, 1, &.{.{ .local_id = "one", .label = "person", .text = "Alice" }}, &.{}));
 }

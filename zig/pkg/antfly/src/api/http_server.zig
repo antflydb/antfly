@@ -22079,6 +22079,26 @@ pub const ApiHttpServer = struct {
                 try references.append(a, reference);
             }
         }
+        const join_target_count = targets.items.len;
+        const graph_binding = @import("graph_primary_table_binding.zig");
+        var graph_document: ?std.json.Value = if (parsed_request.value.graph_queries != null)
+            try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .parse_numbers = false })
+        else
+            null;
+        const graph_qualifiers = if (graph_document) |*root| try graph_binding.qualifiersValueAlloc(a, root) else &.{};
+        for (graph_qualifiers) |name| {
+            // Existing internal qualifiers remain explicit native identities.
+            if (std.mem.startsWith(u8, name, "table:")) continue;
+            const graph_target = try system_catalog.Target.parse(name);
+            const key = try graph_target.resourceNameAlloc(a);
+            if (identity.*) |value| if (!permissionsAllow(value.permissions, .table, key, .read)) return error.Forbidden;
+            const already_bound = for (targets.items) |existing| {
+                if (std.mem.eql(u8, key, try existing.resourceNameAlloc(a))) break true;
+            } else false;
+            if (already_bound) continue;
+            if (targets.items.len == 256) return error.InvalidQueryRequest;
+            try targets.append(a, graph_target);
+        }
         if (targets.items.len == 0) {
             const owned_result_physical = try a.dupe(u8, logical);
             return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context } };
@@ -22090,7 +22110,7 @@ pub const ApiHttpServer = struct {
         // Validate all native participants before dispatch, including nested
         // RHS tables and empty-left joins. External lake sources remain native.
         if (join != null and self.source.vtable.supports_object_tables) {
-            for (result.tables) |resolved| {
+            for (result.tables[0..join_target_count]) |resolved| {
                 if (self.source.vtable.supports_query_definitions and resolved.?.query_definition == null) return error.InvalidCatalogRecord;
                 const resolver = shared_resolver orelse &local_resolver;
                 const definition = (try self.queryTableDefinition(resolver.arena, resolver, resolved.?.name, context)) orelse continue;
@@ -22102,8 +22122,7 @@ pub const ApiHttpServer = struct {
         }
         const offset: usize = if (primary_foreign) 0 else 1;
         const physical = if (primary_foreign) try a.dupe(u8, logical) else result.tables[0].?.name;
-        if (!primary_foreign) if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, primary_key, physical);
-        for (references.items, targets.items[offset..], result.tables[offset..]) |reference, rhs, table| {
+        for (references.items, targets.items[offset..join_target_count], result.tables[offset..join_target_count]) |reference, rhs, table| {
             reference.right_label = try rhs.displayNameAlloc(a);
             reference.right_table = @constCast(table.?.name);
         }
@@ -22112,10 +22131,21 @@ pub const ApiHttpServer = struct {
             if (definition.storage_engine != .object) break :bound null;
             break :bound .{ .table_id = definition.table_id, .generation = definition.object_storage_generation };
         } else null;
-        // Graph readers compare physical identities. Bind only this proved
-        // full primary target; never infer a foreign route from its basename.
-        const primary_names: []const []const u8 = if (target.isDefault()) &.{ primary_key, target.table } else &.{primary_key};
-        const bound_body = if (primary_foreign or parsed_request.value.graph_queries == null) null else try @import("graph_primary_table_binding.zig").bind(a, body, primary_names, physical);
+        // Resolve all structural graph qualifiers in the same catalog snapshot
+        // as the primary and joins. Entity bindings use public table names;
+        // graph storage compares physical identities. Never infer basenames or
+        // rewrite table-like strings inside filters/evidence.
+        var graph_bindings: std.ArrayList(graph_binding.Binding) = .empty;
+        for (targets.items, result.tables) |participant, resolved| {
+            const key = try participant.resourceNameAlloc(a);
+            const names: []const []const u8 = if (participant.isDefault())
+                try a.dupe([]const u8, &.{ key, participant.table })
+            else
+                try a.dupe([]const u8, &.{key});
+            try graph_bindings.append(a, .{ .names = names, .physical = resolved.?.name });
+            if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, key, resolved.?.name);
+        }
+        const bound_body = if (graph_document) |*root| try graph_binding.bindParsedAlloc(a, root, graph_bindings.items) else null;
         return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision, .bound_body = bound_body };
     }
 
@@ -59213,13 +59243,16 @@ test "system catalog graph primary qualifiers bind full target without namespace
         fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(input == .resolve_many);
-            try std.testing.expectEqual(@as(usize, 1), input.resolve_many.targets.len);
             const target = input.resolve_many.targets[0];
             try std.testing.expectEqualStrings(self.expected.database, target.database);
             try std.testing.expectEqualStrings(self.expected.namespace, target.namespace);
             try std.testing.expectEqualStrings(self.expected.table, target.table);
-            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 10, .name = "table:primary" }};
-            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+            const tables = try alloc.alloc(?system_catalog.ResolvedTable, input.resolve_many.targets.len);
+            defer alloc.free(tables);
+            for (input.resolve_many.targets, tables, 0..) |participant, *table, i| {
+                table.* = .{ .table_id = @intCast(10 + i), .name = if (i == 0) "table:primary" else if (participant.isDefault()) "table:default" else "table:foreign" };
+            }
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
         }
     };
     for ([_]system_catalog.Target{ .{ .table = "docs" }, .{ .database = "tenant", .namespace = "blue", .table = "docs" } }) |primary| {
@@ -59240,6 +59273,11 @@ test "system catalog graph primary qualifiers bind full target without namespace
             .@"return" = .{ .bindings = &[_][]const u8{"a"} },
         } } }, .{});
         defer a.free(body);
+        var permission = try usermgr.Permission.initOwned(a, .table, key, .read);
+        defer permission.deinit(a);
+        var permissions = [_]usermgr.Permission{permission};
+        var restricted: ?AuthenticatedIdentity = .{ .username = @constCast("reader"), .permissions = &permissions };
+        try std.testing.expectError(error.Forbidden, server.bindCatalogQuery(a, .{}, key, body, &restricted, null));
         var identity: ?AuthenticatedIdentity = null;
         var bound = try server.bindCatalogQuery(a, .{}, key, body, &identity, null);
         defer bound.deinit();
@@ -59247,8 +59285,8 @@ test "system catalog graph primary qualifiers bind full target without namespace
         defer parsed.deinit();
         const nodes = parsed.value.object.get("graph_queries").?.object.get("q").?.object.get("match").?.object.get("nodes").?.object;
         try std.testing.expectEqualStrings("table:primary", nodes.get("a").?.object.get("table").?.string);
-        try std.testing.expectEqualStrings(foreign, nodes.get("b").?.object.get("table").?.string);
-        try std.testing.expectEqualStrings(if (primary.isDefault()) "table:primary" else "docs", nodes.get("c").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings("table:foreign", nodes.get("b").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings(if (primary.isDefault()) "table:primary" else "table:default", nodes.get("c").?.object.get("table").?.string);
         try std.testing.expectEqualStrings("table:primary", nodes.get("d").?.object.get("table").?.string);
         try std.testing.expect(!nodes.get("e").?.object.contains("table"));
         const selector_body = try std.json.Stringify.valueAlloc(a, .{ .graph_queries = .{
@@ -59266,7 +59304,7 @@ test "system catalog graph primary qualifiers bind full target without namespace
         try std.testing.expectEqualStrings("table:primary", start.object.get("table").?.string);
         const path = operations.get("path").?.object.get("shortest_path").?.object;
         try std.testing.expectEqualStrings("table:primary", path.get("from").?.object.get("table").?.string);
-        try std.testing.expectEqualStrings(foreign, path.get("to").?.object.get("table").?.string);
+        try std.testing.expectEqualStrings("table:foreign", path.get("to").?.object.get("table").?.string);
         const paths = operations.get("paths").?.object.get("k_shortest_paths").?.object;
         try std.testing.expectEqualStrings("table:primary", paths.get("from").?.object.get("table").?.string);
         try std.testing.expectEqualStrings("table:primary", paths.get("to").?.object.get("table").?.string);
@@ -59282,10 +59320,13 @@ test "system catalog retrieval executes bound primary graph qualifiers" {
         }
         fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(input == .resolve_many);
-            try std.testing.expectEqual(@as(usize, 1), input.resolve_many.targets.len);
             try std.testing.expectEqualStrings("docs", input.resolve_many.targets[0].table);
-            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 10, .name = "table:primary" }};
-            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+            const tables = try alloc.alloc(?system_catalog.ResolvedTable, input.resolve_many.targets.len);
+            defer alloc.free(tables);
+            for (input.resolve_many.targets, tables, 0..) |participant, *table, i| {
+                table.* = .{ .table_id = @intCast(10 + i), .name = if (i == 0) "table:primary" else if (participant.isDefault()) "table:default" else "table:foreign" };
+            }
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
         }
         fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
             return null;
@@ -59305,7 +59346,7 @@ test "system catalog retrieval executes bound primary graph qualifiers" {
                 } else {
                     const identities = operation.query.start_nodes.identities;
                     try std.testing.expectEqualStrings("table:primary", identities[0].table.?);
-                    try std.testing.expectEqualStrings("foreign", identities[1].table.?);
+                    try std.testing.expectEqualStrings("table:default", identities[1].table.?);
                 }
             }
             return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };

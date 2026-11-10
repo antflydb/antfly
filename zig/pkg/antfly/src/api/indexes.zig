@@ -4665,6 +4665,8 @@ fn appendResolverReplayDiagnosticsStatus(alloc: std.mem.Allocator, out: *std.Arr
         try appendJsonString(alloc, out, "resolution_artifact");
         try out.appendSlice(alloc, ":");
         try appendJsonString(alloc, out, resolver.resolution_artifact);
+        try out.appendSlice(alloc, ",\"candidate_key_prefix\":");
+        try appendJsonString(alloc, out, resolver.candidate_key_prefix);
         try out.appendSlice(alloc, "}");
     }
     try out.appendSlice(alloc, "]}");

@@ -26568,6 +26568,8 @@ pub const GraphResolverConfig = struct {
     suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
+    /// Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
+    candidate_key_prefix: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
     candidate_limit: ?i64 = null,
     name_embedding: ?[]const u8 = null,
@@ -26597,6 +26599,7 @@ pub const GraphResolverConfig = struct {
         .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
+        .{ "candidate_key_prefix", "candidate_key_prefix", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
         .{ "candidate_limit", "candidate_limit", true },
         .{ "name_embedding", "name_embedding", true },
@@ -26667,6 +26670,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.candidate_search) |value| {
             try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_key_prefix) |value| {
+            try jw.objectField("candidate_key_prefix");
             try jw.write(value);
         }
         if (self.candidate_ann_index) |value| {

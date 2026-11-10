@@ -18964,6 +18964,8 @@ export interface components {
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
+            /** @description Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching. */
+            candidate_key_prefix?: string;
             candidate_ann_index?: string;
             /** Format: uint */
             candidate_limit?: number;
