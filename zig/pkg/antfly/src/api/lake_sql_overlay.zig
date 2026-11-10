@@ -177,7 +177,11 @@ const Cursor = struct {
         };
         try self.context.ensureActive();
         self.page_sequence = try std.math.add(u64, self.page_sequence, 1);
-        return .{ .rows = rows.items, .owned_arena = arena, .after = if (self.base_done and self.change_at == self.cut.pending.changes.len) null else try std.fmt.allocPrint(scratch, "accepted-wal-{d}", .{self.page_sequence}) };
+        // Complete every allocation before transferring the arena by value.
+        // A continuation can allocate a new backing block after an empty page;
+        // copying the arena first would leave that block unowned on deinit.
+        const after = if (self.base_done and self.change_at == self.cut.pending.changes.len) null else try std.fmt.allocPrint(scratch, "accepted-wal-{d}", .{self.page_sequence});
+        return .{ .rows = rows.items, .owned_arena = arena, .after = after };
     }
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));

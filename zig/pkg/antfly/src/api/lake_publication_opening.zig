@@ -33,7 +33,7 @@ pub const max_bundles = 4;
 pub const max_pages = 64;
 const read_budget = 32 * 1024 * 1024;
 const decode_budget = 64 * 1024 * 1024;
-const parallel_budget = 32 * 1024 * 1024;
+const parallel_budget = 64 * 1024 * 1024;
 
 const Navigation = struct { domain: [32]u8, ref: tree.Ref, depth: u8 = 0, optional: bool = false };
 // Byte-cached navigation does not need a second inline provider selector.
@@ -77,6 +77,9 @@ test "external lake cold working set payload locators displace cached navigation
     try std.testing.expectEqualStrings("navigation-0", set.entries.items[0].value.id);
     for (set.entries.items) |entry| try std.testing.expectEqual(@as(u8, 1), entry.priority);
     try std.testing.expect(!set.candidate("uncached-navigation", 0));
+    try std.testing.expect(!set.candidate("overflow-payload", 1));
+    try set.put(a, .{ .id = "bootstrap", .bytes = 44, .generation = "v3" }, 2);
+    try std.testing.expectEqualStrings("bootstrap", set.entries.items[127].value.id);
     try std.testing.expect(!set.candidate("overflow-payload", 1));
 }
 const Producer = struct {
@@ -168,6 +171,13 @@ const Producer = struct {
         var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
         defer arena.deinit();
         const a = arena.allocator();
+        // These roots can be needed before an opening seed is admitted, or
+        // again after byte-cache eviction. Never displace their exact selectors
+        // with speculative payload locations or captured child navigation.
+        try recordLocatorPriority(self, .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len }, 2);
+        if (publication.directory) |ref| try recordLocatorPriority(self, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 2);
+        if (publication.source_navigation) |ref| try recordLocatorPriority(self, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 2);
+        if (publication.row_identity) |ref| try recordLocatorPriority(self, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 2);
         try self.read(a, .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
         if (publication.directory) |ref| try self.read(a, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
         if (publication.source_navigation) |ref| if (ref.byte_len <= packs.max_decoded_bytes) {
@@ -259,8 +269,12 @@ const Producer = struct {
         // identity bytes and compact source columns next; arbitrary archive
         // prefixes never displace navigation or trigger an unbounded scan.
         var working_bytes: usize = 0;
-        for (self.working[0..self.working_count]) |entry| {
+        working: for (self.working[0..self.working_count]) |entry| {
             if (self.collector.full() or working_bytes == 8 * 1024 * 1024) break;
+            // The complete tiny segment was captured above. Reopening it with
+            // a zero-residency producer cache would repeat all provider reads
+            // while contributing no new member to the deduplicated bundles.
+            for (self.small[0..self.small_count]) |tiny| if (std.mem.eql(u8, entry.ref.artifact_id, tiny.ref.artifact_id)) continue :working;
             var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
             defer scratch.deinit();
             const read_store = if (entry.optional) self.store.optionalReadView() else self.store.*;
@@ -333,6 +347,10 @@ const Producer = struct {
             _ = try @import("lake_index_seekable_text.zig").warmOpening(a, .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordPayloadLocator } }, route.ref, 1024 * 1024);
             self.working[self.working_count] = .{ .ref = .{ .artifact_id = try self.a.dupe(u8, route.ref.artifact_id), .checksum = try self.a.dupe(u8, route.ref.checksum), .byte_len = route.ref.byte_len }, .optional = self.capture_optional };
             self.working_count += 1;
+        } else {
+            // Exact sorting can choose any of the observed canonical routes.
+            // The 32-opening working-set cap must not also truncate selectors.
+            try @import("lake_index_seekable_text.zig").warmLocators(a, .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordPayloadLocator } }, route.ref);
         }
         if (self.capture_small and route.bytes <= 256 * 1024 and self.small_count < self.small.len) {
             for (self.small[0..self.small_count]) |*prior| if (std.mem.eql(u8, prior.ref.artifact_id, route.ref.artifact_id)) {

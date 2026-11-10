@@ -374,18 +374,21 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
             }
         };
     }
+    var manifest_ahead: ManifestAhead = .{};
+    defer manifest_ahead.deinit(server.embedding_provider_runtime.io);
     if (prepared.native_cut) |cut| {
-        var cut_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        var cut_store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
         try server.prepareLakeCache();
+        if (cut.manifest) |ref| manifest_ahead.start(server, ref, cut_store.cache_identity, prepared.retained_context);
         retained_pin = try retained_api.loadOwned(ra, &artifacts, cut_store.identity, table, cut, now_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context, .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context });
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     }
     if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
-        var cut_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        var cut_store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
@@ -411,12 +414,12 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer if (!transferred) lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
-    var options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    var options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = server.embedding_provider_runtime.io, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     options.retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null;
     options.authoritative_metadata = prepared.native_cut != null;
     options.native_reader_protected = if (prepared.native_owner) |owner| owner.enabled else false;
     if (prepared.native_cut) |cut| if (cut.manifest) |ref| {
-        var manifest_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        var manifest_store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
         defer manifest_store.deinit();
         manifest_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = manifest_store.cache_identity, .context = context };
@@ -428,7 +431,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     // at its final heap address before selecting/binding any publication.
     // Owned queries reference already durable state. Enforce their no-upload
     // contract through a read-only artifact store, including fresh requests.
-    prepared.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    prepared.store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
     const store = &prepared.store;
     defer if (!transferred) store.deinit();
     if (retained == null) try server.retainLakeQueryStore(a, store, table.table_id, request);
@@ -565,6 +568,89 @@ const Manifest = struct {
         return .{ .bytes = bytes };
     }
 };
+/// Both references are already authenticated by the native owner's cut. Fetch
+/// the small manifest alongside its retained descriptor instead of serializing
+/// independent TLS/object reads. Only immutable bytes enter shared residency;
+/// the normal lease/manifest admission still decides whether a query can use it.
+const ManifestAhead = struct {
+    server: *server_api.ApiHttpServer = undefined,
+    ref: source_owner.admission.Reference = undefined,
+    scope: [32]u8 = undefined,
+    context: Context = .{},
+    stopped: std.atomic.Value(bool) = .init(false),
+    task: ?local.sql_parallel_scheduler.Task(anyerror!void) = null,
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return self.stopped.load(.acquire) or self.context.isCancelled();
+    }
+    fn run(self: *@This()) anyerror!void {
+        try self.context.ensureActive();
+        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        try token.check();
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        var store = try Store.openNativeWithIo(arena.allocator(), self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, self.server.embedding_provider_runtime.io);
+        defer store.deinit();
+        if (!std.mem.eql(u8, &store.cache_identity, &self.scope)) return error.ExternalLakeIndexCredentialsChanged;
+        var context = self.context;
+        context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+        store.implementation.cloud_io = context.io;
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = store.cache_identity, .context = context };
+        const held = try @import("lake_index_decoded_metadata.zig").acquire(Manifest, cached, store.artifactStore(), try Manifest.artifact(self.ref), token, Manifest.load);
+        held.release();
+    }
+    fn start(self: *@This(), server: *server_api.ApiHttpServer, ref: source_owner.admission.Reference, scope: [32]u8, context: Context) void {
+        if (ref.bytes > 4 * 1024 * 1024 or context.isCancelled()) return;
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = scope, .context = context };
+        if (@import("lake_index_decoded_metadata.zig").resident(Manifest, cached, Manifest.artifact(ref) catch return) catch return) return;
+        self.server = server;
+        self.ref = ref;
+        self.scope = scope;
+        self.context = context;
+        if (context.io) |io| self.task = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, ref.bytes) * 3 + 2 * 1024 * 1024, run, .{self});
+    }
+    fn deinit(self: *@This(), io: std.Io) void {
+        if (self.task) |*task| {
+            self.stopped.store(true, .release);
+            _ = task.cancel(io) catch {};
+            self.task = null;
+        }
+    }
+};
+test "external lake owned manifest prefetch owns decoded bytes and skips warm or expired work" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("owned-manifest-ahead");
+    defer directory.cleanup();
+    var unused: u8 = 0;
+    var server = server_api.ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &unused, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var store = try Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var artifacts = store.artifactStore();
+    var saved = try artifacts.putScoped(try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(13), 1, std.testing.io), "manifest bytes", .none);
+    defer saved.deinit(a);
+    const ref: source_owner.admission.Reference = .{ .id = saved.artifact_id, .bytes = @intCast(saved.byte_len) };
+    const context: Context = .{ .io = server.embedding_provider_runtime.io };
+    var expired: ManifestAhead = .{};
+    expired.start(&server, ref, store.cache_identity, .{ .io = context.io, .deadline_ns = 0 });
+    try std.testing.expect(expired.task == null);
+    var ahead: ManifestAhead = .{};
+    defer ahead.deinit(server.embedding_provider_runtime.io);
+    ahead.start(&server, ref, store.cache_identity, context);
+    if (ahead.task) |*task| {
+        try task.await(server.embedding_provider_runtime.io);
+        ahead.task = null;
+    } else try ahead.run();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
+    const owned = (try @import("lake_index_decoded_metadata.zig").lookup(Manifest, cached, try Manifest.artifact(ref))).?;
+    defer owned.release();
+    try std.testing.expectEqualStrings("manifest bytes", owned.value.bytes);
+    const reads = server.lake_read_cache.snapshot().provider_reads;
+    var warm: ManifestAhead = .{};
+    warm.start(&server, ref, store.cache_identity, context);
+    try std.testing.expect(warm.task == null);
+    try std.testing.expectEqual(reads, server.lake_read_cache.snapshot().provider_reads);
+}
 pub fn refreshOwnedCut(backing: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {
     const Stop = struct {
         server: *server_api.ApiHttpServer,
@@ -601,7 +687,7 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
     const retained_api = @import("lake_retained_cut.zig");
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     if (native_owner.current) |cut| if (now < cut.refresh_after_ms and cut.canIssue(now, retained_api.configuredTtl(server.cfg.node_config)) and std.mem.eql(u8, &cut.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) {
-        var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        var store = try Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io);
         defer store.deinit();
         var artifacts = store.artifactStore();
         var resident = retained_api.ownedResident(&artifacts, store.identity, table, cut, &server.lake_read_cache.decoded);

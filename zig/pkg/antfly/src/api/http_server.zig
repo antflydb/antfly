@@ -4199,6 +4199,7 @@ pub const ApiHttpServer = struct {
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
     lake_text_corpora: @import("lake_index_native_text_cache.zig").Cache = .{},
     lake_navigation_warming: @import("lake_index_navigation_warming.zig").Cache = .{},
+    lake_owned_cut_jobs: @import("lake_owned_cut_jobs.zig").Cache = .{},
     lake_query_admission: @import("lake_query_gc.zig").AdmissionCache = .{},
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
@@ -6446,7 +6447,7 @@ pub const ApiHttpServer = struct {
         _ = response;
     }
 
-    fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
+    pub fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
         return !self.hotStandbyMutationPolicy().failover_safe_mutations_only;
     }
 
@@ -10145,7 +10146,7 @@ pub const ApiHttpServer = struct {
         // Internal owners already select the retained DB before schema routing.
         // Only a request-scoped resolver owns capability descriptor memory.
         if (resolver != null) if (query_req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, @import("native_retained_cut.zig").prefix)) {
-            var store = try @import("lake_index_store.zig").Store.openNative(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+            var store = try @import("lake_index_store.zig").Store.openNativeWithIo(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io);
             defer store.deinit();
             var artifacts = store.artifactStore();
             const cut = @import("native_retained_cut.zig").load(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none) catch |err| {
@@ -16098,7 +16099,7 @@ pub const ApiHttpServer = struct {
                 if (external == null and table.storage.engine != .object and !self.cfg.native_retained_cuts) {
                     query_req.req.response_live_read = true;
                 } else if (external == null and table.storage.engine != .object) {
-                    var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+                    var store = try @import("lake_index_store.zig").Store.openNativeWithIo(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io);
                     defer store.deinit();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
                     defer self.source.freeAdminSnapshot(&capture);
@@ -17501,20 +17502,8 @@ pub const ApiHttpServer = struct {
 
     fn reconcileNativeLakeIndexes(self: *ApiHttpServer, table: metadata_table_manager.TableRecord, schema: schema_mod.ParsedTableSchema) !void {
         const local = @import("antfly_local_sources");
-        // Recover the searchable cut independently of WAL draining. A read-only
-        // warehouse, catalog outage, or blocked publication must not prevent
-        // retention renewal over the existing publication and durable WAL.
-        @import("lake_index_text_query.zig").refreshOwnedCut(std.heap.smp_allocator, self, table, .{
-            .deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s,
-            .cancellation = .{ .ptr = self, .is_cancelled_fn = struct {
-                fn canceled(raw: *const anyopaque) bool {
-                    const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));
-                    return server.index_installation_closing.load(.acquire);
-                }
-            }.canceled },
-        }) catch |err| {
-            std.log.debug("native lake serving cut recovery deferred table={s} err={s}", .{ table.name, @errorName(err) });
-        };
+        // Cut renewal/enrichment cannot hold the serialized publication lane.
+        @import("lake_owned_cut_jobs.zig").schedule(self, table);
         const writable = if (schema.external_base_source) |source| source.binding.write_policy == .iceberg_writer else false;
         var ingested = false;
         if (schema.external_base_source) |source_binding| {
@@ -17525,16 +17514,16 @@ pub const ApiHttpServer = struct {
                         return server.index_installation_closing.load(.acquire);
                     }
                 }.canceled };
-                const ingest_options = try @import("lake_source_owner.zig").options(std.heap.smp_allocator, self, table, .{ .cancellation = .{ .ptr = self, .is_cancelled_fn = ingest_cancel.is_cancelled_fn } });
-                const context: local.serverless_query_lake_read_context.Context = .{ .io = self.embedding_provider_runtime.io, .cancellation = ingest_cancel };
+                // One bounded group commit owns this lane. Provider retries
+                // share a single deadline; durable commit intents preserve an
+                // ambiguous attempt for the next pass instead of monopolizing
+                // publication for every other table during a cloud stall.
+                const ingest_deadline = platform_time.monotonicNs() +| 60 * std.time.ns_per_s;
+                const ingest_options = try @import("lake_source_owner.zig").options(std.heap.smp_allocator, self, table, .{ .deadline_ns = ingest_deadline, .cancellation = .{ .ptr = self, .is_cancelled_fn = ingest_cancel.is_cancelled_fn } });
+                const context: local.serverless_query_lake_read_context.Context = .{ .io = self.embedding_provider_runtime.io, .deadline_ns = ingest_deadline, .cancellation = ingest_cancel };
                 // Keep the keyed reconciliation trigger alive while queued WAL
                 // transactions remain. The next pass resolves fresh authority
                 // before building indexes for the newly committed snapshot.
-                // Recent native segments/enrichment proceed before a blocked
-                // Parquet/catalog commit and never depend on its completion.
-                @import("lake_index_text_query.zig").reconcileRecent(std.heap.smp_allocator, self, table, .{ .deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s, .cancellation = .{ .ptr = self, .is_cancelled_fn = ingest_cancel.is_cancelled_fn } }) catch |err| {
-                    if (err != error.ExternalLakeIndexNotPublished and err != error.IndexRebuilding) std.log.warn("native lake recent vector work deferred table={s} err={s}", .{ table.name, @errorName(err) });
-                };
                 ingested = try @import("../serverless/lake_ingestion.zig").drain(std.heap.smp_allocator, source_binding.binding, ingest_options, context);
             }
         }
@@ -17569,11 +17558,7 @@ pub const ApiHttpServer = struct {
             fn replace(raw: *anyopaque, before: metadata_table_manager.TableRecord, after: metadata_table_manager.TableRecord) !void {
                 const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
                 _ = try server.source.replaceTableDefinitionStamped(before, after);
-                // Publication is authoritative before acquiring its warmup
-                // reader lease; no future generation is pinned prematurely.
-                @import("lake_index_navigation_warming.zig").warmPublication(std.heap.smp_allocator, server, after) catch |err| {
-                    std.log.debug("native lake navigation warming deferred table={s} err={s}", .{ after.name, @errorName(err) });
-                };
+                @import("lake_owned_cut_jobs.zig").schedule(server, after);
             }
             fn canceled(raw: *const anyopaque) bool {
                 const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));
@@ -17593,7 +17578,7 @@ pub const ApiHttpServer = struct {
             .deadline_ns = platform_time.monotonicNs() +| 24 * 60 * 60 * std.time.ns_per_s,
             .cancellation = local.storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn),
         };
-        var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithIo(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io);
         defer store.deinit();
         try self.retainLakeQueryStore(a, &store, table.table_id, .{ .deadline_ns = context.deadline_ns, .cancellation = cancel });
         // Retained cuts and recent-vector jobs belong to the bounded durable
@@ -17627,9 +17612,7 @@ pub const ApiHttpServer = struct {
         const force_rebuild = if (repair_publication) |ready| self.lake_index_repairs.contains(table.table_id, ready) else false;
         try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .force_rebuild = force_rebuild, .execution_source = options, .identity_spill_bytes = if (self.cfg.node_config) |node| node.lake_indexes.row_identity.max_spill_bytes else 1024 * 1024 * 1024, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
         if (repair_publication) |ready| self.lake_index_repairs.forget(table.table_id, ready);
-        @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
-            std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
-        };
+        @import("lake_owned_cut_jobs.zig").schedule(self, table);
         if (writable) self.scheduleLakeMaintenance(table.table_id);
         if (ingested) return error.LakeIndexBuildInProgress;
     }
@@ -23283,7 +23266,7 @@ pub const ApiHttpServer = struct {
         try context.ensureActive();
         var bound = table.*;
         if (std.mem.allEqual(u8, &bound.object_storage_identity, 0)) {
-            var store = @import("lake_index_store.zig").Store.openNative(self.alloc, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir) catch |err| switch (err) {
+            var store = @import("lake_index_store.zig").Store.openNativeWithIo(self.alloc, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir, self.embedding_provider_runtime.io) catch |err| switch (err) {
                 error.NativeArtifactStorageRequired, error.NativeArtifactStorageUnauthorized => return try contextual_operations.textAlloc(self.alloc, 503, "object table storage is not configured or authorized"),
                 else => return err,
             };

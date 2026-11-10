@@ -138,6 +138,8 @@ pub const OpenedObjectStore = struct {
 
     pub const OpenOptions = struct {
         ensure_bucket: bool = true,
+        /// Borrowed runtime; it must outlive the opened provider client.
+        io: ?std.Io = null,
     };
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
@@ -249,8 +251,9 @@ pub const OpenedObjectStore = struct {
         var cfg = if (bearer_token) |token|
             try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(alloc, token, null)
         else
-            try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+            try object_storage.Gcs.jsonApiClientConfigFromEnvWithAuthoritiesAlloc(alloc, null, options.io, null);
         errdefer cfg.deinit(alloc);
+        if (options.io) |io| cfg.io = io;
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
 
         var owned_client = gcs.client();
@@ -368,6 +371,7 @@ pub const OpenedObjectStore = struct {
             cfg.io = io.io();
             cfg.credential_provider = context.provider();
         }
+        if (open_options.io) |io| cfg.io = io;
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
         cfg_owned = false;
         var owned_client = s3.client();
@@ -454,4 +458,22 @@ test "storage.hot_standby cleanup object store does not create a missing bucket 
     );
     defer opened.deinit();
     try std.testing.expect(!(try client.bucketExists("missing-ha-bucket")));
+}
+
+test "external lake provider clients borrow the live runtime without private transport executors" {
+    const a = std.testing.allocator;
+    {
+        var opened = try OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(a, "test-bucket", "prefix", "test-token", .{ .ensure_bucket = false, .io = std.testing.io });
+        defer opened.deinit();
+        try std.testing.expect(opened.gcs_client.?.cfg.io != null);
+        try std.testing.expect(opened.gcs_client.?.owned_httpx.?.io_impl == null);
+    }
+    {
+        var opened = try OpenedObjectStore.initS3UriWithS3AndOpenOptions(a, "test-bucket", "prefix", .{ .access_key_id = "test-key", .secret_access_key = "test-secret", .endpoint = "localhost", .use_ssl = false }, .{ .ensure_bucket = false, .io = std.testing.io });
+        defer opened.deinit();
+        try std.testing.expect(opened.s3_client.?.cfg.io != null);
+        try std.testing.expect(opened.s3_client.?.owned_httpx.?.io_impl == null);
+    }
+    // Both provider clients are gone; the borrowed runtime remains usable.
+    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
 }

@@ -1387,3 +1387,29 @@ critical path. The next candidate prioritizes payload locators within the fixed
 catalog envelope, captures bounded complete ranking/identity/compact-column
 working sets, and batches adjacent selected hydration chunks. Its correctness
 and latency require separate validation; sub-second GCS remains unproven.
+
+### Working-set candidate and GCS repeat (81dc6f51b8)
+
+The optimized build and every simulator fixture pass. At 30 ms simulated RTT,
+10,000-row common search improves from 482 to 429 ms, highlights from 470 to
+432 ms and selective filtering from 559 to 457 ms. Four mixed queries take
+443–555 ms. Strict-external common search at 100 ms RTT improves from 1.094 s
+to 901 ms. These remain individual samples.
+
+The first GCS stored-source cold query spikes to 37.43 s, with 33 provider reads
+and 51.96 s aggregate overlapping provider time. The Parquet case measures
+15.85 s cold, then fails its existing concurrent-publication readiness deadline.
+The unchanged-candidate repeat passes both full GCS cases and HN: stored source
+1.98 s cold / 1.25 s restart; Parquet hydration 2.52 s cold / 1.14 s restart.
+Cold server CPU is 240/264 ms and peak RSS 280/294 MiB. Both repeats still have
+three generation-map reads (301/274 ms). All four task-owned prefixes were
+cleaned with zero remaining versions. The spike is consistent with transient
+provider delay; it does not prove the publication timeout harmless.
+
+The next candidate removes synchronous recovery/warming from publication CAS and
+catalog-ACK paths, bounds ingestion passes, preserves coalesced recovery wakeups,
+borrows existing provider I/O runtimes, and discovers later canonical payload
+selectors independently of the warming cap. Bootstrap locators retain priority;
+tiny seeds avoid a duplicate producer pass. Sub-second GCS and the disappearance
+of remaining generation-map reads still require candidate validation. No public
+readiness timeout, fixture concurrency or correctness assertion is relaxed.

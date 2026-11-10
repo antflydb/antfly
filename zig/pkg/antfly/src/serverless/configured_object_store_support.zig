@@ -37,6 +37,9 @@ pub fn openNativeArtifactObjectStoreAlloc(
     secret_store: ?*common_secrets.FileStore,
     read_only: bool,
 ) !object_store_support.OpenedObjectStore {
+    return openNativeArtifactObjectStoreWithIoAlloc(alloc, node_config, secret_store, read_only, null);
+}
+pub fn openNativeArtifactObjectStoreWithIoAlloc(alloc: Allocator, node_config: *const common_config.Config, secret_store: ?*common_secrets.FileStore, read_only: bool, io: ?std.Io) !object_store_support.OpenedObjectStore {
     const location = node_config.storage.artifacts;
     const connection_id = location.connection orelse return error.NativeArtifactStorageRequired;
     const bucket = location.bucket orelse return error.NativeArtifactStorageRequired;
@@ -45,8 +48,8 @@ pub fn openNativeArtifactObjectStoreAlloc(
     if (connection.kind != .external_io or !hasConnectionCapability(connection, "storage.primary")) return error.NativeArtifactStorageUnauthorized;
     const external_io = connection.external_io orelse return error.NativeArtifactStorageUnauthorized;
     return switch (external_io.protocol) {
-        .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
-        .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
+        .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only, io),
+        .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only, io),
         .filesystem => blk: {
             const root = external_io.root orelse return error.NativeArtifactStorageUnauthorized;
             try validateFilesystemSourceRelativePath(prefix);
@@ -100,7 +103,7 @@ pub const BindingObjectStoreOpenOptions = struct {
         if (self.native_reader_protected) return null;
         if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
         const pins = @import("lake_snapshot_pins.zig");
-        var opened = try openNativeArtifactObjectStoreAlloc(pin_alloc, self.node_config.?, self.secret_store, false);
+        var opened = try openNativeArtifactObjectStoreWithIoAlloc(pin_alloc, self.node_config.?, self.secret_store, false, context.io);
         errdefer opened.deinit();
         const prefix = try pins.namespace(pin_alloc, opened.prefix, source, uuid);
         errdefer pin_alloc.free(prefix);
@@ -152,6 +155,9 @@ pub const BindingObjectStoreOpenOptions = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     read_only: bool = true,
+    /// Synchronous provider clients borrow this runtime. The native execution
+    /// bridge clears it and reconstructs from its checked IoBorrow.
+    io: ?std.Io = null,
     catalog_table_id: u64 = 0,
     catalog_generation: u64 = 0,
 };
@@ -224,7 +230,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, u
     defer if (journal_store) |*store| store.deinit();
     var journal: ?lake_catalog.rest.Journal = null;
     if (mutation or operation == .resolve) {
-        journal_store = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, !mutation);
+        journal_store = try openNativeArtifactObjectStoreWithIoAlloc(a, node, options.secret_store, !mutation, context.io);
         const authority = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config }, .{});
         const prefix = try std.fmt.allocPrint(scratch, "{s}/lake-catalog/{d}/{d}/{s}", .{ journal_store.?.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(authority) });
         journal = .{ .client = journal_store.?.client, .bucket = journal_store.?.bucket, .prefix = prefix };
@@ -259,7 +265,7 @@ pub fn executeExternalMaintenanceAlloc(a: Allocator, binding: catalog_binding.Bi
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Idempotency-Key") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) return error.LakeCatalogForbidden;
         try headers.append(scratch, .{ entry.key_ptr.*, value });
     }
-    var opened = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, false);
+    var opened = try openNativeArtifactObjectStoreWithIoAlloc(a, node, options.secret_store, false, context.io);
     defer opened.deinit();
     const identity = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config, .uuid = uuid }, .{});
     const journal_prefix = try std.fmt.allocPrint(scratch, "{s}/lake-provider-maintenance/{d}/{d}/{s}", .{ opened.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(identity) });
@@ -311,7 +317,7 @@ pub fn openBindingObjectStoreAlloc(
         alloc,
         binding.source_uri,
         options.file_bucket,
-        .{ .ensure_bucket = !options.read_only },
+        .{ .ensure_bucket = !options.read_only, .io = options.io },
     );
     return try openCredentialedBindingObjectStoreAlloc(alloc, binding, options);
 }
@@ -345,6 +351,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 value.bucket,
                 value.prefix,
                 options.read_only,
+                options.io,
             );
         },
         .gcs => |value| blk: {
@@ -356,6 +363,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 value.bucket,
                 value.prefix,
                 options.read_only,
+                options.io,
             );
         },
         .file => |path| blk: {
@@ -370,7 +378,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 alloc,
                 file_uri,
                 options.file_bucket,
-                .{ .ensure_bucket = !options.read_only },
+                .{ .ensure_bucket = !options.read_only, .io = options.io },
             );
         },
     };
@@ -383,6 +391,7 @@ fn openCredentialedS3PrefixAlloc(
     bucket: []const u8,
     prefix: []const u8,
     read_only: bool,
+    io: ?std.Io,
 ) !object_store_support.OpenedObjectStore {
     if (external_io.protocol != .s3) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
@@ -414,7 +423,7 @@ fn openCredentialedS3PrefixAlloc(
                 .virtual_hosted => .virtual_hosted,
             },
         },
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = io },
     );
 }
 
@@ -425,6 +434,7 @@ fn openCredentialedGcsPrefixAlloc(
     bucket: []const u8,
     prefix: []const u8,
     read_only: bool,
+    io: ?std.Io,
 ) !object_store_support.OpenedObjectStore {
     if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
@@ -443,7 +453,7 @@ fn openCredentialedGcsPrefixAlloc(
         bucket,
         prefix,
         bearer_token,
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = io },
     );
 }
 

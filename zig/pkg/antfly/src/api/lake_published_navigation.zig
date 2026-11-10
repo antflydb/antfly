@@ -200,7 +200,7 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     var source_options: @import("antfly_local_sources").serverless_lake_host.OpenOptions = options;
     source_options.row_identity_version = binding.row_identity_version;
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
-    var store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
+    var store = Store.openNativeWithIo(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, server.embedding_provider_runtime.io) catch |err| {
         try optionalAdmission(context, reader != null, err);
         return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     };

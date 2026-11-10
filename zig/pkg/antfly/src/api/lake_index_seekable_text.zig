@@ -107,6 +107,17 @@ pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
 pub fn warmOpening(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
     return warmMode(a, read, ref, maximum_bytes, true);
 }
+/// Selector discovery is cheaper than warming a segment. Later canonical
+/// routes still need their physical pack versions when the metadata/working
+/// set budget deliberately stops opening payloads after the first 32 routes.
+pub fn warmLocators(a: A, read: Read, ref: Ref) !void {
+    if (read.locator == null or ref.byte_len > 512 * 1024) return;
+    try read.check();
+    try recordDirectoryLocators(read, try loadDirectory(a, read, ref));
+}
+fn recordDirectoryLocators(read: Read, directory: Directory) !void {
+    if (read.locator) |hook| for (directory.blocks) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
+}
 test "external lake cold working set locators cover late physical packs beyond the old block prefix" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -130,7 +141,10 @@ test "external lake cold working set locators cover late physical packs beyond t
         }
     };
     var probe: Probe = .{ .a = sa };
-    _ = try warmOpening(sa, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none, .locator = .{ .ptr = &probe, .record = Probe.record } }, ref, 1024 * 1024);
+    const read: Read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none, .locator = .{ .ptr = &probe, .record = Probe.record } };
+    try warmLocators(sa, read, ref);
+    try std.testing.expectEqual(@as(usize, 9), probe.ids.count());
+    _ = try warmOpening(sa, read, ref, 1024 * 1024);
     try std.testing.expectEqual(@as(usize, 9), probe.ids.count());
 }
 /// Publication-only second pass, after every navigation root has priority.
@@ -239,13 +253,13 @@ fn warmMode(a: A, read: Read, ref: Ref, maximum_bytes: usize, opening_only: bool
     if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
     try read.check();
     const directory = try loadDirectory(a, read, ref);
-    if (read.locator) |hook| {
+    if (read.locator != null) {
         // Metadata is already copied into opening bundles. The scarce inline
         // selector budget belongs to original packs still read on demand.
         // The directory is already bounded; deduplication and lookup admission
         // belong to the publication locator collector, not an arbitrary block
         // prefix that misses later packs selected by a different query.
-        for (directory.blocks) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
+        try recordDirectoryLocators(read, directory);
     }
     var spent: usize = @intCast(ref.byte_len);
     var bundled = false;

@@ -617,3 +617,50 @@ When a demand range overlaps this query's pending prefetch, it uses the existing
 bounded physical-flight path instead of initiating speculative whole-pack I/O.
 Warm units still return without joining unrelated speculative work; each decoded
 member retains its own integrity and request-authority checks.
+
+### Serving recovery outside publication
+
+Serving-cut recovery, recent enrichment and optional navigation warming run as
+bounded cleanup-owner jobs, outside the serialized index-publication lane and
+its metadata CAS callbacks. Eight jobs are admitted by table ID and object
+incarnation. A duplicate trigger marks the active job dirty; completion releases
+its sequence-fenced ticket and resubmits that key, so a racing publication does
+not lose the recovery wakeup. Workers obtain a fresh local control snapshot,
+reject recreated tables and honor the existing shutdown and 60-second recovery
+budget. The cleanup owner joins them before server/runtime teardown.
+
+Catalog-commit acknowledgement durably invalidates the source epoch, then wakes
+publication and recovery independently. Trying to recover that epoch's old search
+cut synchronously can block the publisher needed to replace it. Accepted WAL
+acknowledgements retain their eager searchable-cut behavior. Request-side cut
+validation and mandatory recovery are unchanged. Ingestion group commits share a
+60-second pass deadline, including provider retries; durable intents preserve
+ambiguous attempts for a later pass. Public query/readiness timeouts are unchanged.
+
+Provider clients borrow the live server I/O runtime through native store opening,
+reader reopening, source resolution and WAL/catalog helpers. Clients, credentials,
+request buffers and generation bindings remain independently owned. Native
+execution clears the raw I/O field from source options and reconstructs clients
+from the checked `IoBorrow` in the receiving owner. Clients and cache entries are
+destroyed before their borrowed runtime; callers without a runtime retain the
+existing self-contained fallback. This avoids one private executor per reopen
+without sharing authentication state or request arenas.
+
+Bootstrap-root provider selectors take precedence over payload selectors, which
+in turn take precedence over already copied navigation, within the same 128-entry
+catalog limit. The 32 fully warmed segment cap no longer truncates selector
+discovery: later observed routes can contribute their bounded directory's pack
+locations without warming payloads. Complete tiny segments are excluded from a
+second working-set pass. Opening workers retain a 64-MiB per-publication wave
+budget and global scheduler admission, accounting compressed bytes, decoding and
+member copies. Candidate latency, amplification and peak memory must be measured
+before claiming that these changes meet a cold-query target.
+
+For an authenticated owned cut, a manifest of at most four MiB can be fetched
+alongside its retained descriptor. A resident-only probe skips warm work. The
+optional worker owns its client and scratch, verifies the captured credential
+scope, and admits only immutable decoded bytes. A stopped flag and joined task
+keep the cut reference/request context alive through every exit path; failed or
+unadmitted speculation retains required-reader fallback. Publication leases and
+normal manifest validation remain mandatory. This removes a sequential remote
+read without query-time uploads or carrying clients into cached metadata.

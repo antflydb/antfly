@@ -18,6 +18,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 
 test {
     _ = @import("api/lake_publication_opening.zig");
+    _ = @import("api/lake_owned_cut_jobs.zig");
     _ = @import("serverless/configured_object_store_support.zig");
     _ = @import("api/lake_ordering_keys.zig");
     _ = @import("api/lake_owned_serving_test.zig");

@@ -53,7 +53,7 @@ pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_obj
         defer a.free(uri);
         return local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(a, uri, "native-lake-indexes", .{ .ensure_bucket = true });
     }
-    return configured.openNativeArtifactObjectStoreAlloc(a, config, options.secret_store, false);
+    return configured.openNativeArtifactObjectStoreWithIoAlloc(a, config, options.secret_store, false, options.io);
 }
 pub fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 {
     const identity = try std.json.Stringify.valueAlloc(a, .{ .source = binding.source_uri, .catalog = binding.catalog }, .{});

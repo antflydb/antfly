@@ -78,9 +78,9 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     try request.cancellation.check();
     const store_started = probeNow();
     var store = if (request.store.config) |config|
-        try Store.openRetainedNative(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir)
+        try Store.openRetainedNativeWithIo(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir, io)
     else
-        try Store.openNative(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir);
+        try Store.openNativeWithIo(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir, io);
     defer store.deinit();
     probeStage("store_open_ns", store_started);
     if (store.locator.protocol != request.store.locator.protocol or store.locator.tls != request.store.locator.tls or
@@ -90,6 +90,7 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     store.implementation.cloud_vacuum = request.store.cloud_vacuum;
     var source_options = request.source;
     source_options.read_only = true;
+    source_options.io = io;
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, request.table.schema_json)) orelse return error.InvalidExternalTableBinding;
     defer binding.deinit(a);
     // Each writer family revisits source metadata and ranges. Keep reuse in

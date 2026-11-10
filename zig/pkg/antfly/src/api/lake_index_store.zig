@@ -22,7 +22,7 @@ const stores = @import("../serverless/artifacts/store.zig");
 const A = std.mem.Allocator;
 
 pub const Store = struct {
-    const Reopen = struct { config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8 };
+    const Reopen = struct { config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8, io: ?std.Io = null };
     opened: local.serverless_object_store_support.OpenedObjectStore,
     implementation: artifacts.ObjectStore,
     identity: local.metadata_lake_index_catalog.Digest,
@@ -36,9 +36,12 @@ pub const Store = struct {
         return openNative(a, config, secrets, read_only, config.deployment_mode, null);
     }
     pub fn openNative(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8) !Store {
+        return openNativeWithIo(a, config, secrets, read_only, deployment, local_base_dir, null);
+    }
+    pub fn openNativeWithIo(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8, io: ?std.Io) !Store {
         const storage = if (config) |value| value.storage else local.common_config.Config.StorageConfig{};
         var opened = if (storage.artifacts.connection != null)
-            try configured.openNativeArtifactObjectStoreAlloc(a, config.?, secrets, read_only)
+            try configured.openNativeArtifactObjectStoreWithIoAlloc(a, config.?, secrets, read_only, io)
         else fallback: {
             if (deployment != .standalone and deployment != .embedded) return error.NativeArtifactStorageRequired;
             const base = local_base_dir orelse storage.local_base_dir orelse
@@ -89,7 +92,7 @@ pub const Store = struct {
         defer a.free(physical);
         var identity: local.metadata_lake_index_catalog.Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(physical, &identity, .{});
-        return .{ .opened = opened, .implementation = implementation, .identity = identity, .cache_identity = cache_identity, .locator = locator, .reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir } };
+        return .{ .opened = opened, .implementation = implementation, .identity = identity, .cache_identity = cache_identity, .locator = locator, .reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir, .io = io } };
     }
     /// Reopen a retained namespace with currently authorized credentials. A
     /// connection can rotate keys, but cannot silently redirect old collection
@@ -99,13 +102,16 @@ pub const Store = struct {
         return openRetainedNative(a, config, secrets, locator, read_only, config.deployment_mode, null);
     }
     pub fn openRetainedNative(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, locator: local.metadata_lake_index_catalog.StoreLocator, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8) !Store {
+        return openRetainedNativeWithIo(a, config, secrets, locator, read_only, deployment, local_base_dir, null);
+    }
+    pub fn openRetainedNativeWithIo(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, locator: local.metadata_lake_index_catalog.StoreLocator, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8, io: ?std.Io) !Store {
         try locator.validate();
         var retained = config.*;
         retained.storage.artifacts = .{ .connection = if (locator.connection) |connection| @constCast(connection) else null, .bucket = @constCast(locator.bucket), .prefix = @constCast(locator.prefix) };
-        var opened = try openNative(a, &retained, secrets, read_only, deployment, local_base_dir);
+        var opened = try openNativeWithIo(a, &retained, secrets, read_only, deployment, local_base_dir, io);
         errdefer opened.deinit();
         // The temporary configuration override must not escape.
-        opened.reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir };
+        opened.reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir, .io = io };
         if (opened.locator.protocol != locator.protocol or opened.locator.tls != locator.tls or !std.mem.eql(u8, opened.locator.root, locator.root) or !std.mem.eql(u8, opened.locator.bucket, locator.bucket) or !std.mem.eql(u8, opened.locator.prefix, locator.prefix)) return error.NativeArtifactStoreLocationChanged;
         return opened;
     }
@@ -120,9 +126,9 @@ pub const Store = struct {
     pub fn reopenReadOnly(self: *const Store, a: A) !Store {
         const options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
         var result = if (options.config) |config|
-            try openRetainedNative(a, config, options.secrets, self.locator, true, options.deployment, options.local_base_dir)
+            try openRetainedNativeWithIo(a, config, options.secrets, self.locator, true, options.deployment, options.local_base_dir, options.io)
         else
-            try openNative(a, null, options.secrets, true, options.deployment, options.local_base_dir);
+            try openNativeWithIo(a, null, options.secrets, true, options.deployment, options.local_base_dir, options.io);
         errdefer result.deinit();
         if (!std.mem.eql(u8, &result.identity, &self.identity)) return error.ExternalLakeIndexStoreChanged;
         if (!std.mem.eql(u8, &result.cache_identity, &self.cache_identity)) return error.ExternalLakeIndexCredentialsChanged;

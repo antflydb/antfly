@@ -65,6 +65,8 @@ const Callbacks = struct {
 pub fn build(a: A, io: std.Io, table: local.common_topology_records.TableRecord, source_options: c.SourceOptions, store: c.values.StoreDescriptor, context: Context, cancellation: Cancellation, clock: c.values.Clock, lease: c.values.Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, policy: c.values.BuildPolicy, build_limits: c.BuildLimits, artifact_cause: *?anyerror) ![]u8 {
     var callbacks: Callbacks = .{ .allocator = a, .context = context, .cancellation = cancellation, .clock = clock, .lease = lease };
     var request: c.Request = .{ .allocator = a, .allocator_headroom = .{ .context = &callbacks, .query = Callbacks.headroom }, .table = table, .source = source_options, .store = store, .io = c.native.IoBorrow.init(&io), .cancellation = cancellation, .control = .{ .ptr = &callbacks, .check = Callbacks.check, .now = Callbacks.now, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, .embedding_options = embedding_options, .policy = policy, .build_limits = build_limits };
+    // Reconstruct provider runtimes from the checked IoBorrow in the owner.
+    request.source.io = null;
     // Clients/caches embed the creator's executor and cannot cross error domains.
     // Only the checked AntflyProvider and secret-store capabilities are borrowed.
     if (request.embedding_options) |*options| {

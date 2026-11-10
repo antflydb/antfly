@@ -68,7 +68,7 @@ pub fn options(backing: A, server: *server_api.ApiHttpServer, table: Table, requ
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     const a = arena.allocator();
-    var result: configured.BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation, .native_owner_resolver = .{ .ptr = server, .resolve = resolve } };
+    var result: configured.BindingObjectStoreOpenOptions = .{ .io = server.embedding_provider_runtime.io, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation, .native_owner_resolver = .{ .ptr = server, .resolve = resolve } };
     if (try lookup(a, server, table, request)) |owner| result.native_owner = .{ .token = owner.owner, .ptr = server, .table_id = table.table_id, .object_generation = table.object_storage_generation, .acknowledge = acknowledge };
     return result;
 }
@@ -97,6 +97,16 @@ fn acknowledge(raw: *anyopaque, table_id: u64, generation: u64, nonce: [16]u8, l
             // mutation merely to obtain a newer epoch.
             if (observed.dropped or newer.object_generation != generation or !std.mem.eql(u8, &newer.owner, &nonce) or newer.epoch <= owner.epoch) return err;
         };
+    }
+    if (lsn == null) {
+        // A catalog commit invalidates the old source epoch before its search
+        // publication exists. Recovering that cut synchronously can block the
+        // very publisher needed to make it valid. Retain the durable fence and
+        // wake publication/recovery independently; accepted WAL ACKs below
+        // retain their existing eager searchable-cut behavior.
+        @import("lake_owned_cut_jobs.zig").schedule(server, table);
+        server.notifyLakeCommit(table.name) catch {};
+        return;
     }
     // The ACK is already durable. Eager capture is best effort; until a
     // failed capture is repaired by reconciliation, fresh reads rebuild rather
