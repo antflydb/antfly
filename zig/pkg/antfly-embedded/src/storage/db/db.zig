@@ -6239,6 +6239,8 @@ pub const DB = struct {
         self.retained_query_lease = null;
         if (self.retained_remote_query_lease) |*lease| lease.deinit();
         self.retained_remote_query_lease = null;
+        if (self.local_execution.native_query_reuse) |*hint| hint.deinit();
+        self.local_execution.native_query_reuse = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -21221,23 +21223,26 @@ pub const DB = struct {
         defer arena.deinit();
         return self.nativeQueryReuseDigestLocked(arena.allocator());
     }
+    fn rememberNativeQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, proof: @import("native_query_reuse.zig").Proof) void {
+        // Retention has committed. Optional hint allocation cannot revoke it.
+        const next = @import("native_query_reuse.zig").State.init(self.alloc, request, proof) catch return;
+        if (self.local_execution.native_query_reuse) |*previous| previous.deinit();
+        self.local_execution.native_query_reuse = next;
+    }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
     fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
-        if (!basis.matchesIndexes(request.indexes)) return false;
-        // Preflight and execution may bind the same generation with different
-        // transport deadlines. Its first publication wins even after writes.
-        if (std.mem.eql(u8, &basis.id, request.id))
-            return basis.table_id == request.table_id and basis.expires_ms == request.expires_ms;
         if (repository.vtable.reuse == null) return false;
+        if (!basis.matchesSelection(request)) return false;
+        if (std.mem.eql(u8, &basis.id, request.id)) return false;
         const digest = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
         if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
         const proof = (try repository.reuse(io, basis.asRequestWithIndexes(request.indexes), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
         // Rotate the logical authority, so expiry of the original manifest does
         // not force capture while the authenticated extents still cover readers.
-        self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+        self.rememberNativeQueryCut(request, proof);
         return true;
     }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
@@ -21256,10 +21261,30 @@ pub const DB = struct {
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         profile.next("reuse_and_admission");
+        var reference_checked = false;
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+            // Statistics, preflight and execution may capture the same cut.
+            // Its first committed generation remains authority even after live
+            // writes or warming rotate the owner's optional reuse hint. Lease
+            // that exact generation before considering any fresh capture.
+            const retained_path = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
+            defer self.alloc.free(retained_path);
+            const existing = try repository.openRead(io, retained_path, request, self.core.identity_namespace, token);
+            if (existing) |opened| {
+                var lease = opened;
+                lease.deinit();
+                return;
+            }
+            if (self.primary_lsm_storage) |storage| {
+                reference_checked = true;
+                if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+            }
+        };
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         // A process-local hint is optional. Recover an already committed
         // binding before considering a fresh capture of mutable live state.
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+        if (publish and !reference_checked) if (self.backend_runtime.query_cut_repository) |repository| {
+            // A custom storage owner already performed this lookup above.
             // Default filesystem owners have no custom Storage override.
             // They still need committed-binding discovery after hint loss;
             // the native view simply has no remote checkpoint reference.
@@ -21288,7 +21313,7 @@ pub const DB = struct {
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
-                self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+                self.rememberNativeQueryCut(request, proof);
             }
         };
     }
@@ -21366,7 +21391,7 @@ pub const DB = struct {
             try warming.writeState(a, io, state_path, state.?);
             var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
             defer guard.deinit();
-            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(state.?.request, proof);
+            if (warmed.proof) |proof| self.rememberNativeQueryCut(state.?.request, proof);
             try std.Io.Dir.cwd().deleteTree(io, root);
         }
         return completed;
@@ -21400,11 +21425,15 @@ pub const DB = struct {
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
+        var stage: []const u8 = "request";
+        errdefer std.log.debug("native query cut open failed stage={s}", .{stage});
         try request.validate(cut.nowMs());
         const origin = try request.namespace(self.core.identity_namespace);
         const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
         defer self.alloc.free(cache_id);
+        stage = "capture";
         if (request.create) try self.captureQueryCut(request, cancellation);
+        stage = "local_manifest";
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const path = try cut.pathAlloc(self.alloc, self.core.path, cache_id);
         defer self.alloc.free(path);
@@ -21426,6 +21455,7 @@ pub const DB = struct {
         } else false;
         if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
             // The read lease retains the caller's token beyond this stack frame.
+            stage = "repository_lease";
             if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
@@ -21434,6 +21464,7 @@ pub const DB = struct {
                 // the filesystem publication guard across provider I/O.
                 guard.deinit();
                 guarded = false;
+                stage = "repository_database";
                 var readonly = try DB.open(self.alloc, path, .{
                     .open_mode = .query_readonly,
                     .query_indexes = request.indexes,
@@ -21454,16 +21485,19 @@ pub const DB = struct {
             // manifest. Protect active readers before replacing any invalid root.
             if (local_exists) try cut.discardInvalidCache(self.alloc, io, std.fs.path.dirname(path).?, cache_id, path);
             try self.admitQueryCut(io, cache_id, control.token());
+            stage = "repository_recovery";
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
             try self.admitQueryCut(io, cache_id, control.token());
             source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
+        stage = "local_lease";
         var reader = try cut.readLeaseOwned(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
         defer if (!transferred) reader.deinit() catch unreachable;
+        stage = "local_database";
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .query_indexes = request.indexes,
@@ -45372,7 +45406,11 @@ pub const DB = struct {
         return try self.searchLocked(alloc, req);
     }
 
-    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest, privacy_policy_version: ?[64]u8) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        return self.collectExplicitTextStatsWithPrivacyPolicy(alloc, requests, null);
+    }
+
+    pub fn collectExplicitTextStatsWithPrivacyPolicy(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest, privacy_policy_version: ?[64]u8) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -45386,6 +45424,14 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitBackgroundTextStats(
+        self: *DB,
+        alloc: Allocator,
+        requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+    ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        return self.collectExplicitBackgroundTextStatsWithPrivacyPolicy(alloc, requests, null);
+    }
+
+    pub fn collectExplicitBackgroundTextStatsWithPrivacyPolicy(
         self: *DB,
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
@@ -74696,6 +74742,74 @@ test "db idle dense query captures retain the same immutable runs" {
         try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
         try std.testing.expectEqualSlices(u64, second.run_ids, next.run_ids);
     }
+}
+
+test "db native checkpoint discovery probes a repository once before capture" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cut = @import("native_query_cut.zig");
+    const port = @import("native_query_cut_repository.zig");
+    const Namespace = @import("doc_identity_namespace.zig").Namespace;
+    const Fixture = struct {
+        references: usize = 0,
+        publications: usize = 0,
+        committed: bool = false,
+        fn publish(raw: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.publications += 1;
+        }
+        fn recover(_: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn reference(raw: *anyopaque, _: port.Executor, _: cut.Request, _: Namespace, _: port.Storage, _: types.CancellationToken) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return self.committed;
+        }
+    };
+    var directory = try TestDirectory.init("native-discovery-once");
+    defer directory.cleanup();
+    const path = directory.path();
+    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{path});
+    defer a.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(io, pins) catch {};
+    var db = try DB.open(a, path, .{
+        .no_sync = true,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+    var fixture: Fixture = .{};
+    const previous_repository = db.backend_runtime.query_cut_repository;
+    defer db.backend_runtime.query_cut_repository = previous_repository;
+    db.backend_runtime.query_cut_repository = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.publish, .recover = Fixture.recover, .reference = Fixture.reference } };
+    const previous_storage = db.primary_lsm_storage;
+    defer db.primary_lsm_storage = previous_storage;
+    var native = try lsm_backend_mod.storage_io.NativeStorage.init(a, .threaded);
+    defer native.deinit();
+    for ([_]bool{ true, false }) |custom_storage| {
+        db.primary_lsm_storage = if (custom_storage) native.storage() else null;
+        const id: [64]u8 = @splat(if (custom_storage) @as(u8, 'a') else @as(u8, 'b'));
+        const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        fixture.references = 0;
+        fixture.committed = false;
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectEqual(@as(usize, 1), fixture.references);
+        // A committed binding must bypass capture even without open_read or
+        // an owner-local hint. Holding the snapshot lock makes that observable.
+        fixture.references = 0;
+        fixture.committed = true;
+        try std.testing.expect(db.snapshot_publication_mutex.tryLock());
+        defer db.snapshot_publication_mutex.unlock();
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectEqual(@as(usize, 1), fixture.references);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.publications);
 }
 
 test "db native checkpoint warming skips unchanged expired cuts and resumes on content changes" {
@@ -149509,6 +149623,44 @@ test "privacy primed roots preserve durable retry deadlines and healthy consumer
     try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
 }
 
+test "db publication witness compact and legacy prefixes retire only the deleted document" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-witness-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .primary_backend = .{ .mem = .{} },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer db.close();
+    const document = try a.alloc(u8, internal_keys.inline_document_metadata_prefix_bytes);
+    defer a.free(document);
+    @memset(document, 'x');
+    try db.batch(.{ .writes = &.{ .{ .key = document, .value = "{}" }, .{ .key = "neighbor", .value = "{}" } }, .sync_level = .write });
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, document, "asset", "proof");
+    defer a.free(artifact);
+    const neighbor = try internal_keys.artifactNamedPrefixAlloc(a, "neighbor", "asset", "proof");
+    defer a.free(neighbor);
+    const privacy = @import("../../privacy/local_publication.zig");
+    const local = @import("artifact_local_publication.zig");
+    const metadata = [_][]u8{ try privacy.key(a, artifact), try privacy.legacyKey(a, artifact), try local.key(a, artifact), try local.legacyKey(a, artifact) };
+    defer for (metadata) |key| a.free(key);
+    const neighbor_key = try privacy.key(a, neighbor);
+    defer a.free(neighbor_key);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        for (metadata) |key| try write.put(key, "proof");
+        try write.put(neighbor_key, "published neighbor");
+        try write.commit();
+    }
+    try db.batch(.{ .deletes = &.{document}, .sync_level = .write });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    for (metadata) |key| try std.testing.expectError(error.NotFound, read.get(key));
+    try std.testing.expectEqualStrings("published neighbor", try read.get(neighbor_key));
+}
+
 test "privacy discovery regenerates completed artifacts whose local publication witness was not restored" {
     const a = std.testing.allocator;
     const privacy = @import("../../privacy/document.zig");
@@ -150183,6 +150335,32 @@ test "external vector compatibility declaration rejects missing and mismatched w
     // Withdrawing the receipt permits an acquisition update to retain hidden
     // vector bytes; source search independently requires the exact receipt.
     try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+}
+
+test "relational prepared writes validate orphan vector receipts before releasing parsed rows" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("relational-vector-receipt-lifetime");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"metadata":{"type":"json"},"revision":{"type":"text"},"embedding":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    // Preparation releases its parsed wrapper even without text consumers.
+    // A plain typed write must never dereference it during commit.
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{}" }}, .sync_level = .full_index });
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+    });
+    // Validation cannot be skipped merely because there are no vector writes:
+    // a matching receipt without its authored vector is an invalid assertion.
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "orphan", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+        .sync_level = .full_index,
+    }));
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
 }
 
 test "time series prepared rows validate external vector receipts" {

@@ -5398,7 +5398,7 @@ pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
         if (bundle.len == 0 or bundle.len > 4 * 1024 * 1024) return .invalid_argument;
         const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err| {
             std.log.warn("native row policy phase apply failed table_id={} err={s}", .{ publication.table_id, @errorName(err) });
-            return storageOwnerStatusFromError(err);
+            return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
         };
         var result = owned.result();
         result.row_policy_receipt = receipt;

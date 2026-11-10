@@ -59,6 +59,47 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
     accept.merge_replication.?.transition_id += 1;
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, encodeBatchRequest(alloc, accept));
 }
+test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
+    const a = std.testing.allocator;
+    const inventory = @import("../storage/db/artifact_inventory.zig");
+    const catalogs: inventory.Catalogs = .{};
+    const requests = [_]db_mod.types.BatchRequest{
+        .{ .activate_range_tracking = true },
+        .{ .artifact_catalog = .{
+            .namespace = @splat(1),
+            .catalogs = catalogs,
+            .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a) },
+        } },
+        .{ .relational_topology = .{ .action = .begin, .fence = .{
+            .transition_id = 1,
+            .admission_epoch = 1,
+            .attempt = 1,
+            .owner_group_id = 3,
+            .peer_group_id = 4,
+            .role = .child_generation_source,
+            .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .catalog_digest = @splat(5),
+        } } },
+    };
+    for (requests) |request| {
+        for ([_]bool{ false, true }) |owner| {
+            const bytes = if (owner) try encodeOwnerBatchRequest(a, request) else try encodeBatchRequest(a, request);
+            defer a.free(bytes);
+            var decoded = try parseInternalBatchRequest(a, bytes);
+            defer decoded.deinit(a);
+            try std.testing.expectEqualDeep(request, decoded.req);
+            // A second forwarding hop must retain the same private command,
+            // including the strict catalog-only validation before encoding.
+            const forwarded = try encodeBatchRequest(a, decoded.req);
+            defer a.free(forwarded);
+            var next = try parseInternalBatchRequest(a, forwarded);
+            defer next.deinit(a);
+            try std.testing.expectEqualDeep(request, next.req);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, forwarded));
+        }
+    }
+}
+
 test "artifact publication upload control is private, bounded, and single purpose" {
     const alloc = std.testing.allocator;
     const transport = @import("../storage/db/artifact_publication_transport.zig");
@@ -1053,7 +1094,16 @@ fn parseBatchRequestWithOptions(
     };
 
     const document_version_scheme: db_mod.types.DocumentVersionScheme = scheme: {
-        const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner) .admit_current else .legacy;
+        // Isolated control commands never assign ordinary document versions.
+        // Preserve their neutral request default across forwarding and native
+        // owner calls: choosing legacy here adds an adjunct that their strict
+        // single-purpose validators correctly reject. Ordinary unmarked row
+        // replay retains its historical legacy interpretation.
+        const isolated_control = activate_range_tracking or relational_topology != null or relational_generation_gc != null or
+            row_policy_publication != null or artifact_catalog != null or group_source != null or
+            resolver_review != null or artifact_publication != null or artifact_publication_transport != null or
+            leann_record_index != null or merge_proof_adoption != null;
+        const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner or isolated_control) .admit_current else .legacy;
         if (!allow_internal or !document_versions_envelope) return error.InvalidBatchRequest;
         const version = try parseInternalU64(value);
         break :scheme switch (version) {

@@ -42593,7 +42593,8 @@ test "resolver curation namespace propagation scoped discovery excludes ten thou
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scoped-discovery", .{tmp.sub_path});
-    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    // Exercise catalog scale and fences; crash durability has separate fixtures.
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .no_sync = true });
     defer store.deinit();
     const group: u64 = 41;
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" } });
@@ -42784,7 +42785,10 @@ test "resolver curation namespace propagation progress identity reads skip megab
     const group: u64 = 41;
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "source", .indexes_json = "{}" } });
     const payload = try a.alloc(u8, 1024 * 1024);
-    @memset(payload, 'x');
+    // Large, valid authored JSON: derived catalog rebuilds may inspect it.
+    // The bounded identity read must still avoid materializing these bytes.
+    @memset(payload, ' ');
+    @memcpy(payload[payload.len - 2 ..], "{}");
     const record: metadata.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = payload, .schema_json = payload };
     {
         var txn = try store.store.beginWriteTxn();
@@ -43438,7 +43442,8 @@ test "resolver curation namespace propagation query profile references reuse can
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/query-profile-references", .{tmp.sub_path});
-    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path });
+    // Profile pinning/retirement is transactional, without a crash boundary.
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path, .no_sync = true });
     defer store.deinit();
     const group: u64 = 41;
     const domain = @import("../resolver_authority.zig");
@@ -43766,7 +43771,8 @@ test "resolver curation namespace propagation compact execution admits bounded p
     // Hundreds of thousands of derived metadata rows are deliberately built
     // and retired. Batch their test allocations: the debug allocator's stack
     // capture on every individual free otherwise dominates fixture teardown.
-    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    // Preserve the full scale/readiness workload without syncing each replay page.
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
     defer store.deinit();
     const group: u64 = 41;
     const domain = @import("../resolver_authority.zig");

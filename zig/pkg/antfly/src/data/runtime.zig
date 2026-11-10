@@ -32923,6 +32923,20 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         ) !antfly.common.http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const snapshot = self.snapshot orelse return .{ .status = 503 };
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_privacy_policy_binding)) {
+                const input = try std.json.parseFromSlice(antfly.metadata_api.CatalogTableRoutingSnapshotRequest, response_alloc, request.body, .{});
+                defer input.deinit();
+                const table = antfly.public_api.tables.findTableByName(snapshot, input.value.table_name) orelse return .{ .status = 404 };
+                // Ordinary integrity preflight uses the production compact
+                // privacy fence before opening a routed group. The fixture
+                // must serve that authority, even for a table without policy.
+                return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.PrivacyPolicyBinding{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = snapshot.status.metadata_epoch,
+                    .policy_version = try @import("antfly_local_sources").privacy_catalog.policyBinding(response_alloc, table.indexes_json),
+                }, .{}) };
+            }
             // This fixture owns metadata directly. Serve the same compact
             // read contract as production instead of relying on data caches
             // to stand in for the catalog authority.

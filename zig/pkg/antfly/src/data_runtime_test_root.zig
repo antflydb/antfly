@@ -38,8 +38,9 @@ test {
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_control.zig");
 
-// The source-profile fixtures own their lake execution backend in this root;
-// the control-source adapter does not select physical build implementations.
+// Match the distributed runtime's inline lake owner. This test root owns
+// the coordinator's source implementation without adding physical storage
+// implementations to the control catalog shared by native consumers.
 pub const lake_execution_backend = @import("api/lake_execution_build_impl.zig");
 
 pub const consumer_tests_only = true;

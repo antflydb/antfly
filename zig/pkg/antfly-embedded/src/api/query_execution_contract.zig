@@ -327,6 +327,37 @@ pub fn parseTextStatsRequest(
     return error.InvalidQueryRequest;
 }
 
+test "local query contract text stats wire preserves privacy controls and rejects unknown metadata" {
+    const a = std.testing.allocator;
+    const version = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for ([_][]const u8{ "none", version }) |value| {
+        const expected: [64]u8 = if (std.mem.eql(u8, value, "none")) @splat(0) else version.*;
+        const bodies = [_][]const u8{
+            "\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]",
+            "\"background_fields\":[{\"aggregation_name\":\"sig\",\"field\":\"body\",\"terms\":[\"alpha\"],\"background_query\":{\"match_all\":{}}}]",
+            "\"query_request\":{}",
+        };
+        for (bodies) |body| {
+            const wire = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",{s}}}", .{ value, body });
+            defer a.free(wire);
+            var parsed = try parseTextStatsRequest(a, "docs", wire);
+            defer parsed.deinit(a);
+            const actual = switch (parsed) {
+                .explicit_fields => |request| request.privacy_policy_version,
+                .background_fields => |request| request.privacy_policy_version,
+                .query_request => |request| request.req.privacy_policy_version,
+            };
+            try std.testing.expect(actual != null);
+            try std.testing.expectEqualSlices(u8, &expected, &actual.?);
+        }
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", "{\"_privacy_policy_version\":\"bad\",\"fields\":[]}"));
+    try std.testing.expectError(error.UnknownField, parseTextStatsRequest(a, "docs", "{\"unexpected\":true,\"fields\":[]}"));
+    const conflicting = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",\"query_request\":{{\"_privacy_policy_version\":\"none\"}}}}", .{version});
+    defer a.free(conflicting);
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", conflicting));
+}
+
 pub fn identityGenerationFromTextStatsResolvedFilter(
     explicit_generation: ?u64,
     resolved_doc_filter: ?*const db_mod.doc_filter_wire.ParsedResolvedDocFilter,
