@@ -40265,6 +40265,14 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        // Source quiescence joins source-owned work; cached DB workers also
+        // borrow it through runtime hooks and must drain before its destruction.
+        fn deinitManagedSourceForTest(source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
+            source.quiesce();
+            cache.closeAllDbsLocked() catch @panic("managed fixture retained DB leases");
+            source.deinit();
+        }
+
         fn appendDenseReplayForTest(
             seed_alloc: std.mem.Allocator,
             db: *db_mod.DB,
@@ -46798,6 +46806,7 @@ fn implementationTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             const batch_size = auto_bulk_ingest_min_batch_ops;
             const total_docs = batch_size;
@@ -46918,6 +46927,7 @@ fn implementationTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             const batch_size = 250;
             const expected_docs = 1000;
@@ -50762,6 +50772,7 @@ fn implementationTests() type {
             defer write_cache.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
             lockAtomic(&source.local_db_mutex);
             var cached = try write_cache.getOrOpenLocked(group_path, FakeCatalog.iface(), 7001, 0, "docs");
             source.local_db_mutex.unlock();
@@ -52616,9 +52627,9 @@ fn implementationTests() type {
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbModeWithMetadata(
                 alloc,
@@ -52766,9 +52777,9 @@ fn implementationTests() type {
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbModeWithMetadata(
                 alloc,
@@ -53031,9 +53042,9 @@ fn implementationTests() type {
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
             var capture: DebtCapture = .{};
             source.setLocalIndexRepairDebtHook(.{ .ptr = &capture, .on_change = DebtCapture.onDebt });
 
@@ -54395,6 +54406,7 @@ fn implementationTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var hook = Hook{};
             source.setLocalChangeHook(.{
@@ -55492,6 +55504,7 @@ fn implementationTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
             cached.deinit(alloc);
@@ -55745,9 +55758,9 @@ fn implementationTests() type {
             defer write_cache.deinit();
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
             cached.deinit(alloc);
@@ -57245,9 +57258,9 @@ fn implementationTests() type {
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             {
                 var seeded = try db_mod.DB.open(alloc, path, .{
@@ -57398,9 +57411,9 @@ fn implementationTests() type {
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
             try std.testing.expect(cached.db.core.index_manager.denseIndex("dense_idx") != null);
@@ -60039,6 +60052,7 @@ fn implementationTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             source.write_cache = &write_cache;
             source.runtime_status_cache = &snapshot_cache;
+            defer deinitManagedSourceForTest(&source, &write_cache);
 
             const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
 
