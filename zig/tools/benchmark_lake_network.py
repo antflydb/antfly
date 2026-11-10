@@ -283,6 +283,7 @@ def main(argv=None):
     parser.add_argument("--bandwidth-mib", type=float, default=0)
     parser.add_argument("--io-concurrency", type=int, default=16)
     parser.add_argument("--clients", type=int, default=1)
+    parser.add_argument("--client-workload", choices=["same", "mixed"], default="same")
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--cursor-pages", type=int, default=3)
     parser.add_argument("--case", action="append")
@@ -360,6 +361,7 @@ def main(argv=None):
         "authoritative_cuts": args.authoritative_cuts,
         "sql_count_qualified": False,
         "clients": args.clients,
+        "client_workload": args.client_workload,
         "samples": [],
         "policies": [asdict(policy) for policy in policies],
         "transport": "local GCS JSON API simulation; no real cloud requests",
@@ -476,7 +478,9 @@ def main(argv=None):
                     else []
                 )
                 for policy_index, policy in enumerate(policies):
-                    for case in selected:
+                    for case in (
+                        selected[:1] if args.client_workload == "mixed" else selected
+                    ):
                         for sample in range(args.samples):
                             archive.verify_inputs(inputs)
                             client.session.close()
@@ -500,14 +504,23 @@ def main(argv=None):
                                 ) as memory:
                                     started = time.perf_counter_ns()
 
-                                    def query(_):
+                                    def query(lane_id):
                                         # Separate HTTP clients avoid sharing a mutable
                                         # requests.Session between benchmark threads.
                                         lane = archive.Client(server, args.timeout)
                                         try:
                                             sent = time.perf_counter_ns()
-                                            value = lane.query(case)
-                                            return value, time.perf_counter_ns() - sent
+                                            lane_case = (
+                                                selected[lane_id % len(selected)]
+                                                if args.client_workload == "mixed"
+                                                else case
+                                            )
+                                            value = lane.query(lane_case)
+                                            return (
+                                                lane_case,
+                                                value,
+                                                time.perf_counter_ns() - sent,
+                                            )
                                         finally:
                                             lane.session.close()
 
@@ -521,17 +534,22 @@ def main(argv=None):
                                                 pool.map(query, range(args.clients))
                                             )
                                     elapsed_ns = time.perf_counter_ns() - started
-                                for value, _ in values:
+                                for lane_case, value, _ in values:
                                     if (
-                                        archive.verify_case(case, value)
-                                        != references[case["name"]]
+                                        archive.verify_case(lane_case, value)
+                                        != references[lane_case["name"]]
                                     ):
                                         raise AssertionError(
                                             "Query answer changed under the network/cache policy"
                                         )
                                 service.wait_idle()
                                 row = {
-                                    "case": case["name"],
+                                    "case": "mixed"
+                                    if args.client_workload == "mixed"
+                                    else case["name"],
+                                    "query_cases": [
+                                        item["name"] for item, _, _ in values
+                                    ],
                                     "policy": policy_index,
                                     "sample": sample,
                                     "cache_mode": mode,
@@ -539,9 +557,12 @@ def main(argv=None):
                                     "queries": args.clients,
                                     "memory": memory.report(),
                                     "query_elapsed_ns": [
-                                        duration for _, duration in values
+                                        duration for _, _, duration in values
                                     ],
-                                    "answer_sha256": references[case["name"]],
+                                    "answer_sha256": [
+                                        references[item["name"]]
+                                        for item, _, _ in values
+                                    ],
                                     "io": service.summary(phase),
                                 }
                                 if row["io"]["fixture_errors"]:

@@ -1286,7 +1286,8 @@ uv run --project zig/e2e/antfly --locked --extra lake --extra iceberg \
 The matrix covers common, rare and absent terms, phrases, conjunctions, highlights, wide projection and
 selective filters. Vary `--files`, `--row-group`, `--payload-bytes`, `--cache-mib`,
 `--clients` and `--no-store-source` to expose topology, amplification, eviction,
-cold stampedes and Parquet hydration costs. `--fault` accepts `throttle`, `reset`
+cold stampedes and Parquet hydration costs. `--client-workload mixed` rotates
+clients through distinct query cases to distinguish contention from coalescing. `--fault` accepts `throttle`, `reset`
 or `truncate`; `--fault-every` injects faults on media requests. An unrecovered
 query produces an incomplete report and retained local failure evidence, never
 a successful timing. Protocol tests independently check recovery and immutable
