@@ -28,6 +28,31 @@ pub const PublicOperationPolicy = struct {
 /// that deliberately bypass foreground admission. A newly generated route
 /// therefore fails its contract test until its resource class is reviewed.
 pub const public_operation_policies = [_]PublicOperationPolicy{
+    // Graph execution selects query/write admission after bounded compilation,
+    // as SQL does. Catalog DDL and transaction receipt reads stay control-plane.
+    .{ .operation_id = "listGraphs", .class = .none },
+    .{ .operation_id = "getGraph", .class = .none },
+    .{ .operation_id = "createGraph", .class = .none },
+    .{ .operation_id = "updateGraph", .class = .none },
+    .{ .operation_id = "dropGraph", .class = .none },
+    .{ .operation_id = "executeGraphQuery", .class = .none },
+    .{ .operation_id = "getTransactionStatus", .class = .none },
+    // Privacy previews invoke providers and findings scan bounded storage pages.
+    // Durable policy/scan updates share write admission with curation changes.
+    .{ .operation_id = "getTablePrivacy", .class = .none },
+    .{ .operation_id = "getNamespaceTablePrivacy", .class = .none },
+    .{ .operation_id = "getTablePrivacyScan", .class = .none },
+    .{ .operation_id = "getNamespaceTablePrivacyScan", .class = .none },
+    .{ .operation_id = "putTablePrivacy", .class = .write },
+    .{ .operation_id = "putNamespaceTablePrivacy", .class = .write },
+    .{ .operation_id = "startTablePrivacyScan", .class = .write },
+    .{ .operation_id = "startNamespaceTablePrivacyScan", .class = .write },
+    .{ .operation_id = "previewTablePrivacy", .class = .query },
+    .{ .operation_id = "previewNamespaceTablePrivacy", .class = .query },
+    .{ .operation_id = "listTablePrivacyFindings", .class = .query },
+    .{ .operation_id = "listNamespaceTablePrivacyFindings", .class = .query },
+    .{ .operation_id = "queryTablePrivacyFindings", .class = .query },
+    .{ .operation_id = "queryNamespaceTablePrivacyFindings", .class = .query },
     // Resolver model calls share query admission; durable curation shares write admission.
     .{ .operation_id = "listResolvers", .class = .none },
     .{ .operation_id = "namespaceListResolvers", .class = .none },

@@ -216,6 +216,9 @@ pub const Config = struct {
             retention_ms: u64 = 300_000,
             max_native_cuts: usize = 64,
             max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            /// Speculative durable native snapshots. Null enables warming only
+            /// for serverless; on-demand cursor capture is always available.
+            background_warming: ?bool = null,
         } = .{},
         text_cache: struct {
             /// Maximum corpus admitted by one streaming ranking window.
@@ -232,6 +235,10 @@ pub const Config = struct {
             max_marked: usize = 262144,
             max_read_bytes: u64 = 512 * 1024 * 1024,
         } = .{},
+
+        pub fn nativeSnapshotWarmingEnabled(self: LakeIndexConfig, deployment: DeploymentMode) bool {
+            return self.query_cursors.background_warming orelse (deployment == .serverless);
+        }
     };
 
     pub const StorageConfig = struct {
@@ -3990,6 +3997,26 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     const gc = parsed.value.artifact_gc;
     if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
     return parsed.value;
+}
+
+test "external lake native snapshot warming defaults by deployment and accepts explicit overrides" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expect(defaults.lake_indexes.query_cursors.background_warming == null);
+    inline for (std.meta.tags(DeploymentMode)) |deployment| {
+        try std.testing.expectEqual(deployment == .serverless, defaults.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+    }
+    for ([_]bool{ false, true }) |enabled| {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .lake_indexes = .{ .query_cursors = .{ .background_warming = enabled } } }, .{});
+        defer a.free(bytes);
+        var config = try Config.parseFromSlice(a, bytes);
+        defer config.deinit();
+        inline for (std.meta.tags(DeploymentMode)) |deployment| {
+            try std.testing.expectEqual(enabled, config.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+        }
+    }
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, "{\"lake_indexes\":{\"query_cursors\":{\"background_warming\":\"false\"}}}"));
 }
 
 test "external lake native artifact collection config validates bounded operator controls" {

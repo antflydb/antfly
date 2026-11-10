@@ -5089,16 +5089,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(retired_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retired_prefix, delete_keys, owned_delete_keys, null);
 
-            // Standalone privacy witnesses live in the control namespace, but
-            // preserve the exact document prefix after their own prefix. Retire
-            // every policy generation beside the document, even if an older
-            // producer's artifact has already been garbage-collected.
+            // Standalone witnesses retain a per-document prefix, using a digest
+            // for oversized IDs. Retire every policy generation beside the
+            // document, even after an older artifact was garbage-collected.
             const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(privacy_prefix);
             try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
             const local_asset_prefix = try @import("artifact_local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(local_asset_prefix);
             try collectDeleteKeysForPrefix(alloc, store, local_asset_prefix, delete_keys, owned_delete_keys, null);
+            if (internal_keys.documentMetadataDigestPrefixLen(document_prefix) != null) {
+                // Rolling upgrades may retain v1 witnesses. Retire both
+                // namespaces together, without visiting neighboring documents.
+                inline for (.{ @import("../../privacy/local_publication.zig"), @import("artifact_local_publication.zig") }) |publication| {
+                    const old = try publication.legacyKey(alloc, document_prefix);
+                    defer alloc.free(old);
+                    try collectDeleteKeysForPrefix(alloc, store, old, delete_keys, owned_delete_keys, null);
+                }
+            }
             const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
             defer alloc.free(retry_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);

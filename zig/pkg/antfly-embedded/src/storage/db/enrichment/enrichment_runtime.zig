@@ -2998,9 +2998,36 @@ const ScopedReplay = struct {
         return observed.stamp;
     }
     fn documentKey(a: Allocator, key: []const u8) ![]u8 {
-        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(key.len));
-        _ = std.base64.standard.Encoder.encode(encoded, key);
-        return encoded;
+        return scoped_retries.documentIdentityAlloc(a, key);
+    }
+    fn readDocumentReference(ptr: *anyopaque, a: Allocator, digest: [32]u8) ![]u8 {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+        return enrichment_state.loadScopedRetryDocument(a, runtime.store, digest);
+    }
+    fn documentResolver(runtime: *EnrichmentRuntime) scoped_retries.DocumentResolver {
+        return .{ .ptr = runtime, .get = readDocumentReference };
+    }
+    fn parkTicket(self: *@This(), runtime: *EnrichmentRuntime, group: enrichment_worker.PendingDocumentGroup, deadline: u64, budget: scoped_retries.Budget, digest: ?[32]u8, stamp: ?scoped_retries.SourceStamp, publication: *RuntimePublicationStore) !void {
+        // An intermediate bounded flush may commit earlier tickets. Retain
+        // any subsequent preparation if a later member cannot be published.
+        defer self.unsaved = true;
+        var location: ?scoped_retries.DocumentLocation = null;
+        if (group.doc_key.len > scoped_retries.max_document_key_bytes and stamp != null) {
+            const physical = try documentSourceStoreKeyAlloc(runtime, group.doc_key);
+            defer runtime.alloc.free(physical);
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            location = try retry_source.captureLocation(runtime.alloc, &read, physical, group.doc_key);
+        }
+        const Publisher = struct {
+            scheduler: *ScopedReplay,
+            runtime: *EnrichmentRuntime,
+            publication: *RuntimePublicationStore,
+            pub fn save(owner: @This()) !void {
+                try owner.scheduler.saveAssumeLocked(owner.runtime, owner.publication.store(owner.runtime).*, owner.publication.retry_fence);
+            }
+        };
+        try self.state.parkBounded(runtime.alloc, group, deadline, budget, digest, stamp, location, scoped_retries.max_bytes, Publisher{ .scheduler = self, .runtime = runtime, .publication = publication });
     }
     /// Dependency priming precedes ordinary document replay. Consult the same
     /// source/incarnation/definition-bound tickets before invoking a root.
@@ -3066,11 +3093,16 @@ const ScopedReplay = struct {
         var i: usize = 0;
         while (i < self.state.tickets.items.len) {
             const ticket = &self.state.tickets.items[i];
-            const size = try std.base64.standard.Decoder.calcSizeForSlice(ticket.document);
-            const key = try runtime.alloc.alloc(u8, size);
-            defer runtime.alloc.free(key);
-            try std.base64.standard.Decoder.decode(key, ticket.document);
-            const observed = try observeSource(runtime, key, ticket.source_stamp, ticket.source_stamp == null);
+            const observed = metadata: {
+                if (ticket.source_stamp != null) if (ticket.document_location) |location| {
+                    var read = try runtime.store.beginProbe();
+                    defer read.abort();
+                    if (try retry_source.observeLocation(&read, location, ticket.source_stamp)) |value| break :metadata value;
+                };
+                const key = try self.state.documentAlloc(runtime.alloc, ticket.document, ticket.document_bytes, documentResolver(runtime));
+                defer runtime.alloc.free(key);
+                break :metadata try observeSource(runtime, key, ticket.source_stamp, ticket.source_stamp == null);
+            };
             const same = if (observed.stamp) |current| current.incarnation <= ticket.sequence and
                 (if (ticket.source_stamp) |old| old.sameInput(current) else std.meta.eql(ticket.source_digest, observed.logical_digest)) else false;
             if (!same) {
@@ -3138,7 +3170,7 @@ const ScopedReplay = struct {
             if (enrichmentFailureSparesAttemptBudget(err)) budget.waits +|= 1 else budget.failures +|= 1;
             const hint_ms = @max(batch_hint, self.ownerHint(request));
             const deadline = now_ms +| workerRetryDelayJitterMs(budget.failures +| budget.waits, hint_ms, jitter);
-            try self.state.parkStamped(runtime.alloc, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp);
+            try self.parkTicket(runtime, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp, &publication);
         }
         try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
         for (requests) |request| try self.recorded_requests.put(runtime.alloc, requestFailureFingerprint(request), {});
@@ -3180,7 +3212,7 @@ const ScopedReplay = struct {
             var budget = try self.state.priorLogical(runtime.alloc, logicalRequestFingerprint(request), digest);
             budget.fingerprint = request_fp;
             self.unsaved = true;
-            try self.state.parkStamped(runtime.alloc, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp);
+            try self.parkTicket(runtime, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp, &publication);
             try self.recorded_requests.put(runtime.alloc, request_fp, {});
         }
         if (self.unsaved) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
@@ -9364,7 +9396,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
 /// `error_name` is the durable, operator-visible cause. Callers that wrap a
 /// lower-level failure pass that failure's name rather than the wrapper.
 fn recordIsolatedRequestErrorNamed(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, error_name: []const u8, attempt_number: u64) !void {
-    std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key, error_name });
+    std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s} doc_key_bytes={d}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key[0..@min(request.doc_key.len, 256)], request.doc_key.len, error_name });
     const owned_indexes = if (runtime.coverage_apply_mutex != null)
         try affectedIndexesForRequestAlloc(runtime, request)
     else
@@ -10058,6 +10090,7 @@ fn runForegroundCatchUpPassOwned(
     const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
     const config_changed = scheduler.state.config_hash != 0 and scheduler.state.config_hash != config_hash;
     if (config_changed) {
+        scheduler.state.beginReplan();
         scheduler.state.scanned_sequence = runtime.applied_sequence;
         scheduler.state.clearScanDocument(runtime.alloc);
     }
@@ -10072,10 +10105,7 @@ fn runForegroundCatchUpPassOwned(
     }
     runtime.retry_scheduler = &scheduler;
     defer runtime.retry_scheduler = null;
-    const due = if (config_changed)
-        try scheduler.state.replan(runtime.alloc, runtime.clock.nowRealtimeMs())
-    else
-        try scheduler.state.due(runtime.alloc, runtime.clock.nowRealtimeMs());
+    const due = try scheduler.state.dueWithReferences(runtime.alloc, runtime.clock.nowRealtimeMs(), ScopedReplay.documentResolver(runtime), 4 * 1024 * 1024);
     defer due.deinit(runtime.alloc);
     var processed_request_count: u64 = 0;
     if (due.groups.len != 0) {
@@ -10088,6 +10118,7 @@ fn runForegroundCatchUpPassOwned(
         };
         try drain_due;
         try replay_lease_guard.check();
+        scheduler.state.completeReplan(due);
         scheduler.state.retire(runtime.alloc, due.tokens);
         try scheduler.save(runtime);
     }
@@ -10103,7 +10134,7 @@ fn runForegroundCatchUpPassOwned(
     else
         .{ .groups = try runtime.alloc.alloc(enrichment_worker.PendingDocumentGroup, 0), .last_sequence = scheduler.state.scanned_sequence };
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, replay_window.groups);
-    const scan_key = try scheduler.state.scanDocumentAlloc(runtime.alloc);
+    const scan_key = try scheduler.state.scanDocumentAllocWithReferences(runtime.alloc, ScopedReplay.documentResolver(runtime));
     defer runtime.alloc.free(scan_key);
     var start: usize = 0;
     if (scheduler.state.hasScanDocument()) while (start < replay_window.groups.len) : (start += 1) {
@@ -16786,8 +16817,9 @@ fn processAssetOrDefer(
     // their existing bounded execution paths; they do not queue provider input.
     var batch = PreparedAssetBatch{};
     defer batch.deinit(runtime.alloc);
-    // Scanner thread: the identity is the runtime-global active request.
-    var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
+    // Keep the request owner for durable retry admission and terminal receipts.
+    var scope = FailureScope{};
+    scope.enterRequest(request);
     processAsset(runtime, request, &batch, prepared_sources, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
     std.debug.assert(batch.items.items.len == 0);
 }
@@ -18252,7 +18284,9 @@ fn processDocumentExtractionAsset(
             documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        // Consult the owning durable retry scope before publishing a terminal
+        // receipt. The runtime-global counter does not own lane retries.
+        if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -18269,15 +18303,17 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
         return;
     };
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
         .http_error => |http_error| {
-            if (shouldYieldRemoteHttpFailure(runtime, http_error.status)) {
+            if (document_extraction_mod.remoteHttpStatusIsTransient(http_error.status)) {
+                // Parking persists the deadline, so install the server hint
+                // before asking the durable scope to schedule this attempt.
                 setRetryAfterHintFor(runtime, requestFailureFingerprint(request), http_error.retry_after_ms);
-                return error.RemoteDocumentFetchFailed;
+                if (try scope.shouldYield(runtime, error.RemoteDocumentFetchFailed)) return error.RemoteDocumentFetchFailed;
             }
             const message = try std.fmt.allocPrint(runtime.alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer runtime.alloc.free(message);
@@ -18297,7 +18333,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
-            try recordIsolatedRequestError(runtime, window, request, error.RemoteDocumentFetchFailed);
+            try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
             return;
         },
     };
@@ -18329,7 +18365,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, raw_err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
         return;
     };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
@@ -18399,7 +18435,7 @@ fn processDocumentExtractionAsset(
             configured_pdf_decode_limits,
             runtime.syncWaitTimeoutMs(),
         ) catch |err| {
-            if (shouldYieldRequestError(runtime, err)) return err;
+            if (try scope.shouldYield(runtime, err)) return err;
             try writeDocumentExtractionFailureManifest(
                 runtime,
                 request.doc_key,
@@ -18416,7 +18452,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
-            try recordIsolatedRequestError(runtime, window, request, err);
+            try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
             return;
         }
     else
@@ -18554,7 +18590,7 @@ fn processDocumentExtractionAsset(
             documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -18571,7 +18607,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
         return;
     };
     // Page rendering is complete. Its task-local coordinator is gone, while the
@@ -18782,7 +18818,7 @@ fn processDocumentExtractionAsset(
             error.DocumentExtractionWorkingSetTooLarge
         else
             raw_err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -18799,7 +18835,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
         return;
     };
     config.pdf_decode_limits = configured_pdf_decode_limits;
@@ -46020,6 +46056,44 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     const ready = try restarted.state.due(a, deadline);
     defer ready.deinit(a);
     try std.testing.expectEqualStrings("bad", ready.groups[0].doc_key);
+    {
+        // A lane's terminal extraction receipt must use its restored owner
+        // budget even when no scanner-global request identity is installed.
+        const http = @import("../../../common/http/http_common.zig");
+        const App = struct {
+            fn execute(_: *anyopaque, _: Allocator, _: http.HttpRequest) !http.HttpResponse {
+                return .{ .status = 503 };
+            }
+        };
+        var marker: u8 = 0;
+        var listener = @import("../../../common/http/std_http_listener.zig").StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = App.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const uri = try listener.baseUri(a);
+        defer a.free(uri);
+        const remote = scraping.RemoteContentConfig{ .security = .{ .block_private_ips = false } };
+        runtime.config.io = std.testing.io;
+        runtime.config.remote_content = &remote;
+        defer runtime.config.remote_content = null;
+        defer clearIsolatedFailedIndexes(&runtime);
+        var sources = PreparedDocumentSourceCache.init(&runtime);
+        defer sources.deinit();
+        var window = GeneratedReplayWindow{ .alloc = a };
+        defer window.deinit();
+        var extraction_scope = FailureScope{};
+        extraction_scope.enterRequest(request);
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(a, request.doc_key, "asset", requestArtifactName(request));
+        defer a.free(manifest_key);
+        try processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope);
+        const manifest = try storeGetAlloc(&runtime, manifest_key);
+        defer a.free(manifest);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, manifest, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("error", parsed.value.object.get("route_type").?.string);
+        try std.testing.expectEqualStrings("RemoteDocumentFetchFailed", parsed.value.object.get("last_error").?.object.get("code").?.string);
+        try std.testing.expectEqual(@as(u64, 2), extraction_scope.attemptNumber(&runtime));
+        try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    }
     // The retry identity follows the producer, not journal notifications or
     // physical rebatching. A new model/template owns a new retry episode.
     var changed = request;
