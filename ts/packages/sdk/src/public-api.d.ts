@@ -18490,7 +18490,7 @@ export interface components {
              */
             bound_scale?: number;
             /**
-             * @description Candidates recomputed per batch. 0 uses k.
+             * @description Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
              * @default 0
              */
             batch_size?: number;
