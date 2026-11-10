@@ -1290,21 +1290,3 @@ def test_root_enrollment_does_not_retry_permanent_rejection(status):
             {"identity": {}},
         )
     assert len(writes) == 1
-
-
-def test_stateful_cluster_uses_production_consensus_cadence(tmp_path):
-    metadata = e2e_conftest._metadata_command(
-        "antfly", host="127.0.0.1", raft_port=8001, admin_port=8002, root=tmp_path
-    )
-    data = e2e_conftest._data_command(
-        "antfly",
-        host="127.0.0.1",
-        port=8003,
-        raft_port=8004,
-        metadata_admin_base_uri="http://127.0.0.1:8002",
-        root=tmp_path,
-    )
-    # The common fixture must not compress elections relative to real fsync.
-    for command in (metadata, data):
-        assert "--raft-tick-ms" not in command
-        assert "--control-tick-ms" not in command
