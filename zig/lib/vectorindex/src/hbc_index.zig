@@ -9074,7 +9074,10 @@ pub fn splitLeafWithOptions(
     };
 
     const partition_start = now_fn();
-    var split = try self.splitVectorSet(&vector_set, leaf.members);
+    var split = if (self.config.experimental_emeans_leaf_splits)
+        try splitLeafVectorSetEmeans(self, &vector_set, leaf.members)
+    else
+        try self.splitVectorSet(&vector_set, leaf.members);
     if (self.config.prefer_key_local_leaf_splits) {
         if (try self.maybeBuildKeyLocalLeafSplit(txn, leaf.members, &vector_set, &split)) |replacement| {
             self.alloc.free(split.c1);
@@ -12526,6 +12529,95 @@ fn calcIndexedTolerance(
     return (variance_sum / @as(f32, @floatFromInt(dims))) * 1e-4;
 }
 
+/// Leaf-only experiment. Internal splits and recursive bulk partitioning retain
+/// the established splitVectorSet implementation. Recompute the returned means
+/// after enforcing occupancy, since balanced labels can differ from argmin.
+fn splitLeafVectorSetEmeans(self: anytype, vectors: *const vec.Set, ids: []const u64) !SplitResult {
+    if (self.config.metric != .l2_squared) return error.EmeansRequiresL2;
+    if (self.config.kmeans_backend == .metal) return error.EmeansRequiresCpu;
+    if (self.config.split_algo != .kmeans) return error.EmeansRequiresKmeansSplit;
+    if (ids.len < 2) return error.TooFewVectors;
+    const count = ids.len;
+    const dims: usize = self.config.dims;
+    if (vectors.count != count or vectors.dims != dims or vectors.data.len != count * dims) return error.InvalidDimensions;
+    if (self.config.kmeans_min_balance_pct > 50) return error.InvalidSplitBalance;
+
+    // Includes runEmeans's permutation, mass and closing statistics. Output
+    // groups/centroids are accounted by splitLeafWithOptions after return.
+    const scratch_bytes = count * (@sizeOf(kmeans.Point) + 2 * @sizeOf(usize) + @sizeOf(f32) + @sizeOf(kmeans.Entry)) +
+        6 * dims * @sizeOf(f32) + 2 * (@sizeOf(f32) + @sizeOf(usize));
+    addApplyWorkspaceBytes(self, @intCast(scratch_bytes));
+    defer releaseApplyWorkspaceBytes(self, @intCast(scratch_bytes));
+    const points = try self.alloc.alloc(kmeans.Point, count);
+    defer self.alloc.free(points);
+    for (points, ids, 0..) |*point, id, i| point.* = .{ .stable_id = id, .vector = vectors.atConst(i) };
+    const centers = try self.alloc.alloc(f32, 2 * dims);
+    defer self.alloc.free(centers);
+    const sums = try self.alloc.alloc(f32, 2 * dims);
+    defer self.alloc.free(sums);
+    const labels = try self.alloc.alloc(usize, count);
+    defer self.alloc.free(labels);
+    const distances = try self.alloc.alloc(f32, count);
+    defer self.alloc.free(distances);
+    const entries = try self.alloc.alloc(kmeans.Entry, count);
+    defer self.alloc.free(entries);
+    var counts: [2]usize = undefined;
+    const stats = try kmeans.run(.{
+        .dims = dims,
+        .metric = .l2_squared,
+        .max_iter = self.config.kmeans_max_iter,
+        .emeans = true,
+        .allocator = self.alloc,
+        .backend = self.config.kmeans_backend,
+    }, points, self.rng.intN(count), centers, sums, labels, distances, &counts, entries);
+    recordKmeansRunStats(self, stats);
+    self.write_profile.emeans_leaf_split_calls += 1;
+
+    const minimum = @min(count / 2, @max(1, (count * self.config.kmeans_min_balance_pct + 99) / 100));
+    if (counts[0] < minimum or counts[1] < minimum) {
+        // Rank by relative preference for the left cluster, breaking ties by
+        // stable ID and input position. This also splits identical vectors.
+        for (entries, points, 0..) |*entry, point, i| entry.* = .{
+            .point_index = i,
+            .cluster = 0,
+            .distance = vec.l2SquaredDistance(point.vector, centers[0..dims]) - vec.l2SquaredDistance(point.vector, centers[dims..]),
+        };
+        std.mem.sort(kmeans.Entry, entries, ids, struct {
+            fn lessThan(stable_ids: []const u64, a: kmeans.Entry, b: kmeans.Entry) bool {
+                if (a.distance != b.distance) return a.distance < b.distance;
+                const aid = stable_ids[a.point_index];
+                const bid = stable_ids[b.point_index];
+                return aid < bid or (aid == bid and a.point_index < b.point_index);
+            }
+        }.lessThan);
+        counts[0] = std.math.clamp(counts[0], minimum, count - minimum);
+        counts[1] = count - counts[0];
+        for (entries, 0..) |entry, i| labels[entry.point_index] = @intFromBool(i >= counts[0]);
+        self.write_profile.emeans_leaf_split_rebalances += 1;
+    }
+
+    const left = try self.alloc.alloc(u64, counts[0]);
+    errdefer self.alloc.free(left);
+    const right = try self.alloc.alloc(u64, counts[1]);
+    errdefer self.alloc.free(right);
+    const c1 = try self.alloc.alloc(f32, dims);
+    errdefer self.alloc.free(c1);
+    const c2 = try self.alloc.alloc(f32, dims);
+    errdefer self.alloc.free(c2);
+    @memset(c1, 0);
+    @memset(c2, 0);
+    var cursor = [_]usize{ 0, 0 };
+    for (labels, ids, points) |label, id, point| {
+        const group = if (label == 0) left else right;
+        group[cursor[label]] = id;
+        cursor[label] += 1;
+        vec.add(if (label == 0) c1 else c2, point.vector);
+    }
+    vec.scale(1.0 / @as(f32, @floatFromInt(counts[0])), c1);
+    vec.scale(1.0 / @as(f32, @floatFromInt(counts[1])), c2);
+    return .{ .c1 = c1, .g1 = left, .c2 = c2, .g2 = right };
+}
+
 fn splitVectorSetKmeans(
     self: anytype,
     vectors: *const vec.Set,
@@ -13029,4 +13121,70 @@ fn elapsed_fn_u64_adapter(elapsed_fn: fn (u64) u64) fn (i128) u64 {
             return inner(@intCast(start));
         }
     }.call;
+}
+
+fn checkEmeansLeafSplit(alloc: Allocator, identical: bool) !void {
+    const go_rand = @import("antfly_vector").go_rand;
+    const Mock = struct {
+        alloc: Allocator,
+        config: types.HBCConfig = .{ .dims = 3, .experimental_emeans_leaf_splits = true, .kmeans_backend = .cpu },
+        rng: go_rand.GoPcg = go_rand.GoPcg.init(42, 1024),
+        write_profile: hbc_runtime.WriteProfile = .{},
+    };
+    var mock = Mock{ .alloc = alloc };
+    var raw: [33]f32 = @splat(0);
+    if (!identical) @memset(raw[30..], 100);
+    const vectors = vec.Set{ .dims = 3, .count = 11, .data = &raw };
+    const ids = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    const split = try splitLeafVectorSetEmeans(&mock, &vectors, &ids);
+    defer alloc.free(split.g1);
+    defer alloc.free(split.g2);
+    defer alloc.free(split.c1);
+    defer alloc.free(split.c2);
+    try std.testing.expect(split.g1.len >= 4 and split.g2.len >= 4);
+    var seen: [11]bool = @splat(false);
+    for ([_][]const u64{ split.g1, split.g2 }, [_][]const f32{ split.c1, split.c2 }) |group, centroid| {
+        var expected: [3]f32 = @splat(0);
+        for (group) |id| {
+            try std.testing.expect(!seen[id - 1]);
+            seen[id - 1] = true;
+            vec.add(&expected, vectors.atConst(id - 1));
+        }
+        vec.scale(1.0 / @as(f32, @floatFromInt(group.len)), &expected);
+        for (expected, centroid) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    }
+    for (seen) |present| try std.testing.expect(present);
+    try std.testing.expectEqual(@as(u64, 1), mock.write_profile.emeans_leaf_split_calls);
+    try std.testing.expectEqual(@as(u64, 66), mock.write_profile.kmeans_assignment_points_total);
+    if (identical) try std.testing.expectEqual(@as(u64, 1), mock.write_profile.emeans_leaf_split_rebalances);
+}
+
+test "e-means leaf split preserves balance members and exact means" {
+    try checkEmeansLeafSplit(std.testing.allocator, true);
+    try checkEmeansLeafSplit(std.testing.allocator, false);
+}
+
+test "e-means leaf split frees scratch and output on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkEmeansLeafSplit, .{false});
+}
+
+test "e-means leaf split rejects unsupported configuration" {
+    const go_rand = @import("antfly_vector").go_rand;
+    const Mock = struct {
+        alloc: Allocator = std.testing.allocator,
+        config: types.HBCConfig = .{ .dims = 3, .metric = .cosine },
+        rng: go_rand.GoPcg = go_rand.GoPcg.init(42, 1024),
+        write_profile: hbc_runtime.WriteProfile = .{},
+    };
+    var mock = Mock{};
+    var raw: [6]f32 = @splat(0);
+    const vectors = vec.Set{ .dims = 3, .count = 2, .data = &raw };
+    const ids = [_]u64{ 1, 2 };
+    try std.testing.expectError(error.EmeansRequiresL2, splitLeafVectorSetEmeans(&mock, &vectors, &ids));
+    mock.config.metric = .l2_squared;
+    mock.config.kmeans_backend = .metal;
+    try std.testing.expectError(error.EmeansRequiresCpu, splitLeafVectorSetEmeans(&mock, &vectors, &ids));
+    mock.config.kmeans_backend = .cpu;
+    mock.config.split_algo = .hilbert;
+    try std.testing.expectError(error.EmeansRequiresKmeansSplit, splitLeafVectorSetEmeans(&mock, &vectors, &ids));
 }

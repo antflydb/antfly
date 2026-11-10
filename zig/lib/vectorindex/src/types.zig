@@ -90,6 +90,8 @@ pub const HBCConfig = struct {
     dims: u32,
     metric: vec.DistanceMetric = .l2_squared,
     split_algo: vec.ClustAlgorithm = .kmeans,
+    /// Opt-in CPU L2 e-means for ordinary binary leaf splits only.
+    experimental_emeans_leaf_splits: bool = false,
     branching_factor: u32 = 16,
     leaf_size: u32 = 100,
     search_width: u32 = 32,

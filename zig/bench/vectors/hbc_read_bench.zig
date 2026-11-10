@@ -39,6 +39,7 @@ const Config = struct {
     storage_mode: StorageSelection = .host,
     build_mode: BuildSelection = .both,
     split_algo: vec.ClustAlgorithm = .kmeans,
+    emeans_leaf_splits: bool = false,
     bulk_build_algo: hbc.BulkBuildAlgo = .hilbert_seeded,
     kmeans_backend: hbc.HBCConfig.KmeansBackend = .auto,
     kmeans_update_strategy: hbc.HBCConfig.KmeansUpdateStrategy = .auto,
@@ -486,6 +487,7 @@ pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
                 try buildIndex(&scenario, sample_items);
                 const build_elapsed = nanotime() - build_start;
                 const after_build_storage = scenario.storage_harness.snapshotCounters();
+                if (scenario.index.stats().active_count != cfg.vectors or !(try scenario.index.verifyTreeLinks()).consistent()) return error.InvalidBuiltTree;
                 try printBuildResult(out, &scenario, build_elapsed, before_build_storage, after_build_storage);
                 try stdout_writer.flush();
                 if (cfg.shadow_segment_checkpoint) {
@@ -840,6 +842,8 @@ fn printBuildResult(
     try writer.print("{{\"workload\":\"build_shape\",\"algorithm\":\"{s}\",\"metric\":\"{s}\",\"leaves\":{d},\"members\":{d},\"min_leaf_members\":{d},\"max_leaf_members\":{d},\"mean_leaf_members\":{d:.2}}}\n", .{ @tagName(scenario.cfg.bulk_build_algo), @tagName(scenario.cfg.metric), leaves, members, if (leaves == 0) 0 else min_members, max_members, @as(f64, @floatFromInt(members)) / @as(f64, @floatFromInt(@max(leaves, 1))) });
     const storage_delta = StorageCounters.delta(after_storage, before_storage);
     const profile = scenario.index.getWriteProfile();
+    try writer.print("{{\"workload\":\"split_profile\",\"sample\":{d},\"emeans_leaf_splits\":{any},\"emeans_leaf_split_calls\":{d},\"emeans_leaf_split_rebalances\":{d},\"split_leaf_ns\":{d},\"split_leaf_partition_ns\":{d},\"split_internal_calls\":{d},\"kmeans_assignment_points_total\":{d}}}\n", .{ scenario.sample_index, scenario.cfg.emeans_leaf_splits, profile.emeans_leaf_split_calls, profile.emeans_leaf_split_rebalances, profile.split_leaf_ns, profile.split_leaf_partition_ns, profile.split_internal_calls, profile.kmeans_assignment_points_total });
+
     try writer.print(
         "{{\"scenario\":\"{s}_{s}_build\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"build\",\"vectors\":{d},\"dims\":{d},\"ns\":{d},\"ns_per_vector\":{d:.2},\"vectors_per_second\":{d:.2},\"storage_write_file\":{d},\"storage_write_bytes\":{d},\"storage_manifest_write_file\":{d},\"storage_manifest_write_bytes\":{d},\"insert_calls\":{d},\"save_node_calls\":{d},\"split_leaf_calls\":{d},\"refresh_quantized_ns\":{d},\"quantized_store_ns\":{d},\"quantized_put_ns\":{d}}}\n",
         .{
@@ -1074,6 +1078,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
         .dims = @intCast(cfg.dims),
         .metric = cfg.metric,
         .split_algo = cfg.split_algo,
+        .experimental_emeans_leaf_splits = cfg.emeans_leaf_splits,
         .branching_factor = cfg.branching_factor,
         .leaf_size = cfg.leaf_size,
         .search_width = if (cfg.search_width == 0) cfg.branching_factor else cfg.search_width,
@@ -1201,6 +1206,8 @@ fn parseArgs(args: *std.process.Args.Iterator) !Config {
             cfg.bulk_build_algo = .doc_key_seeded;
         } else if (std.mem.eql(u8, arg, "--metric")) {
             cfg.metric = std.meta.stringToEnum(vec.DistanceMetric, args.next() orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--emeans-leaf-splits")) {
+            cfg.emeans_leaf_splits = true;
         } else if (std.mem.eql(u8, arg, "--bulk-build-emeans")) {
             cfg.bulk_build_algo = .emeans;
         } else if (std.mem.eql(u8, arg, "--bulk-build-kmeans")) {

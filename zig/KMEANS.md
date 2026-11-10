@@ -167,8 +167,9 @@ the same incremental routing and Lloyd-based splits. Every run recorded
 leaves holding all 100,000 members (maximum 128 per leaf). Reopened-index query
 result digests were identical. Timing differences across these identical code
 paths reflect run-to-run conditions rather than an e-means benefit. This
-experiment therefore demonstrates no incremental insertion speedup; applying
-e-means to online splits would be a separate implementation and evaluation.
+bulk-only comparison therefore demonstrates no incremental insertion speedup.
+The independently enabled leaf-split experiment below evaluates e-means on the
+actual incremental partitioning path.
 
 Reproduce with the comparison script's incremental mode:
 
@@ -177,3 +178,51 @@ python3 tools/bench_emeans.py --build online_coalesced --vectors 100000 --dims 1
 ```
 
 One query is used only to exercise reopen/search, not to estimate recall.
+
+### Experimental e-means for incremental binary leaf splits
+
+`HBCConfig.experimental_emeans_leaf_splits` (default false) selects the existing
+five-epoch CPU e-means optimizer for ordinary two-way leaf splits. This is
+independent of `bulk_build_algo`. Internal-node splits and oversized-leaf bulk
+rebuild paths retain their existing algorithms. This library/benchmark option
+requires squared L2, the k-means split policy, and a CPU-compatible backend; it
+is not exposed through the public index API.
+
+The splitter enforces the existing minimum occupancy percentage (at least one
+member per side), deterministically reassigning points by centroid-distance
+difference when needed. It then recomputes both centroids from the final member
+groups before persistence and quantization. Incremental scratch is accounted
+through the existing apply-workspace hooks. The benchmark prints actual e-means
+split-call and rebalance counts plus leaf partition time; it also checks active
+count and tree links outside the timed insertion loop.
+
+Reproduce the Lloyd/e-means split comparison from `zig/`:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build hbc-read-bench -Doptimize=ReleaseFast
+python3 tools/bench_emeans.py --build online_coalesced --compare-leaf-splits --vectors 100000 --dims 128 --batch-size 1000 --samples 3 --queries 100 --output .zig-cache/emeans-leaf-splits-100k
+```
+
+Both settings retain the same Hilbert bulk configuration; incremental inserts
+start empty and do not call the bulk builder. Search measurements use 100
+queries after reopen, with search width 16 and the existing boundary rerank.
+
+Measured results are in
+[`emeans_leaf_splits_100k.json`](bench/vectors/emeans_leaf_splits_100k.json):
+
+| Leaf split optimizer | Median insert seconds | Leaf partition ms | Recall@10 | Warm query µs | Final leaves |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Lloyd | 7.714 | 48.827 | 0.419 | 1,033.45 | 1,134 |
+| e-means | 7.733 | 122.447 | 0.456 | 873.29 | 1,170 |
+
+There is no meaningful insertion-speed improvement: total times differ by
+about 0.25%, while e-means partitioning itself is about 2.5x slower for these
+small two-cluster problems. Lloyd partitioning accounts for only about 0.6%
+of total insertion time, limiting the upside from optimizing it alone.
+E-means ran on all 1,169 binary leaf splits and required 670 occupancy
+corrections; the 15 internal splits retained the original policy. All tree
+checks passed, all 100,000 members remained present, and no leaf exceeded 128.
+
+Fixed-budget recall and warm query time improved on this fixture, but absolute
+recall is low, these are not matched-recall measurements, and they reuse one
+synthetic seed. This result does not support enabling e-means splits by default.
