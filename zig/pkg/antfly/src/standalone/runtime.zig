@@ -1088,6 +1088,7 @@ const LocalStandaloneMetadata = struct {
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
+                .owner_readiness = catalogOwnerReadiness,
                 .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
@@ -1960,9 +1961,19 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
-    fn acquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, _: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+    fn lockRoutingBudget(mutex: *std.atomic.Mutex, budget: antfly.public_api.table_catalog.RoutingBudget) !void {
+        while (true) {
+            try budget.checkpoint();
+            if (mutex.tryLock()) return;
+            try budget.sleepNs(std.time.ns_per_ms);
+        }
+    }
+
+    fn acquireRoutingGeneration(ptr: *anyopaque, input_budget: antfly.public_api.table_catalog.RoutingBudget, _: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        var budget: antfly.public_api.table_catalog.RoutingBudget = .{ .cancellation = input_budget.cancellation };
+        budget.deadline_ns = budget.deadlineFrom(input_budget);
+        try lockRoutingBudget(&self.mutex, budget);
         if (self.catalog_durability_failed) {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
@@ -1982,7 +1993,7 @@ const LocalStandaloneMetadata = struct {
             }
         }
         const projection_incarnation = self.projection_incarnation;
-        var snapshot = self.routingSnapshotLocked(deadline_ns) catch |err| {
+        var snapshot = self.routingSnapshotLocked(budget.deadline_ns) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -1991,9 +2002,9 @@ const LocalStandaloneMetadata = struct {
         // Build indexes outside the publication lock. The captured generation
         // is still a valid linearizable observation if a writer races it, but
         // it must not replace a newer cached generation.
-        const next = try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, .{ .deadline_ns = deadline_ns });
+        const next = try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, budget);
         errdefer next.release();
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        try lockRoutingBudget(&self.mutex, budget);
         if (self.catalog_durability_failed) {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
@@ -2036,7 +2047,7 @@ const LocalStandaloneMetadata = struct {
         self.mutex.unlock();
         // Reuse the compact, coherently captured tables and ranges. Building
         // planning indexes never requires an administrative snapshot.
-        const routing = try acquireRoutingGeneration(ptr, deadline_ns, false);
+        const routing = try acquireRoutingGeneration(ptr, .{ .deadline_ns = deadline_ns }, false);
         defer routing.release();
         const snapshot = routing.indexed.snapshot.value;
         const next = try antfly.public_api.join_planning.Generation.create(self.alloc, .{
@@ -2070,6 +2081,18 @@ const LocalStandaloneMetadata = struct {
         return self.routingSnapshotLocked(deadline_ns);
     }
 
+    fn catalogOwnerReadiness(ptr: *anyopaque, request: antfly.metadata_api.OwnerReadinessRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        const generation = try acquireRoutingGeneration(ptr, budget, true);
+        defer generation.release();
+        for (request.owners) |owner| {
+            const range = try generation.indexed.rangeForGroup(request.table_id, owner.group_id, budget);
+            if (antfly.metadata.table_manager.rangeDocIdentityShardId(range.*) != owner.shard_id or antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*) != owner.range_id) return .{ .status = .topology_changed };
+        }
+        try budget.checkpoint();
+        return .{ .status = .ready, .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = generation.indexed.snapshot.value.metadata_incarnation };
+    }
+
     fn catalogPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
@@ -2095,7 +2118,7 @@ const LocalStandaloneMetadata = struct {
         const budget = antfly.public_api.table_catalog.RoutingBudget{ .deadline_ns = deadline_ns };
         while (true) {
             try budget.checkpoint();
-            const generation = try acquireRoutingGeneration(ptr, deadline_ns, true);
+            const generation = try acquireRoutingGeneration(ptr, .{ .deadline_ns = deadline_ns }, true);
             defer generation.release();
             if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
             defer self.mutex.unlock();
@@ -2118,7 +2141,7 @@ const LocalStandaloneMetadata = struct {
                     tables[0].indexes_json = indexes;
                 }
             }
-            const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
+            const refs = if (table) |value| if (generation.indexed.table_range_refs.get(value.table_id)) |entry| entry.ranges else &.{} else &.{};
             const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
             var copied_ranges: usize = 0;
             errdefer {
@@ -15812,7 +15835,7 @@ test "system catalog standalone replacement invalidates same-revision routing an
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
     defer metadata.deinit();
     const epoch = metadata.epoch;
-    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer old.release();
     const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer old_plan.release();
@@ -15823,7 +15846,7 @@ test "system catalog standalone replacement invalidates same-revision routing an
     }, .{});
     defer alloc.free(replacement);
     try metadata.loadCatalogBytes(replacement);
-    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer current.release();
     const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer plan.release();
@@ -16506,7 +16529,7 @@ test "privacy standalone progress retains routing and join planning generations"
     installed.indexes_json = try privacy.install(a, "{}", resource);
     try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
     before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
-    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer old.release();
     const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer old_plan.release();
@@ -16518,7 +16541,7 @@ test "privacy standalone progress retains routing and join planning generations"
     try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, replacement);
     try std.testing.expectEqual(epoch, metadata.epoch);
     try std.testing.expect(metadata.durable_revision > durable);
-    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer current.release();
     const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer plan.release();

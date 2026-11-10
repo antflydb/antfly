@@ -372,12 +372,19 @@ export function seriesBatch(
   return { inserts };
 }
 
+export interface SeriesSQLOptions {
+  fieldPaths?: Record<string, readonly string[]>;
+  /** Explicit output name for the time bucket. Must not overlap a group or measure.
+   * By default, uses "bucket", appending underscores to avoid collisions. */
+  bucketAlias?: string;
+}
+
 /** Parameterized SQL equivalent for populated buckets (empty filling is a JSON
  * presentation option). Identifier quoting preserves names without SQL injection.
  */
 export function seriesSQL(
   options: SeriesQueryOptions,
-  sqlOptions: { fieldPaths?: Record<string, readonly string[]> } = {}
+  sqlOptions: SeriesSQLOptions = {}
 ): SQLRequest {
   // SQL emits populated buckets, so JSON presentation limits do not apply.
   seriesQuery({ ...options, emptyBuckets: false });
@@ -388,11 +395,32 @@ export function seriesSQL(
     return `$${parameters.length}`;
   };
   const groupBy = options.groupBy ?? [];
+  const outputNames = new Set(groupBy);
+  if (outputNames.size !== groupBy.length)
+    throw new TypeError("SQL group fields must have distinct output names");
+  for (const name of Object.keys(options.measures)) {
+    if (outputNames.has(name))
+      throw new TypeError(
+        `SQL measurement output name ${JSON.stringify(name)} overlaps a group field`
+      );
+    outputNames.add(name);
+  }
+  let bucketAlias = sqlOptions.bucketAlias ?? "bucket";
+  if (sqlOptions.bucketAlias !== undefined) {
+    if (typeof sqlOptions.bucketAlias !== "string" || !bucketAlias || outputNames.has(bucketAlias))
+      throw new TypeError(
+        "SQL bucketAlias must be nonempty and distinct from group and measurement output names"
+      );
+  } else {
+    while (outputNames.has(bucketAlias)) bucketAlias += "_";
+  }
+
   const used = new Set([
     options.table,
     options.timestamp,
     ...groupBy,
     ...Object.keys(options.measures),
+    bucketAlias,
   ]);
   const internal = (base: string) => {
     let name = base;
@@ -448,9 +476,9 @@ export function seriesSQL(
   const columns = [
     ...groupBy.map((field) => {
       const expression = column(field, `${source}.`);
-      return segments(field).length > 1 ? `${expression} AS ${quote(field)}` : expression;
+      return `${expression} AS ${quote(field)}`;
     }),
-    `${bucket} AS "bucket"`,
+    `${bucket} AS ${quote(bucketAlias)}`,
     ...Object.entries(options.measures).map(([name, metric]) => {
       const argument = metric.op === "count" ? "*" : column(metric.field, `${source}.`);
       const aggregate = `${metric.op.toUpperCase()}(${metric.op !== "count" && segments(metric.field).length > 1 ? `(${argument})::double precision` : argument})`;
@@ -464,12 +492,12 @@ export function seriesSQL(
     fields.length === 1
       ? fields[0]
       : `concat('[', ${fields.map((field) => `COALESCE(to_jsonb(${field})::text, 'null')`).join(", ',', ")}, ']')`;
-  const topDimensions = groupBy.map((field) => column(field));
-  const selectedDimensions = groupBy.map((field, i) =>
-    segments(field).length > 1 ? `${topDimensions[i]} AS ${quote(field)}` : topDimensions[i]
-  );
+  // Qualified CTE keys cannot bind an output alias when a remapped physical
+  // column has the same name as the internal count (especially in ORDER BY).
+  const topDimensions = dimensions;
+  const selectedDimensions = groupBy.map((field, i) => `${topDimensions[i]} AS ${quote(field)}`);
   const cte = groupBy.length
-    ? `WITH ${selected} AS (SELECT ${selectedDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} WHERE ${predicates()} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
+    ? `WITH ${selected} AS (SELECT ${selectedDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} AS ${source} WHERE ${predicates(`${source}.`)} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
     : "";
   const join = groupBy.length
     ? ` JOIN ${selected} ON ${groupBy.map((field) => `${column(field, `${source}.`)} IS NOT DISTINCT FROM ${selected}.${quote(field)}`).join(" AND ")}`

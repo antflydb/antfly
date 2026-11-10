@@ -4851,3 +4851,32 @@ test "time series owner query preserves invalid histogram class before runtime c
     var healthy = try owner.queryJson("docs", "{\"query\":{\"match_all\":{}},\"limit\":1}");
     defer healthy.deinit();
 }
+
+test "selected owner readiness compiled projections retain independent query control versions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const group = 7303;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "rows" } });
+    const input: @import("../metadata/api.zig").OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 3, .shard_id = 3, .range_id = 3 }} };
+    try std.testing.expectEqual(.topology_changed, (try store.ownerReadiness(a, group, input, .{})).status);
+    const checks = try store.ownerReadinessTransitions(a, group, input, .{});
+    defer a.free(checks);
+    try std.testing.expectEqual(@as(usize, 0), checks.len);
+    // A storage header cannot substitute for the independently versioned
+    // shared query control, even when the outer projection header is valid.
+    const invalid_control_version = if (abi.abi_version != abi.query_abi_version) abi.abi_version else abi.query_abi_version + 1;
+    const contract = @import("../metadata/storage/raft_apply_contract.zig");
+    for ([_]contract.CatalogProjectionRequest{ .{ .owner_readiness = input }, .{ .owner_readiness_transitions = input } }) |projection| {
+        const bytes = try std.json.Stringify.valueAlloc(a, projection, .{});
+        defer a.free(bytes);
+        var rejected: abi.OwnedBytes = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&rejected);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .kind = .system_catalog, .group_id = group, .key = .fromSlice(bytes), .control = .{ .version = invalid_control_version } }, &rejected));
+        try std.testing.expect(rejected.ptr == null);
+    }
+}
