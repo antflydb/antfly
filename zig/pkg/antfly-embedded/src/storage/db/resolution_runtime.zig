@@ -362,6 +362,16 @@ fn siblingResolutionsJsonAlloc(
     for (resolvers) |*sibling| {
         if (sibling == cfg or !cfg.sharesRoutingDomain(sibling.*)) continue;
         if (!resolverMatchesArtifact(sibling, parsed.source_artifact_kind, parsed.artifact_name)) continue;
+        // Event identities only compose non-event participants. Reading an
+        // event-only sibling cannot change that identity, but would introduce
+        // a reverse causal dependency: events consume entity resolutions,
+        // whose proofs would then consume the events they are meant to drive.
+        // Keep these irrelevant outputs out of the recorded read set entirely.
+        if (sibling.labels.len != 0) {
+            for (sibling.labels) |label| {
+                if (!std.ascii.eqlIgnoreCase(label, "event")) break;
+            } else continue;
+        }
         const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, parsed.resolution_scope_key, sibling.resolution_artifact);
         const raw: ?[]const u8 = overlay: {
             var i = pending_overlay.len;
@@ -3978,6 +3988,43 @@ test "processRecordKeys fans one source artifact out to all consuming resolvers"
     // Both resolver outputs share one writer handoff; production publishes all
     // completion markers in one follow-up metadata transaction.
     try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
+}
+
+test "event identity sibling inputs exclude event-only reverse dependencies" {
+    const Probe = struct {
+        reads: usize = 0,
+        fn get(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const a = testing.allocator;
+    var configs = [_]ResolverConfig{
+        .{ .name = "events", .table = "events", .source_artifact = "kg", .resolution_artifact = "events_resolved", .key_template = "event/{{ hash _entity.event_identity }}", .labels = &.{ "event", "Event" } },
+        .{ .name = "entities", .table = "entities", .source_artifact = "kg", .resolution_artifact = "entities_resolved", .key_template = "entity/{{ slug _entity.text }}" },
+    };
+    var probe: Probe = .{};
+    const store: resolver_lib.ArtifactStore = .{ .ptr = &probe, .vtable = &.{ .get = Probe.get, .put = Probe.put, .delete = Probe.delete } };
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(key);
+    var source = (try parseSourceArtifactKeyAlloc(a, key)).?;
+    defer source.deinit(a);
+    try testing.expect(try siblingResolutionsJsonAlloc(a, &configs, &configs[1], store, source, &.{}) == null);
+    try testing.expectEqual(@as(usize, 0), probe.reads);
+    // A mixed or catch-all sibling can contain non-event participants and
+    // still must be read and fenced; do not weaken those causal dependencies.
+    configs[0].labels = &.{ "event", "person" };
+    try testing.expectError(error.TestUnexpectedResult, siblingResolutionsJsonAlloc(a, &configs, &configs[1], store, source, &.{}));
+    configs[0].labels = &.{};
+    try testing.expectError(error.TestUnexpectedResult, siblingResolutionsJsonAlloc(a, &configs, &configs[1], store, source, &.{}));
+    try testing.expectEqual(@as(usize, 2), probe.reads);
 }
 
 test "changed sibling resolution re-drives event identity onto canonical participant keys" {

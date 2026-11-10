@@ -34,10 +34,61 @@ pub const SourceStamp = struct {
 };
 const header_magic = "ESQ2";
 const empty_cursor_header_magic = "ESQ3";
+const referenced_cursor_header_magic = "ESQ4";
+// Optional bounded envelope around an ESQ2/3/4 cursor header. Ticket rows
+// and invocation budgets are unchanged; only outstanding reconsideration is new.
+const replan_header_magic = "ESQ5";
+const replan_mask_bytes = (max_documents + 7) / 8;
 const snapshot_magic = "ESR2";
 const ticket_magic = "EST2";
+const referenced_ticket_magic = "EST3";
+const max_references = max_documents + 1;
+const Reference = [32]u8;
+
+/// Large opaque IDs stay in separate, deduplicated durable rows. Scheduling
+/// metadata keeps a SHA-256 reference, never a larger per-slot allowance.
+/// '@' is outside base64, so a reference cannot alias an ordinary opaque ID.
+pub fn documentIdentityAlloc(a: A, key: []const u8) ![]u8 {
+    if (key.len <= max_document_key_bytes) {
+        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(key.len));
+        _ = std.base64.standard.Encoder.encode(encoded, key);
+        return encoded;
+    }
+    var digest: Reference = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    const encoded = try a.alloc(u8, 1 + std.base64.standard.Encoder.calcSize(digest.len));
+    encoded[0] = '@';
+    _ = std.base64.standard.Encoder.encode(encoded[1..], &digest);
+    return encoded;
+}
+fn isReference(encoded: []const u8) bool {
+    return encoded.len != 0 and encoded[0] == '@';
+}
+fn wireIdentity(encoded: []const u8) []const u8 {
+    return if (isReference(encoded)) encoded[1..] else encoded;
+}
+fn referenceDigest(encoded: []const u8) !Reference {
+    if (!isReference(encoded) or try binary.keyLength(encoded[1..]) != 32) return error.InvalidEnrichmentState;
+    var digest: Reference = undefined;
+    std.base64.standard.Decoder.decode(&digest, encoded[1..]) catch return error.InvalidEnrichmentState;
+    return digest;
+}
+fn readIdentity(a: A, reader: *binary.Reader, referenced: bool) ![]const u8 {
+    const encoded = try reader.key(a, if (referenced) 32 else max_document_key_bytes);
+    if (!referenced) return encoded;
+    defer if (encoded.len != 0) a.free(encoded);
+    if (try binary.keyLength(encoded) != 32) return error.InvalidEnrichmentState;
+    return std.mem.concat(a, u8, &.{ "@", encoded });
+}
+pub const DocumentResolver = struct {
+    ptr: *anyopaque,
+    get: *const fn (*anyopaque, A, Reference) anyerror![]u8,
+};
+const PendingDocument = struct { digest: Reference, bytes: []u8 };
+pub const DocumentLocation = struct { revision_hash: [32]u8, ordinal: u32, kind: u8 };
 pub const max_ticket_bytes = 4 + 4 + max_document_key_bytes + 8 + 1 + 32 + 1 + 48 + 8 + 8 + 2 + max_budgets * 40;
-const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 1 + 2 + max_documents;
+const max_cursor_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 1 + 2 + max_documents;
+const max_header_bytes = 8 + max_cursor_header_bytes + replan_mask_bytes;
 comptime {
     // Every admitted combination fits, including maximum opaque keys, every
     // producer budget, both source identities, and a partial-record cursor.
@@ -53,6 +104,8 @@ pub const Budget = struct {
 };
 pub const Ticket = struct {
     document: []const u8, // base64 of the opaque document key
+    document_bytes: u64 = 0, // nonzero only for an external reference
+    document_location: ?DocumentLocation = null,
     sequence: u64,
     source_digest: ?[32]u8 = null,
     source_stamp: ?SourceStamp = null,
@@ -77,6 +130,7 @@ pub const Due = struct {
     groups: []Group,
     tokens: []Token,
     documents: [][]const u8,
+    replanned_slots: std.StaticBitSet(max_documents) = .empty,
     pub fn deinit(self: Due, a: A) void {
         for (self.groups) |group| a.free(group.doc_key);
         a.free(self.groups);
@@ -92,9 +146,16 @@ pub const State = struct {
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
+    scan_document_bytes: u64 = 0,
     empty_scan_document: bool = false,
     tickets: std.ArrayListUnmanaged(Ticket) = .empty,
     persisted_slots: std.StaticBitSet(max_documents) = .empty,
+    // Configuration reconsideration is independent of invocation deadlines.
+    // Slot identities survive swapRemove and incremental persistence.
+    pending_replan: std.StaticBitSet(max_documents) = .empty,
+    persisted_documents: [max_references]Reference = undefined,
+    persisted_document_count: usize = 0,
+    pending_documents: std.ArrayListUnmanaged(PendingDocument) = .empty,
     logical_budgets: std.AutoHashMapUnmanaged(BudgetKey, BudgetCounts) = .empty,
     logical_present: std.AutoHashMapUnmanaged(u64, void) = .empty,
     budget_index_valid: bool = false,
@@ -106,8 +167,17 @@ pub const State = struct {
     }
     pub fn removeTicket(self: *State, a: A, index: usize) void {
         self.invalidateBudgetIndex();
+        self.pending_replan.unset(self.tickets.items[index].slot);
         self.tickets.items[index].deinit(a);
         _ = self.tickets.swapRemove(index);
+    }
+    pub fn beginReplan(self: *State) void {
+        for (self.tickets.items) |ticket| self.pending_replan.set(ticket.slot);
+    }
+    pub fn completeReplan(self: *State, due_work: Due) void {
+        // Called only after the entire selected page has published/drained.
+        // New retries retain their clocks; they need no second reconsideration.
+        self.pending_replan = self.pending_replan.differenceWith(due_work.replanned_slots);
     }
     fn mergeBudget(self: *State, digest: ?[32]u8, budget: Budget) void {
         const key = BudgetKey{ .logical = budget.logical_fingerprint, .digest = digest };
@@ -138,8 +208,94 @@ pub const State = struct {
         self.tickets.deinit(a);
         self.logical_budgets.deinit(a);
         self.logical_present.deinit(a);
+        self.releasePersistedDocuments(a);
+        self.pending_documents.deinit(a);
         if (self.scan_document.len != 0) a.free(self.scan_document);
         self.* = .{};
+    }
+    pub fn releasePersistedDocuments(self: *State, a: A) void {
+        for (self.pending_documents.items) |document| a.free(document.bytes);
+        self.pending_documents.clearRetainingCapacity();
+    }
+    fn rememberDocument(self: *State, a: A, identity: []const u8, bytes: []const u8) !void {
+        if (!isReference(identity)) return;
+        const digest = try referenceDigest(identity);
+        for (self.persisted_documents[0..self.persisted_document_count]) |existing|
+            if (std.mem.eql(u8, &existing, &digest)) return;
+        var pending_bytes: usize = 0;
+        for (self.pending_documents.items) |existing| {
+            if (std.mem.eql(u8, &existing.digest, &digest)) return;
+            pending_bytes +|= existing.bytes.len;
+        }
+        // The replay source admits one oversized record to make progress.
+        // Persist it before admitting another, rather than multiplying an
+        // oversized allowance by the scheduling slot count.
+        if (self.pending_documents.items.len != 0 and bytes.len > max_bytes -| pending_bytes)
+            return error.MemoryBudgetExceeded;
+        const copy = try a.dupe(u8, bytes);
+        errdefer a.free(copy);
+        try self.pending_documents.append(a, .{ .digest = digest, .bytes = copy });
+    }
+    pub fn parkBounded(self: *State, a: A, group: Group, deadline_ms: u64, budget: Budget, source_digest: ?[32]u8, stamp: ?SourceStamp, location: ?DocumentLocation, pending_limit: usize, publisher: anytype) !void {
+        var retained: usize = 0;
+        for (self.pending_documents.items) |document| retained +|= document.bytes.len;
+        if (retained != 0 and group.doc_key.len > max_document_key_bytes and
+            group.doc_key.len > @min(pending_limit, max_bytes) -| retained)
+        {
+            var digest: Reference = undefined;
+            std.crypto.hash.sha2.Sha256.hash(group.doc_key, &digest, .{});
+            const known = known: {
+                for (self.persisted_documents[0..self.persisted_document_count]) |value|
+                    if (std.mem.eql(u8, &value, &digest)) break :known true;
+                for (self.pending_documents.items) |value|
+                    if (std.mem.eql(u8, &value.digest, &digest)) break :known true;
+                break :known false;
+            };
+            // Publish the first large identity before retaining another. The
+            // caller supplies its existing owner/fence; never reacquire a
+            // writer while that publication authority is already held.
+            if (!known) try publisher.save();
+        }
+        return self.parkLocated(a, group, deadline_ms, budget, source_digest, stamp, location);
+    }
+    fn referencedDocuments(self: State, out: *[max_references]Reference) usize {
+        var count: usize = 0;
+        if (isReference(self.scan_document)) {
+            out[count] = referenceDigest(self.scan_document) catch unreachable;
+            count += 1;
+        }
+        for (self.tickets.items) |ticket| {
+            if (!isReference(ticket.document)) continue;
+            const digest = referenceDigest(ticket.document) catch unreachable;
+            for (out[0..count]) |existing| {
+                if (std.mem.eql(u8, &existing, &digest)) break;
+            } else {
+                out[count] = digest;
+                count += 1;
+            }
+        }
+        return count;
+    }
+    pub fn documentAlloc(self: State, a: A, identity: []const u8, expected_bytes: u64, resolver: ?DocumentResolver) ![]u8 {
+        if (!isReference(identity)) {
+            const n = try binary.keyLength(identity);
+            const key = try a.alloc(u8, n);
+            errdefer a.free(key);
+            try std.base64.standard.Decoder.decode(key, identity);
+            return key;
+        }
+        const digest = try referenceDigest(identity);
+        const key = pending: {
+            for (self.pending_documents.items) |document|
+                if (std.mem.eql(u8, &document.digest, &digest)) break :pending try a.dupe(u8, document.bytes);
+            const port = resolver orelse return error.InvalidEnrichmentState;
+            break :pending try port.get(port.ptr, a, digest);
+        };
+        errdefer a.free(key);
+        var actual: Reference = undefined;
+        std.crypto.hash.sha2.Sha256.hash(key, &actual, .{});
+        if (key.len != expected_bytes or !std.mem.eql(u8, &digest, &actual)) return error.InvalidEnrichmentState;
+        return key;
     }
     pub fn decode(a: A, bytes: []const u8) !State {
         if (bytes.len > max_bytes) return error.InvalidEnrichmentState;
@@ -156,6 +312,7 @@ pub const State = struct {
             try decoded.state.tickets.append(a, ticket);
         }
         try reader.end();
+        decoded.state.persisted_document_count = decoded.state.referencedDocuments(&decoded.state.persisted_documents);
         return decoded.state;
     }
     fn decodeLegacy(a: A, bytes: []const u8) !State {
@@ -202,18 +359,44 @@ pub const State = struct {
         return bytes;
     }
     pub fn isHeader(bytes: []const u8) bool {
-        return std.mem.startsWith(u8, bytes, header_magic) or std.mem.startsWith(u8, bytes, empty_cursor_header_magic);
+        return std.mem.startsWith(u8, bytes, replan_header_magic) or std.mem.startsWith(u8, bytes, header_magic) or std.mem.startsWith(u8, bytes, empty_cursor_header_magic) or std.mem.startsWith(u8, bytes, referenced_cursor_header_magic);
     }
     pub const Header = struct { state: State, slots: [max_documents]u8 = undefined, count: usize };
     pub fn decodeHeader(a: A, raw: []const u8) !Header {
         if (!isHeader(raw) or raw.len > max_header_bytes) return error.InvalidEnrichmentState;
         var reader = binary.Reader{ .bytes = raw };
         _ = try reader.take(4);
+        if (std.mem.startsWith(u8, raw, replan_header_magic)) {
+            const base = try reader.take(try reader.int(u32));
+            // Exactly one envelope; reject nesting before decoding the cursor.
+            if (!isHeader(base) or std.mem.startsWith(u8, base, replan_header_magic)) return error.InvalidEnrichmentState;
+            var result = try decodeCursorHeader(a, base);
+            errdefer result.state.deinit(a);
+            const mask = try reader.take(replan_mask_bytes);
+            var used: std.StaticBitSet(max_documents) = .empty;
+            for (result.slots[0..result.count]) |slot| used.set(slot);
+            for (0..max_documents) |slot| if (mask[slot / 8] & (@as(u8, 1) << @intCast(slot % 8)) != 0) {
+                if (!used.isSet(slot)) return error.InvalidEnrichmentState;
+                result.state.pending_replan.set(slot);
+            };
+            try reader.end();
+            return result;
+        }
+        return decodeCursorHeader(a, raw);
+    }
+    fn decodeCursorHeader(a: A, raw: []const u8) !Header {
+        var reader = binary.Reader{ .bytes = raw };
+        _ = try reader.take(4);
         var result = Header{ .state = .{}, .count = 0 };
         errdefer result.state.deinit(a);
         result.state.config_hash = try reader.int(u64);
         result.state.scanned_sequence = try reader.int(u64);
-        result.state.scan_document = try reader.key(a, max_document_key_bytes);
+        const referenced = std.mem.startsWith(u8, raw, referenced_cursor_header_magic);
+        result.state.scan_document = try readIdentity(a, &reader, referenced);
+        if (referenced) {
+            result.state.scan_document_bytes = try reader.int(u64);
+            if (result.state.scan_document_bytes <= max_document_key_bytes) return error.InvalidEnrichmentState;
+        }
         if (std.mem.startsWith(u8, raw, empty_cursor_header_magic)) {
             if (try reader.int(u8) != 1 or result.state.scan_document.len != 0) return error.InvalidEnrichmentState;
             result.state.empty_scan_document = true;
@@ -230,17 +413,37 @@ pub const State = struct {
         return result;
     }
     fn encodeHeader(self: State, a: A) ![]u8 {
-        if (self.tickets.items.len > max_documents) return error.InvalidEnrichmentState;
-        const cursor_len = try binary.keyLength(self.scan_document);
-        if (cursor_len > max_document_key_bytes) return error.InvalidEnrichmentState;
-        const empty_cursor = self.empty_scan_document and self.scan_document.len == 0;
-        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + @intFromBool(empty_cursor) + 2 + self.tickets.items.len);
+        const base = try self.encodeCursorHeader(a);
+        if (self.pending_replan.count() == 0) return base;
+        defer a.free(base);
+        const bytes = try a.alloc(u8, 8 + base.len + replan_mask_bytes);
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
-        writer.put(if (empty_cursor) empty_cursor_header_magic else header_magic);
+        writer.put(replan_header_magic);
+        writer.int(u32, @intCast(base.len));
+        writer.put(base);
+        var mask: [replan_mask_bytes]u8 = @splat(0);
+        for (0..max_documents) |slot| if (self.pending_replan.isSet(slot)) {
+            mask[slot / 8] |= @as(u8, 1) << @intCast(slot % 8);
+        };
+        writer.put(&mask);
+        return bytes;
+    }
+    fn encodeCursorHeader(self: State, a: A) ![]u8 {
+        if (self.tickets.items.len > max_documents) return error.InvalidEnrichmentState;
+        const cursor_len = try binary.keyLength(wireIdentity(self.scan_document));
+        if (cursor_len > max_document_key_bytes) return error.InvalidEnrichmentState;
+        const referenced = isReference(self.scan_document);
+        if (referenced and (cursor_len != 32 or self.scan_document_bytes <= max_document_key_bytes)) return error.InvalidEnrichmentState;
+        const empty_cursor = self.empty_scan_document and self.scan_document.len == 0;
+        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + @as(usize, if (referenced) 8 else 0) + @intFromBool(empty_cursor) + 2 + self.tickets.items.len);
+        errdefer a.free(bytes);
+        var writer = binary.Writer{ .bytes = bytes };
+        writer.put(if (referenced) referenced_cursor_header_magic else if (empty_cursor) empty_cursor_header_magic else header_magic);
         writer.int(u64, self.config_hash);
         writer.int(u64, self.scanned_sequence);
-        try writer.key(self.scan_document);
+        try writer.key(wireIdentity(self.scan_document));
+        if (referenced) writer.int(u64, self.scan_document_bytes);
         if (empty_cursor) writer.int(u8, 1);
         writer.int(u16, @intCast(self.tickets.items.len));
         var used: std.StaticBitSet(max_documents) = .empty;
@@ -252,8 +455,12 @@ pub const State = struct {
         return bytes;
     }
     fn validateTicket(ticket: Ticket) !void {
-        const n = try binary.keyLength(ticket.document);
+        const n = try binary.keyLength(wireIdentity(ticket.document));
         if (n > max_document_key_bytes or ticket.revision == 0 or ticket.budgets.items.len == 0 or ticket.budgets.items.len > max_budgets) return error.InvalidEnrichmentState;
+        if (isReference(ticket.document)) {
+            if (n != 32 or ticket.document_bytes <= max_document_key_bytes) return error.InvalidEnrichmentState;
+            if (ticket.document_location) |location| if (location.ordinal == 0) return error.InvalidEnrichmentState;
+        } else if (ticket.document_bytes != 0 or ticket.document_location != null) return error.InvalidEnrichmentState;
         var earliest: u64 = std.math.maxInt(u64);
         for (ticket.budgets.items) |budget| {
             if (budget.fingerprint == 0 or budget.revision == 0 or budget.revision > ticket.revision) return error.InvalidEnrichmentState;
@@ -262,11 +469,16 @@ pub const State = struct {
         if (earliest != ticket.deadline_ms) return error.InvalidEnrichmentState;
     }
     pub fn decodeTicket(a: A, raw: []const u8, slot: u8) !Ticket {
-        if (raw.len > max_ticket_bytes or !std.mem.startsWith(u8, raw, ticket_magic) or slot >= max_documents) return error.InvalidEnrichmentState;
+        const referenced = std.mem.startsWith(u8, raw, referenced_ticket_magic);
+        if (raw.len > max_ticket_bytes or (!referenced and !std.mem.startsWith(u8, raw, ticket_magic)) or slot >= max_documents) return error.InvalidEnrichmentState;
         var reader = binary.Reader{ .bytes = raw };
         _ = try reader.take(4);
-        var ticket = Ticket{ .document = try reader.key(a, max_document_key_bytes), .sequence = 0, .deadline_ms = 0, .revision = 0, .slot = slot };
+        var ticket = Ticket{ .document = try readIdentity(a, &reader, referenced), .sequence = 0, .deadline_ms = 0, .revision = 0, .slot = slot };
         errdefer ticket.deinit(a);
+        if (referenced) {
+            ticket.document_bytes = try reader.int(u64);
+            if (try reader.flag()) ticket.document_location = .{ .revision_hash = (try reader.take(32))[0..32].*, .ordinal = try reader.int(u32), .kind = try reader.int(u8) };
+        }
         ticket.sequence = try reader.int(u64);
         if (try reader.flag()) ticket.source_digest = (try reader.take(32))[0..32].*;
         if (try reader.flag()) ticket.source_stamp = .{ .mutation_revision = try reader.int(u64), .incarnation = try reader.int(u64), .digest = (try reader.take(32))[0..32].* };
@@ -282,12 +494,22 @@ pub const State = struct {
     }
     fn encodeTicket(ticket: Ticket, a: A) ![]u8 {
         try validateTicket(ticket);
-        const size = 4 + 4 + try binary.keyLength(ticket.document) + 8 + 1 + @as(usize, if (ticket.source_digest != null) 32 else 0) + 1 + @as(usize, if (ticket.source_stamp != null) 48 else 0) + 8 + 8 + 2 + ticket.budgets.items.len * 40;
+        const referenced = isReference(ticket.document);
+        const size = 4 + 4 + try binary.keyLength(wireIdentity(ticket.document)) + @as(usize, if (referenced) 9 + @as(usize, if (ticket.document_location != null) 37 else 0) else 0) + 8 + 1 + @as(usize, if (ticket.source_digest != null) 32 else 0) + 1 + @as(usize, if (ticket.source_stamp != null) 48 else 0) + 8 + 8 + 2 + ticket.budgets.items.len * 40;
         const bytes = try a.alloc(u8, size);
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
-        writer.put(ticket_magic);
-        try writer.key(ticket.document);
+        writer.put(if (referenced) referenced_ticket_magic else ticket_magic);
+        try writer.key(wireIdentity(ticket.document));
+        if (referenced) {
+            writer.int(u64, ticket.document_bytes);
+            writer.int(u8, @intFromBool(ticket.document_location != null));
+            if (ticket.document_location) |location| {
+                writer.put(&location.revision_hash);
+                writer.int(u32, location.ordinal);
+                writer.int(u8, location.kind);
+            }
+        }
         writer.int(u64, ticket.sequence);
         writer.int(u8, @intFromBool(ticket.source_digest != null));
         if (ticket.source_digest) |digest| writer.put(&digest);
@@ -315,12 +537,16 @@ pub const State = struct {
         pub const Row = struct { slot: u8, bytes: []u8 };
         header: []u8,
         rows: []Row,
+        documents: []PendingDocument,
+        removed_documents: [max_references]Reference = undefined,
+        removed_document_count: usize = 0,
         removed: [max_documents]u8 = undefined,
         removed_len: usize = 0,
         pub fn deinit(self: @This(), a: A) void {
             a.free(self.header);
             for (self.rows) |row| a.free(row.bytes);
             a.free(self.rows);
+            a.free(self.documents);
         }
     };
     pub fn preparePersistence(self: State, a: A, all: bool) !Persistence {
@@ -339,7 +565,27 @@ pub const State = struct {
             errdefer a.free(bytes);
             try rows.append(a, .{ .slot = ticket.slot, .bytes = bytes });
         }
-        var result = Persistence{ .header = header, .rows = try rows.toOwnedSlice(a) };
+        var wanted: [max_references]Reference = undefined;
+        const wanted_count = self.referencedDocuments(&wanted);
+        var documents: std.ArrayListUnmanaged(PendingDocument) = .empty;
+        defer documents.deinit(a);
+        for (self.pending_documents.items) |document| for (wanted[0..wanted_count]) |digest| {
+            if (std.mem.eql(u8, &document.digest, &digest)) {
+                try documents.append(a, document);
+                break;
+            }
+        };
+        const owned_documents = try documents.toOwnedSlice(a);
+        errdefer a.free(owned_documents);
+        var result = Persistence{ .header = header, .rows = try rows.toOwnedSlice(a), .documents = owned_documents };
+        for (self.persisted_documents[0..self.persisted_document_count]) |digest| {
+            for (wanted[0..wanted_count]) |current| {
+                if (std.mem.eql(u8, &digest, &current)) break;
+            } else {
+                result.removed_documents[result.removed_document_count] = digest;
+                result.removed_document_count += 1;
+            }
+        }
         for (0..max_documents) |slot| if (self.persisted_slots.isSet(slot) and !used.isSet(slot)) {
             result.removed[result.removed_len] = @intCast(slot);
             result.removed_len += 1;
@@ -352,25 +598,27 @@ pub const State = struct {
             ticket.dirty = false;
             self.persisted_slots.set(ticket.slot);
         }
+        self.persisted_document_count = self.referencedDocuments(&self.persisted_documents);
     }
     pub fn clearScanDocument(self: *State, a: A) void {
         if (self.scan_document.len != 0) a.free(self.scan_document);
         self.scan_document = "";
+        self.scan_document_bytes = 0;
         self.empty_scan_document = false;
     }
     pub fn scanDocumentAlloc(self: State, a: A) ![]u8 {
-        const size = try std.base64.standard.Decoder.calcSizeForSlice(self.scan_document);
-        const bytes = try a.alloc(u8, size);
-        errdefer a.free(bytes);
-        try std.base64.standard.Decoder.decode(bytes, self.scan_document);
-        return bytes;
+        return self.scanDocumentAllocWithReferences(a, null);
+    }
+    pub fn scanDocumentAllocWithReferences(self: State, a: A, resolver: ?DocumentResolver) ![]u8 {
+        return self.documentAlloc(a, self.scan_document, self.scan_document_bytes, resolver);
     }
     pub fn setScanDocument(self: *State, a: A, group: Group) !void {
-        if (group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
-        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(group.doc_key.len));
-        _ = std.base64.standard.Encoder.encode(encoded, group.doc_key);
+        const encoded = try documentIdentityAlloc(a, group.doc_key);
+        errdefer a.free(encoded);
+        try self.rememberDocument(a, encoded, group.doc_key);
         self.clearScanDocument(a);
         self.scan_document = encoded;
+        self.scan_document_bytes = if (isReference(encoded)) group.doc_key.len else 0;
         self.empty_scan_document = group.doc_key.len == 0;
         self.scanned_sequence = group.sequence;
     }
@@ -396,14 +644,16 @@ pub const State = struct {
         return self.parkStamped(a, group, deadline_ms, budget, source_digest, null);
     }
     pub fn parkStamped(self: *State, a: A, group: Group, deadline_ms: u64, budget: Budget, source_digest: ?[32]u8, stamp: ?SourceStamp) !void {
-        if (group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
+        return self.parkLocated(a, group, deadline_ms, budget, source_digest, stamp, null);
+    }
+    pub fn parkLocated(self: *State, a: A, group: Group, deadline_ms: u64, budget: Budget, source_digest: ?[32]u8, stamp: ?SourceStamp, location: ?DocumentLocation) !void {
         if (self.budget_index_valid) {
             try self.logical_budgets.ensureUnusedCapacity(a, 1);
             try self.logical_present.ensureUnusedCapacity(a, 1);
         }
-        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(group.doc_key.len));
+        const encoded = try documentIdentityAlloc(a, group.doc_key);
         defer a.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, group.doc_key);
+        try self.rememberDocument(a, encoded, group.doc_key);
         var selected: ?*Ticket = null;
         for (self.tickets.items) |*ticket| {
             if (ticket.sequence == group.sequence and std.mem.eql(u8, ticket.document, encoded)) {
@@ -417,7 +667,7 @@ pub const State = struct {
             for (self.tickets.items) |existing| used.set(existing.slot);
             var slot: usize = 0;
             while (used.isSet(slot)) : (slot += 1) {}
-            var ticket = Ticket{ .slot = @intCast(slot), .source_stamp = stamp, .document = try a.dupe(u8, encoded), .sequence = group.sequence, .source_digest = source_digest, .deadline_ms = deadline_ms, .revision = 1 };
+            var ticket = Ticket{ .slot = @intCast(slot), .source_stamp = stamp, .document = try a.dupe(u8, encoded), .document_bytes = if (isReference(encoded)) group.doc_key.len else 0, .document_location = if (isReference(encoded)) location else null, .sequence = group.sequence, .source_digest = source_digest, .deadline_ms = deadline_ms, .revision = 1 };
             errdefer ticket.deinit(a);
             var next = budget;
             next.deadline_ms = deadline_ms;
@@ -450,6 +700,7 @@ pub const State = struct {
         }
         ticket.source_digest = source_digest;
         ticket.source_stamp = stamp;
+        if (isReference(ticket.document) and location != null) ticket.document_location = location;
         ticket.dirty = true;
         ticket.revision = revision;
         var next = budget;
@@ -471,6 +722,7 @@ pub const State = struct {
         return .{ .fingerprint = 0, .logical_fingerprint = logical, .failures = counts.failures, .waits = counts.waits };
     }
     pub fn deadline(self: State) u64 {
+        if (self.pending_replan.count() != 0) return 0;
         var result: u64 = std.math.maxInt(u64);
         for (self.tickets.items) |ticket| result = @min(result, ticket.deadline_ms);
         return if (self.tickets.items.len == 0) 0 else result;
@@ -481,16 +733,29 @@ pub const State = struct {
         return result;
     }
     pub fn due(self: State, a: A, now_ms: u64) !Due {
-        return self.selectDue(a, now_ms, false);
+        return self.selectDue(a, now_ms, false, null, 0);
     }
     pub fn replan(self: State, a: A, now_ms: u64) !Due {
-        return self.selectDue(a, now_ms, true);
+        return self.selectDue(a, now_ms, true, null, 0);
     }
-    fn selectDue(self: State, a: A, now_ms: u64, include_waiting: bool) !Due {
+    pub fn dueWithReferences(self: State, a: A, now_ms: u64, resolver: DocumentResolver, max_key_bytes: usize) !Due {
+        return self.selectDue(a, now_ms, false, resolver, max_key_bytes);
+    }
+    pub fn replanWithReferences(self: State, a: A, now_ms: u64, resolver: DocumentResolver, max_key_bytes: usize) !Due {
+        return self.selectDue(a, now_ms, true, resolver, max_key_bytes);
+    }
+    fn selectDue(self: State, a: A, now_ms: u64, include_waiting: bool, resolver: ?DocumentResolver, max_key_bytes: usize) !Due {
         var document_count: usize = 0;
         var budget_count: usize = 0;
+        var key_bytes: usize = 0;
+        // Finish finite configuration work before ordinary due retries. A
+        // quickly failing head ticket must not starve later replan pages.
+        const replanning = self.pending_replan.count() != 0;
         for (self.tickets.items) |ticket| {
-            if (!include_waiting and ticket.deadline_ms > now_ms) continue;
+            if (if (replanning) !self.pending_replan.isSet(ticket.slot) else (!include_waiting and ticket.deadline_ms > now_ms)) continue;
+            const n = if (isReference(ticket.document)) std.math.cast(usize, ticket.document_bytes) orelse return error.InvalidEnrichmentState else try binary.keyLength(ticket.document);
+            if (document_count != 0 and max_key_bytes != 0 and n > max_key_bytes -| key_bytes) break;
+            key_bytes +|= n;
             document_count += 1;
             for (ticket.budgets.items) |budget| if (budget.deadline_ms <= now_ms) {
                 budget_count += 1;
@@ -508,12 +773,13 @@ pub const State = struct {
             a.free(documents[i]);
         };
         var token_count: usize = 0;
+        var replanned_slots: std.StaticBitSet(max_documents) = .empty;
         for (self.tickets.items) |ticket| {
-            if (!include_waiting and ticket.deadline_ms > now_ms) continue;
-            const size = try std.base64.standard.Decoder.calcSizeForSlice(ticket.document);
-            const key = try a.alloc(u8, size);
+            if (if (replanning) !self.pending_replan.isSet(ticket.slot) else (!include_waiting and ticket.deadline_ms > now_ms)) continue;
+            if (initialized == document_count) break;
+            if (self.pending_replan.isSet(ticket.slot)) replanned_slots.set(ticket.slot);
+            const key = try self.documentAlloc(a, ticket.document, ticket.document_bytes, resolver);
             errdefer a.free(key);
-            try std.base64.standard.Decoder.decode(key, ticket.document);
             documents[initialized] = try a.dupe(u8, ticket.document);
             groups[initialized] = .{ .doc_key = key, .sequence = ticket.sequence };
             for (ticket.budgets.items) |budget| {
@@ -529,7 +795,7 @@ pub const State = struct {
             }
         };
         std.mem.sort(Group, groups, {}, Order.less);
-        return .{ .groups = groups, .tokens = tokens, .documents = documents };
+        return .{ .groups = groups, .tokens = tokens, .documents = documents, .replanned_slots = replanned_slots };
     }
     pub fn hasDocument(self: State, encoded: []const u8) bool {
         for (self.tickets.items) |ticket| if (std.mem.eql(u8, ticket.document, encoded)) return true;
@@ -663,6 +929,37 @@ test "scoped retry workset keeps independent producer clocks and logical budgets
     try std.testing.expectEqual(@as(usize, 0), state.tickets.items.len);
 }
 
+test "scoped retry workset replan headers retain every cursor form and reject invalid slots" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, max_document_key_bytes + 1);
+    defer a.free(large);
+    @memset(large, 'x');
+    for ([_][]const u8{ "", "cursor", large }) |key| {
+        var state: State = .{};
+        defer state.deinit(a);
+        try state.park(a, .{ .doc_key = key, .sequence = 7 }, 1000, .{ .fingerprint = 1 }, null);
+        try state.setScanDocument(a, .{ .doc_key = key, .sequence = 7 });
+        // Existing ESQ2/3/4 cursor headers remain readable without migration.
+        const legacy = try state.encodeHeader(a);
+        defer a.free(legacy);
+        var old = try State.decodeHeader(a, legacy);
+        defer old.state.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), old.state.pending_replan.count());
+        state.beginReplan();
+        const bytes = try state.encodeHeader(a);
+        defer a.free(bytes);
+        var restored = try State.decodeHeader(a, bytes);
+        defer restored.state.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), restored.state.pending_replan.count());
+        try std.testing.expectEqualStrings(state.scan_document, restored.state.scan_document);
+        try std.testing.expectEqual(state.scan_document_bytes, restored.state.scan_document_bytes);
+        try std.testing.expectEqual(state.empty_scan_document, restored.state.empty_scan_document);
+        // An unowned slot is corruption, never an endless immediate wakeup.
+        bytes[bytes.len - 1] |= 0x80;
+        try std.testing.expectError(error.InvalidEnrichmentState, State.decodeHeader(a, bytes));
+    }
+}
+
 test "scoped retry workset allocation failures preserve ownership" {
     const Harness = struct {
         fn run(a: A) !void {
@@ -670,6 +967,7 @@ test "scoped retry workset allocation failures preserve ownership" {
             defer state.deinit(a);
             try state.park(a, .{ .doc_key = "document", .sequence = 1 }, 1_000, .{ .fingerprint = 1, .logical_fingerprint = 7 }, null);
             try state.park(a, .{ .doc_key = "document", .sequence = 1 }, 2_000, .{ .fingerprint = 2, .logical_fingerprint = 8 }, null);
+            state.beginReplan();
             const raw = try state.encode(a);
             defer a.free(raw);
             var restored = try State.decode(a, raw);
@@ -682,6 +980,37 @@ test "scoped retry workset allocation failures preserve ownership" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "scoped retry workset oversized identity allocation failures preserve ownership" {
+    const key = try std.testing.allocator.alloc(u8, max_document_key_bytes + 1);
+    defer std.testing.allocator.free(key);
+    @memset(key, 'x');
+    const Harness = struct {
+        fn run(a: A, document: []const u8) !void {
+            var state: State = .{};
+            defer state.deinit(a);
+            try state.park(a, .{ .doc_key = document, .sequence = 1 }, 10, .{ .fingerprint = 1 }, null);
+            try state.setScanDocument(a, .{ .doc_key = document, .sequence = 1 });
+            state.beginReplan();
+            const raw = try state.encode(a);
+            defer a.free(raw);
+            var restored = try State.decode(a, raw);
+            defer restored.deinit(a);
+            // Snapshot decoding must retain body ownership for later GC,
+            // just as the incremental loader does.
+            try std.testing.expectEqual(@as(usize, 1), restored.persisted_document_count);
+            while (restored.tickets.items.len != 0) restored.removeTicket(a, 0);
+            restored.clearScanDocument(a);
+            const retirement = try restored.preparePersistence(a, false);
+            defer retirement.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), retirement.removed_document_count);
+            const ready = try state.due(a, 10);
+            defer ready.deinit(a);
+            try std.testing.expectEqualSlices(u8, document, ready.groups[0].doc_key);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{key});
 }
 
 test "scoped retry workset maximum metadata fits binary and incremental persistence" {
