@@ -36,6 +36,7 @@ const (
 	CodeUnsupported  = "unsupported"
 	CodeTimeout      = "timeout"
 	CodeRunFailed    = "run_failed"
+	CodeInterrupted  = "interrupted"
 	CodeTransport    = "transport"
 	CodeFailed       = "request_failed"
 )
