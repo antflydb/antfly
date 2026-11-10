@@ -6960,8 +6960,6 @@ pub const MetadataAdminVoprSource = struct {
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
             .fk_initial_parent_decision,
-            .resolver_authority_mutate,
-            .native_memory_create,
             => return error.UnsupportedOperation,
             .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{
                 .metadata_group_id = group_id,
@@ -7000,7 +6998,6 @@ pub const MetadataAdminVoprSource = struct {
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),
             .resolver_catalog_read => |request| try store.resolverCatalogRead(alloc, group_id, request),
-            .graph_authority => |request| try std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, group_id, request), .{}),
             .mutate => unreachable,
         };
         errdefer alloc.free(result);
