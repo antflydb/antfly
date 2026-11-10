@@ -56973,7 +56973,7 @@ fn applyDerivedBatchToIndexReplayContext(
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
     };
     if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) {
-        try local_mutation.applyAssetPublicationMetadataContext(&async_ctx, batch, index_ref.name);
+        try local_mutation.applyAssetPublicationMetadataContext(&async_ctx, batch, index_ref.name, null);
         return false;
     }
     // Only a batch accepted by this projection may publish its source
@@ -58761,7 +58761,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     const self = replay_ctx.db;
     const resources = self.core.asyncResources();
     if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) {
-        try local_mutation.applyAssetPublicationMetadataContext(self.async_context, batch, index_ref.name);
+        try local_mutation.applyAssetPublicationMetadataContext(self.async_context, batch, index_ref.name, null);
         return false;
     }
     // See applyDerivedBatchToIndexReplayContext: irrelevant tail windows must
@@ -61381,20 +61381,20 @@ fn resetPath(path: []const u8) !void {
 pub fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (comptime storage_engine.enabled) return storage_engine.call("applyDerivedBatchToIndexAsync", .{ ctx, batch, index_ref, token });
-    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) {
-        try local_mutation.applyAssetPublicationMetadataContext(ctx, batch, index_ref.name);
-        return false;
-    }
-    if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
-        return error.ReplayDocumentNotVisible;
-    }
-
     var admitted_replay = if (index_ref.kind == .dense_vector)
         try retainAsyncDenseCatchUpAdmission(ctx, index_ref.name, token)
     else
         null;
     defer if (admitted_replay) |*lease| lease.release();
     const admission = if (admitted_replay) |*lease| lease else null;
+
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) {
+        try local_mutation.applyAssetPublicationMetadataContext(ctx, batch, index_ref.name, admission);
+        return false;
+    }
+    if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
+        return error.ReplayDocumentNotVisible;
+    }
 
     // The executor opened the source capture in
     // beginDerivedCatchUpSessionAsync; this callback alone owns the right to
@@ -150927,4 +150927,68 @@ test "source semantic media input native asset replay survives provider-free rec
     try db.reconfigureEnrichmentRuntimePaused(.{});
     try std.testing.expect(db.enrichment_runtime != null);
     try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
+}
+
+test "metadata replay progress borrows dense admission past a queued capture" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata-admission", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try DB.open(a, path, .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const admission = db.core.snapshot_replay_admission;
+    var lease: ?snapshot_admission_mod.SnapshotAdmission.MutationLease = admission.acquireMutation();
+    const token = try installAsyncDenseCatchUpSession(db.async_context, "metadata", 1, null, &lease);
+    var session_open = true;
+    defer if (session_open) {
+        var session = takeAsyncDenseCatchUpSession(db.async_context, "metadata", token) catch unreachable;
+        a.free(session.index_name);
+        if (session.snapshot_replay) |*held| held.release();
+    };
+    const Work = struct {
+        fn capture(barrier: *snapshot_admission_mod.SnapshotAdmission, done: *std.atomic.Value(bool)) void {
+            var held = barrier.acquireCapture();
+            defer held.release();
+            done.store(true, .release);
+        }
+    };
+    var capture_done = std.atomic.Value(bool).init(false);
+    const capture = try std.Thread.spawn(.{}, Work.capture, .{ admission, &capture_done });
+    var capture_joined = false;
+    defer {
+        if (session_open) {
+            var session = takeAsyncDenseCatchUpSession(db.async_context, "metadata", token) catch unreachable;
+            a.free(session.index_name);
+            if (session.snapshot_replay) |*held| held.release();
+            session_open = false;
+        }
+        if (!capture_joined) capture.join();
+    }
+    // Observe the actual exclusive waiter, rather than relying on a sleep or
+    // elapsed-time threshold. Its presence closes admission to new readers.
+    while (admission.lock.exclusive_waiters.load(.acquire) == 0) std.Thread.yield() catch {};
+    try std.testing.expect(!admission.lock.tryLockShared());
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(key);
+    // This must borrow the exact dense session's lease. Reacquiring shared
+    // admission here would deadlock against the capture waiting for that lease.
+    try std.testing.expect(!try applyDerivedBatchToIndexAsync(db.async_context, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{key},
+    }, .{ .name = "metadata", .kind = .dense_vector }, token));
+    try std.testing.expect(!capture_done.load(.acquire));
+    var session = try takeAsyncDenseCatchUpSession(db.async_context, "metadata", token);
+    a.free(session.index_name);
+    if (session.snapshot_replay) |*held| held.release();
+    session_open = false;
+    capture.join();
+    capture_joined = true;
+    try std.testing.expect(capture_done.load(.acquire));
+    try std.testing.expect(admission.lock.tryLockExclusive());
+    admission.lock.unlockExclusive();
 }

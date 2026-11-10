@@ -28272,8 +28272,8 @@ components:
         in_progress:
           type: integer
           format: uint64
-          description: Number of selected repair records or indexes skipped because another repair pass
-            already owns them.
+          description: Number of selected repair records or indexes still in progress after this pass,
+            including queued native producer work and work owned by another repair pass.
         indexes_rebuilt:
           type: integer
           format: uint64
@@ -28438,7 +28438,14 @@ components:
           description: Attempt the first bounded pass immediately. Remaining passes always run server-side.
     TableRepairJob:
       type: object
-      description: Durable table repair job state.
+      description: >
+        Durable table repair job state. In result, work counters accumulate across
+
+        passes, while unresolved and in_progress describe only the latest bounded
+
+        pass. Earlier failures remain represented by cumulative failure counters,
+
+        debt_remaining, and the current remaining_failures summary.
       required:
         - job_id
         - attempt_id

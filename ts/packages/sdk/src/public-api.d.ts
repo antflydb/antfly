@@ -9355,7 +9355,7 @@ export interface components {
             unresolved: number;
             /**
              * Format: uint64
-             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             * @description Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
              */
             in_progress: number;
             /**
@@ -9475,7 +9475,12 @@ export interface components {
              */
             advance?: boolean;
         };
-        /** @description Durable table repair job state. */
+        /**
+         * @description Durable table repair job state. In result, work counters accumulate across
+         *     passes, while unresolved and in_progress describe only the latest bounded
+         *     pass. Earlier failures remain represented by cumulative failure counters,
+         *     debt_remaining, and the current remaining_failures summary.
+         */
         TableRepairJob: {
             /**
              * Format: uint64

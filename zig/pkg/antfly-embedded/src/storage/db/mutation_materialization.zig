@@ -3300,6 +3300,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
 
+        /// Borrow an operation's existing admission without reopening the
+        /// shared gate: a queued capture may already have closed that gate.
+        /// The caller keeps the supplied lease alive through this invocation.
+        fn acquireReplayAdmission(
+            ctx: *const AsyncContext,
+            admitted: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        ) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+            if (admitted) |lease| {
+                std.debug.assert(lease.active and lease.admission == ctx.snapshot_replay_admission);
+                return null;
+            }
+            return try acquireSnapshotReplayAsyncContext(ctx);
+        }
+
         pub fn applyDerivedBatchToIndexContextProfiled(
             ctx: *const AsyncContext,
             batch: derived_types.DerivedBatch,
@@ -3311,13 +3325,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Generated files and their publication metadata are one physical
             // generation. Native capture takes the exclusive side of this admission
             // while copying, so no async worker may rewrite an artifact mid-copy.
-            var snapshot_replay = if (admitted_replay) |lease| blk: {
-                std.debug.assert(lease.admission == ctx.snapshot_replay_admission);
-                std.debug.assert(lease.active);
-                // The callback keeps its retained lease alive for this entire call.
-                // Borrow it directly instead of adding another shared-count round trip.
-                break :blk @as(?snapshot_admission_mod.SnapshotAdmission.MutationLease, null);
-            } else try acquireSnapshotReplayAsyncContext(ctx);
+            var snapshot_replay = try acquireReplayAdmission(ctx, admitted_replay);
             defer if (snapshot_replay) |*lease| lease.release();
             if (index_ref.kind == .full_text) {
                 const apply_start_ns = monotonicTimeNs();
@@ -3881,12 +3889,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
         }
 
-        pub fn applyAssetPublicationMetadataContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_name: []const u8) !void {
+        pub fn applyAssetPublicationMetadataContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_name: []const u8, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            if (ctx.projection_only) return;
             const has_asset_root = for (batch.changed_artifact_keys) |key| {
                 if (internal_keys.isAssetArtifactKey(key)) break true;
             } else false;
             if (!has_asset_root) return;
-            var replay = try acquireSnapshotReplayAsyncContext(ctx);
+            var replay = try acquireReplayAdmission(ctx, admitted_replay);
             defer if (replay) |*lease| lease.release();
             try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_name, batch.changed_artifact_keys, batch.sequence);
         }
