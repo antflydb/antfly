@@ -193,6 +193,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft protocol barrier is fail closed for legacy batch parsers",
         "raft protocol barrier rejects unsupported future versions",
         "raft proposal materializes a default batch timestamp exactly once",
+        "raft proposal preserves isolated catalog admission through document revision negotiation",
         "online merge admission distinguishes unsupported peers and fences leader authority",
         "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
