@@ -337,7 +337,10 @@ inference bridge and worker transport without holding admission, attachment, or
 RPC accounting locks during callbacks. Preflight, auxiliary weights, runs and
 metadata all participate. One owner pass per admission leaves inference caches
 and model eviction an opportunity to help. Every retry re-probes physical memory;
-reported decreases are never allocation credit.
+reported decreases are never allocation credit. The reclaim target is solved
+against the same physical and operator-envelope policies, including reserve
+floors and usage above the envelope, rather than assuming a clamped zero
+capacity means only the requested allocation needs to be freed.
 
 Linux file-cache cleanup belongs to the file-producing operation. A completed
 snapshot drops its synced private output cache before publication; a writable

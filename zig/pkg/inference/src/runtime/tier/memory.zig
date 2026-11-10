@@ -916,6 +916,7 @@ pub const AdmissionController = struct {
     live_capacity_bytes: usize = 0,
     live_pending_bytes: usize = 0,
     live_reclaim_target_bytes: usize = 0,
+    live_reclaim_required_bytes: usize = 0,
     live_epoch: u64 = 0,
     /// Suppress a warning storm while repeated requests are denied by the
     /// same live-memory pressure condition. Successful admission clears it.
@@ -1039,8 +1040,16 @@ pub const AdmissionController = struct {
         if (!retained) return 0;
         defer budget.releaseContext();
         spinLockAdmission(&self.live_mutex);
-        const target = @max(self.live_reclaim_target_bytes, mib(64));
+        const fallback_target = @max(self.live_reclaim_target_bytes, mib(64));
+        const required = self.live_reclaim_required_bytes;
         self.live_mutex.unlock();
+        const target = if (required == 0) fallback_target else blk: {
+            const measured = liveReclamationTargetForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance, required) orelse return 0;
+            // A fresh sample already permits the request. Let the caller retry
+            // admission instead of evicting an unrelated cache on stale pressure.
+            if (measured == 0) return 1;
+            break :blk measured;
+        };
         return reclaim(budget.context, target);
     }
 
@@ -1481,6 +1490,7 @@ pub const AdmissionController = struct {
         info: ?SystemMemoryInfo,
     ) !usize {
         std.debug.assert(incremental_bytes > 0);
+        self.live_reclaim_required_bytes = self.live_pending_bytes +| incremental_bytes;
         if (info) |memory_info| {
             const available = memory_info.available_bytes orelse {
                 if (self.live_pending_bytes != 0) return error.ResourceTemporarilyUnavailable;
@@ -1512,6 +1522,7 @@ pub const AdmissionController = struct {
         }
         self.live_pending_bytes = next_pending;
         self.live_reclaim_target_bytes = 0;
+        self.live_reclaim_required_bytes = 0;
         return incremental_bytes;
     }
 
@@ -1963,6 +1974,57 @@ fn applyLinuxProcessMemoryLimit(
         if (forwarded_host_total) null else sample.cgroup.leaf_working_set_bytes,
         provenance,
     );
+}
+
+/// Reclamation uses the same policies as admission. Increasing availability
+/// and decreasing charged usage models actual owner release; solving for the
+/// minimum avoids both the clamped-zero reserve trap and needless eviction.
+fn minimumReclamationBytes(detected: ?SystemMemoryInfo, limit: usize, usage: ?usize, provenance: ProcessMemoryLimitProvenance, required: usize) ?usize {
+    const Probe = struct {
+        fn permits(raw: ?SystemMemoryInfo, bounded_limit: usize, current: ?usize, source: ProcessMemoryLimitProvenance, bytes: usize, freed: usize) bool {
+            var next = raw;
+            if (next) |*info| if (info.available_bytes) |available| {
+                info.available_bytes = @min(info.total_bytes, available +| freed);
+            };
+            const view = applyOptionalProcessMemoryLimit(next, bounded_limit, if (current) |value| value -| freed else null, source) orelse return false;
+            checkLiveHostMemoryWithInfo(view, bytes) catch return false;
+            return true;
+        }
+    };
+    var low: usize = 0;
+    var high = @max(required, @max(limit, @max(usage orelse 0, if (detected) |info| info.total_bytes else 0)));
+    if (!Probe.permits(detected, limit, usage, provenance, required, high)) return null;
+    // The capacity policies are monotonic in released memory. At most one
+    // machine word of arithmetic-only iterations runs on a pressure path.
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (Probe.permits(detected, limit, usage, provenance, required, middle)) high = middle else low = middle + 1;
+    }
+    return low;
+}
+
+fn liveReclamationTargetForLimit(limit: usize, provenance: ProcessMemoryLimitProvenance, required: usize) ?usize {
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            const sample = probeSystemMemoryInfoLinuxSample();
+            const forwarded = provenance == .host and sample.info != null and limit >= sample.info.?.total_bytes;
+            break :blk minimumReclamationBytes(sample.info, limit, if (forwarded) null else sample.cgroup.leaf_working_set_bytes, provenance, required);
+        },
+        .macos => minimumReclamationBytes(probeSystemMemoryInfoMacos(), limit, processWorkingSetBytesFromSnapshot(platform.process_memory.pressureSnapshot()), provenance, required),
+        else => null,
+    };
+}
+
+test "host reclamation target crosses physical reserve floors without over-eviction" {
+    const constrained = SystemMemoryInfo{ .total_bytes = gib(2), .available_bytes = mib(100) };
+    // Both the physical floor and the over-budget operator envelope apply.
+    try std.testing.expectEqual(@as(?usize, mib(428)), minimumReclamationBytes(constrained, mib(1843), mib(1948), .explicit, mib(16)));
+    // A healthy physical host does not justify over-evicting an operator envelope.
+    const healthy = SystemMemoryInfo{ .total_bytes = gib(16), .available_bytes = gib(8) };
+    try std.testing.expectEqual(@as(?usize, mib(304)), minimumReclamationBytes(healthy, mib(256), mib(512), .explicit, mib(16)));
+    try std.testing.expectEqual(@as(?usize, mib(40)), minimumReclamationBytes(.{ .total_bytes = gib(2), .available_bytes = mib(600) }, 0, null, .automatic, mib(128)));
+    try std.testing.expectEqual(@as(?usize, 0), minimumReclamationBytes(healthy, 0, null, .automatic, mib(16)));
+    try std.testing.expectEqual(@as(?usize, null), minimumReclamationBytes(constrained, mib(256), 0, .explicit, mib(256)));
 }
 
 fn processWorkingSetBytesFromSnapshot(stats: platform.process_memory.Stats) ?usize {

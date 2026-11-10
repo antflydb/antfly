@@ -6785,6 +6785,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
         owner_attempted: *bool,
+        host_target_bytes: usize,
     ) bool {
         switch (pressure) {
             .live_host => if (!owner_attempted.*) {
@@ -6799,7 +6800,7 @@ pub const ModelManager = struct {
             .domain_scratch => true, // retained preflight/index leases
             else => pressureCanBeRelievedByHostCache(pressure),
         };
-        if (cold_host_cache_can_help and self.reclaimHostCache(1) != 0) return true;
+        if (cold_host_cache_can_help and self.reclaimHostCache(@max(1, host_target_bytes)) != 0) return true;
         if (self.evictOneIdleForAdmission(pressure)) return true;
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
@@ -6844,7 +6845,7 @@ pub const ModelManager = struct {
                 if (self.admissionController().reserveLiveCapacity(bytes)) |reservation| return reservation else |retry| {
                     if (retry != error.ResourceTemporarilyUnavailable) return retry;
                 }
-                if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(.live_host, &owner_attempted)) return error.ResourceTemporarilyUnavailable;
+                if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(.live_host, &owner_attempted, bytes)) return error.ResourceTemporarilyUnavailable;
             }
         };
     }
@@ -6893,6 +6894,7 @@ pub const ModelManager = struct {
                     if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                         &owner_attempted,
+                        amounts.hostTotalBytes(),
                     )) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, &requests);
                         return error.ResourceTemporarilyUnavailable;
@@ -6915,6 +6917,8 @@ pub const ModelManager = struct {
         defer self.allocator.free(requests);
         for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
         self.tightenUnifiedDeviceAdmission();
+        var host_target_bytes: usize = 0;
+        for (requests) |request| host_target_bytes +|= request.amounts.hostTotalBytes();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireRequestsWithPressure(
             requests,
@@ -6944,6 +6948,7 @@ pub const ModelManager = struct {
                     if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                         &owner_attempted,
+                        host_target_bytes,
                     )) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, requests);
                         return error.ResourceTemporarilyUnavailable;
