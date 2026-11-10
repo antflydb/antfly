@@ -128,6 +128,27 @@ def cases(rows, limit=7):
             "expected_ids": list(range(17, rows, 257))[:limit],
         },
         {
+            "name": "phrase",
+            "request": {
+                **base,
+                "full_text_search": {"match_phrase": "quasar token17", "field": "body"},
+            },
+            "expected_ids": list(range(17, rows, 257))[:limit],
+        },
+        {
+            "name": "conjunction",
+            "request": {
+                **base,
+                "full_text_search": {
+                    "conjuncts": [
+                        {"match": "quasar", "field": "body"},
+                        {"match": "token17", "field": "body"},
+                    ]
+                },
+            },
+            "expected_ids": list(range(17, rows, 257))[:limit],
+        },
+        {
             "name": "absent",
             "request": {
                 **base,

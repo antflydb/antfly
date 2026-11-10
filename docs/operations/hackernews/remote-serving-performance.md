@@ -1283,7 +1283,7 @@ uv run --project zig/e2e/antfly --locked --extra lake --extra iceberg \
   --bandwidth-mib 32 --io-concurrency 16 --qualify-sql
 ```
 
-The matrix covers common, rare and absent terms, highlights, wide projection and
+The matrix covers common, rare and absent terms, phrases, conjunctions, highlights, wide projection and
 selective filters. Vary `--files`, `--row-group`, `--payload-bytes`, `--cache-mib`,
 `--clients` and `--no-store-source` to expose topology, amplification, eviction,
 cold stampedes and Parquet hydration costs. `--fault` accepts `throttle`, `reset`
