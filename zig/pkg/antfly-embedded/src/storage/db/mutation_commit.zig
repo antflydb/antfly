@@ -6239,6 +6239,108 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        /// Like `lockAtomicWithBackoff`, but yields through the given Io
+        /// instead of a raw OS `nanosleep` once spinning/yielding alone
+        /// stops being productive. VOPR's cooperative scheduler runs its
+        /// deterministic scenario on a single logical thread; a raw
+        /// `nanosleep` there blocks the exact thread a contending lock
+        /// holder needs to run again (to finish its own work and release
+        /// the lock), starving it forever instead of just slowing it down.
+        /// Production backends see no behavior change: `io.sleep` resolves
+        /// to the real OS clock there too. Used only for
+        /// `applied_sequence_mutex`; see `DETERMINISM_AUDIT.md` for why the
+        /// other `lockAtomicWithBackoff(Profiled)` callers were left alone.
+        pub fn lockAtomicWithBackoffIo(mutex: *std.atomic.Mutex, io: std.Io) void {
+            var attempts: usize = 0;
+            while (!mutex.tryLock()) : (attempts += 1) {
+                if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                if (attempts < 64) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                if (attempts < 128) {
+                    @import("antfly_platform").time.yieldNow();
+                    continue;
+                }
+                const backoff_step = @min(attempts - 128, 5);
+                const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+            }
+        }
+
+        /// Io-aware counterpart to `lockAtomicWithBackoffProfiled`; see
+        /// `lockAtomicWithBackoffIo`'s doc comment for why this variant
+        /// exists and is intentionally not a drop-in replacement for the
+        /// general helper above.
+        pub fn lockAtomicWithBackoffProfiledIo(mutex: *std.atomic.Mutex, stats: *MutexContentionStats, io: std.Io) ProfiledLock {
+            if (!asyncIndexProfileEnabled()) {
+                lockAtomicWithBackoffIo(mutex, io);
+                return .{
+                    .mutex = mutex,
+                    .stats = stats,
+                    .hold_start_ns = 0,
+                    .profiled = false,
+                };
+            }
+            _ = stats.lock_calls.fetchAdd(1, .monotonic);
+            if (mutex.tryLock()) {
+                return .{
+                    .mutex = mutex,
+                    .stats = stats,
+                    .hold_start_ns = monotonicTimeNs(),
+                    .profiled = true,
+                };
+            }
+
+            _ = stats.contended_calls.fetchAdd(1, .monotonic);
+            const current_waiters = stats.current_waiters.fetchAdd(1, .monotonic) + 1;
+            atomicMaxU64(&stats.max_waiters, current_waiters);
+            defer _ = stats.current_waiters.fetchSub(1, .monotonic);
+
+            const wait_start_ns = monotonicTimeNs();
+            var attempts: usize = 0;
+            var spin_loops: u64 = 0;
+            var yield_loops: u64 = 0;
+            var sleep_loops: u64 = 0;
+            while (!mutex.tryLock()) : (attempts += 1) {
+                if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                    std.atomic.spinLoopHint();
+                    spin_loops += 1;
+                    continue;
+                }
+                if (attempts < 64) {
+                    std.atomic.spinLoopHint();
+                    spin_loops += 1;
+                    continue;
+                }
+                if (attempts < 128) {
+                    @import("antfly_platform").time.yieldNow();
+                    yield_loops += 1;
+                    continue;
+                }
+                const backoff_step = @min(attempts - 128, 5);
+                const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+                sleep_loops += 1;
+            }
+
+            const wait_ns = elapsedSince(wait_start_ns);
+            _ = stats.spin_loops.fetchAdd(spin_loops, .monotonic);
+            _ = stats.yield_loops.fetchAdd(yield_loops, .monotonic);
+            _ = stats.sleep_loops.fetchAdd(sleep_loops, .monotonic);
+            _ = stats.wait_ns.fetchAdd(wait_ns, .monotonic);
+            atomicMaxU64(&stats.max_wait_ns, wait_ns);
+            return .{
+                .mutex = mutex,
+                .stats = stats,
+                .hold_start_ns = monotonicTimeNs(),
+                .profiled = true,
+            };
+        }
+
         pub fn mirrorReplicationEncodedBatchMutationCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
             const projected = replicationCommitContext(ctx);
             return try replication_commit.mirrorReplicationEncodedBatchMutationCommitContext(&projected, payload);

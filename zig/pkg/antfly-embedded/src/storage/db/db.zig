@@ -2654,6 +2654,7 @@ fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_
 }
 
 const lockAtomicWithBackoffProfiled = local_mutation.lockAtomicWithBackoffProfiled;
+const lockAtomicWithBackoffProfiledIo = local_mutation.lockAtomicWithBackoffProfiledIo;
 
 fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: *MutexContentionStats) ProfiledApplyLock {
     if (!asyncIndexProfileEnabled()) {
@@ -36365,14 +36366,11 @@ pub const DB = struct {
 
     fn flushAppliedSequences(self: *DB, force: bool) !void {
         var lifecycle_completed = false;
-        const published = blk: {
-            var seq_lock = lockAtomicWithBackoffProfiled(
-                &self.async_context.applied_sequence_mutex,
-                &self.async_context.stats.applied_sequence_mutex,
-            );
-            defer seq_lock.unlock();
-            break :blk try flushPendingAppliedSequencesLocked(self.async_context, force, &lifecycle_completed);
-        };
+        const ctx = self.async_context;
+        const io = ctx.io orelse std.Options.debug_io;
+        ctx.applied_sequence_flush_mutex.lockUncancelable(io);
+        defer ctx.applied_sequence_flush_mutex.unlock(io);
+        const published = try flushPendingAppliedSequencesLocked(ctx, force, &lifecycle_completed);
         if (lifecycle_completed) {
             notifyQueryVisibilityHook(self.async_context, .publish_blocking);
         } else if (published) {
@@ -62082,7 +62080,7 @@ fn finishDerivedCatchUpSessionAsync(
         defer if (session.lease) |lease| if (lease.ownsLifecycle())
             ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
         _ = ctx.stats.dense_catch_up.abort_calls.fetchAdd(1, .monotonic);
-        var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, ctx.io orelse std.Options.debug_io);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
         var catch_up_tracked = true;
@@ -62171,29 +62169,28 @@ fn finishDerivedCatchUpSessionAsync(
     const posting_applied_sequence_persisted = capture_advances_applied_sequence and
         ctx.index_manager.densePostingCoverageIncludesByName(index_ref.name, applied_sequence);
     var lifecycle_completed = false;
-    const lifecycle_handoff_persisted = blk: {
-        var seq_lock = lockAtomicWithBackoffProfiled(
-            &ctx.applied_sequence_mutex,
-            &ctx.stats.applied_sequence_mutex,
-        );
+    const lifecycle_handoff_io = ctx.io orelse std.Options.debug_io;
+    // The native capture commit above owns posting durability. It must
+    // still hand the covered sequence to projection finalization before
+    // the executor may skip its generic persistence callback. Without
+    // this explicit note the finished-index flush has nothing to consume,
+    // leaving a durably caught-up index stuck in rebuilding forever.
+    if (posting_applied_sequence_persisted) {
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, lifecycle_handoff_io);
         defer seq_lock.unlock();
-        // The native capture commit above owns posting durability. It must
-        // still hand the covered sequence to projection finalization before
-        // the executor may skip its generic persistence callback. Without
-        // this explicit note the finished-index flush has nothing to consume,
-        // leaving a durably caught-up index stuck in rebuilding forever.
-        if (posting_applied_sequence_persisted) {
-            _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
-            _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
-            try ctx.applied_sequence_coalescer.note(ctx.alloc, index_ref.name, applied_sequence);
-        }
-        const published = try flushFinishedDenseAppliedSequenceLocked(
+        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
+        _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
+        try ctx.applied_sequence_coalescer.note(ctx.alloc, index_ref.name, applied_sequence);
+    }
+    ctx.applied_sequence_flush_mutex.lockUncancelable(lifecycle_handoff_io);
+    const lifecycle_handoff_persisted = blk: {
+        defer ctx.applied_sequence_flush_mutex.unlock(lifecycle_handoff_io);
+        break :blk try flushFinishedDenseAppliedSequenceLocked(
             ctx,
             index_ref.name,
             if (posting_applied_sequence_persisted) applied_sequence else null,
             &lifecycle_completed,
         );
-        break :blk published;
     };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);
@@ -63296,14 +63293,17 @@ fn persistAppliedSequencesBatchAsync(ctx_ptr: *anyopaque, snapshots: []const der
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (snapshots.len == 0) return true;
     var lifecycle_completed = false;
-    const published = blk: {
-        var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+    const io = ctx.io orelse std.Options.debug_io;
+    ctx.applied_sequence_flush_mutex.lockUncancelable(io);
+    defer ctx.applied_sequence_flush_mutex.unlock(io);
+    {
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
         defer seq_lock.unlock();
         _ = ctx.stats.applied_sequence.note_calls.fetchAdd(snapshots.len, .monotonic);
         _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
         for (snapshots) |snapshot| try ctx.applied_sequence_coalescer.note(ctx.alloc, snapshot.index_name, snapshot.sequence);
-        break :blk try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
-    };
+    }
+    const published = try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
     if (published) {
         for (snapshots) |snapshot| {
             if (ctx.index_manager.denseProjectionCheckpointMetadata(snapshot.index_name) == null) {
@@ -63318,40 +63318,48 @@ fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequ
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (force) {
         var lifecycle_completed = false;
-        const published = blk: {
-            var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+        const io = ctx.io orelse std.Options.debug_io;
+        ctx.applied_sequence_flush_mutex.lockUncancelable(io);
+        defer ctx.applied_sequence_flush_mutex.unlock(io);
+        {
+            var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
             defer seq_lock.unlock();
             _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
             _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
             try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
-            break :blk try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
-        };
+        }
+        const published = try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
         const dense_index = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null;
         if (published and !dense_index) {
             DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
         }
         return published;
     }
-    if (!ctx.applied_sequence_mutex.tryLock()) {
+    // Best-effort: skip entirely rather than wait if a flush is already in
+    // flight, instead of blocking this (possibly synchronous, foreground)
+    // caller on it.
+    if (!ctx.applied_sequence_flush_mutex.tryLock()) {
         _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
         return false;
     }
-    errdefer ctx.applied_sequence_mutex.unlock();
+    const io = ctx.io orelse std.Options.debug_io;
+    defer ctx.applied_sequence_flush_mutex.unlock(io);
     var lifecycle_completed = false;
-    _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
-    try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
-    if (shouldDeferAppliedSequenceFlush(ctx, false)) {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-        ctx.applied_sequence_mutex.unlock();
-        return false;
-    }
-    if (!ctx.applied_sequence_coalescer.shouldFlush(monotonicTimeNs())) {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-        ctx.applied_sequence_mutex.unlock();
-        return false;
+    {
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
+        try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
+        if (shouldDeferAppliedSequenceFlush(ctx, false)) {
+            _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
+            return false;
+        }
+        if (!ctx.applied_sequence_coalescer.shouldFlush(monotonicTimeNs())) {
+            _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
+            return false;
+        }
     }
     const published = try flushPendingAppliedSequencesLocked(ctx, false, &lifecycle_completed);
-    ctx.applied_sequence_mutex.unlock();
     const dense_index = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null;
     if (published and !dense_index) {
         DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
@@ -63650,13 +63658,22 @@ fn finalizeCoveredDenseProjectionCheckpointsClaimed(ctx: *AsyncContext) !bool {
     return completed;
 }
 
+/// Caller must hold `applied_sequence_flush_mutex` for the duration of this
+/// call; see that field's doc comment and `flushPendingAppliedSequencesLocked`'s.
 fn flushFinishedDenseAppliedSequenceLocked(
     ctx: *AsyncContext,
     index_name: []const u8,
     posting_persisted_through: ?u64,
     lifecycle_completed: *bool,
 ) !bool {
-    const pending = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
+    const pending = blk: {
+        const io = ctx.io orelse std.Options.debug_io;
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        const taken = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
+        ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+        break :blk taken;
+    };
     defer ctx.alloc.free(pending.owned_name);
 
     const flush_start_ns = monotonicTimeNs();
@@ -63729,7 +63746,8 @@ fn flushFinishedDenseAppliedSequenceLocked(
         break :blk elapsedSince(save_start_ns);
     };
 
-    ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+    // last_flush_ns was already updated under applied_sequence_mutex above,
+    // before this unlocked commit ran.
     const flush_ns = elapsedSince(flush_start_ns);
     _ = ctx.stats.applied_sequence.flush_calls.fetchAdd(1, .monotonic);
     _ = ctx.stats.applied_sequence.flushed_indexes.fetchAdd(1, .monotonic);
@@ -63743,26 +63761,53 @@ fn flushFinishedDenseAppliedSequenceLocked(
     return true;
 }
 
+/// Drains the coalescer under `applied_sequence_mutex` -- a brief critical
+/// section that never yields -- then runs the durable commit below without
+/// that lock held. The caller must hold `applied_sequence_flush_mutex` for
+/// the duration of this call (see that field's doc comment): the commit
+/// below can yield through Io for the WAL group-commit wait, and two
+/// overlapping flushes for the same index could otherwise land out of
+/// order and regress the durable watermark, since
+/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates` and friends
+/// overwrite rather than merge. See DETERMINISM_AUDIT.md.
 fn flushPendingAppliedSequencesLocked(
     ctx: *AsyncContext,
     force: bool,
     lifecycle_completed: *bool,
 ) !bool {
-    if (ctx.applied_sequence_coalescer.pending.count() == 0) return false;
-
     const flush_start_ns = monotonicTimeNs();
     var updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
-    defer updates.deinit(ctx.alloc);
-
-    var it = ctx.applied_sequence_coalescer.pending.iterator();
-    while (it.next()) |entry| {
-        if (!force and shouldDeferAppliedSequenceFlush(ctx, false)) continue;
-        try updates.append(ctx.alloc, .{
-            .index_name = entry.key_ptr.*,
-            .sequence = entry.value_ptr.*,
-        });
+    defer {
+        for (updates.items) |update| ctx.alloc.free(@constCast(update.index_name));
+        updates.deinit(ctx.alloc);
     }
-    if (updates.items.len == 0) return false;
+
+    {
+        const io = ctx.io orelse std.Options.debug_io;
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        if (ctx.applied_sequence_coalescer.pending.count() == 0) return false;
+        var it = ctx.applied_sequence_coalescer.pending.iterator();
+        while (it.next()) |entry| {
+            if (!force and shouldDeferAppliedSequenceFlush(ctx, false)) continue;
+            // Owned copies: the coalescer's own key strings are freed by
+            // the drain below, which runs in this same locked section, so
+            // updates[].index_name must not borrow pointers into the map.
+            try updates.append(ctx.alloc, .{
+                .index_name = try ctx.alloc.dupe(u8, entry.key_ptr.*),
+                .sequence = entry.value_ptr.*,
+            });
+        }
+        if (updates.items.len == 0) return false;
+        // Drain now, under the same lock that protects the map: nothing
+        // below touches the coalescer's pending map again. A note() that
+        // arrives while the commit below is in flight (unlocked) lands in
+        // the now-empty map and is picked up by the next flush; it can
+        // never be lost or double-counted, since every drained entry above
+        // has its own owned copy.
+        for (updates.items) |update| ctx.applied_sequence_coalescer.removePending(ctx.alloc, update.index_name);
+        ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+    }
     const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates.items);
     defer ctx.alloc.free(enriched_updates);
     const sync_ns: u64 = 0;
@@ -63840,8 +63885,11 @@ fn flushPendingAppliedSequencesLocked(
         status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
-    ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
-    ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+    // The coalescer's pending map was already drained (and last_flush_ns
+    // updated) under applied_sequence_mutex above, before this unlocked
+    // commit ran -- see this function's doc comment. Clearing it again
+    // here would discard any note() that arrived while this commit was in
+    // flight.
     const flush_ns = elapsedSince(flush_start_ns);
     _ = ctx.stats.applied_sequence.flush_calls.fetchAdd(1, .monotonic);
     _ = ctx.stats.applied_sequence.flushed_indexes.fetchAdd(@intCast(updates.items.len), .monotonic);

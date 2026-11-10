@@ -613,7 +613,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadSourceExtractionForResolution = materialization.loadSourceExtractionForResolution;
         pub const lockApply = commit.lockApply;
         pub const lockAtomicWithBackoff = commit.lockAtomicWithBackoff;
+        pub const lockAtomicWithBackoffIo = commit.lockAtomicWithBackoffIo;
         pub const lockAtomicWithBackoffProfiled = commit.lockAtomicWithBackoffProfiled;
+        pub const lockAtomicWithBackoffProfiledIo = commit.lockAtomicWithBackoffProfiledIo;
         pub const logSparseWriteProfileDelta = materialization.logSparseWriteProfileDelta;
         pub const makeChunkCacheKey = materialization.makeChunkCacheKey;
         pub const makeTimestampKey = preparation.makeTimestampKey;
