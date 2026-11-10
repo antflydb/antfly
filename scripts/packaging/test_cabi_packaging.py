@@ -290,13 +290,22 @@ class CAbiPackagingTests(unittest.TestCase):
         )
         self.assertIn("permissions:\n  contents: read", artifact_build_workflow)
         self.assertNotIn("contents: write", artifact_build_workflow)
-        # Only archive builders need keyless, read-only dependency-mirror access.
-        before_archives, archives = artifact_build_workflow.split(
-            "\n  build-zig-runtime-archives:\n", 1
-        )
-        archives, after_archives = archives.split("\n  test-macos-homebrew:\n", 1)
-        self.assertNotIn("id-token: write", before_archives + after_archives)
-        self.assertEqual(archives.count("id-token: write"), 1)
+        # OIDC is job-scoped: archive builders read the dependency mirror;
+        # package jobs exchange immutable build outputs through the CI bucket.
+        # Registry/release publication remains in the protected publisher.
+        oidc_jobs = {
+            "build-zig-runtime-archives": "uses: ./release-controller/.github/actions/prepare-zig-dependencies",
+            "package-cli-artifacts": "uses: ./.github/workflows/cli-package.yml",
+            "package-embedded-zig-source": "uses: ./.github/actions/upload-ci-artifact",
+        }
+        remaining = artifact_build_workflow
+        for name, purpose in oidc_jobs.items():
+            job = workflow_job(artifact_build_workflow, name)
+            self.assertEqual(job.count("id-token: write"), 1, name)
+            self.assertIn("contents: read", job, name)
+            self.assertIn(purpose, job, name)
+            remaining = remaining.replace(job, "")
+        self.assertNotIn("id-token: write", remaining)
         self.assertNotIn("environment:", artifact_build_workflow)
         self.assertNotIn("publish_objectstorage.py", artifact_build_workflow)
         self.assertNotIn("workflow_dispatch:", release_workflow)
@@ -344,7 +353,15 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("sha256sum --check --status", github_cli_action)
         self.assertIn('case "$RUNNER_ARCH" in', github_cli_action)
         self.assertIn("--content-addressed-prefix", release_workflow)
-        self.assertEqual(release_workflow.count("--exact-prefix"), 2)
+        for name, expected in (
+            ("prepare-release-promotion", 2),
+            ("promote-channel-aliases", 1),
+        ):
+            # Initial upload, sealed-object recovery and alias promotion each
+            # require the complete asset set; recovery adds no weaker path.
+            self.assertEqual(
+                workflow_job(release_workflow, name).count("--exact-prefix"), expected
+            )
         self.assertIn("--signer-workflow", release_workflow)
         self.assertIn("prepare_pypi_promotion.py", release_workflow)
         self.assertNotIn("--replace-assets", release_workflow)
@@ -356,7 +373,12 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("release:\n", container_workflow)
         self.assertIn("workflow_call:", container_workflow)
         self.assertIn("workflow_run|repository_dispatch", container_workflow)
-        self.assertIn("antfly-release-runtime-archives", container_workflow)
+        restore_runtime = container_workflow.split(
+            "uses: ./.github/actions/restore-release-scope", 1
+        )[1].split("      - name:", 1)[0]
+        self.assertIn("scope: runtime", restore_runtime)
+        self.assertIn("ledger-sha256: ${{ inputs.ledger_sha256 }}", restore_runtime)
+        self.assertIn("commit: ${{ inputs.source_commit }}", restore_runtime)
         self.assertIn("consumer-matrix container", container_workflow)
         self.assertIn("registryctl.py container-digest", container_workflow)
         self.assertIn("registryctl.py container-lookup", container_workflow)

@@ -22628,14 +22628,20 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         entry: db_mod.OrderedApplyReceipt,
     ) !?void {
-        return try self.applyReplicatedBatchGroupLocalWithMetadata(
+        return self.applyReplicatedBatchGroupLocalWithMetadata(
             alloc,
             group_id,
             table_name,
             req,
             .local_persisted,
             entry,
-        );
+        ) catch |err| return @import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err);
+    }
+
+    fn normalizeCachedApplyError(err: anyerror, ordered: bool, preserve_writer: *bool) anyerror {
+        const normalized = if (ordered) @import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err) else err;
+        preserve_writer.* = normalized == error.RaftApplyWriterUnavailable;
+        return normalized;
     }
 
     const ReplicatedApplyMetadataSource = enum { catalog, local_persisted };
@@ -22753,24 +22759,31 @@ pub const ProvisionedTableWriteSource = struct {
                 ) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err);
             defer cached.deinit(alloc);
             const already_applied = if (raft_entry) |entry|
-                try cached.db.orderedMutationAlreadyApplied(entry)
+                cached.db.orderedMutationAlreadyApplied(entry) catch |err| {
+                    return normalizeCachedApplyError(err, raft_entry != null, &preserve_writer_on_error);
+                }
             else
                 false;
             if (!already_applied) {
-                if (!try batchUsesDurableTransactionContract(alloc, cached.db, apply_req))
-                    try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                const durable_transaction = batchUsesDurableTransactionContract(alloc, cached.db, apply_req) catch |err|
+                    return normalizeCachedApplyError(err, raft_entry != null, &preserve_writer_on_error);
+                if (!durable_transaction)
+                    validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms) catch |err|
+                        return normalizeCachedApplyError(err, raft_entry != null, &preserve_writer_on_error);
                 local_write_test_hooks.runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
-                    try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig()) catch |err|
+                        return normalizeCachedApplyError(err, raft_entry != null, &preserve_writer_on_error);
                     if (raft_entry) |entry|
-                        try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
+                        applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry) catch |err| {
+                            return normalizeCachedApplyError(err, true, &preserve_writer_on_error);
+                        }
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry| {
                     @import("../storage/server_db_adapter.zig").applyOrdered(&cached.db, apply_req, entry) catch |err| {
-                        preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
-                        return err;
+                        return normalizeCachedApplyError(err, true, &preserve_writer_on_error);
                     };
                 } else try cached.db.batchReplicatedApply(apply_req);
             }
@@ -22810,7 +22823,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (!local_prepared)
                 try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const already_applied = if (raft_entry) |entry|
-                try db.orderedMutationAlreadyApplied(entry)
+                db.orderedMutationAlreadyApplied(entry) catch |err| return @import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err)
             else
                 false;
             if (!already_applied) {
@@ -40550,6 +40563,14 @@ fn implementationTests() type {
                 .receiver_group_id = 1,
                 .identity_namespace = namespace,
             } };
+            {
+                // The outer receipt fast path runs before the ordered adapter.
+                // Reader contention must yield without retiring the worker
+                // that will clear the graph ownership fence.
+                writer.db.core.lockApplyShared();
+                defer writer.db.core.unlockApplyShared();
+                try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 }));
+            }
             try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);

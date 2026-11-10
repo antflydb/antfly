@@ -19,8 +19,13 @@ const std = @import("std");
 const contract = @import("contract.zig");
 const A = std.mem.Allocator;
 const prefix = "\x00\x00__privacy_publication:";
-pub fn key(a: A, artifact: []const u8) ![]u8 {
+const keys = @import("../storage/internal_keys.zig");
+const compact_prefix = prefix ++ "v2:";
+pub fn legacyKey(a: A, artifact: []const u8) ![]u8 {
     return std.mem.concat(a, u8, &.{ prefix, artifact });
+}
+pub fn key(a: A, artifact: []const u8) ![]u8 {
+    return keys.documentMetadataKeyAlloc(a, prefix, compact_prefix, artifact);
 }
 pub fn encode(version: [64]u8, source: []const u8, output: []const u8) [192]u8 {
     var value: [192]u8 = undefined;
@@ -37,9 +42,7 @@ pub fn encodeDigest(version: [64]u8, source_digest: [32]u8, output: []const u8) 
     return value;
 }
 pub fn require(a: A, read: anytype, artifact: []const u8, version: [64]u8, source: []const u8, output: []const u8) !void {
-    const selected = try key(a, artifact);
-    defer a.free(selected);
-    const actual = read.get(selected) catch |err| if (err == error.NotFound) return error.PrivacyPublicationPending else return err;
+    const actual = keys.readDocumentMetadata(a, read, prefix, compact_prefix, artifact) catch |err| if (err == error.NotFound) return error.PrivacyPublicationPending else return err;
     if (!std.mem.eql(u8, actual, &encode(version, source, output))) return error.PrivacyStale;
 }
 

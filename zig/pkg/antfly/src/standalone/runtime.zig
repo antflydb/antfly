@@ -2799,6 +2799,7 @@ const LocalStandaloneMetadata = struct {
                 defer alloc.free(body);
                 try context.ensureActive();
                 const previous = self.durable_revision;
+                const authority_revision = try self.lifecycle_store.?.standaloneRevision();
                 try self.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_resolver_authority = body });
                 const receipt_id = try write.receipt(alloc);
                 defer alloc.free(receipt_id);
@@ -2816,7 +2817,13 @@ const LocalStandaloneMetadata = struct {
                     self.epoch = revision;
                     self.durable_revision = revision;
                 } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
-                if (!view.value.receipt) return error.ResolverCurationConflict;
+                if (!view.value.receipt) {
+                    // A missing receipt certifies non-publication. Catalog
+                    // churn is distinct from a caller's namespace revision
+                    // conflict and may safely acquire a fresh adoption cut.
+                    if (write.catalog_revision.? != authority_revision) return error.CatalogGenerationChanged;
+                    return error.ResolverCurationConflict;
+                }
                 return result;
             },
             .resolver_catalog_read => |input| {
@@ -12855,6 +12862,9 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
             // The background driver can advance the same durable intent
             // between work selection and its revision-fenced acknowledgement.
             // Retry from fresh work, exactly as the production driver does.
+            // Prepared-owner lease admission can also yield to concurrent
+            // maintenance without changing this durable publication decision.
+            error.StorageOwnerAdmissionPending,
             error.ForeignKeyParentSchemaPending,
             error.GenerationAdmissionPending,
             error.IndexBuildPending,
@@ -16375,6 +16385,18 @@ test "system catalog resolver curation standalone record commits retain large de
     bounded.reset();
     _ = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
     try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+    const current_cut = try store.standaloneRevision();
+    const current_namespace = namespace;
+    namespace.revision = 3;
+    namespace.state.suppress.keys = &.{"entity/other"};
+    write.patches = &.{try domain.records.difference(a, current_namespace, namespace)};
+    write.catalog_revision = current_cut;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "unrelated", .indexes_json = "{}" } });
+    try std.testing.expectError(error.CatalogGenerationChanged, source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write }));
+    // A current catalog cut cannot turn a namespace CAS conflict into a retry.
+    write.catalog_revision = try store.standaloneRevision();
+    write.patches = &.{try domain.records.difference(a, before, namespace)};
+    try std.testing.expectError(error.ResolverCurationConflict, source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write }));
 }
 
 test "standalone shared document state follows metadata HA replay and fenced ownership" {

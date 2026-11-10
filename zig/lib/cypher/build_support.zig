@@ -19,7 +19,7 @@ pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.R
     module.addImport("cypher_regex_capture", b.createModule(.{ .root_source_file = root.path(b, "../regex/src/captures.zig"), .target = target, .optimize = optimize }));
     return module;
 }
-pub fn addSteps(b: *std.Build, options: struct { root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, codegen: *std.Build.Step.Compile, compare_tool: *std.Build.Step.Compile, filters: []const []const u8 = &.{} }) *std.Build.Module {
+pub fn addSteps(b: *std.Build, options: struct { root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, codegen: *std.Build.Step.Compile, compare_tool: *std.Build.Step.Compile, filters: []const []const u8 = &.{}, test_runner: ?std.Build.Step.Compile.TestRunner = null }) *std.Build.Module {
     const generate = b.addRunArtifact(options.codegen);
     generate.addFileArg2(options.root.path(b, "grammar/antfly_cypher.y"), .{ .make_absolute = true });
     const output = generate.addOutputFileArg2("cypher_grammar.zig", .{ .make_absolute = true });
@@ -34,7 +34,7 @@ pub fn addSteps(b: *std.Build, options: struct { root: std.Build.LazyPath, targe
     const check = b.step("cypher-grammar-generated-check", "Verify graph grammar provenance and generated output");
     check.dependOn(&compare.step);
     const module = createModule(b, options.root, options.target, options.optimize);
-    const tests = b.addRunArtifact(b.addTest(.{ .root_module = module, .filters = options.filters }));
+    const tests = b.addRunArtifact(b.addTest(.{ .root_module = module, .filters = options.filters, .test_runner = options.test_runner }));
     b.step("lib-cypher-test", "Run graph compiler, binding, execution, and semantic tests").dependOn(&tests.step);
     check.dependOn(&tests.step);
     return module;

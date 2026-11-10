@@ -6361,6 +6361,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("vopr", vopr_mod);
 
+    // Compile the query wire contract under its existing named module owner.
+    // Importing its source into the broad catalog would give the file two
+    // owners anywhere a storage client also imports local_query_abi.
+    const local_query_contract_tests = b.addTest(.{
+        .name = "local-query-abi-tests",
+        .root_module = antfly_imports.storage_boundary.query,
+    });
+    const run_local_query_contract_tests = addFilteredTestRunArtifact(b, local_query_contract_tests);
+    b.step("local-query-abi-test", "Validate local-query capability contracts under their owning module")
+        .dependOn(&run_local_query_contract_tests.step);
+    unit_test_step.dependOn(&run_local_query_contract_tests.step);
+
     const opaque_read_session_step = b.step("opaque-read-session-test", "Run source and independently compiled statement and read-session lifetime regressions");
     if (b.top_level_steps.get("opaque-read-session-abi-integration-test")) |integration|
         opaque_read_session_step.dependOn(&integration.step);
@@ -7462,6 +7474,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.publication_recovery_owner.",
             "storage.db.artifact_publication_transport_codec.",
             "storage.db.artifact_publication_wire.",
+            "storage.db.artifact_catalog_proposal.",
             "storage.db.artifact_reconcile.",
             "storage.db.artifact_reconcile_intent.",
             "storage.db.artifact_semantics.",
@@ -7632,6 +7645,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.template_stub.",
             "storage.db.text_memory_stats.",
             "storage.db.transform.",
+            "storage.db.mutation_commit_disposition_test.",
+            "storage.db.mutation_plan.",
+            "storage.db.transform_read_plan.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
             "storage.vector_migration_offline.",
@@ -7653,6 +7669,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.prepared_score_plan.",
             "storage.projection_seal.",
             "storage.retained_frame.",
+            "storage.verified_retained_frame.",
             "storage.admission_waiter.",
             "storage.dense_work_admission.",
             "storage.maintenance_signal.",
@@ -7663,6 +7680,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.embedded_graph_catalog.",
+            "storage.read_session_contract.",
+            "storage.read_session_values.",
             "storage.prepared_score_request.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
@@ -7793,7 +7813,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
-    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig" }) |source| {
+    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "local_query_abi.zig" }) |source| {
         unit_storage_shard_audit.addArg("--local-dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
