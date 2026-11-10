@@ -5556,6 +5556,7 @@ pub const IndexManager = struct {
     }
 
     fn denseNativeAuthorityPermitted(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (entry.index.leann != null) return false;
         return self.denseNativeAuthorityTransitionPermitted(
             entry.native_physical_v2,
             entry.native_candidate_build_authorized,
@@ -5609,6 +5610,7 @@ pub const IndexManager = struct {
             if (!source.authorityPermitted()) return false;
         }
         const entry = self.denseIndex(name) orelse return false;
+        if (entry.index.leann != null) return false;
         return !entry.native_physical_v2;
     }
 
@@ -10093,6 +10095,9 @@ pub const IndexManager = struct {
         const entry = for (self.dense_indexes.items) |*candidate| {
             if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
         } else return null;
+        // LEANN's file and generic replay checkpoint own its durability;
+        // the empty HBC wrapper cannot certify a posting generation.
+        if (entry.index.leann != null) return null;
         const checkpoint = entry.index.projectionCheckpointMetadata();
         const applied_sequence = if (entry.index.experimentalPostingWalAuthoritative())
             // Once authority is sticky, an absent live HBC generation is an
@@ -13075,7 +13080,7 @@ pub const IndexManager = struct {
         }
 
         const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding)
-            self.freshDenseNativeV2Permitted(stored_cfg)
+            try self.freshDenseNativeV2Permitted(stored_cfg)
         else
             false;
         var fresh_native_generation: ?FreshDenseNativeGeneration = if (create_fresh_native_v2)
@@ -18607,6 +18612,7 @@ pub const IndexManager = struct {
     }
 
     fn densePostingStoreAvailableForEntry(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (entry.index.leann != null) return false;
         // Published v2 indexes open through HBC's dedicated native environment;
         // legacy/candidate indexes need a configured backend adapter that can
         // host the native WAL and immutable segment namespace.
@@ -18614,6 +18620,7 @@ pub const IndexManager = struct {
     }
 
     fn densePostingSidecarEnabledForEntry(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (entry.index.leann != null) return false;
         return entry.index.experimentalPostingWalAuthoritative() or
             (densePostingSidecarEnabled() and self.densePostingStoreAvailableForEntry(entry));
     }
@@ -22560,8 +22567,11 @@ pub const IndexManager = struct {
         try ensureIndexDirDurable(self.alloc, self.io, self.base_path, path);
     }
 
-    fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) bool {
+    fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) !bool {
         if (cfg.kind != .dense_vector or builtin.os.tag == .freestanding) return false;
+        const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
+        defer dense_cfg.deinit(self.alloc);
+        if (dense_cfg.leann != null) return false;
         if (!densePostingWalMutationStoreEnabled()) return false;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
         // Fresh-v2 publication currently stages a host directory and commits
@@ -22585,7 +22595,7 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
     ) !FreshDenseNativeGeneration {
         if (builtin.os.tag == .freestanding) return error.DenseNativeV2NotPermitted;
-        if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
+        if (!try self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
         try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
 
         for (0..64) |_| {
