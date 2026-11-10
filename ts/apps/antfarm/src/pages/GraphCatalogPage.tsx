@@ -48,7 +48,7 @@ export default function GraphCatalogPage() {
   const [tables, setTables] = useState<string[]>([]);
   const [graphIndexes, setGraphIndexes] = useState<Record<string, string[]>>({});
   const [name, setName] = useState("");
-  const [labels, setLabels] = useState<NodeMapping[]>([
+  const [labels, setLabels] = useState<NodeMapping[]>(() => [
     { editorId: crypto.randomUUID(), name: "Document", table: "", predicate: "" },
   ]);
   const [relationships, setRelationships] = useState<EdgeMapping[]>([]);
