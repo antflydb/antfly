@@ -150947,7 +150947,7 @@ test "metadata replay progress borrows dense admission past a queued capture" {
     var session_open = true;
     defer if (session_open) {
         var session = takeAsyncDenseCatchUpSession(db.async_context, "metadata", token) catch unreachable;
-        a.free(session.index_name);
+        db.async_context.alloc.free(session.index_name);
         if (session.snapshot_replay) |*held| held.release();
     };
     const Work = struct {
@@ -150963,7 +150963,7 @@ test "metadata replay progress borrows dense admission past a queued capture" {
     defer {
         if (session_open) {
             var session = takeAsyncDenseCatchUpSession(db.async_context, "metadata", token) catch unreachable;
-            a.free(session.index_name);
+            db.async_context.alloc.free(session.index_name);
             if (session.snapshot_replay) |*held| held.release();
             session_open = false;
         }
@@ -150983,7 +150983,7 @@ test "metadata replay progress borrows dense admission past a queued capture" {
     }, .{ .name = "metadata", .kind = .dense_vector }, token));
     try std.testing.expect(!capture_done.load(.acquire));
     var session = try takeAsyncDenseCatchUpSession(db.async_context, "metadata", token);
-    a.free(session.index_name);
+    db.async_context.alloc.free(session.index_name);
     if (session.snapshot_replay) |*held| held.release();
     session_open = false;
     capture.join();
