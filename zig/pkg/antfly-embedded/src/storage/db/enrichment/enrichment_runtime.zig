@@ -12037,6 +12037,8 @@ const RuntimePdfPageTextSpool = struct {
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
         const segment = self.segment orelse return 0;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(segment.owner) orelse return 0;
+        defer scope.deinit();
         const bytes = if (physical) segment.limit.live_bytes else if (segment.budgeted) |*budgeted| budgeted.reservation.bytes else 0;
         self.enabled = false;
         self.clearPending();
@@ -13835,6 +13837,8 @@ const DocumentPreparationPipeline = struct {
             // A transferred window still uses this job's allocator. Reclaim
             // only optional state, never buffers already borrowed by the owner.
             if (self.consumed) return 0;
+            var scope = resource_manager_mod.ReclamationScope.tryAcquire(if (self.budgeted) |*budget| budget.threadSafeAllocator() else platform.allocator.concurrentFallback()) orelse return 0;
+            defer scope.deinit();
             // Allocator callbacks must not wait on a source-cache map lock
             // (the allocation which triggered us may already hold it).
             if ((self.source != null or self.pdf != null) and self.cache.mutex.tryLock()) {
@@ -14330,9 +14334,10 @@ const PreparedDocumentSourceCache = struct {
 
     fn cacheFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.lockAllocator();
+        const reuse = @import("antfly_platform").allocator.reclamation.Guard.reuse(&self.allocator_mutex);
+        if (!reuse) self.lockAllocator();
+        defer if (!reuse) self.allocator_mutex.unlock();
         self.rawAllocator().rawFree(memory, alignment, ret_addr);
-        self.allocator_mutex.unlock();
     }
 
     pub fn deinit(self: *@This()) void {
@@ -14413,15 +14418,19 @@ const PreparedDocumentSourceCache = struct {
         // A reservation callback may originate inside this very allocator.
         // Detect that case without blocking/reentering its mutex.
         if (!self.allocator_mutex.tryLock()) return 0;
+        defer self.allocator_mutex.unlock();
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(if (self.budgeted) |*budget| budget.threadSafeAllocator() else self.backing_alloc) orelse return 0;
+        defer scope.deinit();
+        const guard = @import("antfly_platform").allocator.reclamation.Guard;
+        if (!guard.allowed()) return 0;
+        guard.enter(&self.allocator_mutex);
+        defer guard.leave();
         const before = if (physical) self.budgeted.?.live_bytes else self.budgeted.?.reservation.bytes;
         var reclaimed = self.budgeted.?.releaseUnusedCredit();
         if (physical) reclaimed = 0;
-        self.allocator_mutex.unlock();
         while (reclaimed < target_bytes and self.reclaimIdleAssumeLocked()) {
-            self.lockAllocator();
             _ = self.budgeted.?.releaseUnusedCredit();
             reclaimed = before -| (if (physical) self.budgeted.?.live_bytes else self.budgeted.?.reservation.bytes);
-            self.allocator_mutex.unlock();
         }
         return reclaimed;
     }
@@ -19239,6 +19248,8 @@ const PrecommitResultCache = struct {
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
         const budget = if (self.budgeted) |*value| value else return 0;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(budget.threadSafeAllocator()) orelse return 0;
+        defer scope.deinit();
         const before = if (physical) budget.live_bytes else budget.reservation.bytes;
         self.releaseSpareCredit();
         const alloc = self.staging.allocator();
@@ -45183,15 +45194,22 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(doc_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = doc_key, .value = "{}" }, .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    var request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
     for (0..2) |_| for (0..32) |i| {
         const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
         defer alloc.free(config);
+        const producer = try std.fmt.allocPrint(alloc, "{{\"type\":\"vector_labels\",\"config\":{s}}}", .{config});
+        defer alloc.free(producer);
+        // Exercise real recipe changes while preserving publication fencing.
+        _ = try index_manager.upsertEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = producer });
+        request.producer_json = producer;
         try processVectorLabels(&runtime, request, config, null, "{}", output_key, &window);
     };
     try std.testing.expectEqual(@as(usize, 32), fake.calls);

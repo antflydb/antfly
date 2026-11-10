@@ -14,12 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linux 1 CPU/2 GiB regression for bounded owner cleanup and live admission.
+"""Linux 1 CPU/2 GiB regression for terminal owner cleanup and live admission.
 
 Run inside a no-swap 2 GiB cgroup with a Linux inference test binary compiled
 with -Dtest-filter=memory. The writer exits before the runtime denies work
-under measured pressure, cleans the file through bounded owner advice, and
-admits the same request. No model download or external service is required. Test data stays in the caller-supplied directory and is deleted.
+under measured pressure, cleans the file through terminal owner advice, and admits the same request.
+The hot mapping can follow a sparse prefix to exercise large file tails.
+No model download or external service is required. Test data stays in the
+caller-supplied directory and is deleted.
 """
 
 import argparse
@@ -60,11 +62,12 @@ def snapshot(stage):
     }
 
 
-def write_cache(path):
+def write_cache(path, hot_offset_mib):
     size = 1664 * MIB
     with path.open("xb+") as stream:
-        stream.truncate(size)
-        with mmap.mmap(stream.fileno(), size) as pages:
+        prefix = hot_offset_mib * MIB
+        stream.truncate(prefix + size)
+        with mmap.mmap(stream.fileno(), size, offset=prefix) as pages:
             for offset in range(0, size, 4096):
                 pages[offset] = 49
             pages.flush()
@@ -80,11 +83,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-binary", type=Path)
     parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument(
+        "--hot-offset-mib",
+        type=int,
+        default=0,
+        help="Offset of the cached mapping; test large sparse file tails",
+    )
     parser.add_argument("--writer", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     path = args.directory / "antfly-retired-pressure.bin"
+    if args.hot_offset_mib < 0:
+        parser.error("--hot-offset-mib must be nonnegative")
     if args.writer:
-        write_cache(path)
+        write_cache(path, args.hot_offset_mib)
         return
     if args.test_binary is None:
         parser.error("--test-binary is required")
@@ -100,7 +111,15 @@ def main():
     print(json.dumps(baseline), flush=True)
     try:
         subprocess.run(
-            [sys.executable, __file__, "--directory", str(args.directory), "--writer"],
+            [
+                sys.executable,
+                __file__,
+                "--directory",
+                str(args.directory),
+                "--hot-offset-mib",
+                str(args.hot_offset_mib),
+                "--writer",
+            ],
             check=True,
             timeout=120,
         )
@@ -112,7 +131,7 @@ def main():
             [
                 str(args.test_binary.resolve()),
                 "--test-filter",
-                "live pressure recovers after bounded file owner cleanup",
+                "live pressure recovers after file owner cleanup",
             ],
             env={**os.environ, "ANTFLY_PRESSURE_TEST_FILE": str(path.resolve())},
             check=True,

@@ -348,16 +348,28 @@ destroyed payload storage separately from unused reservation credit. The
 storage process also purges unused libc arenas where supported. A fresh
 admission probe remains authoritative even after a zero-byte owner report.
 
-Linux file-cache cleanup belongs to the file-producing operation. A completed
-snapshot syncs and advises private output in 64 MiB windows before publication;
-a writable file owner performs bounded best-effort cleanup before releasing
-its lifetime writer lease. Internal readers, read-only snapshots and externally
-leased generations do not discard another owner's hot pages on close. Each
-DONTNEED hint covers at most 8 MiB; a cleanup pass covers at most 2 GiB regardless of logical file size. It checks cancellation before each hint
-and yields every 32 ranges. Large bulk output does not rely on a close-time
-whole-file scan. Advice can initiate writeback and is best-effort; it runs outside admission rather than under the eviction lock.
-No descriptor or path is retained after close, so deleted files release their
-inodes immediately and there is no registry to diverge between compiled images.
+Linux file-cache cleanup belongs to the file-producing operation. Snapshots
+sync and advise private output in 64 MiB windows before publication. Streaming
+range hints cover at most 8 MiB each, with a 2 GiB batch cap and cancellation
+checks; range-only capabilities do not imply whole-file cleanup.
+
+A native terminal capability disposes of an owner's file cache before releasing
+its lifetime writer lease. Linux traverses the mapping's cached-folio index,
+including hot ranges beyond sparse holes or a cold prefix, rather than scanning
+every logical offset in userspace. Work scales with cache residency, not file
+length. This is best-effort, potentially writeback-initiating advice, not a hard
+wall-clock bound or allocation credit. It is never invoked by admission or
+while holding the inference eviction lock. Internal readers, read-only snapshots
+and externally leased generations do not discard another owner's hot pages on
+close. No descriptor or path is retained after close.
+
+Managed NativeFile page and link caches use stable heap owners so callbacks
+survive file moves. Registered reclaimers preserve pinned views and their
+charges, release empty map storage, and drain before cache teardown. Reclamation
+pre-acquires known nested budget/quota allocator chains with try-locks before
+detaching storage; a busy chain is skipped without partial eviction. Guarded
+frees reuse those locks. This includes metadata/workspace, native chunk, scratch,
+document-preparation, vocabulary and retained-frame caches.
 
 Native advice is granted by the I/O producer and forwarded in the checked
 executor borrow. Borrowed consumers never identify native handles by comparing
@@ -370,7 +382,8 @@ concurrent detach. `runtime-file-cache-abi-test` links an independent provider
 archive to verify that native advice survives executor translation and that
 abstract I/O cannot grant it. The Linux kernel regression in
 `scripts/ci/run_inference_memory_pressure.py` uses a 1 CPU / 2 GiB no-swap cgroup,
-creates active file cache in a writer that exits, applies bounded owner cleanup,
+creates active file cache in a writer that exits, applies terminal owner cleanup
+at offsets 0 and 3 GiB,
 and verifies fresh admission recovery without an OOM kill. It requires no model
 download; workload-specific embedding/indexing throughput and snapshot/crash
 recovery remain separate qualification.

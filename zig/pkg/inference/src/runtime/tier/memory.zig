@@ -3739,7 +3739,7 @@ test "host reclamation borrows owner lifetime and invokes callbacks outside admi
     try std.testing.expectEqual(@as(usize, 0), owner.references);
 }
 
-test "live pressure recovers after bounded file owner cleanup" {
+test "live pressure recovers after file owner cleanup" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const path = platform.env.getenv("ANTFLY_PRESSURE_TEST_FILE") orelse return error.SkipZigTest;
     const io = std.testing.io;
@@ -3753,7 +3753,7 @@ test "live pressure recovers after bounded file owner cleanup" {
         const file = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
         const advice = @import("antfly_runtime_abi").io_abi.FileCacheAdvice.native();
-        advice.discard(io, file, (try file.stat(io)).size);
+        advice.discardFile(io, file);
     }
     var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(16) }, true);
     lease.release();

@@ -1496,7 +1496,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         // vacuum can replace the file and reclaim its cache during inspection;
         // concurrent maintenance is covered by the dedicated vacuum tests.
         docs.maintenance_start_suppressed = true;
-        docs.file.page_cache.limit_bytes = 256 * 1024;
+        docs.file.pageCache().limit_bytes = 256 * 1024;
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
         try storage.writeFileAbsolute("/hot", bytes[0..12000]);
@@ -1505,7 +1505,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         try std.testing.expectEqualSlices(u8, bytes[0..12000], hot);
         var hot_pages = std.ArrayList(u64).empty;
         defer hot_pages.deinit(alloc);
-        var cached = docs.file.page_cache.pages.iterator();
+        var cached = docs.file.pageCache().pages.iterator();
         while (cached.next()) |entry| {
             if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
         }
@@ -1522,14 +1522,14 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
             try writer.appendSlice(bytes[0..case[1]]);
             active = false;
             try writer.finish();
-            for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
-            cached = docs.file.page_cache.pages.iterator();
+            for (hot_pages.items) |id| try std.testing.expect(docs.file.pageCache().pages.contains(id));
+            cached = docs.file.pageCache().pages.iterator();
             var payload_pages: usize = 0;
             while (cached.next()) |entry| {
                 if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
-            try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
+            try std.testing.expect(docs.file.pageCache().pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
         }
 
         // Policy is local to the sink, and can be changed before publication.
@@ -1542,12 +1542,12 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         active = false;
         try normal.finish();
         var payload_pages: usize = 0;
-        cached = docs.file.page_cache.pages.iterator();
+        cached = docs.file.pageCache().pages.iterator();
         while (cached.next()) |entry| {
             if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
         }
         try std.testing.expect(payload_pages > hot_pages.items.len);
-        for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
+        for (hot_pages.items) |id| try std.testing.expect(docs.file.pageCache().pages.contains(id));
     }
     var reopened = try docstore.Store.open(alloc, path, true);
     defer reopened.close();

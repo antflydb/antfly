@@ -34,6 +34,7 @@ test "file cache capability survives independently compiled I/O owners" {
     var received = try borrow.receive();
     const io = received.io();
     try std.testing.expect(borrow.file_cache.available());
+    try std.testing.expect(borrow.file_cache.discard_file != null and borrow.file_cache.discard_range != null);
     // A nested borrow must forward the original capability and dispatcher.
     const nested = executor.Borrow.init(&io);
     try std.testing.expect(nested.file_cache.available());
@@ -43,7 +44,7 @@ test "file cache capability survives independently compiled I/O owners" {
     defer file.close(io);
     try file.writeStreamingAll(io, "preserved data");
     try file.sync(io);
-    nested.file_cache.discard(io, file, 14);
+    nested.file_cache.discardFile(io, file);
     var data: [14]u8 = undefined;
     _ = try file.readPositionalAll(io, &data, 0);
     try std.testing.expectEqualStrings("preserved data", &data);

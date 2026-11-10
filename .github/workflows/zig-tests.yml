@@ -105,7 +105,7 @@ jobs:
             --mount "type=bind,src=$PWD/zig/pkg/inference/zig-out/bin/antfly-inference-tests,dst=/tests,readonly" \
             --mount "type=bind,src=$PWD/scripts/ci/run_inference_memory_pressure.py,dst=/run.py,readonly" \
             --mount type=volume,dst=/data \
-            "$PRESSURE_IMAGE" python /run.py --test-binary /tests --directory /data \
+            "$PRESSURE_IMAGE" sh -c 'python /run.py --test-binary /tests --directory /data && python /run.py --test-binary /tests --directory /data --hot-offset-mib 3072' \
             2>&1 | tee zig/zig-out/inference-memory-pressure.log
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

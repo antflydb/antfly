@@ -106,6 +106,26 @@ pub const Cache = struct {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock(self.io.?);
+        var allocators: [4]std.mem.Allocator = undefined;
+        var count: usize = 0;
+        if (self.pending) |pending| {
+            allocators[count] = pending.source.alloc;
+            count += 1;
+        }
+        if (self.entry) |entry| {
+            allocators[count] = entry.alloc;
+            count += 1;
+            if (entry.frame.stream == null) {
+                allocators[count] = entry.frame.alloc;
+                count += 1;
+            }
+            if (entry.source) |source| {
+                allocators[count] = source.alloc;
+                count += 1;
+            }
+        }
+        var scope = resources.ReclamationScope.tryAcquireMany(allocators[0..count]) orelse return 0;
+        defer scope.deinit();
         const size = if (physical) self.physicalBytes() else (if (self.entry) |entry| if (entry.reservation) |reservation| reservation.bytes else @as(u64, 0) else 0) +
             (if (self.pending) |pending| if (pending.reservation) |reservation| reservation.bytes else @as(u64, 0) else 0);
         self.clear();

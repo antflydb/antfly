@@ -148,6 +148,8 @@ pub const Cache = struct {
         var released: u64 = 0;
         while (released < target_bytes) {
             const entry = self.evictable() orelse break;
+            var scope = resources.ReclamationScope.tryAcquire(entry.backing) orelse break;
+            defer scope.deinit();
             released += if (physical)
                 (if (entry.budget) |budget| budget.live_bytes + @sizeOf(Entry) else entry.bytes)
             else if (entry.budget) |budget|

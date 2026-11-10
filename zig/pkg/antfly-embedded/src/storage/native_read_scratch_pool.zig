@@ -56,7 +56,13 @@ pub const Pool = struct {
     pub fn destroy(self: *Pool) void {
         self.manager.unregisterReclaimer(self.identity);
         std.debug.assert(self.active.load(.acquire) == 0);
-        _ = self.reclaim(std.math.maxInt(u64));
+        // All users and pressure callbacks have drained. Destruction must
+        // release idle slots even when the backing declines pressure frees.
+        while (self.idle_count != 0) {
+            self.idle_count -= 1;
+            self.destroySlot(self.idle[self.idle_count]);
+        }
+        self.idle_bytes = 0;
         self.alloc.destroy(self);
     }
 
@@ -132,9 +138,11 @@ pub const Pool = struct {
         return self.reclaimImpl(target, false);
     }
     fn reclaimImpl(self: *Pool, target: u64, physical: bool) u64 {
+        var scope = resources.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
         var freed: u64 = 0;
         while (freed < target) {
-            self.lock();
+            if (!self.mutex.tryLock()) break;
             if (self.idle_count == 0) {
                 self.mutex.unlock();
                 break;
