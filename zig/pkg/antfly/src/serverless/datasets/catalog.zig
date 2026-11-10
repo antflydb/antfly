@@ -19,6 +19,10 @@ const std = @import("std");
 const objects = @import("objectstore");
 const coordinator = objects.transactional_store;
 const t = @import("types.zig");
+const closure = @import("closure_manifest.zig");
+const local = @import("antfly_local_sources");
+const series = local.storage_retained_series;
+const codec = local.storage_retained_series_archive;
 const A = std.mem.Allocator;
 pub const max_page = 128;
 pub const max_segment_bytes = 16 * 1024 * 1024;
@@ -215,6 +219,65 @@ pub const Catalog = struct {
     /// The caller supplies a bounded, complete immutable segment. Content is
     /// uploaded and read-verified before the authoritative metadata is committed.
     pub fn publish(self: Catalog, value: t.Segment, location: Location, bytes: []const u8) !void {
+        return self.publishImpl(value, location, bytes, null);
+    }
+
+    const ClosedPage = struct { spec: series.Spec, cut: closure.Cut };
+    pub fn publishClosedPage(self: Catalog, spec: series.Spec, cut: closure.Cut, value: t.Segment, location: Location, bytes: []const u8) !void {
+        return self.publishImpl(value, location, bytes, .{ .spec = spec, .cut = cut });
+    }
+    fn closedKey(a: A, generation: u64, partition: t.Id, incarnation: u64) ![]u8 {
+        return std.fmt.allocPrint(a, "closed/{d}/{s}/{d}", .{ generation, std.fmt.bytesToHex(partition, .lower), incarnation });
+    }
+    fn closedProgress(self: Catalog, session: Header, key: []const u8, initial: closure.Manifest) !?closure.Manifest {
+        const observed = (try self.get(session, closure.Manifest, key)) orelse return null;
+        defer observed.deinit();
+        try observed.value.requireScope(initial);
+        return observed.value;
+    }
+    fn checkClosedSpec(self: Catalog, session: Header, spec: series.Spec) !void {
+        if (!std.mem.eql(u8, &spec.id, &self.dataset)) return error.InvalidDatasetBinding;
+        const def_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{spec.generation});
+        defer self.context.alloc.free(def_key);
+        const def = (try self.get(session, t.Definition, def_key)) orelse return error.InvalidDatasetDefinition;
+        defer def.deinit();
+        const summary = def.value.summary orelse return error.InvalidDatasetDefinition;
+        if (def.value.generation != spec.generation or !std.mem.eql(u8, &try def.value.fingerprint(self.context.alloc), &spec.definition) or
+            summary.interval_ns != spec.interval_ns or summary.mutable_for_ns != spec.mutable_for_ns or def.value.retention_ns != spec.retention_ns or
+            try std.fmt.parseInt(i128, summary.origin_ns, 10) != spec.origin_ns or summary.measures.len != spec.laws.len) return error.RetainedSeriesDefinitionMismatch;
+        for (summary.measures, spec.laws, 0..) |measure, law, i| {
+            if (measure.law != law or (law == .count and (measure.field != null) != spec.countsNonNull(i))) return error.RetainedSeriesDefinitionMismatch;
+        }
+    }
+    pub fn getClosedExport(self: Catalog, spec: series.Spec, cut: closure.Cut) !?closure.Manifest {
+        const initial = try closure.Manifest.init(spec, cut);
+        const key = try closedKey(self.context.alloc, spec.generation, spec.source_partition, spec.source_incarnation);
+        defer self.context.alloc.free(key);
+        const session = try self.open(false);
+        defer session.deinit();
+        try self.checkClosedSpec(session.value, spec);
+        return self.closedProgress(session.value, key, initial);
+    }
+    /// The trusted native scan supplies the terminal empty boundary at the
+    /// same closure cut. Only the exact durable frontier can be sealed.
+    pub fn sealClosedExport(self: Catalog, spec: series.Spec, cut: closure.Cut, empty_tail: t.RowKey) !closure.Manifest {
+        const initial = try closure.Manifest.init(spec, cut);
+        const key = try closedKey(self.context.alloc, spec.generation, spec.source_partition, spec.source_incarnation);
+        defer self.context.alloc.free(key);
+        const session = try self.open(true);
+        defer session.deinit();
+        try self.checkClosedSpec(session.value, spec);
+        const current = (try self.closedProgress(session.value, key, initial)) orelse initial;
+        const sealed = try current.seal(empty_tail);
+        if (!current.sealed) {
+            const raw = try std.json.Stringify.valueAlloc(self.context.alloc, sealed, .{});
+            defer self.context.alloc.free(raw);
+            try self.commit(session.value, &.{.{ .kind = .put, .key = key, .value = raw }});
+        }
+        return sealed;
+    }
+
+    fn publishImpl(self: Catalog, value: t.Segment, location: Location, bytes: []const u8, closed_page: ?ClosedPage) !void {
         var session = try self.open(true);
         defer session.deinit();
         const def = try self.definition(session.value);
@@ -224,6 +287,43 @@ pub const Catalog = struct {
             !std.mem.eql(u8, &value.location, &location.id) or value.access != location.access or value.byte_len != bytes.len) return error.InvalidDatasetSegment;
         const key = try segmentKey(self.context.alloc, value.id);
         defer self.context.alloc.free(key);
+        var progress_key: ?[]const u8 = null;
+        defer if (progress_key) |owned| self.context.alloc.free(owned);
+        var progress_bytes: ?[]const u8 = null;
+        defer if (progress_bytes) |owned| self.context.alloc.free(owned);
+        if (closed_page) |page| {
+            const spec = page.spec;
+            const initial = try closure.Manifest.init(spec, page.cut);
+            try self.checkClosedSpec(session.value, spec);
+            const progress = try closedKey(self.context.alloc, spec.generation, spec.source_partition, spec.source_incarnation);
+            progress_key = progress;
+            const current = (try self.closedProgress(session.value, progress, initial)) orelse initial;
+            if (current.last != null and std.mem.eql(u8, &current.last.?, &value.id)) {
+                // A lost commit response is retryable only for the same bytes
+                // and location at the exact last committed frontier.
+                const existing = try self.segment(session.value, value.id);
+                defer existing.deinit();
+                const actual = existing.value;
+                if (!std.meta.eql(actual.source, value.source) or !std.meta.eql(try actual.span(), try value.span()) or
+                    !std.mem.eql(u8, &current.next, &(try actual.span()).end) or actual.retiring or !actual.finalized or
+                    actual.byte_len != value.byte_len or actual.state_encoding != value.state_encoding or
+                    !std.mem.eql(u8, &actual.checksum, &value.checksum) or !std.mem.eql(u8, &actual.location, &location.id)) return error.InvalidDatasetCoverage;
+                _ = try self.checkLocation(session.value, location, false);
+                const verified = try self.readVerified(actual, location);
+                defer self.context.alloc.free(verified);
+                if (!std.mem.eql(u8, bytes, verified)) return error.DatasetSegmentCorrupt;
+                return;
+            }
+            const next = try current.append(value);
+            if (value.state_encoding != codec.encoding or try codec.formatEncoding(bytes) != codec.encoding) return error.InvalidDatasetSegment;
+            var arena = std.heap.ArenaAllocator.init(self.context.alloc);
+            defer arena.deinit();
+            const decoded = try codec.decode(arena.allocator(), spec, bytes);
+            if (!decoded.receipt.source_closed or decoded.rows.len == 0 or decoded.rows.len > series.max_changes or
+                decoded.receipt.source_sequence != page.cut.sequence or decoded.receipt.admitted_ns != page.cut.admitted_ns or
+                decoded.receipt.complete_from_ns != page.cut.complete_from_ns or !std.meta.eql(decoded.receipt.span, try value.span())) return error.InvalidDatasetCoverage;
+            progress_bytes = try std.json.Stringify.valueAlloc(self.context.alloc, next, .{});
+        }
         if (try self.get(session.value, t.Segment, key)) |existing| {
             existing.deinit();
             return error.DatasetSegmentAlreadyExists;
@@ -252,7 +352,8 @@ pub const Catalog = struct {
         defer self.context.alloc.free(encoded);
         if (encoded.len > 32768) return error.DatasetSegmentBudgetExceeded;
         try self.writeVerified(value, location, bytes);
-        try self.putSegmentWithLocation(session.value, value, location);
+        const extra: ?coordinator.Command = if (progress_key) |progress| .{ .kind = .put, .key = progress, .value = progress_bytes.? } else null;
+        try self.putSegmentWithLocation(session.value, value, location, extra);
     }
 
     pub fn hold(self: Catalog, id: t.Id, dependency: Dependency) !void {
@@ -308,7 +409,7 @@ pub const Catalog = struct {
         next.location = destination.id;
         next.access = destination.access;
         next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
-        try self.putSegmentWithLocation(session.value, next, destination);
+        try self.putSegmentWithLocation(session.value, next, destination, null);
     }
 
     fn list(self: Catalog, session: Header, prefix: []const u8, after: []const u8, limit: usize) !std.json.Parsed(Read) {
@@ -603,7 +704,7 @@ pub const Catalog = struct {
         try self.commit(session.value, commands.items);
     }
 
-    fn putSegmentWithLocation(self: Catalog, session: Header, value: t.Segment, location: Location) !void {
+    fn putSegmentWithLocation(self: Catalog, session: Header, value: t.Segment, location: Location, extra: ?coordinator.Command) !void {
         const bound = try self.checkLocation(session, location, true);
         const key = try segmentKey(self.context.alloc, value.id);
         defer self.context.alloc.free(key);
@@ -617,8 +718,8 @@ pub const Catalog = struct {
         defer self.context.alloc.free(coverage_key);
         const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns, .key_span = value.key_span }, .{});
         defer self.context.alloc.free(coverage);
-        const commands = [_]coordinator.Command{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = coverage_key, .value = coverage } };
-        try self.commit(session, commands[if (bound) @as(usize, 1) else 0..]);
+        const commands = [_]coordinator.Command{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = coverage_key, .value = coverage }, extra orelse undefined };
+        try self.commit(session, commands[if (bound) @as(usize, 1) else 0..if (extra != null) @as(usize, 4) else 3]);
     }
 
     fn putSegment(self: Catalog, session: Header, value: t.Segment) !void {
@@ -659,7 +760,7 @@ pub const Catalog = struct {
         next.location = destination.id;
         next.access = .local;
         next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
-        try self.putSegmentWithLocation(session.value, next, destination);
+        try self.putSegmentWithLocation(session.value, next, destination, null);
     }
 
     fn objectKey(self: Catalog, alloc: A, value: t.Segment, location: Location) ![]u8 {

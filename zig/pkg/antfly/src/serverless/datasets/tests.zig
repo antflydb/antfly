@@ -694,3 +694,78 @@ test "retained dataset sliced coverage cannot extend logical lifetime through ex
     value.coverage = .{ .start_ns = "-60", .end_ns = "60" };
     try std.testing.expectError(error.InvalidDatasetCoverage, value.validate(definition(.summary)));
 }
+
+test "retained dataset closed export publishes disjoint retry-safe pages within a bucket" {
+    const export_page = @import("closure_export.zig");
+    const local = @import("antfly_local_sources");
+    const series = local.storage_retained_series;
+    const codec = local.storage_retained_series_archive;
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    const clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const spec: series.Spec = .{ .id = def.id, .generation = def.generation, .definition = try def.fingerprint(a), .source_partition = @splat(5), .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    // Both rows are after the closure clock. The source has stopped, so these
+    // observations are immutable even though the event-time window was open.
+    var counts = [_]series.Metric{ .{ .count = 1 }, .{ .count = 1 }, .{ .count = 2 } };
+    var rows = [_]series.Bucket{
+        .{ .start_ns = 1200, .dimensions = "[1]", .rows = 1, .metrics = counts[0..1] },
+        .{ .start_ns = 1200, .dimensions = "[2]", .rows = 1, .metrics = counts[1..2] },
+    };
+    if (std.mem.order(u8, &codec.key(rows[0]), &codec.key(rows[1])) == .gt) std.mem.swap(series.Bucket, &rows[0], &rows[1]);
+    const cut: export_page.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    const start = t.rowKey(0, @splat(0));
+    const first = (try export_page.encode(a, def, spec, cut, start, rows[0..1], true, cold)).?;
+    defer export_page.deinit(a, first);
+    const second = (try export_page.encode(a, def, spec, cut, (try first.segment.span()).end, rows[1..2], false, cold)).?;
+    defer export_page.deinit(a, second);
+    try std.testing.expectError(error.InvalidDatasetCoverage, export_page.publish(store, spec, cut, second, cold));
+    try export_page.publish(store, spec, cut, first, cold);
+    try export_page.publish(store, spec, cut, first, cold);
+    const half = (try store.getClosedExport(spec, cut)).?;
+    try std.testing.expectEqual(@as(u64, 1), half.pages);
+    try std.testing.expectError(error.DatasetDependencyPending, half.receipt());
+    try std.testing.expectError(error.InvalidDatasetCoverage, store.sealClosedExport(spec, cut, half.next));
+    try export_page.publish(store, spec, cut, second, cold);
+    var plan = try store.planCoveringRange(1, spec.source_partition, 1, .{ .start_ns = "1200", .end_ns = "1260" }, 2);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.segments.len);
+    try std.testing.expectEqualDeep((try plan.segments[0].span()).end, (try plan.segments[1].span()).start);
+    var changed = rows[0];
+    changed.rows = 2;
+    changed.metrics = counts[2..3];
+    const conflict = (try export_page.encode(a, def, spec, cut, start, &.{changed}, true, cold)).?;
+    defer export_page.deinit(a, conflict);
+    try std.testing.expectEqualDeep(first.segment.id, conflict.segment.id);
+    try std.testing.expectError(error.InvalidDatasetCoverage, export_page.publish(store, spec, cut, conflict, cold));
+    try std.testing.expect((try export_page.encode(a, def, spec, cut, start, &.{}, false, cold)) == null);
+    const tail = t.rowKey(1260, @splat(0));
+    const sealed = try store.sealClosedExport(spec, cut, tail);
+    try std.testing.expectEqual(@as(u64, 2), sealed.pages);
+    const reopened = catalog(&memory, &clock);
+    try std.testing.expectEqualDeep(try sealed.receipt(), try (try reopened.getClosedExport(spec, cut)).?.receipt());
+    try std.testing.expectEqualDeep(try sealed.receipt(), try (try reopened.sealClosedExport(spec, cut, tail)).receipt());
+    const Resolve = struct {
+        cold: api.Location,
+        pub fn location(self: @This(), id: t.Id) !api.Location {
+            if (!std.mem.eql(u8, &id, &self.cold.id)) return error.DatasetLocationUnavailable;
+            return self.cold;
+        }
+    };
+    const resolve: Resolve = .{ .cold = cold };
+    const receipt = try sealed.receipt();
+    var mixed = try api.summary_read.readClosed(a, reopened, def, spec, .{ .start_ns = "1200", .end_ns = "1320" }, .{}, cut, receipt, resolve);
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mixed.rows.len);
+    var empty = try api.summary_read.readClosed(a, reopened, def, spec, .{ .start_ns = "1260", .end_ns = "1320" }, .{}, cut, receipt, resolve);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
+    try std.testing.expectError(error.InvalidDatasetCoverage, api.summary_read.readClosed(a, reopened, def, spec, .{ .start_ns = "1260", .end_ns = "1320" }, .{}, cut, @splat(0), resolve));
+    var wrong_cut = cut;
+    wrong_cut.sequence += 1;
+    try std.testing.expectError(error.InvalidDatasetCoverage, reopened.getClosedExport(spec, wrong_cut));
+}
