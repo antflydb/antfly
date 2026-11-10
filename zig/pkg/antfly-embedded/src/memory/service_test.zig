@@ -9862,3 +9862,44 @@ test "memory metadata reads retry bounded authority changes without replaying mu
         }
     }
 }
+
+test "memory semantic supersession final revision conflict never replays inference" {
+    const Race = struct {
+        store: *Store,
+        calls: usize = 0,
+        fn finish(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls != 2) return;
+            const a = self.store.arena.allocator();
+            const row = self.store.values.getPtr("control").?;
+            var state = try std.json.parseFromSliceLeaky(m.types.State, a, row.*, .{});
+            state.revision += 1;
+            row.* = try std.json.Stringify.valueAlloc(a, state, .{});
+            self.store.revision += 1;
+        }
+        fn embed(ptr: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.neighbor_calls += 1;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = IndexedRecallFixture.service(&store, 10);
+    svc.backend.embed = fakeEmbed;
+    svc.backend.embed_document = fakeEmbed;
+    svc.backend.validate_models = fakeValidate;
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "helm");
+    try IndexedRecallFixture.drain(svc, a, "index");
+    var race: Race = .{ .store = &store };
+    svc.context.final_check_ptr = &race;
+    svc.context.final_check_fn = Race.finish;
+    svc.backend.embed = Race.embed;
+    try std.testing.expectError(error.MemoryRevisionConflict, svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"semantic\"}", ""));
+    try std.testing.expectEqual(@as(usize, 1), store.neighbor_calls);
+}

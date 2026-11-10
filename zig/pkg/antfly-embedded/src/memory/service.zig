@@ -234,7 +234,38 @@ pub const Service = struct {
         // between hydration and the final authority fence. Rebuild the whole
         // view after that private conflict, retaining the caller's deadline and
         // rechecking permissions. Never replay writes or model-backed recall.
-        const attempts: usize = if (!mutates(action) and action != .recall and action != .list and action != .brief and action != .consolidate) 4 else 1;
+        const attempts: usize = switch (action) {
+            // Explicit opt-in: a future read action may invoke a provider or
+            // own a frozen paging window, so read-only does not imply replayable.
+            .evaluation_results,
+            .evaluation_dataset,
+            .evaluation_cases,
+            .evaluation_run,
+            .evaluation_tasks,
+            .lineage,
+            .supersession_proposals,
+            .supersession_proposal,
+            .changes,
+            .inspect,
+            .get,
+            .history,
+            .operation,
+            .entities,
+            .resolve_entity,
+            .evidence,
+            .configuration,
+            .explain,
+            .entity_candidates,
+            .entity_proposals,
+            .entity_proposal,
+            .entity_view,
+            .episodes,
+            .episode,
+            .relationship_proposal,
+            .usage,
+            => 4,
+            else => 1,
+        };
         for (0..attempts) |_| {
             var read_revision_changed = false;
             return self.executeInner(alloc, action, id, body, idempotency_key, .{ .read_revision_changed = &read_revision_changed }) catch |err| {
