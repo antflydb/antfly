@@ -146,3 +146,34 @@ members and bounded leaves by 128, and reopened-index queries completed.
 Other builds/services were active during measurement. Samples reuse one fixed
 seeded dataset; real embedding datasets, additional seeds, and matched-recall
 comparisons remain necessary before considering any default change.
+
+### Incremental insertion: 100,000 vectors
+
+[`emeans_incremental_100k.json`](bench/vectors/emeans_incremental_100k.json)
+records three runs per setting of 100,000 x 128-dimensional L2 vectors, inserted
+from empty through 100 coalesced batches of 1,000. The timer covers the insert
+loop, including index maintenance; fixture generation, index open, embeddings,
+and queries are excluded. Storage is in memory, with CPU clustering.
+
+| Bulk algorithm setting | Median incremental insert seconds | Vectors/second |
+| --- | ---: | ---: |
+| Hilbert | 7.479 | 13,372 |
+| Lloyd | 7.609 | 13,142 |
+| e-means | 8.140 | 12,285 |
+
+The bulk algorithm selector is not consulted on this path: every setting uses
+the same incremental routing and Lloyd-based splits. Every run recorded
+100,000 insert calls, 1,133 leaf splits, 26,278 node saves, and 1,134 final
+leaves holding all 100,000 members (maximum 128 per leaf). Reopened-index query
+result digests were identical. Timing differences across these identical code
+paths reflect run-to-run conditions rather than an e-means benefit. This
+experiment therefore demonstrates no incremental insertion speedup; applying
+e-means to online splits would be a separate implementation and evaluation.
+
+Reproduce with the comparison script's incremental mode:
+
+```sh
+python3 tools/bench_emeans.py --build online_coalesced --vectors 100000 --dims 128 --batch-size 1000 --samples 3 --queries 1 --output .zig-cache/emeans-incremental-100k
+```
+
+One query is used only to exercise reopen/search, not to estimate recall.

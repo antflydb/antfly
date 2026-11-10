@@ -35,6 +35,10 @@ def main():
     parser.add_argument(
         "--output", type=Path, default=Path(".zig-cache/emeans-results")
     )
+    parser.add_argument(
+        "--build", choices=("bulk_build", "online_coalesced"), default="bulk_build"
+    )
+    parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--vectors", type=int, default=10000)
     parser.add_argument("--dims", type=int, default=128)
     parser.add_argument("--samples", type=int, default=3)
@@ -42,8 +46,20 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--search-width", type=int, default=16)
     args = parser.parse_args()
-    if min(args.vectors, args.dims, args.samples, args.queries, args.search_width) <= 0:
-        parser.error("vectors, dims, samples, and queries must be positive")
+    if (
+        min(
+            args.vectors,
+            args.dims,
+            args.samples,
+            args.queries,
+            args.search_width,
+            args.batch_size,
+        )
+        <= 0
+    ):
+        parser.error(
+            "counts, dimensions, search width, and batch size must be positive"
+        )
     if not Path(args.binary).is_file():
         parser.error(f"benchmark binary not found: {args.binary}")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -57,7 +73,9 @@ def main():
             "--storage",
             "memory",
             "--build",
-            "bulk_build",
+            args.build,
+            "--batch-size",
+            str(args.batch_size),
             "--kmeans-backend",
             "cpu",
             "--vectors",
@@ -104,6 +122,8 @@ def main():
         rss = re.search(r"(\d+)\s+maximum resident set size", result.stderr)
         row = dict(
             algorithm=algorithm,
+            build=args.build,
+            batch_size=args.batch_size,
             command=command,
             vectors=args.vectors,
             dims=args.dims,
