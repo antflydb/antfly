@@ -56,7 +56,8 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     req: db_mod.types.BatchRequest,
     raft_entry: db_mod.OrderedApplyReceipt,
 ) !void {
-    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
+    applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry) catch |err|
+        return @import("server_db_adapter.zig").normalizeOrderedApplyError(err);
 }
 
 pub fn applyReplicatedTransactionMutationInternal(

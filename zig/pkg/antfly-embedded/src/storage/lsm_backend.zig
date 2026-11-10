@@ -23108,6 +23108,44 @@ fn implementationTests() type {
             }
         }
 
+        test "lsm manifest credits remain additive across interleaved long-key cohorts" {
+            const a = std.testing.allocator;
+            var prior: State = .{};
+            defer prior.deinit(a);
+            var incoming: State = .{};
+            defer incoming.deinit(a);
+            var combined: State = .{};
+            defer combined.deinit(a);
+            const value = try a.alloc(u8, 250 * 1024);
+            defer a.free(value);
+            @memset(value, 'v');
+            for ([_][]const u8{ "b", "h" }) |key| {
+                try prior.upsert(a, .{}, key, value, false);
+                try combined.upsert(a, .{}, key, value, false);
+            }
+            var key: [16 * 1024]u8 = @splat('k');
+            for ("acegik") |first| {
+                key[0] = first;
+                try incoming.upsert(a, .{}, &key, "value", false);
+                try combined.upsert(a, .{}, &key, "value", false);
+            }
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var backend = try Backend.open(a, "/manifest-credit-cohorts", .{
+                .storage = storage.storage(),
+                .max_run_file_bytes = 512 * 1024,
+                .max_run_file_physical_bytes = 1024 * 1024,
+            });
+            defer backend.close();
+            const credit = try backend.prepareManifestCredit(&prior, &@as(State, .{})) + try backend.prepareManifestCredit(&incoming, &@as(State, .{}));
+            var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &combined, 0);
+            defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
+            try std.testing.expect(outputs.items.len > 1);
+            const encoded = try repository_mod.encodeManifestAlloc(a, backend.next_run_id, outputs.items, &.{});
+            defer a.free(encoded);
+            try std.testing.expect(encoded.len <= credit);
+        }
+
         test "lsm point leases pin immutable values across flush and overwrite" {
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);

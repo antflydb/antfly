@@ -8579,10 +8579,16 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
                 \\{"enrichments":[{"name":"echo","kind":"asset","source_artifact_name":"missing"}]}
             ));
-            // Consuming assets read produced bytes; a field cannot also be set.
-            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+            // A field selects structured produced bytes; retain both parts of
+            // that lineage rather than mistaking it for a primary-row field.
+            const selected =
                 \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","field":"summary","source_artifact_name":"summary_text"}]}
-            ));
+            ;
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, selected);
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator, selected);
+            defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+            try std.testing.expectEqualStrings("summary", configs[1].field);
+            try std.testing.expectEqualStrings("summary_text", configs[1].source_artifact_name);
             // Media-locator producers dereference the source as a URL and
             // stay closed to artifact consumption.
             try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,

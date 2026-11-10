@@ -909,7 +909,7 @@ class MultiNodeScalingCluster:
             self._write_config()
             self._start()
         except BaseException:
-            self.stop()
+            self.stop(test_failed=True)
             raise
 
     @property

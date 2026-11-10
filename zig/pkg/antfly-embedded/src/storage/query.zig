@@ -314,7 +314,7 @@ pub fn collectTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitTextStats(alloc, explicit);
+            break :blk try db.collectExplicitTextStatsWithPrivacyPolicy(alloc, explicit, parsed.privacy_policy_version);
         },
         .background_fields => return error.InvalidQueryRequest,
     };
@@ -345,7 +345,7 @@ pub fn collectBackgroundTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitBackgroundTextStats(alloc, explicit);
+            break :blk try db.collectExplicitBackgroundTextStatsWithPrivacyPolicy(alloc, explicit, parsed.privacy_policy_version);
         },
         else => return error.InvalidQueryRequest,
     };
