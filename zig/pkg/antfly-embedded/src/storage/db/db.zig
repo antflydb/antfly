@@ -4013,6 +4013,13 @@ pub const DB = struct {
             );
             var core_owned = true;
             errdefer if (core_owned) core.deinit(alloc);
+            {
+                var retained_read = try core.store.beginReadTxn();
+                defer retained_read.abort();
+                var retained_arena = std.heap.ArenaAllocator.init(alloc);
+                defer retained_arena.deinit();
+                try @import("../retained_series_capture.zig").requireNamespace(retained_arena.allocator(), &retained_read, @import("online_source_contract.zig").namespaceBytes(core.identity_namespace));
+            }
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
             owned_async_context = async_context;
@@ -20831,6 +20838,7 @@ pub const DB = struct {
     }
 
     fn requireSupportedRelationalTopology(self: *DB) !void {
+        if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTopologyUnsupported;
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
         var view = self.core.acquireSchemaView();
         defer if (view) |*pinned| pinned.release();
@@ -39522,6 +39530,13 @@ pub const DB = struct {
     ) !PreparedPortableRuntimeMetadata {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         errdefer row_policy_lease.release();
+        {
+            var retained_read = try source_store.beginReadTxn();
+            defer retained_read.abort();
+            var retained_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer retained_arena.deinit();
+            try @import("../retained_series_capture.zig").requireNamespace(retained_arena.allocator(), &retained_read, @import("online_source_contract.zig").namespaceBytes(target_identity));
+        }
         const identity_summary = try doc_identity.visibilitySummaryFromStore(source_store);
         const restored_schema = try schema_mod.loadSchema(source_store, self.alloc);
         var restored_schema_owned = true;

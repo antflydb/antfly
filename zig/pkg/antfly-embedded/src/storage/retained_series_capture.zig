@@ -83,6 +83,16 @@ pub fn load(a: A, txn: anytype) ![]const Binding {
     return bindings;
 }
 
+/// A copied native registry cannot silently start producing under a different
+/// physical owner. Restore/import admission validates this before publication.
+pub fn requireNamespace(a: A, txn: anytype, namespace: [24]u8) !void {
+    const bindings = try load(a, txn);
+    if (bindings.len == 0) return;
+    var partition: series.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+    for (bindings) |binding| if (!std.mem.eql(u8, &binding.spec.source_partition, &partition)) return error.IdentityNamespaceMismatch;
+}
+
 /// Called only by the replicated control path under the source writer fence.
 /// The caller derives complete_from_ns from certified existing source coverage.
 pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_from_ns: i128) !void {
@@ -238,8 +248,22 @@ fn releasePreparedKeys(a: A, txn: anytype, transaction: [16]u8) !void {
     try txn.delete(try preparedCountKey(a, transaction));
 }
 
+const topology_keys = [_][]const u8{
+    @import("db/range_state.zig").range_key,
+    @import("db/range_state.zig").split_bootstrap_marker_key,
+    @import("db/merge_state.zig").key,
+    @import("db/merge_state.zig").legacy_key,
+};
+fn valueDigest(raw: ?[]const u8) ?series.Id {
+    const bytes = raw orelse return null;
+    var result: series.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
+    return result;
+}
+
 pub const Capture = struct {
     before: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    topology_before: std.AutoHashMapUnmanaged(u8, ?series.Id) = .empty,
     staging: bool = false,
     poisoned: bool = false,
     context_touched: bool = false,
@@ -253,6 +277,7 @@ pub const Capture = struct {
             if (entry.value_ptr.*) |bytes| a.free(bytes);
         }
         self.before.deinit(a);
+        self.topology_before.deinit(a);
         self.* = .{};
     }
     pub fn completed(self: *const Capture, cache: ?*Cache) void {
@@ -268,6 +293,15 @@ pub const Capture = struct {
             if (cache) |c| invalidateCache(c);
             return;
         }
+        if (!self.staging) for (topology_keys, 0..) |candidate, index| {
+            if (!std.mem.eql(u8, key, candidate)) continue;
+            const slot: u8 = @intCast(index);
+            if (!self.topology_before.contains(slot)) {
+                errdefer self.poisoned = true;
+                try self.topology_before.put(a, slot, valueDigest(try optional(txn, key)));
+            }
+            break;
+        };
         if (self.staging or !keys.isStoredDocumentRowKey(key)) return;
         if (self.poisoned) return error.RetainedSeriesTransactionPoisoned;
         errdefer self.poisoned = true;
@@ -295,6 +329,13 @@ pub const Capture = struct {
     pub fn stage(self: *Capture, a: A, txn: anytype) !void {
         if (self.poisoned) return error.RetainedSeriesTransactionPoisoned;
         errdefer self.poisoned = true;
+        if (self.topology_before.count() != 0 and try optional(txn, registry_key) != null) {
+            var changed = self.topology_before.iterator();
+            while (changed.next()) |entry| {
+                const after = valueDigest(try optional(txn, topology_keys[entry.key_ptr.*]));
+                if (!std.meta.eql(entry.value_ptr.*, after)) return error.RetainedSeriesTopologyUnsupported;
+            }
+        }
         if (self.before.count() == 0) {
             // Context-only maintenance batches do not leave a reusable marker.
             if (self.context_touched) {
@@ -612,6 +653,20 @@ test "retained series native source commit coalesces corrections and preserves T
     }
     try std.testing.expect(try store.retainedSeriesActive());
     {
+        var noop = try store.beginWriteTxn();
+        errdefer noop.abort();
+        // An absent -> absent lifecycle update is harmless replay.
+        try noop.delete(@import("db/range_state.zig").range_key);
+        try noop.commit();
+    }
+    {
+        var blocked = try store.beginWriteTxn();
+        defer blocked.abort();
+        try blocked.put(@import("db/range_state.zig").range_key, "new owner extent");
+        try std.testing.expectError(error.RetainedSeriesTopologyUnsupported, blocked.commit());
+        try std.testing.expectError(error.RetainedSeriesTransactionPoisoned, blocked.commit());
+    }
+    {
         var batch = try store.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(context_key, try std.json.Stringify.valueAlloc(alloc, Context{ .sequence = 1, .admitted_ns = 5 }, .{}));
@@ -800,6 +855,8 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
         defer current.abort();
         try std.testing.expectError(error.NotFound, current.get(try preparedCountKey(alloc, noop_txn)));
     }
+    try std.testing.expectError(error.RetainedSeriesTopologyUnsupported, db.finalizeSplit(.{ .start = "", .end = "m" }));
+    try std.testing.expectError(error.IdentityNamespaceMismatch, db.preparePortableRuntimeMetadata(db.core.store, .{ .table_id = 9, .shard_id = 2, .range_id = 3 }));
     const expiration_txn = try db.beginTransaction(261);
     try db.writeTransaction(expiration_txn, .{ .admitted_timestamp_ns = 261, .deletes = &.{"a"}, .expiration_deletes = &.{"a"} });
     try db.resolveTransactionIntents(expiration_txn, .committed, 262);
