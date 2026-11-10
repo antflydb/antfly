@@ -16354,12 +16354,60 @@ const TemporalPredicateToken = struct {
     token: []u8,
 };
 
+/// A physical state can feed several aliases (including COUNT aliases). Compile
+/// this insertion-ordered dispatch once, rather than searching every logical
+/// metric for every scanned/exported/folded cell. Keys borrow the pinned plan.
+const TemporalMetricBindings = struct {
+    const Binding = struct {
+        law_id: algebraic_mod.law.Id,
+        slots: std.ArrayListUnmanaged(usize) = .empty,
+    };
+    entries: std.StringArrayHashMapUnmanaged(Binding) = .empty,
+
+    fn init(a: Allocator, count: algebraic_mod.planner.MetricPlan, children: []const algebraic_mod.planner.MetricPlan) !@This() {
+        var result: @This() = .{};
+        errdefer result.deinit(a);
+        try result.append(a, count, 0);
+        for (children, 0..) |child, i| try result.append(a, child, i + 1);
+        return result;
+    }
+
+    fn append(self: *@This(), a: Allocator, metric: algebraic_mod.planner.MetricPlan, slot: usize) !void {
+        const entry = try self.entries.getOrPut(a, metric.materialization.name);
+        const law_id = algebraic_mod.law.fromOp(metric.op);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .law_id = law_id };
+        if (entry.value_ptr.law_id != law_id) return error.InvalidAggregation;
+        try entry.value_ptr.slots.append(a, slot);
+    }
+
+    fn deinit(self: *@This(), a: Allocator) void {
+        for (self.entries.values()) |*entry| entry.slots.deinit(a);
+        self.entries.deinit(a);
+    }
+
+    fn ownedNamesAlloc(self: *const @This(), a: Allocator) ![][]const u8 {
+        const names = try a.alloc([]const u8, self.entries.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (names[0..initialized]) |name| a.free(name);
+            a.free(names);
+        }
+        for (self.entries.keys(), names) |name, *owned| {
+            owned.* = try a.dupe(u8, name);
+            initialized += 1;
+        }
+        return names;
+    }
+};
+
 const TemporalPlan = struct {
     shape: TemporalShape,
     plan: algebraic_mod.planner.PlanResult,
     predicate_tokens: []const TemporalPredicateToken,
+    metric_bindings: TemporalMetricBindings,
     range: ?algebraic_mod.ir.TimeRange,
     fn deinit(self: *@This(), a: Allocator) void {
+        self.metric_bindings.deinit(a);
         self.plan.deinit(a);
         for (self.predicate_tokens) |predicate| a.free(predicate.token);
         a.free(self.predicate_tokens);
@@ -16475,7 +16523,8 @@ fn temporalPlanAlloc(a: Allocator, index: *const algebraic_mod.index.Index, requ
         };
         initialized += 1;
     }
-    return .{ .shape = shape, .plan = plan, .predicate_tokens = predicates, .range = range };
+    const metric_bindings = try TemporalMetricBindings.init(a, count, plan.child_metrics);
+    return .{ .shape = shape, .plan = plan, .predicate_tokens = predicates, .metric_bindings = metric_bindings, .range = range };
 }
 
 pub fn temporalMaterializationsAlloc(a: Allocator, index: *const algebraic_mod.index.Index, request: SearchAggregationRequest, constraints: []const FixedConstraint) !?[][]const u8 {
@@ -16485,26 +16534,7 @@ pub fn temporalMaterializationsAlloc(a: Allocator, index: *const algebraic_mod.i
 }
 
 fn temporalNamesOwnedAlloc(a: Allocator, plan: TemporalPlan) ![][]const u8 {
-    const all = try materializedExpressionNamesOwnedAlloc(a, plan.plan.count_metric.?, plan.plan.child_metrics);
-    defer freeAlgebraicDistributedMaterializations(a, all);
-    var names = std.ArrayList([]const u8).empty;
-    errdefer {
-        for (names.items) |name| a.free(name);
-        names.deinit(a);
-    }
-    for (all) |name| {
-        var duplicate = false;
-        for (names.items) |existing| if (std.mem.eql(u8, existing, name)) {
-            duplicate = true;
-            break;
-        };
-        if (!duplicate) {
-            const owned = try a.dupe(u8, name);
-            errdefer a.free(owned);
-            try names.append(a, owned);
-        }
-    }
-    return names.toOwnedSlice(a);
+    return plan.metric_bindings.ownedNamesAlloc(a);
 }
 
 const TemporalGroup = struct {
@@ -16564,6 +16594,7 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
     }
     for (rows) |row| {
         try ctx.control.check();
+        const binding = plan.metric_bindings.entries.get(row.metric) orelse continue;
         const cell = try columns.getOrPut(a, row.canonical_axis);
         if (!cell.found_existing) {
             cell.value_ptr.* = &.{};
@@ -16572,10 +16603,7 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
             cell.value_ptr.* = try a.alloc(?[]const u8, children.len + 1);
             @memset(cell.value_ptr.*, null);
         }
-        if (std.mem.eql(u8, row.metric, count_plan.materialization.name)) cell.value_ptr.*[0] = row.value;
-        for (children, 0..) |child, i| if (std.mem.eql(u8, row.metric, child.materialization.name)) {
-            cell.value_ptr.*[i + 1] = row.value;
-        };
+        for (binding.slots.items) |slot| cell.value_ptr.*[slot] = row.value;
     }
     var groups = std.ArrayList(TemporalGroup).empty;
     defer {
@@ -16972,6 +17000,14 @@ pub fn temporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, st
     }
     if (rows.len > 1_000_000 / @max(names.len, 1)) return error.QueryCandidateBudgetExceeded;
     var partials = std.ArrayList(algebraic_mod.distributed.Partial).empty;
+    errdefer {
+        for (partials.items) |partial| {
+            a.free(partial.canonical_axis);
+            a.free(partial.metric);
+            a.free(partial.value);
+        }
+        partials.deinit(a);
+    }
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     for (rows) |row| {
@@ -16980,15 +17016,14 @@ pub fn temporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, st
         // Scanned work remains charged even for rejected rows. Transfer and
         // coordinator retention include only states selected by the predicate.
         if (try selectTemporalAxisAlloc(scratch.allocator(), plan, row.group_key) == null) continue;
-        for (row.values, names) |value, name| if (value) |raw| {
-            var law_id: algebraic_mod.law.Id = .count;
-            if (!std.mem.eql(u8, name, plan.plan.count_metric.?.materialization.name)) {
-                for (plan.plan.child_metrics) |child| if (std.mem.eql(u8, name, child.materialization.name)) {
-                    law_id = algebraic_mod.law.fromOp(child.op);
-                    break;
-                };
-            }
-            try partials.append(a, .{ .canonical_axis = try a.dupe(u8, row.group_key), .metric = try a.dupe(u8, name), .law_id = law_id, .value = try a.dupe(u8, raw) });
+        for (row.values, names, plan.metric_bindings.entries.values()) |value, name, binding| if (value) |raw| {
+            const axis = try a.dupe(u8, row.group_key);
+            errdefer a.free(axis);
+            const metric = try a.dupe(u8, name);
+            errdefer a.free(metric);
+            const state = try a.dupe(u8, raw);
+            errdefer a.free(state);
+            try partials.append(a, .{ .canonical_axis = axis, .metric = metric, .law_id = binding.law_id, .value = state });
         };
     }
     return try partials.toOwnedSlice(a);
@@ -17116,4 +17151,129 @@ test "time series numeric histogram calendar domain includes UTC endpoints" {
     try std.testing.expectEqual(@as(usize, 2), result[0].buckets.len);
     try std.testing.expectEqualStrings("\"0000-01-01T00:00:00Z\"", result[0].buckets[0].key_json);
     try std.testing.expectEqualStrings("\"9999-12-31T23:59:59.999999999Z\"", result[0].buckets[1].key_json);
+}
+
+test "time series metric dispatch preserves aliases and allocation ownership" {
+    const count: algebraic_mod.planner.MetricPlan = .{ .op = .count, .materialization = .{ .name = "rows", .op = "count" } };
+    const sum: algebraic_mod.planner.MetricPlan = .{ .op = .sum, .materialization = .{ .name = "total", .op = "sum", .measure = "v" } };
+    const Fixture = struct {
+        fn run(a: Allocator, rows: algebraic_mod.planner.MetricPlan, total: algebraic_mod.planner.MetricPlan) !void {
+            var bindings = try TemporalMetricBindings.init(a, rows, &.{ rows, total, total });
+            defer bindings.deinit(a);
+            try std.testing.expectEqual(@as(usize, 2), bindings.entries.count());
+            try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, bindings.entries.get("rows").?.slots.items);
+            try std.testing.expectEqualSlices(usize, &.{ 2, 3 }, bindings.entries.get("total").?.slots.items);
+            try std.testing.expectEqual(algebraic_mod.law.Id.count, bindings.entries.get("rows").?.law_id);
+            try std.testing.expectEqual(algebraic_mod.law.Id.sum, bindings.entries.get("total").?.law_id);
+            const names = try bindings.ownedNamesAlloc(a);
+            defer freeAlgebraicDistributedMaterializations(a, names);
+            try std.testing.expectEqualStrings("rows", names[0]);
+            try std.testing.expectEqualStrings("total", names[1]);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{ count, sum });
+    var conflict = sum;
+    conflict.materialization.name = "rows";
+    try std.testing.expectError(error.InvalidAggregation, TemporalMetricBindings.init(std.testing.allocator, count, &.{conflict}));
+}
+
+test "time series partial export cleans cancellation and every allocation failure" {
+    const a = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var index = try algebraic_mod.index.Index.open(a, "series",
+        \\{"version":1,"table":"readings","time_fields":[{"name":"ts","path":"ts","type":"timestamp"}],"measure_fields":[{"name":"v","path":"v","type":"number"}],"materializations":[{"name":"rows","op":"count","time":"ts","bucket":"5m"},{"name":"total","op":"sum","measure":"v","time":"ts","bucket":"5m"}]}
+    );
+    defer index.close();
+    try index.applyBatch(&store, .{ .documents = &.{
+        .{ .key = "a", .action = .upsert, .cleaned_value = "{\"ts\":\"2026-11-06T12:01:00Z\",\"v\":10}" },
+        .{ .key = "b", .action = .upsert, .cleaned_value = "{\"ts\":\"2026-11-06T12:06:00Z\",\"v\":20}" },
+    } });
+    const request: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "5m", .aggregations = &.{ .{ .name = "sum", .type = "sum", .field = "v" }, .{ .name = "alias", .type = "sum", .field = "v" } } };
+    const Fixture = struct {
+        fn run(alloc: Allocator, idx: *algebraic_mod.index.Index, db: *docstore_mod.DocStore, req: SearchAggregationRequest) !void {
+            const partials = (try temporalPartialsAlloc(alloc, idx, db, req, &.{}, .{})) orelse return error.MissingTemporalResult;
+            defer algebraic_mod.distributed.freePartials(alloc, @constCast(partials));
+            try std.testing.expectEqual(@as(usize, 4), partials.len);
+            for (partials) |partial| try std.testing.expectEqual(if (std.mem.eql(u8, partial.metric, "rows")) algebraic_mod.law.Id.count else .sum, partial.law_id);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{ &index, &store, request });
+    const Counter = struct {
+        remaining: usize,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return true;
+            self.remaining -= 1;
+            return false;
+        }
+    };
+    var cancelled_count: usize = 0;
+    var completed_count: usize = 0;
+    for (0..32) |stop| {
+        var counter = Counter{ .remaining = stop };
+        const partials = (temporalPartialsAlloc(a, &index, &store, request, &.{}, .{ .control = .{ .cancellation = .{ .ptr = &counter, .is_cancelled_fn = Counter.cancelled } } }) catch |err| {
+            try std.testing.expectEqual(error.Canceled, err);
+            cancelled_count += 1;
+            continue;
+        }) orelse return error.MissingTemporalResult;
+        algebraic_mod.distributed.freePartials(a, @constCast(partials));
+        completed_count += 1;
+    }
+    try std.testing.expect(cancelled_count != 0 and completed_count != 0);
+}
+
+test "time series wide metric fold preserves bounded cells across measurement widths" {
+    for ([_]usize{ 100, 1000, 10000 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var index = try algebraic_mod.index.Index.open(a, "series",
+            \\{"version":1,"table":"readings","time_fields":[{"name":"ts","path":"ts","type":"timestamp"}],"materializations":[{"name":"rows","op":"count","time":"ts","bucket":"5m"}]}
+        );
+        defer index.close();
+        const children = try a.alloc(SearchAggregationRequest, width);
+        const metrics = try a.alloc(algebraic_mod.planner.MetricPlan, width);
+        for (children, metrics, 0..) |*child, *metric, i| {
+            const name = try std.fmt.allocPrint(a, "metric_{d:0>5}", .{i});
+            child.* = .{ .name = name, .type = "sum", .field = name };
+            metric.* = .{ .op = .sum, .materialization = .{ .name = name, .op = "sum", .measure = name, .time = "ts", .bucket = "5m" } };
+        }
+        const request: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "5m", .min_doc_count = 1, .aggregations = children };
+        const count: algebraic_mod.planner.MetricPlan = .{ .op = .count, .materialization = .{ .name = "rows", .op = "count", .time = "ts", .bucket = "5m" } };
+        var plan: TemporalPlan = .{
+            .shape = .{ .request = request, .histogram = request },
+            .plan = .{ .kind = .exact_materialized, .count_metric = count, .child_metrics = metrics },
+            .predicate_tokens = &.{},
+            .metric_bindings = try TemporalMetricBindings.init(a, count, metrics),
+            .range = null,
+        };
+        defer plan.deinit(a);
+
+        const axis_count = 50000 / (width + 1);
+        const rows = try a.alloc(algebraic_mod.distributed.Partial, axis_count * (width + 1));
+        const empty = try algebraic_mod.token.canonicalTupleAlloc(a, &.{});
+        const base = @import("../../datetime.zig").parseRfc3339ToSignedNs("2026-11-06T12:00:00Z").?;
+        for (0..axis_count) |i| {
+            const at = try @import("../../datetime.zig").formatDateTimeSignedNsAlloc(a, base + @as(i128, @intCast(i)) * 5 * std.time.ns_per_min);
+            const axis = try algebraic_mod.token.canonicalTupleAlloc(a, &.{ at, empty });
+            rows[i * (width + 1)] = .{ .canonical_axis = axis, .metric = "rows", .law_id = .count, .value = "1" };
+            for (metrics, 0..) |metric, j| rows[i * (width + 1) + j + 1] = .{ .canonical_axis = axis, .metric = metric.materialization.name, .law_id = .sum, .value = "1" };
+        }
+        const clock = @import("antfly_platform").time;
+        const started = clock.monotonicNs();
+        var result = try foldTemporalPartialsAlloc(a, &index, plan, rows, .{});
+        defer result.deinit(a);
+        std.debug.print("TEMPORAL_FOLD width={d} axes={d} cells={d} elapsed_ms={d}\n", .{ width, axis_count, rows.len, (clock.monotonicNs() - started) / std.time.ns_per_ms });
+        try std.testing.expectEqual(axis_count, result.buckets.len);
+        for (result.buckets) |bucket| {
+            try std.testing.expectEqual(@as(usize, width), bucket.aggregations.len);
+            try std.testing.expectEqualStrings(children[width - 1].name, bucket.aggregations[width - 1].name);
+            try std.testing.expectEqualStrings(bucket.aggregations[0].value_json.?, bucket.aggregations[width - 1].value_json.?);
+        }
+    }
 }
