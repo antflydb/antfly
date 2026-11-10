@@ -42547,6 +42547,30 @@ fn consumerTests() type {
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 9, 17, 18));
         }
 
+        test "leann dense artifact format admission requires the all-member version 29 barrier" {
+            const a = std.testing.allocator;
+            const codec = @import("antfly_local_sources").storage_db_enrichment_artifact_codec;
+            const value = try codec.encodeProducedDenseEmbeddingAlloc(a, 7, true, &.{ 1, 2 });
+            defer a.free(value);
+            const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "v", .value = value }} };
+            const required = DataServer.requiredRaftBatchProtocolVersion(request);
+            try std.testing.expectEqual(@as(u16, 29), required);
+            var activated = DataRaftProtocolActivationEntry{};
+            activated.protocol_version.store(28, .release);
+            try std.testing.expect(!DataServer.dataRaftProtocolUsable(&activated, 1, required));
+            activated.pending_term.store(1, .release);
+            activated.pending_version.store(required, .release);
+            try std.testing.expect(DataServer.dataRaftProtocolUsable(&activated, 1, required));
+            try std.testing.expect(!DataServer.dataRaftProtocolUsable(&activated, 2, required));
+            activated.protocol_version.store(required, .release);
+            try std.testing.expect(DataServer.dataRaftProtocolUsable(&activated, 2, required));
+            const barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", required);
+            defer a.free(barrier);
+            var decoded = try data_raft_batch.decode(a, barrier);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(required, decoded.protocol_barrier_version.?);
+        }
+
         test "raft proposal preserves isolated catalog admission through document revision negotiation" {
             const alloc = std.testing.allocator;
             const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
@@ -57816,30 +57840,6 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
-}
-
-test "leann dense artifact format admission requires the all-member version 29 barrier" {
-    const a = std.testing.allocator;
-    const codec = @import("antfly_local_sources").storage_db_enrichment_artifact_codec;
-    const value = try codec.encodeProducedDenseEmbeddingAlloc(a, 7, true, &.{ 1, 2 });
-    defer a.free(value);
-    const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "v", .value = value }} };
-    const required = DataServer.requiredRaftBatchProtocolVersion(request);
-    try std.testing.expectEqual(@as(u16, 29), required);
-    var activated = DataRaftProtocolActivationEntry{};
-    activated.protocol_version.store(28, .release);
-    try std.testing.expect(!DataServer.dataRaftProtocolUsable(&activated, 1, required));
-    activated.pending_term.store(1, .release);
-    activated.pending_version.store(required, .release);
-    try std.testing.expect(DataServer.dataRaftProtocolUsable(&activated, 1, required));
-    try std.testing.expect(!DataServer.dataRaftProtocolUsable(&activated, 2, required));
-    activated.protocol_version.store(required, .release);
-    try std.testing.expect(DataServer.dataRaftProtocolUsable(&activated, 2, required));
-    const barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", required);
-    defer a.free(barrier);
-    var decoded = try data_raft_batch.decode(a, barrier);
-    defer decoded.deinit(a);
-    try std.testing.expectEqual(required, decoded.protocol_barrier_version.?);
 }
 
 test "grouped source protocol dominates coexisting graph envelope features" {
