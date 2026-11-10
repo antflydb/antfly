@@ -165,3 +165,102 @@ proven deterministic) during a record pass and its own exact replay of
 `full-cluster.clean`, to find the first byte range that differs and trace it
 back to its source, the same technique that isolated the pacing-clock fix
 above.
+
+## Applied-sequence flush: a mutex held across a yield, not just a real-time leak
+
+Continuing from the entropy fix above: `full-cluster-vopr-test` started
+hanging outright (no output for an hour, `zig build full-cluster-vopr-test`
+hit a 2h timeout) after `perf/lwa-integration` picked up origin/main. `sample`
+on the live process during the hang showed the main thread parked for the
+whole run inside `storage.db.mutation_commit...lockAtomicWithBackoffProfiled`'s
+`sleepNs` (a raw `nanosleep`), reached through
+`DB.independentMaintenanceRun`'s `.repair` branch →
+`finalizeDenseProjectionLifecycleForIdle` → `flushAppliedSequences`, spinning
+on `applied_sequence_mutex`. This is a different bug from the two entropy/
+clock leaks above, not a consequence of them: a lock held across a
+cooperative yield, with the raw-`nanosleep` backoff of a *contending* caller
+compounding it into an outright deadlock.
+
+`persistAppliedSequencesBatchAsync` (added by `02e6575157`, "skip redundant
+progress-v2 commits and batch forced-flush persists") and the other four
+callers of `flushPendingAppliedSequencesLocked`/
+`flushFinishedDenseAppliedSequenceLocked` held `applied_sequence_mutex` —
+a plain `std.atomic.Mutex`, spin-then-real-`nanosleep` on contention — across
+the entire durable commit those functions run (`publishManagedProgress`,
+which can go through a WAL append and its group-commit leader/follower wait:
+a follower cooperatively yields through Io until the group's leader task
+finishes the write and signals it). VOPR's deterministic scenario runs its
+cooperative tasks on a single logical worker. Once that follower's holder
+yielded while still holding `applied_sequence_mutex`, any *other* caller
+contending for that same mutex fell into
+`lockAtomicWithBackoffProfiled`'s raw-`nanosleep` backoff tail — blocking the
+one OS thread the holder needed scheduled again to finish its commit and
+release the lock. Nothing could run again: not the holder, not the group-
+commit leader, not the contender. A resident production backend's real OS
+thread pool has other threads free to run the holder forward, so this was
+invisible there; VOPR's single-worker model turned it into a hang the moment
+anything actually contended for this specific mutex while a flush was
+yielding mid-commit, which the liveness fix two sections up made happen for
+the first time (full-cluster's shadow-index repair previously never
+survived long enough to reach a flush that overlapped the WAL's group-commit
+wait with contention on the same mutex).
+
+Two independent fixes, both required (confirmed by reproducing the hang with
+either one alone):
+
+1. **Never hold a plain spin-mutex across the yield.** Split what
+   `applied_sequence_mutex` protected into two locks with different shapes.
+   `applied_sequence_mutex` (unchanged type, still a bounded, never-yielding
+   critical section) now protects only the coalescer's `pending` map itself
+   — a brief drain, immediately copying out (`alloc.dupe`) and removing
+   exactly the entries about to be flushed, so nothing below touches the map
+   again and a `note()` arriving mid-commit lands cleanly in the
+   now-partially-drained map for the next flush to pick up. The new
+   `AsyncContext.applied_sequence_flush_mutex` (`std.Io.Mutex`) is acquired
+   around the *whole* drain-then-commit sequence instead, by every caller of
+   `flushPendingAppliedSequencesLocked`/`flushFinishedDenseAppliedSequenceLocked`.
+   It exists because `savePhysicalProjectionMetadataForAppliedSequenceUpdates`
+   and `checkpointManagedProjectionEffectsForAppliedSequenceUpdates` overwrite
+   the durable checkpoint rather than merge it: two overlapping, unordered
+   commits for the same index could otherwise regress the watermark once
+   `applied_sequence_mutex` itself stopped serializing the whole operation.
+2. **`lockAtomicWithBackoff`/`lockAtomicWithBackoffProfiled` must not fall
+   back to a raw `nanosleep`.** Added Io-aware counterparts,
+   `lockAtomicWithBackoffIo`/`lockAtomicWithBackoffProfiledIo`
+   (`mutation_commit.zig`), identical except their backoff tail calls
+   `io.sleep(..., .awake)` instead of `sleepNs`. Used only for
+   `applied_sequence_mutex`'s now-brief critical section (six call sites in
+   `db.zig`), not for the other ~60 `lockAtomicWithBackoff(Profiled)` call
+   sites in this file (`dense_admission.mutex`, `index_repair_control_mutex`,
+   and others): none of those were implicated in the hang, and routing all
+   of them through an explicit `Io` would mean auditing every one of their
+   callers for a reachable `Io` and for its own cooperative-yield safety —
+   out of scope for this fix. They remain bare `std.atomic.Mutex` spinlocks,
+   same as before; if any of them is ever found holding across a yield the
+   same way, it needs the same two-part treatment, not just the backoff
+   swap alone.
+
+Production behavior is unchanged: `io.sleep` and `BackendRuntime`'s own
+`io()` both resolve to the real OS clock/thread when not running under VOPR,
+identical to the `nanosleep`/`std.atomic.Mutex` they replace for
+`applied_sequence_mutex` specifically.
+
+Regression: `execution_resources.zig`'s `"a mutex held across a cooperative
+yield does not deadlock a single-worker Io scheduler"` constructs a
+single-worker `std.Io.Threaded` (`.async_limit = .nothing`, the same shape
+VOPR's cooperative scenario has) and runs two concurrent tasks on a bare
+`std.Io.Mutex`: task A locks it, `io.sleep`s while still holding it (the
+exact shape `flushPendingAppliedSequencesLocked` has around its commit), then
+releases; task B starts once A already holds the lock and contends for it.
+The test hangs (and the enclosing build step times out) if `std.Io.Mutex`
+ever regresses to blocking the underlying OS thread instead of cooperatively
+parking a contending task; it also asserts task B never observes the
+critical section as available before task A actually released it, i.e. that
+splitting the two locks did not also break mutual exclusion.
+
+Verified: the full-cluster VOPR hang is gone —
+`full-cluster-vopr-diag` (the clean/resource-pressure bundle) completes in
+its ordinary ~10-15 minutes instead of hitting the 50-minute timeout, back
+to the same `23/25, same two ReplaySelectedTransitionDiverged properties`
+state the entropy-fix section above already described and left open.
+`raft-vopr-test` and `lsm-vopr-test` stay green.
