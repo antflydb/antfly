@@ -34156,21 +34156,7 @@ fn assetStateValueAlloc(
     return try alloc.dupe(u8, &digest);
 }
 
-fn documentExtractionFingerprintAlloc(
-    alloc: Allocator,
-    source_url: []const u8,
-    config_json: []const u8,
-    config: document_extraction_mod.Config,
-    configured_content_type: []const u8,
-    configured_filename: []const u8,
-    downloaded_content_type: []const u8,
-    data: []const u8,
-) ![]u8 {
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
-    const identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, config, configured_content_type, configured_filename, downloaded_content_type, &digest);
-}
+const documentExtractionFingerprintAlloc = document_extraction_mod.contentFingerprintAlloc;
 
 test "OCR sampling byte fingerprints also preserve independent native quality without OCR" {
     const alloc = std.testing.allocator;
@@ -34219,46 +34205,7 @@ test "OCR sampling byte fingerprints also preserve independent native quality wi
 /// that digest with length-framed extraction parameters instead of rescanning
 /// a potentially large download for every consumer and completed-state probe.
 /// The domain tag intentionally invalidates legacy concatenation fingerprints.
-fn documentExtractionFingerprintFromDigestAlloc(
-    alloc: Allocator,
-    source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
-    config_json: []const u8,
-    config: document_extraction_mod.Config,
-    configured_content_type: []const u8,
-    configured_filename: []const u8,
-    downloaded_content_type: []const u8,
-    content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
-) ![]u8 {
-    const native_text = config.native_text;
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    document_extraction_mod.hashRenderPolicy(&hasher, config);
-    hasher.update("antfly.document-extraction.fingerprint.v4\x00");
-    hasher.update(source_identity);
-    for ([_][]const u8{ config_json, document_extraction_mod.native_text_extraction_identity, @tagName(native_text.policy), configured_content_type, configured_filename, downloaded_content_type }) |field| {
-        var size: [8]u8 = undefined;
-        std.mem.writeInt(u64, &size, @intCast(field.len), .little);
-        hasher.update(&size);
-        hasher.update(field);
-    }
-    for ([_]u64{
-        @intCast(native_text.quality.min_chars),
-        @intCast(native_text.quality.garbled_min_words),
-        @intCast(native_text.quality.garbled_sample_words),
-        @bitCast(native_text.quality.max_single_char_word_ratio),
-        @intCast(native_text.quality.min_line_chars),
-        @bitCast(native_text.quality.max_corrupted_line_ratio),
-        @bitCast(native_text.quality.max_font_corruption),
-        @bitCast(native_text.quality.max_replacement_ratio),
-    }) |value| {
-        var encoded: [8]u8 = undefined;
-        std.mem.writeInt(u64, &encoded, value, .little);
-        hasher.update(&encoded);
-    }
-    hasher.update(content_digest);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return try hexBytesAlloc(alloc, &digest);
-}
+const documentExtractionFingerprintFromDigestAlloc = document_extraction_mod.contentFingerprintFromDigestAlloc;
 
 fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, bytes.len * 2);

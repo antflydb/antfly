@@ -5371,7 +5371,7 @@ pub const DB = struct {
             truncateReplaySequenceAsync,
             beginDerivedCatchUpSessionAsync,
             finishDerivedCatchUpSessionAsync,
-            canAdvanceDerivedToTargetAsync,
+            canAdvanceDerivedToTargetAfterReplayAsync,
             notifyDerivedAppliedSequenceAdvanced,
             resource_manager,
             self.backend_runtime,
@@ -10405,12 +10405,17 @@ pub const DB = struct {
 
         const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
         const force_artifacts = [_][]const u8{artifact_name};
-        // Preserve forced generation's precommit planning. A write-only sync
-        // level would lose the force flag for unchanged cached asset outputs.
-        // Public acceptance only skips the postcommit, table-wide visibility wait.
+        var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer.deinit(alloc);
+        // Document extraction persists a config-fenced target generation with
+        // this source mutation. Replay owns provider work, including cold starts
+        // and retries; accepting it must never wait for remote OCR. Other asset
+        // producers still require precommit forcing until they have that durable
+        // execution contract too.
+        const deferred = !wait_for_completion and self.enrichment_runtime != null and producer.type == .document_extraction;
         try self.batchInternal(.{
             .writes = &writes,
-            .sync_level = .full_index,
+            .sync_level = if (deferred) .write else .full_index,
         }, null, .{
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
@@ -10981,6 +10986,10 @@ pub const DB = struct {
     ) !ArtifactRepairCompletionDisposition {
         const coverage_marker_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
         defer if (coverage_marker_key) |key| alloc.free(key);
+        // Resolve catalog policy before the ledger mutex; publication takes
+        // locks in the same order. Re-read only the payload under that mutex.
+        const extraction_key = try self.documentExtractionRepairKeyAlloc(alloc, issue);
+        defer if (extraction_key) |key| alloc.free(key);
 
         lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
         defer self.async_context.artifact_repair_issue_mutex.unlock();
@@ -11013,6 +11022,18 @@ pub const DB = struct {
             if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return .coverage_incomplete;
         }
 
+        if (extraction_key) |manifest_key| {
+            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                error.NotFound => return .coverage_incomplete,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return .coverage_incomplete,
+            };
+            if (health != .complete) return .coverage_incomplete;
+        }
         completion.completed_sequence = @max(completion.completed_sequence, revision.sequence);
         completion.pending_issues -|= 1;
 
@@ -12111,6 +12132,16 @@ pub const DB = struct {
         };
     }
 
+    fn documentExtractionRepairKeyAlloc(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !?[]u8 {
+        if (issue.artifact_kind != .asset) return null;
+        var cfg = (try self.getEnrichment(alloc, .asset, issue.artifact_name)) orelse return null;
+        defer cfg.deinit(alloc);
+        var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer.deinit(alloc);
+        if (producer.type != .document_extraction) return null;
+        return try internal_keys.artifactNamedPrefixAlloc(alloc, if (issue.parent_doc_key.len != 0) issue.parent_doc_key else issue.doc_key, "asset", issue.artifact_name);
+    }
+
     fn assetArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
         const doc_key = if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key;
         if (doc_key.len == 0 or issue.artifact_name.len == 0) return false;
@@ -12134,12 +12165,16 @@ pub const DB = struct {
             defer alloc.free(raw);
             return true;
         }
-        var manifest = (self.getDocumentArtifactManifest(alloc, doc_key, issue.artifact_name) catch |err| switch (err) {
+        const raw = self.core.store.get(alloc, expected_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return false,
-        }) orelse return false;
-        defer manifest.deinit(alloc);
-        return true;
+        };
+        return health == .complete;
     }
 
     fn embeddingArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
@@ -12233,6 +12268,16 @@ pub const DB = struct {
                 continue;
             };
         }
+    }
+
+    fn supportsDeferredArtifactRepair(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
+        if (issue.artifact_kind == .embedding) return true;
+        if (issue.artifact_kind != .asset) return false;
+        var cfg = (try self.getEnrichment(alloc, .asset, issue.artifact_name)) orelse return false;
+        defer cfg.deinit(alloc);
+        var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer.deinit(alloc);
+        return producer.type == .document_extraction;
     }
 
     /// Only submits replay. `.write` prepares durable force-generation intents
@@ -16976,10 +17021,17 @@ pub const DB = struct {
             }
             defer self.endIndexRepairLease(completion_key);
 
-            const completion_snapshot = if (issue.reason == .enrichment_failed or options.defer_durable_index_repair_execution)
+            const supports_deferred = options.defer_durable_index_repair_execution and
+                try self.supportsDeferredArtifactRepair(alloc, issue.*);
+            const completion_snapshot = if (issue.reason == .enrichment_failed or supports_deferred)
                 try self.artifactRepairCompletionSnapshot(alloc, completion_key)
             else
                 ArtifactRepairCompletionState{};
+            // Existing queued work remains observable while its runtime is
+            // absent or being reconfigured. New inline-only embedded work
+            // keeps its synchronous fallback instead of submitting no executor.
+            const defer_execution = supports_deferred and
+                (self.enrichment_runtime != null or completion_snapshot.queued_sequence != 0);
             if (issue.reason == .enrichment_failed and
                 completion_snapshot.completed_sequence >= issue.sequence)
             {
@@ -17014,7 +17066,7 @@ pub const DB = struct {
                 }
             }
 
-            if (options.defer_durable_index_repair_execution) {
+            if (defer_execution) {
                 const queued = completion_snapshot.queued_sequence;
                 const applied = try enrichment_state.loadAppliedSequence(alloc, self.core.store, enrichment_runtime_mod.scope_name);
                 // One job submits a failed source once. Polls wait for that
@@ -18675,7 +18727,7 @@ pub const DB = struct {
             }
             const advanced = catch_up_stats.appliedSequenceAdvance(applied) orelse blk: {
                 if (catch_up_stats.shouldTryTargetAdvance(applied, target_sequence) and
-                    try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence))
+                    try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence, catch_up_stats.targetAdvanceFromSequence(applied, target_sequence)))
                 {
                     break :blk target_sequence;
                 }
@@ -50770,8 +50822,6 @@ const appendDocumentUnitChunkWrites = local_mutation.appendDocumentUnitChunkWrit
 
 const buildDocumentUnitChunkPayloadAlloc = local_mutation.buildDocumentUnitChunkPayloadAlloc;
 
-const documentExtractionFingerprintAlloc = local_mutation.documentExtractionFingerprintAlloc;
-
 const documentExtractionUnitFingerprintAlloc = local_mutation.documentExtractionUnitFingerprintAlloc;
 
 /// Reconstruct the legacy extraction fingerprint from a pre-marker stored
@@ -56858,7 +56908,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
                 .sequence = sequence,
             });
         } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
-            try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence))
+            try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence, stats.targetAdvanceFromSequence(applied, target_sequence)))
         {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try finishReplayCaptureContext(&replay_ctx, index_ref, target_sequence);
@@ -56879,10 +56929,11 @@ fn canAdvanceDerivedReplayTargetContext(
     index_ref: index_manager_mod.ManagedIndexRef,
     from_sequence: u64,
     target_sequence: u64,
+    replayed_through_sequence: u64,
 ) !bool {
     if (target_sequence <= from_sequence) return true;
     if (ctx.async_context) |async_ctx| {
-        return try canAdvanceDerivedToTargetAsync(async_ctx, index_ref, from_sequence, target_sequence);
+        return try canAdvanceDerivedToTargetAfterReplayAsync(async_ctx, index_ref, from_sequence, target_sequence, replayed_through_sequence);
     }
 
     var async_ctx = AsyncContext{
@@ -56899,7 +56950,7 @@ fn canAdvanceDerivedReplayTargetContext(
         .promotion_runtime = ctx.promotion_runtime,
     };
     defer async_ctx.deinit(ctx.alloc);
-    return try canAdvanceDerivedToTargetAsync(&async_ctx, index_ref, from_sequence, target_sequence);
+    return try canAdvanceDerivedToTargetAfterReplayAsync(&async_ctx, index_ref, from_sequence, target_sequence, replayed_through_sequence);
 }
 
 fn applyDerivedBatchToIndexReplayContext(
@@ -56909,17 +56960,8 @@ fn applyDerivedBatchToIndexReplayContext(
 ) !bool {
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     const ctx = replay_ctx.batch;
-    if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) return false;
-    // Only a batch accepted by this projection may publish its source
-    // boundary from the window callback. A mutation-free tail is certified by
-    // canAdvanceDerivedToTargetAsync first, then Core.saveAppliedSequence
-    // emits the empty native coverage transaction. Publishing here would let
-    // the checkpoint itself bypass that cardinality proof.
-    if (index_ref.kind == .dense_vector) {
-        replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
-    }
-
     const async_ctx = AsyncContext{
+        .shared_artifact_repair_issue_mutex = if (ctx.async_context) |owner| owner.artifactRepairIssueMutex() else null,
         .alloc = ctx.alloc,
         .io = ctx.io,
         .store = ctx.store,
@@ -56931,6 +56973,19 @@ fn applyDerivedBatchToIndexReplayContext(
         .require_graph_resolution_contract = true,
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
     };
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) {
+        try local_mutation.applyAssetPublicationMetadataContext(&async_ctx, batch, index_ref.name, null);
+        return false;
+    }
+    // Only a batch accepted by this projection may publish its source
+    // boundary from the window callback. A mutation-free tail is certified by
+    // canAdvanceDerivedToTargetAsync first, then Core.saveAppliedSequence
+    // emits the empty native coverage transaction. Publishing here would let
+    // the checkpoint itself bypass that cardinality proof.
+    if (index_ref.kind == .dense_vector) {
+        replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
+    }
+
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
         const total_start_ns = monotonicTimeNs();
@@ -57437,7 +57492,7 @@ fn replayPendingDerivedBatches(
             try finishReplayCapture(&replay_ctx, index_ref, sequence);
             try self.core.saveAppliedSequence(index_ref.name, sequence);
         } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
-            try canAdvanceDerivedToTargetAsync(self.async_context, index_ref, applied, target_sequence))
+            try canAdvanceDerivedToTargetAfterReplayAsync(self.async_context, index_ref, applied, target_sequence, stats.targetAdvanceFromSequence(applied, target_sequence)))
         {
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try finishReplayCapture(&replay_ctx, index_ref, target_sequence);
@@ -57453,6 +57508,7 @@ fn replayPendingDerivedBatches(
 fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
     const resources = self.core.asyncResources();
     const ctx = AsyncContext{
+        .shared_artifact_repair_issue_mutex = self.async_context.artifactRepairIssueMutex(),
         .alloc = self.alloc,
         .io = self.backend_runtime.io(),
         .store = resources.store,
@@ -58705,13 +58761,17 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
     const self = replay_ctx.db;
     const resources = self.core.asyncResources();
-    if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) {
+        try local_mutation.applyAssetPublicationMetadataContext(self.async_context, batch, index_ref.name, null);
+        return false;
+    }
     // See applyDerivedBatchToIndexReplayContext: irrelevant tail windows must
     // not manufacture coverage before the target-advance completeness gate.
     if (index_ref.kind == .dense_vector) {
         replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
     }
     const ctx = AsyncContext{
+        .shared_artifact_repair_issue_mutex = self.async_context.artifactRepairIssueMutex(),
         .alloc = self.alloc,
         .io = self.backend_runtime.io(),
         .store = resources.store,
@@ -61322,30 +61382,20 @@ fn resetPath(path: []const u8) !void {
 pub fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (comptime storage_engine.enabled) return storage_engine.call("applyDerivedBatchToIndexAsync", .{ ctx, batch, index_ref, token });
-    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) {
-        // A successful extraction manifest is not a graph source row. Settle
-        // its repair metadata before advancing this otherwise empty window;
-        // journal replay retries cleanup after a crash or transient failure.
-        const has_asset_root = for (batch.changed_artifact_keys) |key| {
-            if (internal_keys.isAssetArtifactKey(key)) break true;
-        } else false;
-        if (has_asset_root) {
-            var replay = try acquireSnapshotReplayAsyncContext(ctx);
-            defer if (replay) |*lease| lease.release();
-            try local_mutation.clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
-        }
-        return false;
-    }
-    if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
-        return error.ReplayDocumentNotVisible;
-    }
-
     var admitted_replay = if (index_ref.kind == .dense_vector)
         try retainAsyncDenseCatchUpAdmission(ctx, index_ref.name, token)
     else
         null;
     defer if (admitted_replay) |*lease| lease.release();
     const admission = if (admitted_replay) |*lease| lease else null;
+
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) {
+        try local_mutation.applyAssetPublicationMetadataContext(ctx, batch, index_ref.name, admission);
+        return false;
+    }
+    if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
+        return error.ReplayDocumentNotVisible;
+    }
 
     // The executor opened the source capture in
     // beginDerivedCatchUpSessionAsync; this callback alone owns the right to
@@ -61699,6 +61749,10 @@ fn replayRangeHasManagedIndexApplicableRecord(
 }
 
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
+    return canAdvanceDerivedToTargetAfterReplayAsync(ctx_ptr, index_ref, from_sequence, target_sequence, from_sequence);
+}
+
+fn canAdvanceDerivedToTargetAfterReplayAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64, replayed_through_sequence: u64) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     const persisted_applied = try loadManagedAppliedSequenceContext(
         ctx.alloc,
@@ -61712,7 +61766,11 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         return true;
     }
 
-    if (try replayRangeHasManagedIndexApplicableRecord(ctx, index_ref, from_sequence, target_sequence)) return false;
+    // A visited metadata-only window is not an applied native generation.
+    // Skip only its applicability rescan; all completeness/cardinality checks
+    // below still run against the real persisted checkpoint and source state.
+    const scan_from = @max(from_sequence, @min(replayed_through_sequence, target_sequence));
+    if (try replayRangeHasManagedIndexApplicableRecord(ctx, index_ref, scan_from, target_sequence)) return false;
     if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
     if (index_ref.kind != .dense_vector) return true;
 
@@ -87703,6 +87761,11 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     // Both public endpoints acknowledge the committed request without waiting
     // for the unrelated retry debt. The repair queue still uses full_index.
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:repair", "document_units_v1"));
+    {
+        var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+        defer accepted.deinit(alloc);
+        try std.testing.expectEqual(before.generation, accepted.generation);
+    }
     // Public acceptance commits the request without entering inference. Neither
     // unrelated retries nor rejection by the requested provider can erase it.
     const calls_before_acceptance = gated.successful_requests.load(.acquire);
@@ -87738,6 +87801,7 @@ test "db document extraction manifest inspection and reprocess API" {
 
     var counting = CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
@@ -87855,6 +87919,8 @@ test "db document extraction manifest inspection and reprocess API" {
 
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
     try std.testing.expectEqual(first_calls, counting.calls);
+    try db.runUntilIdle();
+    try std.testing.expectEqual(first_calls, counting.calls);
 
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
@@ -87893,6 +87959,7 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expect(range_first.next_key != null);
     try std.testing.expectEqualStrings("doc:a", range_first.next_key.?);
 
+    try db.runUntilIdle();
     var range_after_a = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer range_after_a.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 3), range_after_a.generation);
@@ -87903,6 +87970,7 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expectEqual(@as(usize, 1), range_second.reprocessed);
     try std.testing.expect(range_second.next_key == null);
 
+    try db.runUntilIdle();
     var range_after_b = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer range_after_b.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), range_after_b.generation);
@@ -147751,7 +147819,6 @@ fn testLiteExternalDenseLifecycle(recreate: bool) !void {
     if (!complete) {
         var pending = try db.loadIndexRepairEntryById(a, repair_id);
         defer pending.deinit(a);
-        std.debug.print("repair phase={s} error={s}\n", .{ @tagName(pending.intent.phase), pending.intent.last_error orelse "none" });
     }
     try std.testing.expect(complete);
     db.shadow_index_repair_hook = null;
@@ -148333,12 +148400,80 @@ test "source vector sealed backup retains exact payloads across writes and porta
     try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, vector);
 }
 
+test "metadata replay progress preserves native completion admission and partial windows" {
+    const Stats = derived_worker.CatchUpStats;
+    const metadata: Stats = .{ .scanned_entries = 1, .last_sequence = 8 };
+    try std.testing.expectEqual(@as(?u64, null), metadata.appliedSequenceAdvance(4));
+    try std.testing.expect(metadata.shouldTryTargetAdvance(4, 10));
+    try std.testing.expectEqual(@as(u64, 8), metadata.targetAdvanceFromSequence(4, 10));
+    try std.testing.expectEqual(@as(u64, 6), metadata.targetAdvanceFromSequence(4, 6));
+    try std.testing.expectEqual(@as(u64, 4), (Stats{}).targetAdvanceFromSequence(4, 10));
+    const partial: Stats = .{ .scanned_entries = 1, .last_sequence = 8, .partial_yields = 1 };
+    try std.testing.expect(!partial.shouldTryTargetAdvance(4, 10));
+    try std.testing.expectEqual(@as(u64, 4), partial.targetAdvanceFromSequence(4, 10));
+}
+
+test "db successful forced document reprocess retires prior asset consumer debt" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |deferred| {
+        var tmp = try TestDirectory.init("forced-reprocess-repair-debt");
+        defer tmp.cleanup();
+        const options: OpenOptions = .{
+            .start_optional_runtime_workers = false,
+            .enrichment = if (deferred) .{ .owner_id = "repair-test", .enable_without_producers = true } else null,
+        };
+        var owned: ?DB = try DB.open(a, tmp.path(), options);
+        defer if (owned) |*active| active.close();
+        var db = &owned.?;
+        try db.addEnrichment(.{
+            .name = "units",
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        });
+        try db.addIndex(.{
+            .name = "page_text",
+            .kind = .full_text,
+            .config_json = "{\"sources\":[{\"artifact\":\"units\",\"field\":\"text\"}]}",
+        });
+        const value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBwcmludA==\"}";
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .full_index });
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+        defer a.free(key);
+        try recordArtifactRepairIssueContextDetailed(db.async_context, .asset, "page_text", "doc", "", "", "units", "", "units", key, null, 1, .enrichment_failed, 1, "ReadOutputTruncated");
+        try std.testing.expect(try db.reprocessDocumentArtifact(a, "doc", "units"));
+        if (deferred) {
+            var accepted = (try db.getDocumentArtifactManifest(a, "doc", "units")) orelse return error.TestUnexpectedResult;
+            defer accepted.deinit(a);
+            try std.testing.expectEqual(@as(u64, 1), accepted.generation);
+            // Reopen before servicing the request: the force-generation contract
+            // must survive the HTTP request and the original owner.
+            db.close();
+            owned = null;
+            owned = try DB.open(a, tmp.path(), options);
+            db = &owned.?;
+        }
+        try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+        _ = try db.waitForCurrentIndexTargets(&.{"page_text"}, monotonicTimeNs() + 30 * std.time.ns_per_s);
+        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        var manifest = (try db.getDocumentArtifactManifest(a, "doc", "units")) orelse return error.TestUnexpectedResult;
+        defer manifest.deinit(a);
+        try std.testing.expectEqual(@as(u64, 0), manifest.ocr_failed_count);
+        try std.testing.expectEqual(@as(u64, 2), manifest.generation);
+        const issues = try db.listArtifactRepairIssues(a, .asset, "page_text", 0);
+        defer types.freeArtifactRepairIssues(a, issues);
+        try std.testing.expectEqual(@as(usize, 0), issues.len);
+    }
+}
+
 test "db successful asset publication clears terminal debt but stale and failed publications do not" {
     const a = std.testing.allocator;
     var tmp = try TestDirectory.init("asset-repair-publication");
     defer tmp.cleanup();
     var db = try DB.open(a, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
     defer a.free(key);
@@ -148364,6 +148499,15 @@ test "db successful asset publication clears terminal debt but stale and failed 
         const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
         defer types.freeArtifactRepairIssues(a, issues);
         try std.testing.expectEqual(@as(usize, 1), issues.len);
+    }
+    {
+        const pending = try db.listArtifactRepairIssues(a, .asset, "text", 1);
+        defer types.freeArtifactRepairIssues(a, pending);
+        try std.testing.expect(!try db.artifactNowReadable(a, pending[0]));
+        const completion_key = try db.artifactRepairCompletionKeyForIssueAlloc(a, pending[0]);
+        defer a.free(completion_key);
+        const completion = try db.artifactRepairCompletionSnapshot(a, completion_key);
+        try std.testing.expectEqual(DB.ArtifactRepairCompletionDisposition.coverage_incomplete, try db.completeArtifactRepairIssueIfCurrent(a, pending[0], DB.ArtifactRepairIssueRevision.capture(pending[0]), completion_key, completion.epoch, false));
     }
     try db.core.store.put(key, "{\"route_type\":\"text\",\"merge_plan\":{\"status\":\"converged\"},\"unit_count\":1,\"chunk_count\":1}");
     var stale = batch;
@@ -150993,4 +151137,68 @@ test "source semantic media input native asset replay survives provider-free rec
     try db.reconfigureEnrichmentRuntimePaused(.{});
     try std.testing.expect(db.enrichment_runtime != null);
     try std.testing.expect(db.enrichment_runtime.?.config.enable_without_producers);
+}
+
+test "metadata replay progress borrows dense admission past a queued capture" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata-admission", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try DB.open(a, path, .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const admission = db.core.snapshot_replay_admission;
+    var lease: ?snapshot_admission_mod.SnapshotAdmission.MutationLease = admission.acquireMutation();
+    const token = try installAsyncDenseCatchUpSession(db.async_context, "metadata", 1, null, &lease);
+    var session_open = true;
+    defer if (session_open) {
+        var session = takeAsyncDenseCatchUpSession(db.async_context, "metadata", token) catch unreachable;
+        db.async_context.alloc.free(session.index_name);
+        if (session.snapshot_replay) |*held| held.release();
+    };
+    const Work = struct {
+        fn capture(barrier: *snapshot_admission_mod.SnapshotAdmission, done: *std.atomic.Value(bool)) void {
+            var held = barrier.acquireCapture();
+            defer held.release();
+            done.store(true, .release);
+        }
+    };
+    var capture_done = std.atomic.Value(bool).init(false);
+    const capture = try std.Thread.spawn(.{}, Work.capture, .{ admission, &capture_done });
+    var capture_joined = false;
+    defer {
+        if (session_open) {
+            var session = takeAsyncDenseCatchUpSession(db.async_context, "metadata", token) catch unreachable;
+            db.async_context.alloc.free(session.index_name);
+            if (session.snapshot_replay) |*held| held.release();
+            session_open = false;
+        }
+        if (!capture_joined) capture.join();
+    }
+    // Observe the actual exclusive waiter, rather than relying on a sleep or
+    // elapsed-time threshold. Its presence closes admission to new readers.
+    while (admission.lock.exclusive_waiters.load(.acquire) == 0) std.Thread.yield() catch {};
+    try std.testing.expect(!admission.lock.tryLockShared());
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(key);
+    // This must borrow the exact dense session's lease. Reacquiring shared
+    // admission here would deadlock against the capture waiting for that lease.
+    try std.testing.expect(!try applyDerivedBatchToIndexAsync(db.async_context, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{key},
+    }, .{ .name = "metadata", .kind = .dense_vector }, token));
+    try std.testing.expect(!capture_done.load(.acquire));
+    var session = try takeAsyncDenseCatchUpSession(db.async_context, "metadata", token);
+    db.async_context.alloc.free(session.index_name);
+    if (session.snapshot_replay) |*held| held.release();
+    session_open = false;
+    capture.join();
+    capture_joined = true;
+    try std.testing.expect(capture_done.load(.acquire));
+    try std.testing.expect(admission.lock.tryLockExclusive());
+    admission.lock.unlockExclusive();
 }
