@@ -1000,6 +1000,11 @@ pub const Ticket = struct {
     allocator: Allocator = undefined,
     ptr: *anyopaque = undefined,
     wait_fn: ?*const fn (Allocator, *anyopaque) anyerror!void = null,
+    /// Optional: set only by a backend whose staged-commit phase can report
+    /// the sequence its group committed at (currently just Lite's native
+    /// store -- see `lite/docstore.zig`'s `Store.Ticket.waitSequence` and
+    /// `batchFrom`'s `commitStaged` below). Regression-B test hook.
+    wait_sequence_fn: ?*const fn (Allocator, *anyopaque) anyerror!u64 = null,
 
     /// A ticket for a write that is already durable (or needed no durability
     /// phase of its own) by the time it is returned.
@@ -1007,8 +1012,19 @@ pub const Ticket = struct {
         return .{};
     }
 
+    /// A ticket must be waited on exactly once, via either `wait` or
+    /// `waitSequence`, never both.
     pub fn wait(self: Ticket) !void {
         if (self.wait_fn) |run| try run(self.allocator, self.ptr);
+    }
+
+    /// Like `wait`, also returning the commit sequence this ticket's own
+    /// group committed at -- 0 on a backend with no `wait_sequence_fn` (no
+    /// such concept, or `alreadyDurable()`'s empty ticket).
+    pub fn waitSequence(self: Ticket) !u64 {
+        if (self.wait_sequence_fn) |run| return try run(self.allocator, self.ptr);
+        try self.wait();
+        return 0;
     }
 };
 
@@ -2263,6 +2279,8 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
                         defer alloc.destroy(typed);
                         defer parent_allocator.destroy(boxed_parent);
                         typed.payload.wait() catch |err| {
+                            // (See the matching catch in `wait_sequence_fn`
+                            // below -- same contract, different return type.)
                             // On success `payload.wait` (the backend's own
                             // staged-commit type) already released/freed
                             // everything it owns. On failure it deliberately
@@ -2279,6 +2297,25 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
                         };
                     }
                 }.run,
+                // Regression-B test hook: only when `Handle.commitStaged`'s
+                // own result type (`@TypeOf(payload)`, Lite's `StagedCommit`)
+                // actually exposes `waitSequence` -- currently always true,
+                // since Lite is the only `Handle` with `commitStaged` at
+                // all, but guarded the same way every other optional vtable
+                // entry above is, in case that ever changes.
+                .wait_sequence_fn = if (@hasDecl(@TypeOf(payload), "waitSequence")) struct {
+                    fn run(alloc: Allocator, raw: *anyopaque) anyerror!u64 {
+                        const typed: *TicketBox = @ptrCast(@alignCast(raw));
+                        const boxed_parent = typed.parent;
+                        const parent_allocator = boxed_parent.allocator;
+                        defer alloc.destroy(typed);
+                        defer parent_allocator.destroy(boxed_parent);
+                        return typed.payload.waitSequence() catch |err| {
+                            boxed_parent.handle.abort();
+                            return err;
+                        };
+                    }
+                }.run else null,
             };
         }
 
