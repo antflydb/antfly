@@ -27,7 +27,7 @@ from uuid import uuid4
 import pytest
 import requests
 
-from helpers import start_http_server, wait_until
+from helpers import PhaseTimings, start_http_server, wait_until
 
 
 # Server ownership is dynamic/direct, outside static fixture inference.
@@ -35,10 +35,18 @@ pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
 def _write_grouped_fixture(
-    api, table_name, *, inserts=None, deletes=None, sync_level=None, timeout_s=120.0
+    api,
+    table_name,
+    *,
+    inserts=None,
+    deletes=None,
+    sync_level=None,
+    timeout_s=120.0,
+    timings=None,
 ):
     """Retry only idempotent fixture rows until their visibility fence succeeds."""
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
     observed = {}
 
     def attempt():
@@ -80,6 +88,15 @@ def _write_grouped_fixture(
         observed,
         api.debug_logs()[-16000:],
     )
+    if timings is not None:
+        timings.observe(
+            "batch-visibility",
+            sync_level=sync_level,
+            result_status=observed.get("status"),
+            insert_count=len(inserts or {}),
+            delete_count=len(deletes or []),
+            visibility_wait_seconds=round(time.monotonic() - started, 6),
+        )
     return observed
 
 
@@ -114,6 +131,7 @@ def test_grouped_generation_orders_prior_context_and_bounds_replay(
     siblings,
     cells,
 ):
+    timings = PhaseTimings(request.node.name)
     if raft:
         monkeypatch.setenv("ANTFLY_E2E_STATEFUL_RAFT", "1")
     if max_members == 1:
@@ -372,7 +390,7 @@ def test_grouped_generation_orders_prior_context_and_bounds_replay(
             }
 
         def write(table_name, **kwargs):
-            return _write_grouped_fixture(api, table_name, **kwargs)
+            return _write_grouped_fixture(api, table_name, timings=timings, **kwargs)
 
         def matching(prefix):
             with lock:
