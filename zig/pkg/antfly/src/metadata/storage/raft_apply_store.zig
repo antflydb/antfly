@@ -12785,7 +12785,35 @@ pub const RaftApplyStore = struct {
         defer descriptor.deinit();
         if (descriptor.value.definition.generation != plan.generation or
             !std.mem.eql(u8, &try descriptor.value.definition.fingerprint(a), &plan.definition)) return error.RetainedOwnerPlanChanged;
-        return std.json.Stringify.valueAlloc(alloc, .{ .cursor = key.cursor, .plan = plan, .owner = owner.value, .resource = resource.value }, .{});
+        // A native actor receives the source schema and physical owner from
+        // this same cut. No independent table-name lookup can substitute a
+        // replacement source between plan admission and command compilation.
+        var source_table: ?metadata.TableRecord = null;
+        var source_range: ?metadata.RangeRecord = null;
+        if (descriptor.value.source) |expected| {
+            const meta = try system_catalog_storage.readMeta(a, &txn, group);
+            const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta } };
+            const actual = (try reader.retainedSource(plan.source_table)) orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &actual.identity(), &plan.source) or !std.mem.eql(u8, &expected.identity(), &plan.source) or
+                !std.mem.eql(u8, &actual.schema, &expected.schema) or actual.schema_version != expected.schema_version) return error.RetainedOwnerPlanChanged;
+            const fence = try self.loadTableTransitionFenceTxn(&txn, group, plan.source_table);
+            if (fence.active() or fence.generation != plan.topology_generation or
+                !std.mem.eql(u8, &fence.membership(plan.source_table).digest, &plan.membership)) return error.RetainedOwnerPlanChanged;
+            var source_key: [160]u8 = undefined;
+            source_table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&source_key, group, plan.source_table)));
+            source_range = try decodeRangeRecord(a, try txn.get(try rangeKeyForGroup(&source_key, group, owner.value.group)));
+            if (source_table.?.table_id != plan.source_table or source_range.?.table_id != plan.source_table or
+                source_range.?.group_id != owner.value.group) return error.InvalidRetainedOwnerPlan;
+            const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{
+                .table_id = plan.source_table,
+                .shard_id = metadata_table_manager.rangeDocIdentityShardId(source_range.?),
+                .range_id = metadata_table_manager.rangeDocIdentityRangeId(source_range.?),
+            });
+            var partition: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+            if (!std.mem.eql(u8, &partition, &owner.value.partition)) return error.RetainedOwnerPlanChanged;
+        } else if (owner.value.mode != .revoked) return error.RetainedOwnerPlanChanged;
+        return std.json.Stringify.valueAlloc(alloc, .{ .cursor = key.cursor, .plan = plan, .owner = owner.value, .resource = resource.value, .source_table = source_table, .source_range = source_range }, .{});
     }
 
     pub fn retainedDatasetWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64, native: bool) ![]u8 {
@@ -45646,11 +45674,13 @@ test "system catalog retained activation journals source ownership atomically an
     {
         const bytes = try store.retainedOwnerReadJson(a, group, .{ .work = .{} });
         defer a.free(bytes);
-        var value = try std.json.parseFromSlice(struct { cursor: retained_owner_model.Cursor, plan: retained_owner_model.Plan, owner: retained_owner_model.Owner, resource: system_catalog.Resource }, a, bytes, .{});
+        var value = try std.json.parseFromSlice(struct { cursor: retained_owner_model.Cursor, plan: retained_owner_model.Plan, owner: retained_owner_model.Owner, resource: system_catalog.Resource, source_table: ?metadata.TableRecord, source_range: ?metadata.RangeRecord }, a, bytes, .{});
         defer value.deinit();
         try std.testing.expectEqual(@as(u64, 2), value.value.cursor.owner_group);
         try std.testing.expectEqualDeep(original, value.value.plan);
         try std.testing.expectEqual(original.resource, value.value.resource.id);
+        try std.testing.expectEqual(@as(u64, 7), value.value.source_table.?.table_id);
+        try std.testing.expectEqual(@as(u64, 2), value.value.source_range.?.group_id);
         const exact: retained_owner_model.Read = .{ .owner = .{ .resource = original.resource, .generation = 1, .plan = original.id, .group = 2, .revision = 1 } };
         const exact_bytes = try store.retainedOwnerReadJson(a, group, exact);
         defer a.free(exact_bytes);
@@ -45664,6 +45694,44 @@ test "system catalog retained activation journals source ownership atomically an
         const wrapped = try store.retainedOwnerReadJson(a, group, .{ .work = .{ .resource = original.resource, .generation = 1, .owner_group = 71 } });
         defer a.free(wrapped);
         try std.testing.expectEqualStrings(bytes, wrapped);
+        // Simulate independently restored metadata bypassing normal source
+        // admission. The owner must refuse a changed schema or physical
+        // namespace even if its journal revision still matches the request.
+        const original_table = try encodeTableRecord(a, table);
+        defer a.free(original_table);
+        var changed_table = table;
+        changed_table.schema_json = "{\"version\":2}";
+        const replacement = try encodeTableRecord(a, changed_table);
+        defer a.free(replacement);
+        var source_key: [160]u8 = undefined;
+        {
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.put(try tableKeyForGroup(&source_key, group, table.table_id), replacement);
+            try write.commit();
+        }
+        try std.testing.expectError(error.RetainedOwnerPlanChanged, store.retainedOwnerReadJson(a, group, exact));
+        const wrong_range = try encodeRangeRecord(a, .{ .table_id = 7, .group_id = 2, .range_id = 99, .start_key = "", .end_key = "a" });
+        defer a.free(wrong_range);
+        const original_range = try encodeRangeRecord(a, .{ .table_id = 7, .group_id = 2, .range_id = 2, .start_key = "", .end_key = "a" });
+        defer a.free(original_range);
+        {
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.put(try tableKeyForGroup(&source_key, group, table.table_id), original_table);
+            try write.put(try rangeKeyForGroup(&source_key, group, 2), wrong_range);
+            try write.commit();
+        }
+        try std.testing.expectError(error.RetainedOwnerPlanChanged, store.retainedOwnerReadJson(a, group, exact));
+        {
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.put(try rangeKeyForGroup(&source_key, group, 2), original_range);
+            try write.commit();
+        }
+        const recovered = try store.retainedOwnerReadJson(a, group, exact);
+        defer a.free(recovered);
+        try std.testing.expectEqualStrings(bytes, recovered);
     }
     // Even an internally forwarded descriptor cannot promote an owner which
     // has never acknowledged installation, or detach by inventing a receipt.
