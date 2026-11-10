@@ -422,6 +422,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db enrichment restart supervisor recovers transient start failures",
         "storage.db.db.test.db enrichment status changes notify query visibility hook",
         "storage.db.db.test.db enrichment status changes notify only after atomic publication",
+        "storage.db.db.test.db enrichment status changes notify after discarding corrupt optional cursors",
         "storage.db.db.test.db enrichment status does not wait for lifecycle mutation",
         "storage.db.db.test.db enrichments precomputed watermark advances across replay entries without enrichment debt",
         "storage.db.db.test.db enrichments precomputes generated enrichments into the committed batch",

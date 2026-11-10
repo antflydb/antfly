@@ -78058,62 +78058,130 @@ test "db enrichment status changes notify only after atomic publication" {
         }
     };
     const alloc = std.testing.allocator;
-    for (std.enums.values(Phase)) |phase| {
-        var path_tmp = try TestDirectory.init("db");
-        defer path_tmp.cleanup();
-        const path = path_tmp.path().ptr;
-        defer cleanupTempDir(path);
-        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-        var db = try DB.open(alloc, std.mem.span(path), .{
-            .enrichment = .{ .dense_embedder = deterministic.interface() },
-            .start_index_workers = false,
-            .start_optional_runtime_workers = false,
-        });
-        defer db.close();
-        const runtime = db.enrichment_runtime.?;
-        try enrichment_state.saveRuntimeStatus(runtime.store, "generated", .{ .worker_failed = true, .target_sequence = 1 });
-        for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
-            try enrichment_state.saveReplayCursor(runtime.store, scope, .{ .base_applied_sequence = 0, .sequence = 1, .doc_key = @constCast("pending") });
-        }
-        runtime.worker_failed = true;
-        runtime.target_sequence = 1;
-        const original_vtable = runtime.store.vtable;
-        var vtable = original_vtable.*;
-        Fault.begin_original = vtable.begin_write;
-        Fault.phase = phase;
-        Fault.begins = 0;
-        vtable.begin_write = Fault.begin;
-        runtime.store.vtable = &vtable;
-        defer runtime.store.vtable = original_vtable;
-        try std.testing.expectError(error.InputOutput, runtime.markAppliedThrough(1));
-        try std.testing.expectEqual(@as(u64, 0), runtime.applied_sequence);
-        try std.testing.expect(runtime.worker_failed);
-        try std.testing.expectEqual(@as(u64, 0), try enrichment_state.loadAppliedSequence(alloc, runtime.store, "generated"));
-        try std.testing.expect((try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated")).worker_failed);
-        for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
-            var cursor = (try enrichment_state.loadReplayCursor(alloc, runtime.store, scope)) orelse return error.TestUnexpectedResult;
-            defer cursor.deinit(alloc);
-            try std.testing.expectEqual(@as(u64, 1), cursor.sequence);
-        }
-        Fault.phase = null;
-        Fault.begins = 0;
-        if (phase == .begin or phase == .cursor) {
+    for ([_]bool{ false, true }) |corrupt_cursor| {
+        for (std.enums.values(Phase)) |phase| {
+            var path_tmp = try TestDirectory.init("db");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path().ptr;
+            defer cleanupTempDir(path);
+            var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+            var db = try DB.open(alloc, std.mem.span(path), .{
+                .enrichment = .{ .dense_embedder = deterministic.interface() },
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+            });
+            defer db.close();
+            const runtime = db.enrichment_runtime.?;
+            try enrichment_state.saveRuntimeStatus(runtime.store, "generated", .{ .worker_failed = true, .target_sequence = 1 });
+            for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
+                try enrichment_state.saveReplayCursor(runtime.store, scope, .{ .base_applied_sequence = 0, .sequence = 1, .doc_key = @constCast("pending") });
+            }
+            if (corrupt_cursor) {
+                var txn = try runtime.store.beginWrite();
+                errdefer txn.abort();
+                try txn.put("\x00\x00__metadata__:enrichment_replay_cursor:generated.assets", "corrupt");
+                try txn.commit();
+            }
+            runtime.worker_failed = true;
+            runtime.target_sequence = 1;
+            const original_vtable = runtime.store.vtable;
+            var vtable = original_vtable.*;
+            Fault.begin_original = vtable.begin_write;
+            Fault.phase = phase;
+            Fault.begins = 0;
+            vtable.begin_write = Fault.begin;
+            runtime.store.vtable = &vtable;
+            defer runtime.store.vtable = original_vtable;
+            try std.testing.expectError(error.InputOutput, runtime.markAppliedThrough(1));
+            try std.testing.expectEqual(@as(u64, 0), runtime.applied_sequence);
+            try std.testing.expect(runtime.worker_failed);
+            try std.testing.expectEqual(@as(u64, 0), try enrichment_state.loadAppliedSequence(alloc, runtime.store, "generated"));
+            try std.testing.expect((try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated")).worker_failed);
+            for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
+                if (corrupt_cursor and std.mem.eql(u8, scope, "generated.assets")) {
+                    try std.testing.expectError(error.InvalidEnrichmentState, enrichment_state.loadReplayCursor(alloc, runtime.store, scope));
+                    continue;
+                }
+                var cursor = (try enrichment_state.loadReplayCursor(alloc, runtime.store, scope)) orelse return error.TestUnexpectedResult;
+                defer cursor.deinit(alloc);
+                try std.testing.expectEqual(@as(u64, 1), cursor.sequence);
+            }
+            Fault.phase = null;
+            Fault.begins = 0;
+            if (phase == .begin or phase == .cursor) {
+                try db.markPrecomputedEnrichmentAppliedForSync(.enrichments, 1);
+            } else {
+                const context = db.batchContext();
+                try markPrecomputedEnrichmentAppliedForSyncContext(&context, .enrichments, 1);
+            }
+            try std.testing.expectEqual(@as(usize, 1), Fault.begins);
+            try std.testing.expectEqual(@as(u64, 1), runtime.applied_sequence);
+            try std.testing.expect(!runtime.worker_failed);
+            try std.testing.expectEqual(@as(u64, 1), try enrichment_state.loadAppliedSequence(alloc, runtime.store, "generated"));
+            try std.testing.expect(!(try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated")).worker_failed);
+            for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
+                try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, runtime.store, scope)) == null);
+            }
+            try runtime.markAppliedThrough(1);
             try db.markPrecomputedEnrichmentAppliedForSync(.enrichments, 1);
-        } else {
-            const context = db.batchContext();
-            try markPrecomputedEnrichmentAppliedForSyncContext(&context, .enrichments, 1);
+            try std.testing.expectEqual(@as(usize, 1), Fault.begins);
         }
-        try std.testing.expectEqual(@as(usize, 1), Fault.begins);
-        try std.testing.expectEqual(@as(u64, 1), runtime.applied_sequence);
-        try std.testing.expect(!runtime.worker_failed);
-        try std.testing.expectEqual(@as(u64, 1), try enrichment_state.loadAppliedSequence(alloc, runtime.store, "generated"));
-        try std.testing.expect(!(try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated")).worker_failed);
-        for ([_][]const u8{ "generated.assets", "generated.dense" }) |scope| {
-            try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, runtime.store, scope)) == null);
+    }
+}
+
+test "db enrichment status changes notify after discarding corrupt optional cursors" {
+    const alloc = std.testing.allocator;
+    const scopes = [_][]const u8{ "generated.assets", "generated.dense" };
+    for (scopes, 0..) |bad_scope, bad_index| {
+        for ([_]bool{ false, true }) |bad_checksum| {
+            var path_tmp = try TestDirectory.init("db");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path().ptr;
+            defer cleanupTempDir(path);
+            var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+            var db = try DB.open(alloc, std.mem.span(path), .{
+                .enrichment = .{ .dense_embedder = deterministic.interface() },
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+            });
+            defer db.close();
+            const runtime = db.enrichment_runtime.?;
+            const future_scope = scopes[1 - bad_index];
+            try enrichment_state.saveReplayCursor(runtime.store, bad_scope, .{ .base_applied_sequence = 0, .sequence = 1, .doc_key = @constCast("completed") });
+            try enrichment_state.saveReplayCursor(runtime.store, future_scope, .{ .base_applied_sequence = 0, .sequence = 2, .doc_key = @constCast("future") });
+            const bad_key = try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:enrichment_replay_cursor:{s}", .{bad_scope});
+            defer alloc.free(bad_key);
+            {
+                var txn = try runtime.store.beginWrite();
+                errdefer txn.abort();
+                if (bad_checksum) {
+                    const raw = try alloc.dupe(u8, try txn.get(bad_key));
+                    defer alloc.free(raw);
+                    raw[raw.len - 1] ^= 1;
+                    try txn.put(bad_key, raw);
+                } else try txn.put(bad_key, "corrupt");
+                try txn.commit();
+            }
+            runtime.target_sequence = 2;
+            runtime.retrying = true;
+            runtime.next_retry_at_ms = 42;
+            if (bad_checksum) {
+                const context = db.batchContext();
+                try markPrecomputedEnrichmentAppliedForSyncContext(&context, .enrichments, 1);
+            } else try db.markPrecomputedEnrichmentAppliedForSync(.enrichments, 1);
+            try std.testing.expectEqual(@as(u64, 1), runtime.applied_sequence);
+            try std.testing.expectEqual(@as(u64, 1), try enrichment_state.loadAppliedSequence(alloc, runtime.store, "generated"));
+            try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, runtime.store, bad_scope)) == null);
+            var future = (try enrichment_state.loadReplayCursor(alloc, runtime.store, future_scope)) orelse return error.TestUnexpectedResult;
+            defer future.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 1), future.base_applied_sequence);
+            try std.testing.expectEqual(@as(u64, 2), future.sequence);
+            try std.testing.expectEqualStrings("future", future.doc_key);
+            const status = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated");
+            try std.testing.expect(status.retrying);
+            try std.testing.expectEqual(@as(u64, 2), status.target_sequence);
+            try std.testing.expectEqual(@as(u64, 42), status.next_retry_at_ms);
         }
-        try runtime.markAppliedThrough(1);
-        try db.markPrecomputedEnrichmentAppliedForSync(.enrichments, 1);
-        try std.testing.expectEqual(@as(usize, 1), Fault.begins);
     }
 }
 

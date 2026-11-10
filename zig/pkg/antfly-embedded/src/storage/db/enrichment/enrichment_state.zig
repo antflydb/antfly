@@ -270,7 +270,18 @@ pub fn publishAppliedProgress(alloc: Allocator, store: anytype, scope: []const u
         defer alloc.free(cursor_key);
         const cursor_raw = txn.get(cursor_key) catch |err| if (err == error.NotFound) null else return err;
         if (cursor_raw) |bytes| {
-            var cursor = try decodeReplayCursor(alloc, bytes);
+            var cursor = decodeReplayCursor(alloc, bytes) catch |err| switch (err) {
+                // Cursors only avoid replaying already prepared work. Match
+                // worker recovery: corrupt optimization state cannot block an
+                // authoritative applied cut. Delete it in this same transaction
+                // so a storage failure still rolls back the whole publication.
+                error.InvalidEnrichmentState => {
+                    std.log.warn("discarding corrupt enrichment replay cursor scope={s}", .{cursor_scope});
+                    try txn.delete(cursor_key);
+                    continue;
+                },
+                else => return err,
+            };
             defer cursor.deinit(alloc);
             if (cursor.sequence <= sequence) {
                 try txn.delete(cursor_key);
