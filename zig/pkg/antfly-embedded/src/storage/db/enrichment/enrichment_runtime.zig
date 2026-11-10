@@ -1891,7 +1891,7 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
         if (request.input_kind != .document) {
-            const text = (try reembedChunkTextAlloc(runtime, request, &cache.sources, scoped_chunker)) orelse continue;
+            const text = (try reembedChunkTextAlloc(runtime, request, &cache.sources, scoped_chunker, session.cancellation != null)) orelse continue;
             if (request.expected_source_hash) |expected| {
                 const legacy = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
                 const actual = retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
@@ -1926,7 +1926,7 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
                     if (actual != expected) continue;
                     require_digest = generation.revision == null;
                 }
-                const vector = try embedDensePartsTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(request), parts, dims);
+                const vector = try embedDensePartsTrackedImpl(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(request), parts, dims, session.cancellation != null);
                 defer alloc.free(vector);
                 try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(request), generation);
                 try validateRecoveredVector(vector, dims);
@@ -2005,6 +2005,7 @@ fn reembedChunkTextAlloc(
     request: enrichment_types.GeneratedEnrichmentRequest,
     source_cache: *ReembedChunkSourceCache,
     provider: ?ChunkProvider,
+    foreground: bool,
 ) !?[]u8 {
     if (request.input_kind != .inline_chunks) return error.ReembedUnsupportedInput;
     const alloc = runtime.alloc;
@@ -2031,6 +2032,10 @@ fn reembedChunkTextAlloc(
             // These chunks carry model metadata and never qualify for text
             // elision. Reject legacy stubs before executing media inference.
             if (config.isModelAware()) return error.ReembedUnsupportedInput;
+            if (foreground and config.provider == .antfly and std.mem.trim(u8, config.api_url, " \t\r\n").len == 0) {
+                if (provider) |value| if (value.chunk_input_callback != null and value.chunk_input_with_context_callback == null)
+                    return error.UncancellableInferenceProvider;
+            }
         }
         const entry = try alloc.create(ReembedChunkSourceCache.Entry);
         errdefer alloc.destroy(entry);
@@ -2072,6 +2077,10 @@ pub fn embedDensePartsTracked(
     parts: []const template.ContentPart,
     dims: u32,
 ) ![]f32 {
+    return embedDensePartsTrackedImpl(runtime, index_names, alloc, dense_embedder, embedding_name, parts, dims, false);
+}
+
+fn embedDensePartsTrackedImpl(runtime: *EnrichmentRuntime, index_names: []const []const u8, alloc: Allocator, dense_embedder: embedder_mod.DenseEmbedder, embedding_name: []const u8, parts: []const template.ContentPart, dims: u32, foreground: bool) ![]f32 {
     var total_bytes: usize = 0;
     var max_bytes: usize = 0;
     for (parts) |part| {
@@ -2085,7 +2094,10 @@ pub fn embedDensePartsTracked(
     }
     noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
     const started_ns = runtime.clock.nowRealtimeNs();
-    const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
+    const vector = (if (foreground)
+        dense_embedder.embedDensePartsWithContext(alloc, embedding_name, parts, dims, dense_embedder.part_request_context.?)
+    else
+        dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims)) catch |err| {
         noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
@@ -6228,6 +6240,18 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
             @memset(out, self.bad_value orelse 1);
             return out;
         }
+        fn controlledParts(raw: *anyopaque, a: Allocator, name: []const u8, input: []const template.ContentPart, dims: u32, context: inference_request_context.RequestContext) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.check();
+            if (self.cancel_on_batch) |signal| signal.store(true, .release);
+            try context.check();
+            return parts(raw, a, name, input, dims);
+        }
+        fn legacyChunk(raw: *anyopaque, _: Allocator, _: []const u8, _: @import("inference_chunker").Input, _: @import("../../../chunking/types.zig").Config) ![]@import("inference_chunker").Chunk {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.chunk_calls += 1;
+            return error.InvalidChunkProvider;
+        }
         fn chunk(raw: *anyopaque, a: Allocator, _: []const u8, input: @import("inference_chunker").Input, _: @import("../../../chunking/types.zig").Config, context: inference_request_context.RequestContext) ![]@import("inference_chunker").Chunk {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.chunk_calls += 1;
@@ -6257,7 +6281,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         }
 
         fn interface(self: *@This()) embedder_mod.DenseEmbedder {
-            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_parts_fn = parts, .dense_embed_batch_fn = embedDenseBatch, .dense_embed_batch_with_context_fn = controlledBatch, .capabilities_fn = caps, .deinit_fn = null };
+            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_parts_fn = parts, .dense_embed_parts_with_context_fn = controlledParts, .dense_embed_batch_fn = embedDenseBatch, .dense_embed_batch_with_context_fn = controlledBatch, .capabilities_fn = caps, .deinit_fn = null };
         }
     };
     var probe = Probe{};
@@ -6379,9 +6403,9 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     {
         var sources = ReembedChunkSourceCache{};
         defer sources.deinit(alloc);
-        const text = (try reembedChunkTextAlloc(&runtime, requests[0], &sources, runtime.config.chunk_provider)).?;
+        const text = (try reembedChunkTextAlloc(&runtime, requests[0], &sources, runtime.config.chunk_provider, false)).?;
         defer alloc.free(text);
-        try std.testing.expect((try reembedChunkTextAlloc(&runtime, requests[1], &sources, runtime.config.chunk_provider)) == null);
+        try std.testing.expect((try reembedChunkTextAlloc(&runtime, requests[1], &sources, runtime.config.chunk_provider, false)) == null);
         try std.testing.expectEqual(@as(usize, 1), sources.entries.count());
     }
 
@@ -6459,6 +6483,20 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         try std.testing.expect(signal.load(.acquire));
         try std.testing.expectEqual(before, probe.batch_calls);
         try std.testing.expect(runtime.config.chunk_provider.?.execution.cancellation.ptr == null);
+        signal.store(false, .release);
+        probe.cancel_on_chunk = null;
+        runtime.config.chunk_provider.?.chunk_input_callback = @ptrCast(&Probe.legacyChunk);
+        runtime.config.chunk_provider.?.chunk_input_with_context_callback = null;
+        const chunk_calls = probe.chunk_calls;
+        try std.testing.expectError(error.UncancellableInferenceProvider, reembedDenseDocumentsSession(&runtime, alloc, &.{request}, 2, out[0..2], found[0..1], &cancelled));
+        try std.testing.expectEqual(chunk_calls, probe.chunk_calls);
+        var document = document_request;
+        document.input_kind = .document;
+        document.source_template = "literal";
+        probe.cancel_on_batch = &signal;
+        defer probe.cancel_on_batch = null;
+        try std.testing.expectError(error.Cancelled, reembedDenseDocumentsSession(&runtime, alloc, &.{document}, 2, out[0..2], found[0..1], &cancelled));
+        try std.testing.expect(signal.load(.acquire));
     }
 
     // Stored-chunk inputs are not re-chunked from the document.
