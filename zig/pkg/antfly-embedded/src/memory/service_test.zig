@@ -9821,3 +9821,44 @@ test "memory preparation bounds policy support hydration and rejects atomically"
     try std.testing.expectEqual(revision, store.revision);
     try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "supersession-proposal/", null, 32)).rows.len);
 }
+
+test "memory metadata reads retry bounded authority changes without replaying mutations" {
+    const Race = struct {
+        store: *Store,
+        remaining: usize,
+        calls: usize = 0,
+        fn finish(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.remaining == 0) return;
+            self.remaining -= 1;
+            const a = self.store.arena.allocator();
+            const row = self.store.values.getPtr("control").?;
+            var state = try std.json.parseFromSliceLeaky(m.types.State, a, row.*, .{});
+            state.revision += 1;
+            row.* = try std.json.Stringify.valueAlloc(a, state, .{});
+            self.store.revision += 1;
+        }
+    };
+    for ([_]usize{ 1, 3, 4 }) |changes| {
+        var store = Store.init();
+        defer store.deinit();
+        try setup(&store);
+        var race: Race = .{ .store = &store, .remaining = changes };
+        var svc = store.service("alice", true, 100);
+        svc.context.final_check_ptr = &race;
+        svc.context.final_check_fn = Race.finish;
+        const result = svc.execute(std.testing.allocator, .inspect, "", "{}", "");
+        if (changes == 4) {
+            try std.testing.expectError(error.MemoryRevisionConflict, result);
+            try std.testing.expectEqual(@as(usize, 4), race.calls);
+        } else {
+            const output = try result;
+            defer std.testing.allocator.free(output);
+            const inspection = try std.json.parseFromSlice(m.types.Inspection, std.testing.allocator, output, .{});
+            defer inspection.deinit();
+            try std.testing.expectEqual(@as(usize, changes + 1), race.calls);
+            try std.testing.expectEqual(@as(usize, 0), race.remaining);
+        }
+    }
+}

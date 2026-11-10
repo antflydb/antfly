@@ -976,11 +976,22 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Restore ARC Zig cache dirs
         id: cache
@@ -1025,7 +1036,10 @@ jobs:
           # The @antfly/web package contract suite runs from its built ESM
           # artifact in the TypeScript SDK gate.
           node pkg/antfly-embedded/wasm_client_test.mjs
-          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          # Separate the complete embedded image and inference image phases:
+          # their LLVM peaks must not overlap within the runner's fixed budget.
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-embedded-build.json build wasm-test -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-inference-build.json build inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
           EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
           zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
           zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
@@ -1034,6 +1048,15 @@ jobs:
           node web/test-wasm-abi.mjs wasm32
           zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
           node web/test-wasm-abi.mjs wasm64
+
+      - name: Upload WASM compiler memory profiles
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm-compiler-memory-${{ github.run_attempt }}
+          path: zig/reports/wasm-*-build.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Release completed qualification artifacts
         if: always() && steps.cache.outcome == 'success'

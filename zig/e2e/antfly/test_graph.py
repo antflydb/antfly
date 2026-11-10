@@ -134,13 +134,13 @@ def test_stateful_graph_diagnostic_identifies_later_incoming_operation(stateful_
                     "index": "knowledge",
                     "traverse": {"start": start, "direction": "in", "max_depth": 1},
                 },
-                "seed_paths": {
+                "weighted_incoming": {
                     "index": "knowledge",
                     "traverse": {
                         "start": start,
                         "direction": "in",
                         "max_depth": 1,
-                        "deduplicate_nodes": False,
+                        "weight_mode": "min_weight",
                     },
                 },
             }
@@ -148,8 +148,8 @@ def test_stateful_graph_diagnostic_identifies_later_incoming_operation(stateful_
     )
     assert response.status_code == 422, response.text
     error = response.json()
-    assert error["operation"] == "seed_paths", error
-    assert error["reason"] == "deduplicate_nodes_must_be_true", error
+    assert error["operation"] == "weighted_incoming", error
+    assert error["reason"] == "weight_mode_must_be_min_hops", error
 
 
 def _batch_write_stateful(api, table_name: str, **kwargs) -> dict:
@@ -2148,9 +2148,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             "return": {"aggregates": {"count": {"count": "*"}}},
         }
 
-    neq = lambda left, right: {
-        "not_equal": {"left": {"alias": left}, "right": {"alias": right}}
-    }
+    def neq(left, right):
+        return {"not_equal": {"left": {"alias": left}, "right": {"alias": right}}}
+
     queries = {
         "q1": count_query(
             {

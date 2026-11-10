@@ -157,7 +157,7 @@ pub const Handle = struct {
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
     sql_commit_mutex: std.Io.Mutex = .init,
-    sql_preparation: @import("sql.zig").PreparationAdmission = .{},
+    sql_preparation: @import("../sql/preparation_admission.zig").PreparationAdmission = .{},
 
     pub fn database(self: *Handle) *db_mod.DB {
         return self.selected_db orelse &self.db;
