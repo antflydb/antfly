@@ -17,6 +17,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -33,6 +34,21 @@ from conftest import (
     StandaloneAntflyServer,
     find_free_port,
 )
+
+
+def _psql_binary():
+    """Use the configured client or PATH on every supported platform."""
+    configured = os.environ.get("ANTFLY_TEST_PSQL_BIN") or os.environ.get("PSQL")
+    candidate = configured or "psql"
+    resolved = shutil.which(candidate)
+    if resolved is None and configured is None and sys.platform == "darwin":
+        # Homebrew's PostgreSQL is keg-only, so it need not be on PATH.
+        resolved = shutil.which("/opt/homebrew/opt/postgresql@18/bin/psql")
+    if resolved is None:
+        raise RuntimeError(
+            "pgwire coverage requires psql on PATH or ANTFLY_TEST_PSQL_BIN"
+        )
+    return resolved
 
 
 @pytest.mark.e2e_resource("antfly_process")
@@ -722,7 +738,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         # Exercise the same negotiated cursor behind the pgwire authority guard.
         pgwire = subprocess.run(
             [
-                "/opt/homebrew/opt/postgresql@18/bin/psql",
+                _psql_binary(),
                 f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
                 "-X",
                 "-At",
@@ -1322,7 +1338,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )["rows"] == [["k000999", "1"]]
         pg_groups = subprocess.run(
             [
-                "/opt/homebrew/opt/postgresql@18/bin/psql",
+                _psql_binary(),
                 f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
                 "-X",
                 "-At",

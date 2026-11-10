@@ -63,13 +63,16 @@ if [[ "$sdk" == rust || "$sdk" == all ]]; then
     --features antfly-embedded/libantfly,antfly-embedded/sqlx ${rust_args[@]+"${rust_args[@]}"}
 fi
 if [[ "$sdk" == python || "$sdk" == all ]]; then
-  python_args=(--durations=25 --durations-min=1)
+  # Passed physical-work fixtures otherwise accumulate for the entire run.
+  # Pytest removes these only after dependent database fixtures have closed;
+  # failed cases and their diagnostics remain available for inspection.
+  python_args=(-o tmp_path_retention_policy=failed --durations=25 --durations-min=1)
   if [[ -n "${ANTFLY_SDK_NATIVE_REPORT_DIR:-}" ]]; then
     mkdir -p "$ANTFLY_SDK_NATIVE_REPORT_DIR"
     python_args+=(--junitxml="$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml")
   fi
   if [[ "$inference" == 0 ]]; then python_args+=(--ignore=tests/test_inference.py); fi
-  (cd "$repo_root/py/packages/embedded" && uv run --locked pytest -q ${python_args[@]+"${python_args[@]}"})
+  (cd "$repo_root/py/packages/embedded" && uv run --locked pytest -v -o faulthandler_timeout=120 ${python_args[@]+"${python_args[@]}"})
 fi
 if [[ "$sdk" == typescript || "$sdk" == all ]]; then
   ts_args=()
