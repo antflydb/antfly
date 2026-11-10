@@ -147,6 +147,18 @@ def test_constraint_activation_wait_preserves_process_failure():
         wait_for_constraint_activation(Cluster(), None, "parent")
 
 
+def parse_owner_control(body, path):
+    """Inspect object control envelopes without interpreting opaque batch roots."""
+    try:
+        control = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(control, dict):
+        return {}
+    control["_fault_path"] = path
+    return control
+
+
 class OwnerLinkFault:
     def __init__(self, window):
         self.window = window
@@ -386,6 +398,23 @@ class OwnerLinkFault:
         with self.lock:
             self.drop_next_reply = True
             self.healed = True
+
+
+@pytest.mark.parametrize(
+    "body", [b'[{"operation":{"snapshot":{}}}]', b'"batch"', b"null", b"7", b"\xff"]
+)
+def test_owner_link_fault_ignores_opaque_batch_roots(body):
+    fault = OwnerLinkFault("snapshot")
+    control = parse_owner_control(body, "/internal/groups/7/batch-routed-v1")
+    fault.observe_request(control)
+    assert not fault.block(0, control)
+    assert not fault.observed()
+    # Actual object control traffic still reaches the exact armed fault.
+    snapshot = parse_owner_control(
+        b'{"operation":{"snapshot":{}}}', "/internal/groups/7/online-merge-io"
+    )
+    assert fault.block(0, snapshot)
+    assert fault.observed() == {0}
 
 
 def test_owner_link_failed_response_diagnostics_survive_heal_and_stay_bounded():
@@ -634,14 +663,9 @@ def owner_link_fault(request, monkeypatch):
                 # through unchanged unless the quorum outage is active.
                 control = {}
                 if index < 3 and self.command == "POST" and "/internal/" in self.path:
-                    try:
-                        control = json.loads(body)
-                    except (ValueError, UnicodeDecodeError):
-                        pass
-                    if isinstance(control, dict):
-                        # Test-only metadata: the original wire bytes below
-                        # are forwarded unchanged to the actual owner.
-                        control["_fault_path"] = self.path
+                    # Test-only metadata: the original wire bytes below
+                    # are forwarded unchanged to the actual owner.
+                    control = parse_owner_control(body, self.path)
                 raft_blocked = index >= 3 and fault.raft_cut.is_set()
                 if index < 3:
                     fault.observe_request(control)
