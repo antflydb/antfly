@@ -33,7 +33,11 @@ pub const Entry = struct {
     inventory: [32]u8,
     linked: bool,
 };
-const Ledger = struct { version: u16 = 1, entries: []const Entry = &.{} };
+pub const Position = struct { namespace: Namespace, after: [64]u8 };
+pub const ScanUpdate = struct { namespace: Namespace, expected_after: ?[64]u8, after: [64]u8 };
+pub const Scan = struct { entries: []const Entry, after: ?[64]u8 };
+const Ledger = struct { version: u16 = 1, entries: []const Entry = &.{}, positions: []const Position = &.{} };
+const Identity = struct { namespace: Namespace, id: [64]u8 };
 const max_ledger_bytes = 4 * 1024 * 1024;
 const Bridge = struct {
     token: Cancellation,
@@ -62,11 +66,11 @@ pub const Store = struct {
     }
     fn parse(a: A, saved: ?objectstore.GetResult) !Ledger {
         const ledger = if (saved) |value| try std.json.parseFromSliceLeaky(Ledger, a, value.body, .{ .allocate = .alloc_always }) else Ledger{};
-        if (ledger.version != 1 or ledger.entries.len > 4096) return error.CatalogGenerationChanged;
+        if (ledger.version != 1 or ledger.entries.len > 4096 or ledger.positions.len > 4096) return error.CatalogGenerationChanged;
         return ledger;
     }
-    fn save(self: Store, a: A, entries: []const Entry, saved: ?objectstore.GetResult, token: Cancellation) !void {
-        const bytes = try std.json.Stringify.valueAlloc(a, Ledger{ .entries = entries }, .{});
+    fn save(self: Store, a: A, entries: []const Entry, positions: []const Position, saved: ?objectstore.GetResult, token: Cancellation) !void {
+        const bytes = try std.json.Stringify.valueAlloc(a, Ledger{ .entries = entries, .positions = positions }, .{});
         if (bytes.len > max_ledger_bytes) return error.QueryCandidateBudgetExceeded;
         var client = self.client;
         client.allocator = a;
@@ -93,7 +97,7 @@ pub const Store = struct {
                         // its reclamation proof requirement before that upload.
                         const updated = try a.dupe(Entry, ledger.entries);
                         updated[index] = entry;
-                        self.save(a, updated, saved, token) catch |err| switch (err) {
+                        self.save(a, updated, ledger.positions, saved, token) catch |err| switch (err) {
                             error.PreconditionFailed, error.ConditionalCheckFailed, error.ObjectAlreadyExists => continue :attempts,
                             else => return err,
                         };
@@ -121,7 +125,7 @@ pub const Store = struct {
             const entries = try a.alloc(Entry, ledger.entries.len + 1);
             @memcpy(entries[0..ledger.entries.len], ledger.entries);
             entries[ledger.entries.len] = entry;
-            self.save(a, entries, saved, token) catch |err| switch (err) {
+            self.save(a, entries, ledger.positions, saved, token) catch |err| switch (err) {
                 error.PreconditionFailed, error.ConditionalCheckFailed, error.ObjectAlreadyExists => continue,
                 else => return err,
             };
@@ -129,9 +133,14 @@ pub const Store = struct {
         }
         return error.QueryCandidateBudgetExceeded;
     }
-    /// Maintenance checks physical reclamation outside the CAS. A removed ID
-    /// cannot be republished: requests have already expired before this call.
+    /// Maintenance proves reclamation before calling this method. Compare
+    /// exact entries again on every retry: a stale proof must not remove a
+    /// changed reservation, nor may a stale scanner rewind another collector.
     pub fn release(self: Store, allocator: A, entry: Entry, token: Cancellation) !void {
+        return self.releaseBatch(allocator, &.{entry}, null, token);
+    }
+    pub fn releaseBatch(self: Store, allocator: A, proven: []const Entry, update: ?ScanUpdate, token: Cancellation) !void {
+        if (proven.len == 0 and update == null) return;
         for (0..16) |_| {
             try token.check();
             var arena = std.heap.ArenaAllocator.init(allocator);
@@ -140,19 +149,58 @@ pub const Store = struct {
             var saved = try self.read(a, token);
             defer if (saved) |*value| value.deinit(a);
             const ledger = try parse(a, saved);
+            var proofs: std.AutoHashMap(Identity, Entry) = .init(a);
+            for (proven) |entry| try proofs.put(.{ .namespace = entry.namespace, .id = entry.id }, entry);
             var entries: std.ArrayList(Entry) = .empty;
+            var namespaces: std.AutoHashMap(Namespace, void) = .init(a);
             for (ledger.entries) |old| {
-                if (std.meta.eql(old, entry)) continue;
+                if (proofs.get(.{ .namespace = old.namespace, .id = old.id })) |proof| {
+                    if (std.meta.eql(old, proof)) continue;
+                }
                 try entries.append(a, old);
+                try namespaces.put(old.namespace, {});
             }
-            if (entries.items.len == ledger.entries.len) return;
-            self.save(a, entries.items, saved, token) catch |err| switch (err) {
+            var changed = entries.items.len != ledger.entries.len;
+            var positions: std.ArrayList(Position) = .empty;
+            var found = false;
+            for (ledger.positions) |old| {
+                if (!namespaces.contains(old.namespace)) {
+                    changed = true;
+                    continue;
+                }
+                var position = old;
+                if (update) |scan_update| if (old.namespace.eql(scan_update.namespace)) {
+                    found = true;
+                    if (std.meta.eql(@as(?[64]u8, old.after), scan_update.expected_after) and !std.meta.eql(old.after, scan_update.after)) {
+                        position.after = scan_update.after;
+                        changed = true;
+                    }
+                };
+                try positions.append(a, position);
+            }
+            if (update) |scan_update| if (!found and scan_update.expected_after == null and namespaces.contains(scan_update.namespace)) {
+                try positions.append(a, .{ .namespace = scan_update.namespace, .after = scan_update.after });
+                changed = true;
+            };
+            if (!changed) return;
+            self.save(a, entries.items, positions.items, saved, token) catch |err| switch (err) {
                 error.PreconditionFailed, error.ConditionalCheckFailed, error.ObjectAlreadyExists => continue,
                 else => return err,
             };
             return;
         }
         return error.QueryCandidateBudgetExceeded;
+    }
+    pub fn scan(self: Store, a: A, namespace: Namespace, token: Cancellation) !Scan {
+        var saved = try self.read(a, token);
+        defer if (saved) |*value| value.deinit(a);
+        const ledger = try parse(a, saved);
+        var after: ?[64]u8 = null;
+        for (ledger.positions) |position| if (position.namespace.eql(namespace)) {
+            after = position.after;
+            break;
+        };
+        return .{ .entries = ledger.entries, .after = after };
     }
     pub fn snapshot(self: Store, a: A, token: Cancellation) ![]const Entry {
         var saved = try self.read(a, token);

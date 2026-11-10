@@ -643,15 +643,32 @@ pub const Repository = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const store = try self.budgetStore(a);
-        const entries = try store.snapshot(a, cancellation);
+        if (max_entries == 0) return;
+        const scan = try store.scan(a, namespace, cancellation);
+        var entries: std.ArrayList(retention_budget.Entry) = .empty;
+        for (scan.entries) |entry| if (entry.namespace.eql(namespace)) {
+            try entries.append(a, entry);
+        };
+        if (entries.items.len == 0) return;
+        std.mem.sort(retention_budget.Entry, entries.items, {}, struct {
+            fn less(_: void, left: retention_budget.Entry, right: retention_budget.Entry) bool {
+                return std.mem.lessThan(u8, &left.id, &right.id);
+            }
+        }.less);
+        var start: usize = 0;
+        if (scan.after) |after| {
+            while (start < entries.items.len and !std.mem.lessThan(u8, &after, &entries.items[start].id)) start += 1;
+            if (start == entries.items.len) start = 0;
+        }
+        var proven: std.ArrayList(retention_budget.Entry) = .empty;
+        var last: ?[64]u8 = null;
         const bridge: TokenBridge = .{ .token = cancellation };
-        var visited: usize = 0;
-        for (entries) |entry| {
-            if (!entry.namespace.eql(namespace)) continue;
+        for (0..@min(max_entries, entries.items.len)) |offset| {
+            try cancellation.check();
+            const entry = entries.items[(start + offset) % entries.items.len];
+            last = entry.id;
             const horizon = if (entry.linked) @as(u64, 30_000) else 3 * cache_window_ms + 30_000;
             if (entry.expires_ms +| horizon >= now) continue;
-            if (visited == max_entries) break;
-            visited += 1;
             if (self.store.opened.fs_client) |filesystem| {
                 const parent = try self.linkedNamespace(a, namespace);
                 const expiry = try std.fmt.allocPrint(a, "{d:0>20}", .{entry.expires_ms});
@@ -666,7 +683,7 @@ pub const Repository = struct {
                 }
                 if (present) continue;
                 if (entry.linked) {
-                    try store.release(self.a, entry, cancellation);
+                    try proven.append(a, entry);
                     continue;
                 }
             }
@@ -675,7 +692,7 @@ pub const Repository = struct {
                 const request: cut.Request = .{ .id = &entry.id, .table_id = namespace.table_id, .expires_ms = entry.expires_ms };
                 var manifest = self.store.opened.client.getObject(self.store.opened.bucket, try self.key(a, request, namespace), .{ .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| switch (err) {
                     error.FileNotFound, error.NotFound, error.ObjectNotFound => {
-                        try store.release(self.a, entry, cancellation);
+                        try proven.append(a, entry);
                         continue;
                     },
                     else => return err,
@@ -683,6 +700,7 @@ pub const Repository = struct {
                 manifest.deinit(self.store.opened.client.allocator);
             }
         }
+        if (last) |after| try store.releaseBatch(self.a, proven.items, .{ .namespace = namespace, .expected_after = scan.after, .after = after }, cancellation);
     }
     fn ownerPrefix(self: *Repository, a: A) ![]u8 {
         return std.fmt.allocPrint(a, "{s}{s}native-query-owners/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/" });
@@ -2930,4 +2948,124 @@ test "external lake native durable budget retries a real competing owner revisio
     const saved = try backing.snapshot(arena.allocator(), .none);
     try std.testing.expectEqual(@as(usize, 1), saved.len);
     try std.testing.expectEqual(competitor.entry.id, saved[0].id);
+}
+
+test "external lake native budget reclamation advances past leased cohorts across owners" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-budget-fairness");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    repository.retained_limits = .{ .max_cuts = 4, .max_bytes = 4 };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const store = try repository.budgetStore(scratch);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const expires = cut.nowMs() + 60_000;
+    for ([_]u8{ 'a', 'b', 'c', 'd' }, 0..) |letter, index| {
+        try store.reserve(a, .{ .id = @splat(letter), .namespace = namespace, .expires_ms = if (index < 2) expires else expires - 1000, .bytes = 1, .inventory = @splat(letter), .linked = true }, .none);
+    }
+    const parent = try repository.linkedNamespace(scratch, namespace);
+    const held = try std.fmt.allocPrint(scratch, "{s}/{d:0>20}", .{ parent, expires });
+    try fs.createDirPathPortable(io, held);
+    const lease = try std.Io.Dir.cwd().createFile(io, try std.fs.path.join(scratch, &.{ held, ".lease" }), .{ .truncate = false });
+    defer lease.close(io);
+    try std.testing.expect(try lease.tryLock(io, .shared));
+    defer lease.unlock(io);
+    // The entire first inspection budget is consumed by one leased cohort.
+    try repository.releaseReclaimedBudget(io, namespace, expires + 30_001, 2, true, .none);
+    try std.testing.expectEqual(@as(usize, 4), (try store.snapshot(scratch, .none)).len);
+    try std.testing.expectEqual(@as([64]u8, @splat('b')), (try store.scan(scratch, namespace, .none)).after.?);
+    // A new adapter must resume from the persisted cursor, not begin at a/b.
+    var reopened = try Repository.init(a, null, null, .standalone, directory.path());
+    defer reopened.deinit();
+    reopened.retained_limits = repository.retained_limits;
+    try reopened.releaseReclaimedBudget(io, namespace, expires + 30_001, 2, true, .none);
+    const remaining = try store.snapshot(scratch, .none);
+    try std.testing.expectEqual(@as(usize, 2), remaining.len);
+    for (remaining) |entry| try std.testing.expect(entry.id[0] == 'a' or entry.id[0] == 'b');
+    try std.Io.Dir.cwd().access(io, held, .{});
+    // Reclaimed store-wide capacity is available to an unrelated namespace
+    // while the original reader continues holding its cohort.
+    try store.reserve(a, .{ .id = @splat('e'), .namespace = .{ .table_id = 8, .shard_id = 2, .range_id = 2 }, .expires_ms = expires, .bytes = 1, .inventory = @splat('e'), .linked = true }, .none);
+}
+
+test "external lake native budget reclaims a batch with constant ledger IO" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-budget-batch");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const store = try repository.budgetStore(scratch);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const expires = cut.nowMs() + 60_000;
+    for (0..128) |index| {
+        var id: [64]u8 = undefined;
+        _ = try std.fmt.bufPrint(&id, "{x:0>64}", .{index});
+        try store.reserve(a, .{ .id = id, .namespace = namespace, .expires_ms = expires, .bytes = 1, .inventory = @splat(1), .linked = true }, .none);
+    }
+    const backing = repository.store.opened.client;
+    var fault = objectstore.ScriptedFaultClient.init(a, backing);
+    defer fault.deinit();
+    repository.store.opened.client = fault.client();
+    defer repository.store.opened.client = backing;
+    try repository.releaseReclaimedBudget(std.testing.io, namespace, expires + 30_001, 128, true, .none);
+    // One scan snapshot, one fresh CAS read, and one conditional write for
+    // the entire batch; physical filesystem checks do not fetch the ledger.
+    try std.testing.expectEqual(@as(u64, 2), fault.get_attempts);
+    try std.testing.expectEqual(@as(u64, 1), fault.put_attempts);
+    try std.testing.expectEqual(@as(usize, 0), (try store.snapshot(scratch, .none)).len);
+}
+
+test "external lake native budget batch retry preserves changed entries and newer scan positions" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-budget-batch-race");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const store = try repository.budgetStore(scratch);
+    const entry: retention_budget.Entry = .{ .id = @splat('a'), .namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .expires_ms = cut.nowMs() + 60_000, .bytes = 1, .inventory = @splat(1), .linked = true };
+    var second = entry;
+    second.id = @splat('b');
+    try store.reserve(a, entry, .none);
+    try store.reserve(a, second, .none);
+    const Competitor = struct {
+        store: retention_budget.Store,
+        entry: retention_budget.Entry,
+        failure: ?anyerror = null,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // A cross-device fallback extends the entry's proof requirement.
+            self.store.reserve(std.testing.allocator, self.entry, .none) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.store.releaseBatch(std.testing.allocator, &.{}, .{ .namespace = self.entry.namespace, .expected_after = null, .after = @splat('f') }, .none) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var competitor: Competitor = .{ .store = store, .entry = entry };
+    competitor.entry.linked = false;
+    var fault = objectstore.ScriptedFaultClient.init(a, store.client);
+    defer fault.deinit();
+    fault.next_get = .{ .complete_then_callback = .{ .ptr = &competitor, .run = Competitor.run } };
+    var racing = store;
+    racing.client = fault.client();
+    try racing.releaseBatch(a, &.{ entry, second }, .{ .namespace = entry.namespace, .expected_after = null, .after = @splat('b') }, .none);
+    try std.testing.expect(competitor.failure == null);
+    const saved = try store.scan(scratch, entry.namespace, .none);
+    try std.testing.expectEqual(@as(usize, 1), saved.entries.len);
+    try std.testing.expect(!saved.entries[0].linked);
+    try std.testing.expectEqual(@as([64]u8, @splat('f')), saved.after.?);
+    try std.testing.expectEqual(@as(u64, 2), fault.get_attempts);
+    try std.testing.expectEqual(@as(u64, 2), fault.put_attempts);
 }
