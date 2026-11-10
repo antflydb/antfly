@@ -75,6 +75,9 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         const keyTimestamp = @import("antfly_local_sources").retained_dataset_types.rowKeyTimestamp;
         read_clock = @max(read_clock, manifest.cut.admitted_ns);
         const start = try range.start();
+        if (manifest.expired_before_ns) |floor| {
+            if (start < floor) return error.RetainedSeriesHistoryExpired;
+        }
         if (try spec.expired(start, read_clock)) return error.RetainedSeriesHistoryExpired;
         if (start < try keyTimestamp(manifest.first)) return error.RetainedSeriesCoverageMissing;
         const tail = try keyTimestamp(manifest.next);

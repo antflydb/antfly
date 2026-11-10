@@ -703,7 +703,7 @@ test "retained dataset closed export publishes disjoint retry-safe pages within 
     var memory = objects.memory.MemoryClient.init(a);
     defer memory.deinit();
     try setup(&memory);
-    const clock: FakeClock = .{};
+    var clock: FakeClock = .{};
     const store = catalog(&memory, &clock);
     const cold = location(&memory, true);
     const def = definition(.summary);
@@ -765,6 +765,11 @@ test "retained dataset closed export publishes disjoint retry-safe pages within 
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
     try std.testing.expectError(error.InvalidDatasetCoverage, api.summary_read.readClosed(a, reopened, def, spec, .{ .start_ns = "1260", .end_ns = "1320" }, .{}, cut, @splat(0), resolve));
+    const prior_clock = clock.now;
+    clock.now = @as(u64, @intCast(def.retention_ns)) + 1260;
+    try reopened.retire(first.segment.id, 1);
+    clock.now = prior_clock;
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.readClosed(a, reopened, def, spec, .{ .start_ns = "1200", .end_ns = "1260" }, .{}, cut, receipt, resolve));
     var wrong_cut = cut;
     wrong_cut.sequence += 1;
     try std.testing.expectError(error.InvalidDatasetCoverage, reopened.getClosedExport(spec, wrong_cut));

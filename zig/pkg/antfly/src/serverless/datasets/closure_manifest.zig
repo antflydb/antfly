@@ -45,6 +45,9 @@ pub const Manifest = struct {
     cut: Cut,
     first: t.RowKey,
     next: t.RowKey,
+    /// Persist the exclusive expired bucket boundary independently of the
+    /// content receipt so clock rollback cannot make expired history visible.
+    expired_before_ns: ?i128 = null,
     pages: u64 = 0,
     last: ?t.Id = null,
     chain: t.Id,
@@ -75,6 +78,10 @@ pub const Manifest = struct {
             (self.pages == 0 and (!std.mem.eql(u8, &self.first, &self.next) or !std.mem.eql(u8, &self.chain, &initial.chain))) or
             (self.sealed and !std.mem.allEqual(u8, self.next[32..], '0'))) return error.InvalidDatasetCoverage;
         if (self.pages > 0) try (t.KeySpan{ .start = self.first, .end = self.next }).validate();
+        if (self.expired_before_ns) |floor| {
+            if (!self.sealed or self.pages == 0 or floor <= try t.rowKeyTimestamp(self.first) or
+                floor > try t.rowKeyTimestamp(self.next)) return error.InvalidDatasetCoverage;
+        }
     }
 
     /// The catalog caller must check the actual immutable object and exact

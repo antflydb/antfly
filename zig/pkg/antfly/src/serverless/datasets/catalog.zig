@@ -637,6 +637,28 @@ pub const Catalog = struct {
         if (dependencies.value.results[0].len != 0) return error.DatasetDependencyPending;
         try self.requireNoReaders(session.value, id, null);
         next.retiring = true;
+        const closed_key = try closedKey(self.context.alloc, next.definition_generation, next.source.partition, next.source.incarnation);
+        defer self.context.alloc.free(closed_key);
+        if (try self.get(session.value, closure.Manifest, closed_key)) |owned| closed: {
+            defer owned.deinit();
+            var manifest = owned.value;
+            const span = try next.span();
+            // Older segments outside the closed export remain governed by
+            // their own retirement records.
+            if (std.mem.order(u8, &span.end, &manifest.first) != .gt) break :closed;
+            if (!std.meta.eql(manifest.source, next.source) or !std.mem.eql(u8, &next.id, &closure.segmentId(manifest.cut.closure, span))) return error.InvalidDatasetCoverage;
+            if (!manifest.sealed) return error.DatasetDependencyPending;
+            const end = try next.coverage.end();
+            manifest.expired_before_ns = @max(end, manifest.expired_before_ns orelse end);
+            const closed_bytes = try std.json.Stringify.valueAlloc(self.context.alloc, manifest, .{});
+            defer self.context.alloc.free(closed_bytes);
+            const segment_key = try segmentKey(self.context.alloc, id);
+            defer self.context.alloc.free(segment_key);
+            const segment_bytes = try std.json.Stringify.valueAlloc(self.context.alloc, next, .{});
+            defer self.context.alloc.free(segment_bytes);
+            try self.commit(session.value, &.{ .{ .kind = .put, .key = segment_key, .value = segment_bytes }, .{ .kind = .put, .key = closed_key, .value = closed_bytes } });
+            return;
+        }
         try self.putSegment(session.value, next);
     }
 
