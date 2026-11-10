@@ -1863,6 +1863,7 @@ pub fn reembedDenseDocuments(
         defer runtime.alloc.free(doc_store_key);
         const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse continue;
         defer runtime.alloc.free(raw);
+        if (!try @import("../../../template_inspection.zig").canReplayLocally(runtime.alloc, request.source_template, raw)) continue;
         var prepared = try prepareDenseSourceInput(runtime.alloc, runtime.config, dense_embedder, raw, request);
         defer prepared.deinit(runtime.alloc);
         switch (prepared) {
@@ -1936,6 +1937,15 @@ const ReembedChunkSourceCache = struct {
     }
 };
 
+fn requestCanReplayLocally(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, parent: []const u8) !bool {
+    if (std.mem.indexOf(u8, request.source_template, "remote") == null) return true;
+    const key = try documentSourceStoreKeyAlloc(runtime, parent);
+    defer runtime.alloc.free(key);
+    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, key)) orelse return false;
+    defer runtime.alloc.free(raw);
+    return @import("../../../template_inspection.zig").canReplayLocally(runtime.alloc, request.source_template, raw);
+}
+
 fn reembedChunkTextAlloc(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1953,6 +1963,7 @@ fn reembedChunkTextAlloc(
     const cache_key = try workerChunkCacheTupleKeyAlloc(alloc, &.{ requestArtifactName(request), worker_key });
     defer alloc.free(cache_key);
     const entry = source_cache.entries.get(cache_key) orelse create: {
+        if (!try requestCanReplayLocally(runtime, parent_request, parent)) return null;
         const entry = try alloc.create(ReembedChunkSourceCache.Entry);
         errdefer alloc.destroy(entry);
         entry.* = .{ .sources = try chunkEmbeddingSourceSetForRequest(runtime, parent_request, requestArtifactName(request), chunk_cache) };
@@ -5829,6 +5840,7 @@ const StaleEmbeddingDeletes = struct {
 };
 
 const PlainDenseBatchItem = struct {
+    text_input: bool = true,
     request: enrichment_types.GeneratedEnrichmentRequest,
     source_text: []const u8,
     source_hash: u64,
@@ -30473,7 +30485,7 @@ fn collectPlainDenseBatchItem(
     const source_text = switch (prepared) {
         .text => |text| text,
         .parts => |parts| {
-            try processDenseTemplateParts(runtime, request, dense_embedder, consumer_indexes, parts, sourceRecordDigest(raw), if (input) |*token| token else null, window, scope);
+            try processDenseTemplateParts(runtime, request, dense_embedder, consumer_indexes, parts, try @import("../../../template_inspection.zig").canReplayLocally(runtime.alloc, request.source_template, raw), sourceRecordDigest(raw), if (input) |*token| token else null, window, scope);
             if (input) |*token| token.deinit();
             return null;
         },
@@ -30538,6 +30550,7 @@ fn collectPlainDenseBatchItem(
     return .{
         .request = request,
         .source_text = source_text,
+        .text_input = try @import("../../../template_inspection.zig").canReplayLocally(runtime.alloc, request.source_template, raw),
         .source_hash = source_hash,
         .text_generation = generation,
         .artifact_key = artifact_key,
@@ -30613,7 +30626,7 @@ fn flushPlainDenseItems(
         writes[i] = .{
             .key = item.artifact_key,
             // Plain items embed the rendered source text alone.
-            .value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, true, vector),
+            .value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, item.text_input, vector),
             .source_key = source_key,
             .source_digest = item.source_record_digest,
             .doc_key = item.request.doc_key,
@@ -31076,6 +31089,7 @@ fn processChunkedDenseWindow(
             const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
             defer runtime.alloc.free(source_key);
             const fallback_source_digest = if (!requestHasChunking(request)) try currentRecordDigest(runtime, source_key) else null;
+            const locally_replayable = try requestCanReplayLocally(runtime, request, request.doc_key);
             var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);
             defer source_set.deinit(runtime.alloc);
             const source_digest = if (requestHasChunking(request)) source_set.source_record_digest else fallback_source_digest;
@@ -31187,7 +31201,7 @@ fn processChunkedDenseWindow(
                     .source_record_is_parent = source.source_record_is_parent,
                     // Plain text chunks only: model metadata means media
                     // windows or model outputs re-chunking cannot redo.
-                    .text_input = request.input_kind == .inline_chunks and source.metadata == null and precomputed == null,
+                    .text_input = request.input_kind == .inline_chunks and source.metadata == null and precomputed == null and locally_replayable,
                 });
                 owned_vector = null; // The bounded batch now owns this result.
                 request_batch_items_pending = true;
@@ -33625,6 +33639,7 @@ fn processDenseTemplateParts(
     dense_embedder: embedder_mod.DenseEmbedder,
     consumer_indexes: []const []const u8,
     parts: []const template.ContentPart,
+    locally_replayable: bool,
     source_digest: [32]u8,
     input: ?*producer_input.Token,
     window: *GeneratedReplayWindow,
@@ -33684,7 +33699,7 @@ fn processDenseTemplateParts(
         .source_sequence = request.sequence,
         .vector = vector,
         .ordered_input = input,
-        .text_input = partsAreText(parts),
+        .text_input = partsAreText(parts) and locally_replayable,
     })) return;
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
@@ -33754,7 +33769,7 @@ fn processDenseEmbedding(
     const source_text = switch (prepared) {
         .text => |text| text,
         .parts => |parts| {
-            return processDenseTemplateParts(runtime, request, dense_embedder, consumer_indexes, parts, sourceRecordDigest(raw), if (input) |*token| token else null, window, null);
+            return processDenseTemplateParts(runtime, request, dense_embedder, consumer_indexes, parts, try @import("../../../template_inspection.zig").canReplayLocally(runtime.alloc, request.source_template, raw), sourceRecordDigest(raw), if (input) |*token| token else null, window, null);
         },
         .empty => {
             if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
@@ -33806,7 +33821,7 @@ fn processDenseEmbedding(
         .vector = vector,
         .ordered_input = if (input) |*token| token else null,
         // Prepared as plain text: re-embedding renders the same text.
-        .text_input = true,
+        .text_input = try @import("../../../template_inspection.zig").canReplayLocally(runtime.alloc, request.source_template, raw),
     })) return;
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 

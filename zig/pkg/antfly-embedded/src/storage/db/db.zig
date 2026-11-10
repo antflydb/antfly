@@ -134418,14 +134418,18 @@ test "db native snapshot exports self-contained generation" {
 }
 
 test "db native snapshot pins a local leann graph file" {
-    try testLeannNativeSnapshot(false);
+    try testLeannNativeSnapshot(false, false);
 }
 
 test "db native snapshot restores an upgraded native leann wrapper" {
-    try testLeannNativeSnapshot(true);
+    try testLeannNativeSnapshot(true, false);
 }
 
-fn testLeannNativeSnapshot(legacy_native: bool) !void {
+test "db native snapshot restores leann through explicit native storage" {
+    try testLeannNativeSnapshot(false, true);
+}
+
+fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool) !void {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -134437,7 +134441,9 @@ fn testLeannNativeSnapshot(legacy_native: bool) !void {
         .filesystem_io = std.testing.io,
     });
     defer runtime.deinit();
-    var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+    var native = try lsm_backend_mod.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .index_backends = .{ .dense_lsm_storage = if (explicit_storage) native.storage() else null }, .ttl_cleanup = .{ .enabled = false } });
     var db_open = true;
     defer if (db_open) db.close();
     try db.addIndex(.{
@@ -149440,7 +149446,7 @@ test "db templated dense routes preserve backfill and reembedding semantics" {
         var out: [dims]f32 = undefined;
         var found = [_]bool{false};
         // Re-embedding follows the same explicitly selected route as backfill.
-        const templated = [_]enrichment_types.GeneratedEnrichmentRequest{.{
+        var templated = [_]enrichment_types.GeneratedEnrichmentRequest{.{
             .kind = .dense_embedding,
             .index_name = "leann_idx",
             .embedding_name = "model",
@@ -149449,12 +149455,24 @@ test "db templated dense routes preserve backfill and reembedding semantics" {
             .source_template = "{{body}}",
             .expected_dims = dims,
         }};
+        // Recover the actual synchronously-produced identity, not an unbound
+        // request that could conceal a different canonical input hash.
+        templated[0].expected_source_hash = try enrichment_artifact_codec.sourceHash(computed.artifact_writes[0].value);
+        templated[0].expected_vector_digest = @import("../leann_store.zig").vectorDigest(computed.dense_embeddings[0].vector);
         try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, &templated, dims, &out, &found);
         try std.testing.expect(found[0]);
         try std.testing.expectEqual(@as(usize, if (equivalent) 0 else 1), probe.parts_calls);
         try std.testing.expectEqual(@as(usize, if (equivalent) 1 else 0), probe.batch_calls);
         try std.testing.expectEqual(@as(f32, if (equivalent) 2 else 3), out[0]);
         probe.batch_calls = 0;
+
+        var remote = templated;
+        remote[0].source_template = "{{remoteMedia url=\"https://example.invalid/file.pdf\" mode=extract}}";
+        found[0] = false;
+        try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, &remote, dims, &out, &found);
+        try std.testing.expect(!found[0]);
+        try std.testing.expectEqual(@as(usize, 0), probe.batch_calls);
+        try std.testing.expectEqual(@as(usize, if (equivalent) 0 else 1), probe.parts_calls);
 
         // A plain source field stays on the batched text path.
         found[0] = false;

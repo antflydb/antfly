@@ -4591,6 +4591,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 sources.deinit(alloc);
             }
 
+            const locally_replayable = try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value);
             const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
             for (chunks) |chunk| {
                 const chunk_text = chunk.text orelse continue;
@@ -4599,7 +4600,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
                 errdefer alloc.free(key);
                 const text = try alloc.dupe(u8, chunk_text);
-                sources.appendAssumeCapacity(.{ .key = key, .text = text, .has_metadata = chunk.metadata != null });
+                sources.appendAssumeCapacity(.{ .key = key, .text = text, .has_metadata = chunk.metadata != null, .locally_replayable = locally_replayable });
                 chunks_created.* += 1;
             }
             // Inline chunks are derived from this document revision. An empty set is
@@ -6280,6 +6281,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, parts, request.expected_dims);
                     defer alloc.free(vector);
                     try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
+                    const source_hash = if (parts.len == 1 and parts[0] == .text and dense_embedder.textPartsEquivalent(embedding_name))
+                        enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, parts[0].text, generation.revision)
+                    else
+                        try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision);
                     const artifact_key = try appendEmbeddingArtifactWrite(
                         alloc,
                         artifact_writes,
@@ -6288,10 +6293,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         embedding_name,
                         request.source_field,
                         null,
-                        if (enrichment_runtime_mod.partsAreText(parts))
-                            .{ .generated_text = try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision) }
+                        if (enrichment_runtime_mod.partsAreText(parts) and try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value))
+                            .{ .generated_text = source_hash }
                         else
-                            .{ .generated = try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision) },
+                            .{ .generated = source_hash },
                         vector,
                     );
                     defer alloc.free(artifact_key);
@@ -6356,7 +6361,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                .{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) },
+                if (try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value)) .{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) } else .{ .generated = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) },
                 vector,
             );
             defer alloc.free(artifact_key);

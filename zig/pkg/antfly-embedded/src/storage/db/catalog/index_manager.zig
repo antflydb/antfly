@@ -8938,6 +8938,7 @@ pub const IndexManager = struct {
         // Keep it while any consumer still needs stored vectors; the catalog
         // is the same on every replica, so all of them decide alike.
         if (self.embeddingHasPersistentConsumer(index_name, embedding_name)) return 0;
+        const keep_media_full = !entry.leann_media_int8 or self.embeddingHasFullMediaConsumer(index_name, embedding_name);
         var written: usize = 0;
         for (entries) |e| {
             if (e.key.len == 0) continue;
@@ -8960,7 +8961,7 @@ pub const IndexManager = struct {
             // instead. The header is replicated data, so every replica
             // decides alike.
             const media = !header.flags.text_input;
-            if (media and !entry.leann_media_int8) continue;
+            if (media and keep_media_full) continue;
             if (!media and !header.flags.has_source_hash) continue;
             const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.alloc, raw) catch continue;
             defer self.alloc.free(vector);
@@ -9025,6 +9026,16 @@ pub const IndexManager = struct {
 
     /// Whether an index other than `index_name` consumes `embedding_name` and
     /// reads stored vectors (anything but another transient LEANN index).
+    fn embeddingHasFullMediaConsumer(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
+        for (self.dense_indexes.items) |*other| {
+            if (std.mem.eql(u8, other.config.name, index_name)) continue;
+            const consumes = if (other.embedding_name) |name| std.mem.eql(u8, name, embedding_name) else false;
+            if (consumes and !other.leann_media_int8) return true;
+            for (other.embedding_names) |name| if (std.mem.eql(u8, name, embedding_name) and !other.leann_media_int8) return true;
+        }
+        return false;
+    }
+
     fn embeddingHasPersistentConsumer(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
         for (self.dense_indexes.items) |*other| {
             if (std.mem.eql(u8, other.config.name, index_name)) continue;
@@ -33505,18 +33516,46 @@ pub const IndexManager = struct {
         var source_hashes = std.ArrayListUnmanaged(?u64).empty;
         defer source_hashes.deinit(alloc);
         const incarnation = leannIncarnation(entry.config);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var read = if (entry.leann_transient and entry.embedding_name != null) try store.beginProbeTxn() else null;
+        defer if (read) |*txn| txn.abort();
+        const raw_by_slot = try scratch.alloc(?[]const u8, metadata.len);
+        @memset(raw_by_slot, null);
+        if (read) |*txn| {
+            const Read = struct {
+                key: []const u8,
+                slot: usize,
+                fn less(_: void, a: @This(), b: @This()) bool {
+                    return std.mem.lessThan(u8, a.key, b.key);
+                }
+            };
+            var reads = std.ArrayListUnmanaged(Read).empty;
+            for (metadata, 0..) |meta, slot| {
+                if (meta.len == 0) continue;
+                try reads.append(scratch, .{ .key = try denseVectorArtifactKeyForMetadataAlloc(scratch, entry, meta), .slot = slot });
+            }
+            std.mem.sort(Read, reads.items, {}, Read.less);
+            const keys = try scratch.alloc([]const u8, reads.items.len);
+            const values = try scratch.alloc(?[]const u8, reads.items.len);
+            for (reads.items, keys) |item, *key| key.* = item.key;
+            try txn.getManySorted(keys, values);
+            for (reads.items, values) |item, value| raw_by_slot[item.slot] = value;
+        }
         for (vector_ids, metadata, 0..) |vector_id, meta, i| {
             found[i] = false;
             if (meta.len == 0) continue;
             const loaded = blk: {
-                if (entry.leann_transient) if (entry.embedding_name) |embedding_name| {
-                    break :blk manager.loadDenseVectorArtifactForHbc(alloc, store, meta, embedding_name, null) catch |err| switch (err) {
+                if (entry.leann_transient) if (entry.embedding_name != null) {
+                    const raw_artifact = raw_by_slot[i] orelse continue;
+                    break :blk enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw_artifact) catch |err| switch (err) {
                         error.VectorElided => {
                             // A hot candidate re-embedded by an earlier query
                             // for this exact stub is served from the cache.
                             // Media vectors kept as int8 copies read back
                             // without embedding anything.
-                            if (try leannInt8StubVectorAlloc(alloc, store, meta, embedding_name)) |copy| {
+                            if (try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(alloc, raw_artifact)) |copy| {
                                 defer alloc.free(copy);
                                 if (copy.len == d) {
                                     @memcpy(out[i * d ..][0..d], copy);
@@ -33524,7 +33563,9 @@ pub const IndexManager = struct {
                                     continue;
                                 }
                             }
-                            const identity = (try leannStubIdentity(alloc, store, meta, embedding_name)) orelse return error.ReembedRevisionMismatch;
+                            const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(raw_artifact)) orelse return error.ReembedRevisionMismatch;
+                            const header = try enrichment_artifact_codec.decodeHeader(raw_artifact);
+                            const identity = .{ .digest = stub.vector_digest, .source_hash = if (header.flags.has_source_hash) @as(?u64, header.source_hash) else null };
                             const digest = identity.digest;
                             if (manager.leann_reembed_cache.get(incarnation, meta, digest, out[i * d ..][0..d])) {
                                 found[i] = true;
@@ -33537,8 +33578,10 @@ pub const IndexManager = struct {
                             try elided_digests.append(alloc, digest);
                             continue;
                         },
-                        error.NotFound => continue,
-                        else => return err,
+                        else => {
+                            if (isRecoverableEmbeddingArtifactError(err)) continue;
+                            return err;
+                        },
                     };
                 };
                 break :blk loadDenseVectorForHbc(ctx, alloc, vector_id, meta) catch |err| switch (err) {
@@ -33551,6 +33594,8 @@ pub const IndexManager = struct {
             @memcpy(out[i * d ..][0..d], loaded);
             found[i] = true;
         }
+        if (read) |*txn| txn.abort();
+        read = null;
         if (elided_keys.items.len == 0) return;
         const vectors = try alloc.alloc(f32, elided_keys.items.len * d);
         defer alloc.free(vectors);
@@ -52876,6 +52921,14 @@ test "auto leann stubs text-derived vectors and keeps media-derived ones" {
 }
 
 test "auto leann media_vectors int8 keeps an int8 copy of media vectors" {
+    try testLeannMediaRetention(false);
+}
+
+test "auto leann shared media honors every consumer retention policy" {
+    try testLeannMediaRetention(true);
+}
+
+fn testLeannMediaRetention(full_consumer: bool) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -52935,6 +52988,11 @@ test "auto leann media_vectors int8 keeps an int8 copy of media vectors" {
     manager.dense_reembedder = .{ .ctx = &embedder, .embed_fn = Embedder.embed };
     manager.updateRange(.{ .start = "", .end = "" });
     try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+    if (full_consumer) {
+        const full_json = try std.mem.replaceOwned(u8, alloc, config_json, "\"media_vectors\":\"int8\"", "\"media_vectors\":\"full\"");
+        defer alloc.free(full_json);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "full_media", .kind = .dense_vector, .config_json = full_json }});
+    }
     const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
     try std.testing.expect(entry.leann_transient and entry.leann_text_only and entry.leann_media_int8);
     // LEANN stays out of the shared vector-block plane: no scope to mirror
@@ -52963,10 +53021,10 @@ test "auto leann media_vectors int8 keeps an int8 copy of media vectors" {
         const raw = try store.get(alloc, k);
         defer alloc.free(raw);
         // Every vector is a stub now; media ones keep an int8 copy.
-        try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+        try std.testing.expectEqual(!(full_consumer and i % 2 == 1), try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
         const copy = try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(alloc, raw);
         defer if (copy) |c| alloc.free(c);
-        try std.testing.expectEqual(i % 2 == 1, copy != null);
+        try std.testing.expectEqual(!full_consumer and i % 2 == 1, copy != null);
     }
 
     // Searches re-embed text documents only; media vectors come from their int8 copies.

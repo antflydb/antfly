@@ -915,7 +915,7 @@ pub const LeannStore = struct {
         if (self.dirty) return error.NativeBackupProjectionNotQuiescent;
         if (self.replicated) |state| if (self.durable_raft_index != state.applied_raft_index)
             return error.NativeBackupProjectionNotQuiescent;
-        if (self.opts.storage != null) return error.NativeBackupProjectionBackendUnsupported;
+        if (self.opts.storage) |storage| if (!storage.supportsHostPathGenerationPublication()) return error.NativeBackupProjectionBackendUnsupported;
         std.Io.Dir.cwd().access(self.io, self.path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,

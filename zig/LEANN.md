@@ -10,8 +10,7 @@ indexes keep only a small stub per document once the graph covers it and
 re-embed query candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
 `lib/vectorindex/src/leann.zig`; the table integration is described in
 [Table integration](#table-integration). Not yet supported for LEANN indexes:
-remote dense storage and native index backups (backups use the logical
-path) ([Remaining work](#remaining-work)).
+native backups of replicated LEANN (local graph files are pinned in native backups) ([Remaining work](#remaining-work)).
 
 ## Overview
 
@@ -470,7 +469,7 @@ and rescores leaf members near the admission cutoff with extended codes
   field for direct-field indexes). Explicit ID filters map directly to graph
   nodes. Best-effort searches bound work for arbitrary predicates, so a very
   selective filter can return fewer than `k`; search effort `1.0` instead
-  exhausts the graph for complete coverage. Missing candidates are omitted
+  streams every live candidate once for complete coverage. Missing candidates are omitted
   from best-effort results; complete-coverage requests fail if a live vector
   cannot be loaded. Source identity mismatches are treated as unavailable
   candidates rather than scoring a different revision.
@@ -482,11 +481,11 @@ and rescores leaf members near the admission cutoff with extended codes
   same binary and CPU converge, but floating-point differences across CPUs
   (for example AVX-512 vs. NEON) can pick different neighbors, so graphs
   may drift apart. [Leader replication](#leader-replication) removes that.
-- **Guards.** `pruneDenseSplitRange` and `handoffDenseFrom` fail with
-  `error.UnsupportedLeannSplit` before moving any state.
-  `nativeBackupSupportsImmutableCheckpoint` returns false, so backups take
-  the logical path and restore rebuilds from stored embeddings. Remote dense
-  storage fails with `error.UnsupportedLeannStorage`.
+- **Splits and storage.** Local splits prune the parent and build the child
+  from its own documents. Replicated splits queue graph deletions through Raft.
+  Graph files persist through the configured storage provider. Local native
+  backups pin the immutable graph file when the provider exposes host paths;
+  replicated LEANN requires logical backups until restore resets Raft positions.
 - **Tests.** `leann_store.zig` (buffer, build, filters, idempotent writes,
   persistence, rebuild, corrupt file) and the index-manager test
   `leann dense index applies writes, searches, deletes, and reopens`.
@@ -503,12 +502,13 @@ Three modes:
 
 - `auto` (the default when the index has its own embedder and RaBitQ codes)
   stubs only embeddings the producer computed from text alone: a field, a
-  text-only template, or a plain text chunk. The producer marks those with
+  locally reproducible template, or a plain text chunk. The producer marks those with
   the artifact header flag `text_input`. Embeddings from media (images via
   `remoteMedia`, audio windows, PDF pages, model outputs), authored vectors,
   and vectors written by older builds or copied by restore paths lack the
-  flag and stay stored. Re-embedding therefore only ever renders text: no
-  query fetches or decodes media.
+  flag and stay stored. Executed remote helpers, including PDF-to-text
+  extraction, also keep their vectors. Recovery checks helper dependencies
+  without remote I/O before rendering or re-chunking any candidate.
 - `transient` stubs covered text embeddings. It requires inputs that
   re-embed from text: no media chunkers (`audio`, `policy`, `outputs`,
   `embedding`, or a non-`fixed` model) and no stored chunk inputs. If a
@@ -574,7 +574,8 @@ Three modes:
   settle (about 14 per query at 4 bits on NYTimes-256): about 0.1 s for
   16 short passages with EmbeddingGemma 2 on an Apple M4 Max (Metal),
   seconds on a small CPU. Restoring a logical backup re-embeds every
-  document, since the graph file is not part of backups yet.
+  document when its graph is not captured. Local native snapshots preserve
+  the graph; logical snapshots preserve stubs and reconstruct graph state.
 - **Tests.** `index_manager.zig`: "transient leann vectors become stubs and
   are re-embedded on demand" (local) and "replicated transient leann
   replicas stub vectors in log order and rebuild from codes";
@@ -653,10 +654,10 @@ out-of-band rebuild, missing and corrupt generations, restart).
 1. **Raft entry.** `BatchRequest.leann_record` (`storage/db/types.zig`)
    travels as the internal `_leann_record` field of the batch wire
    (`api/batch.zig`) and must stand alone in its batch. It requires
-   `batch_leann_record_protocol_version = 25`
-   (`common/data_raft_protocol.zig`); versions are per entry, so older
-   replicas reject only LEANN entries. It is exempt from the timestamp
-   override.
+   `batch_dense_artifact_flags_protocol_version = 28`
+   (`common/data_raft_protocol.zig`). A durable capability barrier certifies
+   every applying replica before new dense flags or graph records are
+   admitted. It is exempt from the timestamp override.
 2. **Apply path.** `db.applyLeannRecordBatch` requires an ordered apply
    receipt, persists the record under `leann_record_prefix` (index name +
    Raft index) together with the receipt in one transaction, then drains
@@ -700,7 +701,8 @@ out-of-band rebuild, missing and corrupt generations, restart).
    changes, restarts, chunked generations) and checks that all replicas end
    with identical state and search results.
 
-Still to do: splits (each child's leader builds a generation from its key
-range), a production-cluster VOPR that checks replica graph equality, and an
-e2e test. The data runtime pieces (step 3) need CI to compile and run: their
-test build declares more memory than the sandbox this was written in.
+Remaining qualification work is the production-cluster VOPR that checks
+replica graph equality across splits, plus native restore support for the
+replicated Raft-position domain. Targeted storage, leader-runtime, and
+protocol regressions run through `leann-regression-test` and
+`leann-replication-runtime-test`.

@@ -606,6 +606,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             for (source_indexes.items, vectors) |source_index, vector| {
                 const source = sources[source_index];
+                const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try appendEmbeddingArtifactWrite(
                     alloc,
                     artifact_writes,
@@ -616,10 +620,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     source.key,
                     // Inline text chunks re-embed by re-chunking the parent;
                     // stored chunk inputs cannot.
-                    if (request.input_kind == .inline_chunks and !source.has_metadata)
-                        EmbeddingArtifactOrigin{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision) }
+                    if (request.input_kind == .inline_chunks and !source.has_metadata and source.locally_replayable)
+                        EmbeddingArtifactOrigin{ .generated_text = source_hash }
                     else
-                        EmbeddingArtifactOrigin{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
+                        EmbeddingArtifactOrigin{ .generated = source_hash },
                     vector,
                 );
                 defer alloc.free(artifact_key);

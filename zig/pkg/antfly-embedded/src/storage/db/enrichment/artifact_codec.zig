@@ -48,7 +48,7 @@ pub const Flags = packed struct(u8) {
     /// text-only template, or a plain text chunk), so re-embedding the source
     /// reproduces it. LEANN `vector_storage: auto` drops only these. Unset on
     /// media-derived, authored, imported and older vectors, which stay stored.
-    /// Older readers ignore the bit.
+    /// Requires the all-replica dense-artifact protocol barrier.
     text_input: bool = false,
     /// Elided stub that keeps an int8 copy of the vector (LEANN
     /// `media_vectors: int8`), read back instead of re-embedding.
