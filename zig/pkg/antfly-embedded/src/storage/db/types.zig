@@ -309,6 +309,8 @@ pub const BatchRequest = struct {
     relational_repair: bool = false,
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
+    /// Trusted physical TTL deletes; an exact subset of deletes, never public input.
+    expiration_deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     /// Private owner-leader maintenance: one bounded durable endpoint page.
     graph_endpoint_cleanup: bool = false,
@@ -1774,6 +1776,8 @@ pub const TransactionIntentRequest = struct {
     relational_repair: bool = false,
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
+    /// Trusted physical TTL deletes; an exact subset of deletes, never public input.
+    expiration_deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
@@ -5619,4 +5623,20 @@ test "graph relationship protocol gates document effects before extraction" {
         "{}",
     }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
     try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
+}
+
+/// Private TTL provenance must identify only final deletion intents. A bounded
+/// allocation-free validation is also used before wire encoding and admission.
+pub fn validateExpirationDeletes(req: anytype) !void {
+    if (req.expiration_deletes.len > 1024) return error.InvalidBatchRequest;
+    for (req.expiration_deletes, 0..) |key, i| {
+        if (key.len == 0 or key.len > 4096) return error.InvalidBatchRequest;
+        for (req.expiration_deletes[0..i]) |prior| if (std.mem.eql(u8, key, prior)) return error.InvalidBatchRequest;
+        const found = for (req.deletes) |deleted| {
+            if (std.mem.eql(u8, key, deleted)) break true;
+        } else false;
+        if (!found) return error.InvalidBatchRequest;
+        for (req.writes) |write| if (std.mem.eql(u8, key, write.key)) return error.InvalidBatchRequest;
+        for (req.transforms) |transform| if (std.mem.eql(u8, key, transform.key)) return error.InvalidBatchRequest;
+    }
 }

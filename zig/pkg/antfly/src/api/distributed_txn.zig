@@ -92,6 +92,7 @@ test "distributed txn range guard wire preserves absent and exact counters" {
 }
 
 const PrepareExtensions = struct {
+    expiration_deletes: []const []const u8 = &.{},
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -1272,6 +1273,7 @@ pub fn executeCrossGroup(
         .normalized_graph_rows = req.normalized_graph_rows,
         .writes = req.writes,
         .deletes = req.deletes,
+        .expiration_deletes = req.expiration_deletes,
         .transforms = req.transforms,
         .graph_writes = req.graph_writes,
         .graph_deletes = req.graph_deletes,
@@ -1388,6 +1390,7 @@ fn executeMultiTableCommitOnce(
             for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
         }
 
+        try db_mod.types.validateExpirationDeletes(table);
         for (table.writes) |write| {
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
@@ -1397,6 +1400,10 @@ fn executeMultiTableCommitOnce(
             const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
+            for (table.expiration_deletes) |expired| if (std.mem.eql(u8, expired, key)) {
+                try participant.expiration_deletes.append(alloc, key);
+                break;
+            };
         }
         for (table.graph_writes) |edge| {
             const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
@@ -1631,7 +1638,7 @@ fn executeMultiTableCommitOnce(
     }
 
     if (!resume_committed) {
-        runPrepareFanout(worker, txn_id, participants.items, fanout_slots, options);
+        runPrepareFanout(worker, txn_id, commit_version, participants.items, fanout_slots, options);
         if (firstFanoutError(fanout_slots)) |participant_index| {
             const participant = participants.items[participant_index];
             const err = fanout_slots[participant_index].err.?;
@@ -2025,6 +2032,7 @@ const ParticipantTxn = struct {
     relational_repair: bool = false,
     writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    expiration_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
     graph_writes: std.ArrayListUnmanaged(db_mod.types.GraphEdgeWrite) = .empty,
     graph_deletes: std.ArrayListUnmanaged(db_mod.types.GraphEdgeDelete) = .empty,
@@ -2043,6 +2051,7 @@ const ParticipantTxn = struct {
         self.range_guards.deinit(alloc);
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
+        self.expiration_deletes.deinit(alloc);
         self.transforms.deinit(alloc);
         self.graph_writes.deinit(alloc);
         self.graph_deletes.deinit(alloc);
@@ -2140,6 +2149,7 @@ const PrepareFanoutTask = struct {
         worker: ParticipantWorker,
         participant: *const ParticipantTxn,
         txn_id: db_mod.types.TxnId,
+        admitted_timestamp_ns: u64,
         slot: *ParticipantFanoutSlot,
     ) void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2149,12 +2159,14 @@ const PrepareFanoutTask = struct {
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
             .req = .{
+                .admitted_timestamp_ns = admitted_timestamp_ns,
                 .row_policy_principal_proof = participant.row_policy_principal_proof,
                 .row_policy_database = participant.row_policy_database,
                 .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
                 .normalized_graph_rows = participant.normalized_graph_rows,
                 .writes = participant.writes.items,
                 .deletes = participant.deletes.items,
+                .expiration_deletes = participant.expiration_deletes.items,
                 .transforms = participant.transforms.items,
                 .graph_writes = participant.graph_writes.items,
                 .graph_deletes = participant.graph_deletes.items,
@@ -2181,6 +2193,7 @@ const PrepareFanoutTask = struct {
 fn runPrepareFanout(
     worker: ParticipantWorker,
     txn_id: db_mod.types.TxnId,
+    admitted_timestamp_ns: u64,
     participants: []const ParticipantTxn,
     slots: []ParticipantFanoutSlot,
     options: ExecuteOptions,
@@ -2194,12 +2207,12 @@ fn runPrepareFanout(
         if (options.fanout_io) |io| {
             var group: std.Io.Group = .init;
             for (start..end) |i| {
-                group.concurrent(io, PrepareFanoutTask.run, .{ worker, &participants[i], txn_id, &slots[i] }) catch
-                    PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
+                group.concurrent(io, PrepareFanoutTask.run, .{ worker, &participants[i], txn_id, admitted_timestamp_ns, &slots[i] }) catch
+                    PrepareFanoutTask.run(worker, &participants[i], txn_id, admitted_timestamp_ns, &slots[i]);
             }
             awaitFanout(&group, io);
         } else {
-            for (start..end) |i| PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
+            for (start..end) |i| PrepareFanoutTask.run(worker, &participants[i], txn_id, admitted_timestamp_ns, &slots[i]);
         }
         if (firstFanoutError(slots[start..end]) != null) break;
     }
@@ -2426,13 +2439,15 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
 }
 
 pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
+    try db_mod.types.validateExpirationDeletes(req.req);
     try validateRestorePlan(req.req.restore_staging_scope, req.req.restore_staging_plan_id);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
-    if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    const expiration = req.req.expiration_deletes.len != 0;
+    if (expiration) try out.appendSlice(alloc, "[\"retained-expiration-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
@@ -2470,7 +2485,13 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
-    try out.appendSlice(alloc, "],\"transforms\":[");
+    if (expiration) {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, req.req.expiration_deletes, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, "],\"expiration_deletes\":");
+        try out.appendSlice(alloc, encoded);
+        try out.appendSlice(alloc, ",\"transforms\":[");
+    } else try out.appendSlice(alloc, "],\"transforms\":[");
     for (req.req.transforms, 0..) |transform, i| {
         if (i > 0) try out.append(alloc, ',');
         const encoded_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(transform.key, .{})});
@@ -2564,7 +2585,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (guarded or row_semantics) try out.append(alloc, ']');
+    if (expiration or guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2734,11 +2755,13 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     defer parsed.deinit();
     const wrapped = parsed.value == .array;
     var row_semantics = false;
+    var expiration = false;
     const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
         row_semantics = std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
-        if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
+        expiration = std.mem.eql(u8, entries[0].string, "retained-expiration-prepare-v1");
+        if (!expiration and !row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
     const obj = switch (root) {
@@ -2748,6 +2771,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer extensions.deinit();
     const ext = extensions.value;
+    if (expiration != (ext.expiration_deletes.len != 0)) return error.InvalidTxnRequest;
     if ((ext.row_policy_principal_proof.len == 0) != (ext.row_policy_database.len == 0) or
         (ext.row_policy_principal_proof.len == 0) != (ext.row_policy_admitted_at_seconds == 0) or
         ext.row_policy_admitted_at_seconds < 0) return error.InvalidTxnRequest;
@@ -2758,6 +2782,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer freeTxnDeletes(alloc, deletes);
     const transforms = try parseTxnTransforms(alloc, obj.get("transforms") orelse return error.InvalidTxnRequest);
     errdefer freeTxnTransforms(alloc, transforms);
+    db_mod.types.validateExpirationDeletes(.{ .expiration_deletes = ext.expiration_deletes, .writes = writes, .deletes = deletes, .transforms = transforms }) catch return error.InvalidTxnRequest;
     const predicates = try parseTxnPredicates(alloc, obj.get("predicates") orelse return error.InvalidTxnRequest);
     errdefer freeTxnPredicates(alloc, predicates);
     const integrity = if (obj.get("integrity")) |value| try integrity_wire.parse(alloc, value) else &.{};
@@ -2793,8 +2818,8 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
-    if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
-    if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
+    if (wrapped and !expiration and !row_semantics and !has_guards) return error.InvalidTxnRequest;
+    if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics and !expiration) return error.InvalidTxnRequest;
     return .{
         .extensions_owner = extensions,
         .route_fence = if (route_fence) |fence| fence.value else null,
@@ -2809,6 +2834,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .graph_deletes = ext.graph_deletes,
             .writes = writes,
             .deletes = deletes,
+            .expiration_deletes = ext.expiration_deletes,
             .transforms = transforms,
             .predicates = predicates,
             .integrity = integrity,
@@ -7054,4 +7080,27 @@ test "distributed txn prepare retains signed graph mutations and normalized rows
     var decoded = try parseTxnPrepareRequest(alloc, encoded);
     defer freeTxnPrepareRequest(alloc, &decoded);
     try std.testing.expectEqualDeep(request.req, decoded.req);
+}
+
+test "distributed txn retained series expiration wire rejects downgrade and preserves bounded provenance" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const req: TxnPrepareRequest = .{ .txn_id = @splat(1), .topology_epoch = 1, .req = .{ .deletes = &.{"expired"}, .expiration_deletes = &.{"expired"} } };
+            const bytes = try encodeTxnPrepareRequest(alloc, req);
+            defer alloc.free(bytes);
+            var parsed = try parseTxnPrepareRequest(alloc, bytes);
+            defer freeTxnPrepareRequest(alloc, &parsed);
+            try std.testing.expectEqualStrings("expired", parsed.req.expiration_deletes[0]);
+            const root = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            defer root.deinit();
+            const unwrapped = try std.json.Stringify.valueAlloc(alloc, root.value.array.items[1], .{});
+            defer alloc.free(unwrapped);
+            if (parseTxnPrepareRequest(alloc, unwrapped)) |value| {
+                var unexpected = value;
+                freeTxnPrepareRequest(alloc, &unexpected);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidTxnRequest) return err;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

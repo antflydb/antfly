@@ -71,6 +71,7 @@ pub const TableCommitRequest = struct {
     relational_repair: bool = false,
     writes: []const db_types.TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
+    expiration_deletes: []const []const u8 = &.{},
     transforms: []const db_types.DocumentTransform = &.{},
     graph_writes: []const db_types.GraphEdgeWrite = &.{},
     graph_deletes: []const db_types.GraphEdgeDelete = &.{},

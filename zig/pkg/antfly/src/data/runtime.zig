@@ -12721,7 +12721,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
-        if (req.retained_series != null) return @import("../common/data_raft_protocol.zig").batch_retained_series_protocol_version;
+        if (req.retained_series != null or req.expiration_deletes.len != 0) return @import("../common/data_raft_protocol.zig").batch_retained_series_protocol_version;
         const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
         // Keep proposal admission and the encoded envelope in lockstep as
         // the private document-version effect language evolves.
@@ -57685,6 +57685,9 @@ test "retained series lifecycle protocol dominates document revision negotiation
     var req: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1, .retained_series = .{ .action = .tick, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } };
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     req.document_version_scheme = .revision_v1;
+    try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series = null;
+    req.expiration_deletes = &.{"expired"};
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     try std.testing.expect(p.batch_protocol_version >= p.batch_retained_series_protocol_version);
 }

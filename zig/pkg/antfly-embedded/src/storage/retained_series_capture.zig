@@ -103,7 +103,7 @@ pub fn install(a: A, txn: anytype, binding: Binding, context: Context, complete_
 
 /// Physical inputs have already been schema-normalized by native intent
 /// preparation. Metadata intents are excluded by that caller before planning.
-pub const PreparedInput = struct { key: []const u8, logical_key: []const u8, after: ?[]const u8 };
+pub const PreparedInput = struct { key: []const u8, logical_key: []const u8, after: ?[]const u8, cause: series.Cause = .mutation };
 pub const AdmissionCost = series.AdmissionCost;
 pub const PrepareEffects = struct { writes: []const @import("docstore.zig").KVPair, deletes: []const []const u8, costs: []const AdmissionCost };
 const PreparedBudget = struct { count: usize = 0, before: usize = 0, after: usize = 0 };
@@ -196,7 +196,7 @@ pub fn planPrepare(a: A, read: *@import("docstore.zig").DocStore.Txn, transactio
     const changes = try a.alloc(series.Change, decoded.len);
     var costs = std.StringHashMap(u64).init(a);
     for (bindings) |binding| {
-        for (decoded, changes) |entry, *change| change.* = .{ .key = entry.input.key, .before = if (entry.before) |image| try normalizeImage(a, binding, image) else null, .after = if (entry.after) |image| try normalizeImage(a, binding, image) else null };
+        for (decoded, changes) |entry, *change| change.* = .{ .key = entry.input.key, .cause = entry.input.cause, .before = if (entry.before) |image| try normalizeImage(a, binding, image) else null, .after = if (entry.after) |image| try normalizeImage(a, binding, image) else null };
         std.mem.sort(series.Change, changes, {}, struct {
             fn less(_: void, left: series.Change, right: series.Change) bool {
                 return std.mem.order(u8, left.key, right.key) == .lt;
@@ -799,6 +799,17 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
         var current = try db.core.store.beginReadTxn();
         defer current.abort();
         try std.testing.expectError(error.NotFound, current.get(try preparedCountKey(alloc, noop_txn)));
+    }
+    const expiration_txn = try db.beginTransaction(261);
+    try db.writeTransaction(expiration_txn, .{ .admitted_timestamp_ns = 261, .deletes = &.{"a"}, .expiration_deletes = &.{"a"} });
+    try db.resolveTransactionIntents(expiration_txn, .committed, 262);
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectError(error.NotFound, current.get(try keys.documentKeyAlloc(alloc, "a")));
+        const retained = try (series.Engine{ .alloc = a, .spec = binding.spec }).scan(alloc, &current, 0, 10, 262, null, 10);
+        try std.testing.expectEqual(@as(i64, 1), retained.rows[0].rows);
+        try std.testing.expectEqual(@as(?f64, 3), retained.rows[0].metrics[1].value(.sum));
     }
 }
 

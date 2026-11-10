@@ -724,7 +724,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
+        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].expiration_deletes.len == 0 and tables[0].relational_index_maintenance == null) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
@@ -732,6 +732,7 @@ pub const BoundTableWriteSource = struct {
             const req: db_mod.types.BatchRequest = .{
                 .writes = transactionWritesAsBatchWrites(table.writes),
                 .deletes = table.deletes,
+                .expiration_deletes = table.expiration_deletes,
                 .transforms = table.transforms,
                 .sync_level = sync_level,
             };
@@ -866,8 +867,10 @@ pub const BoundTableWriteSource = struct {
             else => return err,
         };
         db.writeTransaction(txn_id, .{
+            .admitted_timestamp_ns = commit_version,
             .writes = table.writes,
             .deletes = table.deletes,
+            .expiration_deletes = table.expiration_deletes,
             .transforms = table.transforms,
             .predicates = table.predicates,
             .integrity = table.integrity,

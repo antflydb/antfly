@@ -89,7 +89,14 @@ pub const Spec = struct {
 /// numeric inputs are null (SQL aggregate null semantics); count counts rows.
 pub const Row = struct { timestamp_ns: i128, dimensions: []const u8, values: []const ?f64 };
 pub const AdmissionCost = struct { key: []const u8, bytes: u64 };
-pub const Change = struct { key: []const u8, before: ?Row = null, after: ?Row = null };
+pub const Change = struct {
+    key: []const u8,
+    before: ?Row = null,
+    after: ?Row = null,
+    /// Trusted prepare admission only. Resolution uses the persisted proof;
+    /// ordinary source commands use their command-level cause.
+    cause: Cause = .mutation,
+};
 pub const Cause = enum { mutation, expiration };
 pub const Progress = struct {
     definition: Id,
@@ -99,6 +106,7 @@ pub const Progress = struct {
     complete_from_ns: i128,
     ready: bool = false,
     backfill_cursor: []const u8 = "",
+    backfill_clean: bool = false,
     feed_latest: u64 = 0,
     feed_floor: u64 = 0,
     feed_bytes: usize = 0,
@@ -178,6 +186,7 @@ pub const Engine = struct {
         const raw = try txn.get(k);
         const p = (try std.json.parseFromSlice(Progress, a, raw, .{ .allocate = .alloc_always })).value;
         if (!std.mem.eql(u8, &p.definition, &self.spec.definition) or p.source_incarnation != self.spec.source_incarnation) return error.RetainedSeriesDefinitionMismatch;
+        if (p.backfill_clean and !p.ready) return error.RetainedSeriesCorrupt;
         if (p.feed_floor > p.feed_latest or p.feed_latest - p.feed_floor > max_feed_frames or p.feed_bytes > max_feed_bytes or
             try self.spec.bucket(p.complete_from_ns) != p.complete_from_ns) return error.RetainedSeriesCorrupt;
         return p;
@@ -392,9 +401,12 @@ pub const Engine = struct {
             const before = try self.contribution(change.before);
             const after = try self.contribution(change.after);
             const previous = try self.readReservation(a, txn, transaction, change.key);
-            if (previous) |old| if (!std.meta.eql(old.before, before)) return error.RetainedSeriesReservationMismatch;
+            if (previous) |old| if (old.cause != change.cause or !std.meta.eql(old.before, before)) return error.RetainedSeriesReservationMismatch;
             var holds: std.ArrayList([]const u8) = .empty;
-            if (!std.meta.eql(before, after)) {
+            if (change.cause == .expiration) {
+                if (change.after != null) return error.RetainedSeriesNotReady;
+                if (change.before) |row| if (!try self.expirationReady(a, txn, p, row, now)) return error.RetainedSeriesNotReady;
+            } else if (!std.meta.eql(before, after)) {
                 for ([_]?Row{ change.before, change.after }, 0..) |optional_row, side| {
                     const row = optional_row orelse continue;
                     if (try self.spec.expired(row.timestamp_ns, now)) continue;
@@ -408,7 +420,7 @@ pub const Engine = struct {
             }
             if (previous) |old| for (old.holds) |bucket| try self.changeHold(a, txn, bucket, false);
             for (holds.items) |bucket| try self.changeHold(a, txn, bucket, true);
-            const raw = try std.json.Stringify.valueAlloc(a, Reservation{ .admitted_ns = if (previous) |old| @max(now, old.admitted_ns) else now, .document = change.key, .before = before, .after = after, .holds = holds.items }, .{});
+            const raw = try std.json.Stringify.valueAlloc(a, Reservation{ .cause = change.cause, .admitted_ns = if (previous) |old| @max(now, old.admitted_ns) else now, .document = change.key, .before = before, .after = after, .holds = holds.items }, .{});
             if (raw.len > 32768) return error.RetainedSeriesBatchTooLarge;
             const reservation_key = try self.reservationKey(a, transaction, change.key);
             try txn.put(reservation_key, raw);
@@ -515,7 +527,7 @@ pub const Engine = struct {
         if (prepared) |transaction| for (changes) |change| {
             if ((try reservations.getOrPut(change.key)).found_existing) return error.RetainedSeriesDuplicateRow;
             const value = (try self.readReservation(a, txn, transaction, change.key)) orelse return error.RetainedSeriesReservationMismatch;
-            if (value.cause != cause or !std.meta.eql(value.before, try self.contribution(change.before)) or !std.meta.eql(value.after, try self.contribution(change.after))) return error.RetainedSeriesReservationMismatch;
+            if (!std.meta.eql(value.before, try self.contribution(change.before)) or !std.meta.eql(value.after, try self.contribution(change.after))) return error.RetainedSeriesReservationMismatch;
             now = @max(now, value.admitted_ns);
             try reservations.put(change.key, value);
         };
@@ -529,7 +541,8 @@ pub const Engine = struct {
             if (change.before) |r| try self.validateRow(r);
             if (change.after) |r| try self.validateRow(r);
             const reserved = reservations.get(change.key);
-            if (cause == .expiration) {
+            const effective_cause = if (reserved) |proof| proof.cause else cause;
+            if (effective_cause == .expiration) {
                 if (change.after != null) return error.RetainedSeriesNotReady;
                 if (change.before) |r| {
                     if (try self.spec.bucket(r.timestamp_ns) < p.complete_from_ns or try self.spec.expired(r.timestamp_ns, now)) continue;
@@ -761,8 +774,9 @@ pub const Engine = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const p = try self.load(a, txn);
+        var p = try self.load(a, txn);
         if (!p.ready) return error.RetainedSeriesNotReady;
+        if (p.backfill_clean) return 0;
         const marker = try self.key(a, "backfill:");
         const keys = try a.alloc([]const u8, limit);
         var n: usize = 0;
@@ -778,6 +792,10 @@ pub const Engine = struct {
             }
         }
         for (keys[0..n]) |k| try txn.delete(k);
+        if (n < limit) {
+            p.backfill_clean = true;
+            try self.save(a, txn, p);
+        }
         return n;
     }
     /// Read this and snapshot rows in ONE immutable read transaction for the

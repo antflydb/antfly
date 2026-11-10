@@ -171,6 +171,7 @@ const Work = struct {
     queued: bool = false,
     dirty: bool = false,
     explicit: bool = false,
+    expiration: bool = false,
     // Immutable statement input, before any cascading edge changes `after`.
     explicit_after: ?[]const u8 = null,
     expansion: ?planner.Expansion = null,
@@ -698,6 +699,7 @@ const Builder = struct {
         if (definition.match != .partial and !try self.childStillReferences(child, definition, transition.address, false)) return;
         if (action == .cascade and parent.after == null) {
             child.after = null;
+            if (!child.explicit) child.expiration = parent.expiration;
             try self.enqueue(child);
             return;
         }
@@ -1067,6 +1069,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
+        try types.validateExpirationDeletes(request);
         var commands: std.ArrayList(planner.storage.Command) = .empty;
         for (request.integrity_commands) |command| {
             if (command.operation != .compare_claim) return error.InvalidIntegrityCommand;
@@ -1108,6 +1111,9 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
             item.explicit = true;
             item.after = entry.value_ptr.*;
             item.explicit_after = item.after;
+            item.expiration = item.after == null and for (request.expiration_deletes) |key| {
+                if (std.mem.eql(u8, key, item.key)) break true;
+            } else false;
             if (item.after) |json| {
                 try builder.charge(json.len);
                 const parsed = try std.json.parseFromSlice(std.json.Value, builder.alloc, json, .{ .allocate = .alloc_always, .parse_numbers = false });
@@ -1153,9 +1159,12 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
         builder.output.items[i].writes = &.{};
         builder.output.items[i].deletes = &.{};
+        builder.output.items[i].expiration_deletes = &.{};
     }
     const final_writes = try builder.alloc.alloc(std.ArrayList(types.TransactionWrite), builder.output.items.len);
     const final_deletes = try builder.alloc.alloc(std.ArrayList([]const u8), builder.output.items.len);
+    const final_expirations = try builder.alloc.alloc(std.ArrayList([]const u8), builder.output.items.len);
+    @memset(final_expirations, .empty);
     @memset(final_writes, .empty);
     @memset(final_deletes, .empty);
     for (builder.work.items) |item| {
@@ -1163,6 +1172,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
         try builder.appendPredicate(i, item.key, item.observed_version, item.observed_digest);
         if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json }) else try final_deletes[i].append(builder.alloc, item.key);
+        if (item.after == null and item.expiration) try final_expirations[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
         for (expansion.commands) |command| try builder.appendCommand(command.table_name, command.command);
@@ -1176,6 +1186,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (writes.items.len != 0 or deletes.items.len != 0) {
             builder.output.items[i].writes = writes.items;
             builder.output.items[i].deletes = deletes.items;
+            builder.output.items[i].expiration_deletes = final_expirations[i].items;
         }
     }
     for (builder.final_references.items) |pending| {
@@ -2764,14 +2775,17 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
         fake.claims = .{ a_unique.tables[0].integrity_commands[0].operation.establish, b_unique.tables[0].integrity_commands[0].operation.establish };
         fake.addresses = .{ a_unique.tables[0].integrity_commands[0].address, b_unique.tables[0].integrity_commands[0].address };
         fake.references = .{ b_foreign.tables[1].integrity_commands[0].operation.attach, a_foreign.tables[1].integrity_commands[0].operation.attach };
-        var deletion = try prepare(alloc, source, &metadata, &.{.{ .table_name = "a", .deletes = &.{"a"} }});
+        var deletion = try prepare(alloc, source, &metadata, &.{.{ .table_name = "a", .deletes = &.{"a"}, .expiration_deletes = &.{"a"} }});
         defer deletion.deinit();
         try std.testing.expectEqual(@as(usize, 2), deletion.tables.len);
         try std.testing.expectEqualStrings("a", deletion.tables[0].deletes[0]);
+        try std.testing.expectEqualStrings("a", deletion.tables[0].expiration_deletes[0]);
         if (comptime std.mem.eql(u8, delete_action, "cascade")) {
             try std.testing.expectEqualStrings("b", deletion.tables[1].deletes[0]);
+            try std.testing.expectEqualStrings("b", deletion.tables[1].expiration_deletes[0]);
         } else {
             try std.testing.expectEqualStrings("{\"id\":null}", deletion.tables[1].writes[0].value);
+            try std.testing.expectEqual(@as(usize, 0), deletion.tables[1].expiration_deletes.len);
         }
         try std.testing.expectEqual(@as(usize, 2), fake.reference_reads);
         var updated = try prepare(alloc, source, &metadata, &.{.{ .table_name = "a", .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }});

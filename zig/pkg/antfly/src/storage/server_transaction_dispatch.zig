@@ -125,6 +125,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .normalized_graph_rows = req.normalized_graph_rows,
                 .writes = batchWritesAsTransactionWrites(req.writes),
                 .deletes = req.deletes,
+                .expiration_deletes = req.expiration_deletes,
                 .transforms = req.transforms,
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,

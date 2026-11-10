@@ -8963,6 +8963,9 @@ pub const DB = struct {
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
         if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
+        // Prepared expiration provenance belongs to the transaction dispatcher.
+        // Ordinary batch entry points cannot silently reinterpret it as a delete.
+        if (req.expiration_deletes.len != 0) return error.InvalidRetainedSeries;
         if (req.retained_series != null) return self.applyRetainedSeriesBatch(req, opts);
         if (try self.core.store.retainedSeriesActive()) {
             // These routes need retained correction reservations and complete
@@ -25465,14 +25468,16 @@ pub const DB = struct {
         }
     }
 
-    fn prepareRetainedIntentEffects(self: *DB, a: Allocator, transaction: transactions_mod.TxnId, admitted_timestamp_ns: u64, intents: []const transactions_mod.WriteIntent) !@import("../retained_series_capture.zig").PrepareEffects {
+    fn prepareRetainedIntentEffects(self: *DB, a: Allocator, transaction: transactions_mod.TxnId, admitted_timestamp_ns: u64, intents: []const transactions_mod.WriteIntent, expiration_deletes: []const []const u8) !@import("../retained_series_capture.zig").PrepareEffects {
         const capture = @import("../retained_series_capture.zig");
         if (!try self.core.store.retainedSeriesActive()) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
         var inputs: std.ArrayList(capture.PreparedInput) = .empty;
         for (intents) |intent| {
             if (isMetadataKey(intent.key) or isProtectedIntegrityKey(intent.key) or isProtectedRangeWriteKey(intent.key)) continue;
             const physical = if (relationalColumns(self) != null) try relational_store.keyAlloc(a, intent.key) else try internal_keys.documentKeyAlloc(a, intent.key);
-            try inputs.append(a, .{ .key = physical, .logical_key = intent.key, .after = intent.prepared_row orelse intent.value });
+            try inputs.append(a, .{ .key = physical, .logical_key = intent.key, .after = intent.prepared_row orelse intent.value, .cause = if (for (expiration_deletes) |key| {
+                if (std.mem.eql(u8, key, intent.key)) break true;
+            } else false) .expiration else .mutation });
         }
         if (inputs.items.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
         if (admitted_timestamp_ns == 0) return error.InvalidRetainedSeries;
@@ -25538,7 +25543,7 @@ pub const DB = struct {
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, prepared_intents, view, &guarded_predicates);
         var retained_arena = std.heap.ArenaAllocator.init(preparation_alloc);
         defer retained_arena.deinit();
-        const retained = try self.prepareRetainedIntentEffects(retained_arena.allocator(), txn_id, admitted_timestamp_ns, prepared_intents);
+        const retained = try self.prepareRetainedIntentEffects(retained_arena.allocator(), txn_id, admitted_timestamp_ns, prepared_intents, &.{});
         try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, guarded_predicates.items, .{
             .writes = retained.writes,
             .deletes = retained.deletes,
@@ -25632,6 +25637,7 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        try types.validateExpirationDeletes(req);
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
@@ -25974,7 +25980,7 @@ pub const DB = struct {
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
-            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items);
+            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items, req.expiration_deletes);
             var retained_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
             try retained_writes.appendSlice(retained_alloc, retained.writes);
             try retained_writes.append(retained_alloc, marker);
@@ -25985,7 +25991,7 @@ pub const DB = struct {
                 .{ .writes = retained_writes.items, .deletes = retained.deletes, .retained_series_costs = retained.costs, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
-            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items);
+            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items, req.expiration_deletes);
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
                 .writes = retained.writes,
                 .deletes = retained.deletes,
@@ -26872,9 +26878,6 @@ pub const DB = struct {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 if (try manager.hasTopologySensitiveTransactions()) return error.RetainedSeriesTransactionsUnsupported;
-                var schema_view = self.core.schema_registry.acquire();
-                defer if (schema_view) |*view| view.release();
-                if (schema_view) |view| if (view.hasCoordinatedConstraints()) return error.RetainedSeriesCoordinatedTtlUnsupported;
                 if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
             }
             var txn = try self.core.store.beginWriteTxn();
@@ -53860,7 +53863,6 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
     if (view) |pinned| if (pinned.hasCoordinatedConstraints()) {
-        if (try ctx.batch.store.retainedSeriesActive()) return error.RetainedSeriesCoordinatedTtlUnsupported;
         const io = ctx.batch.io orelse std.Options.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
@@ -53871,6 +53873,12 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
         const schema = pinned.tableSchema();
         if (schema.ttl_duration_ns == 0) return 0;
         const now = ctx.clock.nowRealtimeNs();
+        var summary_arena = std.heap.ArenaAllocator.init(ctx.batch.alloc);
+        defer summary_arena.deinit();
+        const summary_alloc = summary_arena.allocator();
+        var summary_read: ?docstore_mod.DocStore.Txn = if (try ctx.batch.store.retainedSeriesActive()) try ctx.batch.store.beginReadTxn() else null;
+        defer if (summary_read) |*read| read.abort();
+        const summary_guard = if (summary_read) |*read| try @import("../retained_series_capture.zig").ExpirationGuard.init(summary_alloc, read) else null;
         var prepared = std.ArrayList(coordinated_ttl.Candidate).empty;
         defer prepared.deinit(ctx.batch.alloc);
         {
@@ -53897,6 +53905,12 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
                     error.NotFound => continue,
                     else => return err,
                 };
+                if (summary_guard) |required| {
+                    // The observation is only a prefilter. Prepared participant
+                    // admission revalidates exact current contributions.
+                    const observed = try summary_alloc.dupe(u8, raw);
+                    if (!try required.allowed(summary_alloc, &summary_read.?, observed, now)) continue;
+                }
                 var digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 try prepared.append(ctx.batch.alloc, .{

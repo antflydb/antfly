@@ -15,6 +15,7 @@
 
 test {
     _ = @import("storage/retained_series.zig");
+    _ = @import("storage/retained_series_maintenance.zig");
     _ = @import("storage/document_value_bound.zig");
     _ = @import("storage/retained_series_archive.zig");
 }

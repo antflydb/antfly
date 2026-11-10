@@ -667,3 +667,32 @@ test "retained series prepared admission clock cannot reopen finalized history o
     try std.testing.expectEqual(@as(i128, 120), (try e.status(arena.allocator(), &store)).admitted_ns);
     try std.testing.expectError(error.RetainedSeriesCorrectionWindow, e.apply(&store, 3, 7, .mutation, &.{.{ .key = "a", .before = sample(1, &updated), .after = sample(1, &old) }}));
 }
+
+test "retained series prepared expiration preserves history alongside ordinary cascade effects" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const values = [_]?f64{ null, 3, 3, 3, 3 };
+    try e.apply(&store, 1, 5, .mutation, &.{.{ .key = "expired", .after = sample(1, &values) }});
+    // A TTL delete is safe only after its contribution is finalized.
+    const expiration = series.Change{ .key = "expired", .before = sample(1, &values), .cause = .expiration };
+    try std.testing.expectError(error.RetainedSeriesNotReady, e.prepare(&store, @splat(1), 109, &.{expiration}));
+    const changes = [_]series.Change{ expiration, .{ .key = "survivor", .after = sample(121, &values) } };
+    try e.prepare(&store, @splat(1), 120, &changes);
+    // Retry cannot turn an admitted physical expiration into a retraction.
+    try std.testing.expectError(error.RetainedSeriesReservationMismatch, e.prepare(&store, @splat(1), 120, &.{.{ .key = "expired", .before = sample(1, &values) }}));
+    // The resolution command need not trust or retransmit per-row causes.
+    try e.applyPrepared(&store, @splat(1), 2, 120, .mutation, &.{
+        .{ .key = "expired", .before = sample(1, &values) },
+        .{ .key = "survivor", .after = sample(121, &values) },
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const page = try e.scan(arena.allocator(), &store, 0, 130, 120, null, 10);
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expectEqual(@as(i64, 1), page.rows[0].rows);
+    try std.testing.expectEqual(@as(?f64, 3), page.rows[0].metrics[3].value(.min));
+    try std.testing.expectEqual(@as(i64, 1), page.rows[1].rows);
+    try std.testing.expectEqual(@as(usize, 0), try e.releasePrepared(&store, @splat(1)));
+}

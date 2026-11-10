@@ -1729,6 +1729,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-rewrite-admission-contract-test", "Verify scoped rewrite admission and durable intent binding")
         .dependOn(&addFilteredTestRunArtifact(b, rewrite_admission_contract_tests).step);
+    const retained_series_ttl_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "retained series expiration", "distributed txn retained series", "distributed txn ttl", "distributed txn atomic cascade closure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("retained-series-ttl-test", "Verify coordinated expiration provenance, foreign-key closure and fail-closed transport")
+        .dependOn(&addFilteredTestRunArtifact(b, retained_series_ttl_tests).step);
     const row_semantics_codec_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn prepare preserves JSON null", "distributed txn prepare JSON null", "internal batch JSON null", "distributed txn range guard wire" },
