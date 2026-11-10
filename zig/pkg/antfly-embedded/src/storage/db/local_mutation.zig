@@ -429,6 +429,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const clearGeneratedSparseMemoJobs = preparation.clearGeneratedSparseMemoJobs;
         pub const clearGraphArtifactStatePaged = materialization.clearGraphArtifactStatePaged;
         pub const clearPrecomputeAssetProducerBatchItems = materialization.clearPrecomputeAssetProducerBatchItems;
+        pub const applyAssetPublicationMetadataContext = materialization.applyAssetPublicationMetadataContext;
         pub const clearPublishedAssetArtifactRepairIssuesContext = materialization.clearPublishedAssetArtifactRepairIssuesContext;
         pub const clearPublishedEmbeddingArtifactRepairIssueContext = materialization.clearPublishedEmbeddingArtifactRepairIssueContext;
         pub const clearPublishedEmbeddingArtifactRepairIssuesContext = materialization.clearPublishedEmbeddingArtifactRepairIssuesContext;
@@ -485,7 +486,6 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const derivedCoverageOutcomeCounterValueForStore = materialization.derivedCoverageOutcomeCounterValueForStore;
         pub const directGraphNeighborContextHintsAlloc = materialization.directGraphNeighborContextHintsAlloc;
         pub const documentExtractionFailureManifestPayloadAlloc = materialization.documentExtractionFailureManifestPayloadAlloc;
-        pub const documentExtractionFingerprintAlloc = materialization.documentExtractionFingerprintAlloc;
         pub const documentExtractionKeyIndex = materialization.documentExtractionKeyIndex;
         pub const documentExtractionManifestGeneration = materialization.documentExtractionManifestGeneration;
         pub const documentExtractionManifestHasLastError = materialization.documentExtractionManifestHasLastError;
