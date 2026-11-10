@@ -15,10 +15,12 @@
 
 """Resolver curation admission, owner progress, and namespace routes over HTTP."""
 
+import time
 from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
+import requests
 
 
 # Server ownership is dynamic/direct, outside static fixture inference.
@@ -27,11 +29,39 @@ pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 def _entity_progress(api, table, key):
     """Observe each consumer through the bounded, revision-fenced public API."""
-    path = f"/tables/{table}/entities/{quote(key, safe='')}/progress?limit=1"
+    initial_path = f"/tables/{table}/entities/{quote(key, safe='')}/progress?limit=1"
+    path = initial_path
+    deadline = time.monotonic() + 10.0
     results = []
     seen = set()
     while True:
-        page = api.get(path)
+        try:
+            page = api.get(path)
+        except requests.HTTPError as error:
+            response = error.response
+            if response is None or response.status_code != 409:
+                raise
+            try:
+                detail = response.json()
+            except ValueError:
+                raise error
+            remaining = deadline - time.monotonic()
+            if (
+                not isinstance(detail, dict)
+                or detail.get("error") != "CatalogGenerationChanged"
+                or detail.get("retryable") is not True
+                or remaining <= 0
+            ):
+                raise
+            # A changed revision invalidates the entire paginated snapshot.
+            # Never combine earlier pages with the next generation's results.
+            results.clear()
+            seen.clear()
+            path = initial_path
+            time.sleep(min(0.05, remaining))
+            if time.monotonic() >= deadline:
+                raise
+            continue
         assert len(page["results"]) <= 1, page
         for row in page["results"]:
             identity = (row["source_table"], row["resolver"], row["key_template"])
