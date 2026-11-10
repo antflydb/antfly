@@ -75,6 +75,42 @@ def _entity_progress(api, table, key):
         path = path.partition("&cursor=")[0] + "&cursor=" + quote(cursor, safe="")
 
 
+def test_entity_progress_discards_partial_snapshot_on_catalog_change(monkeypatch):
+    before = {"source_table": "notes", "resolver": "concepts", "key_template": "a"}
+    after = {**before, "applied": True}
+    neighbor = {**after, "key_template": "b"}
+    response = requests.Response()
+    response.status_code = 409
+    response._content = b'{"error":"CatalogGenerationChanged","retryable":true}'
+    conflict = requests.HTTPError(response=response)
+    pages = iter(
+        [
+            {"results": [before], "next_cursor": "old", "complete": False},
+            conflict,
+            {"results": [after], "next_cursor": "new", "complete": False},
+            {"results": [neighbor], "complete": True},
+        ]
+    )
+
+    class Api:
+        def __init__(self):
+            self.paths = []
+
+        def get(self, path):
+            self.paths.append(path)
+            page = next(pages)
+            if isinstance(page, Exception):
+                raise page
+            return page
+
+    api = Api()
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    assert _entity_progress(api, "entities", "concept/a") == [after, neighbor]
+    assert api.paths[0] == api.paths[2]
+    assert api.paths[1] == api.paths[0] + "&cursor=old"
+    assert api.paths[3] == api.paths[0] + "&cursor=new"
+
+
 def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     api = stateful_api
     suffix = uuid4().hex[:8]
