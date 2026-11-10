@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
 // Retained document capabilities and incremental HTTP request-body reads.
-pub const abi_version: u32 = 35;
+pub const abi_version: u32 = 36;
 pub const DocumentStoreView = @import("antfly_runtime_abi").document_abi.View;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";

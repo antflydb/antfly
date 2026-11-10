@@ -6912,7 +6912,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const memory_pressure_tests = b.addTest(.{
         .name = "memory-pressure-tests",
         .root_module = antfly_test_mod,
-        .filters = selectTestFilters(b, &.{ "resource manager physical pressure", "lite native retirement" }),
+        .filters = selectTestFilters(b, &.{ "resource manager physical pressure", "lite native cache advice", "host memory owners", "Lite inference reclaims attached" }),
         .max_rss = 6 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

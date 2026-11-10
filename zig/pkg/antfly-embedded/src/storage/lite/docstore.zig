@@ -1318,6 +1318,7 @@ pub const OpenOptions = struct {
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     io: ?std.Io = null,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice = .{},
 };
 
 pub const CreateOptions = struct {
@@ -1328,6 +1329,7 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice = .{},
 };
 
 const MutationRequest = struct {
@@ -1544,6 +1546,7 @@ pub const Store = struct {
             .wait_for_reader_lock = opts.read_only,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
+            .cache_advice = opts.cache_advice,
         };
         const file = if (opts.io) |io|
             try native.NativeFile.openWithIo(allocator, io, path, native_opts)
@@ -1595,6 +1598,7 @@ pub const Store = struct {
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
+            .cache_advice = opts.cache_advice,
             .writer_lock_marker = opts.writer_lock_marker,
             .indexed_reclamation = opts.reclamation.page_reuse,
         };

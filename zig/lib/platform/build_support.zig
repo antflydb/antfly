@@ -108,15 +108,7 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
     }) });
     const run_resource_policy_tests = b.addRunArtifact(resource_policy_tests);
-    const retired_file_cache_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = options.root.path(b, "src/retired_file_cache.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = link_libc,
-    }) });
-    const run_retired_file_cache_tests = b.addRunArtifact(retired_file_cache_tests);
     const run_unit = b.addRunArtifact(unit);
-    run_unit.step.dependOn(&run_retired_file_cache_tests.step);
     run_unit.step.dependOn(&run_resource_policy_tests.step);
     run_unit.step.dependOn(&run_atomic_tests.step);
     run_unit.step.dependOn(&run_entropy_tests.step);

@@ -328,31 +328,42 @@ known; it never infers ownership from RSS growth. Probes occur at admission and
 batched metadata reservation boundaries, not on cache hits or individual parser
 allocations.
 
-Physical denial can also ask the process owner to reclaim host caches, even
-when the managed ledger is below its ceiling. Standalone uses ResourceManager's
-existing weighted cache reclamation; embedded Lite supplies the retired-file
-capability through the same versioned inference bridge. Worker transport forwards
-that capability without holding its lease mutex. All paths re-probe memory after
-reclamation: callback counters and advisory hints never grant allocation credit.
+Physical denial can also ask the process owner to reclaim managed host caches,
+even when its ledger is below its ceiling. Standalone uses ResourceManager's
+weighted cache reclamation; Lite attaches each live storage manager to its
+shared inference service. Attachments rotate fairly and detach drains borrowed
+callbacks before DB/cache teardown. The capability crosses the versioned
+inference bridge and worker transport without holding admission, attachment, or
+RPC accounting locks during callbacks. Preflight, auxiliary weights, runs and
+metadata all participate. One owner pass per admission leaves inference caches
+and model eviction an opportunity to help. Every retry re-probes physical memory;
+reported decreases are never allocation credit.
 
-Linux Lite file owners and completed snapshot outputs retire clean-file-cache
-opportunities before closing. A fixed 64-entry registry owns CLOEXEC duplicates,
-so callbacks never reopen paths or borrow destroyed owners. Normal closes retain
-warm pages; pressure issues best-effort DONTNEED advice, while owner teardown and
-registry overflow release the descriptors and advise their clean ranges. Internal
-readers do not retire shared hot files. Abstract I/O is excluded; native Threaded
-and Evented file capabilities are checked explicitly. Other platforms retain
-their existing behavior. Dirty, pinned and writeback pages remain protected by
-the kernel. A declined hint retains a cooled-down opportunity for a later request,
-and each admission has a bounded reclaim-pass budget, preventing retry spins.
+Linux file-cache cleanup belongs to the file-producing operation. A completed
+snapshot drops its synced private output cache before publication; a writable
+file owner drops cache before releasing its lifetime writer lease. Internal
+readers, read-only snapshots and externally leased generations do not discard
+another owner's hot pages on close. Each DONTNEED hint covers at most 8 MiB and
+the operation yields between ranges. Advice can initiate writeback and is
+best-effort; it runs outside admission rather than under the eviction lock.
+No descriptor or path is retained after close, so deleted files release their
+inodes immediately and there is no registry to diverge between compiled images.
 
-The focused `antfly-memory-pressure-test` checks managed reclamation and Lite
-snapshot/reader ownership. The Linux kernel regression in
+Native advice is granted by the I/O producer and forwarded in the checked
+executor borrow. Borrowed consumers never identify native handles by comparing
+implementation addresses. Abstract I/O carries no such authority. The native
+runtime ABI version covers this additional capability.
+
+The focused `antfly-memory-pressure-test` checks Lite managed-cache recovery,
+snapshot/internal-reader ownership, deleted-inode release, fair callbacks and
+concurrent detach. `runtime-file-cache-abi-test` links an independent provider
+archive to verify that native advice survives executor translation and that
+abstract I/O cannot grant it. The Linux kernel regression in
 `scripts/ci/run_inference_memory_pressure.py` uses a 1 CPU / 2 GiB no-swap cgroup,
-creates clean active file cache in a writer that exits, and verifies that the
-real inference controller recovers a denied request through the owner capability.
-It requires no model download; it does not substitute for workload-specific
-embedding/indexing throughput and snapshot recovery qualification.
+creates active file cache in a writer that exits, applies bounded owner cleanup,
+and verifies fresh admission recovery without an OOM kill. It requires no model
+download; workload-specific embedding/indexing throughput and snapshot/crash
+recovery remain separate qualification.
 
 An explicit envelope also makes its live-usage probe mandatory. If the
 leaf-cgroup working set or macOS process footprint is temporarily unavailable,

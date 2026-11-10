@@ -15,7 +15,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-pub const retired_file_cache = @import("antfly_platform").retired_file_cache;
 const allocator_residency = @import("antfly_platform").allocator.reclamation;
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
@@ -1542,11 +1541,9 @@ pub const ResourceManager = struct {
     }
 
     /// Physical pressure can precede a logical ledger deficit (for example,
-    /// buffered snapshot I/O). Reclaim retired file pages first, then managed
-    /// caches, without treating either counter as proof of physical capacity.
+    /// buffered snapshot I/O). Invoke managed owners without treating their
+    /// counters as proof of physical capacity. File I/O sheds cache at source.
     pub fn reclaimHostMemory(self: *ResourceManager, target_bytes: u64) u64 {
-        const retired = retired_file_cache.reclaim(target_bytes);
-        if (retired != 0) return retired;
         return self.reclaimCaches(.dense_apply_working_set, 0, target_bytes);
     }
 
@@ -1997,7 +1994,6 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
-        retired_file_cache.releaseOwner(@intFromPtr(self));
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();

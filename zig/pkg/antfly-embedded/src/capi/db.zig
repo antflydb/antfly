@@ -3117,6 +3117,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .exclusive = true,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .cache_advice = if (backend_runtime) |runtime| runtime.fileCacheAdvice() else .{},
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
@@ -3124,6 +3125,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .cache_advice = if (backend_runtime) |runtime| runtime.fileCacheAdvice() else .{},
         });
     errdefer if (!handle_owns_resources) backend.deinit();
     if (resolved.allocator_verification_owner) |verified| {
@@ -3237,6 +3239,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .process_memory_budget_mb = resolved.inference.process_memory_budget_mb,
         });
     }
+    try handles.attachLiteInferenceStorage(handle);
     // Restores the managed enrichment runtime for indexes/enrichments that
     // were already declared in a prior session (`create` only ever adds the
     // default full-text index, so this is a no-op there). Must run after

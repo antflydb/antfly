@@ -708,12 +708,6 @@ fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_ad
     return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
 
-/// Capability check for optional native file-cache advice. Deterministic and
-/// wrapped I/O implementations must not send virtual handles to the kernel.
-pub fn usesOsFileDescriptors(value: Io) bool {
-    return value.vtable.fileClose == fileClose;
-}
-
 pub fn io(ev: *Evented) Io {
     return .{
         .userdata = ev,

@@ -1250,6 +1250,13 @@ pub const BackendRuntime = struct {
         return if (self.io_impl) |io_impl| io_impl.io() else if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
     }
 
+    pub fn fileCacheAdvice(self: *BackendRuntime) @import("antfly_runtime_abi").io_abi.file_cache.Advice {
+        if (self.borrowed_receivers) |*borrowed| return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.borrow.file_cache else borrowed.general.borrow.file_cache;
+        if (self.io_impl != null) return .native();
+        if (self.borrowed_filesystem_receiver) |*filesystem| return filesystem.borrow.file_cache;
+        return .{};
+    }
+
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
         return self.native_storage_pool;
     }

@@ -111,6 +111,7 @@ pub const DB = struct {
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
+            .cache_advice = if (opts.lite_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io).file_cache else if (opts.backend_runtime) |runtime| runtime.fileCacheAdvice() else .{},
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend, false);
     }
@@ -122,6 +123,7 @@ pub const DB = struct {
             .exclusive = true,
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
+            .cache_advice = if (opts.lite_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io).file_cache else if (opts.backend_runtime) |runtime| runtime.fileCacheAdvice() else .{},
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend, true);
     }

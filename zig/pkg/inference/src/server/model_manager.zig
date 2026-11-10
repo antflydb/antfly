@@ -5853,7 +5853,10 @@ pub const ModelManager = struct {
         }
 
         pub fn reserveMetadataCapacity(self: @This(), bytes: usize) !runtime.tier.memory.LiveReservation {
-            return self.domain.admission.reserveLiveCapacity(bytes);
+            return self.domain.admission.reserveLiveCapacity(bytes) catch |err| {
+                if (err != error.ResourceTemporarilyUnavailable or self.domain.admission.reclaimHostCapacity() == 0) return err;
+                return self.domain.admission.reserveLiveCapacity(bytes);
+            };
         }
     };
 
@@ -5903,22 +5906,14 @@ pub const ModelManager = struct {
     }
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
-        const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory) catch |err| {
-            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
-            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
-        };
+        return self.acquireAmountsWithEvictionMode(.cpu, self.resource_domain.?.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
     }
 
     /// Auxiliary resident models share the physical host domain with primary
     /// sessions. The constructor shrinks this lease to actual owned weights.
     pub fn admitHostWeights(self: *ModelManager, peak_bytes: usize) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
-        const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true) catch |err| {
-            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(peak_bytes) == 0) return err;
-            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true);
-        };
+        return self.acquireAmountsWithEviction(.cpu, self.resource_domain.?.admission_limits, .{ .host_weight_bytes = peak_bytes });
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -6789,10 +6784,14 @@ pub const ModelManager = struct {
     fn reclaimOneForAdmission(
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
+        owner_attempted: *bool,
     ) bool {
         switch (pressure) {
-            .live_host => if (self.admissionController().reclaimHostCapacity() != 0) {
-                return true;
+            .live_host => if (!owner_attempted.*) {
+                // One owner pass per admission. A reported decrease can remain
+                // in an allocator arena; it must not starve other mechanisms.
+                owner_attempted.* = true;
+                if (self.admissionController().reclaimHostCapacity() != 0) return true;
             },
             else => {},
         }
@@ -6839,12 +6838,13 @@ pub const ModelManager = struct {
             spinLock(&self.eviction_lock);
             defer self.eviction_lock.unlock();
             var reclaim_attempts: usize = 0;
+            var owner_attempted = false;
             while (true) {
                 reclaim_attempts += 1;
                 if (self.admissionController().reserveLiveCapacity(bytes)) |reservation| return reservation else |retry| {
                     if (retry != error.ResourceTemporarilyUnavailable) return retry;
                 }
-                if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(.live_host)) return error.ResourceTemporarilyUnavailable;
+                if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(.live_host, &owner_attempted)) return error.ResourceTemporarilyUnavailable;
             }
         };
     }
@@ -6874,6 +6874,7 @@ pub const ModelManager = struct {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 var reclaim_attempts: usize = 0;
+                var owner_attempted = false;
                 while (true) {
                     reclaim_attempts += 1;
                     if (self.admissionController().tryAcquireWithPressure(
@@ -6891,6 +6892,7 @@ pub const ModelManager = struct {
                     }
                     if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
+                        &owner_attempted,
                     )) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, &requests);
                         return error.ResourceTemporarilyUnavailable;
@@ -6923,6 +6925,7 @@ pub const ModelManager = struct {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 var reclaim_attempts: usize = 0;
+                var owner_attempted = false;
                 while (true) {
                     reclaim_attempts += 1;
                     if (self.admissionController().tryAcquireRequestsWithPressure(
@@ -6940,6 +6943,7 @@ pub const ModelManager = struct {
                     }
                     if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
+                        &owner_attempted,
                     )) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, requests);
                         return error.ResourceTemporarilyUnavailable;
@@ -20256,4 +20260,44 @@ test "model processor resampling fences declared and implicit image routes" {
     try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
     inputs[0] = "audio";
     try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+}
+
+test "owner reclamation covers preflight and weights and cannot starve inference caches" {
+    const memory = runtime.tier.memory;
+    const Owner = struct {
+        calls: usize = 0,
+        cache_calls: usize = 0,
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+        fn reclaim(raw: *anyopaque, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 1;
+        }
+        fn cache(raw: *anyopaque, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cache_calls += 1;
+            return 0;
+        }
+    };
+    var owner = Owner{};
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    try controller.configureResourceBudget(.{ .context = &owner, .try_reserve = Owner.reserve, .retain = Owner.retain, .release = Owner.release, .reclaim_host = Owner.reclaim });
+    controller.configureProcessMemoryLimit(1, .explicit);
+    manager.setHostCacheReclaimer(.{ .context = &owner, .reclaim = Owner.cache });
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflight(1));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostWeights(1));
+    try std.testing.expectEqual(@as(usize, 2), owner.calls);
+    try std.testing.expect(owner.cache_calls >= 2);
+    owner.calls = 0;
+    owner.cache_calls = 0;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.cpu, .{}, .{ .host_scratch_bytes = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), owner.calls);
+    try std.testing.expectEqual(@as(usize, 1), owner.cache_calls);
 }

@@ -25,7 +25,7 @@ const builtin = @import("builtin");
 // Routing-generation callbacks now carry the complete cancellation/clock budget.
 // Reject older callers before interpreting callback arguments; shallow contracts
 // cannot detect the changed function signature behind catalog vtables.
-pub const abi_version: u32 = 12;
+pub const abi_version: u32 = 13;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

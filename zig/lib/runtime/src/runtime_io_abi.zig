@@ -19,6 +19,8 @@
 //! The Receiver must stay at a stable address until its tasks and I/O finish.
 const std = @import("std");
 const native = @import("runtime_native_abi.zig");
+pub const file_cache = @import("file_cache.zig");
+pub const FileCacheAdvice = file_cache.Advice;
 const fields = @typeInfo(std.Io.VTable).@"struct".field_names;
 const ErrorName = extern struct { ptr: [*]const u8, len: usize };
 const ErrorNames = *const fn (u16) callconv(.c) ErrorName;
@@ -187,9 +189,26 @@ pub const Borrow = extern struct {
     contract: native.TypeContract,
     dispatch: Dispatch,
     error_names: ErrorNames,
+    file_cache: FileCacheAdvice = .{},
 
     pub fn init(io: *const std.Io) Borrow {
-        return .{ .userdata = io.userdata, .vtable = io.vtable, .contract = .of(std.Io), .dispatch = dispatchLocal, .error_names = errorName };
+        // Forward authority without unwrapping the executor: nested receiver
+        // state and error-domain translation keep their existing semantics.
+        const authority: FileCacheAdvice = if (io.vtable == &vtable) blk: {
+            const producer_receiver: *Receiver = @ptrCast(@alignCast(io.userdata.?));
+            break :blk producer_receiver.borrow.file_cache;
+        } else if (@import("builtin").os.tag == .linux and io.vtable.fileClose == std.Io.Threaded.global_single_threaded.io().vtable.fileClose)
+            .native()
+        else
+            .{};
+        return .{
+            .userdata = io.userdata,
+            .vtable = io.vtable,
+            .contract = .of(std.Io),
+            .dispatch = dispatchLocal,
+            .error_names = errorName,
+            .file_cache = authority,
+        };
     }
 
     pub fn receive(self: Borrow) !Receiver {
@@ -410,4 +429,18 @@ fn dispatchSwitchForQualification(borrow: *const Borrow, method: u16, raw_args: 
             @as(*Wire(Return(field_name)), @ptrCast(@alignCast(output))).* = encode(Return(field_name), result);
         },
     }
+}
+
+test "file cache authority is absent for abstract I/O and preserved by nested receivers" {
+    const Abstract = struct {
+        fn close(_: ?*anyopaque, _: []const std.Io.File) void {}
+    };
+    var table = std.Io.Threaded.global_single_threaded.io().vtable.*;
+    table.fileClose = Abstract.close;
+    const io: std.Io = .{ .vtable = &table, .userdata = null };
+    const borrow = Borrow.init(&io);
+    try std.testing.expect(!borrow.file_cache.available());
+    var received = try borrow.receive();
+    const again = received.io();
+    try std.testing.expect(!Borrow.init(&again).file_cache.available());
 }

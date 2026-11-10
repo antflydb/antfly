@@ -79,6 +79,7 @@ pub const OpenOptions = struct {
     /// Optional caller-owned runtime for the complete native-single-file
     /// lifecycle. Bridge mode rejects it because that engine is native-only.
     io: ?std.Io = null,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice = .{},
 };
 
 pub const CreateOptions = struct {
@@ -89,6 +90,7 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice = .{},
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -209,6 +211,7 @@ pub const Handle = struct {
                 .exclusive = true,
                 .no_sync = opts.no_sync,
                 .resource_manager = opts.resource_manager,
+                .cache_advice = opts.cache_advice,
                 .io = opts.io,
             }) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => try open(allocator, path, opts),
@@ -718,6 +721,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
+        .cache_advice = opts.cache_advice,
         .io = opts.io,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
@@ -743,6 +747,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
         .writer_lock_marker = opts.writer_lock_marker,
+        .cache_advice = opts.cache_advice,
         .io = opts.io,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);

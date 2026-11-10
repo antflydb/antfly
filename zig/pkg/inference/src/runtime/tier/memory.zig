@@ -3676,34 +3676,22 @@ test "host reclamation borrows owner lifetime and invokes callbacks outside admi
     try std.testing.expectEqual(@as(usize, 0), owner.references);
 }
 
-test "live pressure recovers retired file cache through the owner capability" {
+test "live pressure recovers after bounded file owner cleanup" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const path = platform.env.getenv("ANTFLY_PRESSURE_TEST_FILE") orelse return error.SkipZigTest;
     const io = std.testing.io;
     var controller = AdmissionController{};
-    const Owner = struct {
-        fn reserve(_: *anyopaque, _: AdmissionAmounts) AdmissionResourceError!usize {
-            return 1;
-        }
-        fn retain(_: *anyopaque, _: usize, _: AdmissionAmounts) AdmissionResourceError!void {}
-        fn release(_: *anyopaque, _: usize) void {}
-        fn reclaim(_: *anyopaque, target: usize) usize {
-            return @intCast(platform.retired_file_cache.reclaim(target));
-        }
-    };
-    var context: u8 = 0;
     controller.configureProcessMemoryLimit(mib(1843), .explicit);
-    try controller.configureResourceBudget(.{ .context = &context, .try_reserve = Owner.reserve, .retain = Owner.retain, .release = Owner.release, .reclaim_host = Owner.reclaim });
     defer controller.deinit();
-    const owner_id = @intFromPtr(&context);
-    defer platform.retired_file_cache.releaseOwner(owner_id);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(16) }, true));
     {
+        // The file owner sheds cache during its own lifecycle, outside any
+        // admission lock. No descriptor or path is retained for later advice.
         const file = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
-        platform.retired_file_cache.retire(owner_id, io, file, (try file.stat(io)).size);
+        const advice = @import("antfly_runtime_abi").io_abi.FileCacheAdvice.native();
+        advice.discard(io, file, (try file.stat(io)).size);
     }
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(16) }, true));
-    try std.testing.expect(controller.reclaimHostCapacity() > 0);
     var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(16) }, true);
     lease.release();
 }

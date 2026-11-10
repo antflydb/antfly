@@ -25,7 +25,6 @@ pub const one_shot_process = @import("one_shot_process.zig");
 pub const process = @import("process.zig");
 pub const inference_settings = @import("inference_settings.zig");
 pub const resource_policy = @import("resource_policy.zig");
-pub const retired_file_cache = @import("retired_file_cache.zig");
 pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");

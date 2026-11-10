@@ -785,6 +785,24 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = error_consumer,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }));
+    const file_cache_provider = b.addLibrary(.{ .name = "file-cache-test-provider", .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/file_cache_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const file_cache_consumer = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/file_cache_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    file_cache_consumer.linkLibrary(file_cache_provider);
+    const file_cache_roundtrip = b.addTest(.{ .root_module = file_cache_consumer, .filters = &.{"file cache "} });
+    const file_cache_test_step = b.step("runtime-file-cache-abi-test", "Verify file cache authority across independently compiled executors");
+    file_cache_test_step.dependOn(&b.addRunArtifact(file_cache_roundtrip).step);
+    b.step("install-runtime-file-cache-abi-tests", "Install the executor cache capability regression for another host").dependOn(&b.addInstallArtifact(file_cache_roundtrip, .{ .dest_sub_path = "file-cache-abi-tests" }).step);
+    error_identity_step.dependOn(file_cache_test_step);
     const graph_reply_provider_mod = b.createModule(.{ .root_source_file = b.path("lib/runtime/src/runtime_graph_reply_roundtrip_test.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
     graph_reply_provider_mod.addImport("cypher", antfly_test_mod.import_table.get("cypher").?);
     const graph_reply_provider = b.addLibrary(.{ .name = "graph-reply-test-provider", .root_module = graph_reply_provider_mod });
@@ -815,6 +833,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(file_cache_test_step);
     unit_test_step.dependOn(&run_documents_tests.step);
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);

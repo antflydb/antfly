@@ -14,13 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linux 1 CPU/2 GiB regression for retired clean cache and live admission.
+"""Linux 1 CPU/2 GiB regression for bounded owner cleanup and live admission.
 
 Run inside a no-swap 2 GiB cgroup with a Linux inference test binary compiled
-with -Dtest-filter=memory. The writer exits before the runtime registers the
-retired file, denies work under measured pressure, reclaims through its owner
-capability, and admits the same request. No model download or external service
-is required. Test data stays in the caller-supplied directory and is deleted.
+with -Dtest-filter=memory. The writer exits before the runtime denies work
+under measured pressure, cleans the file through bounded owner advice, and
+admits the same request. No model download or external service is required. Test data stays in the caller-supplied directory and is deleted.
 """
 
 import argparse
@@ -30,6 +29,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 MIB = 1024 * 1024
 CGROUP = Path("/sys/fs/cgroup")
@@ -107,15 +107,25 @@ def main():
         before = snapshot("writer_exited")
         print(json.dumps(before), flush=True)
         assert before["active_file"] > 1600 * MIB, before
+        started = time.monotonic()
         subprocess.run(
             [
                 str(args.test_binary.resolve()),
                 "--test-filter",
-                "live pressure recovers retired file cache through the owner capability",
+                "live pressure recovers after bounded file owner cleanup",
             ],
             env={**os.environ, "ANTFLY_PRESSURE_TEST_FILE": str(path.resolve())},
             check=True,
             timeout=60,
+        )
+        print(
+            json.dumps(
+                {
+                    "stage": "cleanup_and_admission_timing",
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+            ),
+            flush=True,
         )
         after = snapshot("reclaimed_and_admitted")
         print(json.dumps(after), flush=True)

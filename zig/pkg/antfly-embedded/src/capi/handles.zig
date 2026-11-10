@@ -130,6 +130,7 @@ pub const Handle = struct {
     /// Retained independently of storage/catalog generations. Foreground,
     /// maintenance and retired cursor snapshots share this service.
     lite_inference: ?*SharedLiteInference = null,
+    lite_reclaim_attachment: ?*inference_provider.StorageReclaimAttachment = null,
     // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
     // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
     // this caller intent across its own reconfigure passes -- see its doc
@@ -237,7 +238,24 @@ pub const SharedLiteInference = struct {
     }
 };
 
+pub fn attachLiteInferenceStorage(handle: *Handle) !void {
+    const service = handle.lite_inference orelse return;
+    const owner = service.lifetime.resource_owner orelse return;
+    const backend = if (handle.owned_lite_backend) |*value| value else return;
+    const manager = backend.native_docstore.?.resource_manager orelse return;
+    std.debug.assert(handle.lite_reclaim_attachment == null);
+    handle.lite_reclaim_attachment = try inference_provider.attachLiteStorageReclaimer(owner, handle.alloc, manager);
+}
+
+fn detachLiteInferenceStorage(handle: *Handle) void {
+    if (handle.lite_reclaim_attachment) |attachment| {
+        handle.lite_reclaim_attachment = null;
+        attachment.detach();
+    }
+}
+
 pub fn stopLiteEmbeddedInference(handle: *Handle) void {
+    detachLiteInferenceStorage(handle);
     if (handle.lite_inference) |service| {
         handle.lite_inference = null;
         service.release();
@@ -302,6 +320,7 @@ pub fn closeHandle(handle: *Handle) void {
     @import("sql_cursor.zig").closeAll(handle);
     @import("sql_session.zig").closeAll(handle);
     @import("tables.zig").closeAll(handle);
+    detachLiteInferenceStorage(handle);
     if (handle.db_live) {
         if (handle.lease_snapshot) handle.db.closeImmutableSnapshot() else handle.db.close();
     }

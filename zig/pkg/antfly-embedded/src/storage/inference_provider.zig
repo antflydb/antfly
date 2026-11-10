@@ -403,20 +403,22 @@ pub fn destroyEmbeddedInferenceNode(handle: *anyopaque, resource_owner: ?*LiteIn
     if (resource_owner) |owner| owner.releaseBaseReference();
 }
 
-/// Minimal resource-budget owner for a Lite-embedded inference node. Unlike
-/// `standalone/runtime.zig`'s `InferenceResourceBudgetOwner`, this does not
-/// track real memory accounting against a shared storage `ResourceManager`:
-/// Lite has no such manager, and a single embedded node with no concurrent
-/// tenants does not need arbitrated admission. It exists solely to satisfy
-/// the resource-budget capability contract every provider call requires.
+/// Resource-budget owner for a Lite-embedded inference node. Logical
+/// inference admission retains Lite's existing permissive policy.
+/// Attached storage owners supply physical-pressure reclamation and detach
+/// before their DB/cache state is destroyed.
 pub const LiteInferenceResourceOwner = struct {
     references: std.atomic.Value(usize) = .init(1),
     next_lease_token: std.atomic.Value(usize) = .init(1),
+    reclaimers: @import("host_memory_reclaimers.zig").Registry = .{},
 
     fn releaseBaseReference(self: *LiteInferenceResourceOwner) void {
         const previous = self.references.fetchSub(1, .acq_rel);
         std.debug.assert(previous >= 1);
-        if (previous == 1) std.heap.c_allocator.destroy(self);
+        if (previous == 1) {
+            self.reclaimers.deinit();
+            std.heap.c_allocator.destroy(self);
+        }
     }
 };
 
@@ -481,8 +483,20 @@ fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, p
     return 1;
 }
 
-fn reclaimLiteInferenceHostMemory(_: *anyopaque, target: u64) callconv(.c) u64 {
-    return @import("resource_manager.zig").retired_file_cache.reclaim(target);
+fn reclaimLiteInferenceHostMemory(raw: *anyopaque, target: u64) callconv(.c) u64 {
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(raw));
+    return owner.reclaimers.reclaim(target);
+}
+
+pub const StorageReclaimAttachment = @import("host_memory_reclaimers.zig").Registry.Attachment;
+pub fn attachLiteStorageReclaimer(owner: *LiteInferenceResourceOwner, allocator: std.mem.Allocator, manager: *@import("resource_manager.zig").ResourceManager) !*StorageReclaimAttachment {
+    const Callback = struct {
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const resources: *@import("resource_manager.zig").ResourceManager = @ptrCast(@alignCast(raw));
+            return resources.reclaimHostMemory(target);
+        }
+    };
+    return owner.reclaimers.attach(allocator, manager, Callback.reclaim);
 }
 
 fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
@@ -2008,4 +2022,32 @@ fn inferenceProviderDocumentJson(ptr: *anyopaque, a: std.mem.Allocator, bytes: [
         }
     };
     return invokeInferenceProvider([]u8, a, ptr, if (extract) .document_extract else .document_read, Raw{ .bytes = bytes }, context);
+}
+
+test "Lite inference reclaims attached storage without logical debt" {
+    const resources = @import("resource_manager.zig");
+    const Cache = struct {
+        manager: *resources.ResourceManager,
+        bytes: u64 = 0,
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const freed = @min(self.bytes, target);
+            self.manager.observeUsage(.lite_docstore_snapshot_cache, &self.bytes, self.bytes - freed);
+            return freed;
+        }
+    };
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 } });
+    defer manager.deinit(std.testing.allocator);
+    var cache = Cache{ .manager = &manager };
+    manager.observeUsage(.lite_docstore_snapshot_cache, &cache.bytes, 400);
+    defer manager.observeUsage(.lite_docstore_snapshot_cache, &cache.bytes, 0);
+    const id = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(id);
+    var owner = LiteInferenceResourceOwner{};
+    defer owner.reclaimers.deinit();
+    const attachment = try attachLiteStorageReclaimer(&owner, std.testing.allocator, &manager);
+    try std.testing.expectEqual(@as(u64, 64), reclaimLiteInferenceHostMemory(&owner, 64));
+    try std.testing.expectEqual(@as(u64, 336), cache.bytes);
+    attachment.detach();
+    try std.testing.expectEqual(@as(u64, 0), reclaimLiteInferenceHostMemory(&owner, 64));
 }
