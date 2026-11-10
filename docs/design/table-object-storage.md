@@ -403,6 +403,24 @@ posting pull. The existing shared byte allowance, queue cap, physical adjacency,
 pack limits, and at-most-32-member envelopes bound speculation; demand continues
 to authenticate every member independently.
 
+### Bounded scoring admission in opening bundles
+
+Opening publication captures up to 64 segment admission descriptors through the
+existing validated, fragmented routing cursor. Navigation roots retain priority;
+at most 32 segment openings and 16 tiny complete segments are seeded, within the
+existing decoded-byte, read-byte and bundle-count limits. This is an optional
+prefix cache, never a segment-selection limit: demand outside the prefix uses
+the original authenticated objects and generation-map fallback. No wire-format
+change or rewritten source identity is required.
+
+Ranking decodes a separate authenticated admission view of each descriptor. It
+validates segment references and native section admissions without expanding
+external physical-source pages. Winning-row hydration and maintenance retain
+full physical-route validation. The decoded admission cache has its own type,
+so it cannot be mistaken for a fully validated physical FileGroup. Prepared cloud
+bindings own their locator metadata through teardown, including lazy SQL readers
+that outlive the publication parser.
+
 ## Storage binding and incarnation isolation
 
 Use the capability-scoped `storage.artifacts` destination for native object

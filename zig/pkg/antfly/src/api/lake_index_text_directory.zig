@@ -807,6 +807,23 @@ test "external lake exact segment admission skips missing unrelated descriptors 
         summary.* = null;
     }
     var group: corpus.FileGroup = .{ .file = .{ .id = "one-large-file", .digest = @splat(1) }, .segments = segments, .admissions = admissions, .summaries = summaries, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 10, .count = 9 }} };
+    // Scoring admission must not fetch paged physical routes. The winner path
+    // still rejects a missing source proof rather than trusting the subset.
+    {
+        var paged = group;
+        paged.source_pages = &.{segments[0]}; // A real artifact, but not a source page.
+        paged.source_count = 1;
+        const descriptor = try put(ca, &store, paged, .none);
+        const descriptor_ref: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len };
+        const admitted = try corpus.loadCachedAdmissions(ca, store, descriptor_ref, .none, null);
+        try std.testing.expectEqual(segments.len, admitted.segments.len);
+        try std.testing.expectEqual(admissions[0].doc_count, admitted.admissions[0].doc_count);
+        if (corpus.loadCachedFile(ca, store, descriptor_ref, .none, null)) |_| return error.InvalidSourceProofAccepted else |_| {}
+        var invalid = paged;
+        invalid.admissions = admissions[0..1];
+        const bad = try put(ca, &store, invalid, .none);
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, corpus.loadCachedAdmissions(ca, store, .{ .kind = .text_segment, .artifact_id = bad.artifact_id, .checksum = bad.checksum, .byte_len = bad.byte_len }, .none, null));
+    }
     try prepare(ca, &store, &group, .none);
     const manifest = try put(ca, &store, group, .none);
     const roots = try publish(a, &store, &.{group}, &.{manifest}, &.{}, &.{}, .{}, .none, std.testing.io);

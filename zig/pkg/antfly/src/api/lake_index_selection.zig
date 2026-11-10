@@ -295,6 +295,39 @@ test "external lake opening inventory coverage proofs bind immutable plans publi
     try std.testing.expectEqual(parsed.value.published.?.opening_bundles.len, seed_reads);
     try @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, opening_read, .none);
     try std.testing.expectEqual(seed_reads, opening_trace.snapshot().provider_reads);
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var warmed_publication = parsed.value.published.?;
+        try @import("lake_index_directory.zig").hydrateLazy(sa, artifact_store, &warmed_publication, .none, opening_read);
+        const corpus = @import("lake_index_native_text.zig");
+        const Capture = struct {
+            store: @import("../serverless/artifacts/store.zig").ArtifactStore,
+            read: @import("lake_index_aggregate_artifact.zig").CachedRead,
+            a: A,
+            count: usize = 0,
+            fn keep(raw: *anyopaque, route: corpus.SegmentRouting) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const descriptor = route.descriptor orelse return error.MissingAdmissionDescriptor;
+                _ = try corpus.loadCachedAdmissions(self.a, self.store, .{ .kind = .text_segment, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len }, .none, self.read);
+                self.count += 1;
+                return true;
+            }
+        };
+        var capture: Capture = .{ .store = artifact_store, .read = opening_read, .a = sa };
+        for (warmed_publication.declarations) |declaration| {
+            if (declaration.artifact.kind != .text_segment) continue;
+            const root = (try corpus.loadDirectory(sa, artifact_store, declaration.artifact, .none, opening_read)).root;
+            const cursor = try @import("lake_index_text_directory.zig").RoutingCursor.create(sa, root, artifact_store, opening_read, .none);
+            defer cursor.deinit();
+            cursor.filter = .{ .ptr = &capture, .keep = Capture.keep };
+            var ids: [64][32]u8 = undefined;
+            _ = try cursor.next(&ids);
+        }
+        try std.testing.expect(capture.count > 0);
+        try std.testing.expectEqual(seed_reads, opening_trace.snapshot().provider_reads);
+    }
     var damaged = parsed.value.published.?;
     var bad_bundle = damaged.opening_bundles[0];
     bad_bundle.decoded_bytes += 1;

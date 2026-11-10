@@ -1266,3 +1266,54 @@ The next fixes target these observed gaps, before another optimized build:
    publication, maintenance and cursor checks. Keep existing timeouts and reader
    protection. Sub-second cold latency remains unproven; broader archive/payload
    layout work depends on the resulting trace.
+
+
+### Reproducible network simulation
+
+`zig/tools/benchmark_lake_network.py` runs the real server against a loopback
+versioned GCS JSON API fixture. It does not contact a cloud provider. Example:
+
+```sh
+uv run --project zig/e2e/antfly --locked --extra lake --extra iceberg \
+  python zig/tools/benchmark_lake_network.py \
+  --binary zig/zig-out/bin/antfly \
+  --output-dir .benchmark-results/lake/network-candidate \
+  --rows 10000 --files 4 --row-group 100 --samples 3 \
+  --latency-ms 0 --latency-ms 30 --latency-ms 100 \
+  --bandwidth-mib 32 --io-concurrency 16 --qualify-sql
+```
+
+The matrix covers common, rare and absent terms, highlights, wide projection and
+selective filters. Vary `--files`, `--row-group`, `--payload-bytes`, `--cache-mib`,
+`--clients` and `--no-store-source` to expose topology, amplification, eviction,
+cold stampedes and Parquet hydration costs. `--fault` accepts `throttle`, `reset`
+or `truncate`; `--fault-every` injects faults on media requests. An unrecovered
+query produces an incomplete report and retained local failure evidence, never
+a successful timing. Protocol tests independently check recovery and immutable
+generation authority after removing each fault.
+
+Each sample restarts the process after clearing only the configured Antfly cache.
+Navigation warming is disabled; startup I/O and startup latency are reported
+separately. The OS filesystem cache is uncontrolled. Authoritative serving cuts
+are enabled for the sealed manifest; use `--no-authoritative-cuts` for strict
+external coordination, which has a different freshness and cursor-publication
+cost. Cursor pages are replayed after restart before timing (`--cursor-pages`,
+default three); this immutable fixture does not qualify pending WAL mutations.
+The assembled HN regression remains the mutation/publication/maintenance oracle.
+
+The report records binary/tool/config/source hashes, answer equivalence, logical
+ID oracles, per-query and batch timings, peak RSS, requests/bytes, object kinds,
+queue time and observed overlap. Observed request waves are **not** a causal DAG.
+The trace is bounded and overflow or simulator errors invalidate a measurement.
+Bandwidth is shared across responses, and changing phases preserves outstanding
+bandwidth reservations. Headers, credentials and raw object names are omitted.
+Fewer than 20 samples are explicitly marked as inadequate tail qualification.
+
+The preliminary optimized parent fixture (`cb69d8b7b3`, 1,000 synthetic rows,
+17 scoring segments, stored source, strict external mode) took 28 ms at zero
+injected RTT, 1.18 s at 30 ms and 3.78 s at 100 ms. Those are single synthetic
+samples, not HN or GCS latency claims. Seventeen descriptor GETs per common-term
+query motivated the bounded descriptor packing and admission-only decoding.
+Candidate timings must measure the resulting binary separately. The latest
+completed real-GCS parent sample remains 3.13 s cold / 1.62 s restart; sub-second
+cold latency has not yet been established on GCS.

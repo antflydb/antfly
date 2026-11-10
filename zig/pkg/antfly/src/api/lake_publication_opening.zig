@@ -46,6 +46,9 @@ const Producer = struct {
     count: usize = 0,
     position: usize = 0,
     segments: usize = 0,
+    text_roots: [16]@import("lake_index_native_text.zig").Root = undefined,
+    text_count: usize = 0,
+    capture_small: bool = false,
     small: [16]artifacts.ChunkRef = undefined,
     small_count: usize = 0,
     locators: std.ArrayList(catalog.ProviderLocator) = .empty,
@@ -127,9 +130,13 @@ const Producer = struct {
             const ref = declaration.artifact;
             if (ref.byte_len > packs.max_decoded_bytes) continue;
             if (ref.kind == .text_segment and ref.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
-                const root = (try @import("lake_index_native_text.zig").loadDirectory(sa, self.store.*, ref, self.token, self.cached)).root;
+                const root = (try @import("lake_index_native_text.zig").loadDirectory(self.a, self.store.*, ref, self.token, self.cached)).root;
+                if (self.text_count < self.text_roots.len and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
+                    self.text_roots[self.text_count] = root;
+                    self.text_count += 1;
+                }
                 inline for (.{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.ordered, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds }) |page| self.add(root.domain, page, false, 0, false);
-                self.add(root.domain, root.directories.segments, root.seekable, 0, root.serving_bytes != 0 and root.serving_bytes <= 256 * 1024 and root.segment_count <= 16);
+                self.add(root.domain, root.directories.segments, false, 0, false);
                 for (root.open_packs) |pack| try self.read(sa, pack);
             } else if (ref.kind == .ordered_row_index) {
                 const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, self.store.*, ref, self.token, self.cached);
@@ -148,12 +155,46 @@ const Producer = struct {
             var visitor = Visitor{ .producer = self, .navigation = selected, .a = sa };
             try tree.walkPage(sa, store.store(), selected.ref, &visitor);
         }
+        // Navigation roots get first claim on the opening budget. Then stream
+        // a bounded prefix through the normal fragmented-routing decoder:
+        // descriptors must not cost one dependent GET per scored segment.
+        for (self.text_roots[0..self.text_count]) |root| {
+            if (self.segments == 64 or self.collector.full()) break;
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            const cursor = try @import("lake_index_text_directory.zig").RoutingCursor.create(scratch.allocator(), root, self.store.*, self.cached, self.token);
+            defer cursor.deinit();
+            cursor.filter = .{ .ptr = self, .keep = captureRoute };
+            self.capture_small = root.serving_bytes != 0 and root.serving_bytes <= 256 * 1024 and root.segment_count <= self.small.len;
+            var identities: [64][32]u8 = undefined;
+            while (self.segments < 64 and !self.collector.full()) {
+                if (try cursor.next(identities[0 .. 64 - self.segments]) == null) break;
+            }
+        }
         for (self.small[0..self.small_count]) |ref| {
             if (self.collector.full()) break;
             var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
             defer scratch.deinit();
             _ = try @import("lake_index_seekable_text.zig").warmSmall(scratch.allocator(), .{ .store = self.store.*, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordLocator } }, ref, 512 * 1024);
         }
+    }
+    fn captureRoute(raw: *anyopaque, route: @import("lake_index_native_text.zig").SegmentRouting) !bool {
+        const self: *Producer = @ptrCast(@alignCast(raw));
+        if (self.collector.full() or self.segments == 64) return error.OpeningBundleBudgetExceeded;
+        self.segments += 1;
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        if (route.descriptor) |descriptor| try self.read(a, .{ .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len });
+        // Bound navigation decoding separately from descriptor capture. Demand
+        // retains the original authenticated fallback beyond this prefix.
+        if (self.segments <= 32) _ = try @import("lake_index_seekable_text.zig").warmOpening(a, .{ .store = self.store.*, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordLocator } }, route.ref, 1024 * 1024);
+        if (self.capture_small and route.bytes <= 256 * 1024 and self.small_count < self.small.len) {
+            for (self.small[0..self.small_count]) |prior| if (std.mem.eql(u8, prior.artifact_id, route.ref.artifact_id)) return true;
+            self.small[self.small_count] = .{ .artifact_id = try self.a.dupe(u8, route.ref.artifact_id), .checksum = try self.a.dupe(u8, route.ref.checksum), .byte_len = route.ref.byte_len };
+            self.small_count += 1;
+        }
+        return true;
     }
     const Visitor = struct {
         producer: *Producer,
@@ -165,18 +206,7 @@ const Producer = struct {
             self.children += 1;
             self.producer.add(self.navigation.domain, ref, self.navigation.text, self.navigation.depth + 1, self.navigation.small);
         }
-        pub fn record(self: *Visitor, _: []const u8, value: []const u8) !void {
-            if (!self.navigation.text or self.producer.segments == 16 or self.producer.collector.full()) return;
-            self.producer.segments += 1;
-            const route = try std.json.parseFromSliceLeaky(struct { route: @import("lake_index_native_text.zig").SegmentRouting }, self.a, value, .{ .ignore_unknown_fields = true });
-            _ = try @import("lake_index_seekable_text.zig").warmOpening(self.a, .{ .store = self.producer.store.*, .cache = self.producer.cached, .context = self.producer.cached.context, .cancellation = self.producer.token, .locator = .{ .ptr = self.producer, .record = Producer.recordLocator } }, route.route.ref, 1024 * 1024);
-            if (self.navigation.small and route.route.bytes <= 256 * 1024 and self.producer.small_count < self.producer.small.len) {
-                for (self.producer.small[0..self.producer.small_count]) |prior| if (std.mem.eql(u8, prior.artifact_id, route.route.ref.artifact_id)) return;
-                const alloc = self.producer.a;
-                self.producer.small[self.producer.small_count] = .{ .artifact_id = try alloc.dupe(u8, route.route.ref.artifact_id), .checksum = try alloc.dupe(u8, route.route.ref.checksum), .byte_len = route.route.ref.byte_len };
-                self.producer.small_count += 1;
-            }
-        }
+        pub fn record(_: *Visitor, _: []const u8, _: []const u8) !void {}
     };
 };
 

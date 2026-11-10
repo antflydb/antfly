@@ -1692,11 +1692,11 @@ pub fn routedReader(a: A, source: local.index.SegmentSource) !local.segment.Segm
     const descriptor = if (read.descriptors) |routes| routes.get(owner.directory_ref.?.artifact_id) orelse return error.InvalidNativeLakeTextCorpus else Descriptor{ .manifest = owner.manifest_ref orelse return error.InvalidNativeLakeTextCorpus, .ordinal = owner.manifest_ordinal };
     const manifest = descriptor.manifest;
     const corpus = @import("lake_index_native_text.zig");
-    const lease: ?decoded.Owned(corpus.FileGroup) = if (read.cache) |cached| try decoded.acquire(corpus.FileGroup, cached, read.store, manifest, read.cancellation, corpus.loadCachedFile) else null;
+    const lease: ?decoded.Owned(corpus.SegmentAdmissions) = if (read.cache) |cached| try decoded.acquire(corpus.SegmentAdmissions, cached, read.store, manifest, read.cancellation, corpus.loadCachedAdmissions) else null;
     defer if (lease) |owned| owned.release();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const group = if (lease) |owned| owned.value.* else try corpus.loadCachedFile(arena.allocator(), read.store, manifest, read.cancellation, null);
+    const group = if (lease) |owned| owned.value.* else try corpus.loadCachedAdmissions(arena.allocator(), read.store, manifest, read.cancellation, null);
     const index = descriptor.ordinal;
     if (index >= group.segments.len or group.admissions.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
     const ref = owner.directory_ref.?;
