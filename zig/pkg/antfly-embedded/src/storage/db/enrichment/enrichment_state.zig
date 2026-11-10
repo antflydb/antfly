@@ -241,6 +241,56 @@ pub fn saveProjectionCheckpoint(store: anytype, scope: []const u8, checkpoint: P
     try txn.commit();
 }
 
+/// Commit a precomputed visibility cut as one publication. A failed write
+/// leaves progress, cursors and worker status together at the previous cut.
+/// Late acknowledgements cannot retire a newer cursor or regress progress.
+pub fn publishAppliedProgress(alloc: Allocator, store: anytype, scope: []const u8, sequence: u64, config_hash: u64, status: RuntimeStatus) !void {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    var committed = false;
+    defer if (!committed) txn.abort();
+    const key = try appliedSequenceKey(alloc, scope);
+    defer alloc.free(key);
+    const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+    var checkpoint = if (raw) |bytes| try decodeProjectionCheckpoint(bytes) else ProjectionCheckpoint{};
+    if (checkpoint.applied_sequence > sequence) return;
+    const previous = try loadRuntimeStatusTxn(alloc, &txn, scope);
+    // A worker may already have parked a later request while this caller was
+    // acquiring publication authority. Preserve that durable status as well.
+    const current_status = if (previous.target_sequence > sequence and previous.target_sequence >= status.target_sequence) previous else status;
+    const previous_applied = checkpoint.applied_sequence;
+    checkpoint.applied_sequence = sequence;
+    checkpoint.config_hash = config_hash;
+    checkpoint.status = if (current_status.worker_failed) .repair_required else if (current_status.retrying) .degraded else .clean;
+    for ([_][]const u8{ "assets", "dense" }) |stream| {
+        const cursor_scope = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, stream });
+        defer alloc.free(cursor_scope);
+        const cursor_key = try replayCursorKey(alloc, cursor_scope);
+        defer alloc.free(cursor_key);
+        const cursor_raw = txn.get(cursor_key) catch |err| if (err == error.NotFound) null else return err;
+        if (cursor_raw) |bytes| {
+            var cursor = try decodeReplayCursor(alloc, bytes);
+            defer cursor.deinit(alloc);
+            if (cursor.sequence <= sequence) {
+                try txn.delete(cursor_key);
+            } else if (cursor.base_applied_sequence == previous_applied and previous_applied < sequence) {
+                // Preserve partial work beyond this cut, keeping its epoch
+                // fence valid without resurrecting an already stale cursor.
+                cursor.base_applied_sequence = sequence;
+                const rebased = try encodeReplayCursor(alloc, cursor);
+                defer alloc.free(rebased);
+                try txn.put(cursor_key, rebased);
+            }
+        }
+    }
+    var encoded = encodeProjectionCheckpoint(checkpoint);
+    try txn.put(key, &encoded);
+    try putRuntimeStatusTxn(&txn, scope, current_status);
+    try txn.commit();
+    committed = true;
+}
+
 fn decodeProjectionCheckpoint(raw: []const u8) !ProjectionCheckpoint {
     if (raw.len != checkpoint_magic.len + 4 + 8 + 1 + 8 + 8) return error.InvalidEnrichmentState;
     if (!std.mem.eql(u8, raw[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidEnrichmentState;
@@ -292,15 +342,19 @@ fn writeCheckpointInt(out: []u8, pos: *usize, comptime T: type, value: T) void {
 }
 
 pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !RuntimeStatus {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    return loadRuntimeStatusTxn(alloc, &txn, scope);
+}
+
+fn loadRuntimeStatusTxn(alloc: Allocator, txn: anytype, scope: []const u8) !RuntimeStatus {
     const key = try runtimeStatusKey(alloc, scope);
     defer alloc.free(key);
     const retry_count_key = try runtimeRetryCountKey(alloc, scope);
     defer alloc.free(retry_count_key);
 
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginProbe();
-    defer txn.abort();
     const counts_key = try @import("media_output_counts.zig").key(alloc, scope);
     defer alloc.free(counts_key);
     const counts_raw = txn.get(counts_key) catch |err| if (err == error.NotFound) null else return err;
@@ -408,6 +462,15 @@ fn encodeRuntimeAuxSidecar(runtime_status: []const u8, status: RuntimeStatus) [r
 }
 
 pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatus) !void {
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try putRuntimeStatusTxn(&txn, scope, status);
+    try txn.commit();
+}
+
+fn putRuntimeStatusTxn(txn: anytype, scope: []const u8, status: RuntimeStatus) !void {
     // Status is saved on the indexing hot path. Keep the four ordinary keys
     // on the stack; unusually long scopes share a single arena lifetime.
     var key_buffer: [1024]u8 = undefined;
@@ -422,10 +485,6 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     defer key_alloc.free(retry_count_key);
     var buf = encodeRuntimeStatus(status);
     var retry_count_buf = encodeRuntimeAuxSidecar(&buf, status);
-    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.put(retry_count_key, &retry_count_buf);
     const admission_key = try std.mem.concat(key_alloc, u8, &.{ runtime_status_prefix, scope, ":admission" });
@@ -441,7 +500,6 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     const code = status.last_error_code.slice();
     @memcpy(detail[8..][0..code.len], code);
     try txn.put(detail_key, detail[0 .. 8 + code.len]);
-    try txn.commit();
 }
 
 const RuntimeStoreHandle = struct {

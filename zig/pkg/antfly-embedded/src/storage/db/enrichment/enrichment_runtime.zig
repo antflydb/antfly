@@ -7534,22 +7534,10 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub fn markAppliedThrough(self: *@This(), sequence: u64) !void {
-        if (sequence <= self.applied_sequence) {
-            self.target_sequence = @max(self.target_sequence, sequence);
-            return;
-        }
-        try saveAppliedSequenceWithRetry(self, scope_name, sequence);
-        self.applied_sequence = sequence;
-        try clearReplayCursorWithRetry(self);
-        self.target_sequence = @max(self.target_sequence, sequence);
-        self.consecutive_retry_count = 0;
-        self.next_retry_at_ms = 0;
-        self.retry_failure_fingerprint = 0;
-        self.retry_failure_count = 0;
-        self.active_failure_fingerprint = 0;
-        self.retry_error_has_request_identity = false;
-        clearPublishedGeneratedArtifacts(self);
-        clearIsolatedFailedIndexes(self);
+        if (sequence <= self.applied_sequence) return;
+        const before = runtimeStatusSnapshot(self);
+        try publishPrecomputedAppliedWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
+        _ = finishPrecomputedApplied(self, sequence, before);
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
@@ -7679,6 +7667,7 @@ const PlatformEnrichmentRuntime = struct {
     deadline_clock: platform_clock.Clock = platform_clock.Clock.real(),
     ownership: ownership_mod.State,
     lease_fencing_enabled: bool = false,
+    applied_publication_mutex: Io.Mutex = .init,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     sync_wait_epoch: std.atomic.Value(u32) = .init(0),
@@ -8323,36 +8312,27 @@ const PlatformEnrichmentRuntime = struct {
     pub fn markAppliedThrough(self: *EnrichmentRuntime, sequence: u64) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
-        var status: enrichment_state.RuntimeStatus = .{};
-        self.mutex.lockUncancelable(io);
-        self.target_sequence = @max(self.target_sequence, sequence);
-        // Match the single-threaded runtime: an already acknowledged cut
-        // must not erase newer retry/cursor state or replicate another status.
-        if (sequence <= self.applied_sequence) {
+        const changed = publication: {
+            self.applied_publication_mutex.lockUncancelable(io);
+            defer self.applied_publication_mutex.unlock(io);
+            self.mutex.lockUncancelable(io);
+            if (sequence <= self.applied_sequence) {
+                self.mutex.unlock(io);
+                return;
+            }
+            const before = runtimeStatusSnapshot(self);
             self.mutex.unlock(io);
-            return;
-        }
-        self.applied_sequence = sequence;
-        self.last_error_name = null;
-        self.retrying = false;
-        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
-        self.worker_failed = false;
-        self.consecutive_retry_count = 0;
-        self.next_retry_at_ms = 0;
-        self.retry_failure_fingerprint = 0;
-        self.retry_failure_count = 0;
-        self.active_failure_fingerprint = 0;
-        self.retry_error_has_request_identity = false;
-        clearPublishedGeneratedArtifacts(self);
-        clearIsolatedFailedIndexes(self);
-        status = runtimeStatusSnapshot(self);
-        broadcastRuntimeStateChanged(self, io);
-        self.mutex.unlock(io);
 
-        try saveAppliedSequenceWithRetry(self, scope_name, sequence);
-        try clearReplayCursorWithRetry(self);
-        try saveRuntimeStatusWithRetry(self, scope_name, status);
-        self.notifyStatusHook();
+            // Publish all durable state before admitting visibility waiters. An
+            // interrupted publication leaves the in-memory cut retryable too.
+            try publishPrecomputedAppliedWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
+            self.mutex.lockUncancelable(io);
+            const advanced = finishPrecomputedApplied(self, sequence, before);
+            if (advanced) broadcastRuntimeStateChanged(self, io);
+            self.mutex.unlock(io);
+            break :publication advanced;
+        };
+        if (changed) self.notifyStatusHook();
     }
 
     pub fn stats(self: *EnrichmentRuntime) types.EnrichmentStats {
@@ -36514,6 +36494,62 @@ fn coverageReceiptIsCurrent(runtime: *EnrichmentRuntime, txn: anytype, transitio
     const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
     const revision = (try @import("../artifact_producer_readiness.zig").localPrimaryRevision(runtime.alloc, txn, document)) orelse state.created_generation;
     return state.isLive() and transition.source_sequence != 0 and revision <= transition.source_sequence;
+}
+
+fn appliedRuntimeStatus(before: enrichment_state.RuntimeStatus, sequence: u64) enrichment_state.RuntimeStatus {
+    var status = before;
+    status.target_sequence = @max(status.target_sequence, sequence);
+    // Completion of an older cut does not repair a later failed request.
+    if (before.target_sequence > sequence) return status;
+    status.retrying = false;
+    status.worker_failed = false;
+    status.consecutive_retry_count = 0;
+    status.next_retry_at_ms = 0;
+    status.retry_failure_fingerprint = 0;
+    status.retry_failure_count = 0;
+    return status;
+}
+
+/// Caller owns the worker state mutex on threaded runtimes.
+fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, before: enrichment_state.RuntimeStatus) bool {
+    if (sequence <= runtime.applied_sequence) return false;
+    const reset_retry = before.target_sequence <= sequence and std.meta.eql(before, runtimeStatusSnapshot(runtime));
+    runtime.applied_sequence = sequence;
+    runtime.target_sequence = @max(runtime.target_sequence, sequence);
+    if (reset_retry) {
+        if (@hasField(EnrichmentRuntime, "last_error_name")) runtime.last_error_name = null;
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        runtime.consecutive_retry_count = 0;
+        runtime.next_retry_at_ms = 0;
+        runtime.retry_failure_fingerprint = 0;
+        runtime.retry_failure_count = 0;
+        runtime.active_failure_fingerprint = 0;
+        runtime.retry_error_has_request_identity = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
+        clearPublishedGeneratedArtifacts(runtime);
+        clearIsolatedFailedIndexes(runtime);
+    }
+    return true;
+}
+
+fn publishPrecomputedAppliedWithRetry(runtime: *EnrichmentRuntime, sequence: u64, status: enrichment_state.RuntimeStatus) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
+    const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        enrichment_state.publishAppliedProgress(runtime.alloc, live_store.*, scope_name, sequence, config_hash, status) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
 }
 
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
