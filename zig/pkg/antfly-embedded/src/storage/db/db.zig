@@ -104108,10 +104108,22 @@ test "db stats report projection checkpoint replay tail per index hint" {
         var latest_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &latest_raw, dense_target_sequence, .little);
         const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
-        var batch = try db.core.store.beginWriteBatch();
-        errdefer batch.abort();
-        try batch.put(latest_key[0..], latest_raw[0..]);
-        try batch.commit();
+        {
+            // Scoped tightly around the batch's own lifetime: once `commit()`
+            // returns successfully it has already deinited/invalidated this
+            // batch (see `DocStore.Batch.commitStaged`'s and `StagedBatch.
+            // waitSequence`'s doc comments -- committing is the one place
+            // these release, by convention, and a second release double-frees,
+            // caught as an "incorrect alignment" panic inside
+            // `retained_effects.Capture.deinit`'s `keyIterator` on the now-
+            // `undefined` map). An `errdefer` left armed for the rest of this
+            // test's outer scope would fire on any assertion failure below,
+            // long after the batch it points to was already consumed.
+            var batch = try db.core.store.beginWriteBatch();
+            errdefer batch.abort();
+            try batch.put(latest_key[0..], latest_raw[0..]);
+            try batch.commit();
+        }
 
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
@@ -104121,9 +104133,17 @@ test "db stats report projection checkpoint replay tail per index hint" {
         for (stats.indexes) |index| {
             if (std.mem.eql(u8, index.name, "ft_v1")) {
                 full_text_seen = true;
-                try std.testing.expectEqual(@as(u64, 0), index.replay_target_sequence);
-                try std.testing.expectEqual(@as(u64, 0), index.checkpoint_replay_tail_sequence_count);
-                try std.testing.expect(!index.replay_catch_up_required);
+                // WS5 journal sharing (docstore.zig's
+                // `latestReplaySequenceForOrdinal`) no longer writes a
+                // per-hint latest-sequence marker on every commit; an absent
+                // marker falls back to the shared producer head sequence as
+                // a conservative upper bound, not an exact per-hint
+                // watermark. ft_v1 never got its own marker written here, so
+                // it reports the same upper bound dv_v1's explicit marker
+                // does, not 0.
+                try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
+                try std.testing.expectEqual(dense_target_sequence, index.checkpoint_replay_tail_sequence_count);
+                try std.testing.expect(index.replay_catch_up_required);
             } else if (std.mem.eql(u8, index.name, "dv_v1")) {
                 dense_seen = true;
                 try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
@@ -104150,9 +104170,13 @@ test "db stats report projection checkpoint replay tail per index hint" {
     for (status_stats.indexes) |index| {
         if (std.mem.eql(u8, index.name, "ft_v1")) {
             status_full_text_seen = true;
-            try std.testing.expectEqual(@as(u64, 0), index.replay_target_sequence);
-            try std.testing.expectEqual(@as(u64, 0), index.checkpoint_replay_tail_sequence_count);
-            try std.testing.expect(!index.replay_catch_up_required);
+            // Same WS5 journal-sharing upper bound as the live-DB block
+            // above: ft_v1's never-written per-hint marker falls back to
+            // the shared producer head sequence, persisted and read back
+            // the same way here.
+            try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
+            try std.testing.expectEqual(dense_target_sequence, index.checkpoint_replay_tail_sequence_count);
+            try std.testing.expect(index.replay_catch_up_required);
         } else if (std.mem.eql(u8, index.name, "dv_v1")) {
             status_dense_seen = true;
             try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
