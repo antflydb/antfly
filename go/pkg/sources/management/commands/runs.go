@@ -269,13 +269,19 @@ func CancelRun(ctx context.Context, env Env, ref, runID string) (management.Run,
 	return run, Classify(env.writeHuman(fmt.Sprintf("Cancellation requested for run %s (state %s).\n", run.Id, run.State)))
 }
 
-// requireCapability fetches the runtime's capabilities and checks one feature.
-func requireCapability(ctx context.Context, env Env, feature string) error {
+// requireCapability fetches the runtime's capabilities once and checks each
+// feature in order, returning the first unsupported one.
+func requireCapability(ctx context.Context, env Env, features ...string) error {
 	c, err := env.API.Capabilities(ctx)
 	if err != nil {
 		return Classify(err)
 	}
-	return Require(c, feature)
+	for _, feature := range features {
+		if err := Require(c, feature); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // newIdempotencyKey returns a random key that satisfies the idempotency key format.
