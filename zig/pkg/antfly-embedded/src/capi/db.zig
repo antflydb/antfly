@@ -3117,7 +3117,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .exclusive = true,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
-            .cache_advice = if (backend_runtime) |runtime| runtime.fileCacheAdvice() else .{},
+            .cache_advice = if (borrowed_io) |io| db_mod.background_runtime.Filesystem.borrowed(io).cache_advice else .{},
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
@@ -3125,7 +3125,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
-            .cache_advice = if (backend_runtime) |runtime| runtime.fileCacheAdvice() else .{},
+            .cache_advice = if (borrowed_io) |io| db_mod.background_runtime.Filesystem.borrowed(io).cache_advice else .{},
         });
     errdefer if (!handle_owns_resources) backend.deinit();
     if (resolved.allocator_verification_owner) |verified| {

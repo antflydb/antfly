@@ -5854,7 +5854,7 @@ pub const ModelManager = struct {
 
         pub fn reserveMetadataCapacity(self: @This(), bytes: usize) !runtime.tier.memory.LiveReservation {
             return self.domain.admission.reserveLiveCapacity(bytes) catch |err| {
-                if (err != error.ResourceTemporarilyUnavailable or self.domain.admission.reclaimHostCapacity() == 0) return err;
+                if (err != error.ResourceTemporarilyUnavailable or self.domain.admission.reclaimHostCapacity(bytes) == 0) return err;
                 return self.domain.admission.reserveLiveCapacity(bytes);
             };
         }
@@ -6792,7 +6792,7 @@ pub const ModelManager = struct {
                 // One owner pass per admission. A reported decrease can remain
                 // in an allocator arena; it must not starve other mechanisms.
                 owner_attempted.* = true;
-                if (self.admissionController().reclaimHostCapacity() != 0) return true;
+                if (self.admissionController().reclaimHostCapacity(host_target_bytes) != 0) return true;
             },
             else => {},
         }

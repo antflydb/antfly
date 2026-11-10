@@ -482,6 +482,17 @@ pub const Config = struct {
 
 const IoReceiver = @import("antfly_runtime_abi").io_abi.Receiver;
 const IoBorrow = @import("antfly_runtime_abi").io_abi.Borrow;
+/// An executor and the native handle authority granted by that executor.
+/// Consumers must carry this pair together when constructing file owners.
+pub const Filesystem = struct {
+    io: Io,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice,
+
+    pub fn borrowed(io: Io) Filesystem {
+        return .{ .io = io, .cache_advice = IoBorrow.init(&io).file_cache };
+    }
+};
+
 fn receiveIo(io_value: ?Io) !?IoReceiver {
     const value = io_value orelse return null;
     return try IoBorrow.init(&value).receive();
@@ -1248,6 +1259,10 @@ pub const BackendRuntime = struct {
         if (self.borrowed_receivers) |*borrowed| return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
         return if (self.io_impl) |io_impl| io_impl.io() else if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
+    }
+
+    pub fn filesystemCapability(self: *BackendRuntime) ?Filesystem {
+        return .{ .io = self.filesystemIo() orelse return null, .cache_advice = self.fileCacheAdvice() };
     }
 
     pub fn fileCacheAdvice(self: *BackendRuntime) @import("antfly_runtime_abi").io_abi.file_cache.Advice {

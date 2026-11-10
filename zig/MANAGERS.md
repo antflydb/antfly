@@ -332,23 +332,30 @@ Physical denial can also ask the process owner to reclaim managed host caches,
 even when its ledger is below its ceiling. Standalone uses ResourceManager's
 weighted cache reclamation; Lite attaches each live storage manager to its
 shared inference service. Attachments rotate fairly and detach drains borrowed
-callbacks before DB/cache teardown. The capability crosses the versioned
-inference bridge and worker transport without holding admission, attachment, or
+callbacks before DB/cache teardown. Each pass visits all pre-existing owner
+slots in bounded batches; new or reused slots wait for the next pass. The
+capability crosses the versioned inference bridge and worker transport without holding admission, attachment, or
 RPC accounting locks during callbacks. Preflight, auxiliary weights, runs and
 metadata all participate. One owner pass per admission leaves inference caches
 and model eviction an opportunity to help. Every retry re-probes physical memory;
 reported decreases are never allocation credit. The reclaim target is solved
 against the same physical and operator-envelope policies, including reserve
 floors and usage above the envelope, rather than assuming a clamped zero
-capacity means only the requested allocation needs to be freed.
+capacity means only the requested allocation needs to be freed. Demand belongs
+to the requesting operation and is combined with current pending promises;
+concurrent success or denial cannot overwrite it. Physical callbacks report
+destroyed payload storage separately from unused reservation credit. The
+storage process also purges unused libc arenas where supported. A fresh
+admission probe remains authoritative even after a zero-byte owner report.
 
 Linux file-cache cleanup belongs to the file-producing operation. A completed
-snapshot drops its synced private output cache before publication; a writable
-file owner drops cache before releasing its lifetime writer lease. Internal
-readers, read-only snapshots and externally leased generations do not discard
-another owner's hot pages on close. Each DONTNEED hint covers at most 8 MiB and
-the operation yields between ranges. Advice can initiate writeback and is
-best-effort; it runs outside admission rather than under the eviction lock.
+snapshot syncs and advises private output in 64 MiB windows before publication;
+a writable file owner performs bounded best-effort cleanup before releasing
+its lifetime writer lease. Internal readers, read-only snapshots and externally
+leased generations do not discard another owner's hot pages on close. Each
+DONTNEED hint covers at most 8 MiB; a cleanup pass covers at most 2 GiB regardless of logical file size. It checks cancellation before each hint
+and yields every 32 ranges. Large bulk output does not rely on a close-time
+whole-file scan. Advice can initiate writeback and is best-effort; it runs outside admission rather than under the eviction lock.
 No descriptor or path is retained after close, so deleted files release their
 inodes immediately and there is no registry to diverge between compiled images.
 

@@ -1634,7 +1634,7 @@ pub const Store = struct {
         if (self.metadata_ready.load(.acquire)) return self.metadata_pool.allocator(self.allocator, self.resource_manager);
         platform_sync.lockYielding(&self.workspace_mutex);
         if (self.workspace_reclaimer == null) {
-            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch null;
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimerWithOptions(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces, .{ .reclaim_physical = reclaimIdleWorkspacesPhysical }) catch null;
         }
         if (self.resource_manager == null or self.workspace_reclaimer != null) self.metadata_ready.store(true, .release);
         self.workspace_mutex.unlock();
@@ -1642,6 +1642,12 @@ pub const Store = struct {
     }
 
     fn reclaimIdleWorkspaces(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimIdleWorkspacesImpl(context, target_bytes, false);
+    }
+    fn reclaimIdleWorkspacesPhysical(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimIdleWorkspacesImpl(context, target_bytes, true);
+    }
+    fn reclaimIdleWorkspacesImpl(context: *anyopaque, target_bytes: u64, physical_only: bool) u64 {
         const self: *Store = @ptrCast(@alignCast(context));
         const metadata = self.metadata_pool.reclaimDetailed(target_bytes);
         var freed = metadata.physical;
@@ -1669,7 +1675,7 @@ pub const Store = struct {
             freed +|= physical;
             reported +|= bytes;
         }
-        return reported;
+        return if (physical_only) freed else reported;
     }
 
     fn checkoutWorkspace(self: *Store, caller: Allocator) !?*ReadWorkspace {
@@ -1677,7 +1683,7 @@ pub const Store = struct {
         if (query_budget == null and !(caller.ptr == self.allocator.ptr and caller.vtable == self.allocator.vtable)) return null;
         platform_sync.lockYielding(&self.workspace_mutex);
         if (self.workspace_reclaimer == null) {
-            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch {
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimerWithOptions(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces, .{ .reclaim_physical = reclaimIdleWorkspacesPhysical }) catch {
                 self.workspace_mutex.unlock();
                 return null;
             };

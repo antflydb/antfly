@@ -21,31 +21,26 @@ const platform = @import("antfly_platform");
 
 pub const Registry = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    head: ?*Attachment = null,
-    tail: ?*Attachment = null,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    entries: std.ArrayListUnmanaged(?*Attachment) = .empty,
     count: usize = 0,
+    cursor: usize = 0,
+    next_identity: u64 = 1,
 
     pub const Attachment = struct {
         registry: *Registry,
         allocator: std.mem.Allocator,
         context: *anyopaque,
         callback: *const fn (*anyopaque, u64) u64,
-        next: ?*Attachment = null,
+        slot: usize = 0,
+        identity: u64 = 0,
         in_flight: std.atomic.Value(usize) = .init(0),
 
         pub fn detach(self: *Attachment) void {
             const registry = self.registry;
             platform.sync.lockYielding(&registry.mutex);
-            var previous: ?*Attachment = null;
-            var cursor = registry.head;
-            while (cursor) |entry| {
-                if (entry == self) break;
-                previous = entry;
-                cursor = entry.next;
-            }
-            std.debug.assert(cursor == self);
-            if (previous) |entry| entry.next = self.next else registry.head = self.next;
-            if (registry.tail == self) registry.tail = previous;
+            std.debug.assert(registry.entries.items[self.slot] == self);
+            registry.entries.items[self.slot] = null;
             registry.count -= 1;
             registry.mutex.unlock();
             while (self.in_flight.load(.acquire) != 0) platform.time.yieldBriefly();
@@ -58,43 +53,62 @@ pub const Registry = struct {
         entry.* = .{ .registry = self, .allocator = allocator, .context = context, .callback = callback };
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (self.tail) |tail| tail.next = entry else self.head = entry;
-        self.tail = entry;
+        errdefer allocator.destroy(entry);
+        const slot = for (self.entries.items, 0..) |value, index| {
+            if (value == null) break index;
+        } else blk: {
+            try self.entries.append(self.allocator, null);
+            break :blk self.entries.items.len - 1;
+        };
+        entry.slot = slot;
+        entry.identity = self.next_identity;
+        self.next_identity = std.math.add(u64, self.next_identity, 1) catch return error.OwnerIdentityExhausted;
+        self.entries.items[slot] = entry;
         self.count += 1;
         return entry;
     }
 
     pub fn reclaim(self: *Registry, target: u64) u64 {
         if (target == 0) return 0;
-        var selected: [16]*Attachment = undefined;
+        // Snapshot identities and the slot extent, not callback pointers. Each
+        // bounded batch takes leases under the mutex; detach may retire any
+        // unselected owner immediately. New/reused slots wait for another pass.
         platform.sync.lockYielding(&self.mutex);
-        const count = @min(selected.len, self.count);
-        var cursor = self.head;
-        for (selected[0..count]) |*slot| {
-            const entry = cursor.?;
-            cursor = entry.next;
-            _ = entry.in_flight.fetchAdd(1, .monotonic);
-            slot.* = entry;
+        const extent = self.entries.items.len;
+        if (extent == 0) {
+            self.mutex.unlock();
+            return 0;
         }
-        if (self.count > 1) {
-            const first = self.head.?;
-            self.head = first.next;
-            first.next = null;
-            self.tail.?.next = first;
-            self.tail = first;
-        }
+        const start = self.cursor % extent;
+        self.cursor = (start + 1) % extent;
+        const cutoff = self.next_identity - 1;
         self.mutex.unlock();
+        var visited: usize = 0;
         var reclaimed: u64 = 0;
-        for (selected[0..count]) |entry| {
-            if (reclaimed < target) reclaimed +|= entry.callback(entry.context, target - reclaimed);
-            const previous = entry.in_flight.fetchSub(1, .release);
-            std.debug.assert(previous > 0);
+        while (visited < extent and reclaimed < target) {
+            var selected: [16]*Attachment = undefined;
+            var count: usize = 0;
+            platform.sync.lockYielding(&self.mutex);
+            while (visited < extent and count < selected.len) : (visited += 1) {
+                const entry = self.entries.items[(start + visited) % extent] orelse continue;
+                if (entry.identity > cutoff) continue;
+                _ = entry.in_flight.fetchAdd(1, .monotonic);
+                selected[count] = entry;
+                count += 1;
+            }
+            self.mutex.unlock();
+            for (selected[0..count]) |entry| {
+                if (reclaimed < target) reclaimed +|= entry.callback(entry.context, target - reclaimed);
+                const previous = entry.in_flight.fetchSub(1, .release);
+                std.debug.assert(previous > 0);
+            }
         }
         return reclaimed;
     }
 
     pub fn deinit(self: *Registry) void {
-        std.debug.assert(self.head == null and self.tail == null and self.count == 0);
+        std.debug.assert(self.count == 0);
+        self.entries.deinit(self.allocator);
     }
 };
 
@@ -166,4 +180,25 @@ test "host memory owners detach drains callbacks before storage is destroyed" {
     }
     try std.testing.expect(!gate.detached.load(.acquire));
     gate.release.store(true, .release);
+}
+
+test "host memory owners visit later batches when the first sixteen cannot reclaim" {
+    const Probe = struct {
+        calls: usize = 0,
+        bytes: u64 = 0,
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return @min(target, self.bytes);
+        }
+    };
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    var probes: [40]Probe = @splat(.{});
+    probes[39].bytes = 1024;
+    var entries: [40]*Registry.Attachment = undefined;
+    for (&probes, &entries) |*probe, *entry| entry.* = try registry.attach(std.testing.allocator, probe, Probe.reclaim);
+    defer for (entries) |entry| entry.detach();
+    try std.testing.expectEqual(@as(u64, 64), registry.reclaim(64));
+    for (probes) |probe| try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

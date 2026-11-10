@@ -84,11 +84,29 @@ pub const Cache = struct {
         self.io = null;
     }
 
-    fn reclaim(ptr: *anyopaque, _: u64) u64 {
+    fn sourceBytes(source: *const SpoolSource) u64 {
+        return @sizeOf(SpoolSource) + source.descriptor.len + source.cache.bytes.len;
+    }
+    fn physicalBytes(self: *const Cache) u64 {
+        var bytes: u64 = if (self.pending) |pending| sourceBytes(pending.source) else 0;
+        if (self.entry) |entry| {
+            bytes += entry.bytes.len;
+            if (entry.frame.stream == null) bytes += entry.frame.offsets.len * @sizeOf(u32);
+            if (entry.source) |source| bytes += sourceBytes(source);
+        }
+        return bytes;
+    }
+    fn reclaimPhysical(ptr: *anyopaque, target: u64) u64 {
+        return reclaimImpl(ptr, target, true);
+    }
+    fn reclaim(ptr: *anyopaque, target: u64) u64 {
+        return reclaimImpl(ptr, target, false);
+    }
+    fn reclaimImpl(ptr: *anyopaque, _: u64, physical: bool) u64 {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock(self.io.?);
-        const size = (if (self.entry) |entry| if (entry.reservation) |reservation| reservation.bytes else @as(u64, 0) else 0) +
+        const size = if (physical) self.physicalBytes() else (if (self.entry) |entry| if (entry.reservation) |reservation| reservation.bytes else @as(u64, 0) else 0) +
             (if (self.pending) |pending| if (pending.reservation) |reservation| reservation.bytes else @as(u64, 0) else 0);
         self.clear();
         return size;
@@ -102,7 +120,7 @@ pub const Cache = struct {
         }
         self.io = io;
         self.manager = manager;
-        if (manager) |value| self.reclaimer = try value.registerReclaimer(.relational_preparation_working_set, self, reclaim);
+        if (manager) |value| self.reclaimer = try value.registerReclaimerWithOptions(.relational_preparation_working_set, self, reclaim, .{ .reclaim_physical = reclaimPhysical });
     }
 };
 const Receipt = struct {
@@ -610,4 +628,31 @@ test "relational index system rewrite tail chunked spool resumes with bounded me
     try resetCorruptCopy(alloc, io, root, scope, chunk.sequence, &cache);
     try std.testing.expectEqual(@as(u32, 0), try resumeOffset(alloc, io, root, scope, 0));
     cache.clear();
+}
+
+test "relational rewrite tail physical reclamation reports allocated buffers rather than planning credit" {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var cache = Cache{};
+    try cache.bind(std.testing.io, &manager);
+    defer cache.deinit(std.testing.io);
+    cache.entry = blk: {
+        const bytes = try a.alloc(u8, 17);
+        errdefer a.free(bytes);
+        const offsets = try a.alloc(u32, 3);
+        errdefer a.free(offsets);
+        const reservation = try manager.reserve(.relational_preparation_working_set, 4096);
+        break :blk .{
+            .alloc = a,
+            .scope = @splat(0),
+            .sequence = 1,
+            .bytes = bytes,
+            .frame = .{ .reader = undefined, .offsets = offsets, .alloc = a },
+            .reservation = reservation,
+        };
+    };
+    try std.testing.expectEqual(@as(u64, 17 + 3 * @sizeOf(u32)), manager.reclaimHostMemory(1));
+    try std.testing.expect(cache.entry == null);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }

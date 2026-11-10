@@ -1082,6 +1082,7 @@ const ReclaimerSlot = struct {
     slice: Slice = .hbc_node_metadata_cache,
     context: ?*anyopaque = null,
     reclaim: ?ReclaimerFn = null,
+    reclaim_physical: ?ReclaimerFn = null,
     weight: u32 = 1,
     in_flight: u32 = 0,
     retiring: bool = false,
@@ -1096,6 +1097,9 @@ const ReclaimerInvocation = struct {
 };
 
 pub const ReclaimerOptions = struct {
+    /// Default callbacks report destroyed payload bytes. Owners whose logical
+    /// callback also returns reservation credit must supply a physical variant.
+    reclaim_physical: ?ReclaimerFn = null,
     weight: u32 = 1,
 };
 
@@ -1306,6 +1310,12 @@ pub const ResourceManager = struct {
         cache: Cache,
         reclaimer: u64 = 0,
         fn reclaim(ptr: *anyopaque, target: u64) u64 {
+            return reclaimImpl(ptr, target, false);
+        }
+        fn reclaimPhysical(ptr: *anyopaque, target: u64) u64 {
+            return reclaimImpl(ptr, target, true);
+        }
+        fn reclaimImpl(ptr: *anyopaque, target: u64, physical: bool) u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // Cache admission normally takes cache -> allocator locks. Reverse
             // that order only with tryLock on both; never wait for an owner.
@@ -1315,18 +1325,19 @@ pub const ResourceManager = struct {
             defer allocator_residency.Guard.leave();
             allocator_residency.Guard.beginReclaim();
             defer allocator_residency.Guard.endReclaim();
-            const before = self.budget.reservation.bytes;
+            const before = if (physical) self.budget.live_bytes else self.budget.reservation.bytes;
             // Spare credit is cheaper to return than useful cached payloads.
             _ = self.budget.releaseUnusedCredit();
-            const remaining = target -| (before - self.budget.reservation.bytes);
+            const remaining = target -| (before - (if (physical) self.budget.live_bytes else self.budget.reservation.bytes));
             if (remaining != 0) {
                 _ = self.cache.reclaim(remaining);
                 // Hash-table capacity can keep the allocator alive after all
                 // payloads are evicted. Trim the new spare credit as well.
                 _ = self.budget.releaseUnusedCredit();
             }
-            // Admission relief, rather than logical payload bytes freed.
-            return before - self.budget.reservation.bytes;
+            // Logical admission uses credit relief; physical admission counts
+            // only payload allocations destroyed by this invocation.
+            return before - (if (physical) self.budget.live_bytes else self.budget.reservation.bytes);
         }
         fn deinit(self: *@This()) void {
             self.budget.reservation.manager.unregisterReclaimer(self.reclaimer);
@@ -1356,7 +1367,7 @@ pub const ResourceManager = struct {
             .cache = undefined,
         };
         owner.cache = .{ .a = owner.budget.threadSafeAllocator(), .max_bytes = @min(max_bytes, 32 * 1024 * 1024) };
-        owner.reclaimer = self.registerReclaimer(.hbc_node_metadata_cache, owner, NativeChunks.reclaim) catch {
+        owner.reclaimer = self.registerReclaimerWithOptions(.hbc_node_metadata_cache, owner, NativeChunks.reclaim, .{ .reclaim_physical = NativeChunks.reclaimPhysical }) catch {
             owner.budget.deinit();
             metadata.release();
             std.heap.page_allocator.destroy(owner);
@@ -1456,6 +1467,7 @@ pub const ResourceManager = struct {
                 .slice = slice,
                 .context = context,
                 .reclaim = reclaim,
+                .reclaim_physical = options.reclaim_physical orelse reclaim,
                 .weight = @max(@as(u32, 1), options.weight),
             };
             return identity;
@@ -1468,6 +1480,7 @@ pub const ResourceManager = struct {
             .slice = slice,
             .context = context,
             .reclaim = reclaim,
+            .reclaim_physical = options.reclaim_physical orelse reclaim,
             .weight = @max(@as(u32, 1), options.weight),
         });
         return identity;
@@ -1544,7 +1557,12 @@ pub const ResourceManager = struct {
     /// buffered snapshot I/O). Invoke managed owners without treating their
     /// counters as proof of physical capacity. File I/O sheds cache at source.
     pub fn reclaimHostMemory(self: *ResourceManager, target_bytes: u64) u64 {
-        return self.reclaimCaches(.dense_apply_working_set, 0, target_bytes);
+        const freed = self.reclaimCaches(.dense_apply_working_set, 0, target_bytes);
+        // Purge in the process that owns the storage allocator, including
+        // when inference runs in a worker. Cache/ledger locks are released.
+        // This is a cold pressure boundary, never an individual free.
+        if (freed != 0) _ = @import("antfly_platform").allocator.reclaimUnusedProcessMemory();
+        return freed;
     }
 
     fn reclaimCaches(self: *ResourceManager, requester: Slice, additional_bytes: u64, physical_target: u64) u64 {
@@ -1573,7 +1591,7 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache, .lite_docstore_snapshot_cache, .graph_predicate_cache };
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache, .lite_docstore_snapshot_cache, .graph_predicate_cache, .dense_source_payload_state, .full_text_segment_residency };
         for (candidates, 0..) |candidate_slice, candidate_index| {
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
@@ -1623,7 +1641,7 @@ pub const ResourceManager = struct {
                         .slot_index = index,
                         .identity = slot.identity,
                         .context = slot.context.?,
-                        .reclaim = slot.reclaim.?,
+                        .reclaim = if (physical_target != 0) slot.reclaim_physical.? else slot.reclaim.?,
                         .weight = slot.weight,
                     };
                     slot.in_flight += 1;
@@ -6939,4 +6957,54 @@ test "external lake native chunk reclamation preserves pins and skips contended 
     try std.testing.expectEqual(@as(u64, 0), ResourceManager.NativeChunks.reclaim(owner, MiB));
     try std.testing.expectEqualStrings("pinned native extent", bytes);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+}
+
+test "resource manager physical pressure evicts native payload despite spare logical credit" {
+    const a = std.testing.allocator;
+    var manager = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * MiB } });
+    defer manager.deinit(a);
+    const cache = manager.nativeChunkCache(512 * 1024).?;
+    const owner = manager.native_chunks.load(.acquire).?;
+    const lease = try cache.create(64 * 1024);
+    _ = try lease.item.arena.allocator().dupe(u8, "physical payload");
+    cache.publish(@splat(2), lease);
+    lease.release();
+    const live = owner.budget.live_bytes;
+    try std.testing.expect(owner.budget.reservation.bytes > live);
+    try std.testing.expect(manager.reclaimHostMemory(1) > 0);
+    try std.testing.expect(owner.budget.live_bytes < live);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+test "resource manager physical pressure ignores logical-only relief and visits remaining caches" {
+    const Credit = struct {
+        calls: usize = 0,
+        fn logical(_: *anyopaque, target: u64) u64 {
+            return target;
+        }
+        fn physical(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    const Payload = struct {
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return target;
+        }
+    };
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var credit = Credit{};
+    const first = try manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, &credit, Credit.logical, .{ .reclaim_physical = Credit.physical });
+    defer manager.unregisterReclaimer(first);
+    var payload = Payload{};
+    const second = try manager.registerReclaimer(.dense_source_payload_state, &payload, Payload.reclaim);
+    defer manager.unregisterReclaimer(second);
+    try std.testing.expectEqual(@as(u64, 64), manager.reclaimHostMemory(64));
+    try std.testing.expectEqual(@as(usize, 1), credit.calls);
+    try std.testing.expectEqual(@as(usize, 1), payload.calls);
 }

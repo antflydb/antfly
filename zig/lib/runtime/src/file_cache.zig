@@ -19,6 +19,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const max_range_bytes: u64 = 8 * 1024 * 1024;
+/// Close never walks an unbounded logical file (including sparse holes).
+/// Bulk producers drain output incrementally instead of relying on close.
+pub const max_pass_bytes: u64 = 2 * 1024 * 1024 * 1024;
+pub const bulk_window_bytes: u64 = 64 * 1024 * 1024;
 
 pub const Advice = extern struct {
     context: ?*anyopaque = null,
@@ -33,19 +37,28 @@ pub const Advice = extern struct {
         return self.discard_range != null;
     }
 
-    /// Used only by the file owner, after bulk output is synced or while its
-    /// writer lease still excludes a successor. Never called by admission.
-    /// Each syscall has a bounded range; yields allow other runtime work to
-    /// progress between ranges. Hints may initiate writeback and are not credit.
+    /// Best-effort owner cleanup, bounded in both syscall range and total work.
+    /// No descriptor survives this call. Cancellation stops optional advice.
     pub fn discard(self: Advice, io: std.Io, file: std.Io.File, bytes: u64) void {
+        self.discardRange(io, file, 0, bytes);
+    }
+
+    /// Bulk producers call this after syncing each output window. Offsets are
+    /// file offsets, not a promise of physical bytes released by the kernel.
+    pub fn discardRange(self: Advice, io: std.Io, file: std.Io.File, start: u64, bytes: u64) void {
         if (comptime builtin.os.tag != .linux) return;
         const callback = self.discard_range orelse return;
-        var offset: u64 = 0;
-        while (offset < bytes) {
-            const len = @min(max_range_bytes, bytes - offset);
+        const end = start +| @min(bytes, max_pass_bytes);
+        var offset = start;
+        var calls: usize = 0;
+        while (offset < end) {
+            io.checkCancel() catch return;
+            const len = @min(max_range_bytes, end - offset);
             callback(self.context, file.handle, offset, len);
             offset += len;
-            if (offset < bytes) io.sleep(.zero, .awake) catch {};
+            calls += 1;
+            // Avoid one timer syscall per 8 MiB on sparse/uncached files.
+            if (offset < end and calls % 32 == 0) io.sleep(.zero, .awake) catch return;
         }
     }
 };
@@ -73,4 +86,28 @@ test "file cache advice uses bounded non-overlapping ranges and retains no descr
     advice.discard(std.testing.io, .{ .handle = -1, .flags = .{ .nonblocking = false } }, max_range_bytes * 2 + 17);
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expectEqual(max_range_bytes * 2 + 17, probe.offset);
+}
+
+test "file cache advice bounds total work for sparse files and honors cancellation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const Probe = struct {
+        bytes: u64 = 0,
+        fn discard(raw: ?*anyopaque, _: i32, _: u64, len: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.bytes += len;
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var probe = Probe{};
+    const advice = Advice{ .context = &probe, .discard_range = Probe.discard };
+    const file: std.Io.File = .{ .handle = -1, .flags = .{ .nonblocking = false } };
+    advice.discard(std.testing.io, file, 1024 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(max_pass_bytes, probe.bytes);
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Probe.cancel;
+    const cancelled: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &table };
+    advice.discard(cancelled, file, max_pass_bytes);
+    try std.testing.expectEqual(max_pass_bytes, probe.bytes);
 }

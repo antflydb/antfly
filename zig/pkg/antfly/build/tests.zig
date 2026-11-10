@@ -1357,6 +1357,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "embedded db standalone catalog changes require the server after snapshot reopen",
             "embedded custom storage owns its physical namespace",
+            "embedded db file cache authority",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -6916,8 +6917,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = 6 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-memory-pressure-test", "Verify physical reclamation and Lite snapshot cache ownership")
-        .dependOn(&addFilteredTestRunArtifact(b, memory_pressure_tests).step);
+    const memory_pressure_step = b.step("antfly-memory-pressure-test", "Verify physical reclamation and Lite snapshot cache ownership");
+    memory_pressure_step.dependOn(&addFilteredTestRunArtifact(b, memory_pressure_tests).step);
+    const filesystem_authority_tests = b.addTest(.{
+        .root_module = embedded_db_mod,
+        .filters = &.{"embedded db file cache authority"},
+    });
+    memory_pressure_step.dependOn(&addFilteredTestRunArtifact(b, filesystem_authority_tests).step);
     const source_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },

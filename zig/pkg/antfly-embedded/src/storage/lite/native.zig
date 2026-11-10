@@ -71,6 +71,45 @@ test "lite native cache advice is bounded and preserves snapshot and internal re
     try std.testing.expectEqual(before, probe.calls);
 }
 
+test "lite native cache advice streams synced snapshot windows before publication" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const Probe = struct {
+        first_size: ?u64 = null,
+        max_end: u64 = 0,
+        fn discard(raw: ?*anyopaque, fd: i32, offset: u64, len: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const output: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+            if (self.first_size == null) self.first_size = (output.stat(std.testing.io) catch unreachable).size;
+            self.max_end = @max(self.max_end, offset + len);
+        }
+    };
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const path = try testPath(a, dir, "window-source.aflite");
+    defer a.free(path);
+    const snapshot = try testPath(a, dir, "window-snapshot.aflite");
+    defer a.free(snapshot);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const payload = try a.alloc(u8, file_cache.bulk_window_bytes + default_page_size);
+    defer a.free(payload);
+    @memset(payload, 'a');
+    try file.putDocument("bulk", payload);
+    var probe = Probe{};
+    file.cache_advice = .{ .context = &probe, .discard_range = Probe.discard };
+    const report = try file.copyStableSnapshotToPath(snapshot, false);
+    _ = report;
+    const expected_size = try checkpointPrefixSize(file.activeCheckpoint(), file.header.page_size);
+    try std.testing.expect(probe.first_size.? < expected_size);
+    try std.testing.expectEqual(expected_size, probe.max_end);
+    var reader = try NativeFile.openWithIo(a, std.testing.io, snapshot, .{ .read_only = true, .internal_reader = true });
+    defer reader.close();
+    const value = (try reader.getDocumentAlloc(a, "bulk")).?;
+    defer a.free(value);
+    try std.testing.expectEqualSlices(u8, payload, value);
+}
+
 test "lite native cache advice never pins an unlinked owner inode" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -5104,8 +5143,8 @@ pub const NativeFile = struct {
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
-        // Drop private owner cache before releasing the writer lease. No
-        // descriptor survives close and no successor's hot cache is advised.
+        // Bound optional cleanup before releasing the writer lease. Bulk output
+        // drains its cache incrementally; close never scans an entire large file.
         if (self.discard_file_cache_on_close and !self.read_only and self.writer_lock_file != null) {
             const bytes = if (self.cache_advice.available()) (self.file.stat(io) catch null) else null;
             if (bytes) |stat| self.cache_advice.discard(io, self.file, stat.size);
@@ -10245,18 +10284,28 @@ pub const NativeFile = struct {
             defer self.allocator.free(buffer);
 
             var offset: u64 = 0;
+            var advised: u64 = 0;
             while (offset < snapshot_size) {
                 const len: usize = @intCast(@min(@as(u64, buffer.len), snapshot_size - offset));
                 try readExactAt(self.file, io, buffer[0..len], offset);
                 try out_file.writePositionalAll(io, buffer[0..len], offset);
                 offset += len;
+                // Bound buffered output residency during large snapshots;
+                // waiting until publication can fill a small cgroup first.
+                if (self.cache_advice.available() and offset - advised >= file_cache.bulk_window_bytes) {
+                    try out_file.sync(io);
+                    self.cache_advice.discardRange(io, out_file, advised, offset - advised);
+                    advised = offset;
+                }
             }
             var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
             defer destination.page_cache.deinit(self.allocator);
             try destination.bindPrivateEpochNamespace(dest_path);
             try out_file.setLength(io, snapshot_size);
             try out_file.sync(io);
-            self.cache_advice.discard(io, out_file, snapshot_size);
+            self.cache_advice.discardRange(io, out_file, advised, snapshot_size - advised);
+            // Namespace binding may rewrite the already-advised header.
+            self.cache_advice.discardRange(io, out_file, 0, @min(snapshot_size, file_cache.max_range_bytes));
         }
 
         renameFilePath(io, tmp_path, dest_path) catch |err| {

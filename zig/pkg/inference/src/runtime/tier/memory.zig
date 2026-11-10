@@ -915,8 +915,7 @@ pub const AdmissionController = struct {
     live_mutex: std.atomic.Mutex = .unlocked,
     live_capacity_bytes: usize = 0,
     live_pending_bytes: usize = 0,
-    live_reclaim_target_bytes: usize = 0,
-    live_reclaim_required_bytes: usize = 0,
+    test_reclamation_target: if (builtin.is_test) ?*const fn (usize) ?usize else void = if (builtin.is_test) null else {},
     live_epoch: u64 = 0,
     /// Suppress a warning storm while repeated requests are denied by the
     /// same live-memory pressure condition. Successful admission clears it.
@@ -1025,7 +1024,7 @@ pub const AdmissionController = struct {
     /// Borrow the process owner's reclamation capability without holding an
     /// admission lock across storage callbacks. The lifetime survives a
     /// concurrent capability reconfiguration; progress never grants bytes.
-    pub fn reclaimHostCapacity(self: *AdmissionController) usize {
+    pub fn reclaimHostCapacity(self: *AdmissionController, incremental_bytes: usize) usize {
         spinLockAdmission(&self.mutex);
         const budget = self.resource_budget orelse {
             self.mutex.unlock();
@@ -1040,17 +1039,20 @@ pub const AdmissionController = struct {
         if (!retained) return 0;
         defer budget.releaseContext();
         spinLockAdmission(&self.live_mutex);
-        const fallback_target = @max(self.live_reclaim_target_bytes, mib(64));
-        const required = self.live_reclaim_required_bytes;
+        // Only pending promises are shared. The failed operation supplies its
+        // own demand, so another admission cannot erase or replace it.
+        const required = self.live_pending_bytes +| incremental_bytes;
         self.live_mutex.unlock();
-        const target = if (required == 0) fallback_target else blk: {
-            const measured = liveReclamationTargetForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance, required) orelse return 0;
-            // A fresh sample already permits the request. Let the caller retry
-            // admission instead of evicting an unrelated cache on stale pressure.
-            if (measured == 0) return 1;
-            break :blk measured;
-        };
-        return reclaim(budget.context, target);
+        const target = (if (builtin.is_test and self.test_reclamation_target != null)
+            self.test_reclamation_target.?(required)
+        else
+            liveReclamationTargetForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance, required)) orelse return 0;
+        // Retry against a fresh sample even when pressure has already cleared.
+        if (target == 0) return 1;
+        // Always resample once after an owner pass. An owner may free buffers
+        // conservatively omitted from its physical count, or another request
+        // may have released memory while the callbacks ran.
+        return @max(1, reclaim(budget.context, target));
     }
 
     pub fn configureResourceBudget(
@@ -1490,7 +1492,6 @@ pub const AdmissionController = struct {
         info: ?SystemMemoryInfo,
     ) !usize {
         std.debug.assert(incremental_bytes > 0);
-        self.live_reclaim_required_bytes = self.live_pending_bytes +| incremental_bytes;
         if (info) |memory_info| {
             const available = memory_info.available_bytes orelse {
                 if (self.live_pending_bytes != 0) return error.ResourceTemporarilyUnavailable;
@@ -1516,13 +1517,10 @@ pub const AdmissionController = struct {
             return error.ResourceTemporarilyUnavailable;
         };
         if (next_pending > self.live_capacity_bytes) {
-            self.live_reclaim_target_bytes = next_pending - self.live_capacity_bytes;
             if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
             return error.ResourceTemporarilyUnavailable;
         }
         self.live_pending_bytes = next_pending;
-        self.live_reclaim_target_bytes = 0;
-        self.live_reclaim_required_bytes = 0;
         return incremental_bytes;
     }
 
@@ -3707,6 +3705,9 @@ test "host reclamation borrows owner lifetime and invokes callbacks outside admi
     const Owner = struct {
         controller: *AdmissionController,
         references: usize = 0,
+        fn measureTarget(required: usize) ?usize {
+            return required;
+        }
         fn retain(raw: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.references += 1;
@@ -3723,7 +3724,7 @@ test "host reclamation borrows owner lifetime and invokes callbacks outside admi
         fn free(_: *anyopaque, _: usize) void {}
         fn reclaim(raw: *anyopaque, target: usize) usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            std.debug.assert(target >= mib(64));
+            std.debug.assert(target > 0);
             std.debug.assert(self.controller.live_mutex.tryLock());
             self.controller.live_mutex.unlock();
             self.controller.configureResourceBudget(null) catch unreachable;
@@ -3731,10 +3732,10 @@ test "host reclamation borrows owner lifetime and invokes callbacks outside admi
             return 1;
         }
     };
-    var controller = AdmissionController{};
+    var controller = AdmissionController{ .test_reclamation_target = Owner.measureTarget };
     var owner = Owner{ .controller = &controller };
     try controller.configureResourceBudget(.{ .context = &owner, .retain_context = Owner.retain, .release_context = Owner.release, .try_reserve = Owner.reserve, .retain = Owner.shrink, .release = Owner.free, .reclaim_host = Owner.reclaim });
-    try std.testing.expectEqual(@as(usize, 1), controller.reclaimHostCapacity());
+    try std.testing.expectEqual(@as(usize, 1), controller.reclaimHostCapacity(mib(64)));
     try std.testing.expectEqual(@as(usize, 0), owner.references);
 }
 
@@ -5244,4 +5245,34 @@ test "managed PJRT metadata residency cannot refund a newer pressure epoch" {
     resident.release();
     try std.testing.expectEqual(next, controller.live_pending_bytes);
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "host reclamation demand survives interleaved successful and denied admissions" {
+    const Owner = struct {
+        required: usize = 0,
+        fn measureTarget(required: usize) ?usize {
+            return required;
+        }
+        fn reserve(_: *anyopaque, _: AdmissionAmounts) AdmissionResourceError!usize {
+            return 1;
+        }
+        fn shrink(_: *anyopaque, _: usize, _: AdmissionAmounts) AdmissionResourceError!void {}
+        fn free(_: *anyopaque, _: usize) void {}
+        fn reclaim(raw: *anyopaque, bytes: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.required = bytes;
+            return 0;
+        }
+    };
+    var owner = Owner{};
+    var controller = AdmissionController{ .test_reclamation_target = Owner.measureTarget };
+    defer controller.deinit();
+    try controller.configureResourceBudget(.{ .context = &owner, .try_reserve = Owner.reserve, .retain = Owner.shrink, .release = Owner.free, .reclaim_host = Owner.reclaim });
+    const sample = SystemMemoryInfo{ .total_bytes = gib(2), .available_bytes = mib(640) };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(mib(256), sample));
+    const small = try controller.tryReserveLiveCapacityWithInfo(1, sample);
+    defer controller.releaseLiveReservation(small);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryReserveLiveCapacityWithInfo(gib(2), sample));
+    try std.testing.expectEqual(@as(usize, 1), controller.reclaimHostCapacity(mib(256)));
+    try std.testing.expectEqual(mib(256) + 1, owner.required);
 }
