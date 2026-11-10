@@ -1349,7 +1349,10 @@ pub const GraphMetricNotify = struct {
 /// Embeds documents' source text with an index's document embedder. Fills
 /// `out[i * dims ..]` and sets `found[i]` for each request; documents without
 /// source text stay not found.
+const LeannRecoverySession = @import("../../leann_recovery.zig").Session;
+
 pub const DenseReembedder = struct {
+    embed_session_fn: ?*const fn (*anyopaque, Allocator, []const enrichment_types.GeneratedEnrichmentRequest, u32, []f32, []bool, *LeannRecoverySession) anyerror!void = null,
     ctx: *anyopaque,
     embed_fn: *const fn (
         ctx: *anyopaque,
@@ -24115,6 +24118,7 @@ pub const IndexManager = struct {
                     if (leann_store.loader) |base| {
                         var batched = base;
                         batched.load_batch_timed = loadDenseVectorsForLeann;
+                        batched.load_batch_session = loadDenseVectorsForLeannSession;
                         batched.validate_digest = validateLeannRetainedDigest;
                         leann_store.setLoader(batched);
                     }
@@ -30127,6 +30131,15 @@ pub const IndexManager = struct {
     /// graph already holds the vector with `vector_digest`.
     const ElidedDenseArtifact = struct { write_index: usize, vector_digest: u64 };
 
+    fn validateLeannArtifactPrecision(self: *IndexManager, index_name: []const u8, raw: []const u8) !void {
+        const header = try enrichment_artifact_codec.decodeHeader(raw);
+        if (!header.flags.int8_payload) return;
+        const consumer = self.denseIndex(index_name) orelse return error.IndexNotFound;
+        // Quantization is irreversible. Do not relabel an int8 approximation
+        // as the original full vector; reprocess the producer before retrying.
+        if (!consumer.leann_media_int8) return error.ArtifactRepairRequired;
+    }
+
     fn preloadDenseEmbeddingArtifactVectorsFromSession(
         self: *IndexManager,
         index_name: []const u8,
@@ -30186,7 +30199,10 @@ pub const IndexManager = struct {
                 }
                 fallback_count += 1;
             } else |err| {
-                if (err == error.VectorElided and elided != null) continue;
+                if (err == error.VectorElided and elided != null) {
+                    try self.validateLeannArtifactPrecision(index_name, raw);
+                    continue;
+                }
                 if (isRecoverableEmbeddingArtifactError(err)) {
                     try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
@@ -30307,7 +30323,10 @@ pub const IndexManager = struct {
                 }
                 fallback_count += 1;
             } else |err| {
-                if (err == error.VectorElided and elided != null) continue;
+                if (err == error.VectorElided and elided != null) {
+                    try self.validateLeannArtifactPrecision(index_name, raw);
+                    continue;
+                }
                 if (isRecoverableEmbeddingArtifactError(err)) {
                     try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
@@ -33501,6 +33520,15 @@ pub const IndexManager = struct {
     /// LEANN batch loader: reads stored vectors, then re-embeds every
     /// document whose vector was elided in one embedder call.
     fn loadDenseVectorsForLeann(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void {
+        return loadDenseVectorsForLeannImpl(ctx, alloc, vector_ids, metadata, out, found, reembed_ns, null);
+    }
+
+    fn loadDenseVectorsForLeannSession(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64, session: *LeannRecoverySession) anyerror!void {
+        try session.check();
+        return loadDenseVectorsForLeannImpl(ctx, alloc, vector_ids, metadata, out, found, reembed_ns, session);
+    }
+
+    fn loadDenseVectorsForLeannImpl(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64, session: ?*LeannRecoverySession) anyerror!void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
         const store = manager.primary_store orelse return;
@@ -33551,6 +33579,7 @@ pub const IndexManager = struct {
                     const raw_artifact = raw_by_slot[i] orelse continue;
                     break :blk enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw_artifact) catch |err| switch (err) {
                         error.VectorElided => {
+                            try manager.validateLeannArtifactPrecision(loader.index_name, raw_artifact);
                             // A hot candidate re-embedded by an earlier query
                             // for this exact stub is served from the cache.
                             // Media vectors kept as int8 copies read back
@@ -33605,7 +33634,7 @@ pub const IndexManager = struct {
         {
             const started = platform_time.monotonicNs();
             defer reembed_ns.* +|= platform_time.monotonicNs() -| started;
-            try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, source_hashes.items, elided_digests.items, vectors, ok);
+            try manager.reembedDenseDocumentsSession(alloc, entry, elided_keys.items, source_hashes.items, elided_digests.items, vectors, ok, session);
         }
         for (elided_slots.items, 0..) |slot, j| {
             if (!ok[j]) continue;
@@ -33654,6 +33683,10 @@ pub const IndexManager = struct {
     /// Embeds documents' source text the way the index's dense producer
     /// does, for a transient LEANN index whose stored vectors were elided.
     fn reembedDenseDocuments(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, source_hashes: []const ?u64, digests: []const ?u64, out: []f32, found: []bool) !void {
+        return self.reembedDenseDocumentsSession(alloc, entry, doc_keys, source_hashes, digests, out, found, null);
+    }
+
+    fn reembedDenseDocumentsSession(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, source_hashes: []const ?u64, digests: []const ?u64, out: []f32, found: []bool, session: ?*LeannRecoverySession) !void {
         const reembedder = self.dense_reembedder orelse return error.ReembedUnavailable;
         const generator = (try parseDenseGeneratorConfig(alloc, entry.config.config_json)) orelse return error.InvalidIndexConfig;
         defer generator.deinit(alloc);
@@ -33684,7 +33717,9 @@ pub const IndexManager = struct {
             .producer_json = embedding_cfg.producer_json,
             .execution_json = chunk_cfg.embedding_execution_json,
         };
-        try reembedder.embed_fn(reembedder.ctx, alloc, requests, entry.dims, out, found);
+        if (session != null and reembedder.embed_session_fn != null) {
+            try reembedder.embed_session_fn.?(reembedder.ctx, alloc, requests, entry.dims, out, found, session.?);
+        } else try reembedder.embed_fn(reembedder.ctx, alloc, requests, entry.dims, out, found);
     }
 
     /// Restore and rebuild scans: re-embeds the document behind an elided
@@ -33692,6 +33727,10 @@ pub const IndexManager = struct {
     /// Returns `error.NotFound` when no such index or source text exists.
     pub fn reembedElidedDocument(self: *IndexManager, alloc: Allocator, embedding_name: []const u8, doc_key: []const u8, dims: u32) ![]f32 {
         if (self.primary_store) |store| if (try leannInt8StubVectorAlloc(alloc, store, doc_key, embedding_name)) |copy| {
+            if (self.embeddingHasFullMediaConsumer("", embedding_name)) {
+                alloc.free(copy);
+                return error.ArtifactRepairRequired;
+            }
             if (copy.len == dims) return copy;
             alloc.free(copy);
         };
@@ -33706,6 +33745,10 @@ pub const IndexManager = struct {
 
     fn reembedOneDenseDocument(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_key: []const u8) ![]f32 {
         if (self.primary_store) |store| if (entry.embedding_name) |name| if (try leannInt8StubVectorAlloc(alloc, store, doc_key, name)) |copy| {
+            if (!entry.leann_media_int8) {
+                alloc.free(copy);
+                return error.ArtifactRepairRequired;
+            }
             if (copy.len == entry.dims) return copy;
             alloc.free(copy);
         };
@@ -53034,6 +53077,22 @@ fn testLeannMediaRetention(full_consumer: bool) !void {
         const doc = try manager.lookupDenseDocKey(&store, "leann_idx", results.items.items[0].vector_id);
         defer if (doc) |d| alloc.free(d);
         try std.testing.expectEqualStrings(keys[id], doc.?);
+    }
+    if (!full_consumer) {
+        const full_json = try std.mem.replaceOwned(u8, alloc, config_json, "\"media_vectors\":\"int8\"", "\"media_vectors\":\"full\"");
+        defer alloc.free(full_json);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "late_full_media", .kind = .dense_vector, .config_json = full_json }});
+        const late = [_]mapper.DenseEmbeddingWrite{.{ .index_name = @constCast("late_full_media"), .doc_key = keys[11], .vector = &.{}, .artifact_key = artifact_keys[11] }};
+        try std.testing.expectError(error.ArtifactRepairRequired, manager.applyDenseEmbeddingWritesByName(&store, "late_full_media", &late));
+        try std.testing.expectError(error.ArtifactRepairRequired, manager.reembedElidedDocument(alloc, "leann_idx", keys[11], dims));
+        const persistent_json = try std.mem.replaceOwned(u8, alloc, full_json, "\"vector_storage\":\"auto\"", "\"vector_storage\":\"persistent\"");
+        defer alloc.free(persistent_json);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "late_persistent", .kind = .dense_vector, .config_json = persistent_json }});
+        const persistent = [_]mapper.DenseEmbeddingWrite{.{ .index_name = @constCast("late_persistent"), .doc_key = keys[11], .vector = &.{}, .artifact_key = artifact_keys[11] }};
+        try std.testing.expectError(error.ArtifactRepairRequired, manager.applyDenseEmbeddingWritesByName(&store, "late_persistent", &persistent));
+        const raw = try store.get(alloc, artifact_keys[11]);
+        defer alloc.free(raw);
+        try std.testing.expect((try enrichment_artifact_codec.decodeHeader(raw)).flags.int8_payload);
     }
     try std.testing.expectEqual(@as(usize, 0), embedder.media_requests);
 }

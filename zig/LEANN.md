@@ -705,3 +705,17 @@ replica graph equality across splits, plus native restore support for the
 replicated Raft-position domain. Targeted storage, leader-runtime, and
 protocol regressions run through `leann-regression-test` and
 `leann-replication-runtime-test`.
+
+### Recovery sessions and precision transitions
+
+Each search owns its recovery session. Cancellation reaches provider discovery
+and inference, and chunk source sets survive scoring batches. Retained source
+sets have a 32 MiB soft limit; a single larger parent remains reusable until a
+different parent is needed, bounding retained data to the limit plus one parent.
+External helpers, including `transcribeAudio`, never qualify for text elision.
+
+Int8 media quantization is irreversible. A full-vector consumer added after
+quantization reports `ArtifactRepairRequired` rather than treating a dequantized
+copy as the original vector. Reprocess the embedding producer from its source
+to recreate full artifacts before completing that consumer's backfill. Adding
+a full-vector consumer before elision continues to prevent quantization.

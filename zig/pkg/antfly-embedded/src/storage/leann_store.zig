@@ -83,9 +83,12 @@ pub const ElideEntry = replicated_mod.ElideEntry;
 pub const vectorDigest = replica_mod.vectorDigest;
 pub const GenerationFetcher = replica_mod.GenerationFetcher;
 
-/// Loads the exact stored vector for a vector id. Same shape as the HBC
-/// external vector loader, which the adapter passes through.
+pub const RecoverySession = @import("leann_recovery.zig").Session;
+
+/// Exact-vector loading, with an optional per-search recovery context.
 pub const VectorLoader = struct {
+    /// Preferred during searches; session state is released when the query ends.
+    load_batch_session: ?*const fn (*anyopaque, Allocator, []const u64, []const []const u8, []f32, []bool, *u64, *RecoverySession) anyerror!void = null,
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32,
     /// Optional batch form: fills `out[i * dims ..]` and `found[i]` for each
@@ -339,7 +342,7 @@ pub const LeannStore = struct {
 
     pub fn setLoader(self: *LeannStore, loader: VectorLoader) void {
         self.loader = loader;
-        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch, .load_batch_timed = loader.load_batch_timed, .validate_digest = loader.validate_digest };
+        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch, .load_batch_timed = loader.load_batch_timed, .load_batch_session = loader.load_batch_session, .validate_digest = loader.validate_digest };
     }
 
     pub fn isReplicated(self: *const LeannStore) bool {
@@ -692,7 +695,9 @@ pub const LeannStore = struct {
         // pool until enough results pass the bounds or coverage is exhausted.
         var want: usize = if (search_types.requiresExhaustiveCoverage(req)) req.k else if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
         var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
-        var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
+        var recovery = RecoverySession{ .cancellation = req.cancellation };
+        defer recovery.deinit();
+        var ctx = SourceCtx{ .recovery = &recovery, .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
         var candidate_ids = std.ArrayListUnmanaged(u32).empty;
         defer candidate_ids.deinit(alloc);
@@ -789,6 +794,7 @@ pub const LeannStore = struct {
         far_from: []const f32,
         reembed_ns: ?*u64 = null,
         strict: bool = false,
+        recovery: ?*RecoverySession = null,
 
         fn source(self: *SourceCtx) leann.EmbeddingSource {
             return .{ .ctx = self, .recompute_fn = recompute };
@@ -799,7 +805,7 @@ pub const LeannStore = struct {
             const store = self.store;
             const d: usize = store.opts.dims;
             const loader = store.loader orelse return error.MissingVectorLoader;
-            if (loader.load_batch != null or loader.load_batch_timed != null) {
+            if (loader.load_batch != null or loader.load_batch_timed != null or loader.load_batch_session != null) {
                 const vector_ids = try store.alloc.alloc(u64, ids.len);
                 defer store.alloc.free(vector_ids);
                 const metas = try store.alloc.alloc([]const u8, ids.len);
@@ -813,7 +819,11 @@ pub const LeannStore = struct {
                 }
                 @memset(found, false);
                 var ignored_ns: u64 = 0;
-                if (loader.load_batch_timed) |timed| {
+                if (loader.load_batch_session) |load_session| {
+                    var fallback: RecoverySession = .{};
+                    defer fallback.deinit();
+                    try load_session(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns, self.recovery orelse &fallback);
+                } else if (loader.load_batch_timed) |timed| {
                     try timed(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns);
                 } else try loader.load_batch.?(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
                 for (found, 0..) |ok, i| if (!ok) {
@@ -1077,11 +1087,23 @@ pub const ReembedCache = struct {
     /// Copies the cached vector into `out` and returns true on a hit.
     pub fn get(self: *ReembedCache, incarnation: u64, doc_key: []const u8, digest: u64, out: []f32) bool {
         if (self.limit_bytes == 0) return false;
-        var buf: [1024]u8 = undefined;
-        const key = keyInto(&buf, incarnation, doc_key, digest) orelse return false;
+        var prefix: [16]u8 = undefined;
+        std.mem.writeInt(u64, prefix[0..8], incarnation, .little);
+        std.mem.writeInt(u64, prefix[8..16], digest, .little);
         self.lock();
         defer self.mutex.unlock();
-        const entry = self.map.get(key) orelse {
+        const Lookup = struct {
+            pub fn hash(_: @This(), key: anytype) u64 {
+                var h = std.hash.Wyhash.init(0);
+                h.update(key.prefix);
+                h.update(key.doc);
+                return h.final();
+            }
+            pub fn eql(_: @This(), key: anytype, stored: []const u8) bool {
+                return stored.len == key.prefix.len + key.doc.len and std.mem.eql(u8, stored[0..16], key.prefix) and std.mem.eql(u8, stored[16..], key.doc);
+            }
+        };
+        const entry = self.map.getAdapted(.{ .prefix = @as([]const u8, &prefix), .doc = doc_key }, Lookup{}) orelse {
             self.misses += 1;
             return false;
         };
@@ -1093,16 +1115,18 @@ pub const ReembedCache = struct {
     }
 
     pub fn put(self: *ReembedCache, alloc: Allocator, incarnation: u64, doc_key: []const u8, digest: u64, vector: []const f32) !void {
-        var buf: [1024]u8 = undefined;
-        const key = keyInto(&buf, incarnation, doc_key, digest) orelse return;
-        const size = key.len + vector.len * @sizeOf(f32);
+        const size = doc_key.len + 16 + vector.len * @sizeOf(f32);
         if (size > self.limit_bytes) return;
+        const owned_key = try alloc.alloc(u8, doc_key.len + 16);
+        errdefer alloc.free(owned_key);
+        _ = keyInto(owned_key, incarnation, doc_key, digest);
         self.lock();
         defer self.mutex.unlock();
-        if (self.map.contains(key)) return;
+        if (self.map.contains(owned_key)) {
+            alloc.free(owned_key);
+            return;
+        }
         while (self.bytes + size > self.limit_bytes) self.evictOldest(alloc);
-        const owned_key = try alloc.dupe(u8, key);
-        errdefer alloc.free(owned_key);
         const owned_vector = try alloc.dupe(f32, vector);
         errdefer alloc.free(owned_vector);
         const entry = try alloc.create(Entry);
@@ -1372,9 +1396,23 @@ test "leann search forwards reembedding time from batch loader" {
     const Timed = struct {
         vectors: TestVectors,
         calls: usize = 0,
+        cancel: ?*std.atomic.Value(bool) = null,
+        released: bool = false,
         fn load(ctx: *anyopaque, a: Allocator, id: u64, meta: []const u8) anyerror![]f32 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             return TestVectors.load(&self.vectors, a, id, meta);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released = true;
+        }
+        fn sessionBatch(ctx: *anyopaque, _: Allocator, _: []const u64, _: []const []const u8, _: []f32, _: []bool, _: *u64, session: *RecoverySession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try testing.expect(session.cancellation != null);
+            session.state = ctx;
+            session.release = release;
+            self.cancel.?.store(true, .release);
+            try session.check();
         }
         fn batch(ctx: *anyopaque, _: Allocator, ids: []const u64, _: []const []const u8, out: []f32, found: []bool, elapsed: *u64) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -1398,6 +1436,11 @@ test "leann search forwards reembedding time from batch loader" {
     source.calls = 0;
     try testing.expectError(error.ReembedBudgetExceeded, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
     try testing.expectEqual(@as(usize, 1), source.calls);
+    var signal = std.atomic.Value(bool).init(false);
+    source.cancel = &signal;
+    store.setLoader(.{ .ctx = &source, .load = Timed.load, .load_batch_session = Timed.sessionBatch });
+    try testing.expectError(error.Cancelled, store.search(alloc, .{ .query = data[0..dims], .k = 50, .cancellation = search_types.CancellationToken.fromAtomic(&signal) }));
+    try testing.expect(source.released);
 }
 
 test "leann full effort distance bounds score each surviving vector once" {
@@ -1455,6 +1498,21 @@ test "leann reembed cache: hits by digest, misses on a new digest, evicts least 
     try testing.expect(cache.get(1, "doc:aa", 10, &out));
     try testing.expect(!cache.get(1, "doc:bb", 10, &out));
     try testing.expect(cache.get(1, "doc:cc", 10, &out));
+}
+
+test "leann reembed cache accepts long binary keys without allocating on lookup" {
+    const a = testing.allocator;
+    var cache = ReembedCache{ .limit_bytes = 1 << 20 };
+    defer cache.deinit(a);
+    var key: [4096]u8 = @splat('x');
+    key[13] = 0;
+    const vector = [_]f32{ 1, 2, 3, 4 };
+    var out: [4]f32 = undefined;
+    try cache.put(a, 7, &key, 9, &vector);
+    try testing.expect(cache.get(7, &key, 9, &out));
+    try testing.expectEqualSlices(f32, &vector, &out);
+    key[4000] = 'z';
+    try testing.expect(!cache.get(7, &key, 9, &out));
 }
 
 test "leann store: persists through a storage provider and reopens" {

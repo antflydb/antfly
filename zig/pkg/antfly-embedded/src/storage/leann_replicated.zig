@@ -54,6 +54,7 @@ const Dirty = struct { digest: u64, seq: u64 };
 
 /// Loads a stored vector by local vector id and key (HBC's loader shape).
 pub const VectorLoader = struct {
+    load_batch_session: ?*const fn (*anyopaque, Allocator, []const u64, []const []const u8, []f32, []bool, *u64, *@import("leann_recovery.zig").Session) anyerror!void = null,
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32,
     /// Optional batch form (see `leann_replica.VectorLoader.load_batch`).
@@ -570,9 +571,10 @@ pub const ReplicatedState = struct {
         state: *ReplicatedState,
         loader: VectorLoader,
         reembed_ns: ?*u64 = null,
+        recovery: ?*@import("leann_recovery.zig").Session = null,
 
         fn keyLoader(self: *KeyLoader) replica_mod.VectorLoader {
-            return .{ .ctx = self, .load = load, .validate_digest = if (self.loader.validate_digest != null) validateDigest else null, .load_batch = if (self.loader.load_batch != null or self.loader.load_batch_timed != null) loadBatch else null };
+            return .{ .ctx = self, .load = load, .validate_digest = if (self.loader.validate_digest != null) validateDigest else null, .load_batch = if (self.loader.load_batch != null or self.loader.load_batch_timed != null or self.loader.load_batch_session != null) loadBatch else null };
         }
 
         fn validateDigest(raw: *anyopaque, alloc: Allocator, key: []const u8, digest: u64) anyerror!bool {
@@ -595,7 +597,11 @@ pub const ReplicatedState = struct {
                 m.* = if (bound == null) "" else k;
             }
             var ignored_ns: u64 = 0;
-            if (self.loader.load_batch_timed) |timed| {
+            if (self.loader.load_batch_session) |load_session| {
+                var fallback: @import("leann_recovery.zig").Session = .{};
+                defer fallback.deinit();
+                try load_session(self.loader.ctx, alloc, ids, metas, out, found, self.reembed_ns orelse &ignored_ns, self.recovery orelse &fallback);
+            } else if (self.loader.load_batch_timed) |timed| {
                 try timed(self.loader.ctx, alloc, ids, metas, out, found, self.reembed_ns orelse &ignored_ns);
             } else try self.loader.load_batch.?(self.loader.ctx, alloc, ids, metas, out, found);
         }
@@ -715,7 +721,9 @@ pub const ReplicatedState = struct {
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
         var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
-        var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns };
+        var recovery = @import("leann_recovery.zig").Session{ .cancellation = req.cancellation };
+        defer recovery.deinit();
+        var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns, .recovery = &recovery };
         var want: u32 = @intCast(@max(req.k, 1));
         // Id, key and prefix filters go into the graph walk; only distance
         // bounds are applied afterwards, over an enlarged result set.

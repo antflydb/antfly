@@ -5357,7 +5357,7 @@ pub const DB = struct {
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
         // The async context outlives every index and tracks the attached
         // enrichment runtime, so it is the re-embedder's stable context.
-        self.core.index_manager.dense_reembedder = .{ .ctx = self.async_context, .embed_fn = reembedDenseForIndexManager };
+        self.core.index_manager.dense_reembedder = .{ .ctx = self.async_context, .embed_fn = reembedDenseForIndexManager, .embed_session_fn = reembedDenseForIndexManagerSession };
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
             executor_config,
@@ -27382,6 +27382,12 @@ pub const DB = struct {
         const context: *AsyncContext = @ptrCast(@alignCast(ctx));
         const runtime = context.enrichment_runtime orelse return error.ReembedUnavailable;
         try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, requests, dims, out, found);
+    }
+
+    fn reembedDenseForIndexManagerSession(ctx: *anyopaque, alloc: std.mem.Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../leann_recovery.zig").Session) anyerror!void {
+        const context: *AsyncContext = @ptrCast(@alignCast(ctx));
+        const runtime = context.enrichment_runtime orelse return error.ReembedUnavailable;
+        try enrichment_runtime_mod.reembedDenseDocumentsSession(runtime, alloc, requests, dims, out, found, session);
     }
 
     /// Leader only: plans the next LEANN record of every replicated LEANN

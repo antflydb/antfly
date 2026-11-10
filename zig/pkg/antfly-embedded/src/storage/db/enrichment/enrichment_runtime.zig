@@ -1793,9 +1793,34 @@ pub fn reembedDenseDocuments(
     out: []f32,
     found: []bool,
 ) !void {
+    var session: @import("../../leann_recovery.zig").Session = .{};
+    defer session.deinit();
+    return reembedDenseDocumentsSession(runtime, alloc, requests, dims, out, found, &session);
+}
+
+const ReembedSessionState = struct {
+    alloc: Allocator,
+    chunks: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty,
+    sources: ReembedChunkSourceCache = .{},
+
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.sources.deinit(self.alloc);
+        freeWorkerChunkCache(self.alloc, &self.chunks);
+        self.alloc.destroy(self);
+    }
+};
+
+pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../../leann_recovery.zig").Session) !void {
+    try session.check();
     if (requests.len == 0) return;
     if (out.len != requests.len * @as(usize, dims) or found.len != requests.len) return error.InvalidArgument;
-    const dense_embedder = runtime.config.dense_embedder orelse return error.ReembedUnavailable;
+    var dense_embedder = runtime.config.dense_embedder orelse return error.ReembedUnavailable;
+    if (session.cancellation) |token| dense_embedder.part_request_context = .{
+        .io = concurrencyIo(runtime),
+        .deadline_ns = null,
+        .cancellation = .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn },
+    };
     const index_names = [_][]const u8{requests[0].index_name};
     var texts: std.ArrayList([]const u8) = .empty;
     defer {
@@ -1812,13 +1837,17 @@ pub fn reembedDenseDocuments(
         while (iterator.next()) |key| runtime.alloc.free(key.*);
         generations.deinit(runtime.alloc);
     }
-    var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
-    defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
-    var source_cache = ReembedChunkSourceCache{};
-    defer source_cache.deinit(runtime.alloc);
+    const cache: *ReembedSessionState = if (session.state) |raw| @ptrCast(@alignCast(raw)) else create: {
+        const state = try runtime.alloc.create(ReembedSessionState);
+        state.* = .{ .alloc = runtime.alloc };
+        session.state = state;
+        session.release = ReembedSessionState.release;
+        break :create state;
+    };
     const generation = try dense_embedder.captureTextGeneration(alloc, requestEmbeddingName(requests[0]));
     const pinned_embedder = dense_embedder.withTextGeneration(generation);
     for (requests, 0..) |base_request, i| {
+        try session.check();
         var request = base_request;
         const parent_key = if (internal_keys.isInternalUserKey(request.doc_key))
             (try internal_keys.decodeDocumentComponentAlloc(runtime.alloc, request.doc_key)) orelse return error.ReembedProvenanceUnavailable
@@ -1840,7 +1869,7 @@ pub fn reembedDenseDocuments(
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
         if (request.input_kind != .document) {
-            const text = (try reembedChunkTextAlloc(runtime, request, &chunk_cache, &source_cache)) orelse continue;
+            const text = (try reembedChunkTextAlloc(runtime, request, &cache.chunks, &cache.sources)) orelse continue;
             if (request.expected_source_hash) |expected| {
                 const legacy = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
                 const actual = retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
@@ -1924,6 +1953,8 @@ const ReembedChunkSourceCache = struct {
         by_key: std.StringHashMapUnmanaged(usize) = .empty,
     };
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
+    bytes: usize = 0,
+    builds: usize = 0,
 
     fn deinit(self: *ReembedChunkSourceCache, alloc: Allocator) void {
         var it = self.entries.iterator();
@@ -1939,7 +1970,7 @@ const ReembedChunkSourceCache = struct {
 };
 
 fn requestCanReplayLocally(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, parent: []const u8) !bool {
-    if (std.mem.indexOf(u8, request.source_template, "remote") == null) return true;
+    if (std.mem.indexOf(u8, request.source_template, "remote") == null and std.mem.indexOf(u8, request.source_template, "transcribeAudio") == null) return true;
     const key = try documentSourceStoreKeyAlloc(runtime, parent);
     defer runtime.alloc.free(key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, key)) orelse return false;
@@ -1964,6 +1995,15 @@ fn reembedChunkTextAlloc(
     const cache_key = try workerChunkCacheTupleKeyAlloc(alloc, &.{ requestArtifactName(request), worker_key });
     defer alloc.free(cache_key);
     const entry = source_cache.entries.get(cache_key) orelse create: {
+        // Keep a hot parent even if it alone exceeds the soft limit. On a
+        // different parent, bound retained work to the limit plus one parent.
+        if (source_cache.bytes >= 32 << 20) {
+            const builds = source_cache.builds;
+            source_cache.deinit(alloc);
+            source_cache.* = .{ .builds = builds };
+            freeWorkerChunkCache(alloc, chunk_cache);
+            chunk_cache.* = .empty;
+        }
         if (!try requestCanReplayLocally(runtime, parent_request, parent)) return null;
         const entry = try alloc.create(ReembedChunkSourceCache.Entry);
         errdefer alloc.destroy(entry);
@@ -1974,6 +2014,8 @@ fn reembedChunkTextAlloc(
         const owned_key = try alloc.dupe(u8, cache_key);
         errdefer alloc.free(owned_key);
         try source_cache.entries.put(alloc, owned_key, entry);
+        source_cache.builds += 1;
+        for (entry.sources.sources) |source| source_cache.bytes +|= source.text.len + source.key.len + @sizeOf(@TypeOf(entry.sources.sources[0]));
         break :create entry;
     };
     const index = entry.by_key.get(request.doc_key) orelse return null;
@@ -6122,6 +6164,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     const alloc = std.testing.allocator;
     const Probe = struct {
         revision: u8 = 1,
+        cancel_on_batch: ?*std.atomic.Value(bool) = null,
         batch_calls: usize = 0,
         texts: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -6144,13 +6187,21 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
             return out;
         }
 
+        fn controlledBatch(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.check();
+            if (self.cancel_on_batch) |signal| signal.store(true, .release);
+            try context.check();
+            return embedDenseBatch(raw, a, name, texts, dims);
+        }
+
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
         }
 
         fn interface(self: *@This()) embedder_mod.DenseEmbedder {
-            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_fn = embedDenseBatch, .capabilities_fn = caps, .deinit_fn = null };
+            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_fn = embedDenseBatch, .dense_embed_batch_with_context_fn = controlledBatch, .capabilities_fn = caps, .deinit_fn = null };
         }
     };
     var probe = Probe{};
@@ -6278,6 +6329,30 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         defer alloc.free(text);
         try std.testing.expect((try reembedChunkTextAlloc(&runtime, requests[1], &worker_cache, &sources)) == null);
         try std.testing.expectEqual(@as(usize, 1), sources.entries.count());
+    }
+
+    // Separate scoring batches retain one parent reconstruction for the query.
+    {
+        var session: @import("../../leann_recovery.zig").Session = .{};
+        defer session.deinit();
+        requests[0].expected_source_hash = null;
+        requests[0].expected_vector_digest = null;
+        for (0..8) |_| {
+            try reembedDenseDocumentsSession(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1], &session);
+            try std.testing.expect(found[0]);
+        }
+        const state: *ReembedSessionState = @ptrCast(@alignCast(session.state.?));
+        try std.testing.expectEqual(@as(usize, 1), state.sources.builds);
+    }
+    // Cancellation reaches an invocation that has already entered the provider.
+    {
+        var signal = std.atomic.Value(bool).init(false);
+        var session = @import("../../leann_recovery.zig").Session{ .cancellation = @import("antfly_vectorindex").search_types.CancellationToken.fromAtomic(&signal) };
+        defer session.deinit();
+        probe.cancel_on_batch = &signal;
+        defer probe.cancel_on_batch = null;
+        try std.testing.expectError(error.Cancelled, reembedDenseDocumentsSession(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1], &session));
+        try std.testing.expect(signal.load(.acquire));
     }
 
     // Stored-chunk inputs are not re-chunked from the document.
