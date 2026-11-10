@@ -323,6 +323,28 @@ test "generic Apple generation always requests verified natural completion" {
     try std.testing.expectEqual(@as(i64, 32), parsed.value.object.get("max_tokens").?.integer);
 }
 
+test "Apple generation validates token budgets before serializing bridge requests" {
+    const a = std.testing.allocator;
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "Hello" } }};
+    var cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
+    for ([_]i64{ 0, -1, apple_max_tokens + 1, @as(i64, 1) << 60, std.math.maxInt(i64) }) |budget| {
+        cfg.max_tokens = budget;
+        try std.testing.expectError(error.InvalidGeneratorConfig, cfg.validate());
+        try std.testing.expectError(error.InvalidGeneratorConfig, appleGenerationRequestAlloc(a, cfg, &messages));
+        const config_json = try std.fmt.allocPrint(a, "{{\"provider\":\"apple\",\"max_tokens\":{d}}}", .{budget});
+        defer a.free(config_json);
+        try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(a, config_json));
+    }
+    for ([_]i64{ 1, apple_max_tokens }) |budget| {
+        cfg.max_tokens = budget;
+        const request = try appleGenerationRequestAlloc(a, cfg, &messages);
+        defer a.free(request);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(budget, parsed.value.object.get("max_tokens").?.integer);
+    }
+}
+
 test "Apple generation configuration is local and rejects unsupported options" {
     const alloc = std.testing.allocator;
     var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"apple\"}");
@@ -425,6 +447,8 @@ pub const Provider = enum {
 /// This is intentionally not provider parity: OpenAI leaves the response cap
 /// optional, and Ollama's native num_predict default is unbounded.
 pub const default_max_tokens: i64 = 256;
+// Match the public GenerateRequest integer range at the native provider boundary.
+pub const apple_max_tokens: i64 = std.math.maxInt(i32);
 
 pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
 
@@ -615,6 +639,7 @@ pub const GeneratorConfig = struct {
             if (self.region) |value| if (value.len == 0) return error.InvalidGeneratorConfig;
         } else if (self.region != null) return error.InvalidGeneratorConfig;
         if (self.provider == .apple) {
+            if (self.max_tokens <= 0 or self.max_tokens > apple_max_tokens) return error.InvalidGeneratorConfig;
             if (self.model.len > 0 or self.url.len > 0 or self.api_key != null or
                 self.capability_token != null or self.capability_revision != null or self.project_id != null or
                 self.location != null or self.credentials_path != null or self.tools_json != null or self.tool_choice_json != null or
