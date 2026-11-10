@@ -29,6 +29,63 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNativeSourceKnowledgePrefixResolution(t *testing.T) {
+	endpoint := os.Getenv("ANTFLY_SOURCES_E2E_URL")
+	if endpoint == "" {
+		t.Skip("set ANTFLY_SOURCES_E2E_URL to a disposable native owner")
+	}
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	require.True(t, u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("source_prefix_%d", time.Now().UnixNano())
+	entities := table + "_entities"
+	require.NoError(t, p.EnsureTable(ctx, table))
+	require.NoError(t, p.EnsureTable(ctx, entities))
+	key := "source/" + testSourceID + "/facts/person/curated_alice"
+	_, err = p.call(ctx, "POST", tablePath(entities)+"/batch", map[string]any{
+		"inserts":    map[string]any{key: map[string]any{"canonical_name": "Alice", "label": "person"}},
+		"sync_level": "full_index",
+	})
+	require.NoError(t, err)
+	plan, knowledge, _, err := BuildKnowledgeProcessing(KnowledgePreset{
+		Name: "facts", SourceID: testSourceID, Audience: "research", Field: "facts", EntityTable: entities,
+		Resolver: map[string]any{
+			"candidate_search": "prefix",
+			"scorer": map[string]any{
+				"comparisons": []any{map[string]any{"name": "name", "left": "canonical_text", "right": "canonical_name", "levels": []any{
+					map[string]any{"when": "jaro_winkler > 0.9", "weight": 8.0}, map[string]any{"else": true, "weight": -6.0},
+				}}},
+				"decision": map[string]any{"match": 0.9},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, ReconcileSourceSearch(ctx, p, Source{Table: table, Processing: &plan, Knowledge: &knowledge}, "research"))
+	resources, err := EntityResources(Binding{Table: table, Knowledge: &knowledge}, "facts")
+	require.NoError(t, err)
+	raw, err := p.call(ctx, "POST", resources["resolve"], map[string]any{"extraction": map[string]any{
+		"entities": []any{map[string]any{"id": "e0", "text": "Alice", "label": "person"}},
+	}})
+	require.NoError(t, err)
+	var result struct {
+		Resolution struct {
+			Entities []struct {
+				Decision string `json:"decision"`
+				DocRef   struct {
+					Key string `json:"key"`
+				} `json:"doc_ref"`
+			} `json:"entities"`
+		} `json:"resolution"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &result))
+	require.Len(t, result.Resolution.Entities, 1)
+	require.Equal(t, "match", result.Resolution.Entities[0].Decision, string(raw))
+	require.Equal(t, key, result.Resolution.Entities[0].DocRef.Key)
+}
+
 // Runs native asset publication, resolution, graph projection, temporal filters
 // and owner retraction. Synthetic facts qualify integration, not extraction quality.
 func TestNativeSourceKnowledge(t *testing.T) {

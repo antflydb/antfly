@@ -443,24 +443,32 @@ fn prefixUpperBoundAlloc(allocator: std.mem.Allocator, prefix: []const u8) !?[]u
     return out;
 }
 
-/// A scan ndjson row is the entity document object with an extra `"key"` field
-/// (see `table_reads.appendScanLine`). Pull the key out and hand the row to the
-/// worker as the candidate value; the spurious `"key"` field is harmless because
-/// the matcher only reads the fields its comparisons name.
+/// Scan encoders identify documents with `_id`. Relational scans wrap the
+/// document in `row`; legacy scans project its fields into the envelope.
+/// Pass only the relational document to the matcher, never its metadata.
 fn consumeScanLine(
     allocator: std.mem.Allocator,
     line: []const u8,
     ctx: *anyopaque,
     consume: CandidateSource.Consume,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
-    defer parsed.deinit();
-    if (parsed.value != .object) return;
-    const key = switch (parsed.value.object.get("key") orelse return) {
-        .string => |s| s,
-        else => return,
+    const Wire = struct {
+        _id: []const u8,
+        // Legacy document fields can also be named schema_version or row.
+        // Require the relational version envelope before unwrapping either.
+        version: ?@import("antfly-json").BorrowedValue = null,
+        schema_version: ?@import("antfly-json").BorrowedValue = null,
+        row: ?@import("antfly-json").BorrowedValue = null,
     };
-    try consume(ctx, key, line);
+    const parsed = std.json.parseFromSlice(Wire, allocator, line, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCandidateResponse;
+    defer parsed.deinit();
+    if (parsed.value.schema_version != null and parsed.value.version != null) {
+        const row = parsed.value.row orelse return error.InvalidCandidateResponse;
+        if (row.json.len == 0 or row.json[0] != '{') return error.InvalidCandidateResponse;
+        try consume(ctx, parsed.value._id, row.json);
+    } else {
+        try consume(ctx, parsed.value._id, line);
+    }
 }
 
 /// The public query envelope is `{"responses":[{"hits":{"hits":[{"_id","_source"}]}}]}`
@@ -547,11 +555,11 @@ const FakeTableReadSource = struct {
             const key = e.key_ptr.*;
             if (std.mem.order(u8, key, from_key) == .lt) continue;
             if (std.mem.order(u8, key, to_key) != .lt) continue;
-            // Emit {"key":"<key>", <doc fields>} like the real scan encoder.
+            // Emit the legacy public scan envelope, including its `_id`.
             const doc = e.value_ptr.*;
             const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
             defer alloc.free(escaped_key);
-            try out.appendSlice(alloc, "{\"key\":");
+            try out.appendSlice(alloc, "{\"_id\":");
             try out.appendSlice(alloc, escaped_key);
             if (doc.len > 2) {
                 try out.append(alloc, ',');
@@ -679,6 +687,26 @@ test "DistributedCandidateSource scan_prefix returns only keys under the prefix"
     for (ctx.keys.items) |k| try testing.expect(std.mem.startsWith(u8, k, "person/"));
     // The value carries the document fields the matcher reads.
     for (ctx.values.items) |v| try testing.expect(std.mem.indexOf(u8, v, "canonical_name") != null);
+}
+
+test "DistributedCandidateSource consumes real legacy and relational scan encodings" {
+    const alloc = testing.allocator;
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const document = "{\"canonical_name\":\"Alice\",\"label\":\"person\",\"key\":\"user-field\",\"row\":{\"nested\":true},\"schema_version\":\"user-field\",\"generation\":18446744073709551615}";
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    var collected = CollectCtx{ .alloc = alloc };
+    defer collected.deinit();
+    try contract.appendScanLine(alloc, &out, "person/alice", document, null);
+    try consumeScanLine(alloc, std.mem.trimEnd(u8, out.items, "\n"), &collected, CollectCtx.consume);
+    out.clearRetainingCapacity();
+    try contract.appendRelationalScanLine(alloc, &out, .{ .id = "person/alice", .hash = 42, .document_json = document }, 1);
+    try consumeScanLine(alloc, std.mem.trimEnd(u8, out.items, "\n"), &collected, CollectCtx.consume);
+    try testing.expectEqual(@as(usize, 2), collected.keys.items.len);
+    for (collected.keys.items) |key| try testing.expectEqualStrings("person/alice", key);
+    for (collected.values.items) |value| try @import("antfly-json").testing.expectSubsetJsonText(alloc, document, value);
+    try testing.expectEqualStrings(document, collected.values.items[1]);
+    try testing.expectError(error.InvalidCandidateResponse, consumeScanLine(alloc, "{\"_id\":\"bad\",\"version\":\"1\",\"schema_version\":1,\"row\":null}", &collected, CollectCtx.consume));
 }
 
 test "DistributedCandidateSource nearest parses query hits into candidates" {

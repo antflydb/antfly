@@ -155,7 +155,7 @@ def main():
                         "-count=1",
                         "-v",
                         "-run",
-                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission|SourceKnowledge|SourceKnowledgeRecipeMigration)$",
+                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission|SourceKnowledge|SourceKnowledgePrefixResolution|SourceKnowledgeRecipeMigration)$",
                         "-timeout",
                         "4m",
                     ],

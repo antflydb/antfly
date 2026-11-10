@@ -94,6 +94,7 @@ func loadProfile(path string) (sources.Profile, error) {
 		return configuration, fmt.Errorf("source profile exceeds 1 MiB")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&configuration); err != nil {
 		return configuration, fmt.Errorf("invalid source profile: %w", err)
