@@ -543,3 +543,136 @@ test "retained dataset identities always use byte arrays on the JSON wire" {
         try std.testing.expectEqual(id, restored.value.location);
     }
 }
+
+test "retained dataset large buckets split into disjoint key spans and compact without losing siblings" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    const def = definition(.summary);
+    try store.create(def);
+    const split = t.rowKey(0, @splat(128));
+    var left = segment();
+    left.key_span = .{ .start = t.rowKey(0, @splat(0)), .end = split };
+    var right = segment();
+    right.id = @splat(8);
+    right.key_span = .{ .start = split, .end = t.rowKey(60, @splat(0)) };
+    try store.publish(right, hot, "states");
+    try std.testing.expectError(error.DatasetCoverageUnavailable, store.planRange(1, left.source.partition, 1, left.coverage, 10));
+    try store.publish(left, hot, "states");
+    var plan = try store.planRange(1, left.source.partition, 1, left.coverage, 10);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.segments.len);
+    try std.testing.expectEqual(left.id, plan.segments[0].id);
+    try std.testing.expectEqual(right.id, plan.segments[1].id);
+    var overlap = segment();
+    overlap.id = @splat(12);
+    try std.testing.expectError(error.DatasetCoverageOverlap, store.publish(overlap, hot, "states"));
+    const required = t.RequiredSummary{ .dataset = def.id, .definition_generation = 1, .source = left.source, .coverage = left.coverage };
+    try std.testing.expectError(error.DatasetDependencyPending, t.requireSourceReclamation(required, def, left));
+    var sliced = required;
+    sliced.key_span = left.key_span;
+    try t.requireSourceReclamation(sliced, def, left);
+    clock.now = def.retention_ns + 1000;
+    clock.authority = clock.now;
+    try store.retire(left.id, 1);
+    try store.collect(left.id, hot);
+    try store.compact(left.id);
+    try std.testing.expectError(error.DatasetSegmentRetired, store.publish(left, hot, "states"));
+    const sibling = try store.getSegment(right.id);
+    defer sibling.deinit();
+    try std.testing.expectEqual(right.id, sibling.value.id);
+    try store.retire(right.id, 1);
+    try store.collect(right.id, hot);
+    try store.compact(right.id);
+}
+
+test "retained dataset covering plans permit narrow ranges but reject interior holes" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    try store.create(definition(.summary));
+    var value = segment();
+    value.coverage.end_ns = "180";
+    try store.publish(value, hot, "states");
+    const narrow = t.Range{ .start_ns = "60", .end_ns = "120" };
+    try std.testing.expectError(error.DatasetCoverageUnavailable, store.planRange(1, value.source.partition, 1, narrow, 10));
+    var plan = try store.planCoveringRange(1, value.source.partition, 1, narrow, 10);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.segments.len);
+    try std.testing.expectError(error.DatasetCoverageUnavailable, store.planCoveringRange(1, value.source.partition, 1, .{ .start_ns = "60", .end_ns = "240" }, 10));
+}
+
+test "retained dataset archived summary serving checks exact state and filters covering files" {
+    const shared = @import("antfly_local_sources");
+    const series = shared.storage_retained_series;
+    const codec = shared.storage_retained_series_archive;
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const spec = series.Spec{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    var metrics = [_]series.Metric{.{ .count = 9_007_199_254_740_993 }};
+    const rows = [_]series.Bucket{
+        .{ .start_ns = 0, .dimensions = "[]", .rows = metrics[0].count, .metrics = &metrics },
+        .{ .start_ns = 60, .dimensions = "[]", .rows = metrics[0].count, .metrics = &metrics },
+        .{ .start_ns = 120, .dimensions = "[]", .rows = metrics[0].count, .metrics = &metrics },
+    };
+    var value = segment();
+    value.coverage.end_ns = "180";
+    const receipt = codec.Receipt{ .source_sequence = value.source.sequence, .admitted_ns = 1000, .complete_from_ns = 0, .span = try value.span() };
+    const bytes = try codec.encode(a, spec, receipt, &rows);
+    defer a.free(bytes);
+    value.byte_len = bytes.len;
+    value.checksum = digest(bytes);
+    try store.publish(value, hot, bytes);
+    try store.migrate(value.id, 1, hot, cold);
+    const Resolver = struct {
+        hot: api.Location,
+        cold: api.Location,
+        pub fn location(self: @This(), id: t.Id) !api.Location {
+            if (std.mem.eql(u8, &id, &self.hot.id)) return self.hot;
+            if (std.mem.eql(u8, &id, &self.cold.id)) return self.cold;
+            return error.InvalidDatasetLocation;
+        }
+    };
+    const resolver = Resolver{ .hot = hot, .cold = cold };
+    const range = t.Range{ .start_ns = "60", .end_ns = "120" };
+    var result = try api.summary_read.read(a, store, def, spec, range, .{}, resolver);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(i128, 60), result.rows[0].start_ns);
+    try std.testing.expectEqual(metrics[0].count, (try result.rows[0].metrics[0].finalize(.count)).integer);
+    try std.testing.expectError(error.DatasetPageBudgetExceeded, api.summary_read.read(a, store, def, spec, range, .{ .bytes = 1 }, resolver));
+    var changed = spec;
+    changed.source_incarnation += 1;
+    try std.testing.expectError(error.DatasetCoverageUnavailable, api.summary_read.read(a, store, def, changed, range, .{}, resolver));
+    var restore = cold;
+    restore.id = @splat(20);
+    restore.access = .restore_required;
+    // A separately bound location is required when access semantics change.
+    restore.storage_identity = @splat(21);
+    var unavailable = value;
+    unavailable.id = @splat(22);
+    unavailable.coverage = .{ .start_ns = "180", .end_ns = "240" };
+    unavailable.location = restore.id;
+    unavailable.access = .restore_required;
+    var empty_receipt = receipt;
+    empty_receipt.span = try unavailable.span();
+    const empty_bytes = try codec.encode(a, spec, empty_receipt, &.{});
+    defer a.free(empty_bytes);
+    unavailable.byte_len = empty_bytes.len;
+    unavailable.checksum = digest(empty_bytes);
+    try store.publish(unavailable, restore, empty_bytes);
+    try std.testing.expectError(error.DatasetRestoreRequired, api.summary_read.read(a, store, def, spec, unavailable.coverage, .{}, resolver));
+}

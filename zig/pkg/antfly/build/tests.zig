@@ -3147,12 +3147,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // The page engine is shared with Lite/object-store users. Dependency
     // module tests need their own compilation root after the extraction.
     const retained_dataset_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/retained_dataset_test_root.zig"), .target = target, .optimize = optimize });
+    const retained_contract_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_dataset_contract_sources.zig"), .target = target, .optimize = optimize });
+    retained_dataset_mod.addImport("antfly_local_sources", retained_contract_mod);
     retained_dataset_mod.addImport("objectstore", antfly_imports.objectstore);
     retained_dataset_mod.addImport("antfly_platform", platform_mod);
     const retained_dataset_tests = b.addTest(.{ .root_module = retained_dataset_mod, .filters = selectTestFilters(b, &.{"retained dataset"}), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const retained_dataset_step = b.step("retained-dataset-test", "Run durable dataset placement, replay coverage and reader-safe retention contracts");
     retained_dataset_step.dependOn(&b.addRunArtifact(retained_dataset_tests).step);
     serverless_test_step.dependOn(retained_dataset_step);
+
+    const retained_series_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_series_test_root.zig"), .target = target, .optimize = optimize });
+    const retained_series_tests = b.addTest(.{ .root_module = retained_series_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_series_step = b.step("retained-series-test", "Run transactional retained aggregate, TTL fence and bounded feed contracts");
+    retained_series_step.dependOn(&b.addRunArtifact(retained_series_tests).step);
+    serverless_test_step.dependOn(retained_series_step);
 
     const ordered_tree_mod = b.createModule(.{ .root_source_file = b.path("lib/objectstore/src/ordered_tree.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, ordered_tree_mod, true, true);
@@ -6890,7 +6898,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
+    const retained_series_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"retained series"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-series-native-test", "Verify native source commit, schema decoding and TTL history maintenance").dependOn(&addFilteredTestRunArtifact(b, retained_series_native_tests).step);
     const grouped_source_production_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{ "grouped sources production", "group worker resumes durable activation", "ordered artifact inventory completion checkpoint resumes", "ordered artifact inventory completion control preserves bounded binary claims" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_series_protocol_tests = b.addTest(.{ .root_module = data_implementation_module, .filters = &.{"retained series"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-series-protocol-test", "Verify retained summary capability negotiation and native delegate enforcement").dependOn(&addFilteredTestRunArtifact(b, retained_series_protocol_tests).step);
     const grouped_source_protocol_tests = b.addTest(.{ .root_module = data_implementation_module, .filters = &.{"grouped source protocol dominates"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const grouped_source_step = b.step("antfly-group-sources-test", "Verify grouped source publication, graph proofs, protocol negotiation and durable owner lifecycle");
     grouped_source_step.dependOn(&addFilteredTestRunArtifact(b, grouped_source_production_tests).step);

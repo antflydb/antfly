@@ -274,6 +274,8 @@ pub const BatchRequest = struct {
     schema_version: ?u32 = null,
     /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
     online_source: ?@import("online_source_contract.zig").Command = null,
+    /// Private canonical-time retained summary lifecycle; never public batch JSON.
+    retained_series: ?@import("../retained_series_control.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
     /// Private grouped-source control; public batch JSON cannot populate it.

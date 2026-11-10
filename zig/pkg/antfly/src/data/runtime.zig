@@ -1255,6 +1255,26 @@ const RaftTableApplyStateMachine = struct {
 
     const ExpectedApplyFailure = enum {
         RetainedEffectsFull,
+        InvalidRetainedSeries,
+        InvalidRetainedSeriesRow,
+        RetainedSeriesAlreadyExists,
+        RetainedSeriesBackfillFence,
+        RetainedSeriesBatchTooLarge,
+        RetainedSeriesCorrectionWindow,
+        RetainedSeriesCoverageMissing,
+        RetainedSeriesDefinitionMismatch,
+        RetainedSeriesDuplicateRow,
+        RetainedSeriesHistoryExpired,
+        RetainedSeriesNotReady,
+        RetainedSeriesNumericOverflow,
+        RetainedSeriesResetRequired,
+        RetainedSeriesResolutionMismatch,
+        RetainedSeriesSequenceMismatch,
+        RetainedSeriesTimeOverflow,
+        RetainedSeriesTransactionsUnsupported,
+        RetainedSeriesTopologyUnsupported,
+        RetainedSeriesCoordinatedTtlUnsupported,
+
         RetainedEffectsConsumerLimit,
         RetainedEffectsNamespaceMismatch,
         RetainedEffectsFenceMismatch,
@@ -1337,6 +1357,9 @@ const RaftTableApplyStateMachine = struct {
         SqlArraySubscriptError,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+                if (err == @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field)) return @field(ExpectedApplyFailure, field);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (err == @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field)) return @field(ExpectedApplyFailure, field);
             }
@@ -1392,6 +1415,9 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field);
             }
@@ -2373,7 +2399,7 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
 }
 
 fn batchRequiresTopologyArbitration(req: antfly.db.types.BatchRequest) bool {
-    return req.online_source != null or req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
+    return req.retained_series != null or req.online_source != null or req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
         req.split_checkpoint != null or req.merge_source_transition != null or req.merge_checkpoint != null or
         req.merge_replication != null or req.merge_page != null;
 }
@@ -12660,7 +12686,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
+        if (proposal_req.retained_series != null or proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12693,6 +12719,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.retained_series != null) return @import("../common/data_raft_protocol.zig").batch_retained_series_protocol_version;
         const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
         // Keep proposal admission and the encoded envelope in lockstep as
         // the private document-version effect language evolves.
@@ -57649,4 +57676,13 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
+}
+
+test "retained series lifecycle protocol dominates document revision negotiation" {
+    const p = @import("../common/data_raft_protocol.zig");
+    var req: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1, .retained_series = .{ .action = .tick, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } };
+    try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.document_version_scheme = .revision_v1;
+    try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    try std.testing.expect(p.batch_protocol_version >= p.batch_retained_series_protocol_version);
 }

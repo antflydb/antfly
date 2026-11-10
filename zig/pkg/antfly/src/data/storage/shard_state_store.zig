@@ -92,6 +92,8 @@ pub const DataOperation = union(enum) {
     set_raft_batch_protocol: u16,
     /// Source effects execute only in the native delegate, after this guard.
     require_source_pin_protocol: void,
+    /// Require an already durable minimum before delegating native-only effects.
+    require_raft_batch_protocol: u16,
     topology_guard: @import("online_topology_arbitration.zig").Guard,
     topology_end: void,
     /// Internal apply boundary. Split deltas use the committed Raft index as
@@ -2795,7 +2797,7 @@ pub fn appendOperationEffects(
     defer if (merge_receiver_state) |*state| state.deinit(alloc);
     var needs_raft_batch_protocol = false;
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol, .require_source_pin_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
+        .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
         else => {},
     };
     var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
@@ -2862,6 +2864,7 @@ pub fn appendOperationEffects(
                 }
             },
             .require_source_pin_protocol => if (raft_batch_protocol_version < data_raft_protocol.batch_source_pin_protocol_version) return error.UnsupportedBatchProtocolVersion,
+            .require_raft_batch_protocol => |minimum| if (minimum > data_raft_protocol.batch_protocol_version or raft_batch_protocol_version < minimum) return error.UnsupportedBatchProtocolVersion,
             .merge_page_fence => |encoded| {
                 var parsed = try std.json.parseFromSlice(db_types.BatchRequest, alloc, encoded, .{});
                 defer parsed.deinit();

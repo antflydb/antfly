@@ -2768,6 +2768,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &write_buffers.owned_store_values,
                 );
             }
+            try @import("../retained_series_capture.zig").appendContext(
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                sequence,
+                batch_timestamp_ns,
+                .mutation,
+                &write_buffers.store_writes,
+                &write_buffers.owned_store_values,
+            );
             var durable_replication_batch_payload: ?[]u8 = null;
             var durable_replication_replay_payload: ?[]u8 = null;
             var durable_replication_batch_outbox_key: ?[]const u8 = null;

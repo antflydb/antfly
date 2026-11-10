@@ -104,6 +104,26 @@ test "SQL retained native scan rejects leader loss without stale retry" {
     try std.testing.expectEqual(@as(usize, 1), barrier.calls);
 }
 
+test "retained series compiled stream admission requires read-index and checks cancellation before owner access" {
+    const Barrier = struct {
+        calls: usize = 0,
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.NotLeader;
+        }
+    };
+    var barrier: Barrier = .{};
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.read_safety_barrier = .{ .ptr = &barrier, .vtable = &.{ .wait_read_safe = Barrier.wait } };
+    try std.testing.expectError(error.NotLeader, source.openRetainedRead(std.testing.allocator, 7, "rows", .{ .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 }, .start_ns = 0, .end_ns = 10, .admitted_ns = 1 }, .{}));
+    try std.testing.expectError(error.NotLeader, source.queryRetainedSeriesJson(std.testing.allocator, 7, "rows", .status, .{}));
+    try std.testing.expectEqual(@as(usize, 2), barrier.calls);
+    var canceled = std.atomic.Value(bool).init(true);
+    var stream = ProvisionedKernelOwnerSource.RetainedRead{ .lease = .{ .source = undefined, .entry = undefined, .active = false }, .stream = .{ .handle = null } };
+    try std.testing.expectError(error.Canceled, stream.nextJson(std.testing.allocator, 1, .{ .cancellation = .fromAtomic(&canceled) }));
+}
+
 test "source owner deadlines normalize executor clock epochs without extending budgets" {
     const FakeClock = struct {
         fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
@@ -2121,6 +2141,59 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!parsed.value.cut.namespace.eql(scope.fence.namespace)) return error.SourceSnapshotCutMismatch;
         try context.ensureActive();
         return parsed.value;
+    }
+
+    pub fn queryRetainedSeriesJson(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_retained_series_read_contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, .read_index);
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = context.cancellation;
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        defer lease.deinit();
+        var response = try lease.owner().retainedQueryJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        try context.ensureActive();
+        return alloc.dupe(u8, response.bytes());
+    }
+
+    pub const RetainedRead = struct {
+        lease: Lease,
+        stream: client.Owner.RetainedRead,
+        pub fn deinit(self: *RetainedRead) void {
+            self.stream.deinit();
+            self.lease.deinit();
+        }
+        pub fn nextJson(self: *RetainedRead, alloc: std.mem.Allocator, limit: u16, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+            errdefer self.deinit();
+            try context.ensureActive();
+            if (self.stream.handle == null) return error.RetainedSeriesSnapshotExpired;
+            if (limit == 0 or limit > 1024) return error.RetainedSeriesBatchTooLarge;
+            var json_buffer: [64]u8 = undefined;
+            const json = try std.fmt.bufPrint(&json_buffer, "{{\"limit\":{d}}}", .{limit});
+            const native_context = try platformDeadlineContext(context);
+            var cancellation = context.cancellation;
+            var response = try self.stream.nextJson(.{ .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+            defer response.deinit();
+            try context.ensureActive();
+            return alloc.dupe(u8, response.bytes());
+        }
+    };
+
+    pub fn openRetainedRead(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, query: @import("antfly_local_sources").storage_retained_series_read_contract.Query, context: @import("antfly_local_sources").api_operation.RequestContext) !RetainedRead {
+        try context.ensureActive();
+        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, .read_index);
+        const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
+        defer alloc.free(json);
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = context.cancellation;
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        errdefer lease.deinit();
+        var stream = try lease.owner().openRetainedRead(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        errdefer stream.deinit();
+        try context.ensureActive();
+        return .{ .lease = lease, .stream = stream };
     }
 
     pub fn onlineSourceArtifact(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_source_artifact_transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {

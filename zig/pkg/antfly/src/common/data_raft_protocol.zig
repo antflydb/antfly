@@ -40,7 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 27;
+pub const batch_protocol_version: u16 = 28;
+/// Version 28 maintains retained summary state and its lifecycle in primary commits.
+pub const batch_retained_series_protocol_version: u16 = 28;
 /// Explicit document revision semantics and source-preserving retained tails.
 /// Missing command tags retain the pre-v27 timestamp semantics on replay.
 pub const batch_document_revisions_protocol_version: u16 = 27;

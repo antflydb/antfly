@@ -1845,12 +1845,18 @@ pub fn loadSchema(store: anytype, alloc: Allocator) !?TableSchema {
 }
 
 pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?TableSchema {
-    const versioned_key = try schemaVersionKeyAlloc(alloc, version);
-    defer alloc.free(versioned_key);
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
+    return loadSchemaVersionTxn(&txn, alloc, version);
+}
+
+/// Decode an immutable layout at the caller's visibility cut. Source-derived
+/// maintenance must not open a second read outside its primary transaction.
+pub fn loadSchemaVersionTxn(txn: anytype, alloc: Allocator, version: u32) !?TableSchema {
+    const versioned_key = try schemaVersionKeyAlloc(alloc, version);
+    defer alloc.free(versioned_key);
     const raw = txn.get(versioned_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,

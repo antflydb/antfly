@@ -2005,6 +2005,23 @@ pub extern fn antfly_storage_owner_backup_pin_control_json(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_retained_query_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_retained_read_open(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_session: *?*anyopaque,
+) callconv(.c) Status;
+pub extern fn antfly_storage_retained_read_next_json(
+    session: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_retained_read_close(session: ?*anyopaque) callconv(.c) void;
+
 pub extern fn antfly_storage_owner_source_artifact_json(
     owner: ?*anyopaque,
     request: *const ControlledJsonOperationRequest,

@@ -8963,6 +8963,16 @@ pub const DB = struct {
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
         if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
+        if (req.retained_series != null) return self.applyRetainedSeriesBatch(req, opts);
+        if (try self.core.store.retainedSeriesActive()) {
+            // These routes need retained correction reservations and complete
+            // summary state handoff before activation can admit them safely.
+            if (req.transaction) |transaction| if (transaction == .prepare) return error.RetainedSeriesTransactionsUnsupported;
+            if (req.online_source != null or req.restore_staging != null or req.relational_topology != null or
+                req.split_checkpoint != null or req.split_transition != null or req.split_replication != null or
+                req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+                req.merge_page != null or req.merge_artifacts.len != 0) return error.RetainedSeriesTopologyUnsupported;
+        }
         if (req.online_source != null) {
             if (comptime builtin.os.tag == .freestanding) {
                 return error.UnsupportedPlatform;
@@ -25484,6 +25494,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTransactionsUnsupported;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
@@ -25801,6 +25812,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTransactionsUnsupported;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
@@ -26790,6 +26802,89 @@ pub const DB = struct {
     /// Internal source-retention controls share the lifecycle transaction path:
     /// source progress, retained log, replication marker and durable outbox are
     /// one commit. The public API has no admission route for these commands.
+    fn applyRetainedSeriesBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        const control = @import("../retained_series_control.zig");
+        try control.validateRequest(req);
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+        }
+        var payload: ?[]u8 = null;
+        defer if (payload) |bytes| self.alloc.free(bytes);
+        {
+            var admission = self.core.snapshot_admission.acquireMutation();
+            defer admission.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (opts.ordered_apply_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+                .already_applied => return,
+                .apply => {},
+            };
+            const command = req.retained_series.?;
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            var partition: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+            if (!std.mem.eql(u8, &partition, &command.fence.partition)) return error.IdentityNamespaceMismatch;
+            if (command.action == .install) {
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                if (try manager.hasTopologySensitiveTransactions()) return error.RetainedSeriesTransactionsUnsupported;
+                var schema_view = self.core.schema_registry.acquire();
+                defer if (schema_view) |*view| view.release();
+                if (schema_view) |view| if (view.hasCoordinatedConstraints()) return error.RetainedSeriesCoordinatedTtlUnsupported;
+                if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
+            }
+            var txn = try self.core.store.beginWriteTxn();
+            var retained_txn_open = true;
+            defer if (retained_txn_open) txn.abort();
+            try @import("restore_staging.zig").requireScope(self.alloc, &txn, null, false);
+            if (command.action == .install) {
+                if (self.core.shard_manager.getSplitState() != null) return error.RetainedSeriesTopologyUnsupported;
+                try self.requireOnlineArtifactCatalogMutableLocked(&txn);
+                try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+                const merge_raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
+                    error.NotFound => txn.get(merge_state_mod.legacy_key) catch |legacy_err| switch (legacy_err) {
+                        error.NotFound => null,
+                        else => return legacy_err,
+                    },
+                    else => return err,
+                };
+                if (merge_raw) |bytes| {
+                    var merge = try merge_state_mod.decodeAlloc(self.alloc, bytes);
+                    defer merge.deinit(self.alloc);
+                    if (merge.phase != .none and merge.phase != .finalized and merge.phase != .rolled_back) return error.RetainedSeriesTopologyUnsupported;
+                }
+            }
+            const sequence = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            try control.stage(arena.allocator(), &txn, command, sequence, @as(i128, req.timestamp_ns));
+            if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
+                payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req);
+            for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
+            if (opts.ordered_apply_receipt) |entry| {
+                var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = orderedApplyReceiptWrite(entry, &bytes);
+                try txn.put(marker.key, marker.value);
+            }
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                var bytes: [replication_applied_lsn_value_len]u8 = undefined;
+                const marker = replicationAppliedSequenceWrite(lsn, &bytes);
+                try txn.put(marker.key, marker.value);
+            }
+            try self.stageRestoreStagingReplicationOutbox(&txn, payload);
+            try txn.commit();
+            retained_txn_open = false;
+        }
+        if (payload != null) try self.flushDurableReplicationOutboxes();
+    }
+
     fn applyOnlineSourceBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         try @import("online_source_contract.zig").validateRequest(req);
         const command = req.online_source orelse return error.InvalidOnlineSourceCommand;
@@ -42324,6 +42419,36 @@ pub const DB = struct {
 
     pub const DocumentReadSession = @import("read_session_backend").Document;
 
+    pub fn queryRetainedSeriesJson(self: *DB, alloc: Allocator, request: @import("../retained_series_read_contract.zig").Request) ![]u8 {
+        var policy = try self.local_execution.row_policy_gate.enterRawRead();
+        defer policy.release();
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer txn.abort();
+        const response = try @import("../retained_series_query.zig").executeJson(alloc, &txn, self.root_incarnation, request);
+        errdefer alloc.free(response);
+        try policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return response;
+    }
+
+    /// Native-owner private retained relation reader. Host admission supplies
+    /// dataset authorization, read-index and a bounded owner/session lifetime.
+    pub fn openRetainedSeriesRead(self: *DB, alloc: Allocator, query: @import("../retained_series_reader.zig").Query) !*@import("../retained_series_reader.zig").Session {
+        var policy = try self.local_execution.row_policy_gate.enterRawRead();
+        errdefer policy.release();
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        var partition: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+        if (!std.mem.eql(u8, &partition, &query.fence.partition)) return error.IdentityNamespaceMismatch;
+        const txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        const session = try @import("../retained_series_reader.zig").Session.open(alloc, txn, query, self.root_incarnation);
+        session.row_policy_lease = policy;
+        return session;
+    }
+
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
         if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts }));
         try self.maybeFinalizePendingRowPolicyPublication();
@@ -53385,6 +53510,12 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
                 return error.ForeignKeyCoordinationRequired;
         }
     }
+    var summary_arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer summary_arena.deinit();
+    const summary_alloc = summary_arena.allocator();
+    var summary_read: ?docstore_mod.DocStore.Txn = if (ttl_guard != null and try ctx.store.retainedSeriesActive()) try ctx.store.beginReadTxn() else null;
+    defer if (summary_read) |*read| read.abort();
+    const summary_guard = if (summary_read) |*read| try @import("../retained_series_capture.zig").ExpirationGuard.init(summary_alloc, read) else null;
     var eligible = std.ArrayList([]const u8).empty;
     defer eligible.deinit(ctx.alloc);
     const eligible_keys = if (ttl_guard) |guard| blk: {
@@ -53401,6 +53532,14 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             const current = (try ttl_mod.readSourceTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
             if (current != candidate.timestamp_ns or
                 !ttl_mod.isExpiredWithGrace(current, guard.duration_ns, guard.grace_period_ns, guard.now_ns)) continue;
+            if (summary_guard) |required| {
+                const primary = if (ctx.relational_base_rows) try relational_store.keyAlloc(summary_alloc, candidate.key) else try internal_keys.documentKeyAlloc(summary_alloc, candidate.key);
+                const physical = summary_read.?.get(primary) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                if (!try required.allowed(summary_alloc, &summary_read.?, physical, guard.now_ns)) continue;
+            }
             try eligible.append(ctx.alloc, candidate.key);
         }
         break :blk eligible.items;
@@ -53621,6 +53760,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
+    try @import("../retained_series_capture.zig").appendContext(
+        ctx.alloc,
+        ctx.store,
+        sequence,
+        if (ttl_guard) |guard| guard.now_ns else platform_time.realtimeNs(),
+        if (ttl_guard != null) .expiration else .mutation,
+        &store_writes,
+        &owned_store_values,
+    );
     var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_replication.deinit(ctx.alloc);
     try primary_replication.stage(ctx, &store_writes);
@@ -53674,6 +53822,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
     if (view) |pinned| if (pinned.hasCoordinatedConstraints()) {
+        if (try ctx.batch.store.retainedSeriesActive()) return error.RetainedSeriesCoordinatedTtlUnsupported;
         const io = ctx.batch.io orelse std.Options.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;

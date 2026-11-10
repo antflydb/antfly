@@ -4616,6 +4616,70 @@ pub fn storageOwnerOnlineMergeIoJson(owner: ?*anyopaque, request: *const kernel_
     return .ok;
 }
 
+pub fn storageOwnerRetainedQueryJson(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
+    if (request.request_json.len > 4096) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(antfly.capi_dependencies.storage_retained_series_reader.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
+    control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const response = handle.db.queryRetainedSeriesJson(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    control.ensureActive() catch |err| {
+        handle.alloc.free(response);
+        return storageOwnerStatusFromError(err);
+    };
+    out.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
+pub fn storageOwnerRetainedReadOpen(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out_session: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    out_session.* = null;
+    if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
+    if (request.request_json.len > 4096) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const reader = antfly.capi_dependencies.storage_retained_series_reader;
+    var parsed = std.json.parseFromSlice(reader.Query, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
+    control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const session = handle.db.openRetainedSeriesRead(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    control.ensureActive() catch |err| {
+        session.close();
+        return storageOwnerStatusFromError(err);
+    };
+    out_session.* = session;
+    return .ok;
+}
+
+pub fn storageRetainedReadNextJson(raw: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
+    if (request.request_json.len > 128) return .invalid_argument;
+    const session: *antfly.capi_dependencies.storage_retained_series_reader.Session = @ptrCast(@alignCast(raw orelse return .invalid_argument));
+    var parsed = std.json.parseFromSlice(struct { limit: u16 = 128 }, session.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
+    control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const page = session.next(parsed.value.limit) catch |err| return storageOwnerStatusFromError(err);
+    var root_buffer: [40]u8 = undefined;
+    const response = std.json.Stringify.valueAlloc(session.alloc, .{ .root_incarnation = std.fmt.bufPrint(&root_buffer, "{d}", .{session.root_incarnation}) catch unreachable, .page = page }, .{}) catch |err| return storageOwnerStatusFromError(err);
+    control.ensureActive() catch |err| {
+        session.alloc.free(response);
+        return storageOwnerStatusFromError(err);
+    };
+    out.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
+pub fn storageRetainedReadClose(raw: ?*anyopaque) callconv(.c) void {
+    const session: *antfly.capi_dependencies.storage_retained_series_reader.Session = @ptrCast(@alignCast(raw orelse return));
+    session.close();
+}
+
 pub fn storageOwnerSourceArtifactJson(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out.* = .{};
     if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;

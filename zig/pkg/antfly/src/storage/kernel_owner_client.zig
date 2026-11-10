@@ -690,6 +690,32 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn retainedQueryJson(self: *Owner, request: abi.ControlledJsonOperationRequest) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_retained_query_json(self.handle, &request, &response.buffer));
+        return response;
+    }
+
+    /// The containing source retains its Owner lease until this stream closes.
+    pub const RetainedRead = struct {
+        handle: ?*anyopaque,
+        pub fn nextJson(self: *RetainedRead, request: abi.ControlledJsonOperationRequest) !Response {
+            var response: Response = .{};
+            try statusToError(abi.antfly_storage_retained_read_next_json(self.handle, &request, &response.buffer));
+            return response;
+        }
+        pub fn deinit(self: *RetainedRead) void {
+            if (self.handle) |handle| abi.antfly_storage_retained_read_close(handle);
+            self.handle = null;
+        }
+    };
+    pub fn openRetainedRead(self: *Owner, request: abi.ControlledJsonOperationRequest) !RetainedRead {
+        var stream = RetainedRead{ .handle = null };
+        try statusToError(abi.antfly_storage_owner_retained_read_open(self.handle, &request, &stream.handle));
+        if (stream.handle == null) return error.StorageKernelFailure;
+        return stream;
+    }
+
     pub fn sourceArtifactJson(self: *Owner, request: abi.ControlledJsonOperationRequest) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_source_artifact_json(self.handle, &request, &response.buffer));

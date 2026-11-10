@@ -27,11 +27,17 @@ pub const pin_grace_ns = 30 * std.time.ns_per_s;
 const Header = struct { state: objects.immutable_log.State, root_cursor: ?objects.conditional_root.Cursor = null };
 const Row = struct { key: []const u8, value: []const u8 };
 pub const Read = struct { results: []const []const Row };
-const RetirementFloor = struct { through_ns: []const u8 };
+const RetirementFloor = struct { through_ns: []const u8, through_key: ?t.RowKey = null };
 const Coverage = struct {
     segment: t.Id,
     start_ns: []const u8,
     end_ns: []const u8,
+    key_span: ?t.KeySpan = null,
+    fn span(self: Coverage) !t.KeySpan {
+        const result = self.key_span orelse try t.KeySpan.fromRange(.{ .start_ns = self.start_ns, .end_ns = self.end_ns });
+        try result.validate();
+        return result;
+    }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try t.writeFields(self, .{}, writer);
     }
@@ -226,20 +232,19 @@ pub const Catalog = struct {
         defer self.context.alloc.free(floor_key);
         if (try self.get(session.value, RetirementFloor, floor_key)) |floor| {
             defer floor.deinit();
-            const through = std.fmt.parseInt(i128, floor.value.through_ns, 10) catch return error.InvalidDatasetCoverage;
-            if (try value.coverage.start() < through) return error.DatasetSegmentRetired;
+            const through = floor.value.through_key orelse t.rowKey(std.fmt.parseInt(i128, floor.value.through_ns, 10) catch return error.InvalidDatasetCoverage, @splat(0));
+            if (std.mem.order(u8, &(try value.span()).start, &through) == .lt) return error.DatasetSegmentRetired;
         }
         const prefix = try coveragePrefix(self.context.alloc, value.definition_generation, value.source.partition, value.source.incarnation);
         defer self.context.alloc.free(prefix);
-        const after = try coverageAfter(self.context.alloc, prefix, try value.coverage.start());
+        const after = try coverageAfter(self.context.alloc, prefix, (try value.span()).start);
         defer self.context.alloc.free(after);
         const successor = try self.list(session.value, prefix, after, 1);
         defer successor.deinit();
         if (successor.value.results[0].len != 0) {
             const index = try std.json.parseFromSlice(Coverage, self.context.alloc, successor.value.results[0][0].value, .{});
             defer index.deinit();
-            const range = t.Range{ .start_ns = index.value.start_ns, .end_ns = index.value.end_ns };
-            if (try value.coverage.overlaps(range)) return error.DatasetCoverageOverlap;
+            if ((try value.span()).overlaps(try index.value.span())) return error.DatasetCoverageOverlap;
         }
         _ = try self.checkLocation(session.value, location, true);
         // Encode before object I/O to reject metadata that exceeds page limits.
@@ -326,7 +331,18 @@ pub const Catalog = struct {
     /// segment before exposing any result. Empty history requires an explicit
     /// empty-state segment; absence is never silently converted into zero.
     pub fn planRange(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, range: t.Range, limit: usize) !RangePlan {
-        try range.validate();
+        return self.planExtent(generation, partition, incarnation, try t.KeySpan.fromRange(range), limit, false);
+    }
+
+    /// Select complete immutable segments covering a requested range. Consumers
+    /// must filter decoded row keys to the requested extent. This preserves
+    /// exact aggregate states without requiring queries to align with files.
+    pub fn planCoveringRange(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, range: t.Range, limit: usize) !RangePlan {
+        return self.planExtent(generation, partition, incarnation, try t.KeySpan.fromRange(range), limit, true);
+    }
+
+    fn planExtent(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, extent_requested: t.KeySpan, limit: usize, covering: bool) !RangePlan {
+        try extent_requested.validate();
         if (limit == 0 or limit > max_page or generation == 0 or incarnation == 0 or t.zero(partition)) return error.DatasetPageBudgetExceeded;
         var arena = std.heap.ArenaAllocator.init(self.context.alloc);
         errdefer arena.deinit();
@@ -337,24 +353,24 @@ pub const Catalog = struct {
         // parsed-header arena escapes by reference to this stack frame.
         const session = try catalog.open(false);
         const prefix = try coveragePrefix(temp, generation, partition, incarnation);
-        const after = try coverageAfter(temp, prefix, try range.start());
+        const after = try coverageAfter(temp, prefix, extent_requested.start);
         const page = try catalog.list(session.value, prefix, after, limit);
         var selected = std.ArrayList(Coverage).empty;
         var keys = std.ArrayList([]const u8).empty;
-        var covered = try range.start();
-        const end = try range.end();
+        var covered = extent_requested.start;
+        const end = extent_requested.end;
         for (page.value.results[0]) |row| {
             const index = try std.json.parseFromSliceLeaky(Coverage, temp, row.value, .{});
-            const extent = t.Range{ .start_ns = index.start_ns, .end_ns = index.end_ns };
-            try extent.validate();
-            if (try extent.start() != covered) return error.DatasetCoverageUnavailable;
-            if (try extent.end() > end) return error.DatasetResolutionUnavailable;
+            const extent = try index.span();
+            if (!std.mem.eql(u8, &extent.start, &covered) and
+                !(covering and selected.items.len == 0 and std.mem.order(u8, &extent.start, &covered) == .lt)) return error.DatasetCoverageUnavailable;
+            if (!covering and std.mem.order(u8, &extent.end, &end) == .gt) return error.DatasetResolutionUnavailable;
             try selected.append(temp, index);
             try keys.append(temp, try segmentKey(temp, index.segment));
-            covered = try extent.end();
-            if (covered == end) break;
+            covered = extent.end;
+            if (std.mem.order(u8, &covered, &end) != .lt) break;
         }
-        if (covered != end) return if (selected.items.len == limit) error.DatasetPageBudgetExceeded else error.DatasetCoverageUnavailable;
+        if (std.mem.order(u8, &covered, &end) == .lt) return if (selected.items.len == limit) error.DatasetPageBudgetExceeded else error.DatasetCoverageUnavailable;
         const definition_key = try std.fmt.allocPrint(temp, "definitions/{d}", .{generation});
         const def = (try catalog.get(session.value, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
         try def.value.validate();
@@ -367,7 +383,7 @@ pub const Catalog = struct {
             part.* = try std.json.parseFromSliceLeaky(t.Segment, temp, value orelse return error.InvalidDatasetCoverage, .{ .allocate = .alloc_always });
             try part.validate(def.value);
             if (!std.mem.eql(u8, &part.id, &index.segment) or !std.mem.eql(u8, &part.source.partition, &partition) or part.source.incarnation != incarnation or
-                try part.coverage.start() != try std.fmt.parseInt(i128, index.start_ns, 10) or try part.coverage.end() != try std.fmt.parseInt(i128, index.end_ns, 10)) return error.InvalidDatasetCoverage;
+                try part.coverage.start() != try std.fmt.parseInt(i128, index.start_ns, 10) or try part.coverage.end() != try std.fmt.parseInt(i128, index.end_ns, 10) or !std.meta.eql(try part.span(), try index.span())) return error.InvalidDatasetCoverage;
             if (part.retiring or try part.expired(def.value, now)) return error.DatasetCoverageUnavailable;
             if (part.access == .restore_required) return error.DatasetRestoreRequired;
         }
@@ -566,8 +582,8 @@ pub const Catalog = struct {
         defer self.context.alloc.free(floor_key);
         if (try self.get(session.value, RetirementFloor, floor_key)) |floor| {
             defer floor.deinit();
-            const previous = std.fmt.parseInt(i128, floor.value.through_ns, 10) catch return error.InvalidDatasetCoverage;
-            if (try value.coverage.end() <= previous) return error.InvalidDatasetCoverage;
+            const previous = floor.value.through_key orelse t.rowKey(std.fmt.parseInt(i128, floor.value.through_ns, 10) catch return error.InvalidDatasetCoverage, @splat(0));
+            if (std.mem.order(u8, &(try value.span()).end, &previous) != .gt) return error.InvalidDatasetCoverage;
         }
         const pins_prefix = try pinPrefix(self.context.alloc, id);
         defer self.context.alloc.free(pins_prefix);
@@ -580,7 +596,7 @@ pub const Catalog = struct {
         defer self.context.alloc.free(segment_key);
         const coverage_key = try coverageKey(self.context.alloc, value);
         defer self.context.alloc.free(coverage_key);
-        const floor = try std.json.Stringify.valueAlloc(self.context.alloc, RetirementFloor{ .through_ns = value.coverage.end_ns }, .{});
+        const floor = try std.json.Stringify.valueAlloc(self.context.alloc, RetirementFloor{ .through_ns = value.coverage.end_ns, .through_key = (try value.span()).end }, .{});
         defer self.context.alloc.free(floor);
         try commands.appendSlice(self.context.alloc, &.{ .{ .kind = .delete, .key = segment_key }, .{ .kind = .delete, .key = coverage_key }, .{ .kind = .put, .key = floor_key, .value = floor } });
         for (pins.value.results[0]) |row| try commands.append(self.context.alloc, .{ .kind = .delete, .key = row.key });
@@ -599,7 +615,7 @@ pub const Catalog = struct {
         defer self.context.alloc.free(raw);
         const coverage_key = try coverageKey(self.context.alloc, value);
         defer self.context.alloc.free(coverage_key);
-        const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns }, .{});
+        const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns, .key_span = value.key_span }, .{});
         defer self.context.alloc.free(coverage);
         const commands = [_]coordinator.Command{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = coverage_key, .value = coverage } };
         try self.commit(session, commands[if (bound) @as(usize, 1) else 0..]);
@@ -712,18 +728,20 @@ fn locationKey(a: A, id: t.Id) ![]u8 {
 fn coveragePrefix(a: A, generation: u64, partition: t.Id, incarnation: u64) ![]u8 {
     return std.fmt.allocPrint(a, "coverage/{d}/{s}/{d}/", .{ generation, std.fmt.bytesToHex(partition, .lower), incarnation });
 }
-fn orderedInstant(value: i128) [32]u8 {
-    var bytes: [16]u8 = undefined;
-    std.mem.writeInt(u128, &bytes, @as(u128, @bitCast(value)) ^ (@as(u128, 1) << 127), .big);
-    return std.fmt.bytesToHex(bytes, .lower);
-}
-fn coverageAfter(a: A, prefix: []const u8, start: i128) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}{s}~", .{ prefix, orderedInstant(start) });
+fn coverageAfter(a: A, prefix: []const u8, start: t.RowKey) ![]u8 {
+    // Legacy whole-time keys have only the time prefix, and consequently sort
+    // before the equivalent time+zero-hash boundary as required.
+    return std.fmt.allocPrint(a, "{s}{s}~", .{ prefix, start });
 }
 fn coverageKey(a: A, value: t.Segment) ![]u8 {
     const prefix = try coveragePrefix(a, value.definition_generation, value.source.partition, value.source.incarnation);
     defer a.free(prefix);
-    return std.fmt.allocPrint(a, "{s}{s}/{s}", .{ prefix, orderedInstant(try value.coverage.end()), std.fmt.bytesToHex(value.id, .lower) });
+    if (value.key_span == null) {
+        const end = (try value.span()).end;
+        // Preserve the physical key of existing legacy entries during updates.
+        return std.fmt.allocPrint(a, "{s}{s}/{s}", .{ prefix, end[0..32], std.fmt.bytesToHex(value.id, .lower) });
+    }
+    return std.fmt.allocPrint(a, "{s}{s}/{s}", .{ prefix, (try value.span()).end, std.fmt.bytesToHex(value.id, .lower) });
 }
 
 fn nextPlacementRevision(value: u64) !u64 {

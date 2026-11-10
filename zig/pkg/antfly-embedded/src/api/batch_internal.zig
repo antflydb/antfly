@@ -506,6 +506,7 @@ pub const OwnedBatchRequest = struct {
     row_policy_install_bundle: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
+    retained_series: ?std.json.Parsed(@import("../storage/retained_series_control.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
@@ -542,6 +543,7 @@ pub const OwnedBatchRequest = struct {
         if (self.row_policy_install_bundle) |bundle| alloc.free(bundle);
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
+        if (self.retained_series) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
         if (self.artifact_catalog) |*control| control.deinit();
@@ -883,6 +885,15 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control), try std.json.parseFromValue(@import("../storage/db/restore_staging_contract.zig").Control, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (restore_staging) |*control| control.deinit();
+    var retained_series = if (root.get("_retained_series")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "retained_series_v1")) return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/retained_series_control.zig").Command), try std.json.parseFromValue(@import("../storage/retained_series_control.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (retained_series) |*control| control.deinit();
     var online_source = if (root.get("_online_source")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1385,6 +1396,10 @@ fn parseBatchRequestWithOptions(
             if (merge_proof_adoption == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
+        if (std.mem.eql(u8, kind_value.string, "retained_series_v1")) {
+            if (retained_series == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
         if (std.mem.eql(u8, kind_value.string, "online_source_v4")) {
             if (online_source == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
@@ -1642,6 +1657,7 @@ fn parseBatchRequestWithOptions(
         .row_policy_install_bundle = row_policy_install_bundle,
         .restore_staging = restore_staging,
         .online_source = online_source,
+        .retained_series = retained_series,
         .group_source = group_source,
         .resolver_review = resolver_review,
         .artifact_catalog = artifact_catalog,
@@ -1679,6 +1695,7 @@ fn parseBatchRequestWithOptions(
             .row_policy_install_bundle = row_policy_install_bundle orelse "",
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
+            .retained_series = if (retained_series) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
@@ -1731,6 +1748,7 @@ fn parseBatchRequestWithOptions(
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
+    try @import("../storage/retained_series_control.zig").validateRequest(result_value.req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
     if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
     if (allow_internal and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
@@ -1837,6 +1855,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+    try @import("../storage/retained_series_control.zig").validateRequest(req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(req);
     try merge_pages.validateRequest(req);
     if (req.merge_checkpoint) |checkpoint| {
@@ -2041,6 +2060,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     if (req.restore_staging) |control| {
         if (req.online_source != null or req.merge_checkpoint != null or req.merge_page != null) return error.InvalidBatchRequest;
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"restore_v3\"},\"_restore_staging\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.retained_series) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"retained_series_v1\"},\"_retained_series\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
