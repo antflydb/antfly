@@ -5955,6 +5955,12 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Physical backup format is independent of graph authority. Upgraded
+    /// LEANN indexes can retain an empty native HBC wrapper from older roots.
+    pub fn nativeBackupUsesPostingFiles(self: *const HBCIndex) bool {
+        return self.experimentalPostingWalAuthoritative() or (self.leann != null and self.env_owner == .native);
+    }
+
     pub const NativeBackupGeneration = struct {
         alloc: Allocator,
         storage: lsm_backend.Storage,
@@ -5983,12 +5989,12 @@ pub const HBCIndex = struct {
         alloc: Allocator,
         expected_source_sequence: u64,
     ) !?NativeBackupGeneration {
-        if (!self.experimentalPostingWalAuthoritative()) return null;
+        if (!self.nativeBackupUsesPostingFiles()) return null;
         if (self.experimentalPostingMutationCaptureActive() or self.write_session_depth != 0)
             return error.NativeBackupProjectionNotQuiescent;
         var store = try self.openExperimentalPostingStore();
         defer store.deinit();
-        if (store.covered_source_sequence != expected_source_sequence)
+        if (self.leann == null and store.covered_source_sequence != expected_source_sequence)
             return error.NativeBackupProjectionNotQuiescent;
         var checkpoint = store.checkpoint orelse return error.MissingPostingCheckpoint;
         checkpoint.wal_committed_bytes = store.wal_committed_bytes;

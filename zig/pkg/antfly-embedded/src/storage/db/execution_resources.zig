@@ -1688,6 +1688,7 @@ pub const GeneratedBatchWritePlan = struct {
 };
 
 pub const GeneratedDenseMemoJob = struct {
+    generation: embedder_mod.DenseEmbedder.TextGeneration = .{},
     key: GeneratedEmbeddingMemo.Key,
     text: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1711,6 +1712,7 @@ pub const GeneratedEmbeddingMemo = struct {
     alloc: Allocator,
     reuse_stored_artifacts: bool = false,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
+    generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
@@ -1718,6 +1720,9 @@ pub const GeneratedEmbeddingMemo = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        var names = self.generations.keyIterator();
+        while (names.next()) |name| self.alloc.free(name.*);
+        self.generations.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1752,6 +1757,27 @@ pub const GeneratedEmbeddingMemo = struct {
         var digest: Key = undefined;
         hasher.final(&digest);
         return digest;
+    }
+
+    /// One immutable provider lease per model per synchronous preparation.
+    pub fn generation(self: *@This(), provider: embedder_mod.DenseEmbedder, name: []const u8) !embedder_mod.DenseEmbedder.TextGeneration {
+        if (self.generations.get(name)) |captured| return captured;
+        const captured = try provider.captureTextGeneration(self.alloc, name);
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.generations.put(self.alloc, owned, captured);
+        return captured;
+    }
+
+    pub fn keyAtRevision(base: Key, revision: ?[32]u8) Key {
+        const current = revision orelse return base;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("synchronous-dense-generation-v1");
+        hash.update(&base);
+        hash.update(&current);
+        var result: Key = undefined;
+        hash.final(&result);
+        return result;
     }
 
     pub fn adoptDense(self: *@This(), key_value: Key, owned: []f32) ![]const f32 {

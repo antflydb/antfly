@@ -695,12 +695,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 runtime,
                 first.consumer_indexes,
                 memo.alloc,
-                embedder,
+                embedder.withTextGeneration(jobs.items[0].generation),
                 requestEmbeddingName(first),
                 texts,
                 first.expected_dims,
             );
             defer embedder_mod.freeDenseEmbeddingBatch(memo.alloc, vectors);
+            try embedder.requireTextGeneration(memo.alloc, requestEmbeddingName(first), jobs.items[0].generation);
             for (jobs.items, vectors) |job, vector| try memo.putDenseCopy(job.key, vector);
         }
 
@@ -1303,14 +1304,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     var text_owned = true;
                     errdefer if (text_owned) memo.alloc.free(text);
-                    const key_value = GeneratedEmbeddingMemo.key(
+                    const generation = try memo.generation(embedder, requestEmbeddingName(request));
+                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
                         .dense_embedding,
                         requestEmbeddingName(request),
                         request.producer_json,
                         request.execution_json,
                         request.expected_dims,
                         text,
-                    );
+                    ), generation.revision);
                     if (memo.dense.contains(key_value) or pending.contains(key_value)) {
                         memo.alloc.free(text);
                         text_owned = false;
@@ -1337,7 +1339,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         batch_bytes = 0;
                     }
                     try pending.put(memo.alloc, key_value, {});
-                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request });
+                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request, .generation = generation });
                     text_owned = false;
                     batch_bytes += text.len;
                     if (jobs.items.len >= max_items or batch_bytes >= max_bytes) {
@@ -1366,7 +1368,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             defer memo.alloc.free(raw);
             const source_hash = enrichment_artifact_codec.sourceHash(raw) catch return false;
-            if (source_hash == null or source_hash.? != enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation)) return false;
+            const expected_hash = if (request.kind == .dense_embedding) dense: {
+                const revision = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
+                    if (runtime.config.dense_embedder) |provider| (try memo.generation(provider, requestEmbeddingName(request))).revision else null
+                else
+                    null;
+                break :dense enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, revision);
+            } else enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+            if (source_hash == null or source_hash.? != expected_hash) return false;
             switch (request.kind) {
                 .dense_embedding => {
                     const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch return false;

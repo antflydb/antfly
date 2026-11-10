@@ -43699,7 +43699,8 @@ components:
           minimum: 0
           maximum: 1024
           default: 0
-          description: Candidates recomputed per batch. 0 uses k.
+          description: Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort
+            search.
         reembed_budget_ms:
           x-go-type-skip-optional-pointer: true
           type: integer

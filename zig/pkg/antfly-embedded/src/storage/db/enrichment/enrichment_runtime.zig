@@ -29663,7 +29663,7 @@ fn writePartsHashJson(writer: *std.Io.Writer, parts: []const template.ContentPar
     try writer.writeByte(']');
 }
 
-fn densePartsSourceHash(_: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parts: []const template.ContentPart, revision: ?[32]u8) !?u64 {
+pub fn densePartsSourceHash(_: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parts: []const template.ContentPart, revision: ?[32]u8) !?u64 {
     for (parts) |part| if (part == .media_url) return null;
     var output: PartsHashWriter = .{};
     var length: [8]u8 = undefined;

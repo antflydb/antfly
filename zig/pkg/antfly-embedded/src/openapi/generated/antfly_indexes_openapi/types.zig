@@ -10975,7 +10975,7 @@ pub const LeannIndexConfig = struct {
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
     bound_scale: ?f32 = null,
-    /// Candidates recomputed per batch. 0 uses k.
+    /// Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
     batch_size: ?i64 = null,
     /// Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
     reembed_budget_ms: ?i64 = null,

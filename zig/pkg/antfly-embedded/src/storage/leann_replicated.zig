@@ -723,7 +723,7 @@ pub const ReplicatedState = struct {
         defer filter.deinit(alloc);
         const key_filtered = true; // Unbound graph keys must never occupy result slots.
         const filtered = filter.distanceActive();
-        if (filtered) want = @intCast(@max(req.k * 4, req.k + 64));
+        if (filtered and !search_types.requiresExhaustiveCoverage(req)) want = @intCast(@max(req.k * 4, req.k + 64));
         const live: u32 = @intCast(@max(self.replica.liveCount(), 1));
         var key_filter = KeyRequestFilter{ .state = self, .filter = &filter };
         var candidate_ids = std.ArrayListUnmanaged(u32).empty;
@@ -748,6 +748,8 @@ pub const ReplicatedState = struct {
                 .filter_truncated = &filter_truncated,
                 .budget_exhausted = &budget_exhausted,
                 .exhaustive = search_types.requiresExhaustiveCoverage(req),
+                .distance_over = req.distance_over,
+                .distance_under = req.distance_under,
                 .gate = gate.recomputeGate(),
             }, ctx.keyLoader());
             defer alloc.free(hits);
@@ -758,7 +760,7 @@ pub const ReplicatedState = struct {
                 if (!try filter.allows(vector_id, h.key) or !filter.distanceAllowed(h.distance)) continue;
                 passed += 1;
             }
-            if (passed >= req.k or want >= live or !filtered or filter_truncated or
+            if (search_types.requiresExhaustiveCoverage(req) or passed >= req.k or want >= live or !filtered or filter_truncated or
                 (filter.has_allowed and want >= filter.allowed.count()))
             {
                 for (hits) |h| {
@@ -1401,6 +1403,21 @@ test "leann replicated state: search honors the index's tuning settings" {
         out.* = counting.loads;
     }
     try testing.expect(loads[1] > loads[0]);
+
+    // A full-effort query whose distance bounds admit no neighbors must still
+    // score each surviving vector exactly once, including after graph deletes.
+    try state.noteWrites(@as([]const TestItem, &.{}), &.{290});
+    while (try state.plan(alloc)) |planned_value| {
+        var planned = planned_value;
+        defer planned.deinit(alloc);
+        raft_index += 1;
+        _ = try state.applyRecord(planned.record, raft_index);
+    }
+    counting.loads = 0;
+    var exhaustive = try state.search(alloc, .{ .query = &vecs[7], .k = 3, .search_effort = 1, .distance_over = 1e6 });
+    defer exhaustive.deinit();
+    try testing.expectEqual(@as(usize, 0), exhaustive.items.items.len);
+    try testing.expectEqual(@as(usize, 299), counting.loads);
 }
 
 test "leann replicated state: randomized replication simulation" {

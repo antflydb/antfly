@@ -672,6 +672,8 @@ pub const Replica = struct {
         filter_truncated: ?*bool = null,
         budget_exhausted: ?*bool = null,
         exhaustive: bool = false,
+        distance_over: ?f32 = null,
+        distance_under: ?f32 = null,
         /// Cancellation and re-embedding budget (see `leann.RecomputeGate`).
         gate: ?leann.RecomputeGate = null,
     };
@@ -699,7 +701,10 @@ pub const Replica = struct {
             if (tuning.filter) |f| if (!try f.allows_fn(f.ctx, key)) continue;
             @memcpy(tmp, v);
             if (metric == .cosine) normalize(tmp);
-            try hits.append(alloc, .{ .key = key, .distance = leann.distance(metric, q, tmp) });
+            const dist = leann.distance(metric, q, tmp);
+            if (tuning.distance_over) |over| if (!(dist > over)) continue;
+            if (tuning.distance_under) |under| if (!(dist < under)) continue;
+            try hits.append(alloc, .{ .key = key, .distance = dist });
         }
         if (self.index) |*index| {
             var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = query, .strict = tuning.exhaustive };
@@ -713,6 +718,8 @@ pub const Replica = struct {
                 .candidate_ids = tuning.candidate_ids,
                 .filter_visit_limit = tuning.filter_visit_limit,
                 .exhaustive = tuning.exhaustive,
+                .distance_over = tuning.distance_over,
+                .distance_under = tuning.distance_under,
                 .verify_source = true,
                 .gate = tuning.gate,
             });

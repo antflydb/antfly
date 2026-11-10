@@ -9100,7 +9100,7 @@ pub const IndexManager = struct {
         return switch (kind) {
             .full_text => @tagName(self.text_main_backend),
             .dense_vector => if (self.denseIndex(name)) |entry|
-                if (entry.index.experimentalPostingWalAuthoritative()) dense_native_backup_backend_id else @tagName(self.dense_storage_backend)
+                if (entry.index.nativeBackupUsesPostingFiles()) dense_native_backup_backend_id else @tagName(self.dense_storage_backend)
             else
                 @tagName(self.dense_storage_backend),
             .sparse_vector => @tagName(self.sparse_backend),
@@ -9360,7 +9360,7 @@ pub const IndexManager = struct {
             if (try entry.index.nativeBackupGeneration(self.alloc, capture_target_sequence)) |generation_value| {
                 var generation = generation_value;
                 defer generation.deinit();
-                has_native_dense = true;
+                has_native_dense = has_native_dense or entry.index.leann == null;
                 const current_relative = try self.retainNativeBackupAllocation(
                     &native_owned,
                     try std.fmt.allocPrint(self.alloc, "indexes/{s}/posting-segments/CURRENT", .{entry.config.name}),
@@ -36093,6 +36093,24 @@ test "leann dense options parse quantization_bits" {
             try std.testing.expectError(error.InvalidIndexConfig, parseLeannDenseOptions(parsed.value.object));
         }
     }
+}
+
+test "leann catalog elision modes require the dense artifact format protocol" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "auto", "transient" }) |mode| {
+        const json = try std.fmt.allocPrint(a, "{{\"field\":\"embedding\",\"dims\":8,\"algorithm\":\"leann\",\"leann\":{{\"vector_storage\":\"{s}\"}}}}", .{mode});
+        defer a.free(json);
+        try std.testing.expect(try denseArtifactFlagsRequired(a, .{ .name = "idx", .kind = .dense_vector, .config_json = json }));
+    }
+    try std.testing.expect(!try denseArtifactFlagsRequired(a, .{ .name = "idx", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":8,\"algorithm\":\"leann\",\"leann\":{\"vector_storage\":\"persistent\"}}" }));
+}
+
+/// Catalog activation for formats an older artifact reader cannot apply.
+pub fn denseArtifactFlagsRequired(alloc: Allocator, cfg: types.IndexConfig) !bool {
+    if (cfg.kind != .dense_vector) return false;
+    const dense = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense.deinit(alloc);
+    return if (dense.leann) |leann| leann.vector_storage.elides() else false;
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {

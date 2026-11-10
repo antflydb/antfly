@@ -687,10 +687,10 @@ pub const LeannStore = struct {
         const live: usize = self.node_of.count();
         if (live == 0) return out;
 
-        // Id, key and prefix filters go into the graph walk. Distance bounds
-        // can only be checked afterwards, so they over-fetch, widening until
-        // k results pass or the whole graph has been considered.
-        var want: usize = if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
+        // Full effort streams live vectors once and applies distance bounds
+        // before top-k admission. Bounded graph search widens its candidate
+        // pool until enough results pass the bounds or coverage is exhausted.
+        var want: usize = if (search_types.requiresExhaustiveCoverage(req)) req.k else if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
         var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
         var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
@@ -710,6 +710,8 @@ pub const LeannStore = struct {
                 .filter = if (filter.nodeActive() or search_types.requiresExhaustiveCoverage(req)) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
                 .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
                 .exhaustive = search_types.requiresExhaustiveCoverage(req),
+                .distance_over = req.distance_over,
+                .distance_under = req.distance_under,
                 .verify_source = true,
                 .filter_visit_limit = if (filter.nodeActive() and !search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
                 .gate = gate.recomputeGate(),
@@ -723,7 +725,7 @@ pub const LeannStore = struct {
                 if (!filter.distanceAllowed(r.distance)) continue;
                 passed += 1;
             }
-            if (passed >= req.k or want >= live or !filter.distanceActive() or resp.stats.filter_truncated or
+            if (search_types.requiresExhaustiveCoverage(req) or passed >= req.k or want >= live or !filter.distanceActive() or resp.stats.filter_truncated or
                 (filter.has_allowed and want >= filter.allowed.count()))
             {
                 for (resp.results) |r| {
@@ -1396,6 +1398,40 @@ test "leann search forwards reembedding time from batch loader" {
     source.calls = 0;
     try testing.expectError(error.ReembedBudgetExceeded, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
     try testing.expectEqual(@as(usize, 1), source.calls);
+}
+
+test "leann full effort distance bounds score each surviving vector once" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const dims = 8;
+    const data = try alloc.alloc(f32, 300 * dims);
+    defer alloc.free(data);
+    for (0..300) |i| @memset(data[i * dims ..][0..dims], @floatFromInt(i));
+    const Counting = struct {
+        vectors: TestVectors,
+        calls: usize = 0,
+        fn load(raw: *anyopaque, a: Allocator, id: u64, metadata: []const u8) anyerror![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return TestVectors.load(&self.vectors, a, id, metadata);
+        }
+    };
+    var source = Counting{ .vectors = .{ .data = data, .dims = dims } };
+    var store = try LeannStore.open(alloc, testing.io, dir, .{ .dims = dims, .metric = .l2_squared, .build_threshold = 32, .max_degree = 8 });
+    defer store.deinit();
+    store.setLoader(.{ .ctx = &source, .load = Counting.load });
+    try addAll(alloc, store, data, dims, 0, 300);
+    try store.apply(@as([]const TestItem, &.{}), &.{290});
+    source.calls = 0;
+    const query: [dims]f32 = @splat(0);
+    var results = try store.search(alloc, .{ .query = &query, .k = 3, .search_effort = 1, .distance_over = 8 * 289 * 289, .distance_under = 8 * 295 * 295 });
+    defer results.deinit();
+    try testing.expectEqual(@as(usize, 3), results.items.items.len);
+    for (results.items.items, 291..) |hit, expected| try testing.expectEqual(@as(u64, @intCast(expected)), hit.vector_id);
+    try testing.expectEqual(@as(usize, 299), source.calls);
 }
 
 test "leann reembed cache: hits by digest, misses on a new digest, evicts least recent" {

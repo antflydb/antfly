@@ -231,6 +231,8 @@ pub const SearchOptions = struct {
     filter_visit_limit: u32 = 0,
     /// Score every eligible candidate instead of pruning by estimates.
     exhaustive: bool = false,
+    distance_over: ?f32 = null,
+    distance_under: ?f32 = null,
     /// Load upper-layer candidates to verify their backing vector is available.
     verify_source: bool = false,
     gate: ?RecomputeGate = null,
@@ -740,6 +742,7 @@ pub const Index = struct {
         if (query.len != self.dimension()) return error.DimensionMismatch;
         var stats = SearchStats{};
         if (self.node_count == 0 or opts.k == 0) return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        if (opts.exhaustive) return self.exhaustiveSearch(alloc, source, query, opts);
         const rerank: Rerank = switch (opts.rerank) {
             .auto => if (self.rabitq != null) .bounds else .ratio,
             else => opts.rerank,
@@ -780,6 +783,53 @@ pub const Index = struct {
             try out.append(alloc, .{ .id = c.id, .distance = c.dist });
         }
         return .{ .results = try out.toOwnedSlice(alloc), .stats = stats };
+    }
+
+    /// Full coverage uses a streaming exact scan, independent of graph
+    /// connectivity, deleted routing nodes, quantizer estimates and beam size.
+    fn exhaustiveSearch(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, opts: SearchOptions) !SearchResponse {
+        const q = try alloc.dupe(f32, query);
+        defer alloc.free(q);
+        if (self.config.metric == .cosine) normalize(q);
+        var stats = SearchStats{};
+        var top = Heap(true){};
+        defer top.deinit(alloc);
+        var ids = std.ArrayListUnmanaged(u32).empty;
+        defer ids.deinit(alloc);
+        var vectors = std.ArrayListUnmanaged(f32).empty;
+        defer vectors.deinit(alloc);
+        var distances = std.ArrayListUnmanaged(f32).empty;
+        defer distances.deinit(alloc);
+        const batch: usize = if (opts.batch_size != 0) opts.batch_size else 128;
+        const count = if (opts.candidate_ids) |candidates| candidates.len else self.node_count;
+        var next: usize = 0;
+        while (next < count) {
+            ids.clearRetainingCapacity();
+            while (next < count and ids.items.len < batch) : (next += 1) {
+                if (next % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                const id: u32 = if (opts.candidate_ids) |candidates| candidates[next] else @intCast(next);
+                if (id >= self.node_count or self.isDeleted(id) or !try allowedNode(opts.filter, id)) continue;
+                try ids.append(alloc, id);
+            }
+            if (ids.items.len == 0) continue;
+            if (!try RecomputeGate.open(opts.gate)) {
+                stats.budget_exhausted = true;
+                break;
+            }
+            try distances.resize(alloc, ids.items.len);
+            try self.recomputeDistances(alloc, source, q, ids.items, &vectors, distances.items, &stats);
+            for (ids.items, distances.items) |id, dist| {
+                if (!std.math.isFinite(dist)) continue;
+                if (opts.distance_over) |over| if (!(dist > over)) continue;
+                if (opts.distance_under) |under| if (!(dist < under)) continue;
+                const candidate = Cand{ .id = id, .dist = dist };
+                if (top.len() < opts.k) try top.push(alloc, candidate) else if (candLessThan({}, candidate, top.top())) top.replaceTop(candidate);
+            }
+        }
+        std.mem.sortUnstable(Cand, top.items.items, {}, candLessThan);
+        const results = try alloc.alloc(Result, top.len());
+        for (top.items.items, results) |candidate, *result| result.* = .{ .id = candidate.id, .distance = candidate.dist };
+        return .{ .results = results, .stats = stats };
     }
 
     /// Sparse tracking keeps bounded predicate walks independent of index size;
@@ -3700,6 +3750,36 @@ test "leann: explicit candidates avoid the graph walk" {
     try testing.expectEqual(@as(usize, 3), result.results.len);
     try testing.expectEqual(@as(u32, 3), result.stats.approx_evaluated);
     try testing.expectEqual(@as(u32, 0), result.stats.expanded);
+}
+
+test "leann: exhaustive distance bounds scan every live vector once independent of topology" {
+    const alloc = testing.allocator;
+    const n = 300;
+    const dims = 8;
+    const data = try alloc.alloc(f32, n * dims);
+    defer alloc.free(data);
+    for (0..n) |i| @memset(data[i * dims ..][0..dims], @as(f32, @floatFromInt(i)));
+    for ([_]Quantizer{ .pq, .rabitq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = dims, .quantizer = quantizer, .max_degree = 8 }, data);
+        defer index.deinit();
+        try index.markDeleted(0);
+        try index.markDeleted(290);
+        // Full coverage must not depend on a route to any live member.
+        for (index.adjacency.items) |*neighbors| neighbors.clearRetainingCapacity();
+        var source = SliceEmbeddingSource{ .vectors = data, .dims = dims };
+        var response = try index.search(alloc, source.source(), &@as([dims]f32, @splat(0)), .{
+            .k = 3,
+            .exhaustive = true,
+            .distance_over = 8 * 289 * 289,
+            .distance_under = 8 * 295 * 295,
+        });
+        defer response.deinit(alloc);
+        try testing.expectEqual(@as(usize, 3), response.results.len);
+        for (response.results, [_]u32{ 291, 292, 293 }) |hit, expected| try testing.expectEqual(expected, hit.id);
+        try testing.expectEqual(@as(u64, n - 2), source.recomputed);
+        try testing.expectEqual(@as(u64, 3), source.calls);
+        try testing.expectEqual(@as(u32, 0), response.stats.approx_evaluated);
+    }
 }
 
 test "leann: opaque filter work is bounded unless exhaustive" {

@@ -24,7 +24,8 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
-pub const max_effect_protocol: u16 = 18;
+pub const dense_artifact_flags_protocol: u16 = 19;
+pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
 
 pub const Binding = struct {
     epoch: u64,
@@ -75,7 +76,8 @@ pub const Catalogs = struct {
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
             for (configs) |cfg| {
-                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) return 18;
+                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
+                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
                 if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
         }
@@ -192,6 +194,8 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     extended.effect_protocol = 18;
     try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 19;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 20;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }

@@ -2838,7 +2838,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const leann_regression_tests = b.addTest(.{
         .name = "leann-regression-tests",
         .root_module = antfly_test_mod,
-        .filters = selectTestFilters(b, &.{ "leann", "reembed", "chunked dense", "synchronous chunk", "synchronously builds chunk", "public table query handler preserves retryable", "preserves public query availability" }),
+        .filters = selectTestFilters(b, &.{ "leann", "reembed", "chunked dense", "synchronous chunk", "synchronously builds chunk", "generated memo reuses only", "public table query handler preserves retryable", "preserves public query availability" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("leann-regression-test", "Run LEANN storage, provenance, split and recovery regressions")
@@ -2846,7 +2846,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const leann_replication_runtime_tests = b.addTest(.{
         .root_module = data_implementation_module,
-        .filters = &.{"leann replication round"},
+        .filters = &.{ "leann replication round", "leann dense artifact format admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("leann-replication-runtime-test", "Run LEANN leader replication routing and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, leann_replication_runtime_tests).step);

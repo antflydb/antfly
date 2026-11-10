@@ -92427,6 +92427,73 @@ test "db extractEnrichments rejects unsupported legacy summaries field" {
     }));
 }
 
+test "leann synchronous document provenance pins revisions and tolerates inference float variation" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        revision: u8 = 1,
+        calls: usize = 0,
+        flip: bool = false,
+        fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const vector = try alloc.dupe(f32, &.{ 1, @as(f32, @floatFromInt(self.calls)) * 0.00001 });
+            if (self.flip) self.revision += 1;
+            return vector;
+        }
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
+        }
+        fn append(_: Allocator, _: *usize, _: []const u8, _: ?[]const u8, _: []const u8, _: []const f32, _: []const []const u8) !void {}
+    };
+    var fake = Fake{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    var directory = try TestDirectory.init("leann-sync-generation");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "sync", .dense_embedder = provider }, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    var memo = GeneratedEmbeddingMemo.init(a);
+    defer memo.deinit();
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        freePrimaryVectorRebuildWrites(a, &writes);
+        writes.deinit(a);
+    }
+    var chunks = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
+    defer chunks.deinit(a);
+    var sink: usize = 0;
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .expected_dims = 2, .consumer_indexes = &.{@constCast("idx")} };
+    const no_deletes = std.StringHashMapUnmanaged(void).empty;
+    const body = "{\"body\":\"alpha\"}";
+    try computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
+    const expected = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, "alpha", @as([32]u8, @splat(1)));
+    try std.testing.expectEqual(expected, (try enrichment_artifact_codec.sourceHash(writes.items[0].value)).?);
+    const original = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, writes.items[0].value);
+    defer a.free(original);
+    freePrimaryVectorRebuildWrites(a, &writes);
+    try computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    freePrimaryVectorRebuildWrites(a, &writes);
+    const key = try internal_keys.documentKeyAlloc(a, request.doc_key);
+    defer a.free(key);
+    try db.core.store.put(key, body);
+    var recovery = request;
+    recovery.expected_source_hash = expected;
+    recovery.expected_vector_digest = @import("../leann_store.zig").vectorDigest(original);
+    var recovered: [2]f32 = undefined;
+    var found = [_]bool{false};
+    try enrichment_runtime_mod.reembedDenseDocuments(db.enrichment_runtime.?, a, (&recovery)[0..1], 2, &recovered, &found);
+    try std.testing.expect(found[0] and original[1] != recovered[1]);
+    fake.revision = 2;
+    try std.testing.expectError(error.EnrichmentSourceChanged, computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append));
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    var next_memo = GeneratedEmbeddingMemo.init(a);
+    defer next_memo.deinit();
+    fake.flip = true;
+    try std.testing.expectError(error.EnrichmentSourceChanged, computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &next_memo, null, Fake.append));
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+}
+
 test "leann synchronous chunk provenance keeps model metadata vectors recoverable" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("leann-provenance");
@@ -134248,6 +134315,14 @@ test "db native snapshot exports self-contained generation" {
 }
 
 test "db native snapshot pins a local leann graph file" {
+    try testLeannNativeSnapshot(false);
+}
+
+test "db native snapshot restores an upgraded native leann wrapper" {
+    try testLeannNativeSnapshot(true);
+}
+
+fn testLeannNativeSnapshot(legacy_native: bool) !void {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -134260,7 +134335,8 @@ test "db native snapshot pins a local leann graph file" {
     });
     defer runtime.deinit();
     var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
-    defer db.close();
+    var db_open = true;
+    defer if (db_open) db.close();
     try db.addIndex(.{
         .name = "leann_idx",
         .kind = .dense_vector,
@@ -134282,6 +134358,30 @@ test "db native snapshot pins a local leann graph file" {
         alloc.free(v);
     };
     try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+
+    if (legacy_native) {
+        // Reproduce the old fresh-v2 policy: it built an empty HBC native
+        // generation around LEANN and published an incompatible root pointer.
+        const entry = db.core.index_manager.denseIndex("leann_idx").?;
+        const config_hash = types.indexConfigHash(entry.config);
+        const applied = try db.core.loadAppliedSequence(alloc, "leann_idx");
+        {
+            const graph = entry.index.leann;
+            entry.index.leann = null;
+            defer entry.index.leann = graph;
+            entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+            try entry.index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = true, .make_authoritative = true });
+        }
+        db.close();
+        db_open = false;
+        // The fixture owns no open handles while moving the physical root.
+        try index_manager_mod.IndexManager.publishRestoredNativePhysicalGeneration(alloc, std.mem.span(path), "leann_idx", config_hash, applied, 71);
+        db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+        db_open = true;
+        const reopened = db.core.index_manager.denseIndex("leann_idx").?;
+        try std.testing.expect(reopened.index.nativeBackupUsesPostingFiles());
+        try std.testing.expect(!reopened.index.experimentalPostingWalAuthoritative());
+    }
 
     // A table with a LEANN index used to fail native snapshots outright.
     _ = try db.snapshotNative("leann");
