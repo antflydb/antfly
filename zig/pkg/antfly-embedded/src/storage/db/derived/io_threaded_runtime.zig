@@ -1940,7 +1940,7 @@ test "io threaded deferred source capture excludes preparation and preserves fai
         defer manager.deinit(alloc);
         manager.dense_deferred_source_capture = enabled;
         var capture: TestThreadedRuntimeCapture = .{};
-        var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager);
+        var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager, null);
         defer runtime.deinit();
         var name = "dense".*;
         var worker: Worker = .{ .runtime = &runtime, .name = &name, .kind = .{ .name = &name, .kind = .dense_vector }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1 };
@@ -2018,7 +2018,7 @@ test "io threaded deferred source capture advances empty targets only through co
     defer manager.deinit(alloc);
     manager.dense_deferred_source_capture = true;
     var capture: TestThreadedRuntimeCapture = .{};
-    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, Coverage.allow, null, &manager);
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, Coverage.allow, null, &manager, null);
     defer runtime.deinit();
     try runtime.addWorker("dense", .{ .name = "dense", .kind = .dense_vector }, 0);
     try runtime.waitForAllWithVisibilityWait(1, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
@@ -2040,7 +2040,7 @@ test "io threaded worker keeps the dense replay working-set factor" {
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
     var capture: TestThreadedRuntimeCapture = .{};
-    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager);
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager, null);
     defer runtime.deinit();
     const kind: index_manager_mod.ManagedIndexRef = .{
         .name = "dense",
@@ -2638,7 +2638,7 @@ fn testFullTextAdmissionRetry(admission_error: anyerror) !void {
 test "derived worker pause retains registration watermark and allocation-free resume" {
     const alloc = std.testing.allocator;
     var capture = TestThreadedRuntimeCapture{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null, null);
     defer runtime.deinit();
     try runtime.addWorker("paused", .{ .name = "paused", .kind = .graph }, 1);
     try runtime.addWorker("other", .{ .name = "other", .kind = .graph }, 4);
@@ -2675,7 +2675,7 @@ test "derived worker pause session close failure keeps retention and fails healt
         }
     };
     var capture = TestThreadedRuntimeCapture{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, Failure.finish, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, Failure.finish, null, null, null, null);
     defer runtime.deinit();
     const worker = try alloc.create(Worker);
     worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "paused"), .kind = .{ .name = "paused", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1, .catch_up_open = true };
@@ -2719,7 +2719,7 @@ test "derived worker pause drains active truncation retries and releases backlog
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
     var probe: Probe = undefined;
-    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager, null);
     defer runtime.deinit();
     const io = runtime.ioContext();
     probe = .{ .io = io };
@@ -2903,7 +2903,7 @@ test "issue1015 terminal worker failure leaves unrelated worker operational and 
         }
     };
     var capture = TestThreadedRuntimeCapture{};
-    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, Apply.apply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, Apply.apply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null, null);
     defer runtime.deinit();
     @import("antfly_test_error_logs").expectErrorLogs(2);
     try runtime.addWorker("failed", .{ .name = "failed", .kind = .full_text }, 0);
@@ -2922,7 +2922,7 @@ test "issue1015 terminal worker failure leaves unrelated worker operational and 
 test "issue1015 foreground notifications cannot defeat worker contention backoff" {
     const alloc = std.testing.allocator;
     var capture = TestThreadedRuntimeCapture{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null, null);
     defer runtime.deinit();
     var worker = Worker{ .runtime = &runtime, .name = @constCast("delayed"), .kind = .{ .name = "delayed", .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1 };
     worker.retry_not_before_ns = platform_time.monotonicNs() + std.time.ns_per_s;
@@ -2950,7 +2950,7 @@ test "issue1015 truncation contention recovers credit and failed claims remain r
         var manager = resource_manager_mod.ResourceManager.init(.{});
         defer manager.deinit(alloc);
         var probe = Probe{ .failure = failure };
-        var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager);
+        var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager, null);
         defer runtime.deinit();
         const worker = try alloc.create(Worker);
         worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 10, .persisted_sequence = 0, .target_sequence = 10 };
@@ -2983,7 +2983,7 @@ test "issue1015 truncation contention recovers credit and failed claims remain r
 test "issue1015 failed registrations stay parked during primary notifications" {
     const alloc = std.testing.allocator;
     var capture = TestThreadedRuntimeCapture{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null, null);
     defer runtime.deinit();
     const io = runtime.ioContext();
     runtime.scheduler = try Scheduler.create(alloc, io, 8);
@@ -3021,7 +3021,7 @@ test "issue1015 visibility truncation timeouts release claims and retain cleanup
         var manager = resource_manager_mod.ResourceManager.init(.{});
         defer manager.deinit(alloc);
         var probe = Probe{};
-        var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager);
+        var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager, null);
         defer runtime.deinit();
         const worker = try alloc.create(Worker);
         worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 10, .persisted_sequence = 10, .target_sequence = 10 };
@@ -3065,7 +3065,7 @@ test "issue1015 cleanup contention yields the shared derived scheduler slot" {
         }
     };
     var probe = Probe{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null, null);
     const io = runtime.ioContext();
     // Four slots is the CPU-limited production scheduler minimum: one per class.
     const scheduler = try Scheduler.create(alloc, io, 4);
@@ -3105,7 +3105,7 @@ test "issue1015 cleanup contention yields the shared derived scheduler slot" {
 test "issue1015 failed registration can still pause and retire retained cleanup" {
     const alloc = std.testing.allocator;
     var capture = TestThreadedRuntimeCapture{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null, null);
     defer runtime.deinit();
     const worker = try alloc.create(Worker);
     worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "failed"), .kind = .{ .name = "failed", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1, .last_error_name = "InvalidData" };
@@ -3129,7 +3129,7 @@ test "issue1015 pause cleanup bypasses persistence for a durable worker" {
         fn truncate(_: *anyopaque, _: u64) !void {}
     };
     var probe = Probe{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null, null);
     defer runtime.deinit();
     const worker = try alloc.create(Worker);
     worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "healthy"), .kind = .{ .name = "healthy", .kind = .full_text }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1 };
@@ -3156,7 +3156,7 @@ test "issue1015 foreground visibility cleanup preserves runtime backoff" {
         }
     };
     var probe = Probe{};
-    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null, null);
     defer runtime.deinit();
     const worker = try alloc.create(Worker);
     worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1 };
@@ -3189,7 +3189,7 @@ test "issue1015 durable idle cleanup skips persistence" {
         }
     };
     var probe = Probe{};
-    var runtime = try DerivedRuntime.init(a, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(a, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null, null);
     defer runtime.deinit();
     const worker = try a.create(Worker);
     worker.* = .{ .runtime = &runtime, .name = try a.dupe(u8, "durable"), .kind = .{ .name = "durable", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1 };
@@ -3228,7 +3228,7 @@ test "issue1015 idle cleanup persists a new watermark once" {
         }
     };
     var probe = Probe{};
-    var runtime = try DerivedRuntime.init(a, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    var runtime = try DerivedRuntime.init(a, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null, null);
     defer runtime.deinit();
     const worker = try a.create(Worker);
     worker.* = .{ .runtime = &runtime, .name = try a.dupe(u8, "durable"), .kind = .{ .name = "durable", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 0, .target_sequence = 1 };
