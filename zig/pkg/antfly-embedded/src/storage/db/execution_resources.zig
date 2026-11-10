@@ -229,6 +229,10 @@ pub const AsyncContext = struct {
     /// enrichment coverage publication. Provider calls never run under this
     /// lock; healthy produced/skipped coverage stays off this path.
     artifact_repair_issue_mutex: std.atomic.Mutex = .unlocked,
+    /// Foreground replay borrows the stable owner's ledger coordination while
+    /// retaining its own projection/capture capabilities.
+    shared_artifact_repair_issue_mutex: ?*std.atomic.Mutex = null,
+
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
@@ -244,6 +248,10 @@ pub const AsyncContext = struct {
     repair_options: types.ArtifactRepairRunOptions = .{},
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
+
+    pub fn artifactRepairIssueMutex(self: *const @This()) *std.atomic.Mutex {
+        return self.shared_artifact_repair_issue_mutex orelse &@constCast(self).artifact_repair_issue_mutex;
+    }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         stopNativeProjectionMaintenance(self);
