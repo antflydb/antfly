@@ -28,6 +28,7 @@ const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
 const writer_queue = @import("writer_queue.zig");
+const inode_lock = @import("inode_lock.zig");
 const wal_trace = @import("../write_amplification_trace.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
@@ -3690,7 +3691,7 @@ const PageAllocator = struct {
     record_used: usize = 0,
     record_page: u64 = 0,
     encoded_record: std.ArrayListUnmanaged(u8) = .empty,
-    data_lock_file: ?std.Io.File = null,
+    data_lock_file: ?inode_lock.Handle = null,
     coordinated_reader_window: bool = false,
     ledger: ?*allocator_v4.State = null,
     ledger_persisted: bool = false,
@@ -3704,8 +3705,8 @@ const PageAllocator = struct {
     metadata_cursor: usize = 0,
 
     pub fn deinit(self: *PageAllocator) void {
-        if (self.data_lock_file) |lock_file| {
-            lock_file.close(self.file.runtimeIo());
+        if (self.data_lock_file) |held| {
+            held.release(self.file.runtimeIo());
             self.file.epoch_window = null;
         }
         if (self.coordinated_reader_window) self.file.endReaderWindow();
@@ -3913,19 +3914,21 @@ const PageAllocator = struct {
         // Unsuspended own readers and every foreign reader still fence reuse.
         if (self.coordinated_reader_window) {
             if (self.file.reader_window_lock == null) {
-                const lock = self.file.acquireEpochReuseLock() catch |err| switch (err) {
+                const lock = self.file.acquireEpochReuseLock("resumeReuseIfUnblocked(coordinated)") catch |err| switch (err) {
                     error.WouldBlock => return,
                     else => return err,
                 };
-                self.file.reader_window_lock = lock.file;
+                if (builtin.mode == .debug) std.debug.assert(self.file.reader_window_lock == null);
+                self.file.reader_window_lock = lock;
             }
             self.can_reuse = true;
         } else {
-            const lock = self.file.acquireEpochReuseLock() catch |err| switch (err) {
+            const lock = self.file.acquireEpochReuseLock("resumeReuseIfUnblocked(uncoordinated)") catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
-            self.data_lock_file = lock.file;
+            if (builtin.mode == .debug) std.debug.assert(self.data_lock_file == null);
+            self.data_lock_file = lock;
             self.can_reuse = true;
         }
     }
@@ -5376,8 +5379,34 @@ pub const NativeFile = struct {
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
     reader_fence: ?*ReaderCoordinator.Fence = null,
+    /// This NativeFile's reference to the process-wide, per-inode lock
+    /// registry entry for `path` (see inode_lock.zig) -- established once,
+    /// at open/create time, and released exactly once, in `close()`. Every
+    /// in-process acquisition of the epoch-reuse (exclusive) or
+    /// reader-fence (shared) lock on the underlying file goes through this
+    /// entry, which is what lets independent NativeFile/Store instances on
+    /// the same path (as `externally_locked` explicitly allows) coordinate
+    /// through one kernel fd instead of self-conflicting across their own.
+    ///
+    /// Atomic, not a plain field: `replaceWithPreparedGeneration` (an
+    /// atomic generation swap -- vacuum, restore) redirects this to a
+    /// different entry mid-lifetime, and a concurrent foreground commit on
+    /// this same NativeFile can read it at any time (this codebase
+    /// deliberately allows a commit to interleave with another's released
+    /// "sync window" -- see that comment in `pageAllocatorFromFreeMapWithProof`).
+    /// A plain read during the swap could see a torn/mixed value; an
+    /// atomic load always sees a whole, valid entry pointer, either the
+    /// pre- or post-swap one. Whichever one a given acquire sees, the
+    /// `Handle` it gets back captures that exact entry, so a concurrent
+    /// swap can only ever affect which entry a *future* acquire resolves
+    /// to -- never which one an in-flight `Handle` releases against.
+    inode_lock_ref: std.atomic.Value(?*inode_lock.Entry) = .init(null),
+    /// The registry handle backing an outstanding `reader_fence`
+    /// (`acquireReaderFence`/`captureFullReadSnapshot`), released in
+    /// `releaseReaderFence` or, defensively, in `close()`.
+    reader_fence_lock: ?inode_lock.Handle = null,
     reader_window_depth: usize = 0,
-    reader_window_lock: ?std.Io.File = null,
+    reader_window_lock: ?inode_lock.Handle = null,
     epoch_window: ?@import("reader_epochs.zig").Frontier = null,
     /// Reader-epoch namespace directory, opened once and kept across many
     /// commits instead of being resolved/opened/closed from scratch on every
@@ -5641,7 +5670,21 @@ pub const NativeFile = struct {
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader or opts.externally_locked) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock);
+        const inode_entry = try inode_lock.open(io, path);
+        errdefer inode_lock.unref(inode_entry, io);
+
+        // Every read-only open used to ask `openDataFile` to take its
+        // `.shared` kernel lock atomically at open, on its own fd, for
+        // `.reader` mode (a plain reader with neither `internal_reader`
+        // nor `externally_locked` set). That self-conflicts the same way
+        // `acquireReaderFence` did against another NativeFile's warm
+        // `.exclusive` registry hold on this inode in this process.
+        // `.internal_reader` already means "no lock at open" to
+        // `openDataFile`; request that uniformly for every read-only open
+        // now, and acquire the registry's `.shared` grant explicitly for
+        // a plain reader below instead.
+        const plain_reader = opts.read_only and !opts.internal_reader and !opts.externally_locked;
+        const opened_file = try openDataFile(io, path, if (opts.read_only) .internal_reader else .writer, opts.wait_for_reader_lock);
         const file = opened_file.file;
         errdefer file.close(io);
 
@@ -5662,6 +5705,7 @@ pub const NativeFile = struct {
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
+            .inode_lock_ref = .init(inode_entry),
             .externally_locked = opts.externally_locked,
             .reader_coordinator = opts.reader_coordinator,
             .header = header,
@@ -5676,12 +5720,43 @@ pub const NativeFile = struct {
             else
                 null,
         };
-        if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
+        if (plain_reader) {
+            // Register with the coordinator *before* acquiring the
+            // registry grant below, so `blocks_exclusive` reflects whether
+            // this reader actually ended up with live epoch protection
+            // (`fence.epoch`/`fence.shared_epoch`, mirroring
+            // `Fence.hasEpoch()`, private to reader_coordinator.zig) --
+            // not just whether a coordinator exists and
+            // `header.indexed_reclamation` is set. `registerEpoch` itself
+            // silently falls back to no epoch at all
+            // (`error.UnsafeNativeReaderAlias`, caught inside it) for a
+            // reader on a path whose directory differs from the canonical
+            // one the epoch namespace is keyed by -- a hardlink or
+            // symlink alias. Guessing `blocks_exclusive` from
+            // `opts.reader_coordinator == null` alone, as an earlier,
+            // more hopeful version of this function did, granted the
+            // registry's `.shared` request free of any real exclusion for
+            // exactly that alias case, leaving the writer's own exclusive
+            // reuse completely unguarded.
             if (opts.reader_coordinator) |coordinator| result.reader_fence = if (header.indexed_reclamation)
                 try coordinator.registerEpoch(file, path, header.reader_epoch_namespace, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint(), true)
             else
                 try coordinator.registerFull(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
+            errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
+            const blocks_exclusive = if (result.reader_fence) |fence| !(fence.epoch != null or fence.shared_epoch != null) else true;
+            // Preserves the kernel-level protection a plain reader held
+            // for its whole lifetime before (`openDataFile`'s old atomic
+            // `.shared` lock at open), now through the registry so it
+            // cannot self-conflict against this same process's own
+            // warm `.exclusive` hold on the same inode.
+            // `opts.wait_for_reader_lock` is this call's only lever for
+            // fail-fast vs. wait; preserve it exactly. (A fail-fast
+            // acquire still retries briefly inside `inode_lock.acquire`
+            // before surfacing `error.WouldBlock` -- see
+            // `shared_fail_fast_retry_ns`.)
+            result.reader_fence_lock = try inode_lock.acquire(inode_entry, io, .shared, opts.wait_for_reader_lock, blocks_exclusive, "openWithRuntime(plain_reader)");
         }
+        errdefer if (result.reader_fence_lock) |handle| handle.release(io);
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
     }
@@ -5827,6 +5902,14 @@ pub const NativeFile = struct {
             try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
         }
 
+        // Only now, with the data file in its final place at `path`, can
+        // this resolve an inode to register with the process-wide lock
+        // registry (`inode_lock.zig`) -- `path` may not have existed at
+        // all before the staging/rename dance above for a first-time
+        // create.
+        const inode_entry = try inode_lock.open(io, path);
+        errdefer inode_lock.unref(inode_entry, io);
+
         var result = NativeFile{
             .allocator = allocator,
             .io_impl = owned_io_impl,
@@ -5834,6 +5917,7 @@ pub const NativeFile = struct {
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
+            .inode_lock_ref = .init(inode_entry),
             .header = initialized_header,
             .read_only = false,
             .no_sync = no_sync,
@@ -5869,6 +5953,19 @@ pub const NativeFile = struct {
         self.invalidateLedger();
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(io);
+        }
+        // Defensive: every acquirer above already pairs its own
+        // acquire/release (reader_window_lock is asserted empty just
+        // above; acquireReaderFence/captureFullReadSnapshot pair through
+        // releaseReaderFence). This only catches a caller that skipped
+        // that pairing instead of relying on it.
+        if (self.reader_fence_lock) |handle| {
+            handle.release(io);
+            self.reader_fence_lock = null;
+        }
+        if (self.inode_lock_ref.load(.acquire)) |entry| {
+            inode_lock.unref(entry, io);
+            self.inode_lock_ref.store(null, .release);
         }
         self.file.close(io);
         self.allocator.free(self.path);
@@ -6109,7 +6206,16 @@ pub const NativeFile = struct {
         if ((self.durable_header == null and !std.meta.eql(self.header, reader.header)) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
         reader.header = self.header;
         if (coordinated) {
-            try reader.file.lock(reader.runtime(), .shared);
+            // Same self-conflict `acquireReaderFence` guards against:
+            // `reader` is a fresh fd on this same writer's (`self`'s)
+            // path, and `self`'s own exclusive grant (if parked warm by
+            // `acquireEpochReuseLock`) would self-conflict a direct lock
+            // on `reader.file`'s own fd. Go through the shared per-inode
+            // registry entry instead -- `errdefer reader.close()` above
+            // releases this via `reader_fence_lock` if anything below
+            // still fails.
+            if (builtin.mode == .debug) std.debug.assert(reader.reader_fence_lock == null);
+            reader.reader_fence_lock = try reader.acquireInodeLock(.shared, true, false, "captureFullReadSnapshot");
             reader.reader_fence = if (self.header.indexed_reclamation)
                 try self.reader_coordinator.?.registerEpoch(reader.file, self.path, self.header.reader_epoch_namespace, inode, reader.metadataReuseFrontier(), self.headerFingerprint(), true)
             else
@@ -6358,30 +6464,148 @@ pub const NativeFile = struct {
         self.allocator_certificate_staged = true;
     }
 
-    /// Read-generation locks join the same-owner frontier only while pinned.
+    /// Acquires `mode` on this file's inode, through the process-wide
+    /// registry (`inode_lock_ref`) when one was established at open/create
+    /// time, or falling back to the original, unshared direct acquisition
+    /// (`inode_lock.acquireStandalone`) when it was not -- true only for a
+    /// handful of internal vacuum/compaction workspace `NativeFile`s built
+    /// directly rather than through `open`/`create`, on private or even
+    /// path-less temp files nothing else in this process could plausibly
+    /// share an inode with.
+    /// `blocks_exclusive` only matters for `mode == .shared` (see
+    /// `inode_lock.acquire`'s doc comment): pass `true` for a plain
+    /// reader relying solely on the kernel lock, `false` for one whose
+    /// protection against this same process's own writer comes from
+    /// `ReaderCoordinator` instead.
+    fn acquireInodeLock(self: *NativeFile, mode: inode_lock.Mode, blocking: bool, blocks_exclusive: bool, site: []const u8) !inode_lock.Handle {
+        // One atomic read of the current entry; the returned `Handle`
+        // captures this exact pointer, so a concurrent rebind
+        // (`replaceWithPreparedGeneration`) after this point can only
+        // affect a *later* acquire, never this one or its eventual release.
+        if (self.inode_lock_ref.load(.acquire)) |entry| return try inode_lock.acquire(entry, self.runtime(), mode, blocking, blocks_exclusive, site);
+        return try inode_lock.acquireStandalone(self.runtime(), self.path, mode, blocking);
+    }
+
+    /// Read-generation locks join the same-owner frontier only while
+    /// pinned. Acquires the shared grant through `inode_lock_ref` (the
+    /// process-wide, per-inode registry) rather than locking `self.file`'s
+    /// own fd directly: `self` (this reader) and `owner` (the writer being
+    /// fenced against) are different NativeFile instances with different
+    /// fds, possibly on the very same inode -- flock() does not recognize
+    /// a different fd from the same process as compatible with one
+    /// already held, so locking `self.file` directly here can queue
+    /// behind `owner`'s own exclusive hold (parked warm by
+    /// `acquireEpochReuseLock` to amortize it across commits) forever,
+    /// since nothing else in this process would ever release it for this
+    /// call. Going through the shared registry entry for this inode
+    /// instead makes that self-conflict structurally impossible: both
+    /// `owner`'s exclusive hold and this shared request resolve against
+    /// the same entry, which grants a `.shared` request for free whenever
+    /// it already holds `.exclusive` in-process.
     pub fn acquireReaderFence(self: *NativeFile, sequence: u64, owner: *NativeFile) !void {
-        try self.file.lock(self.runtime(), .shared);
-        errdefer self.file.unlock(self.runtime());
-        // A read-only owner's inode is its lock authority, including snapshots
-        // opened where no sidecar can be installed. Never switch that authority
-        // merely because its directory becomes writable during the read.
+        // Register with the coordinator *before* deciding `blocks_exclusive`:
+        // whether this reader actually ends up with live epoch protection
+        // (the writer's own `scanReaderEpochsCached`/`epoch_window` can see
+        // it) is only known after the attempt, not from
+        // `self.header.indexed_reclamation and !owner.read_only` alone.
+        // `coordinator.registerEpoch` itself silently falls back to an
+        // inode-only fence (`error.UnsafeNativeReaderAlias`, caught inside
+        // it) for a reader on a path whose directory differs from the
+        // canonical one the epoch namespace is keyed by -- a hardlink or
+        // symlink alias, exactly the case the earlier, pre-registration
+        // guess got backwards: it saw `indexed_reclamation` true and
+        // `owner` not read-only, concluded epoch protection would cover
+        // this reader, and granted the registry's `.shared` request for
+        // free of any real exclusion -- while the fence it got back was
+        // inode-only the whole time, leaving the writer's own exclusive
+        // reuse completely unguarded against this alias.
         if (self.reader_coordinator) |coordinator| self.reader_fence = if (self.header.indexed_reclamation and !owner.read_only)
             try coordinator.registerEpoch(self.file, self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false)
         else
             try coordinator.registerInodeOnly(self.file, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint());
+        errdefer if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
+        // Only a fence that actually got a live `epoch`/`shared_epoch`
+        // (`Fence.hasEpoch()`, private to reader_coordinator.zig --
+        // inlined here) is covered by that separate mechanism instead;
+        // see `inode_lock.Entry.blocking_shared_count`'s doc comment.
+        // `inode_only` is not the right signal: `registerFull` always
+        // sets it `false` despite registering no epoch at all, and
+        // `registerEpoch`'s own alias fallback can set it `true` while
+        // still being the thing to check for (both end up correctly
+        // `blocks_exclusive = true` only by checking `hasEpoch` directly).
+        // Every case without a live epoch -- no coordinator,
+        // `registerInodeOnly`/`registerFull`, or `registerEpoch`'s own
+        // alias fallback -- still needs this lock to actively block this
+        // process's own exclusive reuse too.
+        const blocks_exclusive = if (self.reader_fence) |fence| !(fence.epoch != null or fence.shared_epoch != null) else true;
+        const handle = try self.acquireInodeLock(.shared, true, blocks_exclusive, "acquireReaderFence");
+        errdefer handle.release(self.runtime());
+        // A plain read-only open (`openWithRuntime`'s `plain_reader`
+        // branch) already took its own shared grant, stored here, before
+        // this call -- a caller that later attaches a `reader_coordinator`
+        // and then explicitly calls `acquireReaderFence` (as a test
+        // simulating "retroactively coordinated" readers does) would
+        // otherwise overwrite that handle here without ever releasing it,
+        // permanently leaking its `blocking_shared_count` share.
+        if (self.reader_fence_lock) |stale| stale.release(self.runtime());
+        self.reader_fence_lock = null;
+        if (builtin.mode == .debug) std.debug.assert(self.reader_fence_lock == null);
+        self.reader_fence_lock = handle;
     }
     pub fn releaseReaderFence(self: *NativeFile) void {
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         self.reader_fence = null;
-        self.file.unlock(self.runtime());
+        if (self.reader_fence_lock) |handle| {
+            handle.release(self.runtime());
+            self.reader_fence_lock = null;
+        }
     }
-    fn acquireEpochReuseLock(self: *NativeFile) !LockFile {
+    /// Acquires this inode's shared epoch-reuse (exclusive) grant through
+    /// the process-wide registry (`inode_lock_ref`), never blocking: a
+    /// foreign process already holding anything conflicting surfaces as
+    /// `error.WouldBlock`, which every caller already treats as "skip
+    /// reuse this commit." Granted for free (no kernel call) whenever this
+    /// process -- any NativeFile on this inode, not just `self` -- already
+    /// holds the kernel lock exclusively; that in-process sharing, and the
+    /// warm parking across commits once released, both live inside the
+    /// registry entry now, not on this NativeFile.
+    fn acquireEpochReuseLock(self: *NativeFile, caller: []const u8) !inode_lock.Handle {
         self.epoch_window = null;
-        const lock = try acquireDataRewriteLock(self.runtime(), self.path);
-        errdefer lock.file.close(self.runtime());
-        if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
+        if (self.activeCheckpoint().free_map_root_page != 0) {
+            // Same hazard the old direct-reacquire path guarded against:
+            // an external rename/replace (backup/restore, vacuum) could
+            // have swapped the file at `self.path` out from under this
+            // NativeFile since it was opened. A plain `statFile` (no
+            // `open`) is enough: it tells us what `self.path` currently
+            // resolves to, and `self.file`'s own inode never changes for
+            // this NativeFile's lifetime, so comparing the two still
+            // catches the same case the old open-and-compare did.
+            const current = std.Io.Dir.cwd().statFile(self.runtime(), self.path, .{}) catch return error.EnrichmentSourceChanged;
+            if (current.inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
+        }
+        // `caller` (not a fixed literal) so the permanent debug-outstanding
+        // dump in inode_lock.zig names the actual call site -- beginReaderWindow
+        // vs. either branch of resumeReuseIfUnblocked -- not just this
+        // shared wrapper, which is what originally hid an overwritten-handle
+        // leak behind a single undifferentiated label.
+        const handle = try self.acquireInodeLock(.exclusive, false, false, caller);
+        // `handle` is already checked out (the registry's exclusive_count is
+        // already incremented) at this point -- `scanReaderEpochsCached`
+        // below is a separate, unrelated filesystem operation (the reader-
+        // epoch namespace scan) that can itself fail, including with
+        // `error.WouldBlock` surfaced from deeper in that scan. Every caller
+        // of this function already treats any error here as "skip reuse
+        // this commit" and never looks at `handle`, so without this
+        // `errdefer` that failure leaked the just-acquired handle forever:
+        // exclusive_count stays incremented, `entry.state` stays `.exclusive`,
+        // and nothing ever balances it. This was silent because the leaked
+        // handle still results in `lock_nonnull == false` at every call
+        // site above (the error, including a nested WouldBlock, is caught
+        // there too) -- there was nothing at that layer to show the
+        // registry had already been charged for a handle nobody kept.
+        errdefer handle.release(self.runtime());
         if (self.header.indexed_reclamation) self.epoch_window = try self.scanReaderEpochsCached();
-        return lock;
+        return handle;
     }
 
     /// `reader_namespace`, opened once and reopened whenever it can no
@@ -6453,14 +6677,15 @@ pub const NativeFile = struct {
         errdefer self.minimum_metadata_reader_sequence = self.reader_window_previous_metadata_frontier;
         // Even an append-only owner must fence and account for readers before
         // promoting retirement. Proof authority separately controls page reuse.
-        const held = self.acquireEpochReuseLock() catch |err| switch (err) {
+        const held = self.acquireEpochReuseLock("beginReaderWindow") catch |err| switch (err) {
             error.WouldBlock => blk: {
                 self.allocator_work.reuse_lock_refusals +|= 1;
                 break :blk null;
             },
             else => return err,
         };
-        self.reader_window_lock = if (held) |lock| lock.file else null;
+        if (builtin.mode == .debug) std.debug.assert(self.reader_window_lock == null);
+        self.reader_window_lock = held;
         self.reader_window_depth = 1;
         return true;
     }
@@ -6468,7 +6693,7 @@ pub const NativeFile = struct {
         std.debug.assert(self.reader_window_depth != 0);
         self.reader_window_depth -= 1;
         if (self.reader_window_depth != 0) return;
-        if (self.reader_window_lock) |held| held.close(self.runtime());
+        if (self.reader_window_lock) |held| held.release(self.runtime());
         self.reader_window_lock = null;
         self.epoch_window = null;
         self.minimum_reader_sequence = self.reader_window_previous_frontier;
@@ -10848,8 +11073,13 @@ pub const NativeFile = struct {
 
     pub fn vacuumWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
-        var data_lock = try acquireDataRewriteLock(self.runtimeIo(), self.path);
-        defer data_lock.file.close(self.runtimeIo());
+        // Through the registry, like every other exclusive grant on this
+        // inode: a raw `acquireDataRewriteLock` here would self-conflict
+        // against any in-process warm `.exclusive` hold on the same inode
+        // (this file's own parked epoch-reuse lock, or another NativeFile
+        // on the same path in an `externally_locked` setup).
+        const data_lock = try self.acquireInodeLock(.exclusive, false, false, "vacuumWithCancel");
+        defer data_lock.release(self.runtimeIo());
         if (self.header.indexed_reclamation) {
             const epochs = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
             if (epochs.data != null) return error.WouldBlock;
@@ -11183,7 +11413,22 @@ pub const NativeFile = struct {
         if (!self.no_sync) try compact_file.sync(io);
         if (cancel) |token| try token.check();
         compact_file_open = false;
-        return .{ .prepared = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit }, .report = .{
+        // `prepared` gets published into `self.path`'s place
+        // (`replaceWithPreparedGeneration`, called from the owning
+        // `Store`'s vacuum path) and so *becomes* the live file other
+        // NativeFile instances in this process -- including a fresh probe
+        // like `Store.checkWithCancel`'s -- can concurrently open on that
+        // same path/inode. Without a real registry entry here, every one
+        // of this NativeFile's own commits during the catch-up/residual
+        // phase that runs *after* that publish would fall back to
+        // `acquireInodeLock`'s unshared `acquireStandalone` path (a fresh
+        // raw fd per acquisition on `tmp_path`, which the rename has
+        // already moved to be the very same inode `self.inode_lock_ref`
+        // now points to after the swap) and self-conflict against
+        // anything using the registry on that inode, the same class of
+        // bug this registry exists to rule out everywhere else.
+        const inode_entry = try inode_lock.open(io, tmp_path);
+        return .{ .prepared = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit, .inode_lock_ref = .init(inode_entry) }, .report = .{
             .before_size = before_size,
             .after_size = after_size,
             .reclaimed_bytes = if (before_size > after_size) before_size - after_size else 0,
@@ -12064,12 +12309,12 @@ pub const NativeFile = struct {
             const skip_reuse_lock = !has_retirement_backlog and self.reader_window_depth == 0;
             const coordinated = if (skip_reuse_lock) false else try self.beginReaderWindow();
             errdefer if (coordinated) self.endReaderWindow();
-            const lock = if (skip_reuse_lock or coordinated) null else self.acquireEpochReuseLock() catch |err| switch (err) {
+            const lock = if (skip_reuse_lock or coordinated) null else self.acquireEpochReuseLock("pageAllocatorFromFreeMapWithProof(indexed)") catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
             };
             errdefer if (lock) |held| {
-                held.file.close(self.runtimeIo());
+                held.release(self.runtimeIo());
                 self.epoch_window = null;
             };
             // `retirement_work_pages` is the *background* maintenance budget
@@ -12091,7 +12336,7 @@ pub const NativeFile = struct {
             // forward between calls; nothing here re-scans from the start.
             _ = try self.drainRetirement(state, checkpoint, @min(self.retirement_work_pages, foreground_retirement_cap_pages));
             const can_reuse = self.free_pages_verified and (lock != null or (coordinated and self.reader_window_lock != null));
-            return .{ .file = self, .free_pages = &.{}, .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count), .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
+            return .{ .file = self, .free_pages = &.{}, .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count), .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = lock };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
@@ -12099,9 +12344,16 @@ pub const NativeFile = struct {
             try self.validateFreePagesSafeForCheckpointSlots(free_pages);
             self.free_pages_verified = true;
         }
-        var data_lock_file: ?std.Io.File = null;
+        // Same registry-backed exclusive grant as the indexed branch above
+        // (`acquireEpochReuseLock`), not a direct `acquireDataRewriteLock`:
+        // a non-indexed file can just as well have another NativeFile on
+        // the same inode in this process (an `externally_locked` sibling
+        // Store, a reader doing `acquireReaderFence`), and a raw
+        // `acquireDataRewriteLock` here would self-conflict against it the
+        // same way the old per-commit epoch-reuse lock did.
+        var data_lock_file: ?inode_lock.Handle = null;
         if (self.free_pages_verified and free_pages.len > 0) {
-            const data_lock = acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
+            data_lock_file = self.acquireInodeLock(.exclusive, false, false, "pageAllocatorFromFreeMapWithProof(non-indexed)") catch |err| switch (err) {
                 error.WouldBlock => blk: {
                     self.allocator.free(free_pages);
                     free_pages = try self.allocator.alloc(u64, 0);
@@ -12109,9 +12361,6 @@ pub const NativeFile = struct {
                 },
                 else => return err,
             };
-            if (data_lock) |lock| {
-                data_lock_file = lock.file;
-            }
         }
         return .{
             .file = self,
@@ -13688,6 +13937,44 @@ pub const NativeFile = struct {
         try renameFilePath(io, prepared.path, self.path);
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
+        // `self.file` now holds the fd `prepared` had open on its own
+        // (staging) path, which the rename above just moved into
+        // `self.path`'s place -- the inode is unchanged by a rename, so
+        // `prepared.inode_lock_ref` (resolved against that same inode,
+        // before the rename, at `prepared`'s own open/create time) is
+        // still the correct shared registry entry for what is now
+        // `self.path`'s target.
+        //
+        // Plain field reads/writes would race here: this codebase
+        // deliberately allows a foreground commit to interleave with
+        // another's released "sync window" (see that comment in
+        // `pageAllocatorFromFreeMapWithProof`), and such a commit, running
+        // on another thread, could read `self.inode_lock_ref` at any time,
+        // including while this swap is in progress. Atomics give it a
+        // whole, valid pointer either way -- the pre-swap or the post-swap
+        // entry, never a torn one -- and whichever one it sees, the
+        // `Handle` it acquires captures that exact entry (see
+        // `inode_lock.zig`'s module doc comment), so this swap can only
+        // ever change which entry a *future* acquire resolves to, never
+        // which one an in-flight one releases against.
+        const self_entry = self.inode_lock_ref.load(.acquire);
+        const prepared_entry = prepared.inode_lock_ref.load(.acquire);
+        self.inode_lock_ref.store(prepared_entry, .release);
+        prepared.inode_lock_ref.store(self_entry, .release);
+        // Tell the entry now reachable at `self.path` that its path
+        // moved: a lazy fd reopen inside it (`ensureFd`, only reached if
+        // `entry.fd` had gone back to `null`) must use the name the file
+        // is reachable at *now*, not the one it was opened under
+        // originally. `prepared`'s post-swap entry (if any) now refers to
+        // the retired file the rename just replaced -- unlinked,
+        // reachable by no path at all (its fd, if `entry.fd` is already
+        // populated, stays valid regardless; `prepared.path`, the old
+        // staging name, was never a name for this file and would be
+        // actively wrong to rebind to). `prepared` is always closed by
+        // its caller shortly after this call adopts its contents, well
+        // before anything could need a lazy reopen there.
+        if (prepared_entry) |entry| inode_lock.rebind(entry, io, self.path) catch {};
+        if (self.inode_lock_ref.load(.acquire)) |entry| std.debug.assert(entry.inode == (try self.file.stat(io)).inode);
         const retired_header = self.header;
         self.header = prepared.header;
         prepared.header = retired_header;
@@ -19955,7 +20242,17 @@ test "lite vacuum catchup bounds retained inline bytes and rolls back mid-copy c
         budget.limit = budget.live + 5 * 1024 * 1024;
         var cancel = maintenance.CancelToken{};
         budget.cancel = &cancel;
-        budget.cancel_after = 4000;
+        // Tuned to land mid-copy, not after it: a full, uncanceled copy of
+        // all 4096 documents now takes ~966 allocations through this
+        // allocator (measured directly), well under the 4000 this value
+        // used to be -- continued per-write allocation reduction elsewhere
+        // in `applyCapturedChanges`'s copy path means this number goes
+        // stale again whenever that cost drops further. Keep it a healthy
+        // margin below a fresh measurement (not just one less than it) so
+        // a small future reduction does not immediately make this test
+        // start asserting a cancellation that no longer happens before
+        // completion.
+        budget.cancel_after = 400;
         try std.testing.expectError(error.MaintenanceCanceled, file.applyCapturedChanges(&image.prepared, &capture, &image.report, &cancel));
         try std.testing.expect(image.prepared.test_page_writes.load(.monotonic) > 0);
         try std.testing.expectEqualDeep(before, image.prepared.activeCheckpoint());
@@ -22777,6 +23074,139 @@ test "lite allocator v4 external reader waits for in place reclamation lock" {
     joined = true;
     try context.result;
     try std.testing.expect(context.opened.load(.acquire));
+}
+
+// Regressions for a same-process self-deadlock the inode_lock registry
+// (inode_lock.zig) exists to make structurally impossible: an exclusive
+// grant this process parks warm on one NativeFile's fd (to amortize
+// acquireEpochReuseLock's kernel call across commits) used to self-conflict
+// against a *different* fd this same process opened on the very same
+// inode, since flock() is scoped to the open file description, not the
+// process. Both regressions below run the would-hang call on a background
+// task with a bounded deadline, so a recurrence fails the test instead of
+// hanging the whole suite.
+fn runBoundedReaderFence(a: Allocator, io: std.Io, path: []const u8, coordinator: *ReaderCoordinator, owner: *NativeFile) !void {
+    const Reader = struct {
+        opened: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This(), allocator: Allocator, runtime_io: std.Io, source: []const u8, coord: *ReaderCoordinator, writer: *NativeFile) void {
+            self.read(allocator, runtime_io, source, coord, writer) catch |err| {
+                self.result = err;
+            };
+        }
+        fn read(self: *@This(), allocator: Allocator, runtime_io: std.Io, source: []const u8, coord: *ReaderCoordinator, writer: *NativeFile) !void {
+            var reader = try NativeFile.openWithIo(allocator, runtime_io, source, .{ .read_only = true, .internal_reader = true, .reader_coordinator = coord });
+            defer reader.close();
+            try reader.acquireReaderFence(writer.activeCheckpoint().commit_sequence, writer);
+            defer reader.releaseReaderFence();
+            self.opened.store(true, .release);
+        }
+    };
+    var context = Reader{};
+    var future = try io.concurrent(Reader.run, .{ &context, a, io, path, coordinator, owner });
+    var joined = false;
+    defer if (!joined) future.await(io);
+    const deadline = std.Io.Clock.awake.now(io).addDuration(std.Io.Duration.fromSeconds(3));
+    while (!context.opened.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) {
+            future.await(io);
+            joined = true;
+            return error.TestUnexpectedResult;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    future.await(io);
+    joined = true;
+    try context.result;
+}
+
+test "lite reader fence after a warm writer succeeds instead of hanging" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "warm-writer-reader-fence.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('a');
+    // The first write has nothing to retire yet (skip_reuse_lock stays
+    // true). Each write after that sees the previous one's retirement in
+    // the ledger, so by the last of these the inline commit actually
+    // acquires (not skips) the inode registry's exclusive grant, which
+    // then stays parked warm on the registry entry (not on `writer`)
+    // after the commit releases it.
+    for (0..5) |_| try writer.putDocument("doc", &value);
+    try runBoundedReaderFence(a, io, path, &coordinator, &writer);
+}
+
+test "lite reader fence succeeds across two independently opened NativeFile instances on one externally-locked path" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "shared-inode-reader-fence.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    // `first` and `second` are two entirely independent NativeFile
+    // instances (as two independently opened `externally_locked` Stores
+    // on the same path would be) that happen to share one underlying
+    // inode. `first` parks a warm exclusive grant on the shared registry
+    // entry from its own writes; a reader fenced against `second` -- a
+    // different NativeFile, with its own fd, that itself never wrote
+    // anything -- must still succeed promptly, because both resolve to
+    // the one inode_lock Entry for this path, not because of anything
+    // `second` itself did.
+    var first = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true, .exclusive = false });
+    defer first.close();
+    first.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('b');
+    for (0..5) |_| try first.putDocument("doc", &value);
+    var second = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+    defer second.close();
+    second.reader_coordinator = &coordinator;
+    try runBoundedReaderFence(a, io, path, &coordinator, &second);
+}
+
+// A genuinely foreign process is simulated the same way
+// "lite allocator v4 external reader waits for in place reclamation lock"
+// (above) does: a raw, independent fd via `acquireDataRewriteLock`,
+// bypassing this process's own inode_lock registry entirely -- real
+// cross-process contention has no shared in-memory state to consult.
+test "lite warm parked exclusive still blocks a genuinely foreign probe but not this process's own shared read" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "warm-parked-foreign-probe.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('c');
+    // Same as the other warm-writer tests: enough overwrites that the last
+    // commit's inline drain actually acquires (not skips) the exclusive
+    // grant, which then stays parked -- no in-process holder, kernel lock
+    // still held -- on the registry entry afterward.
+    for (0..5) |_| try writer.putDocument("doc", &value);
+    // A truly independent fd (standing in for a different OS process)
+    // still sees the real kernel lock: parking is not just bookkeeping.
+    const foreign = acquireDataRewriteLock(io, path) catch |err| switch (err) {
+        error.WouldBlock => null,
+        else => return err,
+    };
+    try std.testing.expect(foreign == null);
+    // This process's own fail-fast shared read, by contrast, is granted
+    // for free against its own parked (not actively held) exclusive --
+    // the whole point of distinguishing parked from actively-held in the
+    // registry (inode_lock.zig's `acquire`/`tryAcquireSharedOnce`).
+    try runBoundedReaderFence(a, io, path, &coordinator, &writer);
 }
 
 test "lite immutable checksums traverse linked values once and seek extent ranges" {
