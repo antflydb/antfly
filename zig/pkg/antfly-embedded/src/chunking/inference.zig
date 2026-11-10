@@ -24,7 +24,6 @@ const http_common = @import("../common/http/http_common.zig");
 const std_http_listener = @import("../common/http/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
 const chunk_provider = @import("provider.zig");
-const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const inference_work = @import("antfly_inference_work");
 const execution_context = @import("antfly_inference_execution_context");
@@ -34,30 +33,12 @@ const Allocator = std.mem.Allocator;
 const remote_chunk_max_response_bytes: usize = 16 << 20;
 const remote_chunk_max_timeout_ms: u64 = 300_000;
 
-const ChunkInputFn = *const fn (
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    input: inference_chunker.Input,
-    config: chunking_types.Config,
-) anyerror![]inference_chunker.Chunk;
-const ChunkInputWithContextFn = *const fn (
-    ptr: *anyopaque,
-    alloc: Allocator,
-    model: []const u8,
-    input: inference_chunker.Input,
-    config: chunking_types.Config,
-    context: execution_context.RequestContext,
-) anyerror![]inference_chunker.Chunk;
+const ChunkInputFn = chunk_provider.ChunkInputFn;
+const ChunkInputWithContextFn = chunk_provider.ChunkInputWithContextFn;
 pub const ChunkPage = inference_chunker.types.ChunkPage;
 pub const RemoteMetadata = inference_chunker.types.ModelMetadata;
-const ChunkPageWithContextFn = *const fn (*anyopaque, Allocator, []const u8, inference_chunker.Input, chunking_types.Config, execution_context.RequestContext) anyerror!ChunkPage;
-const ChunkProviderVTable = struct {
-    chunk_page_with_context: ?ChunkPageWithContextFn = null,
-    chunk_input: ?ChunkInputFn = null,
-    chunk_input_with_context: ?ChunkInputWithContextFn = null,
-};
-const ChunkProviderBoundary = runtime_callback_abi.Boundary(ChunkProviderVTable);
+const ChunkPageWithContextFn = chunk_provider.ChunkPageWithContextFn;
+const ChunkProviderBoundary = chunk_provider.CallbackBoundary;
 
 pub const RemoteChunk = inference_chunker.Chunk;
 pub const RemoteInput = inference_chunker.Input;

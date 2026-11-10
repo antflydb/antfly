@@ -6451,7 +6451,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     // Thousands of different parents must not build a second, linear worker
     // cache. Each parent is constructed once and indexed across scoring batches.
     {
-        runtime.config.chunk_provider = .{ .ptr = &probe, .chunk_input_with_context_callback = @ptrCast(&Probe.chunk) };
+        runtime.config.chunk_provider = .{ .ptr = &probe, .boundary_dispatch = chunk_provider.CallbackBoundary.local_dispatch, .chunk_input_with_context_callback = @ptrCast(&Probe.chunk) };
         defer runtime.config.chunk_provider = null;
         var session: @import("../../leann_recovery.zig").Session = .{};
         defer session.deinit();

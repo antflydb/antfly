@@ -24,6 +24,17 @@ const execution_context = @import("antfly_inference_execution_context");
 const httpx = @import("httpx");
 const std = @import("std");
 
+const chunker = @import("inference_chunker");
+const Config = @import("types.zig").Config;
+pub const ChunkInputFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, chunker.Input, Config) anyerror![]chunker.Chunk;
+pub const ChunkInputWithContextFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, chunker.Input, Config, execution_context.RequestContext) anyerror![]chunker.Chunk;
+pub const ChunkPageWithContextFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, chunker.Input, Config, execution_context.RequestContext) anyerror!chunker.types.ChunkPage;
+pub const CallbackBoundary = runtime_callback_abi.Boundary(struct {
+    chunk_page_with_context: ?ChunkPageWithContextFn = null,
+    chunk_input: ?ChunkInputFn = null,
+    chunk_input_with_context: ?ChunkInputWithContextFn = null,
+});
+
 pub const Provider = struct {
     ptr: ?*anyopaque = null,
     boundary_dispatch: ?runtime_callback_abi.CallbackDispatch = null,
