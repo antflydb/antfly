@@ -7375,7 +7375,7 @@ const UnsupportedEnrichmentRuntime = struct {
     pub fn resumeFrom(self: *@This(), sequence: u64, target_sequence: u64) !void {
         const next_applied = @min(self.applied_sequence, sequence);
         if (next_applied != self.applied_sequence) {
-            try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
+            try rewindAppliedSequenceWithRetry(self, scope_name, next_applied);
             self.applied_sequence = next_applied;
         }
         try clearReplayCursorWithRetry(self);
@@ -7515,9 +7515,8 @@ const UnsupportedEnrichmentRuntime = struct {
         if (max_seen > self.applied_sequence) {
             self.active_failure_fingerprint = 0;
             self.retry_error_has_request_identity = false;
-            try saveAppliedSequenceWithRetry(self, scope_name, max_seen);
-            self.applied_sequence = max_seen;
-            try clearReplayCursorWithRetry(self);
+            const applied = try publishAppliedProgressWithRetry(self, max_seen, runtimeStatusSnapshot(self));
+            self.applied_sequence = applied;
             self.processed_requests += processed_request_count;
             self.retrying = false;
             clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
@@ -7536,8 +7535,8 @@ const UnsupportedEnrichmentRuntime = struct {
     pub fn markAppliedThrough(self: *@This(), sequence: u64) !void {
         if (sequence <= self.applied_sequence) return;
         const before = runtimeStatusSnapshot(self);
-        try publishPrecomputedAppliedWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
-        _ = finishPrecomputedApplied(self, sequence, before);
+        const applied = try publishAppliedProgressWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
+        _ = finishPrecomputedApplied(self, sequence, applied, before);
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
@@ -8059,7 +8058,7 @@ const PlatformEnrichmentRuntime = struct {
         self.mutex.unlock(io);
 
         if (next_applied != current_applied) {
-            try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
+            try rewindAppliedSequenceWithRetry(self, scope_name, next_applied);
         }
         try clearReplayCursorWithRetry(self);
         // Persist retry retirement even when resume keeps the same applied
@@ -8325,9 +8324,9 @@ const PlatformEnrichmentRuntime = struct {
 
             // Publish all durable state before admitting visibility waiters. An
             // interrupted publication leaves the in-memory cut retryable too.
-            try publishPrecomputedAppliedWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
+            const applied = try publishAppliedProgressWithRetry(self, sequence, appliedRuntimeStatus(before, sequence));
             self.mutex.lockUncancelable(io);
-            const advanced = finishPrecomputedApplied(self, sequence, before);
+            const advanced = finishPrecomputedApplied(self, sequence, applied, before);
             if (advanced) broadcastRuntimeStateChanged(self, io);
             self.mutex.unlock(io);
             break :publication advanced;
@@ -10161,13 +10160,17 @@ fn runForegroundCatchUpPassOwned(
     // This write precedes the contiguous watermark: a crash can replay healthy
     // publications, but can never advance retention past deferred work.
     try scheduler.save(runtime);
-    const applied = @max(runtime.applied_sequence, scheduler.state.appliedThrough(scheduler.state.completedSequence()));
-    if (applied > runtime.applied_sequence) {
-        try saveAppliedSequenceWithRetry(runtime, scope_name, applied);
-        try clearReplayCursorWithRetry(runtime);
-    }
+    const completed = scheduler.state.appliedThrough(scheduler.state.completedSequence());
     runtime.mutex.lockUncancelable(io);
-    runtime.applied_sequence = applied;
+    const current_applied = runtime.applied_sequence;
+    const pending_status = if (completed > current_applied) runtimeStatusSnapshot(runtime) else null;
+    runtime.mutex.unlock(io);
+    const applied = if (pending_status) |status|
+        try publishAppliedProgressWithRetry(runtime, completed, status)
+    else
+        current_applied;
+    runtime.mutex.lockUncancelable(io);
+    runtime.applied_sequence = @max(runtime.applied_sequence, applied);
     // A full queue still checks a newly notified primary revision once, so
     // deletion/replacement can release slots without a busy polling loop.
     runtime.scoped_retry_observed_target = @max(runtime.scoped_retry_observed_target, target_sequence);
@@ -36458,11 +36461,11 @@ fn appliedRuntimeStatus(before: enrichment_state.RuntimeStatus, sequence: u64) e
 }
 
 /// Caller owns the worker state mutex on threaded runtimes.
-fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, before: enrichment_state.RuntimeStatus) bool {
-    if (sequence <= runtime.applied_sequence) return false;
-    const reset_retry = before.target_sequence <= sequence and std.meta.eql(before, runtimeStatusSnapshot(runtime));
-    runtime.applied_sequence = sequence;
-    runtime.target_sequence = @max(runtime.target_sequence, sequence);
+fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, applied: u64, before: enrichment_state.RuntimeStatus) bool {
+    if (applied <= runtime.applied_sequence) return false;
+    const reset_retry = applied == sequence and before.target_sequence <= sequence and std.meta.eql(before, runtimeStatusSnapshot(runtime));
+    runtime.applied_sequence = applied;
+    runtime.target_sequence = @max(runtime.target_sequence, applied);
     if (reset_retry) {
         if (@hasField(EnrichmentRuntime, "last_error_name")) runtime.last_error_name = null;
         runtime.retrying = false;
@@ -36480,14 +36483,14 @@ fn finishPrecomputedApplied(runtime: *EnrichmentRuntime, sequence: u64, before: 
     return true;
 }
 
-fn publishPrecomputedAppliedWithRetry(runtime: *EnrichmentRuntime, sequence: u64, status: enrichment_state.RuntimeStatus) !void {
+fn publishAppliedProgressWithRetry(runtime: *EnrichmentRuntime, sequence: u64, status: enrichment_state.RuntimeStatus) !u64 {
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
     const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.publishAppliedProgress(runtime.alloc, live_store.*, scope_name, sequence, config_hash, status) catch |err| switch (err) {
+        return enrichment_state.publishAppliedProgress(runtime.alloc, live_store.*, scope_name, sequence, config_hash, status) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -36495,11 +36498,10 @@ fn publishPrecomputedAppliedWithRetry(runtime: *EnrichmentRuntime, sequence: u64
             },
             else => return err,
         };
-        return;
     }
 }
 
-fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
+fn rewindAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
@@ -37381,7 +37383,7 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
         .config_hash = 0,
     });
 
-    try saveAppliedSequenceWithRetry(&runtime, scope_name, 5);
+    try std.testing.expectEqual(@as(u64, 5), try publishAppliedProgressWithRetry(&runtime, 5, runtimeStatusSnapshot(&runtime)));
     const degraded_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 5), degraded_checkpoint.applied_sequence);
     try std.testing.expectEqual(enrichment_state.ProjectionStatus.degraded, degraded_checkpoint.status);
