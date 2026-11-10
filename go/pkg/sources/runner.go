@@ -276,6 +276,16 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if err := writeJSON(r.CatalogPath, catalog, 32<<20); err != nil {
 			return err
 		}
+		// Tie the completed acquisition to the catalog fence only after both
+		// publications succeed. A crash before this checkpoint fails closed.
+		identity, err := sourceAcquisitionIdentity(source, connection)
+		if err != nil {
+			return err
+		}
+		receipt := completedPublication{Identity: identity, Revision: revision, Endpoint: r.Profile.Endpoint, Table: source.Table, SourceID: source.ID}
+		if err := writeJSON(filepath.Join(r.StateDir, source.ID+".publication.json"), receipt, 1<<20); err != nil {
+			return err
+		}
 	}
 	return nil
 }

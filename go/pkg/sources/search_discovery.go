@@ -23,6 +23,13 @@ import (
 	"path/filepath"
 )
 
+// completedPublication is a small local receipt written only after inventory and
+// catalog publication succeed. Keeping it separate avoids decoding the inventory
+// for processing-only edits. Legacy checkpoints require one sync to establish it.
+type completedPublication struct {
+	Identity, Revision, Endpoint, Table, SourceID string
+}
+
 // RefreshSearchDiscovery republishes consumer declarations over an already
 // acquired generation. It never acquires content or extends its access expiry.
 // A configuration or destination mismatch requires a normal source run.
@@ -72,22 +79,18 @@ func (r *Runner) RefreshSearchDiscovery(ctx context.Context, sourceID string) er
 			if !ok {
 				return nil
 			}
-			identityConnection := connection
-			if connection.Provider == ProviderGoogleWorkspace {
-				identityConnection.Services = nil
-			}
-			hash, err := sourceConfigurationHash(source, identityConnection)
+			identity, err := sourceAcquisitionIdentity(source, connection)
 			if err != nil {
 				return err
 			}
-			var state runState
-			if err := loadJSON(filepath.Join(r.StateDir, source.ID+".json"), &state, 256<<20); err != nil {
+			var state completedPublication
+			if err := loadJSON(filepath.Join(r.StateDir, source.ID+".publication.json"), &state, 1<<20); err != nil {
 				if errors.Is(err, os.ErrNotExist) {
 					return nil
 				}
 				return err
 			}
-			if state.ConfigHash != hash || state.SourceID != source.ID || state.Table != source.Table || state.Endpoint != catalog.Endpoint {
+			if state.Identity == "" || state.Identity != identity || state.SourceID != source.ID || state.Table != source.Table || state.Endpoint != catalog.Endpoint {
 				return nil
 			}
 			for i := range catalog.Sources {
@@ -95,15 +98,12 @@ func (r *Runner) RefreshSearchDiscovery(ctx context.Context, sourceID string) er
 				if binding.ID != source.ID || binding.Table != source.Table {
 					continue
 				}
-				if binding.DocumentVersion != SourceRecordVersion {
+				if binding.DocumentVersion != SourceRecordVersion || state.Revision == "" || state.Revision != binding.PublishedRevision {
 					return nil
 				}
 				binding.AcquisitionID = ""
 				if source.Knowledge != nil {
-					binding.AcquisitionID, err = sourceAcquisitionIdentity(source, connection)
-					if err != nil {
-						return err
-					}
+					binding.AcquisitionID = identity
 				}
 				binding.Knowledge = source.Knowledge
 				binding.SearchVersion, binding.Streams, binding.Artifacts = source.SearchVersion, source.Streams, source.Artifacts

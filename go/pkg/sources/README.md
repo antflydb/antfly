@@ -994,3 +994,11 @@ stable namespaces, curation references, temporal/current-state semantics, bounde
 queries, the standalone fixture and Colony deployment controls. Knowledge is
 fail-closed by default and requires an operator-enforced one-instance/one-audience
 boundary; source JSON cannot enable that boundary.
+
+Discovery-only edits reuse a completed publication only when its canonical
+acquisition identity (including the row-key namespace) and published revision
+match the local publication receipt. JSON object ordering does not change that
+identity. The receipt is written after successful inventory and catalog
+publication; interrupted publication or older state without a receipt requires a
+normal sync before discovery can be refreshed. Refresh never extends the access
+lease or relabels an old row-key generation.

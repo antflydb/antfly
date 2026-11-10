@@ -143,3 +143,44 @@ func TestAcquisitionWitnessIgnoresJSONLayoutWithoutRounding(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, before, different)
 }
+
+func TestDiscoveryRefreshCompletedPublicationFence(t *testing.T) {
+	for _, change := range []string{"namespace", "json_order", "legacy", "revision"} {
+		t.Run(change, func(t *testing.T) {
+			runner, _, _ := runnerFixture(t)
+			runner.Profile.Sources[0].Config = json.RawMessage(`{"prefix":"","bucket":"docs"}`)
+			require.NoError(t, runner.Sync(t.Context()))
+			var before Catalog
+			require.NoError(t, loadJSON(runner.CatalogPath, &before, 32<<20))
+			_, knowledge := knowledgeFixture(t)
+			runner.Profile.Sources[0].Knowledge = &knowledge
+			runner.KnowledgeAudience = "research"
+			switch change {
+			case "namespace":
+				runner.Profile.Sources[0].Identity.Namespace = "other"
+			case "json_order":
+				runner.Profile.Sources[0].Config = json.RawMessage(`{"bucket":"docs","prefix":""}`)
+			default:
+				path := filepath.Join(runner.StateDir, testSourceID+".publication.json")
+				var state completedPublication
+				require.NoError(t, loadJSON(path, &state, 1<<20))
+				if change == "legacy" {
+					state.Identity = ""
+				} else {
+					state.Revision = "other"
+				}
+				require.NoError(t, writeJSON(path, state, 1<<20))
+			}
+			require.NoError(t, runner.RefreshSearchDiscovery(t.Context(), testSourceID))
+			var after Catalog
+			require.NoError(t, loadJSON(runner.CatalogPath, &after, 32<<20))
+			if change == "json_order" {
+				require.NotNil(t, after.Sources[0].Knowledge)
+				require.Equal(t, before.Sources[0].PublishedRevision, after.Sources[0].PublishedRevision)
+				require.Equal(t, before.Sources[0].ValidUntil, after.Sources[0].ValidUntil)
+			} else {
+				require.Equal(t, before, after)
+			}
+		})
+	}
+}
