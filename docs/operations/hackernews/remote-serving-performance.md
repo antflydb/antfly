@@ -1329,7 +1329,7 @@ qualification passed: 2.85 s cold, 3.17 s including startup, 232 ms server CPU a
 remaining. This remains above the sub-second target.
 
 The simulator falsified the expected descriptor improvement: the 1,000-row
-common-term query still fetched 16 descriptors and took 1.20 s at 30 ms injected
+common-term query still fetched 16 physical row maps and took 1.20 s at 30 ms injected
 RTT. Publication warming followed the compacted serving root (one segment), while
 exact ordering selected the canonical root (16 segments). The regression now
 constructs distinct roots and checks both against the warmed byte cache. The
@@ -1343,3 +1343,23 @@ columns retain fallback. The simulator checks both legacy numeric and typed
 ranges, independent logical IDs, exact/lower-bound total validity and retained
 pages. These corrections require fresh candidate validation; the measurements
 above do not include them.
+
+The broader regression also exercised a resumed append whose original canonical
+postings had been reclaimed. Canonical warming must remain optional when a
+compacted representation exists. The candidate now carries that policy through
+navigation, descriptors and tiny payloads, using a scoped hint view that cannot
+mark a mandatory recovery failure. Required serving reads retain recovery. The
+existing real-Parquet/checkpoint/cloud-certificate regression and a direct
+recovery-marker test qualify this distinction before candidate timings.
+
+Separating file manifests, scoring admissions and physical row manifests in the
+simulator identified those 16 GETs as physical row maps. The producer now uses a
+synchronous observer of validated routing records to capture all three dependency
+roles, plus bounded source metadata, rather than using a pruning callback only
+for scoring descriptors. Captured identities deduplicate before another provider
+read. This observation was made before the corrected candidate's optimized build.
+
+The corrected pre-build gate passes 15 focused tests, 93 broader targeted native
+tests, six simulator tests and 19 archive-helper tests, without failures or leaks.
+Ordered filter proofs now use the same typed lowering, with a regression that
+rejects a bound widened by f64 rounding. Fresh optimized timings remain pending.

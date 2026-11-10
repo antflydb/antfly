@@ -1290,7 +1290,7 @@ fn orderedFilterProof(a: A, table: catalog.Table, json: []const u8, enforced: []
     const parsed = try std.json.parseFromSlice(std.json.Value, ca, json, .{});
     const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(ca, parsed.value);
     var conditions: std.ArrayList(catalog.Condition) = .empty;
-    if (!try @import("lake_index_text_predicate.zig").exactConditions(ca, compiled, &conditions) or conditions.items.len == 0 or
+    if (!try @import("lake_index_text_predicate.zig").exactConditionsForTable(ca, compiled, &conditions, table) or conditions.items.len == 0 or
         !try compatibleSearchConditions(ca, table, conditions.items)) return null;
     var normalized: std.ArrayList(catalog.Condition) = .empty;
     for (conditions.items) |condition| {
@@ -2258,6 +2258,16 @@ test "external lake dynamic exact keys ordered filter proof binds exact conditio
     const proof = (try orderedFilterProof(a, table, json, &enforced)).?;
     const predicate: Predicate = .{ .cursor = undefined, .filter_proof = proof };
     try std.testing.expect(predicate.provesFilter(json));
+    const numeric = "{\"numeric_range\":{\"field\":\"id\",\"min\":0}}";
+    try std.testing.expect(try orderedFilterProof(a, table, numeric, &enforced) != null);
+    // A lower bound alone cannot prove the upper half of the numeric range.
+    try std.testing.expect(try orderedFilterProof(a, table, "{\"numeric_range\":{\"field\":\"id\",\"min\":0,\"max\":99}}", &enforced) == null);
+    const rounded = "{\"numeric_range\":{\"field\":\"id\",\"min\":9007199254740992,\"inclusive_min\":false}}";
+    var rounded_bound = [_]catalog.Condition{.{ .column = "id", .op = .gte, .value = .{ .integer = 9007199254740993 } }};
+    try std.testing.expect(try orderedFilterProof(a, table, rounded, &rounded_bound) == null);
+    rounded_bound[0].value.integer += 1;
+    try std.testing.expect(try orderedFilterProof(a, table, rounded, &rounded_bound) != null);
+
     try std.testing.expect(!predicate.provesFilter(
         \\{"range":{"id":{"gte":1}}}
     ));

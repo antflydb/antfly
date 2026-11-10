@@ -62,16 +62,22 @@ pub const Collector = struct {
     pub fn full(self: *const Collector) bool {
         return self.refs.items.len >= self.max_packs;
     }
+    fn memberKey(identity: []const u8, digest: [32]u8) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(identity);
+        hash.update(&digest);
+        return hash.finalResult();
+    }
+    pub fn containsIdentity(self: *const Collector, identity: []const u8, digest: [32]u8) bool {
+        return self.version == 2 and self.seen.contains(memberKey(identity, digest));
+    }
     pub fn addIdentity(self: *Collector, identity: []const u8, digest: [32]u8, bytes: []const u8) !void {
         try self.cancellation.check();
         if (self.full()) return;
         if (identity.len == 0 or identity.len > 4096) return error.InvalidNativeLakeTextOpeningPack;
         if (bytes.len > (if (self.version == 1) 1024 * 1024 else max_decoded_bytes) or bytes.len + identity.len + 38 + magic.len > max_decoded_bytes) return;
         if (self.version == 2) {
-            var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            hash.update(identity);
-            hash.update(&digest);
-            const key = hash.finalResult();
+            const key = memberKey(identity, digest);
             if (self.seen.contains(key)) return;
             try self.seen.put(self.a, key, {});
         }

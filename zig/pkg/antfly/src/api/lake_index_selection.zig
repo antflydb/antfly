@@ -310,12 +310,19 @@ test "external lake opening inventory coverage proofs bind immutable plans publi
             read: @import("lake_index_aggregate_artifact.zig").CachedRead,
             a: A,
             count: usize = 0,
-            fn keep(raw: *anyopaque, route: corpus.SegmentRouting) !bool {
+            fn record(raw: *anyopaque, value: *const @import("lake_index_text_directory.zig").SegmentRecord) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
-                const descriptor = route.descriptor orelse return error.MissingAdmissionDescriptor;
+                const descriptor = value.route.descriptor orelse return error.MissingAdmissionDescriptor;
                 _ = try corpus.loadCachedAdmissions(self.a, self.store, .{ .kind = .text_segment, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len }, .none, self.read);
+                for ([_]?@import("lake_index_aggregate_artifact.zig").ChunkRef{ value.manifest, value.physical }) |maybe| if (maybe) |ref| {
+                    const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(self.a, self.store, ref, .none, self.read);
+                    self.a.free(bytes);
+                };
+                for (value.sources) |span| {
+                    const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(self.a, self.store, span.physical, .none, self.read);
+                    self.a.free(bytes);
+                }
                 self.count += 1;
-                return true;
             }
         };
         var capture: Capture = .{ .store = artifact_store, .read = opening_read, .a = sa };
@@ -328,7 +335,7 @@ test "external lake opening inventory coverage proofs bind immutable plans publi
             for ([_]corpus.Root{ canonical, serving }) |root| {
                 const cursor = try @import("lake_index_text_directory.zig").RoutingCursor.create(sa, root, artifact_store, opening_read, .none);
                 defer cursor.deinit();
-                cursor.filter = .{ .ptr = &capture, .keep = Capture.keep };
+                cursor.observer = .{ .ptr = &capture, .record = Capture.record };
                 var identities: [64][32]u8 = undefined;
                 while (try cursor.next(&identities)) |_| {}
             }

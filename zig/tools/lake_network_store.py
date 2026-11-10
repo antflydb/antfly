@@ -102,7 +102,17 @@ class Store:
                     value = json.loads(body)
                     if isinstance(value, dict):
                         keys = set(value)
-                        if {"depth", "leaf", "records", "children"} <= keys:
+                        if {"segments", "admissions", "file"} <= keys:
+                            kind = (
+                                "segment_admission"
+                                if value.get("admissions")
+                                and not value.get("rows")
+                                and not value.get("descriptors")
+                                else "canonical_file_manifest"
+                                if value.get("admissions")
+                                else "physical_rows_manifest"
+                            )
+                        elif {"depth", "leaf", "records", "children"} <= keys:
                             kind = "generation_map"
                         elif {"metadata", "blocks", "bytes"} <= keys:
                             kind = "seekable_directory"

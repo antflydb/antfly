@@ -2011,6 +2011,9 @@ fn requiredConditionsTyped(a: A, input: Compiled, out: *std.ArrayList(Condition)
 pub fn exactConditions(a: A, input: Compiled, out: *std.ArrayList(Condition)) !bool {
     return collectConditions(a, input, out, 0);
 }
+pub fn exactConditionsForTable(a: A, input: Compiled, out: *std.ArrayList(Condition), table: local.sql_catalog.Table) !bool {
+    return collectConditionsTyped(a, input, out, 0, table);
+}
 fn collectConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize) !bool {
     return collectConditionsTyped(a, input, out, depth, null);
 }

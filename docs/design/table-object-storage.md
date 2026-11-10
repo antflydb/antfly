@@ -405,8 +405,10 @@ to authenticate every member independently.
 
 ### Bounded scoring admission in opening bundles
 
-Opening publication captures up to 64 segment admission descriptors through the
-existing validated, fragmented routing cursor. Canonical and compacted serving
+Opening publication observes up to 64 validated, fragmented routing records and
+captures scoring admissions, canonical file manifests and physical row maps.
+Inline source spans and source-page prefixes participate within 256 direct seed
+read attempts; already captured identities are skipped before provider reads. Canonical and compacted serving
 roots both participate, since exact ordering can select canonical segments even
 when a compacted root exists. Routing roots deduplicate within the bounded queue.
 Navigation roots retain priority;
@@ -415,6 +417,14 @@ existing decoded-byte, read-byte and bundle-count limits. This is an optional
 prefix cache, never a segment-selection limit: demand outside the prefix uses
 the original authenticated objects and generation-map fallback. No wire-format
 change or rewritten source identity is required.
+
+Canonical hints are optional when a compacted serving representation exists:
+compaction may have reclaimed their original postings. An opt-in artifact read
+view bypasses derived-recovery classification for those hints while preserving
+namespace, allocator, capabilities and I/O admission. Known missing/corrupt
+optional artifacts are skipped independently. Required serving reads retain their
+normal recovery policy; cancellation, deadlines and allocation failures propagate.
+The same distinction follows navigation pages and tiny payload seeds.
 
 Ranking decodes a separate authenticated admission view of each descriptor. It
 validates segment references and native section admissions without expanding

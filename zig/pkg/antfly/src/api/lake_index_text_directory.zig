@@ -43,6 +43,9 @@ pub const Roots = struct {
     }
 };
 pub const RouteFilter = struct { ptr: *anyopaque, keep: *const fn (*anyopaque, corpus.SegmentRouting) anyerror!bool };
+/// Synchronous observer of validated routing. Record storage is borrowed only
+/// for the call; observers cannot retain pointers into the cursor scratch arena.
+pub const RouteObserver = struct { ptr: *anyopaque, record: *const fn (*anyopaque, *const SegmentRecord) anyerror!void };
 pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
 pub const SegmentRecord = struct {
@@ -1118,6 +1121,7 @@ pub const RoutingCursor = struct {
     last_segment_docs: u32 = 0,
     pending: ?struct { identity: Id, bytes: u64, documents: u32 } = null,
     filter: ?RouteFilter = null,
+    observer: ?RouteObserver = null,
     included: bool = true,
     pruned: u32 = 0,
     pub const Window = struct { identities: []const Id, doc_offset: u64 };
@@ -1163,6 +1167,7 @@ pub const RoutingCursor = struct {
         self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
         self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;
         if (self.emitted > self.root.segment_count) return error.InvalidNativeLakeTextCorpus;
+        if (self.observer) |observer| try observer.record(observer.ptr, &record);
         self.included = if (self.filter) |filter| try filter.keep(filter.ptr, record.route) else true;
         if (!self.included) self.pruned += 1;
         return corpus.term_directory.identity(record.route.ref.artifact_id);
