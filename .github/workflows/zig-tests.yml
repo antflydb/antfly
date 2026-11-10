@@ -1041,12 +1041,12 @@ jobs:
           python3 tools/run_bounded_zig_build.py --report reports/wasm-embedded-build.json build wasm-test -Dmetal=false -j1 -freference-trace=30 --summary all
           python3 tools/run_bounded_zig_build.py --report reports/wasm-inference-build.json build inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
           EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
-          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
-          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-webgpu-build.json build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-inference64-build.json build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
           cd pkg/inference
-          zig build wasm -Dwasm=true -j1 --summary all
+          python3 ../../tools/run_bounded_zig_build.py --report ../../reports/wasm-abi32-build.json build wasm -Dwasm=true -j1 --summary all
           node web/test-wasm-abi.mjs wasm32
-          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
+          python3 ../../tools/run_bounded_zig_build.py --report ../../reports/wasm-abi64-build.json build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
           node web/test-wasm-abi.mjs wasm64
 
       - name: Upload WASM compiler memory profiles

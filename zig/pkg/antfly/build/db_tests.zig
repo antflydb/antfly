@@ -509,6 +509,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_state.test.enrichment apply state works with memory backend store",
         "storage.db.enrichment.enrichment_state.test.enrichment projection checkpoint persists status and identity fields",
         "storage.db.enrichment.enrichment_state.test.enrichment projection checkpoint rejects malformed structured state",
+        "storage.db.enrichment.enrichment_state.test.enrichment status publication keeps progress advanced before write admission",
         "storage.db.enrichment.enrichment_state.test.enrichment replay cursor rejects corruption",
         "storage.db.enrichment.enrichment_state.test.enrichment replay cursor round trips and clears independently",
         "storage.db.enrichment.enrichment_state.test.enrichment state lsm point loads do not clone mutable snapshot",

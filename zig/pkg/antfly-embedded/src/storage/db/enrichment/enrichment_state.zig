@@ -481,6 +481,25 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     try txn.commit();
 }
 
+/// Publish worker status and its projection metadata without replacing progress
+/// from a checkpoint read before write admission.
+pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: []const u8, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64) !void {
+    const key = try appliedSequenceKey(alloc, scope);
+    defer alloc.free(key);
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+    var checkpoint = if (raw) |bytes| try decodeProjectionCheckpoint(bytes) else ProjectionCheckpoint{};
+    checkpoint.status = projection_status;
+    checkpoint.config_hash = config_hash;
+    const encoded = encodeProjectionCheckpoint(checkpoint);
+    try txn.put(key, &encoded);
+    try putRuntimeStatusTxn(&txn, scope, status);
+    try txn.commit();
+}
+
 fn putRuntimeStatusTxn(txn: anytype, scope: []const u8, status: RuntimeStatus) !void {
     // Status is saved on the indexing hot path. Keep the four ordinary keys
     // on the stack; unusually long scopes share a single arena lifetime.
@@ -630,6 +649,50 @@ test "enrichment projection checkpoint persists status and identity fields" {
     try std.testing.expectEqual(@as(u64, 5), checkpoint.generation);
     try std.testing.expectEqual(@as(u64, 0x309), checkpoint.config_hash);
     try std.testing.expectEqual(@as(u64, 41), try loadAppliedSequence(std.testing.allocator, runtime, "generated"));
+}
+
+test "enrichment status publication keeps progress advanced before write admission" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+
+    try saveProjectionCheckpoint(store, "generated", .{ .applied_sequence = 4, .generation = 7 });
+    const Admission = struct {
+        var original: backend_erased.Store = undefined;
+        var writes: usize = 0;
+
+        fn begin(a: Allocator, ptr: *anyopaque) anyerror!backend_erased.WriteTxn {
+            writes += 1;
+            // Publish after the worker captured its status and immediately
+            // before its write transaction obtains a view of the checkpoint.
+            if (writes == 1) try publishAppliedProgress(a, original, "generated", 6, 11, .{ .target_sequence = 6 });
+            return original.vtable.begin_write(a, ptr);
+        }
+    };
+    var erased = try initRuntimeStore(alloc, store);
+    defer erased.deinit();
+    Admission.original = erased.store;
+    Admission.writes = 0;
+    var vtable = erased.store.vtable.*;
+    vtable.begin_write = Admission.begin;
+    var instrumented = erased.store;
+    instrumented.vtable = &vtable;
+    instrumented.write_gate = null;
+
+    const worker_status: RuntimeStatus = .{ .target_sequence = 8, .retrying = true };
+    try saveRuntimeStatusAndProjection(alloc, instrumented, "generated", worker_status, .degraded, 12);
+    try std.testing.expectEqual(@as(usize, 1), Admission.writes);
+
+    const checkpoint = try loadProjectionCheckpoint(alloc, store, "generated");
+    try std.testing.expectEqual(@as(u64, 6), checkpoint.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 7), checkpoint.generation);
+    try std.testing.expectEqual(@as(u64, 12), checkpoint.config_hash);
+    try std.testing.expectEqual(ProjectionStatus.degraded, checkpoint.status);
+    const persisted = try loadRuntimeStatus(alloc, store, "generated");
+    try std.testing.expect(persisted.retrying);
+    try std.testing.expectEqual(@as(u64, 8), persisted.target_sequence);
 }
 
 test "enrichment projection checkpoint rejects malformed structured state" {

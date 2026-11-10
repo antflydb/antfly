@@ -36676,27 +36676,11 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
+    const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
+    const projection_status = runtimeProjectionStatus(status.retrying, status.worker_failed);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveRuntimeStatus(live_store.*, scope, status) catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, live_store.*, scope) catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        checkpoint.status = runtimeProjectionStatus(status.retrying, status.worker_failed);
-        checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
-        enrichment_state.saveProjectionCheckpoint(live_store.*, scope, checkpoint) catch |err| switch (err) {
+        enrichment_state.saveRuntimeStatusAndProjection(runtime.alloc, live_store.*, scope, status, projection_status, config_hash) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
