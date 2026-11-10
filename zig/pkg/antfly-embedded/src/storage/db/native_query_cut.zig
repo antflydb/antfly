@@ -74,6 +74,52 @@ pub fn finishWithReuseDigest(a: A, io: std.Io, root: []const u8, request: Reques
     _ = try backup.writeFileDurable(io, try std.fmt.allocPrint(pa, "{s}/query-cut.json", .{root}), bytes);
     try fs_paths.syncDirPortable(io, root);
 }
+/// Extend only an unpublished local warm hint. Call under the parent guard;
+/// foreground bindings are immutable and never pass through this operation.
+pub fn renewWarm(allocator: A, io: std.Io, root: []const u8, previous: Request, request: Request, namespace: Namespace, cancellation: Cancellation) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Expiry is optional hint metadata. Validate its original binding without
+    // requiring that its old deadline still be current.
+    const path = try std.fs.path.join(a, &.{ root, "query-cut.json" });
+    const bytes = try backup.readFileAlloc(a, io, path, backup.max_manifest_bytes);
+    var manifest = try std.json.parseFromSliceLeaky(Manifest, a, bytes, .{});
+    try validateManifestBinding(manifest, previous, namespace);
+    try cancellation.check();
+    manifest.request = request;
+    _ = try backup.writeFileDurable(io, path, try std.json.Stringify.valueAlloc(a, manifest, .{}));
+    try fs_paths.syncDirPortable(io, root);
+}
+
+/// Clone an already sealed local checkpoint under the parent publication
+/// guard. The new manifest binds its own cursor expiry; no live read is reused.
+pub fn clone(allocator: A, io: std.Io, source: []const u8, target: []const u8, previous: Request, request: Request, namespace: Namespace, cancellation: Cancellation) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try validate(a, io, source, previous, namespace, cancellation);
+    const bytes = try backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ source, "query-cut.json" }), backup.max_manifest_bytes);
+    const manifest = try std.json.parseFromSliceLeaky(Manifest, a, bytes, .{});
+    const staging = try std.fmt.allocPrint(a, "{s}.staging", .{target});
+    try std.Io.Dir.cwd().deleteTree(io, staging);
+    try fs_paths.createDirPathPortable(io, staging);
+    errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    for (manifest.files) |file| {
+        try cancellation.check();
+        const from = try std.fs.path.join(a, &.{ source, file.path });
+        const to = try std.fs.path.join(a, &.{ staging, file.path });
+        try fs_paths.createDirPathPortable(io, std.fs.path.dirname(to).?);
+        try std.Io.Dir.cwd().hardLink(from, .cwd(), to, io, .{});
+    }
+    const rebound = try std.json.Stringify.valueAlloc(a, Manifest{ .request = request, .namespace = namespace, .sequence = manifest.sequence, .files = manifest.files, .reuse_digest = manifest.reuse_digest }, .{});
+    _ = try backup.writeFileDurable(io, try std.fs.path.join(a, &.{ staging, "query-cut.json" }), rebound);
+    _ = try seal.inventoryAlloc(a, io, staging, cancellation);
+    try fs_paths.syncDirPortable(io, staging);
+    try std.Io.Dir.rename(.cwd(), staging, .cwd(), target, io);
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(target).?);
+}
+
 pub fn validate(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !void {
     _ = try validateWithSourceProof(a, io, root, request, namespace, cancellation);
 }
@@ -313,6 +359,18 @@ fn admitPass(a: A, io: std.Io, db_path: []const u8, id: []const u8, limits: Limi
                 continue;
             }
         }
+        const warm_marker = try std.fs.path.join(a, &.{ root, ".local-warm" });
+        defer a.free(warm_marker);
+        const local_warm = exists: {
+            std.Io.Dir.cwd().access(io, warm_marker, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :exists false,
+                else => return err,
+            };
+            break :exists true;
+        };
+        // One unpublished slot has its own byte budget. It must never consume
+        // a foreground cursor slot or evict a retained reader's local cache.
+        if (local_warm) continue;
         retained += 1;
         if (durability != null and !std.mem.eql(u8, entry.name, id)) {
             try candidates.append(a, .{ .id = entry.name[0..64].*, .expires_ms = parsed.value.request.expires_ms });
@@ -540,4 +598,78 @@ test "time series manifest binds indexes independently of transport deadline" {
     try std.testing.expectError(error.CatalogGenerationChanged, validateManifestBinding(manifest, retry, namespace));
     retry.indexes = &.{ "b", "a" };
     try std.testing.expectError(error.CatalogGenerationChanged, validateManifestBinding(manifest, retry, namespace));
+}
+
+test "external lake native private GC expires idle cuts but preserves active reader leases" {
+    const cut = @This();
+    const fs = fs_paths;
+    const Collector = @import("native_query_cut_gc.zig").Collector;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("private-expiry");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const db = directory.path();
+    const namespace = @import("doc_identity_namespace.zig").Namespace{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const now = cut.nowMs();
+    const old: cut.Request = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = now -| 60_000 };
+    const fresh: cut.Request = .{ .id = &@as([64]u8, @splat('b')), .table_id = 7, .expires_ms = now + 300_000 };
+    for ([_]cut.Request{ old, fresh }) |request| {
+        const root = try cut.pathAlloc(scratch, db, request.id);
+        try fs.createDirPathPortable(io, root);
+        _ = try backup.writeFileDurable(io, try std.fs.path.join(scratch, &.{ root, "payload" }), "retained");
+        try cut.finish(a, io, root, request, namespace, 1, .none);
+    }
+    const old_root = try cut.pathAlloc(scratch, db, old.id);
+    const new_root = try cut.pathAlloc(scratch, db, fresh.id);
+    var lease = try cut.readLease(a, io, db, old.id, .none);
+    var lease_open = true;
+    defer if (lease_open) lease.deinit();
+    var collector: Collector = .{ .a = a };
+    defer collector.deinit(io);
+    for (0..256) |_| {
+        if (try collector.step(io, db, now, 1, .none)) break;
+    }
+    try std.Io.Dir.cwd().access(io, old_root, .{});
+    try std.Io.Dir.cwd().access(io, new_root, .{});
+    lease.deinit();
+    lease_open = false;
+    var complete = false;
+    for (0..256) |_| {
+        if (try collector.step(io, db, now, 1, .none)) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, old_root, .{}));
+    try std.Io.Dir.cwd().access(io, new_root, .{});
+    const staging = try std.fmt.allocPrint(scratch, "{s}.staging", .{old_root});
+    try fs.createDirPathPortable(io, staging);
+    _ = try backup.writeFileDurable(io, try std.fs.path.join(scratch, &.{ staging, "partial" }), "partial");
+    var retired = false;
+    for (0..256) |_| {
+        _ = try collector.step(io, db, now, 1, .none);
+        if (collector.reaper != null) {
+            retired = true;
+            break;
+        }
+    }
+    try std.testing.expect(retired);
+    collector.deinit(io);
+    const expired_cache = try std.fmt.allocPrint(scratch, "{s}.query-pins/.chunk-cache/1", .{db});
+    try fs.createDirPathPortable(io, expired_cache);
+    _ = try backup.writeFileDurable(io, try std.fs.path.join(scratch, &.{ expired_cache, "extent.json" }), "{}");
+    complete = false;
+    for (0..256) |_| {
+        if (try collector.step(io, db, now, 1, .none)) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, staging, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, expired_cache, .{}));
 }
