@@ -7709,7 +7709,7 @@ pub const DB = struct {
     /// record. Autocommit (`sql.zig`'s `mutate`) passes `null`: its own
     /// ambiguous-outcome contract is the plain receipt-text scheme
     /// (`outcome_receipts.zig`), not a `transaction_id`.
-    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
+    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, child_exists: ?@import("relational_integrity.zig").ChildExistenceCheck) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -7722,6 +7722,7 @@ pub const DB = struct {
             .primary_committed = primary_committed,
             .integrity_authority = .local_decision,
             .outcome_marker_write = marker_write,
+            .relational_child_existence_check = child_exists,
         };
         self.batchInternal(req, null, opts) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
@@ -26123,7 +26124,17 @@ pub const DB = struct {
             if (req.integrity.len != 0) try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
             try @import("relational_integrity_retirement.zig").admitCommands(&integrity_read, req.integrity_commands);
             const integrity_operations = if (req.integrity_commands.len != 0) operations: {
-                integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands);
+                // lite-single-commit-write-path.md §7.6: `null` here --
+                // only the `.local_decision` fused path (`prepareLocalIntegrityDecision`
+                // below) can leave a dangling Reference in the first
+                // place (its ride-along `.attach` is not always atomic
+                // with its leader's row write), so only that path needs
+                // to self-heal one. The durable two-phase protocol's own
+                // begin/writeTransaction/commitTransaction/recovery
+                // sequence already keeps a participant's intents and the
+                // coordinator's decision consistent, so this call site
+                // cannot create a dangling Reference itself.
+                integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands, null);
                 break :operations integrity_effects.?.operations;
             } else req.integrity;
             try integrity_mod.validatePreparedEffects(preparation_alloc, &integrity_read, integrity_operations);

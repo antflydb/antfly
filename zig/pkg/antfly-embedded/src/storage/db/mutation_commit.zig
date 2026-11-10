@@ -1427,6 +1427,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     req.relational_schema_version orelse req.schema_version,
                     req.relational_integrity_generation_set,
                     req.integrity_commands,
+                    opts.relational_child_existence_check,
                 );
                 for (local_integrity_writes) |intent| {
                     if (intent.value) |value| {
@@ -4890,6 +4891,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             schema_version: ?u32,
             generation_set: ?[32]u8,
             commands: []const @import("relational_integrity_contract.zig").Command,
+            child_exists: ?@import("relational_integrity.zig").ChildExistenceCheck,
         ) ![]const transactions_mod.WriteIntent {
             if (commands.len == 0) return &.{};
             const integrity_mod = @import("relational_integrity.zig");
@@ -4935,7 +4937,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try retirement_mod.requireMutable(&integrity_read);
             try retirement_mod.admitCommands(&integrity_read, commands);
 
-            var effects = try integrity_mod.prepare(alloc, &integrity_read, commands);
+            var effects = try integrity_mod.prepare(alloc, &integrity_read, commands, child_exists);
             defer effects.deinit();
             try integrity_mod.validatePreparedEffects(alloc, &integrity_read, effects.operations);
 

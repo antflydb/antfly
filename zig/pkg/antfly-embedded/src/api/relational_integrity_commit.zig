@@ -2434,7 +2434,7 @@ test "distributed txn deferred unique overlay permits repair and validates immed
         }
     };
     var empty: Empty = .{};
-    try std.testing.expectError(error.UniqueConstraintViolation, @import("../storage/db/relational_integrity.zig").prepare(alloc, &empty, final.tables[0].integrity_commands));
+    try std.testing.expectError(error.UniqueConstraintViolation, @import("../storage/db/relational_integrity.zig").prepare(alloc, &empty, final.tables[0].integrity_commands, null));
     // The first half of a two-statement swap collides with a live row. The
     // second statement repairs the complete overlay; no transient claim is
     // published, and COMMIT recomputes both releases from original rows.
