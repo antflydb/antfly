@@ -29,6 +29,9 @@ pub const Fence = struct {
     partition: Id,
     incarnation: u64,
 
+    pub fn jsonStringify(self: Fence, writer: anytype) !void {
+        try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+    }
     pub fn validate(self: Fence) !void {
         if (self.generation == 0 or self.incarnation == 0 or
             std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.definition, 0) or
@@ -59,6 +62,12 @@ fn read(txn: anytype, id: Id, generation: u64) !?Fence {
     fence.validate() catch return error.RetainedSeriesCorrupt;
     if (!std.mem.eql(u8, &id, &fence.id) or generation != fence.generation) return error.RetainedSeriesCorrupt;
     return fence;
+}
+pub fn isRevoked(txn: anytype, fence: Fence) !bool {
+    try fence.validate();
+    const previous = (try read(txn, fence.id, fence.generation)) orelse return false;
+    if (!std.meta.eql(previous, fence)) return error.RetainedSeriesDefinitionMismatch;
+    return true;
 }
 pub fn requireInstall(txn: anytype, fence: Fence) !void {
     try fence.validate();
@@ -95,12 +104,15 @@ test "retained revocation survives missing installs and rejects stale retries wi
     var store: Store = .{ .a = arena.allocator() };
     const fence: Fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 4 };
     try requireInstall(&store, fence);
+    try std.testing.expect(!try isRevoked(&store, fence));
     try stage(&store, fence);
+    try std.testing.expect(try isRevoked(&store, fence));
     try stage(&store, fence);
     try std.testing.expectError(error.RetainedSeriesSourceRevoked, requireInstall(&store, fence));
     var other = fence;
     other.definition = @splat(9);
     try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, stage(&store, other));
+    try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, isRevoked(&store, other));
     try std.testing.expectError(error.RetainedSeriesSourceRevoked, requireInstall(&store, other));
     other = fence;
     other.generation += 1;

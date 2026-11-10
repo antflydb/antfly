@@ -4331,6 +4331,12 @@ test "relational row query remote transaction prepare preserves scalar validatio
         executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
+    inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+        const reason = @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field);
+        executor.status = @import("relational_row_errors.zig").status(reason);
+        executor.body = field;
+        try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    }
     executor.status = 500;
     executor.body = "RelationalExpressionOverflow";
     try std.testing.expectError(error.InvalidRemoteResponse, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));

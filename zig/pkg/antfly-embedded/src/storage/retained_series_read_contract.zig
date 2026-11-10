@@ -22,6 +22,7 @@ pub const Query = struct {
 };
 pub const Request = union(enum) {
     status,
+    revocation: @import("retained_series_control.zig").Fence,
     poll: struct {
         fence: @import("retained_series_control.zig").Fence,
         root_incarnation: u128,

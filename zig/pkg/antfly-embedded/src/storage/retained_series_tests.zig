@@ -755,3 +755,29 @@ test "retained series cancellation drains prepares without certifying unfinished
     var planner: @import("retained_series_maintenance.zig").Planner = .{};
     try std.testing.expectEqual(@as(?@import("retained_series_maintenance.zig").Task, null), try planner.next(&.{.{ .spec = e.spec, .progress = p }}, 100));
 }
+
+test "retained series close admission drains old votes without accepting new contributions" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const values = [_]?f64{ null, 3, 3, 3, 3 };
+    const row = sample(1, &values);
+    const changes = [_]series.Change{.{ .key = "old", .after = row }};
+    try e.prepare(&store, @splat(1), 1, &changes);
+    try e.beginClose(&store, 2);
+    try e.beginClose(&store, 99);
+    try e.prepare(&store, @splat(1), 2, &changes);
+    try std.testing.expectError(error.RetainedSeriesSourceDraining, e.prepare(&store, @splat(2), 2, &changes));
+    try std.testing.expectError(error.RetainedSeriesSourceDraining, e.apply(&store, 1, 2, .mutation, &changes));
+    try std.testing.expectError(error.RetainedSeriesPreparedHold, e.close(&store, 2));
+    // A decided transaction keeps its vote even after admission is closed.
+    try e.applyPrepared(&store, @splat(1), 1, 3, .mutation, &changes);
+    try e.close(&store, 4);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const p = try e.status(arena.allocator(), &store);
+    try std.testing.expect(p.closed and !p.draining and !p.revoked);
+    const page = try e.scan(arena.allocator(), &store, 0, 10, 4, null, 10);
+    try std.testing.expectEqual(@as(i64, 1), page.rows[0].rows);
+}

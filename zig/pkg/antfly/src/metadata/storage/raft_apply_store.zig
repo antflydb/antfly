@@ -26,6 +26,8 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 // Accommodate their bounded envelope as well as ordinary 255-byte names.
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
+const retained_owner_model = @import("../retained_dataset_owners.zig");
+const retained_owner_journal = @import("../retained_dataset_owner_store.zig");
 const transaction_session_record = @import("../transaction_session_record.zig");
 const resolver_curation = @import("antfly_local_sources").storage_db_resolver_curation;
 const relation_names = @import("antfly_local_sources").system_catalog_relation_names;
@@ -14575,7 +14577,7 @@ pub const RaftApplyStore = struct {
             defer if (policy) |*value| value.deinit();
             if (policy) |value| if (value.value.phase != .disabled or system_catalog_storage.policyPublicationNeedsWork(value.value)) return error.RowPolicyUnsupported;
             const fence = try self.store.loadTableTransitionFenceTxn(self.view.txn, self.view.group_id, id);
-            if (fence.active() or fence.range_membership.count == 0 or table.read_schema_json.len != 0 or
+            if (fence.active() or fence.range_membership.count == 0 or fence.range_membership.count > retained_owner_model.max_owners or table.read_schema_json.len != 0 or
                 try restoreStagingLocksTableTxn(self.view.txn, self.view.group_id, id) or
                 try self.store.fkGenerationTableLockedTxn(self.view.txn, self.view.group_id, id)) return error.RetainedDatasetSourceNotReady;
             return try system_catalog.retained_datasets.Source.fromTable(self.view.alloc, table, cluster);
@@ -14987,11 +14989,76 @@ pub const RaftApplyStore = struct {
                 .drop => if (encoded != null) return,
             }
         }
+        // A descriptor alone never authorizes releasing native ownership. The
+        // journal is born in the same transaction as the source dependency;
+        // later lifecycle publications must match its independently verified
+        // owner progress. Stale lifecycle commands remain semantic no-ops.
+        self.stageRetainedCatalogDeltaTxn(a, txn, group_id, delta, false) catch |err| switch (err) {
+            error.RetainedOwnerPlanChanged, error.InvalidRetainedOwnerPlan => return,
+            else => return err,
+        };
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         try self.applySystemCatalogDeltaTxn(self.alloc, txn, group_id, delta, meta, hash);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
+    }
+
+    fn stageRetainedCatalogDeltaTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, delta: system_catalog.Delta, persist: bool) !void {
+        for (delta.removes) |resource| {
+            if (resource.kind != .dataset) continue;
+            // Standalone replacement deltas remove the previous row before
+            // inserting its successor. That is a lifecycle update, not DROP.
+            const replaced = for (delta.upserts) |next| {
+                if (next.kind == .dataset and next.id == resource.id) break true;
+            } else false;
+            if (replaced) continue;
+            var descriptor = try system_catalog.retained_datasets.parse(a, resource.source_json);
+            defer descriptor.deinit();
+            if (descriptor.value.definition.kind != .summary) continue;
+            const plan = (try retained_owner_journal.getPlan(a, txn, group, resource.id, descriptor.value.definition.generation)) orelse return error.RetainedOwnerPlanChanged;
+            if (plan.phase != .retired) return error.RetainedOwnerPlanChanged;
+        }
+        for (delta.upserts) |resource| {
+            if (resource.kind != .dataset) continue;
+            var descriptor = try system_catalog.retained_datasets.parse(a, resource.source_json);
+            defer descriptor.deinit();
+            const value = descriptor.value;
+            if (value.definition.kind != .summary) continue;
+            var plan = (try retained_owner_journal.getPlan(a, txn, group, resource.id, value.definition.generation)) orelse new: {
+                if (value.phase != .activating) return error.RetainedOwnerPlanChanged;
+                const source = value.source orelse return error.RetainedOwnerPlanChanged;
+                const fence = try self.loadTableTransitionFenceTxn(txn, group, source.table_id);
+                if (fence.active() or fence.range_membership.count == 0 or fence.range_membership.count > retained_owner_model.max_owners) return error.RetainedOwnerPlanChanged;
+                var created: retained_owner_model.Plan = .{
+                    .id = @splat(0),
+                    .resource = resource.id,
+                    .dataset = value.definition.id,
+                    .generation = value.definition.generation,
+                    .definition = try value.definition.fingerprint(a),
+                    .source = source.identity(),
+                    .source_table = source.table_id,
+                    .topology_generation = fence.generation,
+                    .membership = fence.membership(source.table_id).digest,
+                };
+                created.id = created.identity();
+                if (persist) _ = try retained_owner_journal.create(a, txn, group, created);
+                break :new created;
+            };
+            if (!std.mem.eql(u8, &plan.dataset, &value.definition.id) or !std.mem.eql(u8, &plan.definition, &try value.definition.fingerprint(a))) return error.RetainedOwnerPlanChanged;
+            const cursor: retained_owner_journal.Cursor = .{ .resource = resource.id, .generation = value.definition.generation };
+            if (value.phase == .closing and plan.phase == .active) plan = if (persist) try retained_owner_journal.transition(a, txn, group, cursor, plan.revision, .close) else try plan.close();
+            if (value.phase == .retiring and plan.phase != .retiring and plan.phase != .retired) plan = if (persist) try retained_owner_journal.transition(a, txn, group, cursor, plan.revision, .retire) else try plan.retire();
+            const compatible = switch (value.phase) {
+                .activating => plan.phase == .activating,
+                .active => plan.phase == .active,
+                .closing => plan.phase == .closing,
+                .closed => plan.phase == .closed,
+                .retiring => plan.phase == .retiring or plan.phase == .retired,
+            };
+            if (!compatible) return error.RetainedOwnerPlanChanged;
+            if (value.source == null and (value.closed_receipt == null or !std.meta.eql(value.closed_receipt, plan.source_release_receipt))) return error.RetainedOwnerPlanChanged;
+        }
     }
 
     fn applySystemCatalogDeltaTxn(
@@ -15003,6 +15070,9 @@ pub const RaftApplyStore = struct {
         meta: system_catalog_storage.Meta,
         hash: [32]u8,
     ) !void {
+        // Shared by Raft catalog commands, standalone durable updates, and
+        // replay. Every route commits producer ownership with its dependency.
+        try self.stageRetainedCatalogDeltaTxn(alloc, txn, group_id, delta, true);
         try system_catalog_storage.applyDelta(alloc, txn, group_id, delta, meta, hash);
         try relation_reconciliation.advanceTrackedSource(txn, group_id);
         // Physical rows can be installed before their binding (initial FK
@@ -18594,6 +18664,9 @@ pub const RaftApplyStore = struct {
         reallocation_request_pending,
         catalog_revision,
         lake_source_owner,
+        retained_owner_plan,
+        retained_owner,
+        retained_owner_work,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -18612,6 +18685,9 @@ pub const RaftApplyStore = struct {
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
+        .{ .projection = .retained_owner_plan, .key = .{ .prefix = retained_owner_journal.planPrefix } },
+        .{ .projection = .retained_owner, .key = .{ .prefix = retained_owner_journal.ownerPrefix } },
+        .{ .projection = .retained_owner_work, .key = .{ .prefix = retained_owner_journal.workPrefix } },
         .{ .projection = .relation_writer, .key = .{ .point = relationWriterKeyForGroup } },
         .{ .projection = .relation_names, .key = .{ .prefix = relation_names.Key.prefixForGroup } },
         .{ .projection = .relation_reconciliation, .key = .{ .point = relation_reconciliation.jobKey } },
@@ -18691,7 +18767,8 @@ pub const RaftApplyStore = struct {
             .ack_initial_fk_retirement => metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_retire),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
-            .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
+            .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.retained_owner_plan) |
+                metadataSnapshotProjectionBit(.retained_owner) | metadataSnapshotProjectionBit(.retained_owner_work) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_settings => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
@@ -45371,4 +45448,99 @@ test "system catalog retained dependency and maintenance indexes survive restart
         try std.testing.expectEqual(@as(?system_catalog.Resource, null), try view.nextRetainedWork(0, true));
         try std.testing.expectEqual(resource.id, (try view.nextRetainedWork(0, false)).?.id);
     }
+}
+
+test "system catalog retained activation journals source ownership atomically and rejects unverified lifecycle publication" {
+    const a = std.testing.allocator;
+    const retained = system_catalog.retained_datasets;
+    const group: u64 = 21;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/retained-activation", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const cluster = "11111111111111111111111111111111".*;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "raw" };
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = cluster });
+    try store.replaceStandaloneCatalog(group, try store.standaloneRevision(), &.{table}, &.{.{ .table_id = 7, .group_id = 71, .range_id = 71, .start_key = "" }}, "{}");
+    const source = try retained.Source.fromTable(a, table, cluster);
+    var schema: retained.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    var descriptor: retained.Descriptor = .{ .definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(3), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = source.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } }, .source = source, .catalog_location = @splat(4), .catalog_storage_identity = @splat(5) };
+    const json = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(json);
+    const before = try store.systemCatalogMeta(a, group);
+    try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = before.revision, .mutation = .{ .action = .create, .kind = .dataset, .name = "stats", .source_json = json } });
+    const after = try store.systemCatalogMeta(a, group);
+    try std.testing.expectEqual(before.revision + 1, after.revision);
+    var original: retained_owner_model.Plan = undefined;
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        original = (try retained_owner_journal.getPlan(a, &txn, group, before.next_id, 1)).?;
+        try std.testing.expectEqual(@as(u64, 7), original.source_table);
+        try std.testing.expectEqualDeep(try descriptor.definition.fingerprint(a), original.definition);
+        try std.testing.expect(!original.registration_complete and original.registered == 0);
+    }
+    // Even an internally forwarded descriptor cannot promote an owner which
+    // has never acknowledged installation, or detach by inventing a receipt.
+    descriptor.revision = 2;
+    descriptor.phase = .active;
+    const active = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(active);
+    try applySystemCatalogTestCommand(&store, 2, .{ .expected_revision = after.revision, .mutation = .{ .action = .set_definition, .kind = .dataset, .name = "stats", .source_json = active, .expected_dataset_revision = 1 } });
+    try std.testing.expectEqual(after.revision, (try store.systemCatalogMeta(a, group)).revision);
+    descriptor.phase = .retiring;
+    descriptor.source = null;
+    descriptor.closed_receipt = @splat(9);
+    const forged = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(forged);
+    try applySystemCatalogTestCommand(&store, 3, .{ .expected_revision = after.revision, .mutation = .{ .action = .set_definition, .kind = .dataset, .name = "stats", .source_json = forged, .expected_dataset_revision = 1 } });
+    try std.testing.expectEqual(after.revision, (try store.systemCatalogMeta(a, group)).revision);
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqualDeep(original, (try retained_owner_journal.getPlan(a, &txn, group, before.next_id, 1)).?);
+    }
+    // Cancellation commits durably before any cancellation RPC; a missing
+    // installation remains a planned owner until its tombstone is verified.
+    descriptor.source = source;
+    descriptor.closed_receipt = null;
+    const retiring = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(retiring);
+    try applySystemCatalogTestCommand(&store, 4, .{ .expected_revision = after.revision, .mutation = .{ .action = .set_definition, .kind = .dataset, .name = "stats", .source_json = retiring, .expected_dataset_revision = 1 } });
+    try std.testing.expectEqual(after.revision + 1, (try store.systemCatalogMeta(a, group)).revision);
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        const cancelled = (try retained_owner_journal.getPlan(a, &txn, group, before.next_id, 1)).?;
+        try std.testing.expect(cancelled.phase == .retiring and cancelled.source_release_receipt == null);
+    }
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requireRetainedSourceDropAllowed(group, 7));
+    // Standalone durable replacement uses remove-before-upsert deltas. It
+    // must preserve ownership on rename and reject a forged release too.
+    const current = try store.systemCatalogMeta(a, group);
+    var previous: system_catalog.Resource = .{ .kind = .dataset, .id = before.next_id, .parent_id = 2, .name = "stats", .source_json = retiring, .retained = descriptor.identity() };
+    var renamed = previous;
+    renamed.name = "renamed";
+    var prior_rows = [_]system_catalog.Resource{previous};
+    var next_rows = [_]system_catalog.Resource{renamed};
+    try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .logical = .{ .previous_revision = current.revision, .delta = .{ .removes = &prior_rows, .upserts = &next_rows, .next_id = current.next_id } } });
+    const standalone_revision = try store.standaloneRevision();
+    const renamed_meta = try store.systemCatalogMeta(a, group);
+    previous = renamed;
+    descriptor.revision = 3;
+    descriptor.source = null;
+    descriptor.closed_receipt = @splat(9);
+    const forged_standalone = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(forged_standalone);
+    renamed.source_json = forged_standalone;
+    renamed.retained = descriptor.identity();
+    prior_rows[0] = previous;
+    next_rows[0] = renamed;
+    try std.testing.expectError(error.RetainedOwnerPlanChanged, store.updateStandaloneCatalog(group, standalone_revision, .{ .logical = .{ .previous_revision = renamed_meta.revision, .delta = .{ .removes = &prior_rows, .upserts = &next_rows, .next_id = renamed_meta.next_id } } }));
+    try std.testing.expectEqual(standalone_revision, try store.standaloneRevision());
+    try std.testing.expectEqual(renamed_meta.revision, (try store.systemCatalogMeta(a, group)).revision);
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, store.requireRetainedSourceDropAllowed(group, 7));
 }

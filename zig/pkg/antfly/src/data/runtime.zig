@@ -1359,6 +1359,7 @@ const RaftTableApplyStateMachine = struct {
         SqlArraySubscriptError,
         RetainedSeriesSourceClosed,
         RetainedSeriesSourceRevoked,
+        RetainedSeriesSourceDraining,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {

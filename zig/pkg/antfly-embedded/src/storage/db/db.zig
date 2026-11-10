@@ -42484,6 +42484,16 @@ pub const DB = struct {
     pub const DocumentReadSession = @import("read_session_backend").Document;
 
     pub fn queryRetainedSeriesJson(self: *DB, alloc: Allocator, request: @import("../retained_series_read_contract.zig").Request) ![]u8 {
+        const fence: ?@import("../retained_series_control.zig").Fence = switch (request) {
+            .status => null,
+            .revocation => |value| value,
+            .poll => |value| value.fence,
+        };
+        if (fence) |value| {
+            var partition: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace), &partition, .{});
+            if (!std.mem.eql(u8, &partition, &value.partition)) return error.IdentityNamespaceMismatch;
+        }
         var policy = try self.local_execution.row_policy_gate.enterRawRead();
         defer policy.release();
         try self.lockApplySharedForPortableRuntime();

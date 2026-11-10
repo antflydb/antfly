@@ -14766,6 +14766,8 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.InvalidRetainedSeriesRow, error.RetainedSeriesBatchTooLarge, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesCoverageMissing, error.RetainedSeriesSourceDraining, error.RetainedSeriesNumericOverflow, error.RetainedSeriesTimeOverflow => return @errorCast(err),
+            error.RetainedSeriesNotReady, error.RetainedSeriesPreparedHold, error.RetainedSeriesDefinitionMismatch, error.RetainedSeriesReservationMismatch, error.RetainedSeriesSequenceMismatch, error.RetainedSeriesSourceClosed, error.RetainedSeriesSourceRevoked => return error.WriteUnavailable,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,

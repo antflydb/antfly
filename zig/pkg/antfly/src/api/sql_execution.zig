@@ -2738,6 +2738,8 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
 }
 
 fn definiteMutationFailure(status: u16, native: []const u8) ?anyerror {
+    const retained = @import("retained_series_errors.zig");
+    if (retained.decode(native)) |reason| if (status == retained.describe(reason).status) return reason;
     if (status == 409) {
         if (std.mem.eql(u8, native, "batch transaction conflicted") or std.mem.eql(u8, native, "PreparedReadSetChanged") or std.mem.eql(u8, native, "VersionConflict")) return error.SqlWriteConflict;
         if (std.mem.eql(u8, native, "UniqueConstraintViolation")) return error.DuplicateSqlRow;
@@ -4958,4 +4960,25 @@ test "lake SQL GRAPH_TABLE shared graph joins reuse typed bindings and bounded s
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, different.query, &budget));
     budget.remaining = 0;
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, one.query, &budget));
+}
+
+test "SQL retained source responses preserve definitive failures without overriding unknown commit outcomes" {
+    const a = std.testing.allocator;
+    for ([_]struct { reason: anyerror, status: u16 }{
+        .{ .reason = error.RetainedSeriesSourceDraining, .status = 503 },
+        .{ .reason = error.RetainedSeriesCorrectionWindow, .status = 409 },
+        .{ .reason = error.RetainedSeriesCoverageMissing, .status = 409 },
+        .{ .reason = error.RetainedSeriesBatchTooLarge, .status = 413 },
+        .{ .reason = error.InvalidRetainedSeriesRow, .status = 422 },
+        .{ .reason = error.RetainedSeriesNumericOverflow, .status = 422 },
+        .{ .reason = error.RetainedSeriesTimeOverflow, .status = 422 },
+    }) |item| {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .@"error" = @errorName(item.reason) }, .{});
+        defer a.free(bytes);
+        try std.testing.expectEqual(item.reason, classifyMutationFailure(item.status, bytes).err);
+        try std.testing.expectEqual(@as(?anyerror, null), definiteMutationFailure(500, @errorName(item.reason)));
+        const unknown = try std.json.Stringify.valueAlloc(a, .{ .@"error" = @errorName(item.reason), .status = "committed_pending" }, .{});
+        defer a.free(unknown);
+        try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(item.status, unknown).err);
+    }
 }

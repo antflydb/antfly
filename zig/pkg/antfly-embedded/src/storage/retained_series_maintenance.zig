@@ -45,7 +45,7 @@ pub const Planner = struct {
             const entry = entries[index];
             try entry.spec.validate();
             if (!std.mem.eql(u8, &entry.spec.definition, &entry.progress.definition) or entry.spec.source_incarnation != entry.progress.source_incarnation) return error.RetainedSeriesDefinitionMismatch;
-            if (entry.progress.revoked) continue;
+            if (entry.progress.revoked or entry.progress.draining) continue;
             switch (slot % 3) {
                 0 => if (!entry.progress.ready) return .{ .index = index, .action = .backfill, .expected_cursor = entry.progress.backfill_cursor, .work_limit = self.work_limit },
                 1 => {

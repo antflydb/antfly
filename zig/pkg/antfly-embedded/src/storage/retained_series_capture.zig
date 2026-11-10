@@ -1028,6 +1028,8 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     defer new_reader.close();
     const new_page = try new_reader.next(10);
     try std.testing.expectEqual(@as(?f64, 5), new_page.rows[0].metrics[1].value(.sum));
+    try db.batch(.{ .timestamp_ns = 268, .retained_series = .{ .action = .drain, .fence = next_fence } });
+    try std.testing.expectError(error.RetainedSeriesSourceDraining, db.batch(.{ .timestamp_ns = 268, .writes = &.{.{ .key = "new-generation", .value = "{\"ts\":\"1970-01-01T00:00:00.000000271Z\",\"v\":6}" }} }));
     try db.batch(.{ .timestamp_ns = 269, .retained_series = .{ .action = .revoke, .fence = next_fence } });
     try db.batch(.{ .timestamp_ns = 270, .retained_series = .{ .action = .revoke, .fence = next_fence } });
     try std.testing.expect(!try db.core.store.retainedSeriesActive());
@@ -1051,6 +1053,12 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     missing_fence.id = missing.spec.id;
     missing_fence.generation = 1;
     try db.batch(.{ .timestamp_ns = 274, .retained_series = .{ .action = .revoke, .fence = missing_fence } });
+    const revocation_bytes = try db.queryRetainedSeriesJson(a, .{ .revocation = missing_fence });
+    defer a.free(revocation_bytes);
+    var revoked = try std.json.parseFromSlice(@import("retained_series_query.zig").Revocation, a, revocation_bytes, .{});
+    defer revoked.deinit();
+    try std.testing.expect(revoked.value.revoked);
+    try std.testing.expectEqualDeep(missing_fence, revoked.value.fence);
     try std.testing.expectError(error.RetainedSeriesSourceRevoked, db.batch(.{ .timestamp_ns = 275, .retained_series = .{ .action = .install, .fence = missing_fence, .binding = missing } }));
     try db.batch(.{ .timestamp_ns = 276, .writes = &.{.{ .key = "after-cancel", .value = "{\"unrelated\":true}" }} });
 }

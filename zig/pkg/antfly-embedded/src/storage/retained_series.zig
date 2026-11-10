@@ -108,6 +108,8 @@ pub const Progress = struct {
     closed: bool = false,
     /// Terminal producer cancellation; incomplete backfill never becomes coverage.
     revoked: bool = false,
+    /// Stop new admissions while previously prepared transactions drain.
+    draining: bool = false,
     backfill_cursor: []const u8 = "",
     backfill_clean: bool = false,
     feed_latest: u64 = 0,
@@ -191,6 +193,7 @@ pub const Engine = struct {
         if (!std.mem.eql(u8, &p.definition, &self.spec.definition) or p.source_incarnation != self.spec.source_incarnation) return error.RetainedSeriesDefinitionMismatch;
         if ((p.backfill_clean or (p.closed and !p.revoked)) and !p.ready) return error.RetainedSeriesCorrupt;
         if (p.revoked and !p.closed) return error.RetainedSeriesCorrupt;
+        if (p.draining and p.closed) return error.RetainedSeriesCorrupt;
         if (p.feed_floor > p.feed_latest or p.feed_latest - p.feed_floor > max_feed_frames or p.feed_bytes > max_feed_bytes or
             try self.spec.bucket(p.complete_from_ns) != p.complete_from_ns) return error.RetainedSeriesCorrupt;
         return p;
@@ -215,6 +218,20 @@ pub const Engine = struct {
     /// Close one immutable definition generation at a committed source cut.
     /// Even no-contribution prepared intents must drain before closure; their
     /// later resolution must never create a dependency on a retired producer.
+    /// Persist admission closure before waiting for prepared intents. Exact
+    /// prepare retries and committed resolutions retain their original votes;
+    /// a sustained stream of new transactions cannot starve source shutdown.
+    pub fn beginClose(self: Engine, txn: anytype, admitted_ns: i128) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var p = try self.load(a, txn);
+        if (p.revoked) return error.RetainedSeriesSourceRevoked;
+        if (p.closed or p.draining) return;
+        p.draining = true;
+        p.admitted_ns = @max(p.admitted_ns, admitted_ns);
+        try self.save(a, txn, p);
+    }
     pub fn close(self: Engine, txn: anytype, admitted_ns: i128) !void {
         return self.stop(txn, admitted_ns, false);
     }
@@ -248,6 +265,7 @@ pub const Engine = struct {
         }
         p.admitted_ns = @max(p.admitted_ns, admitted_ns);
         p.closed = true;
+        p.draining = false;
         p.revoked = revoking;
         try self.save(a, txn, p);
     }
@@ -445,6 +463,8 @@ pub const Engine = struct {
             const before = try self.contribution(change.before);
             const after = try self.contribution(change.after);
             const previous = try self.readReservation(a, txn, transaction, change.key);
+            if (p.draining and (previous == null or previous.?.cause != change.cause or
+                !std.meta.eql(previous.?.before, before) or !std.meta.eql(previous.?.after, after))) return error.RetainedSeriesSourceDraining;
             if (previous) |old| if (old.cause != change.cause or !std.meta.eql(old.before, before)) return error.RetainedSeriesReservationMismatch;
             var holds: std.ArrayList([]const u8) = .empty;
             if (change.cause == .expiration) {
@@ -612,6 +632,7 @@ pub const Engine = struct {
                 // adjusts only the current side, even before physical cleanup.
                 const before = if (change.before) |r| if (try self.spec.expired(r.timestamp_ns, now)) null else r else null;
                 const after = if (change.after) |r| if (try self.spec.expired(r.timestamp_ns, now)) null else r else null;
+                if (p.draining and reserved == null and (before != null or after != null)) return error.RetainedSeriesSourceDraining;
                 if (before) |r| if (try self.spec.bucket(r.timestamp_ns) < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
                 if (after) |r| if (try self.spec.bucket(r.timestamp_ns) < p.complete_from_ns) return error.RetainedSeriesCoverageMissing;
                 if (before) |r| if (try self.spec.finalized(r.timestamp_ns, now) and !(reserved != null and includesHold(reserved.?, try self.bucketKey(a, r)))) return error.RetainedSeriesCorrectionWindow;
@@ -643,6 +664,7 @@ pub const Engine = struct {
         const a = arena.allocator();
         var p = try self.load(a, txn);
         if (p.closed) return error.RetainedSeriesSourceClosed;
+        if (p.draining) return error.RetainedSeriesSourceDraining;
         if (p.ready or !std.mem.eql(u8, expected_cursor, p.backfill_cursor)) return error.RetainedSeriesBackfillFence;
         var touched = std.StringHashMap(Bucket).init(a);
         var previous = expected_cursor;

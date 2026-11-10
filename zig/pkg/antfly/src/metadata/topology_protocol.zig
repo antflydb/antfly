@@ -117,8 +117,10 @@ const std = @import("std");
 /// its restartable cleanup frontier, including the global composed-cursor row.
 /// Version 84 adds graph definitions and transaction sessions.
 /// Version 85 owns independent retained dataset resources and source/work indexes.
-pub const current_version: u16 = 85;
-pub const retained_datasets_version: u16 = 85;
+/// Version 86 journals native retained owners before activation and requires
+/// verified journal progress before source release or producer collection.
+pub const current_version: u16 = 86;
+pub const retained_datasets_version: u16 = 86;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
