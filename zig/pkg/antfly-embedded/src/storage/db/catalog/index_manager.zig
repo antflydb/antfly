@@ -21752,7 +21752,7 @@ pub const IndexManager = struct {
         // encoded embedding artifact key for multi-source indexes so equal
         // document keys from different artifact streams remain distinct.
         for (self.dense_indexes.items) |*entry| {
-            try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
+            try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options, null);
         }
     }
 
@@ -21985,9 +21985,20 @@ pub const IndexManager = struct {
         writes: []const mapper.DenseEmbeddingWrite,
         batch_options: StoreBatchOptions,
     ) !void {
+        return self.applyDenseEmbeddingWritesByNameWithRecoverySession(store, index_name, writes, batch_options, null);
+    }
+
+    pub fn applyDenseEmbeddingWritesByNameWithRecoverySession(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        writes: []const mapper.DenseEmbeddingWrite,
+        batch_options: StoreBatchOptions,
+        recovery_session: ?*LeannRecoverySession,
+    ) !void {
         if (writes.len == 0) return;
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
-        try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
+        try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options, recovery_session);
     }
 
     fn validateDenseEmbeddingWriteSources(entry: *const DenseIndex, writes: []const mapper.DenseEmbeddingWrite) !void {
@@ -29871,6 +29882,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         writes: []const mapper.DenseEmbeddingWrite,
         batch_options: StoreBatchOptions,
+        recovery_session: ?*LeannRecoverySession,
     ) !void {
         try validateDenseEmbeddingWriteSources(entry, writes);
         const keep_write = try self.alloc.alloc(bool, writes.len);
@@ -29985,6 +29997,56 @@ pub const IndexManager = struct {
         defer self.alloc.free(prefetched_ordinals);
         const prefetched_mappings = try self.lookupDenseVectorMappingsTxnAlloc(store_txn, entry.config.name, mapping_doc_keys);
         defer self.alloc.free(prefetched_mappings);
+        // Recover missing transient vectors as a batch. In particular, a
+        // chunked document must be reconstructed once per batch, not once per
+        // chunk. Existing graph members need no inference at all.
+        var recovery_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer recovery_keys.deinit(self.alloc);
+        var recovery_hashes: std.ArrayListUnmanaged(?u64) = .empty;
+        defer recovery_hashes.deinit(self.alloc);
+        var recovery_digests: std.ArrayListUnmanaged(?u64) = .empty;
+        defer recovery_digests.deinit(self.alloc);
+        var recovery_slots: std.ArrayListUnmanaged(usize) = .empty;
+        defer recovery_slots.deinit(self.alloc);
+        const recovered = try self.alloc.alloc(?[]const f32, if (entry.leann_transient and elided_artifacts.items.len > 0) writes.len else 0);
+        defer self.alloc.free(recovered);
+        @memset(recovered, null);
+        if (entry.leann_transient and elided_artifacts.items.len > 0) if (entry.index.leann) |leann_store| {
+            for (writes, 0..) |write, i| {
+                if (!keep_write[i] or !std.mem.eql(u8, write.index_name, entry.config.name) or write.vector.len != 0 or write.artifact_key == null or preloaded_artifact_vectors[i] != null or elided_digests[i] == null) continue;
+                if (prefetched_mappings[i]) |mapping| if (leann_store.holdsElided(mapping.vector_id)) continue;
+                const name = entry.embedding_name orelse return error.ReembedProvenanceUnavailable;
+                if (try leannInt8StubVectorAlloc(self.alloc, store, write.doc_key, name)) |vector| {
+                    if (!entry.leann_media_int8 or vector.len != entry.dims) {
+                        self.alloc.free(vector);
+                        return error.ArtifactRepairRequired;
+                    }
+                    errdefer self.alloc.free(vector);
+                    try reembedded_vectors.append(self.alloc, vector);
+                    recovered[i] = vector;
+                    continue;
+                }
+                const identity = (try leannStubIdentity(self.alloc, store, write.doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
+                try recovery_keys.append(self.alloc, write.doc_key);
+                try recovery_hashes.append(self.alloc, identity.source_hash);
+                try recovery_digests.append(self.alloc, identity.digest);
+                try recovery_slots.append(self.alloc, i);
+            }
+        };
+        const recovery_vectors = try self.alloc.alloc(f32, recovery_keys.items.len * @as(usize, entry.dims));
+        defer self.alloc.free(recovery_vectors);
+        if (recovery_keys.items.len > 0) {
+            const found = try self.alloc.alloc(bool, recovery_keys.items.len);
+            defer self.alloc.free(found);
+            @memset(found, false);
+            var local_session: LeannRecoverySession = .{};
+            defer local_session.deinit();
+            try self.reembedDenseDocumentsSession(self.alloc, entry, recovery_keys.items, recovery_hashes.items, recovery_digests.items, recovery_vectors, found, recovery_session orelse &local_session);
+            for (recovery_slots.items, 0..) |slot, i| {
+                if (!found[i]) return error.ReembedProvenanceUnavailable;
+                recovered[slot] = recovery_vectors[i * entry.dims ..][0..entry.dims];
+            }
+        }
         {
             var existing_index_write_txn = try entry.index.beginRuntimeWriteTxn();
             defer existing_index_write_txn.abort();
@@ -30052,7 +30114,7 @@ pub const IndexManager = struct {
                             // LEANN index elided this shared embedding: the
                             // owner re-embeds it.
                             const owner = self.elidedArtifactOwner(entry, write.artifact_key.?, write.doc_key) orelse return error.VectorElided;
-                            const reembedded = self.reembedElidedDocument(self.alloc, owner.embedding_name, owner.doc_key, entry.dims) catch |err| switch (err) {
+                            const reembedded = self.reembedElidedDocumentSession(self.alloc, owner.embedding_name, owner.doc_key, entry.dims, recovery_session) catch |err| switch (err) {
                                 error.NotFound => return error.VectorElided,
                                 else => return err,
                             };
@@ -30069,6 +30131,7 @@ pub const IndexManager = struct {
                             try leann_store.noteElided(mapping.vector_id, member_key, digest);
                             continue;
                         };
+                        if (recovered[write_index]) |vector| break :blk vector;
                         const reembedded = self.reembedOneDenseDocument(self.alloc, entry, write.doc_key) catch |err| switch (err) {
                             error.NotFound => continue,
                             else => return err,
@@ -33783,6 +33846,10 @@ pub const IndexManager = struct {
     /// stub through the transient LEANN index that consumes `embedding_name`.
     /// Returns `error.NotFound` when no such index or source text exists.
     pub fn reembedElidedDocument(self: *IndexManager, alloc: Allocator, embedding_name: []const u8, doc_key: []const u8, dims: u32) ![]f32 {
+        return self.reembedElidedDocumentSession(alloc, embedding_name, doc_key, dims, null);
+    }
+
+    fn reembedElidedDocumentSession(self: *IndexManager, alloc: Allocator, embedding_name: []const u8, doc_key: []const u8, dims: u32, session: ?*LeannRecoverySession) ![]f32 {
         if (self.primary_store) |store| if (try leannInt8StubVectorAlloc(alloc, store, doc_key, embedding_name)) |copy| {
             if (self.embeddingHasFullMediaConsumer("", embedding_name)) {
                 alloc.free(copy);
@@ -33795,12 +33862,16 @@ pub const IndexManager = struct {
             if (!entry.leann_transient or entry.dims != dims) continue;
             const name = entry.embedding_name orelse continue;
             if (!std.mem.eql(u8, name, embedding_name)) continue;
-            return self.reembedOneDenseDocument(alloc, entry, doc_key);
+            return self.reembedOneDenseDocumentSession(alloc, entry, doc_key, session);
         }
         return error.NotFound;
     }
 
     fn reembedOneDenseDocument(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_key: []const u8) ![]f32 {
+        return self.reembedOneDenseDocumentSession(alloc, entry, doc_key, null);
+    }
+
+    fn reembedOneDenseDocumentSession(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_key: []const u8, session: ?*LeannRecoverySession) ![]f32 {
         if (self.primary_store) |store| if (entry.embedding_name) |name| if (try leannInt8StubVectorAlloc(alloc, store, doc_key, name)) |copy| {
             if (!entry.leann_media_int8) {
                 alloc.free(copy);
@@ -33818,7 +33889,7 @@ pub const IndexManager = struct {
         const identity = (try leannStubIdentity(alloc, store, doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
         const hashes = [_]?u64{identity.source_hash};
         const digests = [_]?u64{identity.digest};
-        try self.reembedDenseDocuments(alloc, entry, &keys, &hashes, &digests, out, &found);
+        try self.reembedDenseDocumentsSession(alloc, entry, &keys, &hashes, &digests, out, &found, session);
         // A rebuild cannot silently skip an artifact whose source or legacy
         // vector identity cannot be proven.
         if (!found[0]) return error.ReembedProvenanceUnavailable;
@@ -53436,6 +53507,16 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         manager.dense_reembedder = null;
         manager.leann_reembed_cache.deinit(alloc);
         try std.testing.expectError(error.ReembedUnavailable, entry.index.searchWithRequest(.{ .query = &vectors[200], .k = 5 }));
+
+        // A new transient consumer has no graph nodes for existing stubs.
+        // Rebuilding a group must invoke its provider once for the group.
+        manager.dense_reembedder = embedder.reembedder();
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_copy", .kind = .dense_vector, .config_json = config_json }});
+        var writes: [16]mapper.DenseEmbeddingWrite = undefined;
+        for (&writes, 0..) |*write, i| write.* = .{ .index_name = @constCast("leann_copy"), .doc_key = keys[i * 4], .vector = &.{}, .artifact_key = produced[i * 4] };
+        const before_calls = embedder.calls;
+        try manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes);
+        try std.testing.expectEqual(before_calls + 1, embedder.calls);
     }
 }
 

@@ -1838,11 +1838,15 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
     const chunk_control = RecoveryChunkControl{ .session = session, .parent = scoped_chunker.execution.cancellation };
     scoped_chunker.execution.cancellation = .{ .ptr = &chunk_control, .is_cancelled_fn = RecoveryChunkControl.cancelled, .check_fn = RecoveryChunkControl.check };
     var dense_embedder = runtime.config.dense_embedder orelse return error.ReembedUnavailable;
-    if (session.cancellation) |token| dense_embedder.part_request_context = .{
-        .io = concurrencyIo(runtime),
-        .deadline_ns = null,
-        .cancellation = .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn },
+    const embed_control = RecoveryChunkControl{
+        .session = session,
+        .parent = if (dense_embedder.part_request_context) |context| context.cancellation orelse CancellationToken.none else CancellationToken.none,
     };
+    if (session.cancellation != null) {
+        var context: inference_request_context.RequestContext = dense_embedder.part_request_context orelse .{ .io = concurrencyIo(runtime), .deadline_ns = null };
+        context.cancellation = .{ .ptr = &embed_control, .is_cancelled_fn = RecoveryChunkControl.cancelled, .check_fn = RecoveryChunkControl.check };
+        dense_embedder.part_request_context = context;
+    }
     const index_names = [_][]const u8{requests[0].index_name};
     var texts: std.ArrayList([]const u8) = .empty;
     defer {
@@ -6431,6 +6435,21 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         defer probe.cancel_on_batch = null;
         try std.testing.expectError(error.Cancelled, reembedDenseDocumentsSession(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1], &session));
         try std.testing.expect(signal.load(.acquire));
+    }
+
+    // A query cancellation token must augment the producer's existing
+    // deadline and cancellation instead of replacing them.
+    {
+        var query_signal = std.atomic.Value(bool).init(false);
+        var parent_signal = std.atomic.Value(bool).init(true);
+        var session = @import("../../leann_recovery.zig").Session{ .cancellation = @import("antfly_vectorindex").search_types.CancellationToken.fromAtomic(&query_signal) };
+        defer session.deinit();
+        runtime.config.dense_embedder.?.part_request_context = .{ .io = std.testing.io, .deadline_ns = null, .cancellation = CancellationToken.fromAtomic(&parent_signal) };
+        defer runtime.config.dense_embedder.?.part_request_context = null;
+        try std.testing.expectError(error.Cancelled, reembedDenseDocumentsSession(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1], &session));
+        parent_signal.store(false, .release);
+        runtime.config.dense_embedder.?.part_request_context.?.deadline_ns = 0;
+        try std.testing.expectError(error.Timeout, reembedDenseDocumentsSession(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1], &session));
     }
 
     // Invalid output is rejected before it can be marked found or cached,

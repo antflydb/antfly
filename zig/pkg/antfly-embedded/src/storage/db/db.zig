@@ -35958,6 +35958,7 @@ pub const DB = struct {
         alloc: Allocator,
         writes: *std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite),
         mutated_indexes: *std.StringHashMapUnmanaged(void),
+        recovery_session: *@import("../leann_recovery.zig").Session,
     ) !void {
         defer freeDenseArtifactRebuildWrites(alloc, writes);
         if (writes.items.len == 0) return;
@@ -35981,11 +35982,12 @@ pub const DB = struct {
             }
             errdefer if (posting_capture_owned) if (posting_capture) |lease|
                 self.core.index_manager.cancelDensePostingSidecarCaptureLeaseByName(entry.config.name, lease) catch {};
-            try self.core.index_manager.applyDenseEmbeddingWritesByNameWithOptions(
+            try self.core.index_manager.applyDenseEmbeddingWritesByNameWithRecoverySession(
                 self.core.store,
                 entry.config.name,
                 writes.items,
                 .{ .mode = .bulk_ingest },
+                recovery_session,
             );
             if (posting_capture) |lease| if (posting_capture_owned) {
                 // Repair chunks are independently recoverable. Keep their WAL
@@ -37162,6 +37164,7 @@ pub const DB = struct {
             mutated_indexes: *std.StringHashMapUnmanaged(void),
             rebuild_chunk_size: usize,
             rebuild_progress_interval: usize,
+            recovery_session: @import("../leann_recovery.zig").Session = .{},
             rebuild_targets: ?[]const DenseArtifactRebuildTarget = null,
             rebuild_target_lookup: std.StringHashMapUnmanaged(usize) = .empty,
             writes: std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite) = .empty,
@@ -37173,6 +37176,7 @@ pub const DB = struct {
             last_flushed_key: ?[]u8 = null,
 
             pub fn deinit(state: *@This()) void {
+                state.recovery_session.deinit();
                 freeDenseArtifactRebuildWrites(state.alloc, &state.writes);
                 state.writes.deinit(state.alloc);
                 state.rebuild_target_lookup.deinit(state.alloc);
@@ -37214,7 +37218,7 @@ pub const DB = struct {
                 // a later cache/bookkeeping error. Mark the attempt first so
                 // every subsequent failure retires potentially stale readers.
                 state.dense_visibility_attempted.* = true;
-                try state.db.flushDenseArtifactRebuildChunk(state.alloc, &state.writes, state.mutated_indexes);
+                try state.db.flushDenseArtifactRebuildChunk(state.alloc, &state.writes, state.mutated_indexes, &state.recovery_session);
                 try state.updateOwnedKey(&state.last_flushed_key, key);
                 if (state.resume_hook) |hook| try hook(state.resume_ctx.?, key);
                 try state.publishProgress(true);
@@ -37233,35 +37237,14 @@ pub const DB = struct {
                 state.scanned_entries += 1;
                 try state.updateOwnedKey(&state.last_matching_key, key);
 
-                const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| blk: {
-                    if (err == error.VectorElided) {
-                        // Derived embeddings are keyed by their source chunk, not the parent document.
-                        const source_key = if (artifact_ref.source) |source| source_key: {
-                            var source_ref = types.ArtifactRef{
-                                .document_id = try state.alloc.dupe(u8, artifact_ref.document_id),
-                                .name = try state.alloc.dupe(u8, source.name),
-                                .kind = source.kind,
-                                .chunk_id = source.chunk_id,
-                                .window_index = source.window_index,
-                                .unit_id = if (source.unit_id) |unit_id| try state.alloc.dupe(u8, unit_id) else null,
-                            };
-                            defer source_ref.deinit(state.alloc);
-                            break :source_key try artifact_ids.internalKeyForArtifactRefAlloc(state.alloc, source_ref);
-                        } else try state.alloc.dupe(u8, artifact_ref.document_id);
-                        defer state.alloc.free(source_key);
-                        const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(value)).?;
-                        break :blk state.db.core.index_manager.reembedElidedDocument(state.alloc, artifact_ref.name, source_key, stub.dims) catch |reembed_err| switch (reembed_err) {
-                            error.NotFound => return .@"continue",
-                            else => return reembed_err,
-                        };
-                    }
+                // The scan only selects consumers; actual vector recovery belongs
+                // to the selected index's write path, after resume filtering.
+                const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) {
                         return .@"continue";
                     }
                     return err;
                 };
-                defer state.alloc.free(vector);
-                const dims: u32 = @intCast(vector.len);
                 if (dims == 0) return .@"continue";
 
                 const consumer_indexes = state.db.core.index_manager.denseIndexesForEmbedding(state.alloc, artifact_ref.name, dims) catch |err| switch (err) {
@@ -37350,7 +37333,7 @@ pub const DB = struct {
 
         if (state.writes.items.len > 0) {
             dense_visibility_attempted.* = true;
-            try self.flushDenseArtifactRebuildChunk(alloc, &state.writes, &mutated_indexes);
+            try self.flushDenseArtifactRebuildChunk(alloc, &state.writes, &mutated_indexes, &state.recovery_session);
         }
 
         var mutated_it = mutated_indexes.keyIterator();
@@ -118633,6 +118616,37 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
         try std.testing.expectEqual(@as(?u64, doc_count), dense_a_count);
         try std.testing.expectEqual(@as(?u64, doc_count), dense_b_count);
     }
+}
+
+test "targeted dense rebuild ignores unrelated elided artifacts" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-targeted-elided");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "selected", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true,\"embedding_name\":\"selected\"}" });
+    try db.addIndex(.{ .name = "unrelated", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"chunks\",\"embedding_name\":\"unrelated\"},\"algorithm\":\"leann\",\"leann\":{\"vector_storage\":\"transient\"}}" });
+    const document_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(document_key);
+    try db.core.store.put(document_key, "{\"body\":\"text\"}");
+    const selected_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "selected");
+    defer alloc.free(selected_key);
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, selected_key, null, &.{ 1, 2, 3 });
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", 0);
+    defer alloc.free(chunk_key);
+    const unrelated_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "unrelated");
+    defer alloc.free(unrelated_key);
+    const full = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, 123, true, &.{ 1, 2, 3 });
+    defer alloc.free(full);
+    const stub = try enrichment_artifact_codec.encodeElidedDenseEmbeddingAlloc(alloc, try enrichment_artifact_codec.decodeHeader(full), 3, 99);
+    defer alloc.free(stub);
+    try db.core.store.put(unrelated_key, stub);
+    const targets = [_]DB.DenseArtifactRebuildTarget{.{ .dense_index_idx = 0 }};
+    var visibility_attempted = false;
+    const rebuilt = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(alloc, null, &targets, 1, null, null, null, null, &visibility_attempted, 32, 32);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt);
 }
 
 test "db dense artifact rebuild ignores stale wrong-dimension artifacts when counting progress" {
