@@ -1938,7 +1938,14 @@ pub const ReferenceLocationCache = struct {
         if (!self.adaptive) return;
         self.entry_alloc = backing;
         self.manager = manager;
-        self.reclaimer = try manager.registerReclaimer(.dense_source_payload_state, self, reclaim);
+        self.reclaimer = try manager.registerReclaimerWithOptions(.dense_source_payload_state, self, reclaimPhysical, .{ .reclaim_physical = reclaimPhysical });
+    }
+
+    fn reclaimPhysical(raw: *anyopaque, target: u64) u64 {
+        const self: *ReferenceLocationCache = @ptrCast(@alignCast(raw));
+        var scope = resources.ReclamationScope.tryAcquire(self.entry_alloc) orelse return 0;
+        defer scope.deinit();
+        return reclaim(raw, target);
     }
 
     pub fn reclaim(ptr: *anyopaque, target: u64) u64 {

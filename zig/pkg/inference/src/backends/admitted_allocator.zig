@@ -39,7 +39,7 @@ pub const AdmittedAllocator = struct {
     reservations: ?*Reservation = null,
 
     const quantum = 64 * 1024;
-    const Header = struct { prev: ?*Header, next: ?*Header, bytes: usize, alignment: std.mem.Alignment };
+    const Header = struct { prev: ?*Header, next: ?*Header, bytes: usize, alignment: std.mem.Alignment, materialization: memory.MaterializedHostAllocation = .{} };
     const Reservation = struct { next: ?*Reservation, lease: ?memory.AdmissionLease, bytes: usize };
     pub const reservation_overhead = @sizeOf(Reservation);
 
@@ -148,7 +148,7 @@ pub const AdmittedAllocator = struct {
             const spare = (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes);
             const reduction = @min(spare, reservation.bytes);
             if (reduction != 0) {
-                if (reservation.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = reservation.bytes - reduction });
+                if (reservation.lease) |*lease| try lease.reduce(.{ .host_scratch_bytes = reservation.bytes - reduction });
                 reservation.bytes -= reduction;
                 self.reserved_bytes -= reduction;
             }
@@ -165,6 +165,7 @@ pub const AdmittedAllocator = struct {
     pub fn deinit(self: *@This()) void {
         while (self.blocks) |block| {
             self.blocks = block.next;
+            block.materialization.release();
             self.backing.rawFree(@as([*]u8, @ptrCast(block))[0..block.bytes], block.alignment, @returnAddress());
         }
         while (self.reservations) |reservation| {
@@ -178,6 +179,18 @@ pub const AdmittedAllocator = struct {
         self.metadata_bytes = 0;
     }
 
+    fn materializeAllocation(self: *@This(), bytes: []u8) memory.MaterializedHostAllocation {
+        // Attribute to the newest chunk with unused live credit. At most the
+        // old chunk's rounded quantum remains conservative on a boundary.
+        var next = self.reservations;
+        while (next) |node| : (next = node.next) {
+            if (node.lease) |*lease| if (lease.live_reserved_bytes != 0) {
+                if (lease.hostMaterializationPending() != 0) return lease.materializeAllocation(bytes);
+            };
+        }
+        return .{};
+    }
+
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.admission_error = null;
@@ -186,9 +199,19 @@ pub const AdmittedAllocator = struct {
             self.admission_error = err;
             return null;
         };
-        const base = self.backing.rawAlloc(bytes, alignment.max(.of(Header)), ra) orelse return null;
+        var allocation = memory.HostAllocationScope.begin();
+        defer allocation.deinit();
+        const base = blk: {
+            var suspended = memory.HostExecutionScope.pause();
+            defer suspended.deinit();
+            break :blk self.backing.rawAlloc(bytes, alignment.max(.of(Header)), ra) orelse return null;
+        };
         const header: *Header = @ptrCast(@alignCast(base));
-        header.* = .{ .prev = null, .next = self.blocks, .bytes = bytes, .alignment = alignment.max(.of(Header)) };
+        const materialization = if (!allocation.outermost) memory.MaterializedHostAllocation{} else if (memory.hostExecutionActive())
+            memory.materializeUninitializedHostAllocation(base[0..bytes])
+        else
+            self.materializeAllocation(base[0..bytes]);
+        header.* = .{ .prev = null, .next = self.blocks, .bytes = bytes, .alignment = alignment.max(.of(Header)), .materialization = materialization };
         if (self.blocks) |old| old.prev = header;
         self.blocks = header;
         self.live_bytes += bytes;
@@ -206,7 +229,11 @@ pub const AdmittedAllocator = struct {
         if (new_len == 0 or new_len > buffer.len) return false;
         const bytes = std.math.add(usize, overhead, new_len) catch return false;
         const old_bytes = header.bytes;
-        if (!self.backing.rawResize(base[0..old_bytes], header.alignment, bytes, ra)) return false;
+        const reduction = header.materialization.prepareShrink(old_bytes - bytes);
+        if (!self.backing.rawResize(base[0..old_bytes], header.alignment, bytes, ra)) {
+            header.materialization.rollbackShrink(reduction);
+            return false;
+        }
         header.bytes = bytes;
         self.live_bytes -= old_bytes - bytes;
         if (self.trim_on_free) self.trim() catch {};
@@ -222,6 +249,7 @@ pub const AdmittedAllocator = struct {
         if (header.prev) |prev| prev.next = header.next else self.blocks = header.next;
         if (header.next) |next| next.prev = header.prev;
         self.live_bytes -= header.bytes;
+        header.materialization.release();
         self.backing.rawFree(base[0..header.bytes], header.alignment, ra);
         if (self.trim_on_free and (self.live_bytes == 0 or (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes) >= quantum)) self.trim() catch {};
     }
@@ -417,4 +445,38 @@ test "admission prepaid workspace grows only its deficit and rolls back failed s
     a.free(payload);
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "memory chunk admission materializes preprocessing and preserves unused credit after trim" {
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var lease = try self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+            lease.live_reserved_bytes = bytes;
+            self.controller.live_pending_bytes += bytes;
+            return lease;
+        }
+    };
+    var owner = Owner{};
+    defer owner.controller.deinit();
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &owner, .admit = Owner.admit };
+    defer admitted.deinit();
+    const a = admitted.allocator();
+    var bytes = try a.alloc(u8, 8192);
+    defer a.free(bytes);
+    @memset(bytes, 61);
+    try std.testing.expect(owner.controller.live_pending_bytes < 64 * 1024);
+    try std.testing.expect(owner.controller.live_pending_bytes != 0);
+    try admitted.trim();
+    // Only small reservation metadata remains conservative; trim cannot
+    // convert unallocated promises into fictitious resident bytes.
+    try std.testing.expect(owner.controller.live_pending_bytes <= admitted.metadata_bytes);
+    try std.testing.expect(owner.controller.live_pending_bytes != 0);
+    bytes = try a.realloc(bytes, 4096);
+    try std.testing.expectEqual(@as(u8, 61), bytes[0]);
+    a.free(bytes);
+    bytes = &.{};
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), owner.controller.live_pending_bytes);
 }

@@ -4885,10 +4885,10 @@ test "opaque Lite file cache capability reaches the production storage factory" 
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const services = @import("kernel_runtime_services.zig");
     const Probe = struct {
-        bytes: u64 = 0,
-        fn discard(raw: ?*anyopaque, _: i32, _: u64, len: u64) callconv(.c) void {
+        calls: usize = 0,
+        fn discard(raw: ?*anyopaque, _: i32) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.bytes += len;
+            self.calls += 1;
         }
     };
     var tmp = std.testing.tmpDir(.{});
@@ -4900,12 +4900,13 @@ test "opaque Lite file cache capability reaches the production storage factory" 
     defer alloc.free(path);
     var probe = Probe{};
     var borrow = services.executor.Borrow.init(&std.testing.io);
-    borrow.file_cache = .{ .context = &probe, .discard_range = Probe.discard };
+    borrow.file_cache = .{ .context = &probe, .discard_file = Probe.discard };
     {
         var context = client.Context{};
         try context.ensureWithRuntime(.{
             .context = .{ .storage_kind = .lite, .storage_path = .fromSlice(path) },
             .io = &borrow,
+            .cache_retirement = .discard,
         });
         defer context.deinit();
         var catalog = try context.systemStore(alloc, "system/metadata");
@@ -4915,5 +4916,5 @@ test "opaque Lite file cache capability reaches the production storage factory" 
         try write.put("capability", "preserved");
         try write.commit();
     }
-    try std.testing.expect(probe.bytes > 0);
+    try std.testing.expect(probe.calls > 0);
 }

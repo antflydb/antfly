@@ -97,7 +97,7 @@ pub const Cache = struct {
         const self = try std.heap.page_allocator.create(Cache);
         errdefer std.heap.page_allocator.destroy(self);
         self.* = .{ .manager = manager, .metadata = reservation };
-        self.reclaimer = try manager.registerReclaimer(.full_text_segment_residency, self, reclaim);
+        self.reclaimer = try manager.registerReclaimerWithOptions(.full_text_segment_residency, self, reclaim, .{ .reclaim_physical = reclaim });
         return self;
     }
     pub fn key(analyzer: *const analysis.Analyzer, text: []const u8) ![32]u8 {

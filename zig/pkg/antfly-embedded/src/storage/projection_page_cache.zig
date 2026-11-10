@@ -48,7 +48,7 @@ pub const Cache = struct {
         const self = try std.heap.page_allocator.create(Cache);
         errdefer std.heap.page_allocator.destroy(self);
         self.* = .{ .manager = manager, .metadata = reservation };
-        self.reclaimer = try manager.registerReclaimer(.hbc_node_metadata_cache, self, reclaim);
+        self.reclaimer = try manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, self, reclaim, .{ .reclaim_physical = reclaim });
         return self;
     }
 

@@ -150,6 +150,19 @@ def main():
         print(json.dumps(after), flush=True)
         assert after["active_file"] < before["active_file"] // 4, after
         assert after["oom_kill"] == baseline["oom_kill"], after
+        subprocess.run(
+            [
+                str(args.test_binary.resolve()),
+                "--test-filter",
+                "memory active scratch admits overlapping actual allocations",
+            ],
+            env={**os.environ, "ANTFLY_PRESSURE_TEST_FILE": str(path.resolve())},
+            check=True,
+            timeout=60,
+        )
+        overlap = snapshot("overlapping_scratch_completed")
+        print(json.dumps(overlap), flush=True)
+        assert overlap["oom_kill"] == baseline["oom_kill"], overlap
     finally:
         path.unlink(missing_ok=True)
 

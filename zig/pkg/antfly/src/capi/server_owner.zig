@@ -919,6 +919,7 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
                 .resource_manager = &context.resources.resource_manager,
                 .io = if (context.io_receiver) |*io| io.io() else null,
                 .cache_advice = if (context.io_receiver) |*io| io.borrow.file_cache else .{},
+                .cache_retirement = services.cache_retirement,
             });
         },
     }

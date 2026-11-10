@@ -3751,6 +3751,7 @@ pub const OpenOptions = struct {
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     cache_advice: file_cache.Advice = .{},
+    cache_retirement: file_cache.Retirement = .on_pressure,
 };
 
 /// Per-owner writer-lease timing, exposed under `background_publications`.
@@ -3868,6 +3869,7 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     cache_advice: file_cache.Advice = .{},
+    cache_retirement: file_cache.Retirement = .on_pressure,
 };
 
 pub const Header = struct {
@@ -4890,6 +4892,8 @@ pub const NativeFile = struct {
     /// Cleanup occurs under the writer lease, before a successor can open.
     discard_file_cache_on_close: bool = false,
     cache_advice: file_cache.Advice = .{},
+    cache_retirement: file_cache.Retirement = .on_pressure,
+    cache_pressure_epoch: u64 = 0,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
@@ -5065,6 +5069,8 @@ pub const NativeFile = struct {
             .file = file,
             .writer_lock_file = writer_lock_file,
             .discard_file_cache_on_close = !opts.internal_reader and !opts.read_only,
+            .cache_retirement = opts.cache_retirement,
+            .cache_pressure_epoch = if (opts.resource_manager) |m| m.file_cache_pressure_epoch.load(.monotonic) else 0,
             .cache_advice = if (borrowed_io == null) .native() else opts.cache_advice,
             .externally_locked = opts.externally_locked,
             .reader_coordinator = opts.reader_coordinator,
@@ -5091,7 +5097,9 @@ pub const NativeFile = struct {
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation);
+        var file = try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation);
+        file.cache_retirement = opts.cache_retirement;
+        return file;
     }
 
     /// Creates a Lite file using a caller-owned std.Io runtime. The runtime
@@ -5099,6 +5107,7 @@ pub const NativeFile = struct {
     pub fn createWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions) !NativeFile {
         var file = try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation);
         file.cache_advice = opts.cache_advice;
+        file.cache_retirement = opts.cache_retirement;
         return file;
     }
 
@@ -5210,6 +5219,7 @@ pub const NativeFile = struct {
             .writer_lock_file = writer_lock_file,
             .header = initialized_header,
             .discard_file_cache_on_close = true,
+            .cache_pressure_epoch = if (resource_manager) |m| m.file_cache_pressure_epoch.load(.monotonic) else 0,
             .cache_advice = if (borrowed_io == null) .native() else .{},
             .read_only = false,
             .no_sync = no_sync,
@@ -5233,13 +5243,21 @@ pub const NativeFile = struct {
         self.transaction_writes = null;
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        const retire_cache = switch (self.cache_retirement) {
+            .discard => true,
+            .retain => false,
+            .on_pressure => if (self.pageCache().resource_manager) |manager|
+                manager.file_cache_pressure_epoch.load(.monotonic) != self.cache_pressure_epoch
+            else
+                false,
+        };
         self.pageCache().deinit(self.allocator);
         if (self.managed_page_cache) |cache| self.allocator.destroy(cache);
         self.managed_page_cache = null;
         self.invalidateLedger();
         // Terminal advice traverses the kernel's cached-page index rather
         // than scanning logical offsets. It runs only under this owner's lease.
-        if (self.discard_file_cache_on_close and !self.read_only and self.writer_lock_file != null) {
+        if (self.discard_file_cache_on_close and retire_cache and !self.read_only and self.writer_lock_file != null) {
             self.cache_advice.discardFile(io, self.file);
         }
         if (self.writer_lock_file) |lock_file| lock_file.close(io);
@@ -22170,6 +22188,7 @@ test "lite native cache advice terminal cleanup covers EOF while retaining the w
     try file.file.setLength(std.testing.io, 5 * 1024 * 1024 * 1024);
     var probe = Probe{ .file = &file };
     file.cache_advice = .{ .context = &probe, .discard_file = Probe.discard };
+    file.cache_retirement = .discard;
     file.close();
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }
@@ -22195,4 +22214,53 @@ test "lite native managed cache respects thread-confined allocator ownership" {
         try std.testing.expectEqual(@as(usize, 0), file.pageCache().link_bytes);
     }
     try std.testing.expectEqual(@as(u64, 0), backing.live_bytes);
+}
+
+test "lite native cache advice preserves warm closes and retires only pressured owner generations" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const path = try testPath(a, dir, "close-policy.aflite");
+    defer a.free(path);
+    const Probe = struct {
+        calls: usize = 0,
+        fn discard(raw: ?*anyopaque, _: i32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{};
+    const advice = file_cache.Advice{ .context = &probe, .discard_file = Probe.discard };
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .resource_manager = &manager, .cache_advice = advice });
+        try file.putDocument("doc", "warm");
+        file.close();
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .resource_manager = &manager, .cache_advice = advice });
+        _ = manager.reclaimHostMemory(1);
+        file.close();
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    // A later owner does not inherit a historical pressure event.
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .resource_manager = &manager, .cache_advice = advice });
+        file.close();
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .resource_manager = &manager, .cache_advice = advice, .cache_retirement = .retain });
+        _ = manager.reclaimHostMemory(1);
+        file.close();
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    {
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .cache_advice = advice, .cache_retirement = .discard });
+        file.close();
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }

@@ -20,10 +20,11 @@ const abi = @import("kernel_owner_abi");
 pub const memory = @import("runtime_memory_abi");
 pub const executor = @import("antfly_runtime_abi").io_abi;
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 pub const Request = extern struct {
     version: u32 = abi_version,
     _reserved: u32 = 0,
+    cache_retirement: executor.file_cache.Retirement = .on_pressure,
     context: abi.ContextRequest = .{},
     /// Explicit process budget. Zero with borrowed I/O uses fixed defaults;
     /// it must not probe host RAM during deterministic execution.

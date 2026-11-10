@@ -348,13 +348,33 @@ destroyed payload storage separately from unused reservation credit. The
 storage process also purges unused libc arenas where supported. A fresh
 admission probe remains authoritative even after a zero-byte owner report.
 
+Execution leases distinguish unallocated promises from allocator-owned,
+writable host pages. The native compute allocator attributes real allocations
+before kernels run, without preallocating the estimated peak or probing procfs
+per allocation. Its pointer-transparent map preserves legacy allocator layout,
+handles resize/remap rollback and keeps allocator state alive through escaped
+buffers. Layered adapters attribute a backing allocation once. Unknown/device
+producers remain conservative. Chunk-admitted preprocessing records ownership
+on allocation too; reducing unused capacity preserves the remaining promise,
+whereas completing construction settles it. Buffer release restores future
+execution promises before the backing free. Late frees after lease completion
+never dereference the old admission controller. Page commitment never holds an
+admission/accounting lock while faulting pages.
+
 Linux file-cache cleanup belongs to the file-producing operation. Snapshots
 sync and advise private output in 64 MiB windows before publication. Streaming
 range hints cover at most 8 MiB each, with a 2 GiB batch cap and cancellation
 checks; range-only capabilities do not imply whole-file cleanup.
 
-A native terminal capability disposes of an owner's file cache before releasing
-its lifetime writer lease. Linux traverses the mapping's cached-folio index,
+Authority to advise a file is independent of its retirement policy. Ordinary
+writable closes preserve cache warmth. A physical-pressure pass marks the
+ResourceManager's retirement epoch; a writable owner that observed a new epoch
+during its lifetime may discard cache when it retires. Newly opened owners do
+not inherit old pressure. Producers can explicitly retain or discard on close.
+Read-only/internal/externally leased handles never acquire discard ownership.
+
+A native terminal capability disposes of eligible cache before releasing its
+lifetime writer lease. Linux traverses the mapping's cached-folio index,
 including hot ranges beyond sparse holes or a cold prefix, rather than scanning
 every logical offset in userspace. Work scales with cache residency, not file
 length. This is best-effort, potentially writeback-initiating advice, not a hard
@@ -369,7 +389,13 @@ charges, release empty map storage, and drain before cache teardown. Reclamation
 pre-acquires known nested budget/quota allocator chains with try-locks before
 detaching storage; a busy chain is skipped without partial eviction. Guarded
 frees reuse those locks. This includes metadata/workspace, native chunk, scratch,
-document-preparation, vocabulary and retained-frame caches.
+document-preparation, vocabulary and retained-frame caches. Physical dispatch
+requires an explicitly registered callback; logical callbacks never inherit
+foreign-thread authority. HBC callbacks pre-acquire accounting and generation
+locks as well as allocator chains; shared/local HBC eviction skips pinned
+entries without allocating diagnostic records. Fixed linear passes preserve
+class protection and CLOCK cold-before-hot preference without repeatedly
+scanning pinned prefixes.
 
 Native advice is granted by the I/O producer and forwarded in the checked
 executor borrow. Borrowed consumers never identify native handles by comparing
@@ -383,9 +409,10 @@ archive to verify that native advice survives executor translation and that
 abstract I/O cannot grant it. The Linux kernel regression in
 `scripts/ci/run_inference_memory_pressure.py` uses a 1 CPU / 2 GiB no-swap cgroup,
 creates active file cache in a writer that exits, applies terminal owner cleanup
-at offsets 0 and 3 GiB,
-and verifies fresh admission recovery without an OOM kill. It requires no model
-download; workload-specific embedding/indexing throughput and snapshot/crash
+at offsets 0 and 3 GiB, and verifies fresh admission recovery without an OOM
+kill. It also runs two overlapping 600 MiB host allocations under the same
+physical limit, preserving promises for allocations that have not happened.
+It requires no model download; workload-specific embedding/indexing throughput and snapshot/crash
 recovery remain separate qualification.
 
 An explicit envelope also makes its live-usage probe mandatory. If the

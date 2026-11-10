@@ -4275,6 +4275,8 @@ fn loadEphemeralQuantizedLazyWeight(
 pub const QuantizedActivationPolicy = enum { automatic, strict_f32 };
 
 pub const NativeCompute = struct {
+    host_allocator: ?*run_memory.HostAllocator = null,
+
     allocator: std.mem.Allocator,
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
@@ -4298,6 +4300,13 @@ pub const NativeCompute = struct {
     /// process-wide futex pool inside lib/linalg directly.  Tests typically
     /// pass null; production session creation supplies the application's Io.
     io: ?std.Io = null,
+
+    fn trackHostAllocations(self: *NativeCompute) void {
+        if (self.host_allocator != null or !run_memory.hostExecutionActive()) return;
+        const owner = run_memory.HostAllocator.create(self.allocator) catch return;
+        self.host_allocator = owner;
+        self.allocator = owner.allocator();
+    }
 
     pub fn init(allocator: std.mem.Allocator, data: *WeightStore, run_budget: ?*run_memory.RunBudget) NativeCompute {
         initPrefetchQueue(data, allocator);
@@ -4332,6 +4341,11 @@ pub const NativeCompute = struct {
         }
         self.weight_reservations.deinit(self.allocator);
         self.weight_reservations = .empty;
+        if (self.host_allocator) |owner| {
+            self.allocator = owner.backing;
+            self.host_allocator = null;
+            owner.deinit();
+        }
     }
 
     // Dispatchers select the canonical Io API when this backend was constructed
@@ -4734,6 +4748,7 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_
 
 fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const policy = embeddinggemma2_weight_cache;
     if (!self.cache_embeddinggemma2_bf16_weights or !std.mem.startsWith(u8, key, "audio_tower.prepared.")) return null;
     const cache = if (self.data.tier_cache) |*cache| cache else return null;
@@ -5094,6 +5109,7 @@ fn expectedQuantizedStorageLoadBytes(storage: *const QuantizedStorage) usize {
 
 fn getIo(ctx: *anyopaque) ?std.Io {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     return self.io;
 }
 
@@ -5266,12 +5282,14 @@ fn backendKind(_: *anyopaque) BackendKind {
 
 fn deinitBackend(ctx: *anyopaque) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     self.deinit();
     self.allocator.destroy(self);
 }
 
 fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const b = toBuf(tensor);
     if (b.tensor_refs > 1) {
         b.tensor_refs -= 1;
@@ -5519,6 +5537,7 @@ fn deinitWeightHandles(self: *NativeCompute) void {
 
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (self.weight_handles.get(name)) |tensor| {
         toBuf(tensor).weight_handle_refs += 1;
         return tensor;
@@ -5603,6 +5622,7 @@ fn canonicalProjectionWeight(self: *NativeCompute, name: []const u8) !?CT {
 
 fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
     return (try canonicalProjectionWeight(self, stable_name)) orelse try loadWeight(self, stable_name, true);
@@ -5610,6 +5630,7 @@ fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
 
 fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
     return loadWeight(self, stable_name, false);
@@ -5750,6 +5771,7 @@ pub fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) !usi
 
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (self.data.resident_weights.contains(name)) return;
     self.data.prefetch.lock();
     defer self.data.prefetch.unlock();
@@ -5766,6 +5788,7 @@ fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
 
 fn drainPrefetchBudget(ctx: *anyopaque, max_items: usize) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     self.data.prefetch.drainBudget(max_items);
 }
 
@@ -6352,6 +6375,7 @@ fn freeLazyWeights(data: *WeightStore, allocator: std.mem.Allocator) void {
 
 fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const out_len = std.math.mul(usize, total, dim) catch return error.UnsupportedShape;
     const out = try self.allocator.alloc(f32, out_len);
@@ -6669,6 +6693,7 @@ fn dispatchQuantizedLinearStrictF32(request: QuantLinearRequest) !bool {
 
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
@@ -6993,6 +7018,7 @@ fn linearLoRAOp(
     out_dim: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, lora_a);
     defer maybeDiscardMappedWeightAfterUse(self, lora_b);
     _ = rank;
@@ -7033,6 +7059,7 @@ fn linearLoRAOp(
 
 fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, gamma);
     defer maybeDiscardMappedWeightAfterUse(self, beta);
     const output = try self.allocator.dupe(f32, getData(input));
@@ -7044,6 +7071,7 @@ fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps:
 
 fn layerNormConsumeInputOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, gamma);
     defer maybeDiscardMappedWeightAfterUse(self, beta);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
@@ -7130,6 +7158,7 @@ pub fn debertaLayerNormBackwardHost(
 /// `[rows + 2, dim]`: rows 0..rows = dx, row `rows` = dgamma, row `rows+1` = dbeta.
 fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     _ = beta;
     const in_data = getData(input);
     if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
@@ -7149,6 +7178,7 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
 
 fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const x = getData(input);
     const output = try self.allocator.alloc(f32, x.len);
     errdefer self.allocator.free(output);
@@ -7160,6 +7190,7 @@ fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_
 
 fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     var count: usize = 1;
     for (shape) |dim| count *= @intCast(dim);
     const values = try self.allocator.alloc(f32, count);
@@ -7170,6 +7201,7 @@ fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u6
 
 fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const x = getData(input);
     const output = try self.allocator.alloc(f32, x.len);
     errdefer self.allocator.free(output);
@@ -7182,6 +7214,7 @@ fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, he
 
 fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const x = getData(input);
     const output = try self.allocator.alloc(f32, x.len / 2);
     errdefer self.allocator.free(output);
@@ -7193,6 +7226,7 @@ fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
 
 fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const x = getData(input);
     const output = try self.allocator.alloc(f32, x.len);
     errdefer self.allocator.free(output);
@@ -7204,6 +7238,7 @@ fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!
 
 fn packedGeluMultiplyOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const source = try getDataChecked(input);
     if (source.len != try std.math.mul(usize, try std.math.mul(usize, rows, width), 2)) return error.InvalidTensorShape;
     const data = try self.allocator.alloc(f32, rows * width);
@@ -7248,6 +7283,7 @@ fn packedGeluMultiplyOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) a
 fn activationMultiplyOp(ctx: *anyopaque, gate: CT, up: CT, kind: ops.DecoderRuntimeActivationKind) anyerror!?CT {
     if (kind != .gelu and kind != .gelu_new) return null;
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const values = getData(gate);
     const output = try self.allocator.alloc(f32, values.len);
     errdefer self.allocator.free(output);
@@ -7266,6 +7302,7 @@ fn activationMultiplyOp(ctx: *anyopaque, gate: CT, up: CT, kind: ops.DecoderRunt
 
 fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.dupe(f32, getData(input));
     applyGeluForSession(self, output) catch |err| {
         self.allocator.free(output);
@@ -7278,6 +7315,7 @@ fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
 
 fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.geluExact(output);
     const result = try self.makeOwnedBuf(output);
@@ -7289,6 +7327,7 @@ fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
 /// and activated-gate tensors. Keep the established exact-erf implementation.
 fn packedGegluExactOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (rows == 0 or width == 0) return null;
     const count = try std.math.mul(usize, rows, width);
     const source = try getDataChecked(input);
@@ -7390,6 +7429,7 @@ fn applyGeluForSession(self: *NativeCompute, values: []f32) std.Io.Cancelable!vo
 
 fn unaryConsumeOp(ctx: *anyopaque, op: ops.UnaryConsumeOp, input: CT) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     if (op == .gelu) try applyGeluForSession(self, buf.data) else applyUnaryConsume(op, buf.data);
     return input;
@@ -7441,6 +7481,7 @@ test "embeddinggemma2 CPU parallel GELU scope cancellation ownership and alias f
 
 fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .add);
     if (try applyShapeAwareBinaryOp(self, a, b, .add)) |result| {
         return result;
@@ -7952,6 +7993,7 @@ var dense_vision_tiles = DenseVisionTiles{};
 
 fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, sequence: usize, heads: usize, dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (!self.cache_embeddinggemma2_bf16_weights or sequence < 32) return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
     const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidAttentionShape;
     const hidden = std.math.mul(usize, heads, dim) catch return error.InvalidAttentionShape;
@@ -7986,6 +8028,7 @@ fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch:
 
 fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const Q = getData(q_ct);
     const K = getData(k_ct);
     const V = getData(v_ct);
@@ -8221,6 +8264,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
 fn gemma4AudioLocalAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const out = try @import("native_audio_attention.zig").forward(self.allocator, self.io, params, getData(q), getData(k), getData(v), getData(rel), getData(scales), getData(valid));
     const tensor = try self.makeOwnedBuf(out);
     errdefer freeTensor(self, tensor);
@@ -8445,6 +8489,7 @@ fn preparedEmbeddingGemma2Linear(self: *NativeCompute, input: []const f32, sourc
 
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
@@ -8494,6 +8539,7 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
 
 fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedRequest) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const weight_buf = toBuf(request.weight);
     const storage = weight_buf.quantized_storage orelse
         return linearNoBiasOp(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
@@ -8525,6 +8571,7 @@ fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlanne
 
 fn linearPlannedOp(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const weight_buf = toBuf(request.weight);
     const storage = weight_buf.quantized_storage orelse
         return linearOp(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim);
@@ -8572,6 +8619,7 @@ fn linearNoBiasPairOp(
     out_dim: usize,
 ) anyerror!ops.LinearNoBiasPairResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
     if (weight_buf_a.quantized_storage) |storage_a| {
@@ -8777,6 +8825,7 @@ fn mulMatIdQuantizedOp(
 
 fn mulMatIdOp(ctx: *anyopaque, request: *const ops.MulMatIdRequest) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     if (request.expert_ids.len != request.rows) return error.InvalidPackedExpertTensor;
     const input = getData(request.input);
@@ -8832,6 +8881,7 @@ fn linearPairOp(
     out_dim: usize,
 ) anyerror!ops.LinearPairResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
 
@@ -8885,6 +8935,7 @@ fn linearPairOp(
 
 fn linearTripleNoBiasNamedOp(ctx: *anyopaque, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (self.cache_embeddinggemma2_bf16_weights) {
         const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.qkv", .{ names[0], names[1], names[2] });
         defer self.allocator.free(key);
@@ -8935,6 +8986,7 @@ fn packedLinearKey(a: std.mem.Allocator, weights: []const CT, suffix: []const u8
 }
 fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (!self.cache_embeddinggemma2_bf16_weights) return null;
     if (!native.useBlas() and in_dim >= 64) {
         var total: usize = 0;
@@ -9048,6 +9100,7 @@ fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, 
 }
 fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (!native.useBlas() and in_dim >= 64) {
         if (try linearPackedNamedOp(ctx, input, &.{ toBuf(a).name, toBuf(b).name, toBuf(c).name }, &.{ out_dim, out_dim, out_dim }, rows, in_dim)) |combined| {
             defer freeTensor(ctx, combined);
@@ -9085,6 +9138,7 @@ fn linearTripleOp(
     out_dim: usize,
 ) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
     const weight_buf_c = toBuf(weight_c);
@@ -36420,6 +36474,7 @@ fn decodeF32Le(b0: u8, b1: u8, b2: u8, b3: u8) f32 {
 
 fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const values = try self.allocator.dupe(f32, getData(input));
     for (values) |*value| value.* *= scale;
     const result = try self.makeOwnedBuf(values);
@@ -36429,12 +36484,14 @@ fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
 
 fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if ((std.math.mul(usize, rows, cols) catch return error.InvalidTensorShape) != getData(input).len) return error.InvalidTensorShape;
     return try aliasDenseBufWithShape(self, input, &.{ @intCast(rows), @intCast(cols) });
 }
 
 fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, p: ops.EmbeddingHeadParams) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     try p.validate();
     if ((p.gather != 0) != (gather != null) or (p.weighted != 0) != (weight != null)) return error.InvalidTensorShape;
     const source = try getDataChecked(input);
@@ -36477,12 +36534,14 @@ fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, 
 
 fn modelScalarBoundsOp(ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerror!?[4]?f32 {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (!self.cache_embeddinggemma2_bf16_weights) return null;
     return self.data.scalar_bounds.access(self.data.allocator, key, value);
 }
 
 fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const x = getData(input);
     const w = getData(weight);
@@ -36497,6 +36556,7 @@ fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: 
 
 fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.alloc(f32, getData(input).len);
     activations_mod.clampSilu(output, getData(input), min_value, max_value);
     const result = try self.makeOwnedBuf(output);
@@ -36506,6 +36566,7 @@ fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) any
 
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.rmsNorm(output, getData(weight), dim, eps);
@@ -36516,6 +36577,7 @@ fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyer
 
 fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.rmsNorm(buf.data, getData(weight), dim, eps);
@@ -36524,6 +36586,7 @@ fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps
 
 fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.relu(output);
     const result = try self.makeOwnedBuf(output);
@@ -36533,6 +36596,7 @@ fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
 
 fn siluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.silu(output);
     const result = try self.makeBuf(output, true);
@@ -36541,6 +36605,7 @@ fn siluOp(ctx: *anyopaque, input: CT) anyerror!CT {
 
 fn quickGeluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.quickGelu(output);
     return self.makeBuf(output, true);
@@ -36548,6 +36613,7 @@ fn quickGeluOp(ctx: *anyopaque, input: CT) anyerror!CT {
 
 fn sigmoidOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.sigmoid(output);
     return self.makeBuf(output, true);
@@ -36555,6 +36621,7 @@ fn sigmoidOp(ctx: *anyopaque, input: CT) anyerror!CT {
 
 fn tanhOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const output = try self.allocator.alloc(f32, data.len);
     for (data, 0..) |v, i| {
@@ -36565,6 +36632,7 @@ fn tanhOp(ctx: *anyopaque, input: CT) anyerror!CT {
 
 fn concatOp(ctx: *anyopaque, a: CT, b: CT, total: usize, dim_a: usize, dim_b: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const a_data = getData(a);
     const b_data = getData(b);
     const out_dim = dim_a + dim_b;
@@ -36629,6 +36697,7 @@ fn windowedSelfAttentionOp(
     window_size: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const head_dim = dim / num_heads;
 
     const normed_ct = try layerNormOp(ctx, input, norm_weight, norm_bias, dim, 1e-5);
@@ -36705,6 +36774,7 @@ fn channelSelfAttentionOp(
     groups: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
 
     const normed_ct = try layerNormOp(ctx, input, norm_weight, norm_bias, dim, 1e-5);
     defer freeTensor(ctx, normed_ct);
@@ -36738,6 +36808,7 @@ fn tokenGridConv2dOp(
     groups: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     defer maybeDiscardMappedWeightAfterUse(self, bias);
     const input_tokens = getData(input);
@@ -36823,6 +36894,7 @@ fn tokenGridConv2dOp(
 
 fn causalSelfAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const Q = getData(q_ct);
     const K = getData(k_ct);
     const V = getData(v_ct);
@@ -36834,6 +36906,7 @@ fn causalSelfAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bia
 
 fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const Q = getData(q_ct);
     const K = getData(k_ct);
     const V = getData(v_ct);
@@ -36843,6 +36916,7 @@ fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []c
 
 fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const table = getData(weight); // [num_heads, num_buckets]
 
@@ -36895,6 +36969,7 @@ fn debertaTrainingControl(tensor: CT, expected: @import("ml").graph.Shape) ![]al
 
 fn debertaTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: deberta_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     _ = try deberta_training.plan(attrs, .{});
     const layout = try attrs.layout();
@@ -36913,6 +36988,7 @@ fn debertaTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, relative: CT, control_
 
 fn debertaTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dout: CT, attrs: deberta_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     _ = try deberta_training.plan(attrs, .{});
     const layout = try attrs.layout();
@@ -36962,6 +37038,7 @@ fn segmentTrainingControl(tensor: CT, expected: @import("ml").graph.Shape) ![]al
 
 fn segmentTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: segment_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     const layout = try attrs.layout();
     const words = try segmentTrainingControl(control_i32, layout.controlShape());
@@ -36976,6 +37053,7 @@ fn segmentTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs
 
 fn segmentTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, dout: CT, attrs: segment_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     const layout = try attrs.layout();
     const words = try segmentTrainingControl(control_i32, layout.controlShape());
@@ -36992,6 +37070,7 @@ fn segmentTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: C
 
 fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: modernbert_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     const layout = try attrs.layout();
     const words = try debertaTrainingControl(control_i32, layout.controlShape());
@@ -37006,6 +37085,7 @@ fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, at
 
 fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, dout: CT, attrs: modernbert_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     const layout = try attrs.layout();
     const words = try debertaTrainingControl(control_i32, layout.controlShape());
@@ -37026,6 +37106,7 @@ fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT
 
 fn disentangledRelativeAttentionWithControlOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (control) |c| try c.check();
     const Q = getData(q_ct);
     const K = getData(k_ct);
@@ -37048,6 +37129,7 @@ fn disentangledRelativeAttentionWithControlOp(ctx: *anyopaque, q_ct: CT, k_ct: C
 
 fn disentangledRelativeAttentionBackwardOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, dO_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const grads = try debertaDisentangledAttentionBackwardHost(
         self.allocator,
         getData(q_ct),
@@ -37716,6 +37798,7 @@ pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max
 
 fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .multiply);
     if (try applyShapeAwareBinaryOp(self, a, b, .mul)) |result| {
         return result;
@@ -37752,6 +37835,7 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     // NCT/OIK is the height-one NCHW/OIHW layout. Share the accelerated,
     // bounded convolution implementation and retain scalar execution when
     // its optional im2col workspace cannot be admitted.
@@ -37809,6 +37893,7 @@ fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
 
 fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     if (batch == 0 or in_channels == 0 or out_channels == 0 or height == 0 or width == 0 or kernel_h == 0 or kernel_w == 0 or stride_h == 0 or stride_w == 0 or groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
 
@@ -38059,6 +38144,7 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
 }
 fn averagePoolOp(ctx: *anyopaque, input: CT, attrs: *const @import("ml").graph.node.AveragePoolAttrs) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const buf = toBuf(input);
     const shape = buf.logical_shape orelse
         if (buf.quantized_storage) |storage| storage.shape else return error.UnsupportedShape;
@@ -38144,6 +38230,7 @@ fn averagePoolOp(ctx: *anyopaque, input: CT, attrs: *const @import("ml").graph.n
 
 fn convTransposeOp(ctx: *anyopaque, request: *const ops.ConvTransposeRequest) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     defer maybeDiscardMappedWeightAfterUse(self, request.weight);
 
     if (request.num_spatial != 1 and request.num_spatial != 2) return error.UnsupportedShape;
@@ -38355,6 +38442,7 @@ fn mropeOp(
     sections: [3]u32,
 ) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const output = try self.allocator.alloc(f32, data.len);
     errdefer self.allocator.free(output);
@@ -38408,6 +38496,7 @@ pub fn visionRopeCore(
 
 fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.VisionNormRopeParams) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const w = getData(weight);
     const stride: usize = if (p.stride == 0) p.hidden else p.stride;
@@ -38475,6 +38564,7 @@ fn visionRopeOp(
     positions: []const u32,
 ) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const output = try self.allocator.alloc(f32, data.len);
     errdefer self.allocator.free(output);
@@ -38505,6 +38595,7 @@ pub fn ropeChunksPerToken(logical_shape: ?[]const i64, total_chunks: usize, seq_
 
 fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const total_chunks = data.len / head_dim;
     if (seq_len == 0) return error.InvalidRoPEInput;
@@ -38544,6 +38635,7 @@ fn ropePerItemOp(
     consecutive_pairs: bool,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (query_lengths.len != batch or position_offsets.len != batch) return error.InvalidRoPEInput;
 
     const data = getData(input);
@@ -38584,6 +38676,7 @@ fn ropePerItemOp(
 
 fn gqaCausalAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const Q = getData(q_ct);
     const K = getData(k_ct);
     const V = getData(v_ct);
@@ -38841,6 +38934,7 @@ pub fn gqaCausalAttentionNaiveHost(
 
 fn gqaPagedAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, attention: AttentionContext, batch: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const Q = getData(q_ct);
     const K = getData(k_ct);
     const V = getData(v_ct);
@@ -39166,6 +39260,7 @@ fn primBinaryBroadcast(allocator: std.mem.Allocator, a_data: []const f32, b_data
 
 fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .subtract);
     if (try applyShapeAwareBinaryOp(self, a, b, .sub)) |result| {
         return result;
@@ -39182,6 +39277,7 @@ fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (try applyShapeAwareBinaryOp(self, a, b, .div)) |result| {
         return result;
     }
@@ -39197,6 +39293,7 @@ fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const a_data = getData(a);
     const output = try self.allocator.alloc(f32, a_data.len);
     var raw_output: ?[]f32 = output;
@@ -39215,6 +39312,7 @@ fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
 
 fn primUnaryOp(comptime op: enum { sqrt, rsqrt, exp, log, sin, cos, tanh_prim, abs }, ctx: *anyopaque, a: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const a_data = getData(a);
     const output = try self.allocator.alloc(f32, a_data.len);
     var raw_output: ?[]f32 = output;
@@ -39264,6 +39362,7 @@ fn primAbsOp(ctx: *anyopaque, a: CT) anyerror!CT {
 
 fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const a_data = getData(a);
     const output = try self.allocator.alloc(f32, a_data.len);
     var raw_output: ?[]f32 = output;
@@ -39284,6 +39383,7 @@ fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
 
 fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(a) != null or integerSource(b) != null) return exactLessThan(self, a, b);
     if (try applyShapeAwareBinaryOp(self, a, b, .lt)) |result| {
         return result;
@@ -39302,6 +39402,7 @@ fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return exactWhereSelect(self, cond, on_true, on_false);
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
@@ -39601,21 +39702,25 @@ fn resolveDeclaredBatchShape(shape: []const i64, batch_axes: []const u8, batch_s
 
 fn primReduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     return primReduceOp(self, input, axes, input_shape, .sum);
 }
 
 fn primReduceMaxOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     return primReduceOp(self, input, axes, input_shape, .max);
 }
 
 fn primReduceMeanOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     return primReduceOp(self, input, axes, input_shape, .mean);
 }
 
 fn primArgMaxOp(ctx: *anyopaque, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const in_data = getData(input);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
     if (axis >= effective_input_shape.len) return error.ShapeMismatch;
@@ -39766,6 +39871,7 @@ fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: 
 
 fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(input)) |source| {
         if (new_shape.len > 8) return error.UnsupportedShape;
         const stored = tensorStoredShape(input) orelse return error.InvalidTensorShape;
@@ -39839,6 +39945,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
 
 fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const input_buf = toBuf(input);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
     var resolved_shape_buf: [8]i64 = undefined;
@@ -39924,6 +40031,7 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
 
 fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(input)) |source| {
         const plan = try @import("binary_broadcast.zig").SelectionPlan.broadcast(storedOrDeclaredShape(input, input_shape), target_shape, broadcast_axes);
         if (plan.counts[0] != try integerTensorCount(source)) return error.ShapeMismatch;
@@ -40088,6 +40196,7 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
 
 fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const lhs_buf = toBuf(lhs);
     const lhs_len = tensorLogicalElementCount(lhs, lhs_shape) orelse lhs_buf.data.len;
     var rhs_resolved_shape_buf: [8]i64 = undefined;
@@ -40870,6 +40979,7 @@ fn integerBinaryOp(self: *NativeCompute, a: CT, b: CT, comptime kind: enum { add
 
 fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     var flat_shape: [1]i64 = undefined;
     const shape = tensorStoredShape(input) orelse blk: {
         flat_shape[0] = @intCast((try getDataChecked(input)).len);
@@ -41211,6 +41321,7 @@ fn typedScatterAdd(self: *NativeCompute, input: CT, indices: CT, input_shape: []
 
 fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(indices) != null) return typedScatterAdd(self, input, indices, input_shape, indices_shape, axis);
     const in_data = getData(input);
     const idx_data = getData(indices);
@@ -41251,6 +41362,7 @@ fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []cons
 
 fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(indices) != null or integerSource(input) != null) return typedGather(self, input, indices, axis, input_shape);
     const idx_data = getData(indices);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
@@ -41670,6 +41782,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
 
 fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (integerSource(input)) |source| {
         const plan = try @import("slice_plan.zig").Plan.init(storedOrDeclaredShape(input, input_shape), starts, limits, strides, input_shape);
         if (plan.input_count != try integerTensorCount(source)) return error.ShapeMismatch;
@@ -41780,6 +41893,7 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
 
 fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const a_data = getData(a);
     const b_data = getData(b);
     const effective_a_shape_raw = storedOrDeclaredShape(a, a_shape);
@@ -41955,6 +42069,7 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
 
 fn primSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
     if (d == 0 or data.len % d != 0) return error.InvalidTensorShape;
@@ -41998,6 +42113,7 @@ fn softmaxConsumeOp(_: *anyopaque, input: CT, dim: u32) anyerror!?CT {
 
 fn primLogSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const data = getData(input);
     const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
     if (d == 0 or data.len % d != 0) return error.InvalidTensorShape;
@@ -42019,6 +42135,7 @@ fn logSoftmaxConsumeOp(_: *anyopaque, input: CT, dim: u32) anyerror!?CT {
 
 fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const owned = try self.allocator.dupe(f32, data);
     errdefer self.allocator.free(owned);
     return self.makeBuf(owned, true);
@@ -42033,6 +42150,7 @@ fn bceSigmoid(x: f32) f32 {
 
 fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const logits = getData(request.logits);
     const labels = getData(request.labels);
     const mask = getData(request.mask);
@@ -42066,6 +42184,7 @@ fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithL
 
 fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsBackwardRequest) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const logits = getData(request.logits);
     const labels = getData(request.labels);
     const mask = getData(request.mask);
@@ -42111,6 +42230,7 @@ fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceW
 
 fn fromBorrowedFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) !CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const result = try self.makeBuf(@constCast(data), false);
     errdefer freeTensor(self, result);
     var logical: [8]i64 = undefined;
@@ -42131,6 +42251,7 @@ fn hostFloat32WriteOp(ctx: *anyopaque, tensor: CT) !?[]f32 {
 
 fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const owned = try self.allocator.dupe(f32, data);
     errdefer self.allocator.free(owned);
     const logical_shape = try self.allocator.alloc(i64, shape.len);
@@ -42144,6 +42265,7 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
 
 fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const source = integerSource(input);
     const target_integer = switch (target) {
         .i8, .i16, .i32, .i64, .u8, .bool_ => true,
@@ -42190,6 +42312,7 @@ fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?
 
 fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const storage_dtype: tensor_mod.DType = switch (dtype) {
         inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(tensor_mod.DType, @tagName(tag)),
         else => return null,
@@ -42207,6 +42330,7 @@ fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType,
 
 fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (shape.len > 8) return error.InvalidShape;
     var logical_shape: [8]i64 = undefined;
     for (shape, 0..) |dim, index| logical_shape[index] = dim;
@@ -42218,6 +42342,7 @@ fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anye
 /// Host segment-masked attention over token-major Q/K/V (no staging copies).
 fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const q_values = try getDataChecked(q);
     const k_values = try getDataChecked(k);
     const v_values = try getDataChecked(v);
@@ -42243,6 +42368,7 @@ fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.
 
 fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const r = request.visibility;
     if (request.control) |control| try control.check();
     const hidden = try std.math.mul(usize, r.num_heads, r.head_dim);
@@ -42385,6 +42511,7 @@ test "embeddinggemma2 CPU segment attention output transfer frees data on alloca
 
 fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const source = integerSource(input) orelse return null;
     if (shape.len > 8) return error.InvalidShape;
     var logical_shape: [8]i64 = undefined;
@@ -42394,6 +42521,7 @@ fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?
 
 fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const buf = toBuf(tensor);
     if (buf.data.len != 0 or buf.view_strides != null) return allocator.dupe(f32, try getDataChecked(tensor));
     if (buf.source_tensor) |source| return convertTensorToOwnedF32(allocator, source);
@@ -42447,6 +42575,7 @@ fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
 
 fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!ops.SplitLastDim3Result {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const total = std.math.mul(usize, rows, dim) catch return error.UnexpectedOutputShape;
     const input_total = std.math.mul(usize, total, 3) catch return error.UnexpectedOutputShape;
     const shape = [_]i64{
@@ -42481,6 +42610,7 @@ fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror
 
 fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (request.dim == 0 or request.rows != request.row_ids.len) return error.InvalidTensorShape;
     const input = toBuf(request.input);
     if (input.quantized_storage != null or (input.source_tensor != null and input.data.len == 0)) return null;
@@ -42533,6 +42663,7 @@ test "Florence native row gather preserves row identity and independent storage"
 
 fn allocUninitF32ShapeOp(ctx: *anyopaque, shape: []const i32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     if (shape.len == 0 or shape.len > 8) return error.InvalidTensorShape;
     var logical: [8]i64 = undefined;
     var count: usize = 1;
@@ -42565,6 +42696,7 @@ fn copyRows2DOp(ctx: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usiz
 
 fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const a_data = getData(a);
     const b_data = getData(b);
     if (a_data.len != rows_a * cols or b_data.len != rows_b * cols) return error.UnexpectedOutputShape;
@@ -42578,6 +42710,7 @@ fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, c
 
 fn sliceRows2DOp(ctx: *anyopaque, input: CT, start_row: usize, row_count: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const parent = toBuf(input);
     if (cols == 0) return error.UnexpectedOutputShape;
     const total_rows = if (parent.source_tensor) |source| @as(usize, @intCast(source.shape[0])) else @divExact(getData(input).len, cols);
@@ -42648,6 +42781,7 @@ fn exportDenseTensorDType(tensor: *const tensor_mod.Tensor) tensor_mod.DType {
 fn exportTensorDataOp(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ops.ExportTensorData {
     if (@intFromPtr(tensor) == 0) return error.InvalidTensorHandle;
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const buf = toBuf(tensor);
 
     if (buf.name.len > 0) {
@@ -42695,6 +42829,7 @@ fn exportTensorDataOp(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator)
 
 fn tensorDTypeOp(ctx: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const buf = toBuf(tensor);
 
     if (buf.name.len > 0) {
@@ -42755,6 +42890,7 @@ fn tensorShapeMatchesOp(_: *anyopaque, tensor: CT, shape: []const i64) anyerror!
 
 fn sliceLastDimOp(ctx: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.trackHostAllocations();
     const input = toBuf(tensor);
     const shape = input.logical_shape orelse return error.UnsupportedShape;
     if (shape.len != 2) return error.UnsupportedShape;
@@ -54457,4 +54593,43 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
     cb.free(output); // The retained row still owns the parent allocation.
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
     cb.free(view);
+}
+
+test "memory native execution materializes scratch once across aliases and worker frees" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    // Existing allocations retain their exact backing layout when execution
+    // later binds the adapter; no allocation-header guessing is permitted.
+    const old = try compute.allocator.alloc(u8, 53);
+    var controller = run_memory.AdmissionController{};
+    defer controller.deinit();
+    var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 2 * 1024 * 1024 }, false);
+    defer lease.release();
+    // Deterministic pending sample; allocation attribution is independent of
+    // this machine's current pressure. No production probe is replaced.
+    lease.live_reserved_bytes = 2 * 1024 * 1024;
+    controller.live_pending_bytes = lease.live_reserved_bytes;
+    controller.live_capacity_bytes = 4 * 1024 * 1024;
+    var scope = try run_memory.HostExecutionScope.begin(&lease);
+    defer scope.deinit();
+    const tensor = (try cb.allocUninitF32Shape(&.{256 * 1024})).?;
+    compute.allocator.free(old);
+    try std.testing.expect(controller.live_pending_bytes < 1024 * 1024);
+    const alias = try cb.primReshape(tensor, &.{ 512, 512 });
+    try std.testing.expect(controller.live_pending_bytes > 1024 * 1024 - 4096);
+    cb.free(tensor);
+    try std.testing.expect(controller.live_pending_bytes < 1024 * 1024);
+    const Worker = struct {
+        fn run(backend: *const ComputeBackend, value: CT) void {
+            backend.free(value);
+        }
+    };
+    if (builtin.single_threaded) cb.free(alias) else {
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{ &cb, alias });
+        thread.join();
+    }
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), controller.live_pending_bytes);
 }

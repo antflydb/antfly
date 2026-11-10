@@ -53,7 +53,7 @@ pub const Cache = struct {
         const self = try alloc.create(Cache);
         self.* = .{ .alloc = alloc, .count = count, .manager = manager };
         errdefer alloc.destroy(self);
-        if (manager) |m| self.reclaimer = try m.registerReclaimer(.dense_source_payload_state, self, reclaim);
+        if (manager) |m| self.reclaimer = try m.registerReclaimerWithOptions(.dense_source_payload_state, self, reclaimPhysical, .{ .reclaim_physical = reclaimPhysical });
         return self;
     }
 
@@ -61,6 +61,13 @@ pub const Cache = struct {
         if (self.reclaimer) |id| self.manager.?.unregisterReclaimer(id);
         _ = reclaim(self, std.math.maxInt(u64));
         self.alloc.destroy(self);
+    }
+
+    fn reclaimPhysical(raw: *anyopaque, target: u64) u64 {
+        const self: *Cache = @ptrCast(@alignCast(raw));
+        var scope = resources.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
+        return reclaim(raw, target);
     }
 
     pub fn reclaim(ptr: *anyopaque, target: u64) u64 {

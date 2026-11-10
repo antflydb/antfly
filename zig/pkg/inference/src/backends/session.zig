@@ -793,6 +793,8 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
+        var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = try self.vtable.run(self.ptr, inputs, allocator);
         errdefer deinitTensorSlice(outputs, allocator);
         return attachOutputAdmission(outputs, allocator, &resource_lease);
@@ -813,6 +815,8 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
+        var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+        defer host_execution.deinit();
         active.check() catch |err| {
             if (resource_lease) |*lease| lease.release();
             resource_lease = null;
@@ -838,6 +842,8 @@ pub const Session = struct {
         else
             null;
         errdefer if (lease) |*l| l.release();
+        var host_execution = try memory.HostExecutionScope.begin(if (lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = (try run_decisions(self.ptr, inputs, allocator, control)) orelse {
             if (lease) |*l| l.release();
             return null;
@@ -1199,6 +1205,8 @@ pub const Session = struct {
             else
                 null;
             errdefer if (resource_lease) |*lease| lease.release();
+            var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+            defer host_execution.deinit();
             var outputs = (try run_resident(self.ptr, inputs, allocator)) orelse {
                 if (resource_lease) |*lease| lease.release();
                 return null;
@@ -1217,6 +1225,8 @@ pub const Session = struct {
             else
                 null;
             errdefer if (resource_lease) |*lease| lease.release();
+            var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+            defer host_execution.deinit();
             var outputs = (try run_resident_inputs(self.ptr, inputs, allocator)) orelse {
                 if (resource_lease) |*lease| lease.release();
                 return null;
@@ -1288,6 +1298,8 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return self.session.vtable.run(self.session.ptr, inputs, allocator);
     }
 
@@ -1309,6 +1321,8 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = try self.session.vtable.runWithControl(
             self.session.ptr,
             inputs,
@@ -1341,6 +1355,8 @@ pub const RunPermit = struct {
         try active.check();
         var protection = if (control) |c| try c.enterUninterruptible(self.session.interruption()) else null;
         defer if (protection) |*p| p.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = (try run_decisions(self.session.ptr, inputs, allocator, control)) orelse return null;
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
@@ -1354,6 +1370,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
         const run_resident = self.session.vtable.runResident orelse return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return run_resident(self.session.ptr, inputs, allocator);
     }
 
@@ -1376,6 +1394,8 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         var outputs = if (self.session.vtable.runResidentWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null
         else
@@ -1393,6 +1413,8 @@ pub const RunPermit = struct {
         if (self.execution_yielded) return self.runResidentInputsWithControl(inputs, allocator, null);
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return run_resident_inputs(self.session.ptr, inputs, allocator);
     }
 
@@ -1416,6 +1438,8 @@ pub const RunPermit = struct {
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
         const run_controlled = self.session.vtable.runResidentInputsWithControl orelse return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         var outputs = (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null;
         errdefer outputs.deinit();
         try active.check();
@@ -1430,6 +1454,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentTextEmbeddingWithControl(inputs, request, allocator, null);
         const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return run_resident(self.session.ptr, inputs, request, allocator);
     }
 
@@ -1495,6 +1521,8 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         var outputs = if (self.session.vtable.runResidentTextEmbeddingWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, request, allocator, active)) orelse return null
         else

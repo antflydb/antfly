@@ -2041,7 +2041,7 @@ test "Lite inference reclaims attached storage without logical debt" {
     var cache = Cache{ .manager = &manager };
     manager.observeUsage(.lite_docstore_snapshot_cache, &cache.bytes, 400);
     defer manager.observeUsage(.lite_docstore_snapshot_cache, &cache.bytes, 0);
-    const id = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &cache, Cache.reclaim);
+    const id = try manager.registerReclaimerWithOptions(.lite_docstore_snapshot_cache, &cache, Cache.reclaim, .{ .reclaim_physical = Cache.reclaim });
     defer manager.unregisterReclaimer(id);
     var owner = LiteInferenceResourceOwner{};
     defer owner.reclaimers.deinit();

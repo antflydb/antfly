@@ -24,6 +24,10 @@ pub const max_range_bytes: u64 = 8 * 1024 * 1024;
 pub const max_pass_bytes: u64 = 2 * 1024 * 1024 * 1024;
 pub const bulk_window_bytes: u64 = 64 * 1024 * 1024;
 
+/// Authority to advise a file does not imply permission to cool ordinary
+/// reopen traffic. A physical-pressure epoch marks explicit retirement intent.
+pub const Retirement = enum(u32) { on_pressure, retain, discard };
+
 pub const Advice = extern struct {
     context: ?*anyopaque = null,
     /// Producer-owned terminal cleanup. Native implementations traverse the

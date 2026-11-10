@@ -346,11 +346,7 @@ pub const Cache = struct {
         if (locked) self.resource_accounting_mutex.unlock();
 
         if (old_manager) |manager| manager.unregisterReclaimer(old_reclaimer);
-        const identity = resource_manager.registerReclaimer(
-            .lsm_block_table_cache,
-            self,
-            reclaimForResourceManager,
-        ) catch return;
+        const identity = resource_manager.registerReclaimerWithOptions(.lsm_block_table_cache, self, reclaimForResourceManager, .{ .reclaim_physical = reclaimPhysical }) catch return;
         const store_locked = lockAtomic(&self.resource_accounting_mutex);
         if (self.resource_manager == resource_manager and self.reclaimer_identity == 0) {
             self.reclaimer_identity = identity;
@@ -361,8 +357,14 @@ pub const Cache = struct {
         }
     }
 
+    fn reclaimPhysical(raw: *anyopaque, target: u64) u64 {
+        return reclaimForResourceManager(raw, target);
+    }
+
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Cache = @ptrCast(@alignCast(context));
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.allocator) orelse return 0;
+        defer scope.deinit();
         if (target_bytes == 0) return 0;
         // Reclaim runs on another owner's admission path. It must never wait
         // behind cache accounting: that owner may already hold a shard lock

@@ -44,7 +44,7 @@ test "resource manager physical pressure reclaims caches without logical debt" {
     var cache = Cache{ .manager = &manager, .bytes = 0 };
     manager.observeUsage(.hbc_node_metadata_cache, &cache.bytes, 400);
     defer manager.observeUsage(.hbc_node_metadata_cache, &cache.bytes, 0);
-    const id = try manager.registerReclaimer(.hbc_node_metadata_cache, &cache, Cache.reclaim);
+    const id = try manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, &cache, Cache.reclaim, .{ .reclaim_physical = Cache.reclaim });
     defer manager.unregisterReclaimer(id);
     try std.testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.dense_apply_working_set, 64));
     try std.testing.expectEqual(@as(usize, 0), cache.calls);
@@ -161,6 +161,18 @@ pub const ReclamationScope = struct {
             if (manager == null or budget.reservation.manager == manager.?) released +|= bytes;
         }
         return released;
+    }
+
+    /// Extend a live scope with an owner/accounting lock before mutation.
+    pub fn tryLock(self: *ReclamationScope, mutex: *std.atomic.Mutex) bool {
+        for (self.locks[0..self.count]) |held| if (held == mutex) return true;
+        if (allocator_residency.Guard.reuse(mutex)) return true;
+        if (self.count == self.locks.len or !allocator_residency.Guard.allowed() or
+            allocator_residency.Guard.held(mutex) or !mutex.tryLock()) return false;
+        self.locks[self.count] = mutex;
+        self.count += 1;
+        allocator_residency.Guard.enter(mutex);
+        return true;
     }
 
     pub fn deinit(self: *ReclamationScope) void {
@@ -1218,8 +1230,9 @@ const ReclaimerInvocation = struct {
 };
 
 pub const ReclaimerOptions = struct {
-    /// Default callbacks report destroyed payload bytes. Owners whose logical
-    /// callback also returns reservation credit must supply a physical variant.
+    /// Explicit opt-in to foreign-thread physical reclamation. Implementations
+    /// must pre-acquire owner/backing locks without waiting, allocate nothing,
+    /// preserve borrowers, and report only destroyed payload storage.
     reclaim_physical: ?ReclaimerFn = null,
     weight: u32 = 1,
 };
@@ -1242,6 +1255,7 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 }
 
 pub const ResourceManager = struct {
+    file_cache_pressure_epoch: std.atomic.Value(u64) = .init(0),
     dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
@@ -1585,7 +1599,7 @@ pub const ResourceManager = struct {
                 .slice = slice,
                 .context = context,
                 .reclaim = reclaim,
-                .reclaim_physical = options.reclaim_physical orelse reclaim,
+                .reclaim_physical = options.reclaim_physical,
                 .weight = @max(@as(u32, 1), options.weight),
             };
             return identity;
@@ -1598,7 +1612,7 @@ pub const ResourceManager = struct {
             .slice = slice,
             .context = context,
             .reclaim = reclaim,
-            .reclaim_physical = options.reclaim_physical orelse reclaim,
+            .reclaim_physical = options.reclaim_physical,
             .weight = @max(@as(u32, 1), options.weight),
         });
         return identity;
@@ -1675,6 +1689,7 @@ pub const ResourceManager = struct {
     /// buffered snapshot I/O). Invoke managed owners without treating their
     /// counters as proof of physical capacity. File I/O sheds cache at source.
     pub fn reclaimHostMemory(self: *ResourceManager, target_bytes: u64) u64 {
+        if (target_bytes != 0) _ = self.file_cache_pressure_epoch.fetchAdd(1, .monotonic);
         const freed = self.reclaimCaches(.dense_apply_working_set, 0, target_bytes);
         // Purge in the process that owns the storage allocator, including
         // when inference runs in a worker. Cache/ledger locks are released.
@@ -1740,7 +1755,7 @@ pub const ResourceManager = struct {
                     const index = (start_cursor + offset) % scan_len;
                     const slot = &self.reclaimers.items[index];
                     if (slot.identity == 0 or slot.identity > identity_cutoff or
-                        slot.retiring or slot.slice != candidate_slice) continue;
+                        slot.retiring or slot.slice != candidate_slice or (physical_target != 0 and slot.reclaim_physical == null)) continue;
                     remaining_weight +|= slot.weight;
                 }
                 self.reclaimer_mutex.unlock();
@@ -1750,7 +1765,7 @@ pub const ResourceManager = struct {
                     const index = (start_cursor + offset) % scan_len;
                     const slot = &self.reclaimers.items[index];
                     if (slot.identity == 0 or slot.identity > identity_cutoff or
-                        slot.retiring or slot.slice != candidate_slice)
+                        slot.retiring or slot.slice != candidate_slice or (physical_target != 0 and slot.reclaim_physical == null))
                     {
                         self.reclaimer_mutex.unlock();
                         continue;
@@ -7121,7 +7136,7 @@ test "resource manager physical pressure ignores logical-only relief and visits 
     const first = try manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, &credit, Credit.logical, .{ .reclaim_physical = Credit.physical });
     defer manager.unregisterReclaimer(first);
     var payload = Payload{};
-    const second = try manager.registerReclaimer(.dense_source_payload_state, &payload, Payload.reclaim);
+    const second = try manager.registerReclaimerWithOptions(.dense_source_payload_state, &payload, Payload.reclaim, .{ .reclaim_physical = Payload.reclaim });
     defer manager.unregisterReclaimer(second);
     try std.testing.expectEqual(@as(u64, 64), manager.reclaimHostMemory(64));
     try std.testing.expectEqual(@as(usize, 1), credit.calls);
@@ -7172,4 +7187,18 @@ test "resource manager physical pressure never reuses an ordinary in-progress al
     budget.allocator_mutex.unlock();
     var scope = ReclamationScope.tryAcquire(budget.threadSafeAllocator()).?;
     scope.deinit();
+}
+
+test "resource manager physical pressure skips callbacks without explicit foreign-thread authority" {
+    const Legacy = struct {
+        fn reclaim(_: *anyopaque, _: u64) u64 {
+            @panic("legacy callback entered physical pressure");
+        }
+    };
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var context: u8 = 0;
+    const id = try manager.registerReclaimer(.hbc_node_metadata_cache, &context, Legacy.reclaim);
+    defer manager.unregisterReclaimer(id);
+    try std.testing.expectEqual(@as(u64, 0), manager.reclaimHostMemory(1));
 }
