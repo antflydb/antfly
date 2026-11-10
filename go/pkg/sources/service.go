@@ -40,6 +40,7 @@ import (
 // Service is a single-operator source companion. Deploy one per credential trust
 // boundary. It reuses Runner and exposes scoped media capabilities to Antfly.
 type Service struct {
+	knowledgeAudience         string
 	ctx                       context.Context
 	stop                      context.CancelFunc
 	clients                   providerClients
@@ -60,8 +61,10 @@ type Service struct {
 }
 
 type ServiceOptions struct {
-	Profile  Profile
-	StateDir string
+	// KnowledgeAudience enables only deployments isolated to one audience across all native data and APIs.
+	KnowledgeAudience string
+	Profile           Profile
+	StateDir          string
 	// PublicURL is a stable address reachable by Antfly, including after restart.
 	PublicURL  string
 	AdminToken string
@@ -94,7 +97,7 @@ func NewService(o ServiceOptions) (*Service, error) {
 	if err := ValidateEndpoint(o.PublicURL); err != nil {
 		return nil, err
 	}
-	s := &Service{profile: cloneProfile(o.Profile), directory: o.StateDir, baseURL: strings.TrimRight(o.PublicURL, "/"), token: o.AdminToken, mediaKey: bytes.Clone(o.MediaKey), factory: o.Factory, fetchSlots: make(chan struct{}, 4)}
+	s := &Service{knowledgeAudience: o.KnowledgeAudience, profile: cloneProfile(o.Profile), directory: o.StateDir, baseURL: strings.TrimRight(o.PublicURL, "/"), token: o.AdminToken, mediaKey: bytes.Clone(o.MediaKey), factory: o.Factory, fetchSlots: make(chan struct{}, 4)}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	if s.factory == nil {
 		s.factory = CredentialFactory(s.resolveSecret)
@@ -190,7 +193,7 @@ func (s *Service) validateProfile(p Profile) error {
 			p.Connections[source.Connection] = Connection{}
 		}
 	}
-	r := Runner{Profile: p, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), MediaReference: s.pinMedia}
+	r := Runner{KnowledgeAudience: s.knowledgeAudience, Profile: p, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), MediaReference: s.pinMedia}
 	if err := r.validate(); err != nil {
 		return err
 	}
@@ -230,6 +233,7 @@ func serviceDecode(w http.ResponseWriter, r *http.Request, value any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
+	d.UseNumber()
 	if err := d.Decode(value); err != nil {
 		return err
 	}
@@ -252,7 +256,7 @@ func validConnectionName(name string) bool {
 func cloneProfile(p Profile) Profile {
 	b, _ := json.Marshal(p)
 	var out Profile
-	_ = json.Unmarshal(b, &out)
+	_ = decodeJSONExact(b, &out)
 	return out
 }
 
@@ -635,6 +639,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				existing := next.Sources[index]
+				if source.Knowledge == nil {
+					source.Knowledge = existing.Knowledge
+				}
 				if source.Processing == nil {
 					source.Processing = existing.Processing
 				}
@@ -860,7 +867,7 @@ func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly b
 		}
 		return ref, err
 	}
-	runner := Runner{SourceID: sourceID, mediaReferenceAuthorizes: true, Profile: profile, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
+	runner := Runner{KnowledgeAudience: s.knowledgeAudience, SourceID: sourceID, mediaReferenceAuthorizes: true, Profile: profile, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
 	purged := []string{}
 	err := runner.withStateLock(ctx, func() error {
 		before, err := s.readPurges()

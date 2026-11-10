@@ -9604,7 +9604,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 index_manager.alloc.free(parsed.artifact_name);
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
-                                if (source.mention_edge_type.len == 0) continue;
+                                // Resolution also changes canonical relation endpoints when
+                                // document-to-mention edges are disabled.
                                 if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
@@ -9763,7 +9764,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 index_manager.alloc.free(parsed.artifact_name);
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
-                                if (source.mention_edge_type.len == 0) continue;
+                                // Resolution also changes canonical relation endpoints when
+                                // document-to-mention edges are disabled.
                                 if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
