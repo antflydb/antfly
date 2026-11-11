@@ -149,3 +149,7 @@ test "retained owner native controls discovery" {
     _ = @import("api/retained_dataset_status.zig");
     _ = @import("api/retained_subscription.zig");
 }
+
+test {
+    _ = @import("api/api_node_directory.zig");
+}

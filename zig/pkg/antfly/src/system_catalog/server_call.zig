@@ -127,6 +127,8 @@ pub const Call = union(enum) {
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
     lake_source_owner_read: u64,
     /// Bounded metadata-derived registration, protected by an administrative grant.
+    /// Trusted API-node directory; includes metadata-only issuers.
+    api_node_uri: u64,
     retained_dataset_pending: u64,
     retained_source_candidate: domain.Target,
     retained_dataset_read_cut: domain.Target,
@@ -153,6 +155,7 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .api_node_uri,
             .retained_dataset_pending,
             .retained_dataset_read_cut,
             .retained_source_candidate,
@@ -309,6 +312,8 @@ test "system catalog retained work is read only and requires a body bound superv
 test "retained owner controls bind grants to distinct private request bodies" {
     const a = std.testing.allocator;
     const calls = [_]Call{
+        .{ .api_node_uri = 1 },
+        .{ .api_node_uri = 2 },
         .{ .retained_owner_read = .{ .work = .{} } },
         .{ .retained_owner_read = .{ .plan = .{ .resource = 7, .generation = 1 } } },
         .{ .retained_owner_read = .{ .owner = .{ .resource = 7, .generation = 1, .plan = @splat(3), .group = 11, .revision = 1 } } },

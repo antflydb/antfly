@@ -61,13 +61,38 @@ pub const OwnedResponse = struct {
     status: u16 = 200,
     content_type: []const u8,
     body: []u8,
+    /// Present when content_type is dynamically owned rather than static.
+    owned_content_type: ?[]u8 = null,
     public_cors: bool = false,
     headers: []Header = &.{},
 
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        const headers = try alloc.alloc(Header, self.headers.len);
+        errdefer alloc.free(headers);
+        var initialized: usize = 0;
+        errdefer for (headers[0..initialized]) |*header| header.deinit(alloc);
+        for (self.headers, headers) |source, *target| {
+            const name = try alloc.dupe(u8, source.name);
+            errdefer alloc.free(name);
+            target.* = .{ .name = name, .value = try alloc.dupe(u8, source.value) };
+            initialized += 1;
+        }
+        const owned_type = if (self.owned_content_type != null) try alloc.dupe(u8, self.content_type) else null;
+        errdefer if (owned_type) |value| alloc.free(value);
+        return .{
+            .status = self.status,
+            .content_type = owned_type orelse self.content_type,
+            .owned_content_type = owned_type,
+            .body = try alloc.dupe(u8, self.body),
+            .public_cors = self.public_cors,
+            .headers = headers,
+        };
+    }
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.headers) |*header| header.deinit(alloc);
         if (self.headers.len > 0) alloc.free(self.headers);
         alloc.free(self.body);
+        if (self.owned_content_type) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -113,4 +138,15 @@ test "owned contextual response releases its body" {
     const alloc = std.testing.allocator;
     var response = json(try alloc.dupe(u8, "{}"), false);
     response.deinit(alloc);
+}
+
+test "retained owner native controls contextual response cloning retains dynamic content type" {
+    const a = std.testing.allocator;
+    const content_type = try a.dupe(u8, "application/problem+json");
+    var original: OwnedResponse = .{ .content_type = content_type, .owned_content_type = content_type, .body = try a.dupe(u8, "{}") };
+    var copy = try original.clone(a);
+    defer copy.deinit(a);
+    original.deinit(a);
+    try std.testing.expectEqualStrings("application/problem+json", copy.content_type);
+    try std.testing.expectEqualStrings("{}", copy.body);
 }

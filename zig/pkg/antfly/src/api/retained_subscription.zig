@@ -30,6 +30,7 @@ const closure = @import("../serverless/datasets/closure_manifest.zig");
 const operation = local.api_operation;
 const platform = @import("antfly_platform").time;
 const A = std.mem.Allocator;
+const MemoryBudget = @import("antfly_platform").allocator.BoundedAllocator;
 const Target = local.system_catalog_domain.Target;
 const max_owners = 128;
 const max_floors = 32;
@@ -111,12 +112,12 @@ const ArchiveResolver = struct {
         return self.value;
     }
 };
-fn capture(server: anytype, a: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, bounds: Bounds, clock_ns: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize) !Part {
+fn capture(server: anytype, a: A, working: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, bounds: Bounds, clock_ns: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize) !Part {
     const input = try requestFor(a, bounds);
     if (owner.independent_receipt) |receipt| {
         const opened = archive orelse return error.InvalidDatasetBinding;
         const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
-        var part = try archive_read.readClosed(a, opened.store(io, &ctx), definition, try specFor(a, definition, owner), .{ .start_ns = input.start_ns, .end_ns = input.end_ns }, .{ .rows = max_rows, .read_clock_ns = clock_ns }, try cutFor(owner), receipt, ArchiveResolver{ .value = opened.location() });
+        var part = try archive_read.readClosed(working, opened.storeWithAllocator(working, io, &ctx), definition, try specFor(a, definition, owner), .{ .start_ns = input.start_ns, .end_ns = input.end_ns }, .{ .rows = max_rows, .read_clock_ns = clock_ns }, try cutFor(owner), receipt, ArchiveResolver{ .value = opened.location() });
         defer part.deinit();
         const rows = try a.alloc(series.Bucket, part.rows.len);
         for (part.rows, rows) |row, *out| {
@@ -126,9 +127,10 @@ fn capture(server: anytype, a: A, snapshot: read.Snapshot, definition: dataset.D
         return .{ .group = owner.group, .owner_revision = owner.revision, .rows = rows };
     }
     const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
-    const raw = try server.readRetainedOwnerRows(a, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .start_ns = input.start_ns, .end_ns = input.end_ns, .limit = max_rows, .clock_ns = clock_ns }, ctx);
+    const raw = try server.readRetainedOwnerRows(working, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .start_ns = input.start_ns, .end_ns = input.end_ns, .limit = max_rows, .clock_ns = clock_ns }, ctx);
+    defer working.free(raw);
     try spend(budget, raw.len);
-    const reply = try std.json.parseFromSliceLeaky(read.NativeReply, a, raw, .{});
+    const reply = try std.json.parseFromSliceLeaky(read.NativeReply, a, raw, .{ .allocate = .alloc_always });
     if (reply.rows.len > max_rows or !std.mem.eql(u8, &reply.cursor.partition, &owner.partition) or !std.mem.eql(u8, &reply.cursor.definition, &snapshot.plan.definition) or reply.cursor.incarnation != owner.incarnation) return error.RetainedSeriesResetRequired;
     return .{ .group = owner.group, .owner_revision = owner.revision, .root = reply.root_incarnation, .cursor = reply.cursor, .rows = reply.rows };
 }
@@ -191,18 +193,25 @@ fn replayKey(raw: []const u8) !dataset.RowKey {
     return key;
 }
 
-fn admitArchiveClock(server: anytype, a: A, snapshot: read.Snapshot, definition: dataset.Definition, archive: ?*const archive_api.Opened, proposed: i128, ctx: operation.RequestContext) !i128 {
+fn admitArchiveClock(server: anytype, a: A, working: A, snapshot: read.Snapshot, definition: dataset.Definition, archive: ?*const archive_api.Opened, proposed: i128, ctx: operation.RequestContext) !i128 {
     const opened = archive orelse return proposed;
     var clock = proposed;
     for (snapshot.owners) |owner| if (owner.independent_receipt != null) {
         clock = @max(clock, (try cutFor(owner)).admitted_ns);
     };
     const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
-    return opened.store(io, &ctx).admitRetentionClock(try specFor(a, definition, snapshot.owners[0]), clock);
+    return opened.storeWithAllocator(working, io, &ctx).admitRetentionClock(try specFor(a, definition, snapshot.owners[0]), clock);
 }
 
 pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []const u8, principal: registry.Digest, target: Target, input: Create, ctx: operation.RequestContext) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var memory: MemoryBudget = .{ .backing = server.alloc, .limit = read.max_result_bytes };
+    defer std.debug.assert(memory.live == 0);
+    return openBudgeted(server, alloc, memory.allocator(), sessions, secret, principal, target, input, ctx) catch |err| {
+        return if (err == error.OutOfMemory and memory.denied) error.DatasetPageBudgetExceeded else err;
+    };
+}
+fn openBudgeted(server: anytype, alloc: A, working: A, sessions: *registry.Registry, secret: []const u8, principal: registry.Digest, target: Target, input: Create, ctx: operation.RequestContext) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(working);
     defer arena.deinit();
     const a = arena.allocator();
     const snapshot = try read.fetchReadCut(server, a, target, ctx);
@@ -219,7 +228,7 @@ pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
         const observed = try read.observeNative(server, a, source.name, scopeFor(snapshot, owner), observed_clock, ctx);
         observed_clock = @max(observed_clock, observed.admitted_ns);
     };
-    const now = try admitArchiveClock(server, a, snapshot, definition, if (archive) |*opened| opened else null, observed_clock, ctx);
+    const now = try admitArchiveClock(server, a, working, snapshot, definition, if (archive) |*opened| opened else null, observed_clock, ctx);
     const window = if (input.window_ns) |text| std.math.cast(u64, try parseBound(text)) orelse return error.InvalidDatasetCoverage else null;
     const bounds: Bounds = if (window) |width| range: {
         if (input.start_ns != null or input.end_ns != null) return error.InvalidDatasetCoverage;
@@ -228,7 +237,7 @@ pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     if (bounds.start >= bounds.end) return error.InvalidDatasetCoverage;
     const state: State = .{ .resource = snapshot.resource.id, .plan = snapshot.plan.id, .definition = snapshot.plan.definition, .window_ns = window, .bounds = bounds, .clock_ns = now, .parts = try a.alloc(Part, snapshot.owners.len) };
     var budget: usize = registry.max_state_bytes;
-    for (state.parts, snapshot.owners) |*part, owner| part.* = try capture(server, a, snapshot, definition, owner, bounds, now, if (archive) |*opened| opened else null, ctx, &budget);
+    for (state.parts, snapshot.owners) |*part, owner| part.* = try capture(server, a, working, snapshot, definition, owner, bounds, now, if (archive) |*opened| opened else null, ctx, &budget);
     var rows = try aggregate(a, snapshot, state, ctx);
     defer rows.deinit();
     const payload = try std.json.Stringify.valueAlloc(a, state, .{});
@@ -239,17 +248,25 @@ pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
     io.random(&position.id);
     const cursor = registry.token(secret, position);
-    const response = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "snapshot", .cursor = cursor[0..], .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .events = try diff(a, summary, &.{}, rows.rows) }, .{ .emit_null_optional_fields = false });
-    errdefer alloc.free(response);
+    const response = try std.json.Stringify.valueAlloc(a, .{ .kind = "snapshot", .cursor = cursor[0..], .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .events = try diff(a, summary, &.{}, rows.rows) }, .{ .emit_null_optional_fields = false });
     if (response.len > registry.max_reply_bytes) return error.DatasetPageBudgetExceeded;
     try ctx.ensureActive();
+    const output = try alloc.dupe(u8, response);
+    errdefer alloc.free(output);
     try sessions.create(server.alloc, position, principal, platform.monotonicNs(), payload);
-    return response;
+    return output;
 }
 
 pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []const u8, principal: registry.Digest, target: Target, input: Poll, ctx: operation.RequestContext) ![]u8 {
+    var memory: MemoryBudget = .{ .backing = server.alloc, .limit = read.max_result_bytes };
+    defer std.debug.assert(memory.live == 0);
+    return pollBudgeted(server, alloc, memory.allocator(), sessions, secret, principal, target, input, ctx) catch |err| {
+        return if (err == error.OutOfMemory and memory.denied) error.DatasetPageBudgetExceeded else err;
+    };
+}
+fn pollBudgeted(server: anytype, alloc: A, working: A, sessions: *registry.Registry, secret: []const u8, principal: registry.Digest, target: Target, input: Poll, ctx: operation.RequestContext) ![]u8 {
     const position = try registry.verify(secret, input.cursor);
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(working);
     defer arena.deinit();
     const a = arena.allocator();
     const loaded = try sessions.load(server.alloc, a, position, principal, platform.monotonicNs());
@@ -274,13 +291,14 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
         if (old.group != owner.group or old.owner_revision != owner.revision or (old.cursor == null) != (owner.independent_receipt != null)) return error.RetainedSeriesResetRequired;
         if (old.cursor) |cursor| {
             const source = snapshot.source_table orelse return error.RetainedSeriesResetRequired;
-            const raw = server.pollRetainedOwnerReplay(a, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .root_incarnation = old.root, .cursor = cursor, .clock_ns = observed_clock }, ctx) catch |err| switch (err) {
+            const raw = server.pollRetainedOwnerReplay(working, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .root_incarnation = old.root, .cursor = cursor, .clock_ns = observed_clock }, ctx) catch |err| switch (err) {
                 error.RetainedSeriesResetRequired => null,
                 else => return err,
             };
             if (raw) |bytes| {
+                defer working.free(bytes);
                 try spend(&budget, bytes.len);
-                replay.* = try std.json.parseFromSliceLeaky(wire.Replay, a, bytes, .{});
+                replay.* = try std.json.parseFromSliceLeaky(wire.Replay, a, bytes, .{ .allocate = .alloc_always });
                 try validateReplay(old, replay.*.?);
                 observed_clock = @max(observed_clock, replay.*.?.admitted_ns);
             }
@@ -296,7 +314,7 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
             }
         }
     }
-    const now = try admitArchiveClock(server, a, snapshot, definition, if (archive) |*opened| opened else null, observed_clock, ctx);
+    const now = try admitArchiveClock(server, a, working, snapshot, definition, if (archive) |*opened| opened else null, observed_clock, ctx);
     const bounds = if (original.window_ns) |width| try movingBounds(try specFor(a, definition, snapshot.owners[0]), width, now) else original.bounds;
     var next = original;
     next.parts = try a.alloc(Part, original.parts.len);
@@ -308,12 +326,12 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
             const spec = try specFor(a, definition, owner);
             const visible: Bounds = .{ .start = @max(bounds.start, try spec.bucket(try std.math.sub(i128, now, spec.retention_ns))), .end = bounds.end };
             if (visible.start < visible.end) {
-                part.* = try capture(server, a, snapshot, definition, owner, visible, now, if (archive) |*opened| opened else null, ctx, &budget);
+                part.* = try capture(server, a, working, snapshot, definition, owner, visible, now, if (archive) |*opened| opened else null, ctx, &budget);
                 try requireSameProducer(old, .{ .rows = &.{}, .root_incarnation = part.root, .cursor = part.cursor.? });
             } else part.* = .{ .group = old.group, .owner_revision = old.owner_revision, .root = observed.root_incarnation, .cursor = observed.cursor };
             continue;
         }
-        part.* = try advancePart(server, a, snapshot, definition, owner, old, original.bounds, bounds, now, if (archive) |*opened| opened else null, ctx, &budget, replay);
+        part.* = try advancePart(server, a, working, snapshot, definition, owner, old, original.bounds, bounds, now, if (archive) |*opened| opened else null, ctx, &budget, replay);
     }
     var before = try aggregate(a, snapshot, original, ctx);
     defer before.deinit();
@@ -358,13 +376,14 @@ fn validateReplay(old: Part, replay: wire.Replay) !void {
     if (!std.mem.eql(u8, replay.root_incarnation, old.root) or !std.mem.eql(u8, &replay.cursor.definition, &cursor.definition) or !std.mem.eql(u8, &replay.cursor.partition, &cursor.partition) or replay.cursor.incarnation != cursor.incarnation or replay.frames.len > 8) return error.RetainedSeriesResetRequired;
 }
 
-fn advancePart(server: anytype, a: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, old: Part, prior: Bounds, current: Bounds, now: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize, prefetched: ?wire.Replay) !Part {
+fn advancePart(server: anytype, a: A, working: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, old: Part, prior: Bounds, current: Bounds, now: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize, prefetched: ?wire.Replay) !Part {
     try ctx.ensureActive();
     const replay = if (old.cursor) |cursor| prefetched orelse replay: {
         const source = snapshot.source_table orelse return error.RetainedSeriesResetRequired;
-        const raw = try server.pollRetainedOwnerReplay(a, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .root_incarnation = old.root, .cursor = cursor, .clock_ns = now }, ctx);
+        const raw = try server.pollRetainedOwnerReplay(working, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .root_incarnation = old.root, .cursor = cursor, .clock_ns = now }, ctx);
+        defer working.free(raw);
         try spend(budget, raw.len);
-        const value = try std.json.parseFromSliceLeaky(wire.Replay, a, raw, .{});
+        const value = try std.json.parseFromSliceLeaky(wire.Replay, a, raw, .{ .allocate = .alloc_always });
         try validateReplay(old, value);
         break :replay value;
     } else null;
@@ -373,9 +392,9 @@ fn advancePart(server: anytype, a: A, snapshot: read.Snapshot, definition: datas
     var floor = @max(current.start, try spec.bucket(floor_clock));
     if (archive) |opened| if (owner.independent_receipt) |receipt| {
         const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
-        const manifest = (try opened.store(io, &ctx).getClosedExport(spec, try cutFor(owner))) orelse return error.RetainedSeriesResetRequired;
+        const manifest = (try opened.storeWithAllocator(working, io, &ctx).getClosedExport(spec, try cutFor(owner))) orelse return error.RetainedSeriesResetRequired;
         if (!std.mem.eql(u8, &try manifest.receipt(), &receipt)) return error.RetainedSeriesResetRequired;
-        const clock = try opened.store(io, &ctx).admitRetentionClock(spec, @max(now, manifest.cut.admitted_ns));
+        const clock = try opened.storeWithAllocator(working, io, &ctx).admitRetentionClock(spec, @max(now, manifest.cut.admitted_ns));
         floor = @max(floor, try spec.bucket(try std.math.sub(i128, clock, spec.retention_ns)));
         if (manifest.expired_before_ns) |expired| floor = @max(floor, expired);
     };
@@ -387,7 +406,7 @@ fn advancePart(server: anytype, a: A, snapshot: read.Snapshot, definition: datas
     for (old.floors) |fence| if (fence.bounds.end > floor) try floors.append(a, fence);
     if (current.end > prior.end and visible.start < visible.end) {
         const entering: Bounds = .{ .start = @max(prior.end, visible.start), .end = current.end };
-        const fresh = try capture(server, a, snapshot, definition, owner, entering, @max(now, if (replay) |value| value.admitted_ns else now), archive, ctx, budget);
+        const fresh = try capture(server, a, working, snapshot, definition, owner, entering, @max(now, if (replay) |value| value.admitted_ns else now), archive, ctx, budget);
         if (fresh.cursor) |cursor| {
             if (!std.mem.eql(u8, fresh.root, old.root) or cursor.sequence < old.cursor.?.sequence) return error.RetainedSeriesResetRequired;
             try floors.append(a, .{ .bounds = entering, .through = cursor.sequence });
@@ -492,6 +511,7 @@ test "retained subscription archived polling observes durable retention after cl
     try std.testing.expectError(error.RetainedSeriesHistoryExpired, archive_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "180" }, .{}, cut, receipt, Resolver{ .value = loc }));
     var opened: archive_api.Opened = undefined;
     opened.alloc = a;
+    opened.clock = store.clock;
     opened.prefix = "catalog";
     opened.namespace = namespace;
     opened.dataset = @splat(1);
@@ -516,9 +536,27 @@ test "retained subscription archived polling observes durable retention after cl
     const owner: owners.Owner = .{ .plan = @splat(7), .group = 11, .partition = @splat(5), .incarnation = 1, .mode = .closed, .native_receipt = @splat(4), .cut = .{ .closure = cut.closure, .sequence = 20, .complete_from_ns = "0", .admitted_ns = "1000" }, .independent_receipt = receipt };
     var budget: usize = registry.max_state_bytes;
     const bounds: Bounds = .{ .start = 0, .end = 180 };
-    const next = try advancePart(&server, a, undefined, def, owner, .{ .group = 11, .owner_revision = 1, .rows = &rows }, bounds, bounds, 1050, &opened, .{}, &budget, null);
+    const next = try advancePart(&server, a, a, undefined, def, owner, .{ .group = 11, .owner_revision = 1, .rows = &rows }, bounds, bounds, 1050, &opened, .{}, &budget, null);
 
     try std.testing.expectEqual(@as(usize, 1), next.rows.len);
+
+    // A sparse requested interval still reads and decodes its covering file.
+    // Its empty result must not bypass admission of catalog/input allocations.
+    const sparse: Bounds = .{ .start = 60, .end = 120 };
+    var denied: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, capture(&server, a, denied.allocator(), undefined, def, owner, sparse, 1100, &opened, .{}, &budget));
+    try std.testing.expect(denied.denied);
+    try std.testing.expectEqual(@as(usize, 0), denied.live);
+    var working: MemoryBudget = .{ .backing = std.testing.allocator, .limit = read.max_result_bytes };
+    for (0..128) |_| {
+        const untouched = budget;
+        const empty = try capture(&server, a, working.allocator(), undefined, def, owner, sparse, 1100, &opened, .{}, &budget);
+        try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
+        try std.testing.expectEqual(untouched, budget);
+        try std.testing.expectEqual(@as(usize, 0), working.live);
+    }
+    try std.testing.expect(working.peak > 0);
+    try std.testing.expect(working.peak <= working.limit);
 }
 
 test "retained subscription native polling applies the durable retention clock without a removal frame" {
@@ -551,7 +589,7 @@ test "retained subscription native polling applies the durable retention clock w
     const prior: Part = .{ .group = 11, .owner_revision = 1, .root = "7", .cursor = cursor, .rows = &rows };
     const bounds: Bounds = .{ .start = 0, .end = 180 };
     var budget: usize = registry.max_state_bytes;
-    const next = try advancePart(&server, a, snapshot, def, owner, prior, bounds, bounds, 1050, null, .{}, &budget, null);
+    const next = try advancePart(&server, a, a, snapshot, def, owner, prior, bounds, bounds, 1050, null, .{}, &budget, null);
     try std.testing.expect(try spec.expired(0, server.admitted_ns));
     try std.testing.expectEqual(@as(usize, 0), next.rows.len);
 }

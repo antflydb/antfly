@@ -29,6 +29,7 @@ pub const Opened = struct {
     dataset: [32]u8,
     location_id: [32]u8,
     writer: [16]u8,
+    clock: catalog.Clock = .{},
 
     pub fn init(a: std.mem.Allocator, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, descriptor: local.system_catalog_retained_datasets.Descriptor, read_only: bool) !Opened {
         var storage = try artifact_store.Store.open(a, config, secrets, read_only);
@@ -50,7 +51,14 @@ pub const Opened = struct {
         self.storage.deinit();
     }
     pub fn store(self: *const Opened, io: std.Io, context: *const operation.RequestContext) catalog.Catalog {
-        return .{ .context = .{ .alloc = self.alloc, .client = self.storage.opened.client, .bucket = self.storage.opened.bucket, .prefix = self.prefix, .namespace = &self.namespace, .io = io, .cancellation = .fromCallback(context, canceled) }, .dataset = self.dataset, .owner = self.writer };
+        return .{ .context = .{ .alloc = self.alloc, .client = self.storage.opened.client, .bucket = self.storage.opened.bucket, .prefix = self.prefix, .namespace = &self.namespace, .io = io, .cancellation = .fromCallback(context, canceled) }, .dataset = self.dataset, .owner = self.writer, .clock = self.clock };
+    }
+    /// Bind transient catalog and object I/O to the caller's working budget.
+    /// The opened transport/configuration retains its own stable lifetime.
+    pub fn storeWithAllocator(self: *const Opened, a: std.mem.Allocator, io: std.Io, context: *const operation.RequestContext) catalog.Catalog {
+        var result = self.store(io, context);
+        result.context.alloc = a;
+        return result;
     }
     pub fn location(self: *const Opened) catalog.Location {
         return .{ .id = self.location_id, .storage_identity = self.storage.identity, .client = self.storage.opened.client, .bucket = self.storage.opened.bucket, .prefix = self.prefix, .access = .queryable };

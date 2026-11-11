@@ -40,6 +40,9 @@ pub const HostedGroupRouter = struct {
         group_node_ids: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, budget: RouteBudget) anyerror![]u64 = null,
         node_status: ?*const fn (ptr: *anyopaque, node_id: u64, group_id: u64) raft_host.HostedReplicaStatus = null,
         node_base_uri: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) anyerror!?[]u8,
+        /// Optional controlled point lookup for routers which refresh remote
+        /// catalog state while resolving an API-node endpoint.
+        node_base_uri_controlled: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64, budget: RouteBudget) anyerror!?[]u8 = null,
         node_base_uri_for_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, budget: RouteBudget) anyerror!?[]u8 = null,
         /// Resolve a fanout from one routing snapshot. Metadata-backed routers
         /// use this to avoid copying and rescanning the full catalog once per
@@ -84,7 +87,14 @@ pub const HostedGroupRouter = struct {
     }
 
     pub fn nodeBaseUri(self: HostedGroupRouter, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
-        return try self.vtable.node_base_uri(self.ptr, alloc, node_id);
+        try self.budget.check();
+        const uri = if (self.vtable.node_base_uri_controlled) |resolve|
+            try resolve(self.ptr, alloc, node_id, self.budget)
+        else
+            try self.vtable.node_base_uri(self.ptr, alloc, node_id);
+        errdefer if (uri) |value| alloc.free(value);
+        try self.budget.check();
+        return uri;
     }
 
     pub fn nodeBaseUriForGroup(self: HostedGroupRouter, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {

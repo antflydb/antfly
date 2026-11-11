@@ -2604,7 +2604,7 @@ pub const Adapter = struct {
         const window = if (scan_request.order.len == 0 and scan_request.conditions.len == 0 and scan_request.primary_key == null) scan_request.ordered_window else null;
         const prefix = if (window) |maximum| maximum > 0 and maximum <= read.max_input_rows else false;
         var request: read.Request = .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end), .max_rows = if (prefix) @intCast(window.?) else read.max_input_rows, .dimensions_json = dimension_filter, .page = prefix };
-        var result = try read.readResolved(self.server, a, snapshot, definition, request, self.context);
+        var result = try read.readResolved(self.server, snapshot, definition, request, self.context);
         // A bounded archive coverage page can end before the requested number
         // of rows. Fall back to the complete admitted cut instead of silently
         // treating that partial page as exhaustion.
@@ -2612,7 +2612,7 @@ pub const Adapter = struct {
             result.deinit();
             request.page = false;
             request.max_rows = read.max_input_rows;
-            result = try read.readResolved(self.server, a, snapshot, definition, request, self.context);
+            result = try read.readResolved(self.server, snapshot, definition, request, self.context);
         }
         defer result.deinit();
         var native_owners: usize = 0;

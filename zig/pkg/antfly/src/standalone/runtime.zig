@@ -2878,6 +2878,12 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .api_node_uri) {
+            if (!context.setting_admin) return error.Forbidden;
+            if (call.api_node_uri == 0) return error.InvalidArgument;
+            // Standalone subscriptions are local; unknown issuers reset.
+            return alloc.dupe(u8, "null");
+        }
         if (call == .retained_dataset_read_cut) {
             try lockAtomicForRequest(&self.mutex, admission);
             defer self.mutex.unlock();
@@ -3111,7 +3117,7 @@ const LocalStandaloneMetadata = struct {
                 read.standalone = true;
                 return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
             },
-            .retained_owner_archive, .retained_dataset_release, .retained_source_candidate, .retained_dataset_pending, .retained_dataset_read_cut, .retained_dataset_activate, .retained_owner_acknowledge, .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .api_node_uri, .retained_owner_archive, .retained_dataset_release, .retained_source_candidate, .retained_dataset_pending, .retained_dataset_read_cut, .retained_dataset_activate, .retained_owner_acknowledge, .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,

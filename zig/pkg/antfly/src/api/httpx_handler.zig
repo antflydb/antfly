@@ -2935,7 +2935,7 @@ pub const AntflyApiHandler = struct {
                 }
                 var cancellation = requestCancellation(ctx);
                 const timeout_ms: u32 = @intCast(@max(1, @min(30_000, (context.deadline_ns.? -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms)));
-                var forwarded = server.forwardRetainedSubscription(position.owner_node_id, .{ .method = .POST, .uri = ctx.request.uri.raw, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body, .timeout_ms = timeout_ms, .cancellation = &cancellation, .max_response_bytes = registry.max_reply_bytes }) catch |err| break :response @as(anyerror![]u8, err);
+                var forwarded = server.forwardRetainedSubscription(position.owner_node_id, .{ .method = .POST, .uri = ctx.request.uri.raw, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body, .timeout_ms = timeout_ms, .cancellation = &cancellation, .max_response_bytes = registry.max_reply_bytes }, context) catch |err| break :response @as(anyerror![]u8, err);
                 if (forwarded) |*response| {
                     const allowed = http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read) catch |err| {
                         response.deinit(server.alloc);

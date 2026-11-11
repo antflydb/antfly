@@ -11007,6 +11007,7 @@ pub const DataServer = struct {
                 .local_status = dataReadRouterLocalStatus,
                 .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
                 .node_base_uri = dataReadRouterNodeBaseUri,
+                .node_base_uri_controlled = dataReadRouterNodeBaseUriControlled,
                 .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
                 .group_node_ids = dataReadRouterGroupNodeIds,
                 .resolve_group_routes = dataReadRouterResolveGroupRoutes,
@@ -11468,9 +11469,13 @@ pub const DataServer = struct {
     }
 
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        return dataReadRouterNodeBaseUriControlled(ptr, alloc, node_id, .{});
+    }
+    fn dataReadRouterNodeBaseUriControlled(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64, budget: antfly.public_api.table_router.RouteBudget) !?[]u8 {
+        try budget.check();
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.remote_metadata) |metadata| {
-            const peers = try metadata.acquireControlReadGeneration(.{});
+            const peers = try metadata.acquireControlReadGeneration(budget);
             defer peers.release();
             return peers.nodeUri(alloc, node_id);
         }

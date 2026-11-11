@@ -332,7 +332,22 @@ pub fn fetchReadCut(server: anytype, a: A, target: local.system_catalog_domain.T
     return snapshot;
 }
 
-pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
+pub fn readResolved(server: anytype, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
+    // A result owns its arena independently of the HTTP/SQL request arena.
+    // Use the reclaiming server allocator so completed partitions release
+    // actual memory and admission measures peak usage, not cumulative I/O.
+    const backing = server.alloc;
+    const budget = try backing.create(MemoryBudget);
+    errdefer backing.destroy(budget);
+    budget.* = .{ .backing = backing, .limit = max_result_bytes };
+    var result = readResolvedBudgeted(server, budget.allocator(), snapshot, definition, input, request_context) catch |err| {
+        std.debug.assert(budget.live == 0);
+        return if (err == error.OutOfMemory and budget.denied) error.DatasetPageBudgetExceeded else err;
+    };
+    result.budget = budget;
+    return result;
+}
+fn readResolvedBudgeted(server: anytype, a: A, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
     var context = try request_context.platformDeadline();
     const now = @import("antfly_platform").time.monotonicNs();
     context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| 30 * std.time.ns_per_s);
@@ -386,12 +401,12 @@ pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: datas
                     return resolver.value;
                 }
             };
-            return @import("../serverless/datasets/summary_read.zig").readClosed(alloc, opened.store(io, &ctx), self.definition, spec, range, .{ .rows = self.limit, .after = self.input.after, .dimensions_json = self.input.dimensions_json, .page = self.input.page }, cut, owner.independent_receipt orelse return error.DatasetDependencyPending, Resolver{ .value = binding });
+            return @import("../serverless/datasets/summary_read.zig").readClosed(alloc, opened.storeWithAllocator(alloc, io, &ctx), self.definition, spec, range, .{ .rows = self.limit, .after = self.input.after, .dimensions_json = self.input.dimensions_json, .page = self.input.page }, cut, owner.independent_receipt orelse return error.DatasetDependencyPending, Resolver{ .value = binding });
         }
     };
     if (input.max_rows == 0 or input.max_rows > max_input_rows) return error.DatasetPageBudgetExceeded;
     var captures = std.ArrayList(Capture).empty;
-    var result = try read(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = if (input.page) @intCast(@min(input.max_rows + 1, @max(@as(usize, 1), max_input_rows / @max(@as(usize, 1), snapshot.owners.len)))) else input.max_rows, .input = input, .captures = &captures, .capture_alloc = scratch });
+    var result = try readBudgeted(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = if (input.page) @intCast(@min(input.max_rows + 1, @max(@as(usize, 1), max_input_rows / @max(@as(usize, 1), snapshot.owners.len)))) else input.max_rows, .input = input, .captures = &captures, .capture_alloc = scratch });
     errdefer result.deinit();
     const owned = result.arena.allocator();
     const output = owned.dupe(Capture, captures.items) catch |err| return result.allocationFailure(err);
@@ -441,7 +456,7 @@ pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Targ
         if (timestamp < try range.start() or timestamp >= try range.end()) return error.InvalidDatasetCoverage;
     }
     const request: Request = .{ .start_ns = input.start_ns, .end_ns = input.end_ns, .max_rows = input.max_rows, .page = true, .after = if (input.after) |after| try parseAfter(after) else null, .dimensions_json = if (input.dimensions) |values| try canonicalDimensions(scratch, definition, values) else null };
-    var result = try readResolved(server, a, snapshot, definition, request, context);
+    var result = try readResolved(server, snapshot, definition, request, context);
     defer result.deinit();
     const Row = struct { bucket_start_ns: []const u8, dimensions: []const std.json.Value, values: []const std.json.Value };
     const output = try scratch.alloc(Row, result.rows.len);
@@ -644,4 +659,28 @@ test "retained owner native controls exact fanin stays inside one working alloca
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(f64, 0x1p-1069), (try result.rows[0].metrics[0].finalize(.sum)).number);
     try std.testing.expect(result.budget.?.total <= 64 * 1024);
+
+    const Server = struct {
+        alloc: A,
+        rows: [3]series.Bucket,
+        definition: dataset.Id,
+        cfg: struct { node_config: ?*const local.common_config.Config = null, secret_store: ?*local.common_secrets.FileStore = null } = .{},
+        pub fn sharedApiIo(_: *@This()) ?std.Io {
+            return std.testing.io;
+        }
+        pub fn readRetainedOwnerRows(self: *@This(), alloc: A, _: []const u8, group: u64, _: NativeQuery, _: operation.RequestContext) ![]u8 {
+            const index = (group - 1) % 3;
+            return std.json.Stringify.valueAlloc(alloc, NativeReply{ .rows = self.rows[index..][0..1], .root_incarnation = "1", .cursor = .{ .definition = self.definition, .partition = @splat(5), .incarnation = 1, .sequence = 0 } }, .{});
+        }
+    };
+    var server: Server = .{ .alloc = a, .rows = reader.rows, .definition = plan.definition };
+    var serving = snapshot;
+    serving.source_table = .{ .table_id = 7, .name = "raw" };
+    var resolved = try readResolved(&server, serving, definition, .{ .start_ns = "0", .end_ns = "10" }, .{});
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(f64, 0x1p-1069), (try resolved.rows[0].metrics[0].finalize(.sum)).number);
+    try std.testing.expect(resolved.budget.?.peak <= max_result_bytes);
+    // Cumulative partition work exceeds peak usage because temporary buffers
+    // return to the reclaiming backing allocator after each owner.
+    try std.testing.expect(resolved.budget.?.total > resolved.budget.?.peak);
 }

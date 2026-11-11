@@ -13977,25 +13977,44 @@ pub const ApiHttpServer = struct {
             target.* = try ownedContextualHeader(self.alloc, source.name, source.value);
             initialized += 1;
         }
+        const content_type = if (response.content_type) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (content_type) |value| self.alloc.free(value);
         return .{
             .status = response.status,
-            .content_type = response.content_type orelse if (response.status >= 200 and response.status < 300)
+            .content_type = content_type orelse if (response.status >= 200 and response.status < 300)
                 "application/json"
             else
                 "text/plain; charset=utf-8",
             .body = try self.alloc.dupe(u8, response.body),
             .headers = headers,
+            .owned_content_type = content_type,
         };
     }
 
     /// A verified subscription cursor binds its issuer. Keep the bounded
     /// registry on that node while allowing ordinary load-balanced ingress.
-    pub fn forwardRetainedSubscription(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest) !?contextual_operations.OwnedResponse {
+    pub fn forwardRetainedSubscription(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, input_context: api_operation.RequestContext) !?contextual_operations.OwnedResponse {
+        var context = try input_context.platformDeadline();
+        try context.ensureActive();
         if (owner == 0 or owner == self.localSessionNodeId()) return null;
-        const router = self.cfg.session_router orelse return error.RetainedSeriesResetRequired;
-        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return error.RetainedSeriesResetRequired;
-        defer self.alloc.free(base);
         for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Subscription-Hop")) return error.RetainedSeriesResetRequired;
+        const timeout_ms = @min(request.timeout_ms orelse 30_000, 30_000);
+        const now = platform_time.monotonicNs();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| @as(u64, timeout_ms) * std.time.ns_per_ms);
+        const router = (self.cfg.session_router orelse return error.RetainedSeriesResetRequired).withBudget(.{ .clock = .{ .deadline_ns = context.deadline_ns }, .cancellation = context.cancellation });
+        // Shard routers resolve data stores. Metadata-only API nodes have no
+        // store record, so consult the trusted role-independent directory.
+        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse directory: {
+            var directory_context = context;
+            directory_context.setting_admin = true;
+            const raw = try self.source.systemCatalog(self.alloc, directory_context, .{ .api_node_uri = owner });
+            defer self.alloc.free(raw);
+            const uri = try std.json.parseFromSlice(?[]u8, self.alloc, raw, .{ .allocate = .alloc_always });
+            defer uri.deinit();
+            break :directory if (uri.value) |value| try self.alloc.dupe(u8, value) else return error.RetainedSeriesResetRequired;
+        };
+        defer self.alloc.free(base);
+        try context.ensureActive();
         const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
         defer headers.deinit(self.alloc);
@@ -14006,7 +14025,7 @@ pub const ApiHttpServer = struct {
         var outgoing = request;
         outgoing.uri = uri;
         outgoing.headers = headers.items;
-        outgoing.timeout_ms = @min(request.timeout_ms orelse 30_000, 30_000);
+        outgoing.timeout_ms = @intCast(@max(1, @min(timeout_ms, (context.deadline_ns.? -| platform_time.monotonicNs()) / std.time.ns_per_ms)));
         var response = try executor.execute(self.alloc, outgoing);
         defer response.deinit(self.alloc);
         return try self.cloneForwardedResponse(response);
@@ -28244,21 +28263,7 @@ fn contextualRetryableJsonErrorResponse(alloc: std.mem.Allocator, status: u16, m
 }
 
 fn cloneContextualResponse(alloc: std.mem.Allocator, response: contextual_operations.OwnedResponse) !contextual_operations.OwnedResponse {
-    const headers = try alloc.alloc(contextual_operations.Header, response.headers.len);
-    errdefer alloc.free(headers);
-    var initialized: usize = 0;
-    errdefer for (headers[0..initialized]) |*header| header.deinit(alloc);
-    for (response.headers, headers) |source, *target| {
-        target.* = try ownedContextualHeader(alloc, source.name, source.value);
-        initialized += 1;
-    }
-    return .{
-        .status = response.status,
-        .content_type = response.content_type,
-        .body = try alloc.dupe(u8, response.body),
-        .public_cors = response.public_cors,
-        .headers = headers,
-    };
+    return response.clone(alloc);
 }
 
 test "artifact source capability waits for every live data store reporter" {
@@ -63025,62 +63030,89 @@ test "retained owner native controls subscription issuer routes poll retry and c
         fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
             return if (node == 1) try alloc.dupe(u8, "http://issuer") else null;
         }
+        fn uriControlled(ptr: *anyopaque, alloc: std.mem.Allocator, node: u64, budget: table_router.RouteBudget) !?[]u8 {
+            try std.testing.expect(budget.clock.deadline_ns != null);
+            try budget.check();
+            return uri(ptr, alloc, node);
+        }
+        fn directory(_: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, request: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(context.setting_admin);
+            try std.testing.expect(request == .api_node_uri);
+            return alloc.dupe(u8, if (request.api_node_uri == 3) "\"http://issuer\"" else "null");
+        }
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             const principal = if (std.mem.eql(u8, request.authorization orelse "", "Basic reader")) self.principal else @as(subscriptions.Digest, @splat(9));
             try std.testing.expectEqualStrings("forwarded", request.header("X-Antfly-Subscription-Hop").?);
-            try std.testing.expectEqual(@as(?u32, 1500), request.timeout_ms);
+            try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 1500);
             try std.testing.expect(std.mem.startsWith(u8, request.uri, "http://issuer/"));
             const input = try std.json.parseFromSlice(struct { cursor: []const u8 }, alloc, request.body, .{});
             defer input.deinit();
             const position = try subscriptions.verify(&self.secret, input.value.cursor);
-            try std.testing.expectEqual(@as(u64, 1), position.owner_node_id);
+            try std.testing.expectEqual(self.initial.owner_node_id, position.owner_node_id);
             if (std.mem.endsWith(u8, request.uri, "/cancel")) {
                 try self.sessions.cancel(alloc, position, principal);
-                return .{ .status = 204 };
+                return .{ .status = 204, .content_type = try alloc.dupe(u8, "application/json") };
             }
             const loaded = try self.sessions.load(alloc, alloc, position, principal, 2);
             switch (loaded) {
-                .retry_reply => |reply| return .{ .status = 200, .body = reply },
+                .retry_reply => |reply| return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = reply },
                 .state => |state| {
                     defer alloc.free(state);
-                    return .{ .status = 200, .body = try self.sessions.commit(alloc, alloc, position, principal, 3, "next-state", "committed-frame") };
+                    return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try self.sessions.commit(alloc, alloc, position, principal, 3, "next-state", "committed-frame") };
                 },
             }
         }
     };
     var fixture: Fixture = .{ .initial = .{ .owner_node_id = 1, .id = @splat(4), .binding = @splat(5), .sequence = 0 } };
-    var issuer = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.issuer, .local_status = undefined, .node_base_uri = Fixture.uri } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    var issuer = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.issuer, .local_status = undefined, .node_base_uri = Fixture.uri, .node_base_uri_controlled = Fixture.uriControlled } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined, .system_catalog = Fixture.directory } }, null, null);
     defer issuer.deinit();
     fixture.sessions = &issuer.retained_subscriptions;
     fixture.secret = try issuer.researchStateKey(std.testing.io);
     try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, "initial-state");
-    var server = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.uri } }, .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    var server = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.uri, .node_base_uri_controlled = Fixture.uriControlled } }, .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined, .system_catalog = Fixture.directory } }, null, null);
     defer server.deinit();
     try std.testing.expectEqualDeep(fixture.secret, try server.researchStateKey(std.testing.io));
     const cursor = subscriptions.token(&fixture.secret, fixture.initial);
     const body = try std.json.Stringify.valueAlloc(a, .{ .cursor = cursor[0..] }, .{});
     defer a.free(body);
     const request: http_common.HttpRequest = .{ .method = .POST, .uri = "/db/v1/databases/default/namespaces/public/datasets/stats/subscriptions/poll", .authorization = "Basic reader", .body = body, .timeout_ms = 1500 };
-    var first = (try server.forwardRetainedSubscription(1, request)).?;
+    var first = (try server.forwardRetainedSubscription(1, request, .{})).?;
     defer first.deinit(a);
-    var retry = (try server.forwardRetainedSubscription(1, request)).?;
+    var retry = (try server.forwardRetainedSubscription(1, request, .{})).?;
     defer retry.deinit(a);
+    try std.testing.expectEqualStrings("application/json", first.content_type);
+    try std.testing.expectEqualStrings("application/json", retry.content_type);
     try std.testing.expectEqualStrings("committed-frame", first.body);
     try std.testing.expectEqualStrings(first.body, retry.body);
     var loop = request;
     loop.headers = &.{.{ .name = "X-Antfly-Subscription-Hop", .value = "forwarded" }};
-    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, loop));
-    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(99, request));
-    try std.testing.expect((try server.forwardRetainedSubscription(2, request)) == null);
+    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, loop, .{}));
+    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(99, request, .{}));
+    try std.testing.expect((try server.forwardRetainedSubscription(2, request, .{})) == null);
     var denied = request;
     denied.authorization = "Basic other-reader";
-    try std.testing.expectError(error.Forbidden, server.forwardRetainedSubscription(1, denied));
+    try std.testing.expectError(error.Forbidden, server.forwardRetainedSubscription(1, denied, .{}));
     var cancel = request;
     cancel.uri = "/db/v1/databases/default/namespaces/public/datasets/stats/subscriptions/cancel";
-    var canceled = (try server.forwardRetainedSubscription(1, cancel)).?;
+    var canceled = (try server.forwardRetainedSubscription(1, cancel, .{})).?;
     defer canceled.deinit(a);
     try std.testing.expectEqual(@as(u16, 204), canceled.status);
-    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, request));
+    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, request, .{}));
+    fixture.initial.owner_node_id = 3;
+    fixture.initial.id = @splat(8);
+    try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, "initial-state");
+    const metadata_cursor = subscriptions.token(&fixture.secret, fixture.initial);
+    const metadata_body = try std.json.Stringify.valueAlloc(a, .{ .cursor = metadata_cursor[0..] }, .{});
+    defer a.free(metadata_body);
+    var metadata_request = request;
+    metadata_request.body = metadata_body;
+    var metadata_poll = (try server.forwardRetainedSubscription(3, metadata_request, .{})).?;
+    defer metadata_poll.deinit(a);
+    try std.testing.expectEqualStrings("committed-frame", metadata_poll.body);
+    metadata_request.uri = cancel.uri;
+    var metadata_cancel = (try server.forwardRetainedSubscription(3, metadata_request, .{})).?;
+    defer metadata_cancel.deinit(a);
+    try std.testing.expectEqual(@as(u16, 204), metadata_cancel.status);
 }
