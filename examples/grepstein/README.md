@@ -778,9 +778,26 @@ including compressed input and output-buffer growth. Body capacities are capped
 at `max_download_bytes`; the conservative collection bound is three times that
 limit. A separate 8 MiB transport quota covers TLS buffers, trust roots and HTTP
 metadata. `DownloadContext.transport_memory_limit_bytes` configures that quota
-for library callers; exhaustion reports `DownloadTransportMemoryExceeded`.
+for library callers across HTTP, S3, GCS and pinned-range reads; exhaustion reports
+`DownloadTransportMemoryExceeded`. Detached bodies retain the caller allocator,
+while object-store credentials and connection state stay within the transport
+quota.
+
 Download and encoding peaks are separate phases, so admission uses their maximum
 without increasing the transcription response limit. Pre-acquired GCS recordings
 retain their actual-size borrowed-source plan. OpenAI multipart uploads borrow
-the recording directly; Antfly, Vertex and Cloudflare JSON uploads encode into
-one exact-sized body, avoiding multiple recording-sized buffers.
+the recording directly with a randomized, collision-checked delimiter; Antfly,
+Vertex and Cloudflare JSON uploads encode into one exact-sized body, avoiding
+multiple recording-sized buffers.
+
+Native Vertex transcriptions borrow the process provider runtime's Google
+credential manager (or retain a manager for the lifetime of a standalone asset
+runtime). Token exchanges, TLS state and cached tokens use that runtime's
+allocator, rather than a document's invocation allocator. Only the request's
+Authorization value is copied into the invocation. OAuth completes before the
+recognition JSON is built; tokens are reused until refresh is required.
+
+HTTP trust loading and peer-certificate parsing use a scoped Zig 0.17
+certificate compatibility copy with checked DER lengths. Malformed or truncated
+CA certificates return a parse error and release partial allocations. Trust and
+hostname verification remain enabled.

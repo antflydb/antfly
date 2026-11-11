@@ -150,7 +150,7 @@ pub const TlsSession = struct {
     net_in: ?SocketIoReader = null,
     net_out: ?SocketIoWriter = null,
 
-    ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    ca_bundle: ?@import("certificate_compat.zig").Bundle = null,
     ca_bundle_lock: std.Io.RwLock = .init,
     client: ?TlsClient = null,
 
@@ -229,7 +229,7 @@ pub const TlsSession = struct {
         // An explicit CA file replaces system roots. This is required for the
         // projected Kubernetes service-account CA trust boundary.
         if (verify) {
-            var bundle: std.crypto.Certificate.Bundle = .{
+            var bundle: @import("certificate_compat.zig").Bundle = .{
                 .map = .{},
                 .bytes = .empty,
             };
@@ -293,7 +293,7 @@ pub const TlsSession = struct {
     fn caBundleOption(self: *Self) @FieldType(TlsClient.Options, "ca") {
         const CaOption = @FieldType(TlsClient.Options, "ca");
         const BundleOption = @FieldType(CaOption, "bundle");
-        if (BundleOption == std.crypto.Certificate.Bundle) {
+        if (BundleOption == @import("certificate_compat.zig").Bundle) {
             return .{ .bundle = self.ca_bundle.? };
         }
         return .{ .bundle = .{
@@ -561,7 +561,7 @@ test "TLS failed CA loading releases partially allocated bundle" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "invalid.pem", .data = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "invalid.pem", .data = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" });
     const path = try tmp.dir.realPathFileAlloc(io, "invalid.pem", a);
     defer a.free(path);
     const Quota = @import("../util/quota_allocator.zig").QuotaAllocator;
@@ -572,7 +572,7 @@ test "TLS failed CA loading releases partially allocated bundle" {
     // Loading fails before the transport can be touched.
     var socket: Socket = undefined;
     session.attachSocket(&socket);
-    try std.testing.expectError(error.InvalidCharacter, session.handshake("localhost"));
+    try std.testing.expectError(error.CertificateFieldHasInvalidLength, session.handshake("localhost"));
     session.deinit();
     try std.testing.expectEqual(@as(usize, 0), quota.live);
 }

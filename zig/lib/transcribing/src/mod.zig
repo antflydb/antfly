@@ -1357,9 +1357,10 @@ const OpenAiTranscriberState = struct {
         const audio_bytes = content.bytes();
 
         const content_type = "application/octet-stream";
-        const multipart = try buildOpenAiMultipartAlloc(alloc, self.model, req.language orelse self.language_code, audio_bytes, content_type);
+        const multipart = try buildOpenAiMultipartAlloc(alloc, self.http.io, self.model, req.language orelse self.language_code, audio_bytes, content_type);
         defer alloc.free(multipart.prefix);
-        const segments = [_][]const u8{ multipart.prefix, audio_bytes, multipart_suffix };
+        defer alloc.free(multipart.suffix);
+        const segments = [_][]const u8{ multipart.prefix, audio_bytes, multipart.suffix };
         defer alloc.free(multipart.content_type);
 
         const url = try std.fmt.allocPrint(alloc, "{s}/audio/transcriptions", .{self.base_url});
@@ -1587,6 +1588,12 @@ const VertexTranscriberState = struct {
                 .diarizationConfig = if (want_diarization) DiarizationConfig{} else null,
             },
         };
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+
         const body = try audioJsonBodyAlloc(alloc, .{ .config = recognition_config, .content = "" }, .{ .config = recognition_config, .content = Base64Audio{ .bytes = audio_bytes } }, audio_bytes);
         defer alloc.free(body);
 
@@ -1596,12 +1603,6 @@ const VertexTranscriberState = struct {
             .{ self.base_url, self.project_id, self.location },
         );
         defer alloc.free(url);
-
-        var headers = std.ArrayList([2][]const u8).empty;
-        defer headers.deinit(alloc);
-        var minted_auth: ?[]u8 = null;
-        defer if (minted_auth) |value| alloc.free(value);
-        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
 
         var resp = try self.http.post(url, .{
             .json = body,
@@ -2009,11 +2010,10 @@ fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u
     return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
 }
 
-const multipart_boundary = "antfly-zig-audio-boundary";
-const multipart_suffix = "\r\n--" ++ multipart_boundary ++ "--\r\n";
 const MultipartBody = struct {
     content_type: []u8,
     prefix: []u8,
+    suffix: []u8,
 };
 
 /// OpenAI's transcription models do not share one response format.
@@ -2028,26 +2028,50 @@ fn openAiResponseFormat(model: []const u8) []const u8 {
     return "verbose_json";
 }
 
+// Randomized metadata plus an exact payload check gives a collision-free
+// delimiter without hashing/copying the full recording. The nonce also makes
+// progress under deterministic or entropy-free test I/O authorities.
+fn selectMultipartBoundary(boundary_buf: *[69]u8, seed: [32]u8, audio_bytes: []const u8, model: []const u8, language: ?[]const u8) ![]const u8 {
+    var nonce: u64 = 0;
+    return while (true) : (nonce += 1) {
+        var candidate_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        candidate_hash.update(&seed);
+        candidate_hash.update(std.mem.asBytes(&nonce));
+        var candidate: [32]u8 = undefined;
+        candidate_hash.final(&candidate);
+        const value = try std.fmt.bufPrint(boundary_buf, "afly-{s}", .{std.fmt.bytesToHex(candidate, .lower)});
+        if (std.mem.indexOf(u8, audio_bytes, value) == null and
+            std.mem.indexOf(u8, model, value) == null and
+            std.mem.indexOf(u8, language orelse "", value) == null)
+            break value;
+    };
+}
+
 fn buildOpenAiMultipartAlloc(
     alloc: Allocator,
+    io: std.Io,
     model: []const u8,
     language: ?[]const u8,
     audio_bytes: []const u8,
     audio_content_type: []const u8,
 ) !MultipartBody {
-    const boundary = multipart_boundary;
+    var seed: [32]u8 = undefined;
+    io.random(&seed);
+    var boundary_buf: [69]u8 = undefined;
+    const boundary = try selectMultipartBoundary(&boundary_buf, seed, audio_bytes, model, language);
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(alloc);
 
     try appendMultipartField(&buf, alloc, boundary, "model", model);
     if (language) |lang| try appendMultipartField(&buf, alloc, boundary, "language", lang);
     try appendMultipartField(&buf, alloc, boundary, "response_format", openAiResponseFormat(model));
-    _ = audio_bytes; // Kept borrowed by the caller's request segments.
     try buf.print(alloc, "--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, audio_content_type });
 
     const content_type = try std.fmt.allocPrint(alloc, "multipart/form-data; boundary={s}", .{boundary});
     errdefer alloc.free(content_type);
-    return .{ .content_type = content_type, .prefix = try buf.toOwnedSlice(alloc) };
+    const suffix = try std.fmt.allocPrint(alloc, "\r\n--{s}--\r\n", .{boundary});
+    errdefer alloc.free(suffix);
+    return .{ .content_type = content_type, .prefix = try buf.toOwnedSlice(alloc), .suffix = suffix };
 }
 
 fn appendMultipartField(
@@ -2571,9 +2595,10 @@ test "openai response format follows the model's capability" {
     try std.testing.expectEqualStrings("json", openAiResponseFormat("gpt-4o-transcribe"));
     try std.testing.expectEqualStrings("json", openAiResponseFormat("gpt-4o-mini-transcribe"));
 
-    const multipart = try buildOpenAiMultipartAlloc(std.testing.allocator, "gpt-4o-transcribe", null, "fake", "audio/wav");
+    const multipart = try buildOpenAiMultipartAlloc(std.testing.allocator, std.testing.io, "gpt-4o-transcribe", null, "fake", "audio/wav");
     defer std.testing.allocator.free(multipart.content_type);
     defer std.testing.allocator.free(multipart.prefix);
+    defer std.testing.allocator.free(multipart.suffix);
     try std.testing.expect(std.mem.indexOf(u8, multipart.prefix, "name=\"response_format\"\r\n\r\njson\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, multipart.prefix, "verbose_json") == null);
 }
@@ -2902,4 +2927,36 @@ test "Antfly audio JSON encoding owns one exactly sized body under a tight alloc
     defer a.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, encoded);
     try std.testing.expectEqualSlices(u8, bytes, decoded);
+}
+
+test "OpenAI multipart preserves recordings containing the old boundary" {
+    const a = std.testing.allocator;
+    const recording =
+        "\x52\x49\x46\x46\x86\x00\x00\x00\x57\x41\x56\x45\x66\x6d\x74\x20\x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00\x64\x61\x74\x61\x62\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\r\n--antfly-zig-audio-boundary--\r\n" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const multipart = try buildOpenAiMultipartAlloc(a, std.testing.io, "whisper-1", "en", recording, "audio/wav");
+    defer a.free(multipart.prefix);
+    defer a.free(multipart.content_type);
+    defer a.free(multipart.suffix);
+    const boundary = multipart.content_type["multipart/form-data; boundary=".len..];
+    try std.testing.expect(boundary.len <= 70);
+    try std.testing.expect(std.mem.indexOf(u8, recording, boundary) == null);
+    const body = try std.mem.concat(a, u8, &.{ multipart.prefix, recording, multipart.suffix });
+    defer a.free(body);
+    const file_header = "Content-Type: audio/wav\r\n\r\n";
+    const start = (std.mem.indexOf(u8, body, file_header) orelse return error.MissingFile) + file_header.len;
+    const end = std.mem.indexOfPos(u8, body, start, multipart.suffix) orelse return error.MissingFileEnd;
+    try std.testing.expectEqualSlices(u8, recording, body[start..end]);
+}
+
+test "multipart boundary selection retries actual payload collisions" {
+    var first: [69]u8 = undefined;
+    var second: [69]u8 = undefined;
+    const seed: [32]u8 = @splat(0);
+    const original = try selectMultipartBoundary(&first, seed, "", "whisper-1", null);
+    const selected = try selectMultipartBoundary(&second, seed, original, "whisper-1", null);
+    try std.testing.expect(!std.mem.eql(u8, original, selected));
+    try std.testing.expect(std.mem.indexOf(u8, original, selected) == null);
 }

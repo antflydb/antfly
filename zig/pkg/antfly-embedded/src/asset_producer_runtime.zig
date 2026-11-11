@@ -501,6 +501,9 @@ pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
     capability_cache: remote_capabilities.Cache,
+    // Borrowed-client runtimes also retain OAuth caches outside invocation buffers.
+    google_credentials: transcribing.CredentialManager,
+    borrowed_google_credentials: ?*transcribing.CredentialManager = null,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
     model_execution_identity: ?*ModelExecutionIdentity = null,
@@ -558,6 +561,7 @@ pub const Runtime = struct {
             .alloc = alloc,
             .http = http,
             .capability_cache = remote_capabilities.Cache.init(alloc, http.io),
+            .google_credentials = transcribing.CredentialManager.init(alloc, http.io),
             .execution = .{
                 .default_endpoint = options.inference_api_url,
                 .capability_cache = options.remote_capability_cache,
@@ -628,6 +632,7 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         self.capability_cache.deinit();
+        self.google_credentials.deinit();
         if (self.owned_default_endpoint) |endpoint| self.alloc.free(endpoint);
         if (self.owned_source_table) |source_table| self.alloc.free(source_table);
         if (self.owned_inference_api_key) |key| self.alloc.free(key);
@@ -645,6 +650,11 @@ pub const Runtime = struct {
             self.provider_runtime = null;
         }
         self.* = undefined;
+    }
+
+    fn googleCredentialManager(self: *Runtime) *transcribing.CredentialManager {
+        return self.borrowed_google_credentials orelse
+            (if (self.provider_runtime) |provider| &provider.google_credentials else &self.google_credentials);
     }
 
     fn capabilityCache(self: *Runtime) *remote_capabilities.Cache {
@@ -1402,6 +1412,7 @@ pub const Runtime = struct {
         // A copied Runtime must never operate on its copied cache mutex. Bind
         // every scoped call to the original synchronized cache explicitly.
         scoped.execution.capability_cache = self.capabilityCache();
+        scoped.borrowed_google_credentials = self.googleCredentialManager();
         scoped.execution.io = context.io orelse self.execution.io;
         scoped.execution.deadline_ns = if (context.deadline_ns) |invocation_deadline|
             if (self.execution.deadline_ns) |configured_deadline| @min(invocation_deadline, configured_deadline) else invocation_deadline
@@ -4294,6 +4305,7 @@ pub const Runtime = struct {
                 .diarization = cfg_parsed.value.diarization orelse false,
             },
             .{
+                .credential_manager = self.googleCredentialManager(),
                 .resolved_audio = if (request.media.len == 1) request.media[0].bytes else null,
                 .resolved_audio_content_type = if (request.media.len == 1) request.media[0].mime_type else null,
                 .source_table = self.execution.routing.source_table,
@@ -10234,4 +10246,93 @@ test "transcriber negotiated source transport fits the planned allocator indepen
         serving.cancel(io);
         if (server_error) |err| return err;
     }
+}
+
+test "transcriber native Vertex OAuth shares transport outside invocation memory" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var upstream = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/token", .respond = .{ .body = "{\"access_token\":\"fixture-token\",\"expires_in\":3600}" } },
+        .{ .method = .POST, .path = "/projects/fixture/locations/global/recognizers/_:recognize", .respond = .{ .body = "{\"results\":[{\"alternatives\":[{\"transcript\":\"hello\"}]}]}" } },
+    });
+    defer upstream.deinit();
+    upstream.max_request_bytes = 128 * 1024;
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            for (0..3) |_| server.handleOne() catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+        fn tlsHello(server: *std.Io.net.Server, io_arg: std.Io, received: *bool) std.Io.Cancelable!void {
+            var stream = server.accept(io_arg) catch return;
+            defer stream.close(io_arg);
+            var buffer: [16]u8 = undefined;
+            var reader = stream.reader(io_arg, &buffer);
+            const first = reader.interface.takeByte() catch return;
+            received.* = first == 0x16; // TLS handshake record, not HTTP.
+        }
+    };
+    var serving: std.Io.Group = .init;
+    defer serving.cancel(io);
+    var failure: ?anyerror = null;
+    try serving.concurrent(io, Serve.run, .{ &upstream, &failure });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const credentials = try std.fmt.allocPrint(a, "{{\"type\":\"authorized_user\",\"client_id\":\"fixture\",\"client_secret\":\"fixture\",\"refresh_token\":\"fixture\",\"token_uri\":\"{s}/token\"}}", .{upstream.baseUrl()});
+    defer a.free(credentials);
+    try tmp.dir.writeFile(io, .{ .sub_path = "credentials.json", .data = credentials });
+    const path = try tmp.dir.realPathFileAlloc(io, "credentials.json", a);
+    defer a.free(path);
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .max_provider_response_bytes = 4096, .provider_response_envelope_bytes = 64, .result_limits = .{ .transcriber_bytes_per_item = 256 } });
+    defer runtime.deinit();
+    const config = try std.json.Stringify.valueAlloc(a, .{ .provider = "vertex", .project_id = "fixture", .base_url = upstream.baseUrl(), .credentials_path = path }, .{});
+    defer a.free(config);
+    const recording = try a.alloc(u8, 65536);
+    defer a.free(recording);
+    @memset(recording, 0);
+    var request = asset_producer.Request{ .producer_type = .transcriber, .config_json = config, .source_text = "antfly:resolved-audio", .inline_media_trusted = true, .media = &.{.{ .bytes = recording, .mime_type = "audio/wav" }} };
+    const plan = try runtime.producer().invocationMemoryForRequests(a, &.{request});
+    const peak = try plan.attachment_transport.peakResidentSize(recording.len, "audio/wav".len);
+    for (0..2) |_| {
+        var budget = inference_work.BoundedInvocationAllocator.init(a, plan.allocator_limit_bytes + peak - recording.len);
+        const output = try Runtime.produceWithContext(&runtime, budget.allocator(), request, .{ .io = io, .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s });
+        try std.testing.expectEqualStrings("hello", output);
+        budget.allocator().free(output);
+        try std.testing.expect(!budget.limit_exceeded);
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    }
+    try serving.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 1), runtime.google_credentials.sources.count());
+
+    // TLS token exchange must reach ClientHello under the same small caller
+    // budget. The fixture intentionally closes without a server certificate;
+    // connection failure is expected, invocation OOM is not.
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer listener.deinit(io);
+    const tls_credentials = try std.fmt.allocPrint(a, "{{\"type\":\"authorized_user\",\"client_id\":\"fixture\",\"client_secret\":\"fixture\",\"refresh_token\":\"fixture\",\"token_uri\":\"https://{f}/token\"}}", .{listener.socket.address});
+    defer a.free(tls_credentials);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tls.json", .data = tls_credentials });
+    const tls_path = try tmp.dir.realPathFileAlloc(io, "tls.json", a);
+    defer a.free(tls_path);
+    const tls_config = try std.json.Stringify.valueAlloc(a, .{ .provider = "vertex", .project_id = "fixture", .base_url = upstream.baseUrl(), .credentials_path = tls_path }, .{});
+    defer a.free(tls_config);
+    request.config_json = tls_config;
+    var received = false;
+    try serving.concurrent(io, Serve.tlsHello, .{ &listener, io, &received });
+    var budget = inference_work.BoundedInvocationAllocator.init(a, plan.allocator_limit_bytes + peak - recording.len);
+    if (Runtime.produceWithContext(&runtime, budget.allocator(), request, .{ .io = io, .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s })) |output| {
+        budget.allocator().free(output);
+        return error.UnexpectedTlsSuccess;
+    } else |err| try std.testing.expect(err != error.OutOfMemory);
+    try serving.await(io);
+    try std.testing.expect(received);
+    try std.testing.expect(!budget.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
 }

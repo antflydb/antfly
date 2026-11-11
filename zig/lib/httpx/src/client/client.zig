@@ -4797,25 +4797,7 @@ test "raw deflate fallback handles a valid zlib-looking prefix" {
     try std.testing.expectEqualSlices(u8, &expected, decoded.items);
 }
 
-const test_tls_cert_pem =
-    "-----BEGIN CERTIFICATE-----\n" ++
-    "MIIC9TCCAd2gAwIBAgIJAKSB9mD1VeSqMA0GCSqGSIb3DQEBCwUAMBQxEjAQBgNV\n" ++
-    "BAMMCWxvY2FsaG9zdDAeFw0yNjExMTEyMTI2NTFaFw0zNjExMDgyMTI2NTFaMBQx\n" ++
-    "EjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC\n" ++
-    "ggEBALbFwwECV8+EOQKGKGDC1x5fuorRA2DlshtunwulnAPRVW2sRuhGB+JUOB6l\n" ++
-    "4+3mBFJpgZeXhDLoyLKIrS8yKBM09JQKlh097SafHHe1Cl39TfyFpVzHkbIFUK8G\n" ++
-    "5jLoLytUIwmDteXo4R8J2FMliR5JkpRzZ9T+VmnlQA1MeoUCvTNzS/fkWFg0YTSc\n" ++
-    "ey6y+XaZ83xYM4mu37qJ92TIiS1eW1hGlnIXBz1CdL33o3eGrn4G4DCi6HgRuSJN\n" ++
-    "ybcykWAgL+FXBjD7MiiA9ebjFwexBhRFtsx84d1+gPlwIbkt/fbgY4DEH7IAXPPS\n" ++
-    "FA4L0tO2Drn2KEAlsF7hZejSx9ECAwEAAaNKMEgwDwYDVR0TAQH/BAUwAwEB/zAO\n" ++
-    "BgNVHQ8BAf8EBAMCAqQwJQYDVR0RBB4wHIIJbG9jYWxob3N0ggkxMjcuMC4wLjGH\n" ++
-    "BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAEmUp6mqHEwWayCpGiqkhZ9CN0UPpS0T\n" ++
-    "0wRBSGxTQfK/79u8IJUoGfBh+lA5WdGE1o8HbriC/TGtXLePkoYbL2/IfGmX22A4\n" ++
-    "prbDlQBoBOSI/mGiUTXmH0quQIP/sBniDWvxUe+voqBHr7RCnxmPrKsBkDagT4G5\n" ++
-    "HJ8Nwb5qS16lqTnyemkyX40NbYQ9/uca5nmSSPNbh9Lq30Hb9uxbUZ05AWEZJjI8\n" ++
-    "phFd9gcCNwPmrdM/1sSviPZcF71tdG2BfUQg5zIpcuorlaeWd/q8bxlUoIOpQmiQ\n" ++
-    "V+Qo5Z8JqbXl551Q2CGoEhlt4WfzGpqIgCjplAdVy/Pse5Yf+3yZ6mk=\n" ++
-    "-----END CERTIFICATE-----\n";
+const test_tls_cert_pem = @embedFile("../tls/testdata/localhost-cert.pem");
 
 const test_tls_key_pem =
     "-----BEGIN PRIVATE KEY-----\n" ++
