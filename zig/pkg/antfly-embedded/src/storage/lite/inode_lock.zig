@@ -275,13 +275,15 @@ pub const Entry = struct {
     /// unreferenced by any real caller, same posture `shared_lock_region
     /// .zig` itself had through its own steps 1-3.
     ///
-    /// Not yet handled: `rebind` changes `entry.path` (a generation
-    /// swap) without touching an already-open `region`, which would
-    /// then go on serving the *old* path's sidecar. Rebinding the region
-    /// too -- or deciding a generation swap should instead open a fresh
-    /// one -- is deferred to whichever migration step first gives a
-    /// rebound `Entry` a live `region` to actually carry across the
-    /// swap; nothing does yet.
+    /// `rebind` (a generation swap, e.g.
+    /// `NativeFile.replaceWithPreparedGeneration`) closes and clears this
+    /// if set, rather than carrying it across the path change: the region
+    /// is keyed by the path it was opened against (its own
+    /// `<path>.aflite-lock` sidecar), so a region opened against the old
+    /// name must not go on serving lookups for the new one. The next
+    /// `ensureRegion` call after a rebind reopens lazily against the new
+    /// path, exactly like `ensureFd`'s existing lazy-reopen pattern after
+    /// `entry.fd` goes back to `null`.
     region: ?shared_lock_region.Region = null,
 };
 
@@ -622,6 +624,14 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
 /// later lazy reopen (only when `entry.fd` happens to have gone back to
 /// `null`, e.g. after a fairness release) would try the old, now-
 /// nonexistent name.
+///
+/// Also closes and clears `entry.region` if one is open: that mapping was
+/// opened against the old path's own `<old_path>.aflite-lock` sidecar, and
+/// nothing renames that sidecar alongside the data file's own rename, so a
+/// region left open across this call would silently keep serving stale
+/// (pre-swap) writer/reader state for what is now a different generation
+/// at this path. The next `ensureRegion` call lazily reopens a fresh region
+/// against `new_path`, exactly mirroring `ensureFd`'s own lazy-reopen shape.
 pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
     const page = std.heap.page_allocator;
     const owned = try page.dupe(u8, new_path);
@@ -629,6 +639,10 @@ pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
     defer entry.mutex.unlock(io);
     page.free(entry.path);
     entry.path = owned;
+    if (entry.region) |*r| {
+        r.close();
+        entry.region = null;
+    }
 }
 
 /// Caller holds `entry.mutex`. Fully idle (no in-process holder remains):
@@ -726,4 +740,58 @@ test "ensureRegion's region closes when the entry is torn down" {
     const own_pid: u32 = @bitCast(std.c.getpid());
     region.acquireWriter(own_pid);
     region.releaseWriter();
+}
+
+test "rebind closes an already-open region instead of carrying it across the path change" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const old_path = try std.fmt.allocPrint(a, "{s}/inode-rebind-old.data", .{buf[0..dir_len]});
+    defer a.free(old_path);
+    const new_path = try std.fmt.allocPrint(a, "{s}/inode-rebind-new.data", .{buf[0..dir_len]});
+    defer a.free(new_path);
+    const old_region_sidecar = try std.fmt.allocPrint(a, "{s}.aflite-lock", .{old_path});
+    defer a.free(old_region_sidecar);
+    const new_region_sidecar = try std.fmt.allocPrint(a, "{s}.aflite-lock", .{new_path});
+    defer a.free(new_region_sidecar);
+    {
+        const f = try Io.Dir.cwd().createFile(io, old_path, .{});
+        f.close(io);
+    }
+    {
+        const f = try Io.Dir.cwd().createFile(io, new_path, .{});
+        f.close(io);
+    }
+
+    const entry = try open(io, old_path);
+    defer unref(entry, io);
+
+    // Open a region against the old path and use it, mirroring what a
+    // real reader-fence/writer-lock caller would have done before a
+    // generation swap renamed this entry's underlying file.
+    {
+        const region = try ensureRegion(entry, io);
+        const own_pid: u32 = @bitCast(std.c.getpid());
+        region.acquireWriter(own_pid);
+        region.releaseWriter();
+    }
+    // Only the old path's sidecar exists so far -- `ensureRegion` has
+    // never been asked about `new_path`.
+    try Io.Dir.cwd().access(io, old_region_sidecar, .{});
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, new_region_sidecar, .{}));
+
+    try rebind(entry, io, new_path);
+    // The gap this closes: a stale `region` must not survive the rebind,
+    // so the next `ensureRegion` reopens fresh against `new_path` rather
+    // than going on serving the old sidecar's mapping.
+    try std.testing.expect(entry.region == null);
+
+    const region_after_rebind = try ensureRegion(entry, io);
+    try Io.Dir.cwd().access(io, new_region_sidecar, .{});
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    region_after_rebind.acquireWriter(own_pid);
+    region_after_rebind.releaseWriter();
 }
