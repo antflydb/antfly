@@ -742,7 +742,7 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             15,
         )
 
-        def remaining_summary_objects():
+        def remaining_summary_payloads():
             listing = json.loads(
                 subprocess.check_output(
                     [
@@ -761,10 +761,14 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             return [
                 row["Key"]
                 for row in listing.get("Contents", [])
-                if "/datasets/" in row["Key"] and f"/{current['id']}/" in row["Key"]
+                if "/datasets/" in row["Key"]
+                and f"/{current['id']}/" in row["Key"]
+                and row["Size"] > 0
             ]
 
-        wait_for(remaining_summary_objects, lambda keys: not keys, 60, server)
+        # Zero-byte publication fences deliberately survive collection so a
+        # delayed conditional upload cannot recreate a discarded payload.
+        wait_for(remaining_summary_payloads, lambda keys: not keys, 60, server)
 
     finally:
         for process in reversed(processes):
