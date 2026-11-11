@@ -205,6 +205,13 @@ pub const Progress = struct {
     config_hash: u64 = 0,
     published_count: ?u64 = null,
     lsm_wal_checkpointed_through: u64 = 0,
+    /// `contributeProgressTxn` never regresses the durable watermark by
+    /// default (see its own doc comment) -- but a caller that has already
+    /// decided the exact value itself, mode-aware, including an explicit
+    /// reset or rewind to an older cut (`applyProgressUpdateTxn`'s
+    /// `.replace`/`.set` modes), must not have that decision re-clamped
+    /// back up to whatever was previously stored. Set true only there.
+    allow_regression: bool = false,
 };
 
 /// A raw key/value pair to piggyback into the same progress commit (used by
@@ -324,7 +331,7 @@ pub fn contributeProgressTxn(txn: anytype, progress: Progress) !bool {
         error.InvalidDerivedApplyState => null,
         else => return err,
     };
-    const effective_sequence = if (existing) |record| @max(record.applied_sequence, progress.sequence) else progress.sequence;
+    const effective_sequence = if (existing != null and !progress.allow_regression) @max(existing.?.applied_sequence, progress.sequence) else progress.sequence;
     const encoded = encodeProgressRecord(.{
         .applied_sequence = effective_sequence,
         .status = progress.status,
@@ -642,6 +649,12 @@ fn applyProgressUpdateTxn(txn: anytype, update: AppliedSequenceUpdate, mode: Met
         .config_hash = next.config_hash,
         .published_count = next.published_count,
         .lsm_wal_checkpointed_through = next.lsm_wal_checkpointed_through,
+        // `checkpoint.applied_sequence` above already applied this mode's
+        // own, exact merge (`.replace`'s reset, `.set`'s explicit rewind,
+        // or `.advance`'s own max) against `previous_sequence`. That
+        // decision must stand, even when it is lower than whatever is
+        // still durable -- that is the whole point of `.replace`/`.set`.
+        .allow_regression = true,
     });
 }
 

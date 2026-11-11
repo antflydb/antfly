@@ -23172,7 +23172,31 @@ pub const DB = struct {
             // `ensureReplayFloor` -- a floor-only raise, so it is a no-op
             // for a primary already carrying this value under the
             // current layout.
-            try opened_primary.store.ensureReplayNextSequenceAtLeast(native_manifest.?.capture_target_sequence + 1);
+            //
+            // Only a genuinely missing watermark under the *current*
+            // (post-relocation) key -- `lastReplaySequence(0)` reads
+            // exactly `internal_keys.replay_meta_next_sequence_key`, the
+            // relocated key, and returns 0 when nothing was ever written
+            // there -- may be seeded from the manifest's
+            // `capture_target_sequence`. That is precisely the legacy/
+            // pre-relocation case this reseed exists for: a v0.2 backup's
+            // journal bookkeeping (its `replay_meta_init_key` marker
+            // included) predates the relocation and still exists, so
+            // `hasReplayEntries()` alone cannot tell the two cases apart.
+            // The manifest is the caller's own claim, not independently
+            // verified truth: `classifyNativeProjectionCatalogCompatibility`
+            // below re-derives this primary's watermark and compares it
+            // against that same manifest value to catch a tampered claim.
+            // Seeding an already-populated current-key watermark from the
+            // manifest first would make that comparison a tautology -- it
+            // would "validate" any upward tamper of `capture_target_sequence`
+            // by construction, since the watermark it compares against was
+            // just copied from the same untrusted value. A downward tamper
+            // remains caught either way: this is a floor-only raise, so it
+            // never lowers an already-higher, genuinely durable watermark.
+            if (opened_primary.store.lastReplaySequence(0) == 0) {
+                try opened_primary.store.ensureReplayNextSequenceAtLeast(native_manifest.?.capture_target_sequence + 1);
+            }
         }
         if (purpose == .historical_table)
             try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, cancellation);

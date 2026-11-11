@@ -151,7 +151,6 @@ test "bug2: an indexed-reclamation Lite file at a relative path creates no files
     var restored = false;
     defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
 
-    std.debug.print("BUG2-DIAG: about to create, cwd should be tmp={s}\n", .{tmp_dir_path});
     const bare_name = "bug2-repro.aflite";
     // This test is the one legitimate, deliberate exercise of
     // `Namespace.open`'s cwd fallback (see that function's own debug
@@ -166,8 +165,6 @@ test "bug2: an indexed-reclamation Lite file at a relative path creates no files
         defer file.close();
         try file.putDocument("doc", "value");
     }
-    std.debug.print("BUG2-DIAG: create+put+close done\n", .{});
-
     // The reader-epoch namespace directory must have landed inside the temp
     // directory (next to the .aflite file), not vanished or ended up
     // somewhere else: find it and confirm its "identity" marker is there.

@@ -6196,7 +6196,11 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
         if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
             var read = try runtime.store.beginProbe();
             defer read.abort();
-            if (try ordered_publication.authority(&read) == null) try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, parent, bytes);
+            if (try ordered_publication.authority(&read) == null) {
+                const upstream_source_text = try declaredSourceTextAlloc(runtime, request.doc_key, parent, request.upstream_artifact_name);
+                defer runtime.alloc.free(upstream_source_text);
+                try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, upstream_source_text, bytes);
+            }
         }
     };
     // A replay window can contain a newer update for the same document. Keep
@@ -16483,7 +16487,9 @@ fn processAsset(
             if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
                 var read = try runtime.store.beginProbe();
                 defer read.abort();
-                try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, raw, value);
+                const upstream_source_text = try declaredSourceTextAlloc(runtime, request.doc_key, raw, request.upstream_artifact_name);
+                defer runtime.alloc.free(upstream_source_text);
+                try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, upstream_source_text, value);
             }
         }
         break :blk bytes;
@@ -38783,6 +38789,91 @@ const LocalSourceFence = struct {
     producer_recipe: ?[32]u8 = null,
 };
 
+/// Recomputes what `name`'s own asset producer currently declares as its
+/// source text from `raw` -- the same quantity `processAsset`'s own
+/// self-check sites (the `.copy` branch, the generic producer branch, and
+/// `applyAssetProducerBatchOutput`) now encode their receipt's "parent"
+/// against (see their comments), rather than the whole primary document.
+/// `requireLocalAssetSource`'s callers that validate a *different*
+/// artifact's (`name`'s) receipt -- not their own -- must pass this, not
+/// `raw` directly, or the comparison permanently mismatches for any
+/// producer whose declared source narrows `raw` (almost all of them):
+/// the stored receipt was encoded against the producer's own source text,
+/// never against the whole document.
+///
+/// `name` can itself be a `source_artifact_name`-consuming producer (an
+/// asset chained off another asset, e.g. a `.copy` mirroring a `generator`'s
+/// output). In that shape its declared source is not extracted from `raw`
+/// at all -- it is whatever its own upstream most recently published
+/// (optionally narrowed by its own source_field/source_template on top of
+/// that, exactly as `processAsset`'s `consumes_upstream` block builds
+/// `source_text`) -- so this walks the chain one hop at a time rather than
+/// extracting from `raw` directly. A bounded hop count guards against a
+/// misconfigured catalog cycle; it is not expected to ever bind in practice
+/// (the catalog itself has no such cycles).
+///
+/// A grouped-source producer (`group_source_json` set) synthesizes its
+/// input from more than this helper can reconstruct here; fall back to
+/// `raw` there (and on any extraction error, or a missing upstream output)
+/// rather than guess -- a false "changed" signal only costs one harmless
+/// extra check, where a false "unchanged" would wrongly accept a stale
+/// witness.
+fn declaredSourceTextAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8, raw: []const u8, name: []const u8) ![]const u8 {
+    const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return try runtime.alloc.dupe(u8, raw);
+    if (entry.group_source_json.len > 0) return try runtime.alloc.dupe(u8, raw);
+    // `name`'s own source, and the value any source_field/source_template
+    // of its own narrows: `raw` directly, unless `name` itself consumes
+    // another asset (`source_artifact_name` set) rather than a field of
+    // `raw` -- mirrored from the same `consumes_upstream` shape in
+    // `processAsset`. One hop is enough regardless of how deep the chain
+    // above `name` goes: whatever `name`'s own immediate upstream most
+    // recently published is already the correct narrowing input, however
+    // that upstream itself arrived at it.
+    const source_input = if (entry.source_artifact_name.len == 0) raw else blk: {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", entry.source_artifact_name);
+        defer runtime.alloc.free(upstream_key);
+        break :blk (try storeGetOptionalAllocWithRetry(runtime, upstream_key)) orelse return try runtime.alloc.dupe(u8, raw);
+    };
+    defer if (entry.source_artifact_name.len != 0) runtime.alloc.free(@constCast(source_input));
+    const base: []const u8 = base: {
+        if (entry.source_field.len == 0 and entry.source_template.len == 0) break :base try runtime.alloc.dupe(u8, source_input);
+        const synthetic = enrichment_types.GeneratedEnrichmentRequest{
+            .kind = .asset,
+            .index_name = "",
+            .doc_key = "",
+            .source_field = entry.source_field,
+            .source_template = entry.source_template,
+        };
+        const extracted = extractAssetSourceValue(runtime.alloc, runtime.config, source_input, synthetic) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return try runtime.alloc.dupe(u8, raw),
+        };
+        break :base extracted orelse return try runtime.alloc.dupe(u8, raw);
+    };
+    // Mirrors `processAsset`'s own composition: a non-`.copy` producer with
+    // neighbor-context configured joins its same-shard graph adjacency onto
+    // its source text before that text is ever hashed into a receipt (see
+    // the `.copy` early return above that comment in `processAsset`, and
+    // the `std.mem.join(alloc, "\n", &.{ source_text, block })` just below
+    // it) -- so the declared source `name` actually wrote its receipt
+    // against already includes this block, not just the extracted field.
+    if (entry.neighbor_context_json.len == 0) return base;
+    const producer_cfg = asset_producer_mod.parseProducerConfig(runtime.alloc, entry.producer_json) catch return base;
+    defer @constCast(&producer_cfg).deinit(runtime.alloc);
+    if (producer_cfg.type == .copy or !enrichment_config_validation.producerConsumesPromptText(producer_cfg.type)) return base;
+    const neighbor_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .asset,
+        .index_name = "",
+        .doc_key = doc_key,
+        .source_field = "",
+        .neighbor_context_json = entry.neighbor_context_json,
+    };
+    const block = (neighborContextBlockAlloc(runtime, neighbor_request) catch return base) orelse return base;
+    defer runtime.alloc.free(block);
+    defer runtime.alloc.free(@constCast(base));
+    return try std.mem.join(runtime.alloc, "\n", &.{ base, block });
+}
+
 fn requireLocalAssetSource(runtime: *EnrichmentRuntime, txn: anytype, doc_key: []const u8, name: []const u8, parent: []const u8, output: []const u8) !void {
     if (try @import("../../source_authority.zig").maintenanceMode(txn) != .local) return error.ArtifactPublicationPending;
     const local = @import("../artifact_local_publication.zig");
@@ -38815,7 +38906,9 @@ fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: Lo
         defer runtime.alloc.free(upstream_key);
         const output = txn.get(upstream_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
         if (!std.mem.eql(u8, &expected, &sourceRecordDigest(output))) return error.EnrichmentSourceChanged;
-        try requireLocalAssetSource(runtime, txn, guard.doc_key, guard.upstream_name, logical orelse return error.EnrichmentSourceChanged, output);
+        const upstream_source_text = try declaredSourceTextAlloc(runtime, guard.doc_key, logical orelse return error.EnrichmentSourceChanged, guard.upstream_name);
+        defer runtime.alloc.free(upstream_source_text);
+        try requireLocalAssetSource(runtime, txn, guard.doc_key, guard.upstream_name, upstream_source_text, output);
     }
 }
 
@@ -45584,7 +45677,13 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    catalog.binding.effect_protocol = 15;
+    // This catalog's "vectors" index is exactly artifact_inventory.zig's
+    // onlineGeneratedChunkVectorConfig shape, which computes to the current
+    // max (18), not the stale floor (15) a sibling test deliberately pins.
+    // Pinning 15 here trips processOrderedChunkVectorWithAllocator's
+    // execution_revision-gated floor check before reaching the terminal
+    // failure this test means to exercise.
+    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -45807,12 +45906,26 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    // The primary document's stored digest is this request's fencing
+    // guard against (via applyAssetProducerBatchOutput's
+    // storePutBatchGuarded -> validateLocalSourceFence); it must exist
+    // and equal `raw_doc` ("{}" below) or every publish fences as
+    // EnrichmentSourceChanged before producer_json is ever compared.
+    //
+    // Must match the registered catalog entry's producer_json byte-for-byte
+    // (the "labels" enrichment added above): the fencing check this
+    // request's dispatch goes through compares the request's declared
+    // producer config against the catalog's, and a bare "{\"type\":...}"
+    // without the catalog's own "config" object is a mismatch, not a
+    // narrower-but-compatible config.
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     for (0..2) |_| for (0..32) |i| {
         const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
         defer alloc.free(config);
@@ -45910,12 +46023,17 @@ test "model aware media labels authenticate independently refreshed retained tex
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, payload);
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    // Must match the registered catalog entry's producer_json byte-for-byte
+    // (the "labels" enrichment added above): see the sibling vocabulary
+    // cache test's identical fix.
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     const output = try storeGetAlloc(&runtime, output_key);
