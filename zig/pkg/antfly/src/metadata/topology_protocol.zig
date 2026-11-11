@@ -116,18 +116,23 @@ const std = @import("std");
 /// Version 83 decodes independent durable query-artifact store ownership and
 /// its restartable cleanup frontier, including the global composed-cursor row.
 /// Version 84 adds graph definitions and transaction sessions.
-/// Version 85 owns independent retained dataset resources and source/work indexes.
-/// Version 86 journals native retained owners before activation and requires
+/// Version 85 admits publication-scoped immutable opening bundles.
+/// Version 86 admits authenticated demand locators in opening bundles.
+/// Version 87 admits bootstrap selectors in reader protocol 100 publications.
+/// Version 88 admits bounded inline map navigation in reader protocol 101.
+/// Version 89 admits cold lake ranking and authenticated hydration.
+/// Version 90 owns independent retained dataset resources and source/work indexes.
+/// Version 91 journals native retained owners before activation and requires
 /// verified journal progress before source release or producer collection.
-/// Version 87 verifies signed observations against current store enrollment.
-/// Version 88 distinguishes snapshot-origin summaries from certified history.
-/// Version 89 verifies archive authority and atomically releases sources.
-/// Version 90 publishes terminal retained collection and removes scheduling work.
-pub const current_version: u16 = 90;
-pub const retained_collection_version: u16 = 90;
-pub const retained_archive_acknowledgements_version: u16 = 89;
-pub const retained_owner_acknowledgements_version: u16 = 87;
-pub const retained_datasets_version: u16 = 88;
+/// Version 92 verifies signed observations against current store enrollment.
+/// Version 93 distinguishes snapshot-origin summaries from certified history.
+/// Version 94 verifies archive authority and atomically releases sources.
+/// Version 95 publishes terminal retained collection and removes scheduling work.
+pub const current_version: u16 = 95;
+pub const retained_collection_version: u16 = 95;
+pub const retained_archive_acknowledgements_version: u16 = 94;
+pub const retained_owner_acknowledgements_version: u16 = 92;
+pub const retained_datasets_version: u16 = 93;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
@@ -156,7 +161,7 @@ pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
-pub const lake_index_catalog_version: u16 = 83;
+pub const lake_index_catalog_version: u16 = 89;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -335,3 +340,11 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "retained series topology gates do not reuse main cold lake protocol versions" {
+    try std.testing.expect(retained_datasets_version > lake_index_catalog_version);
+    try std.testing.expect(retained_owner_acknowledgements_version > lake_index_catalog_version);
+    try std.testing.expect(retained_archive_acknowledgements_version > retained_datasets_version);
+    try std.testing.expect(retained_collection_version > retained_archive_acknowledgements_version);
+    try std.testing.expect(current_version >= retained_collection_version);
+}

@@ -66,3 +66,7 @@ def test_hackernews_managed_lake_pending_hierarchy_and_restart(tmp_path, monkeyp
     module.test_native_catalog_file_commit_read_and_restart(
         tmp_path, "managed", "overlay"
     )
+    # A reset during optional/background work can leave foreground assertions
+    # passing. Keep the original transport regression visible in that case.
+    server_log = (tmp_path / "server.log").read_text()
+    assert "InvalidSocketOption" not in server_log, server_log[-8000:]

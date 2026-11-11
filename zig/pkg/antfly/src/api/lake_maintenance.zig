@@ -25,14 +25,14 @@ const overlay = @import("lake_search_overlay.zig");
 const server_api = @import("http_server.zig");
 const A = std.mem.Allocator;
 const Request = struct { action: enum { compact, vacuum, wal_gc, status, enrichment_status }, operation_id: []const u8 = "", dry_run: bool = true, exclusive_ownership: bool = false, max_rows: u64 = 16384, max_bytes: u64 = 32 * 1024 * 1024, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096 };
-pub const Result = struct { body: []u8, mutated: bool };
+pub const Result = struct { body: []u8, mutated: bool, retry_delay_ms: u64 = 0 };
 pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, context: catalog.types.Context, request_context: local.api_operation.RequestContext, body: []const u8) !Result {
     if (body.len > 16384) return error.InvalidLakeMaintenanceLimits;
     var parsed = try std.json.parseFromSlice(Request, a, body, .{});
     defer parsed.deinit();
     const request = parsed.value;
     if (request.action == .enrichment_status) {
-        var store = try @import("lake_index_store.zig").Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer store.deinit();
         return .{ .body = try @import("lake_recent_vectors.zig").status(a, &store, table, context), .mutated = false };
     }
@@ -82,7 +82,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     const wal: @import("../serverless/lake_wal.zig").Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try ingestion.prefix(scratch, opened.prefix, binding, options), .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     var result = try wal.prune(scratch, wal_cut, request.max_deleted, request.dry_run);
     if (!request.dry_run and result.complete) {
-        var artifacts = try @import("lake_index_store.zig").Store.openNative(scratch, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        var artifacts = try @import("lake_index_store.zig").Store.openNativeWithTransport(scratch, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer artifacts.deinit();
         const identity = @import("lake_wal_image.zig").digest(.{ .storage = artifacts.identity, .table = table.table_id, .generation = table.object_storage_generation, .prefix = wal.prefix });
         var shared = try wal.open(scratch, false);
@@ -90,5 +90,9 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
         result.collection = try server.lake_wal_collectors.step(scratch, identity, shared.indexed.?, server.embedding_provider_runtime.io, wal.collectionNamespace(), request.max_deleted, catalog.types.contextCancellation(&context));
         result.complete = result.collection.?.phase == .finished or result.collection.?.phase == .idle;
     }
-    return .{ .body = try std.json.Stringify.valueAlloc(a, result, .{}), .mutated = false };
+    const retry_delay_ms: u64 = if (result.collection) |collection| switch (collection.phase) {
+        .waiting, .deferred => 1000,
+        else => 0,
+    } else 0;
+    return .{ .body = try std.json.Stringify.valueAlloc(a, result, .{}), .mutated = false, .retry_delay_ms = retry_delay_ms };
 }

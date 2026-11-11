@@ -93,6 +93,13 @@ fn cutDigest(a: A, table: local.common_topology_records.TableRecord, publication
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
     return digest;
 }
+fn recipeCutDigest(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared) ![32]u8 {
+    const cut = try cutDigest(a, table, publication, overlay);
+    return if (publication.reader_protocol >= 102 and declarations.len == 1 and isRecipe(declarations[0]))
+        @import("lake_wal_image.zig").digest(.{ .format = "recipe-partition-recent-vectors-v1", .cut = cut, .recipe = declarations[0] })
+    else
+        cut;
+}
 fn jobKey(a: A, store: *Store, table: u64, cut: [32]u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}{s}recent-search/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, std.fmt.bytesToHex(cut, .lower) });
 }
@@ -101,6 +108,90 @@ fn cancellation(context: Context) Cancellation {
 }
 const Aggregate = struct { required: u16 = 1, ready: u16 = 0, until_ms: u64 = std.math.maxInt(u64), last_error: ?[]const u8 = null, next_retry_ms: u64 = 0 };
 pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
+    if (publication.reader_protocol < 102 or !hasRecipes(declarations)) return prepareLegacy(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo);
+    return prepareRecipes(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, true);
+}
+fn hasRecipes(declarations: []const Declared) bool {
+    for (declarations) |declaration| if (isRecipe(declaration)) return true;
+    return false;
+}
+fn isRecipe(declaration: Declared) bool {
+    return declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment;
+}
+pub fn selectedRecipes(a: A, declarations: []const Declared, req: local.storage_db_types.SearchRequest) ![]const Declared {
+    var selected: std.ArrayList(Declared) = .empty;
+    errdefer selected.deinit(a);
+    if (req.dense != null) try selectRecipe(a, &selected, declarations, .vector_segment, req.index_name);
+    if (req.sparse != null) try selectRecipe(a, &selected, declarations, .sparse_segment, req.index_name);
+    for (req.dense_queries) |query| try selectRecipe(a, &selected, declarations, .vector_segment, query.index_name);
+    for (req.sparse_queries) |query| try selectRecipe(a, &selected, declarations, .sparse_segment, query.index_name);
+    return selected.toOwnedSlice(a);
+}
+fn selectRecipe(a: A, selected: *std.ArrayList(Declared), declarations: []const Declared, kind: @FieldType(@FieldType(Declared, "artifact"), "kind"), name: ?[]const u8) !void {
+    var found: ?Declared = null;
+    for (declarations) |declaration| if (declaration.artifact.kind == kind and (if (name) |value| std.mem.eql(u8, value, declaration.name) else true)) {
+        if (found != null) return error.IndexNotFound;
+        found = declaration;
+    };
+    const declaration = found orelse return error.IndexNotFound;
+    for (selected.items) |prior| if (std.mem.eql(u8, prior.name, declaration.name)) return;
+    try selected.append(a, declaration);
+}
+pub fn prepareQuery(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, cut_expires_ms: u64, memo: ?*Cache, req: local.storage_db_types.SearchRequest) !Prepared {
+    if (publication.reader_protocol < 102) return prepareLegacy(a, table, publication, overlay, declarations, store, context, options, false, cut_expires_ms, memo);
+    const selected = try selectedRecipes(a, declarations, req);
+    defer a.free(selected);
+    // A read cannot publish table-wide readiness from a selected recipe subset.
+    return prepareRecipes(a, table, publication, overlay, selected, store, context, options, false, cut_expires_ms, memo, false);
+}
+fn supplied(configs: V, name: []const u8) bool {
+    const config = configs.object.get(name) orelse return false;
+    const external = if (config == .object) config.object.get("external") else null;
+    return if (external) |value| value == .bool and value.bool else false;
+}
+fn prepareRecipes(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache, table_status: bool) !Prepared {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const configs = try std.json.parseFromSliceLeaky(V, work, table.indexes_json, .{});
+    var runs: std.ArrayList(Run) = .empty;
+    var roots: std.ArrayList(Declared) = .empty;
+    var aggregate: Aggregate = .{ .ready = std.math.maxInt(u16) };
+    var failure: ?anyerror = null;
+    // Supplied vectors must not queue behind model calls. Successful recipe
+    // partitions are durable independently, and survive another recipe's retry.
+    for ([_]bool{ true, false }) |manual| for (declarations) |declaration| {
+        if (!isRecipe(declaration) or supplied(configs, declaration.name) != manual) continue;
+        try context.ensureActive();
+        var recipe_progress: Aggregate = .{};
+        const prepared = preparePartitions(work, table, publication, overlay, &.{declaration}, store, context, options, build, cut_expires_ms, memo, &recipe_progress) catch |err| {
+            aggregate.required = @max(aggregate.required, recipe_progress.required);
+            aggregate.ready = @min(aggregate.ready, recipe_progress.ready);
+            if (recipe_progress.last_error) |value| aggregate.last_error = value;
+            aggregate.next_retry_ms = @max(aggregate.next_retry_ms, recipe_progress.next_retry_ms);
+            if (err != error.IndexRebuilding) return err;
+            failure = err;
+            // A failed managed recipe must not prevent other ready recipes
+            // from making progress in the same reconciliation turn.
+            if (build) continue;
+            return err;
+        };
+        aggregate.required = @max(aggregate.required, recipe_progress.required);
+        aggregate.ready = @min(aggregate.ready, recipe_progress.ready);
+        aggregate.until_ms = @min(aggregate.until_ms, prepared.expires_ms);
+        try roots.appendSlice(work, prepared.declarations);
+        if (prepared.runs.len != 0) try runs.appendSlice(work, prepared.runs) else try runs.append(work, .{ .prefix = 0, .digest = overlay.contentIdentity(), .declarations = prepared.declarations, .cloud_generations = prepared.cloud_generations });
+    };
+    if (failure) |err| {
+        if (table_status) _ = try publishStatus(a, table, publication, overlay, store, context, if (aggregate.last_error != null) .failed else .building, cut_expires_ms, aggregate);
+        return err;
+    }
+    if (table_status) _ = try publishStatus(a, table, publication, overlay, store, context, .ready, cut_expires_ms, aggregate);
+    const result: Prepared = .{ .declarations = roots.items, .runs = runs.items, .expires_ms = aggregate.until_ms };
+    const encoded = try std.json.Stringify.valueAlloc(work, result, .{});
+    return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
+}
+fn prepareLegacy(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
     var aggregate: Aggregate = .{};
     const prepared = preparePartitions(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, &aggregate) catch |err| {
         if (err == error.IndexRebuilding) _ = try publishStatus(a, table, publication, overlay, store, context, if (aggregate.last_error != null) .failed else .building, cut_expires_ms, aggregate);
@@ -158,7 +249,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const cut = try cutDigest(scratch, table, publication, overlay);
+    const cut = try recipeCutDigest(scratch, table, publication, overlay, declarations);
     var cache_hash = std.crypto.hash.Blake3.init(.{});
     cache_hash.update(&store.cache_identity);
     cache_hash.update(&cut);
@@ -200,6 +291,11 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     job.attempts +|= 1;
     io.random(&job.owner_token);
     job.last_error = null;
+    // A replacement attempt owns fresh artifacts. An expired generation's
+    // complete provider map must never qualify the new output if map capture
+    // declines or becomes unavailable during this attempt.
+    job.declarations = &.{};
+    job.cloud_generations = null;
     var claimed = client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => return error.IndexRebuilding,
         else => {
@@ -337,6 +433,7 @@ fn releaseClaim(a: A, store: *Store, key: []const u8, revision: ?@import("object
     record.next_retry_ms = 0;
     record.last_error = "interrupted";
     record.declarations = &.{};
+    record.cloud_generations = null;
     const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
     defer a.free(bytes);
     var client = store.opened.client;
@@ -739,4 +836,47 @@ test "external lake bounded WAL ready composition retries a conflicting incomple
     try std.testing.expectEqual(@as(usize, 3), race.puts);
     race.always = false;
     try std.testing.expect(try publishStatus(a, table, publication, &overlay, &store, .{}, .ready, now + 300_000, complete));
+}
+
+test "external lake bounded WAL recipe readiness is durable selected and cannot claim table coverage" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-recipe-readiness");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(work, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(a, json);
+    defer config.deinit();
+    var store = try Store.open(a, &config, null, false);
+    defer store.deinit();
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "history", .schema_json = "{}", .indexes_json = "{\"manual\":{\"type\":\"embeddings\",\"external\":true},\"managed\":{\"type\":\"embeddings\"}}" };
+    const publication: local.metadata_lake_index_catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    const overlay = try overlay_api.Overlay.init(work, .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{} });
+    const manual: Declared = .{ .name = "manual", .binding = .{ .sidecar_kind = .vector, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "history", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .column_bindings = &.{"vector"}, .index_config_hash = "manual-config" }, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = "manual-root", .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .byte_len = 1 } };
+    var managed = manual;
+    managed.name = "managed";
+    const cut = try recipeCutDigest(work, table, publication, &overlay, &.{manual});
+    const managed_cut = try recipeCutDigest(work, table, publication, &overlay, &.{managed});
+    try std.testing.expect(!std.mem.eql(u8, &cut, &managed_cut));
+    const key = try jobKey(work, &store, table.table_id, cut);
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut, .expires_ms = now + 600_000, .declarations = &.{manual} };
+    var client = store.opened.client;
+    var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, job, .{}), .{});
+    saved.deinit(client.allocator);
+    // Reopen with no process memo: readiness must come from durable recipe state.
+    var reader = try Store.open(a, &config, null, false);
+    defer reader.deinit();
+    const req: local.storage_db_types.SearchRequest = .{ .dense_queries = &.{.{ .name = "v", .index_name = "manual", .query = .{ .vector = &.{1} } }} };
+    const ready = try prepareQuery(work, table, publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, req);
+    try std.testing.expectEqual(@as(usize, 1), ready.runs.len);
+    try std.testing.expectEqualStrings("manual", ready.runs[0].declarations[0].name);
+    const status_key = try statusKey(work, &reader, table, publication.namespace);
+    try std.testing.expectError(error.FileNotFound, client.getObject(store.opened.bucket, status_key, .{}));
+    const mixed: local.storage_db_types.SearchRequest = .{ .dense_queries = &.{ req.dense_queries[0], .{ .name = "m", .index_name = "managed", .query = .{ .vector = &.{1} } } } };
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, mixed));
+    var old_publication = publication;
+    old_publication.reader_protocol = 101;
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, old_publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, req));
 }

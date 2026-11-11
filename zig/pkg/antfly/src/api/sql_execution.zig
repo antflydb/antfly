@@ -960,7 +960,7 @@ pub const Adapter = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var store = try @import("lake_index_store.zig").Store.openNative(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.server.lakeProviderTransport());
         defer store.deinit();
         var artifacts = store.artifactStore();
         const identity = try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator);
@@ -973,7 +973,7 @@ pub const Adapter = struct {
             const table = try resolve(self, scratch, cut.name orelse return error.CatalogGenerationChanged, .read);
             if (table.id != cut.table_id or table.schema_version != cut.schema_version or !std.mem.eql(u8, table.physical_name, entry.table_name) or (if (table.external_indexes) |indexes| indexes.object_generation else 0) != cut.object_generation) return error.SqlWriteConflict;
             const binding = (table.external_base_source orelse return error.SqlWriteConflict).binding;
-            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
+            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = (try self.server.lakeProviderTransport()).io, .requests = (try self.server.lakeProviderTransport()).requests, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
             var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load);
             defer current.deinit(scratch);
             if (!std.mem.eql(u8, current.table.metadata_location, cut.metadata_location) or !std.mem.eql(u8, current.table.metadata_json, cut.metadata_json) or try @import("../serverless/lake_ingestion.zig").watermark(scratch, binding, options, context) != cut.pending.lsn) return error.SqlWriteConflict;
@@ -1371,7 +1371,7 @@ pub const Adapter = struct {
         try self.server.prepareLakeCache();
         const normalized = try self.context.platformDeadline();
         var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve } };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = (try self.server.lakeProviderTransport()).io, .requests = (try self.server.lakeProviderTransport()).requests, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve } };
         var source = try @import("lake_published_navigation.zig").open(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
@@ -1381,7 +1381,7 @@ pub const Adapter = struct {
         owner.final_page = .init(a);
         var keep_owner = false;
         defer if (!keep_owner) owner.destroyControl();
-        owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
+        owner.store = @import("lake_index_store.zig").Store.openNativeWithTransport(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.server.lakeProviderTransport()) catch |err| {
             try context.ensureActive();
             if (err == error.OutOfMemory) return err;
             return null;
@@ -1481,7 +1481,7 @@ pub const Adapter = struct {
             const pending = self.pending orelse @import("../serverless/lake_ingestion.zig").Pending{ .lsn = base, .base_lsn = base, .key_fields = &.{} };
             const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             const expires = now + 60 * 60 * 1000;
-            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = adapter.server.cfg.node_config, .secret_store = adapter.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = adapter.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = self.table.id, .catalog_generation = if (self.table.external_indexes) |indexes| indexes.object_generation else 0 };
+            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = (try adapter.server.lakeProviderTransport()).io, .requests = (try adapter.server.lakeProviderTransport()).requests, .node_config = adapter.server.cfg.node_config, .secret_store = adapter.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = adapter.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = self.table.id, .catalog_generation = if (self.table.external_indexes) |indexes| indexes.object_generation else 0 };
             var opened = try @import("../serverless/lake_ingestion.zig").openQueue(a, binding, options);
             defer opened.deinit();
             const pins = @import("../serverless/lake_snapshot_pins.zig");
@@ -1545,7 +1545,7 @@ pub const Adapter = struct {
         defer held.deinit(self.server.alloc);
         if (held.version != table.id or held.document_json == null) return error.CatalogGenerationChanged;
         const token = try std.json.parseFromSliceLeaky([]const u8, a, held.document_json.?, .{ .allocate = .alloc_always });
-        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.server.lakeProviderTransport());
         defer store.deinit();
         var artifacts = store.artifactStore();
         const cut = try @import("lake_sql_retained_cut.zig").load(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
@@ -1556,7 +1556,7 @@ pub const Adapter = struct {
         const expiry_deadline = time.monotonicNs() +| (cut.expires_ms - wall_now) * std.time.ns_per_ms;
         normalized.deadline_ns = @min(normalized.deadline_ns orelse expiry_deadline, expiry_deadline);
         self.context = normalized;
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = (try self.server.lakeProviderTransport()).io, .requests = (try self.server.lakeProviderTransport()).requests, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .load);
         defer current.deinit(a);
         const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(a, current.table.metadata_json);
@@ -1573,7 +1573,7 @@ pub const Adapter = struct {
         const now = @import("antfly_platform").time.realtimeNs();
         if (cut.expires_ms <= now / std.time.ns_per_ms) return error.CatalogGenerationChanged;
         _ = try pin.acquireFor(a, cut.snapshot_id, now, (cut.expires_ms - now / std.time.ns_per_ms) * std.time.ns_per_ms);
-        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.server.lakeProviderTransport());
         defer store.deinit();
         try self.server.retainLakeQueryStore(a, &store, table.id, self.context);
         var artifacts = store.artifactStore();
@@ -1590,7 +1590,7 @@ pub const Adapter = struct {
         if (receipt.object_generation != generation) return error.ReadReceiptGenerationMismatch;
         const binding = table.external_base_source.?.binding;
         if (binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = table.id, .catalog_generation = generation };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = (try self.server.lakeProviderTransport()).io, .requests = (try self.server.lakeProviderTransport()).requests, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = table.id, .catalog_generation = generation };
         const normalized = try self.context.platformDeadline();
         const time = @import("antfly_platform").time;
         const wait_ms = self.read_requirements.wait_ms orelse 5000;
@@ -1682,7 +1682,7 @@ pub const Adapter = struct {
                 if (retained) |cut| if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, cut.object_generation, cut.pending.lsn, true);
                 const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
-                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = (try self.server.lakeProviderTransport()).io, .requests = (try self.server.lakeProviderTransport()).requests, .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .native_owner_resolver = .{ .ptr = self.server, .resolve = @import("lake_source_owner.zig").resolve }, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
                 source.* = try @import("lake_published_navigation.zig").open(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, self.context, null);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });

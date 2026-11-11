@@ -116,7 +116,45 @@ pub const Set = struct {
             }
         }
     }
+    /// Planning can allocate much more than the resulting mask. Keep that
+    /// work outside the receiver's retained arena while preserving its budget.
+    pub fn unionFromScratch(self: *Set, input: anytype, comptime build: anytype) !void {
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+        defer scratch.deinit();
+        var selected = try build(input, scratch.allocator());
+        defer selected.deinit();
+        try self.orWith(&selected);
+    }
 };
+
+test "external lake physical sets reclaim planner scratch across retained overlay partitions" {
+    var budget: local.sql_memory_budget = .{ .backing = std.testing.allocator, .limit = 256 * 1024 };
+    const Builder = struct {
+        row: usize = 0,
+        fn resolve(self: *@This(), a: A) !Set {
+            // Model a planner arena whose temporary allocations outlive its
+            // result until the enclosing batch finishes.
+            const temporary = try a.alloc(u8, 128 * 1024);
+            temporary[0] = @intCast(self.row);
+            var result = Set.init(a);
+            try result.addRow("file", 0, temporary[0]);
+            self.row += 1;
+            return result;
+        }
+    };
+    {
+        var retained = std.heap.ArenaAllocator.init(budget.allocator());
+        defer retained.deinit();
+        var result = Set.init(retained.allocator());
+        defer result.deinit();
+        var builder: Builder = .{};
+        for (0..256) |_| try result.unionFromScratch(&builder, Builder.resolve);
+        try std.testing.expectEqual(@as(usize, 256), result.boundedCardinality(256).?);
+        try std.testing.expect(result.contains("file", 0, 0));
+        try std.testing.expect(result.contains("file", 0, 255));
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
 
 test "external lake physical sets intersect and union across files groups and 64-bit row blocks" {
     const a = std.testing.allocator;
