@@ -4373,10 +4373,10 @@ const HostCaches = struct {
     silero_weights: SileroWeightCache = .{},
     silero_weights_lock: std.atomic.Mutex = .unlocked,
 
-    fn reclaim(raw: *anyopaque, target_bytes: usize) usize {
+    fn reclaim(raw: *anyopaque, target_bytes: usize, scratch_only: bool) usize {
         const self: *HostCaches = @ptrCast(@alignCast(raw));
         var freed = @import("../pipelines/media_index_cache.zig").Cache.reclaim(&self.media_index_cache, target_bytes);
-        if (freed < target_bytes and self.silero_weights_lock.tryLock()) {
+        if (!scratch_only and freed < target_bytes and self.silero_weights_lock.tryLock()) {
             defer self.silero_weights_lock.unlock();
             freed +|= self.silero_weights.reclaimIdle(self.allocator, target_bytes - freed);
         }

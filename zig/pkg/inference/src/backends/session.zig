@@ -1250,6 +1250,28 @@ pub const RunPermit = struct {
     request: ?RunRequest = null,
     execution_yielded: bool = false,
 
+    /// The scratch allocator owns the retained inputs and any escaping
+    /// allocations. Let it bind a replacement lease before dispatch.
+    pooled_execution: ?PooledExecution = null,
+
+    pub const PooledExecution = struct {
+        context: *anyopaque,
+        retained: *const fn (*anyopaque, ?*const memory.AdmissionLease) void,
+        replace: *const fn (*anyopaque, *RunPermit, RunRequest) anyerror!RunPermit,
+    };
+
+    fn refreshPooledExecution(self: *RunPermit) !void {
+        if (!self.execution_yielded) return;
+        const pooled = self.pooled_execution orelse return;
+        var replacement = try pooled.replace(pooled.context, self, try self.executionRequest());
+        replacement.pooled_execution = pooled;
+        self.* = replacement;
+    }
+
+    fn updatePooledCapacity(self: *RunPermit) void {
+        if (self.pooled_execution) |pooled| pooled.retained(pooled.context, if (self.lease) |*lease| lease else null);
+    }
+
     fn resolveGeometry(self: *RunPermit, inputs: []const Tensor) !void {
         const request = self.request orelse return;
         if (self.session.vtable.runGeometry == null and self.session.output_geometry == null and self.session.cached_decoder_geometry == null) return;
@@ -1280,15 +1302,20 @@ pub const RunPermit = struct {
         return true;
     }
 
-    fn acquireExecution(self: *RunPermit) !RunPermit {
+    fn executionRequest(self: *RunPermit) !RunRequest {
         var request = self.request.?;
         request.pre_admitted_host_bytes = try addBytes(request.input_bytes, request.host_preprocess_bytes);
-        return self.session.admit(request);
+        return request;
+    }
+
+    fn acquireExecution(self: *RunPermit) !RunPermit {
+        return self.session.admit(try self.executionRequest());
     }
 
     /// Drop transient forward scratch once only materialized outputs remain.
     pub fn retainOutputs(self: *RunPermit, outputs: []const Tensor) !void {
         if (self.lease) |*lease| try lease.retain(try retainedOutputAmounts(outputs, lease.amounts.host_kv_bytes > 0));
+        self.updatePooledCapacity();
     }
 
     pub fn run(
@@ -1310,6 +1337,7 @@ pub const RunPermit = struct {
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1344,6 +1372,7 @@ pub const RunPermit = struct {
         const run_decisions = self.session.vtable.runLayaDecisions orelse return null;
         if (self.session.vtable.hasLayaDecisions) |supported| if (!supported(self.session.ptr)) return null;
         try self.resolveGeometry(inputs);
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1381,6 +1410,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1424,6 +1454,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1481,6 +1512,7 @@ pub const RunPermit = struct {
             @field(extra_keep, name) = @field(needed, name) - @field(base_keep, name);
         }
         try base.retain(base_keep);
+        self.updatePooledCapacity();
         if (extra.lease) |*lease| try lease.retain(extra_keep);
         self.request = request;
     }
@@ -1491,6 +1523,7 @@ pub const RunPermit = struct {
             const admission = self.session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
             try lease.retain(try admission.estimateRequest(request, self.session.outputInfo()));
         }
+        self.updatePooledCapacity();
         self.request = request;
     }
 
@@ -1499,6 +1532,7 @@ pub const RunPermit = struct {
     /// request carrying the same `pre_admitted_host_bytes` credit.
     pub fn retainHostBytes(self: *RunPermit, bytes: usize) !void {
         if (self.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = bytes });
+        self.updatePooledCapacity();
     }
 
     pub fn runResidentTextEmbeddingWithControl(
@@ -1508,6 +1542,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();

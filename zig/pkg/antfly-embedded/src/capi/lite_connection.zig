@@ -1319,6 +1319,7 @@ pub const Owner = struct {
                 i += 1;
             } else {
                 _ = self.retired.swapRemove(i);
+                _ = transferCacheRetirement(retired, self.current);
                 h.closeHandle(retired);
             }
         }
@@ -2477,6 +2478,42 @@ pub const Owner = struct {
         }
     }
 
+    /// A new wrapper also gets a fresh resource manager. Preserve pressure
+    /// for a still-serving inode when its previous generation drains.
+    fn transferCacheRetirement(previous: *h.Handle, current: ?*h.Handle) bool {
+        const replacement = current orelse return false;
+        const old_file = &previous.owned_lite_backend.?.native_docstore.?.file;
+        if (!old_file.wantsFileCacheRetirement()) return false;
+        const current_file = &replacement.owned_lite_backend.?.native_docstore.?.file;
+        const old_stat = old_file.file.stat(old_file.runtime()) catch return false;
+        const current_stat = current_file.file.stat(current_file.runtime()) catch return false;
+        if (old_stat.inode != current_stat.inode) return false;
+        current_file.inherited_cache_pressure = true;
+        return true;
+    }
+
+    fn retireFileCacheOnClose(raw: *anyopaque, file: *native.NativeFile) void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        defer self.gate.mutex.unlock(io);
+        if (self.gate.owners.items.len != 0) return;
+        var lease = self.tryWriterLeaseAssumeLocked() catch return;
+        defer lease.close();
+        file.discardRetiredFileCache();
+    }
+
+    fn closeTerminalRoot(self: *Owner, root: *h.Handle, transfer_to: ?*h.Handle) void {
+        if (h.liteOpenModeCanWrite(self.options.open_mode) and !transferCacheRetirement(root, transfer_to)) {
+            const file = &root.owned_lite_backend.?.native_docstore.?.file;
+            // Run after DB and inference teardown, with the original inode
+            // still open. Never hold the path lease while joining workers.
+            file.external_cache_retirement = .{ .context = self, .retire = retireFileCacheOnClose };
+        }
+        root.lease_snapshot = true;
+        h.closeHandle(root);
+    }
+
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
         self.certifyAllocatorOnClose() catch |err| {
@@ -2487,11 +2524,8 @@ pub const Owner = struct {
         self.artifact_marker_sweep.deinit(h.handleLockIo());
         if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
         if (self.embedding_memo) |*memo| memo.deinit(&self.embedding_memo_budget);
-        for (self.retired.items) |retired| h.closeHandle(retired);
-        if (self.current) |current| {
-            current.lease_snapshot = true;
-            h.closeHandle(current);
-        }
+        for (self.retired.items) |retired| self.closeTerminalRoot(retired, self.current);
+        if (self.current) |current| self.closeTerminalRoot(current, null);
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
         self.deinitMaintenanceSchedules();
@@ -5541,5 +5575,47 @@ test "capi native recovery agenda repeated compaction invalidates a clean metada
         try @import("sql_ddl.zig").recover(refreshed);
         try std.testing.expect(refreshed.sql_ddl_recovery_needed);
         try std.testing.expectError(error.SqlStatementReadUnavailable, @import("sql_ddl.zig").requireRecovered(refreshed, &refreshed.db, "default"));
+    }
+}
+
+test "capi native memory retires pressured source cache only when exclusive" {
+    if (h.builtin.os.tag != .linux or h.builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("retire-source-cache");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const Probe = struct {
+        calls: usize = 0,
+        fn discard(context: ?*anyopaque, _: i32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{};
+    for (0..3) |phase| {
+        const wrapper = try open(path, .{ .profile = .native }, phase == 0);
+        const id = try api.publishHandle(wrapper);
+        var open_id = true;
+        defer if (open_id) api.antfly_db_close(id);
+        const owner = wrapper.lite_connection.?.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+        store.mutex.lock();
+        store.file.cache_advice.discard_file = Probe.discard;
+        store.file.cache_advice.context = &probe;
+        const manager = store.resource_manager.?;
+        store.mutex.unlock();
+        if (phase != 1) _ = manager.reclaimHostMemory(1);
+        var reader = if (phase == 2) try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true }) else null;
+        defer if (reader) |*file| file.close();
+        api.antfly_db_close(id);
+        open_id = false;
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
     }
 }

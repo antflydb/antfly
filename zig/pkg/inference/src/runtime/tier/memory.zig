@@ -805,6 +805,12 @@ pub const AdmissionPressure = union(enum) {
     live_host,
 };
 
+pub const AdmissionFailure = struct {
+    pressure: ?AdmissionPressure = null,
+    logical_deficit_bytes: ?usize = null,
+    live_requested_bytes: usize = 0,
+};
+
 const backend_class_count = 2;
 
 fn backendClassIndex(backend_class: BackendClass) usize {
@@ -818,6 +824,34 @@ fn emptyAdmissionAmountsByBackend() [backend_class_count]AdmissionAmounts {
 /// A lease's unmaterialized promise is separate from allocator-owned pages.
 /// The owner is stable across tensor aliases, worker frees and output escape.
 /// Once the lease settles, late buffer destruction never touches its controller.
+// Only pooled allocations need stable credit records. Capacity reduction
+// clips the newest records first and visits only records whose credit is lost.
+pub const PooledHostCredit = struct {
+    prev: ?*PooledHostCredit = null,
+    next: ?*PooledHostCredit = null,
+    bytes: usize = 0,
+    allocated: bool = false,
+
+    fn unlink(self: *@This(), owner: *HostMaterialization) void {
+        if (self.prev) |prev| prev.next = self.next else owner.newest_credit = self.next;
+        if (self.next) |next| next.prev = self.prev;
+        self.prev = null;
+        self.next = null;
+    }
+
+    fn link(self: *@This(), owner: *HostMaterialization) void {
+        self.next = owner.newest_credit;
+        if (self.next) |next| next.prev = self;
+        owner.newest_credit = self;
+    }
+
+    fn set(self: *@This(), owner: *HostMaterialization, bytes: usize) void {
+        if (self.bytes == 0 and bytes != 0) self.link(owner);
+        if (self.bytes != 0 and bytes == 0) self.unlink(owner);
+        self.bytes = bytes;
+    }
+};
+
 const HostMaterialization = struct {
     mutex: std.atomic.Mutex = .unlocked,
     references: std.atomic.Value(usize) = .init(1),
@@ -828,7 +862,7 @@ const HostMaterialization = struct {
     active: bool = true,
     pooled: bool = false,
     reduction_generation: u64 = 0,
-    clipping_generation: u64 = 0,
+    newest_credit: ?*PooledHostCredit = null,
     materializing: usize = 0,
     threadlocal var current: ?*HostMaterialization = null;
 
@@ -847,7 +881,7 @@ const HostMaterialization = struct {
         if (pending > self.pending) self.controller.live_pending_bytes += pending - self.pending else self.controller.live_pending_bytes -= self.pending - pending;
         self.pending = pending;
     }
-    fn materialize(self: *@This(), bytes: []u8, initialized: bool) MaterializedHostAllocation {
+    fn materialize(self: *@This(), bytes: []u8, initialized: bool, storage: ?*PooledHostCredit) MaterializedHostAllocation {
         spinLockAdmission(&self.mutex);
         if (!self.active or self.capacity == 0 or bytes.len == 0) {
             self.mutex.unlock();
@@ -858,6 +892,14 @@ const HostMaterialization = struct {
             self.mutex.unlock();
             return .{};
         }
+        const credit = if (self.pooled) storage orelse blk: {
+            const record = platform.allocator.concurrentFallback().create(PooledHostCredit) catch {
+                self.mutex.unlock();
+                return .{};
+            };
+            record.* = .{ .allocated = true };
+            break :blk record;
+        } else null;
         if (self.pooled) self.materializing += creditable;
         const generation = self.reduction_generation;
         self.retain();
@@ -879,38 +921,37 @@ const HostMaterialization = struct {
         if (self.pooled) self.materializing -= creditable;
         if (!self.active or generation != self.reduction_generation) {
             self.mutex.unlock();
+            if (storage == null) if (credit) |record| platform.allocator.concurrentFallback().destroy(record);
             self.release();
             return .{};
         }
         const credited = if (self.pooled) @min(creditable, self.pending) else creditable;
         self.resident += credited;
         self.update();
-        const clipping_generation = self.clipping_generation;
+        if (credit) |record| {
+            if (storage != null) record.* = .{};
+            record.set(self, credited);
+        }
         self.mutex.unlock();
         if (credited == 0) {
+            if (storage == null) if (credit) |record| platform.allocator.concurrentFallback().destroy(record);
             self.release();
             return .{};
         }
-        return .{ .owner = self, .bytes = credited, .clipping_generation = clipping_generation };
+        return .{ .owner = self, .bytes = if (credit != null) bytes.len else credited, .pooled_credit = credit };
     }
     fn reduceCapacity(self: *@This(), bytes: usize) void {
         self.capacity -= bytes;
         if (self.pooled and bytes != 0) {
-            if (self.resident > self.capacity) {
-                self.resident = self.capacity;
-                self.clipping_generation +%= 1;
+            while (self.resident > self.capacity) {
+                const credit = self.newest_credit.?;
+                const clipped = @min(credit.bytes, self.resident - self.capacity);
+                credit.set(self, credit.bytes - clipped);
+                self.resident -= clipped;
             }
             self.reduction_generation +%= 1;
         }
         self.update();
-    }
-    fn uncredit(self: *@This(), bytes: usize) usize {
-        // A pool reduction may already have retired part of this credit.
-        if (!self.pooled) std.debug.assert(bytes <= self.resident);
-        const removed = @min(self.resident, bytes);
-        self.resident -= removed;
-        self.update();
-        return removed;
     }
     fn finish(self: *@This()) usize {
         spinLockAdmission(&self.mutex);
@@ -947,9 +988,15 @@ pub const HostMaterializationPool = struct {
         lease.host_materialization = owner;
     }
 
-    pub fn materialize(self: *@This(), bytes: []u8) MaterializedHostAllocation {
-        const owner = self.owner orelse return .{};
-        return owner.materialize(bytes, false);
+    pub fn materialize(self: *@This(), bytes: []u8, storage: ?*PooledHostCredit) MaterializedHostAllocation {
+        // A nested execution may have its own lease. One backing allocation
+        // must retire a promise in that execution or in this pool exactly once.
+        const owner = HostMaterialization.current orelse self.owner orelse return .{};
+        return owner.materialize(bytes, false, storage);
+    }
+
+    pub fn hasMaterializationOwner(self: *@This()) bool {
+        return HostMaterialization.current != null or self.owner != null;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -967,12 +1014,23 @@ pub const HostMaterializationPool = struct {
 pub const MaterializedHostAllocation = struct {
     owner: ?*HostMaterialization = null,
     bytes: usize = 0,
-    clipping_generation: u64 = 0,
+    pooled_credit: ?*PooledHostCredit = null,
     pub const Shrink = struct {
         bytes: usize = 0,
         credit: usize = 0,
         reduction_generation: u64 = 0,
     };
+
+    fn removeCredit(self: *@This(), owner: *HostMaterialization, bytes: usize) usize {
+        const removed = if (self.pooled_credit) |credit| blk: {
+            const removed = @min(bytes, credit.bytes);
+            credit.set(owner, credit.bytes - removed);
+            break :blk removed;
+        } else bytes;
+        owner.resident -= removed;
+        owner.update();
+        return removed;
+    }
 
     pub fn prepareShrink(self: *@This(), bytes: usize) Shrink {
         const count = @min(bytes, self.bytes);
@@ -981,7 +1039,7 @@ pub const MaterializedHostAllocation = struct {
         spinLockAdmission(&owner.mutex);
         const shrink: Shrink = .{
             .bytes = count,
-            .credit = if (owner.active) owner.uncredit(count) else 0,
+            .credit = if (owner.active) self.removeCredit(owner, if (self.pooled_credit) |credit| credit.bytes -| (self.bytes - count) else count) else 0,
             .reduction_generation = owner.reduction_generation,
         };
         owner.mutex.unlock();
@@ -992,12 +1050,13 @@ pub const MaterializedHostAllocation = struct {
         if (shrink.bytes == 0) return;
         const owner = self.owner orelse return;
         spinLockAdmission(&owner.mutex);
-        // A pool reduction may retire this token's credit or consume the
-        // returned promise while backing resize is in flight.
-        if (owner.active and self.clipping_generation == owner.clipping_generation and
-            owner.reduction_generation == shrink.reduction_generation)
-        {
-            owner.resident += if (owner.pooled) @min(shrink.credit, owner.pending -| owner.materializing) else shrink.credit;
+        if (owner.active and owner.reduction_generation == shrink.reduction_generation) {
+            const restored = if (self.pooled_credit) |credit| blk: {
+                const restored = @min(shrink.credit, owner.pending -| owner.materializing);
+                credit.set(owner, credit.bytes + restored);
+                break :blk restored;
+            } else shrink.credit;
+            owner.resident += restored;
             owner.update();
         }
         owner.mutex.unlock();
@@ -1007,8 +1066,9 @@ pub const MaterializedHostAllocation = struct {
     pub fn release(self: *@This()) void {
         const owner = self.owner orelse return;
         spinLockAdmission(&owner.mutex);
-        if (owner.active) _ = owner.uncredit(self.bytes);
+        if (owner.active) _ = self.removeCredit(owner, self.bytes);
         owner.mutex.unlock();
+        if (self.pooled_credit) |credit| if (credit.allocated) platform.allocator.concurrentFallback().destroy(credit);
         owner.release();
         self.* = .{};
     }
@@ -1022,7 +1082,7 @@ pub fn hostExecutionActive() bool {
 
 pub fn materializeHostAllocation(bytes: []u8) MaterializedHostAllocation {
     const owner = HostMaterialization.current orelse return .{};
-    return owner.materialize(bytes, true);
+    return owner.materialize(bytes, true, null);
 }
 
 /// Stable transparent backing for execution-owned host allocations. Each
@@ -1033,7 +1093,7 @@ pub fn materializeHostAllocation(bytes: []u8) MaterializedHostAllocation {
 /// No process probe or estimate-sized preallocation is needed.
 pub fn materializeUninitializedHostAllocation(bytes: []u8) MaterializedHostAllocation {
     const owner = HostMaterialization.current orelse return .{};
-    return owner.materialize(bytes, false);
+    return owner.materialize(bytes, false, null);
 }
 
 pub const HostAllocationScope = struct {
@@ -1137,7 +1197,7 @@ pub const HostAllocator = struct {
         spinLockAdmission(&self.mutex);
         const known = self.allocations.get(@intFromPtr(bytes.ptr));
         var token = known orelse MaterializedHostAllocation{};
-        if (len > bytes.len and token.owner != null and token.owner != HostMaterialization.current) {
+        if (len > bytes.len and token.owner != null and (token.pooled_credit != null or token.owner != HostMaterialization.current)) {
             self.mutex.unlock();
             return null;
         }
@@ -1158,7 +1218,7 @@ pub const HostAllocator = struct {
             token.rollbackShrink(reduction);
             spinLockAdmission(&self.mutex);
             self.pending_changes -= 1;
-            if (known) |original| self.allocations.putAssumeCapacity(@intFromPtr(bytes.ptr), original);
+            if (known != null) self.allocations.putAssumeCapacity(@intFromPtr(bytes.ptr), token);
             self.mutex.unlock();
             return null;
         };
@@ -1479,10 +1539,26 @@ pub const AdmissionController = struct {
         return false;
     }
 
-    /// Borrow the process owner's reclamation capability without holding an
-    /// admission lock across storage callbacks. The lifetime survives a
-    /// concurrent capability reconfiguration; progress never grants bytes.
+    pub fn hostReclamationTarget(self: *AdmissionController, incremental_bytes: usize) ?usize {
+        spinLockAdmission(&self.live_mutex);
+        // Only pending promises are shared. The failed operation supplies its
+        // own demand, so another admission cannot erase or replace it.
+        const required = self.live_pending_bytes +| incremental_bytes;
+        self.live_mutex.unlock();
+        return if (builtin.is_test and self.test_reclamation_target != null)
+            self.test_reclamation_target.?(required)
+        else
+            liveReclamationTargetForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance, required);
+    }
+
     pub fn reclaimHostCapacity(self: *AdmissionController, incremental_bytes: usize) usize {
+        const target = self.hostReclamationTarget(incremental_bytes) orelse return 0;
+        return self.reclaimHostDeficit(target);
+    }
+
+    /// Keep the process owner's capability alive across storage callbacks.
+    /// No admission lock is held during reclamation.
+    pub fn reclaimHostDeficit(self: *AdmissionController, target: usize) usize {
         spinLockAdmission(&self.mutex);
         const budget = self.resource_budget orelse {
             self.mutex.unlock();
@@ -1496,16 +1572,6 @@ pub const AdmissionController = struct {
         self.mutex.unlock();
         if (!retained) return 0;
         defer budget.releaseContext();
-        spinLockAdmission(&self.live_mutex);
-        // Only pending promises are shared. The failed operation supplies its
-        // own demand, so another admission cannot erase or replace it.
-        const required = self.live_pending_bytes +| incremental_bytes;
-        self.live_mutex.unlock();
-        const target = (if (builtin.is_test and self.test_reclamation_target != null)
-            self.test_reclamation_target.?(required)
-        else
-            liveReclamationTargetForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance, required)) orelse return 0;
-        // Retry against a fresh sample even when pressure has already cleared.
         if (target == 0) return 1;
         // Always resample once after an owner pass. An owner may free buffers
         // conservatively omitted from its physical count, or another request
@@ -1595,7 +1661,18 @@ pub const AdmissionController = struct {
         check_live_memory: bool,
         pressure: *?AdmissionPressure,
     ) !AdmissionLease {
-        pressure.* = null;
+        var failure: AdmissionFailure = .{};
+        defer pressure.* = failure.pressure;
+        return self.tryAcquireRequestsWithFailure(requests, check_live_memory, &failure);
+    }
+
+    pub fn tryAcquireRequestsWithFailure(
+        self: *AdmissionController,
+        requests: []const AdmissionRequest,
+        check_live_memory: bool,
+        failure: *AdmissionFailure,
+    ) !AdmissionLease {
+        failure.* = .{};
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
         var limits_by_backend = [_]Limits{ .{}, .{} };
         var active_backends = [_]bool{ false, false };
@@ -1654,8 +1731,8 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             const next_shared_kv = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
             const next_shared_scratch = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
-            try checkAdmissionLimitWithPressure(request_kv, next_shared_kv, self.shared_limits.kv_limit_bytes, .shared_kv, pressure);
-            try checkAdmissionLimitWithPressure(request_scratch, next_shared_scratch, self.shared_limits.scratch_limit_bytes, .shared_scratch, pressure);
+            try checkAdmissionLimitWithPressure(request_kv, next_shared_kv, self.shared_limits.kv_limit_bytes, .shared_kv, failure);
+            try checkAdmissionLimitWithPressure(request_scratch, next_shared_scratch, self.shared_limits.scratch_limit_bytes, .shared_scratch, failure);
 
             // CPU work and CUDA staging/cache allocations consume the same host
             // RAM. Enforce that physical domain before backend-local policies so
@@ -1665,7 +1742,7 @@ pub const AdmissionController = struct {
                 next_global_host,
                 self.shared_limits.host_limit_bytes,
                 .shared_host,
-                pressure,
+                failure,
             );
             if (self.shared_limits.unified_limit_bytes != 0) {
                 try checkAdmissionLimitWithPressure(
@@ -1677,7 +1754,7 @@ pub const AdmissionController = struct {
                     ) catch return error.ResourceLimitExceeded,
                     self.shared_limits.unified_limit_bytes,
                     .shared_unified,
-                    pressure,
+                    failure,
                 );
             }
 
@@ -1718,35 +1795,35 @@ pub const AdmissionController = struct {
                     next_host,
                     limits.host_limit_bytes,
                     .{ .domain_host = backend_class },
-                    pressure,
+                    failure,
                 );
                 try checkAdmissionLimitWithPressure(
                     domain_request_backend,
                     next_backend,
                     limits.backend_limit_bytes,
                     .{ .domain_backend = backend_class },
-                    pressure,
+                    failure,
                 );
                 try checkAdmissionLimitWithPressure(
                     domain_request_combined,
                     next_combined,
                     limits.combined_limit_bytes,
                     .{ .domain_combined = backend_class },
-                    pressure,
+                    failure,
                 );
                 try checkAdmissionLimitWithPressure(
                     domain_request_kv,
                     next_kv,
                     limits.kv_limit_bytes,
                     .{ .domain_kv = backend_class },
-                    pressure,
+                    failure,
                 );
                 try checkAdmissionLimitWithPressure(
                     domain_request_scratch,
                     next_scratch,
                     limits.scratch_limit_bytes,
                     .{ .domain_scratch = backend_class },
-                    pressure,
+                    failure,
                 );
                 next_by_backend[index] = domain_next;
             }
@@ -1758,7 +1835,7 @@ pub const AdmissionController = struct {
         if (self.resource_budget) |resource_budget| {
             const token = resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
                 if (err == error.ResourceTemporarilyUnavailable)
-                    pressure.* = .external_budget;
+                    failure.pressure = .external_budget;
                 self.releaseLocal(amounts_by_backend, amounts);
                 return err;
             };
@@ -1780,8 +1857,10 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             };
             live_reserved_bytes = self.tryReserveLiveCapacity(live_host_incremental) catch |err| {
-                if (err == error.ResourceTemporarilyUnavailable)
-                    pressure.* = .live_host;
+                if (err == error.ResourceTemporarilyUnavailable) {
+                    failure.pressure = .live_host;
+                    failure.live_requested_bytes = live_host_incremental;
+                }
                 self.release(amounts_by_backend, amounts, external_lease);
                 return err;
             };
@@ -2102,11 +2181,13 @@ fn checkAdmissionLimitWithPressure(
     next: usize,
     limit: usize,
     rejected_pressure: AdmissionPressure,
-    pressure: *?AdmissionPressure,
+    failure: *AdmissionFailure,
 ) !void {
     checkAdmissionLimit(request, next, limit) catch |err| {
-        if (err == error.ResourceTemporarilyUnavailable)
-            pressure.* = rejected_pressure;
+        if (err == error.ResourceTemporarilyUnavailable) {
+            failure.pressure = rejected_pressure;
+            failure.logical_deficit_bytes = next - limit;
+        }
         return err;
     };
 }
@@ -5886,7 +5967,7 @@ test "memory pooled scratch preserves new promises after earlier excess residenc
 
     const first = try std.testing.allocator.alloc(u8, 128 * 1024);
     defer std.testing.allocator.free(first);
-    var first_token = pool.materialize(first);
+    var first_token = pool.materialize(first, null);
     defer first_token.release();
     try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
     var overflow = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 * 1024 }, false);
@@ -5903,7 +5984,7 @@ test "memory pooled scratch preserves new promises after earlier excess residenc
 
     const second = try std.testing.allocator.alloc(u8, overflow.live_reserved_bytes);
     defer std.testing.allocator.free(second);
-    var second_token = pool.materialize(second);
+    var second_token = pool.materialize(second, null);
     defer second_token.release();
     try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
 
@@ -5918,4 +5999,34 @@ test "memory pooled scratch preserves new promises after earlier excess residenc
     const clipped_shrink = first_token.prepareShrink(first.len);
     first_token.rollbackShrink(clipped_shrink);
     try std.testing.expect(controller.live_pending_bytes >= more.live_reserved_bytes);
+}
+
+test "memory clipped buffer does not debit newer buffer" {
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    var pool: HostMaterializationPool = .{};
+    defer pool.deinit();
+    var first = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer first.release();
+    first.live_reserved_bytes = 65536;
+    controller.live_pending_bytes = 65536;
+    try pool.adopt(&first);
+    const first_bytes = try std.testing.allocator.alloc(u8, 65536);
+    defer std.testing.allocator.free(first_bytes);
+    var first_token = pool.materialize(first_bytes, null);
+    defer first_token.release();
+    try first.reduce(.{});
+
+    var next = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer next.release();
+    next.live_reserved_bytes = 65536;
+    controller.live_pending_bytes += 65536;
+    try pool.adopt(&next);
+    const next_bytes = try std.testing.allocator.alloc(u8, 65536);
+    defer std.testing.allocator.free(next_bytes);
+    var next_token = pool.materialize(next_bytes, null);
+    defer next_token.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    first_token.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
 }

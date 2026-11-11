@@ -110,6 +110,51 @@ test "lite native cache advice streams synced snapshot windows before publicatio
     try std.testing.expectEqualSlices(u8, payload, value);
 }
 
+test "lite native cache advice keeps a single publication sync with Linux range writeback" {
+    if (comptime builtin.os.tag != .linux or @bitSizeOf(usize) != 64 or !@hasField(std.os.linux.SYS, "sync_file_range")) return error.SkipZigTest;
+    const Probe = struct {
+        threadlocal var syncs: usize = 0;
+
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            // Publication also syncs the parent directory after rename.
+            const io = std.Io{ .userdata = userdata, .vtable = std.testing.io.vtable };
+            if ((file.stat(io) catch unreachable).kind == .file) syncs += 1;
+            return io.vtable.fileSync(userdata, file);
+        }
+    };
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const io = std.testing.io;
+    const path = try testPath(a, dir, "native-window-source.aflite");
+    defer a.free(path);
+    const snapshot = try testPath(a, dir, "native-window-snapshot.aflite");
+    defer a.free(snapshot);
+    var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true, .indexed_reclamation = false, .cache_advice = .native() });
+    defer file.close();
+    const payload = try a.alloc(u8, file_cache.bulk_window_bytes + default_page_size);
+    defer a.free(payload);
+    @memset(payload, 'a');
+    try file.putDocument("bulk", payload);
+
+    // Range writeback may be unavailable under a restricted syscall policy.
+    const status = std.os.linux.syscall4(.sync_file_range, @intCast(file.file.handle), 0, default_page_size, 7);
+    if (std.os.linux.errno(status) != .SUCCESS) return error.SkipZigTest;
+    var table = io.vtable.*;
+    table.fileSync = Probe.sync;
+    Probe.syncs = 0;
+    file.borrowed_io = .{ .userdata = io.userdata, .vtable = &table };
+    defer file.borrowed_io = io;
+    _ = try file.copyStableSnapshotToPath(snapshot, false);
+    try std.testing.expectEqual(@as(usize, 1), Probe.syncs);
+
+    var reader = try NativeFile.openWithIo(a, io, snapshot, .{ .read_only = true, .internal_reader = true });
+    defer reader.close();
+    const value = (try reader.getDocumentAlloc(a, "bulk")).?;
+    defer a.free(value);
+    try std.testing.expectEqualSlices(u8, payload, value);
+}
+
 test "lite native cache advice never pins an unlinked owner inode" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -4894,6 +4939,11 @@ pub const NativeFile = struct {
     cache_advice: file_cache.Advice = .{},
     cache_retirement: file_cache.Retirement = .on_pressure,
     cache_pressure_epoch: u64 = 0,
+    inherited_cache_pressure: bool = false,
+    external_cache_retirement: ?struct {
+        context: *anyopaque,
+        retire: *const fn (*anyopaque, *NativeFile) void,
+    } = null,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
@@ -5243,28 +5293,42 @@ pub const NativeFile = struct {
         self.transaction_writes = null;
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
-        const retire_cache = switch (self.cache_retirement) {
-            .discard => true,
-            .retain => false,
-            .on_pressure => if (self.pageCache().resource_manager) |manager|
-                manager.file_cache_pressure_epoch.load(.monotonic) != self.cache_pressure_epoch
-            else
-                false,
-        };
+        if (self.writer_lock_file != null) {
+            self.discardRetiredFileCache();
+        } else if (self.external_cache_retirement) |owner| {
+            if (self.wantsFileCacheRetirement()) owner.retire(owner.context, self);
+        }
         self.pageCache().deinit(self.allocator);
         if (self.managed_page_cache) |cache| self.allocator.destroy(cache);
         self.managed_page_cache = null;
         self.invalidateLedger();
-        // Terminal advice traverses the kernel's cached-page index rather
-        // than scanning logical offsets. It runs only under this owner's lease.
-        if (self.discard_file_cache_on_close and retire_cache and !self.read_only and self.writer_lock_file != null) {
-            self.cache_advice.discardFile(io, self.file);
-        }
         if (self.writer_lock_file) |lock_file| lock_file.close(io);
         self.file.close(io);
         self.allocator.free(self.path);
         if (self.borrowed_io == null) self.io_impl.deinit();
         self.* = undefined;
+    }
+
+    pub fn wantsFileCacheRetirement(self: *NativeFile) bool {
+        if (!self.discard_file_cache_on_close or self.cache_advice.discard_file == null) return false;
+        return switch (self.cache_retirement) {
+            .discard => true,
+            .retain => false,
+            .on_pressure => self.inherited_cache_pressure or if (self.pageCache().resource_manager) |manager|
+                manager.file_cache_pressure_epoch.load(.monotonic) != self.cache_pressure_epoch
+            else
+                false,
+        };
+    }
+
+    /// The caller holds the writer path lease and has drained this generation.
+    /// A separate inode lock excludes readers, including other processes.
+    pub fn discardRetiredFileCache(self: *NativeFile) void {
+        if (!self.wantsFileCacheRetirement()) return;
+        const io = self.runtimeIo();
+        if (!(self.file.tryLock(io, .exclusive) catch false)) return;
+        defer self.file.unlock(io);
+        self.cache_advice.discardFile(io, self.file);
     }
 
     pub fn usesBorrowedIo(self: *const NativeFile) bool {
@@ -10405,7 +10469,7 @@ pub const NativeFile = struct {
                 // Bound buffered output residency during large snapshots;
                 // waiting until publication can fill a small cgroup first.
                 if (self.cache_advice.discard_range != null and offset - advised >= file_cache.bulk_window_bytes) {
-                    try out_file.sync(io);
+                    try self.cache_advice.writebackRange(io, out_file, advised, offset - advised);
                     self.cache_advice.discardRange(io, out_file, advised, offset - advised);
                     advised = offset;
                 }

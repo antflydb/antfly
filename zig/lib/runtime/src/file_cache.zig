@@ -55,6 +55,31 @@ pub const Advice = extern struct {
         callback(self.context, file.handle);
     }
 
+    /// Make a bounded output window reclaimable before final publication.
+    /// Native Linux can wait for data writeback without a durability barrier.
+    /// Opaque producers and unsupported kernels use their usual I/O sync.
+    pub fn writebackRange(self: Advice, io: std.Io, file: std.Io.File, offset: u64, len: u64) !void {
+        if (comptime builtin.os.tag == .linux and @bitSizeOf(usize) == 64 and @hasField(std.os.linux.SYS, "sync_file_range")) {
+            if (self.discard_range == &discardNative and offset +| len <= std.math.maxInt(i64)) {
+                const wait_before = 1;
+                const write = 2;
+                const wait_after = 4;
+                while (true) {
+                    try io.checkCancel();
+                    const result = std.os.linux.syscall4(.sync_file_range, @intCast(file.handle), offset, len, wait_before | write | wait_after);
+                    switch (std.os.linux.errno(result)) {
+                        .SUCCESS => return,
+                        .INTR => continue,
+                        .IO => return error.InputOutput,
+                        .NOSPC => return error.NoSpaceLeft,
+                        else => break,
+                    }
+                }
+            }
+        }
+        try file.sync(io);
+    }
+
     /// Bulk producers call this after syncing each output window. Offsets are
     /// file offsets, not a promise of physical bytes released by the kernel.
     pub fn discardRange(self: Advice, io: std.Io, file: std.Io.File, start: u64, bytes: u64) void {
