@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -166,6 +167,45 @@ func newMigrateFakeGCSBucket(t *testing.T) (*httptest.Server, *migrateFakeGCSBuc
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bucket.mu.Lock()
 		defer bucket.mu.Unlock()
+		if r.Method == http.MethodPost && r.URL.Path == "/batch/storage/v1" {
+			_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil {
+				http.Error(w, "bad batch", 400)
+				return
+			}
+			parts := multipart.NewReader(r.Body, params["boundary"])
+			w.Header().Set("Content-Type", "multipart/mixed; boundary=fixture")
+			for i := 0; ; i++ {
+				part, err := parts.NextPart()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				request, err := http.ReadRequest(bufio.NewReader(part))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				key := strings.SplitN(request.URL.Path, "/o/", 2)
+				if len(key) != 2 {
+					t.Error("missing object key")
+					return
+				}
+				generation := bucket.generations[key[1]]
+				payload := fmt.Sprintf(`{"generation":"%d"}`, generation)
+				status := "200 OK"
+				if generation == 0 {
+					status = "404 Not Found"
+					payload = "{}"
+				}
+				fmt.Fprintf(w, "--fixture\r\nContent-Type: application/http\r\nContent-ID: <response-%d>\r\n\r\nHTTP/1.1 %s\r\nContent-Length: %d\r\n\r\n%s\r\n", i, status, len(payload), payload)
+			}
+			fmt.Fprint(w, "--fixture--\r\n")
+			return
+		}
 		if r.Method == http.MethodPost {
 			bucket.puts++
 			_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
