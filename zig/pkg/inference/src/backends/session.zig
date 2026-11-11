@@ -793,6 +793,8 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
+        var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = try self.vtable.run(self.ptr, inputs, allocator);
         errdefer deinitTensorSlice(outputs, allocator);
         return attachOutputAdmission(outputs, allocator, &resource_lease);
@@ -813,6 +815,8 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
+        var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+        defer host_execution.deinit();
         active.check() catch |err| {
             if (resource_lease) |*lease| lease.release();
             resource_lease = null;
@@ -838,6 +842,8 @@ pub const Session = struct {
         else
             null;
         errdefer if (lease) |*l| l.release();
+        var host_execution = try memory.HostExecutionScope.begin(if (lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = (try run_decisions(self.ptr, inputs, allocator, control)) orelse {
             if (lease) |*l| l.release();
             return null;
@@ -1199,6 +1205,8 @@ pub const Session = struct {
             else
                 null;
             errdefer if (resource_lease) |*lease| lease.release();
+            var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+            defer host_execution.deinit();
             var outputs = (try run_resident(self.ptr, inputs, allocator)) orelse {
                 if (resource_lease) |*lease| lease.release();
                 return null;
@@ -1217,6 +1225,8 @@ pub const Session = struct {
             else
                 null;
             errdefer if (resource_lease) |*lease| lease.release();
+            var host_execution = try memory.HostExecutionScope.begin(if (resource_lease) |*held| held else null);
+            defer host_execution.deinit();
             var outputs = (try run_resident_inputs(self.ptr, inputs, allocator)) orelse {
                 if (resource_lease) |*lease| lease.release();
                 return null;
@@ -1239,6 +1249,28 @@ pub const RunPermit = struct {
     lease: ?memory.AdmissionLease,
     request: ?RunRequest = null,
     execution_yielded: bool = false,
+
+    /// The scratch allocator owns the retained inputs and any escaping
+    /// allocations. Let it bind a replacement lease before dispatch.
+    pooled_execution: ?PooledExecution = null,
+
+    pub const PooledExecution = struct {
+        context: *anyopaque,
+        retained: *const fn (*anyopaque, ?*const memory.AdmissionLease) void,
+        replace: *const fn (*anyopaque, *RunPermit, RunRequest) anyerror!RunPermit,
+    };
+
+    fn refreshPooledExecution(self: *RunPermit) !void {
+        if (!self.execution_yielded) return;
+        const pooled = self.pooled_execution orelse return;
+        var replacement = try pooled.replace(pooled.context, self, try self.executionRequest());
+        replacement.pooled_execution = pooled;
+        self.* = replacement;
+    }
+
+    fn updatePooledCapacity(self: *RunPermit) void {
+        if (self.pooled_execution) |pooled| pooled.retained(pooled.context, if (self.lease) |*lease| lease else null);
+    }
 
     fn resolveGeometry(self: *RunPermit, inputs: []const Tensor) !void {
         const request = self.request orelse return;
@@ -1270,15 +1302,20 @@ pub const RunPermit = struct {
         return true;
     }
 
-    fn acquireExecution(self: *RunPermit) !RunPermit {
+    fn executionRequest(self: *RunPermit) !RunRequest {
         var request = self.request.?;
         request.pre_admitted_host_bytes = try addBytes(request.input_bytes, request.host_preprocess_bytes);
-        return self.session.admit(request);
+        return request;
+    }
+
+    fn acquireExecution(self: *RunPermit) !RunPermit {
+        return self.session.admit(try self.executionRequest());
     }
 
     /// Drop transient forward scratch once only materialized outputs remain.
     pub fn retainOutputs(self: *RunPermit, outputs: []const Tensor) !void {
         if (self.lease) |*lease| try lease.retain(try retainedOutputAmounts(outputs, lease.amounts.host_kv_bytes > 0));
+        self.updatePooledCapacity();
     }
 
     pub fn run(
@@ -1288,6 +1325,8 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return self.session.vtable.run(self.session.ptr, inputs, allocator);
     }
 
@@ -1298,6 +1337,7 @@ pub const RunPermit = struct {
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1309,6 +1349,8 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = try self.session.vtable.runWithControl(
             self.session.ptr,
             inputs,
@@ -1330,6 +1372,7 @@ pub const RunPermit = struct {
         const run_decisions = self.session.vtable.runLayaDecisions orelse return null;
         if (self.session.vtable.hasLayaDecisions) |supported| if (!supported(self.session.ptr)) return null;
         try self.resolveGeometry(inputs);
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1341,6 +1384,8 @@ pub const RunPermit = struct {
         try active.check();
         var protection = if (control) |c| try c.enterUninterruptible(self.session.interruption()) else null;
         defer if (protection) |*p| p.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         const outputs = (try run_decisions(self.session.ptr, inputs, allocator, control)) orelse return null;
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
@@ -1354,6 +1399,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
         const run_resident = self.session.vtable.runResident orelse return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return run_resident(self.session.ptr, inputs, allocator);
     }
 
@@ -1363,6 +1410,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1376,6 +1424,8 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         var outputs = if (self.session.vtable.runResidentWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null
         else
@@ -1393,6 +1443,8 @@ pub const RunPermit = struct {
         if (self.execution_yielded) return self.runResidentInputsWithControl(inputs, allocator, null);
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return run_resident_inputs(self.session.ptr, inputs, allocator);
     }
 
@@ -1402,6 +1454,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1416,6 +1469,8 @@ pub const RunPermit = struct {
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
         const run_controlled = self.session.vtable.runResidentInputsWithControl orelse return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         var outputs = (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null;
         errdefer outputs.deinit();
         try active.check();
@@ -1430,6 +1485,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentTextEmbeddingWithControl(inputs, request, allocator, null);
         const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         return run_resident(self.session.ptr, inputs, request, allocator);
     }
 
@@ -1455,6 +1512,7 @@ pub const RunPermit = struct {
             @field(extra_keep, name) = @field(needed, name) - @field(base_keep, name);
         }
         try base.retain(base_keep);
+        self.updatePooledCapacity();
         if (extra.lease) |*lease| try lease.retain(extra_keep);
         self.request = request;
     }
@@ -1465,6 +1523,7 @@ pub const RunPermit = struct {
             const admission = self.session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
             try lease.retain(try admission.estimateRequest(request, self.session.outputInfo()));
         }
+        self.updatePooledCapacity();
         self.request = request;
     }
 
@@ -1473,6 +1532,7 @@ pub const RunPermit = struct {
     /// request carrying the same `pre_admitted_host_bytes` credit.
     pub fn retainHostBytes(self: *RunPermit, bytes: usize) !void {
         if (self.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = bytes });
+        self.updatePooledCapacity();
     }
 
     pub fn runResidentTextEmbeddingWithControl(
@@ -1482,6 +1542,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.refreshPooledExecution();
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1495,6 +1556,8 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
+        var host_execution = try memory.HostExecutionScope.begin(if (self.lease) |*held| held else null);
+        defer host_execution.deinit();
         var outputs = if (self.session.vtable.runResidentTextEmbeddingWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, request, allocator, active)) orelse return null
         else

@@ -5429,7 +5429,7 @@ pub const ModelManager = struct {
 
     pub const HostCacheReclaimer = struct {
         context: *anyopaque,
-        reclaim: *const fn (*anyopaque, usize) usize,
+        reclaim: *const fn (*anyopaque, usize, bool) usize,
     };
 
     pub const MemoryAdmissionDiagnostic = admission_diagnostics.Diagnostic;
@@ -5853,7 +5853,10 @@ pub const ModelManager = struct {
         }
 
         pub fn reserveMetadataCapacity(self: @This(), bytes: usize) !runtime.tier.memory.LiveReservation {
-            return self.domain.admission.reserveLiveCapacity(bytes);
+            return self.domain.admission.reserveLiveCapacity(bytes) catch |err| {
+                if (err != error.ResourceTemporarilyUnavailable or self.domain.admission.reclaimHostCapacity(bytes) == 0) return err;
+                return self.domain.admission.reserveLiveCapacity(bytes);
+            };
         }
     };
 
@@ -5887,11 +5890,11 @@ pub const ModelManager = struct {
         defer self.host_cache_mutex.unlock();
         self.host_cache_reclaimer = hook;
     }
-    fn reclaimHostCache(self: *ModelManager, target_bytes: usize) usize {
+    fn reclaimHostCache(self: *ModelManager, target_bytes: usize, scratch_only: bool) usize {
         if (!self.host_cache_mutex.tryLock()) return 0;
         defer self.host_cache_mutex.unlock();
         const hook = self.host_cache_reclaimer orelse return 0;
-        const freed = hook.reclaim(hook.context, target_bytes);
+        const freed = hook.reclaim(hook.context, target_bytes, scratch_only);
         if (freed != 0) _ = platform.allocator.reclaimUnusedProcessMemory();
         return freed;
     }
@@ -5903,22 +5906,14 @@ pub const ModelManager = struct {
     }
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
-        const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory) catch |err| {
-            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
-            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
-        };
+        return self.acquireAmountsWithEvictionMode(.cpu, self.resource_domain.?.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
     }
 
     /// Auxiliary resident models share the physical host domain with primary
     /// sessions. The constructor shrinks this lease to actual owned weights.
     pub fn admitHostWeights(self: *ModelManager, peak_bytes: usize) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
-        const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true) catch |err| {
-            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(peak_bytes) == 0) return err;
-            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true);
-        };
+        return self.acquireAmountsWithEviction(.cpu, self.resource_domain.?.admission_limits, .{ .host_weight_bytes = peak_bytes });
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -6788,13 +6783,33 @@ pub const ModelManager = struct {
 
     fn reclaimOneForAdmission(
         self: *ModelManager,
-        pressure: runtime.tier.memory.AdmissionPressure,
+        failure: runtime.tier.memory.AdmissionFailure,
+        owner_attempted: *bool,
     ) bool {
+        const pressure = failure.pressure orelse return false;
+        const live_deficit = if (pressure == .live_host)
+            self.admissionController().hostReclamationTarget(failure.live_requested_bytes)
+        else
+            null;
+        if (pressure == .live_host and !owner_attempted.*) {
+            // A reported decrease can remain in an allocator arena. Resample
+            // once after the owner pass, then try the inference caches.
+            owner_attempted.* = true;
+            if (live_deficit) |target| {
+                if (target == 0 or self.admissionController().reclaimHostDeficit(target) != 0) return true;
+            }
+        }
+
         const cold_host_cache_can_help = switch (pressure) {
-            .domain_scratch => true, // retained preflight/index leases
+            .domain_scratch, .domain_host, .domain_combined => |backend_class| backend_class == .cpu,
+            .shared_scratch => true,
             else => pressureCanBeRelievedByHostCache(pressure),
         };
-        if (cold_host_cache_can_help and self.reclaimHostCache(1) != 0) return true;
+        // Opaque constraints can only be retried after a bounded eviction.
+        // Scratch pressure can evict media indexes, whose leases own scratch.
+        const target = @max(1, live_deficit orelse failure.logical_deficit_bytes orelse 1);
+        const scratch_only = pressure == .domain_scratch or pressure == .shared_scratch;
+        if (cold_host_cache_can_help and self.reclaimHostCache(target, scratch_only) != 0) return true;
         if (self.evictOneIdleForAdmission(pressure)) return true;
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
@@ -6832,11 +6847,14 @@ pub const ModelManager = struct {
             if (err != error.ResourceTemporarilyUnavailable) return err;
             spinLock(&self.eviction_lock);
             defer self.eviction_lock.unlock();
+            var reclaim_attempts: usize = 0;
+            var owner_attempted = false;
             while (true) {
+                reclaim_attempts += 1;
                 if (self.admissionController().reserveLiveCapacity(bytes)) |reservation| return reservation else |retry| {
                     if (retry != error.ResourceTemporarilyUnavailable) return retry;
                 }
-                if (!self.reclaimOneForAdmission(.live_host)) return error.ResourceTemporarilyUnavailable;
+                if (reclaim_attempts >= 64 or !self.reclaimOneForAdmission(.{ .pressure = .live_host, .live_requested_bytes = bytes }, &owner_attempted)) return error.ResourceTemporarilyUnavailable;
             }
         };
     }
@@ -6849,49 +6867,11 @@ pub const ModelManager = struct {
         // repeating stable-limit OS probes for every parser node; live physical
         // capacity is checked separately by metadata's batched reservations.
         if (check_live) self.tightenUnifiedDeviceAdmission();
-        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        const requests = [_]runtime.tier.memory.AdmissionRequest{.{
+        return self.acquireConfiguredRequestsWithEviction(&.{.{
             .backend_class = backend_class,
             .limits = limits,
             .amounts = amounts,
-        }};
-        return self.admissionController().tryAcquireWithPressure(
-            backend_class,
-            limits,
-            amounts,
-            check_live,
-            &pressure,
-        ) catch |first_err| switch (first_err) {
-            error.ResourceTemporarilyUnavailable => {
-                spinLock(&self.eviction_lock);
-                defer self.eviction_lock.unlock();
-                while (true) {
-                    if (self.admissionController().tryAcquireWithPressure(
-                        backend_class,
-                        limits,
-                        amounts,
-                        check_live,
-                        &pressure,
-                    )) |lease| return lease else |retry_err| switch (retry_err) {
-                        error.ResourceTemporarilyUnavailable => {},
-                        else => {
-                            self.logRunAdmissionDenied(retry_err, pressure, &requests);
-                            return retry_err;
-                        },
-                    }
-                    if (!self.reclaimOneForAdmission(
-                        pressure orelse return error.ResourceTemporarilyUnavailable,
-                    )) {
-                        self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, &requests);
-                        return error.ResourceTemporarilyUnavailable;
-                    }
-                }
-            },
-            else => {
-                self.logRunAdmissionDenied(first_err, pressure, &requests);
-                return first_err;
-            },
-        };
+        }}, check_live);
     }
 
     fn acquireRequestsWithEviction(
@@ -6903,41 +6883,37 @@ pub const ModelManager = struct {
         defer self.allocator.free(requests);
         for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
         self.tightenUnifiedDeviceAdmission();
-        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        return self.admissionController().tryAcquireRequestsWithPressure(
-            requests,
-            true,
-            &pressure,
-        ) catch |first_err| switch (first_err) {
-            error.ResourceTemporarilyUnavailable => {
-                spinLock(&self.eviction_lock);
-                defer self.eviction_lock.unlock();
-                while (true) {
-                    if (self.admissionController().tryAcquireRequestsWithPressure(
-                        requests,
-                        true,
-                        &pressure,
-                    )) |lease|
-                        return lease
-                    else |retry_err| switch (retry_err) {
-                        error.ResourceTemporarilyUnavailable => {},
-                        else => {
-                            self.logRunAdmissionDenied(retry_err, pressure, requests);
-                            return retry_err;
-                        },
-                    }
-                    if (!self.reclaimOneForAdmission(
-                        pressure orelse return error.ResourceTemporarilyUnavailable,
-                    )) {
-                        self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, requests);
-                        return error.ResourceTemporarilyUnavailable;
+        return self.acquireConfiguredRequestsWithEviction(requests, true);
+    }
+
+    fn acquireConfiguredRequestsWithEviction(
+        self: *ModelManager,
+        requests: []const runtime.tier.memory.AdmissionRequest,
+        check_live: bool,
+    ) !runtime.tier.memory.AdmissionLease {
+        const controller = self.admissionController();
+        var failure: runtime.tier.memory.AdmissionFailure = .{};
+        return controller.tryAcquireRequestsWithFailure(requests, check_live, &failure) catch |first_err| {
+            if (first_err != error.ResourceTemporarilyUnavailable) {
+                self.logRunAdmissionDenied(first_err, failure.pressure, requests);
+                return first_err;
+            }
+            spinLock(&self.eviction_lock);
+            defer self.eviction_lock.unlock();
+            var owner_attempted = false;
+            for (0..64) |attempt| {
+                if (controller.tryAcquireRequestsWithFailure(requests, check_live, &failure)) |lease| {
+                    return lease;
+                } else |retry_err| {
+                    if (retry_err != error.ResourceTemporarilyUnavailable or attempt == 63 or
+                        !self.reclaimOneForAdmission(failure, &owner_attempted))
+                    {
+                        self.logRunAdmissionDenied(retry_err, failure.pressure, requests);
+                        return retry_err;
                     }
                 }
-            },
-            else => {
-                self.logRunAdmissionDenied(first_err, pressure, requests);
-                return first_err;
-            },
+            }
+            unreachable;
         };
     }
 
@@ -17046,7 +17022,7 @@ test "model aware media host index cache pressure releases idle leases before pr
         lease: *runtime.tier.memory.AdmissionLease,
         pinned: bool = true,
         calls: usize = 0,
-        fn reclaim(raw: *anyopaque, _: usize) usize {
+        fn reclaim(raw: *anyopaque, _: usize, _: bool) usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.pinned) return 0;
@@ -20244,4 +20220,117 @@ test "model processor resampling fences declared and implicit image routes" {
     try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
     inputs[0] = "audio";
     try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+}
+
+test "owner reclamation covers preflight and weights and cannot starve inference caches" {
+    const memory = runtime.tier.memory;
+    const Owner = struct {
+        calls: usize = 0,
+        cache_calls: usize = 0,
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+        fn reclaim(raw: *anyopaque, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 1;
+        }
+        fn cache(raw: *anyopaque, _: usize, _: bool) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cache_calls += 1;
+            return 0;
+        }
+    };
+    var owner = Owner{};
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    try controller.configureResourceBudget(.{ .context = &owner, .try_reserve = Owner.reserve, .retain = Owner.retain, .release = Owner.release, .reclaim_host = Owner.reclaim });
+    controller.configureProcessMemoryLimit(1, .explicit);
+    manager.setHostCacheReclaimer(.{ .context = &owner, .reclaim = Owner.cache });
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflight(1));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostWeights(1));
+    try std.testing.expectEqual(@as(usize, 2), owner.calls);
+    try std.testing.expect(owner.cache_calls >= 2);
+    owner.calls = 0;
+    owner.cache_calls = 0;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.cpu, .{}, .{ .host_scratch_bytes = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), owner.calls);
+    try std.testing.expectEqual(@as(usize, 1), owner.cache_calls);
+}
+
+test "memory unified backend denial reaches storage owner" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const memory = runtime.tier.memory;
+    const Owner = struct {
+        requested: usize = 0,
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+        fn target(bytes: usize) ?usize {
+            return bytes;
+        }
+        fn reclaim(raw: *anyopaque, bytes: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.requested += bytes;
+            return bytes;
+        }
+    };
+    var owner = Owner{};
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    try controller.configureResourceBudget(.{ .context = &owner, .try_reserve = Owner.reserve, .retain = Owner.retain, .release = Owner.release, .reclaim_host = Owner.reclaim });
+    controller.configureProcessMemoryLimit(1, .explicit);
+    controller.test_reclamation_target = Owner.target;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.gpu, .{}, .{ .backend_scratch_bytes = 4096 }));
+    try std.testing.expectEqual(@as(usize, 4096), owner.requested);
+    owner.requested = 0;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireRequestsWithEviction(&.{
+        .{ .backend_class = .gpu, .limits = .{}, .amounts = .{ .backend_scratch_bytes = 4096 } },
+        .{ .backend_class = .cpu, .limits = .{}, .amounts = .{ .host_scratch_bytes = 1024 } },
+    }));
+    try std.testing.expectEqual(@as(usize, 5120), owner.requested);
+}
+
+test "memory admission reclaims the live deficit or one cache entry" {
+    const memory = runtime.tier.memory;
+    const Probe = struct {
+        target_bytes: usize = 0,
+        fn cache(raw: *anyopaque, target: usize, _: bool) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.target_bytes = target;
+            return target;
+        }
+        fn deficit(_: usize) ?usize {
+            return 4096;
+        }
+    };
+    var probe = Probe{};
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    manager.admissionController().test_reclamation_target = Probe.deficit;
+    manager.setHostCacheReclaimer(.{ .context = &probe, .reclaim = Probe.cache });
+    var attempted = false;
+    try std.testing.expect(manager.reclaimOneForAdmission(.{ .pressure = .live_host, .live_requested_bytes = 64 * 1024 * 1024 }, &attempted));
+    try std.testing.expectEqual(@as(usize, 4096), probe.target_bytes);
+
+    const controller = manager.admissionController();
+    var held = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 * 1024 * 1024 }, false);
+    defer held.release();
+    var failure: memory.AdmissionFailure = .{};
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquireRequestsWithFailure(&.{.{
+        .backend_class = .cpu,
+        .limits = .{ .scratch_limit_bytes = 128 * 1024 * 1024 - 1 },
+        .amounts = .{ .host_scratch_bytes = 64 * 1024 * 1024 },
+    }}, false, &failure));
+    try std.testing.expect(manager.reclaimOneForAdmission(failure, &attempted));
+    try std.testing.expectEqual(@as(usize, 1), probe.target_bytes);
 }

@@ -106,22 +106,26 @@ pub const DB = struct {
     }
 
     pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
+        const filesystem = liteFilesystem(opts);
         var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
             .reclamation = opts.lite_reclamation,
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
-            .io = liteIo(opts),
+            .io = if (filesystem) |value| value.io else null,
+            .cache_advice = if (filesystem) |value| value.cache_advice else .{},
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend, false);
     }
 
     pub fn createLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         if (!openModeCanWrite(opts.open_mode)) return error.InvalidArgument;
+        const filesystem = liteFilesystem(opts);
         var lite_backend = try support.lite.backend.Handle.createWithOptions(alloc, path, .{
             .reclamation = opts.lite_reclamation,
             .exclusive = true,
             .no_sync = opts.no_sync,
-            .io = liteIo(opts),
+            .io = if (filesystem) |value| value.io else null,
+            .cache_advice = if (filesystem) |value| value.cache_advice else .{},
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend, true);
     }
@@ -440,9 +444,9 @@ test "embedded custom storage owns its physical namespace" {
     try std.testing.expectEqual(.filesystem_managed, toDbOpenOptions(.{ .storage = lock_only }, .hosted).physical_root_mode);
 }
 
-fn liteIo(opts: OpenOptions) ?std.Io {
-    if (opts.lite_io) |io| return io;
-    if (opts.backend_runtime) |runtime| return runtime.io();
+fn liteFilesystem(opts: OpenOptions) ?support.background_runtime.Filesystem {
+    if (opts.lite_io) |io| return .borrowed(io);
+    if (opts.backend_runtime) |runtime| return runtime.filesystemCapability();
     return null;
 }
 
@@ -1087,4 +1091,31 @@ test "embedded db standalone catalog changes require the server after snapshot r
     try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 }));
     try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.deleteEnrichment(.chunk, "chunks"));
     try db.batch(.{ .writes = &.{.{ .key = "edited", .value = "{\"body\":\"offline edit\"}" }}, .sync_level = .write });
+}
+
+test "embedded db file cache authority follows the selected filesystem executor" {
+    const General = struct {
+        fn close(_: ?*anyopaque, _: []const std.Io.File) void {
+            @panic("filesystem handles reached the general executor");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var table = std.testing.io.vtable.*;
+    table.fileClose = General.close;
+    const general: std.Io = .{ .vtable = &table, .userdata = std.testing.io.userdata };
+    var runtime = try support.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = general },
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testLitePath(alloc, tmp, "paired-capability.aflite");
+    defer alloc.free(path);
+    var db = try DB.createLite(alloc, path, .{ .backend_runtime = runtime.ptr() });
+    defer db.close();
+    const file = &db.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expectEqual(runtime.ptr().fileCacheAdvice().available(), file.cache_advice.available());
+    try db.batch(.{ .writes = &.{.{ .key = "paired", .value = "{\"title\":\"paired executor\"}" }}, .sync_level = .write });
 }

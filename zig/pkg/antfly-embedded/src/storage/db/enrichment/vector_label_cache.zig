@@ -130,19 +130,32 @@ pub const Cache = struct {
         if (self.manager) |current| return manager == current;
         if (manager) |current| {
             if (self.count != 0) return false;
-            self.reclaimer_id = current.registerReclaimer(.document_extraction_working_set, self, reclaim) catch return false;
+            self.reclaimer_id = current.registerReclaimerWithOptions(.document_extraction_working_set, self, reclaim, .{ .reclaim_physical = reclaimPhysical }) catch return false;
             self.manager = current;
         }
         return true;
     }
     pub fn reclaim(raw: *anyopaque, target_bytes: u64) u64 {
+        return reclaimImpl(raw, target_bytes, false);
+    }
+    fn reclaimPhysical(raw: *anyopaque, target_bytes: u64) u64 {
+        return reclaimImpl(raw, target_bytes, true);
+    }
+    fn reclaimImpl(raw: *anyopaque, target_bytes: u64, physical: bool) u64 {
         const self: *Cache = @ptrCast(@alignCast(raw));
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
         var released: u64 = 0;
         while (released < target_bytes) {
             const entry = self.evictable() orelse break;
-            released += if (entry.budget) |budget| budget.reservation.bytes + (if (entry.header) |header| header.bytes else 0) else entry.bytes;
+            var scope = resources.ReclamationScope.tryAcquire(entry.backing) orelse break;
+            defer scope.deinit();
+            released += if (physical)
+                (if (entry.budget) |budget| budget.live_bytes + @sizeOf(Entry) else entry.bytes)
+            else if (entry.budget) |budget|
+                budget.reservation.bytes + (if (entry.header) |header| header.bytes else 0)
+            else
+                entry.bytes;
             self.remove(entry);
         }
         return released;
@@ -294,4 +307,21 @@ test "model aware media vocabulary LRU handles hash collisions and reclaims only
     _ = Cache.reclaim(&cache, Cache.max_bytes);
     try std.testing.expectEqual(@as(usize, 0), cache.count);
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+}
+
+test "model aware media vocabulary physical reclamation excludes unused reservation credit" {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const entry = try Cache.Entry.createAdmitted(a, @splat(3), "{\"labels\":[{\"label\":\"speech\"}]}", &manager);
+    const scratch = try entry.budget.?.reserveScratch(32 * 1024);
+    scratch.release();
+    const expected = entry.budget.?.live_bytes + @sizeOf(Cache.Entry);
+    try std.testing.expect(entry.budget.?.reservation.bytes > entry.budget.?.live_bytes);
+    cache.retain(entry);
+    cache.release(entry);
+    try std.testing.expectEqual(expected, manager.reclaimHostMemory(1));
+    try std.testing.expectEqual(@as(usize, 0), cache.count);
 }

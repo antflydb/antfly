@@ -1357,6 +1357,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "embedded db standalone catalog changes require the server after snapshot reopen",
             "embedded custom storage owns its physical namespace",
+            "embedded db file cache authority",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -6909,6 +6910,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const memory_pressure_tests = b.addTest(.{
+        .name = "memory-pressure-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "resource manager physical pressure", "lite native cache advice", "host memory owners", "Lite inference reclaims attached", "lite native managed", "lite physical reclamation" }),
+        .max_rss = 6 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const memory_pressure_step = b.step("antfly-memory-pressure-test", "Verify physical reclamation and Lite snapshot cache ownership");
+    memory_pressure_step.dependOn(&addFilteredTestRunArtifact(b, memory_pressure_tests).step);
+    const filesystem_authority_tests = b.addTest(.{
+        .root_module = embedded_db_mod,
+        .filters = &.{"embedded db file cache authority"},
+    });
+    memory_pressure_step.dependOn(&addFilteredTestRunArtifact(b, filesystem_authority_tests).step);
     const repair_publication_tests = b.addTest(.{
         .name = "artifact-repair-publication-tests",
         .root_module = db_test_mod,

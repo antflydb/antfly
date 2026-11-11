@@ -301,16 +301,124 @@ request limits use the same envelope, and immediately before an inference
 allocation the controller checks the requested increment against the current
 leaf-cgroup working set on Linux or process physical footprint on macOS, plus
 safety headroom. When the remaining explicit envelope is the tighter live
-constraint,
-admission keeps a fixed 512 MiB emergency reserve inside that bounded view
-instead of reserving half of the remaining capacity a second time. Automatic
+constraint, admission keeps an emergency reserve of one-eighth of the effective
+envelope, capped at 512 MiB, inside that bounded view instead of reserving half
+of the remaining capacity a second time. The reserve is based on the total
+envelope, not its changing availability: small explicit budgets retain usable
+inference capacity while allocations still stop at a stable safety boundary.
+Envelopes of 4 GiB and above retain the 512 MiB reserve. Automatic
 host/cgroup sizing retains the dynamic pressure reserve. Current node or finite
-cgroup pressure also remains authoritative when it is tighter, so an explicit
-value cannot weaken a physical pressure signal. The working set is
+cgroup pressure also remains authoritative when it is tighter: the controller
+retains the original physical capacity after its reserve and admits against
+the minimum of that capacity and the explicit-envelope capacity. Comparing raw
+availability before applying different reserves would weaken physical safety.
+The working set is
 `memory.current - inactive_file`: it includes anonymous memory, the test
 harness, sibling processes, and active mapped pages while excluding file pages
 that the kernel can reclaim. The kubelet uses the same working-set signal to
 rank memory-pressure evictions.
+
+Every new live reservation re-probes memory, including while another load or
+run remains pending. Unmaterialized reservations remain charged against the
+fresh sample: a new sample cannot spend promises made to concurrent work.
+Materialization transfers pending credit into kernel-observed residency;
+releasing an old residency lease cannot inflate a newer sample. This is
+deliberately conservative for estimates whose physical materialization is not
+known; it never infers ownership from RSS growth. Probes occur at admission and
+batched metadata reservation boundaries, not on cache hits or individual parser
+allocations.
+
+Physical denial can also ask the process owner to reclaim managed host caches,
+even when its ledger is below its ceiling. Standalone uses ResourceManager's
+weighted cache reclamation; Lite attaches each live storage manager to its
+shared inference service. Attachments rotate fairly and detach drains borrowed
+callbacks before DB/cache teardown. Each pass visits all pre-existing owner
+slots in bounded batches; new or reused slots wait for the next pass. The
+capability crosses the versioned inference bridge and worker transport without holding admission, attachment, or
+RPC accounting locks during callbacks. Preflight, auxiliary weights, runs and
+metadata all participate. One owner pass per admission leaves inference caches
+and model eviction an opportunity to help. Every retry re-probes physical memory;
+reported decreases are never allocation credit. The reclaim target is solved
+against the same physical and operator-envelope policies, including reserve
+floors and usage above the envelope, rather than assuming a clamped zero
+capacity means only the requested allocation needs to be freed. Demand belongs
+to the requesting operation and is combined with current pending promises;
+concurrent success or denial cannot overwrite it. Physical callbacks report
+destroyed payload storage separately from unused reservation credit. The
+storage process also purges unused libc arenas where supported. A fresh
+admission probe remains authoritative even after a zero-byte owner report.
+
+Execution leases distinguish unallocated promises from allocator-owned,
+writable host pages. The native compute allocator attributes real allocations
+before kernels run, without preallocating the estimated peak or probing procfs
+per allocation. Its pointer-transparent map preserves legacy allocator layout,
+handles resize/remap rollback and keeps allocator state alive through escaped
+buffers. Dense aliases keep the allocator that owns their shared payload.
+Prepaid execution and overflow chunks for one request share a materialization
+pool, so a buffer spanning their capacity needs one accounting token. Layered
+adapters attribute a backing allocation once. Unknown/device producers remain
+conservative. Reducing unused capacity preserves the remaining promise.
+Buffer release restores future
+execution promises before the backing free. Late frees after lease completion
+never dereference the old admission controller. Page commitment never holds an
+admission/accounting lock while faulting pages.
+
+Linux file-cache cleanup belongs to the file-producing operation. Snapshots
+sync and advise private output in 64 MiB windows before publication. Streaming
+range hints cover at most 8 MiB each, with a 2 GiB batch cap and cancellation
+checks; range-only capabilities do not imply whole-file cleanup.
+
+Authority to advise a file is independent of its retirement policy. Ordinary
+writable closes preserve cache warmth. A physical-pressure pass marks the
+ResourceManager's retirement epoch; a writable owner that observed a new epoch
+during its lifetime may discard cache when it retires. Newly opened owners do
+not inherit old pressure. Producers can explicitly retain or discard on close.
+Read-only/internal/externally leased handles never acquire discard ownership.
+
+A native terminal capability disposes of eligible cache before releasing its
+lifetime writer lease. Linux traverses the mapping's cached-folio index,
+including hot ranges beyond sparse holes or a cold prefix, rather than scanning
+every logical offset in userspace. Work scales with cache residency, not file
+length. This is best-effort, potentially writeback-initiating advice, not a hard
+wall-clock bound or allocation credit. It is never invoked by admission or
+while holding the inference eviction lock. Internal readers, read-only snapshots
+and externally leased generations do not discard another owner's hot pages on
+close. No descriptor or path is retained after close.
+
+Managed NativeFile page and link caches use stable heap owners so callbacks
+survive file moves. Registered reclaimers preserve pinned views and their
+charges, release empty map storage, and drain before cache teardown. Reclamation
+pre-acquires known nested budget/quota allocator chains with try-locks before
+detaching storage. Busy chains and unrecognized backing allocators decline
+reclamation. Guarded frees reuse only mutexes explicitly acquired for
+reclamation. SQL and graph caches can also borrow locks explicitly offered by
+stateless synchronizing wrappers when the entire free path is audited. This
+includes metadata/workspace, native chunk, scratch,
+document-preparation, vocabulary and retained-frame caches. Physical dispatch
+requires an explicitly registered callback; logical callbacks never inherit
+foreign-thread authority. HBC callbacks pre-acquire accounting and generation
+locks as well as allocator chains; shared/local HBC eviction skips pinned
+entries without allocating diagnostic records. Fixed linear passes preserve
+class protection and CLOCK cold-before-hot preference without repeatedly
+scanning pinned prefixes.
+
+Native advice is granted by the I/O producer and forwarded in the checked
+executor borrow. Borrowed consumers never identify native handles by comparing
+implementation addresses. Abstract I/O carries no such authority. The native
+runtime ABI version covers this additional capability.
+
+The focused `antfly-memory-pressure-test` checks Lite managed-cache recovery,
+snapshot/internal-reader ownership, deleted-inode release, fair callbacks and
+concurrent detach. `runtime-file-cache-abi-test` links an independent provider
+archive to verify that native advice survives executor translation and that
+abstract I/O cannot grant it. The Linux kernel regression in
+`scripts/ci/run_inference_memory_pressure.py` uses a 1 CPU / 2 GiB no-swap cgroup,
+creates active file cache in a writer that exits, applies terminal owner cleanup
+at offsets 0 and 3 GiB, and verifies fresh admission recovery without an OOM
+kill. It also runs two overlapping 600 MiB host allocations under the same
+physical limit, preserving promises for allocations that have not happened.
+It requires no model download; workload-specific embedding/indexing throughput and snapshot/crash
+recovery remain separate qualification.
 
 An explicit envelope also makes its live-usage probe mandatory. If the
 leaf-cgroup working set or macOS process footprint is temporarily unavailable,

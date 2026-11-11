@@ -233,6 +233,6 @@ test "lite throughput benchmark warm point views" {
             defer a.free(value);
             try std.testing.expectEqualStrings("value", value);
         }
-        std.debug.print("LITE_BENCH_POINT n={d} elapsed_ns={d} comparisons={d} view_hits={d} cache_bytes={d}\n", .{ count, time.monotonicNs() - started, file.test_index_comparisons.load(.monotonic) - before, file.test_index_view_hits.load(.monotonic) - hits, file.page_cache.total_bytes });
+        std.debug.print("LITE_BENCH_POINT n={d} elapsed_ns={d} comparisons={d} view_hits={d} cache_bytes={d}\n", .{ count, time.monotonicNs() - started, file.test_index_comparisons.load(.monotonic) - before, file.test_index_view_hits.load(.monotonic) - hits, file.pageCache().total_bytes });
     }
 }

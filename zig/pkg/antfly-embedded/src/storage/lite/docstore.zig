@@ -1318,6 +1318,8 @@ pub const OpenOptions = struct {
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     io: ?std.Io = null,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice = .{},
+    cache_retirement: @import("antfly_runtime_abi").io_abi.file_cache.Retirement = .on_pressure,
 };
 
 pub const CreateOptions = struct {
@@ -1328,6 +1330,8 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
+    cache_advice: @import("antfly_runtime_abi").io_abi.file_cache.Advice = .{},
+    cache_retirement: @import("antfly_runtime_abi").io_abi.file_cache.Retirement = .on_pressure,
 };
 
 const MutationRequest = struct {
@@ -1544,6 +1548,8 @@ pub const Store = struct {
             .wait_for_reader_lock = opts.read_only,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
+            .cache_advice = opts.cache_advice,
+            .cache_retirement = opts.cache_retirement,
         };
         const file = if (opts.io) |io|
             try native.NativeFile.openWithIo(allocator, io, path, native_opts)
@@ -1595,6 +1601,8 @@ pub const Store = struct {
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
+            .cache_advice = opts.cache_advice,
+            .cache_retirement = opts.cache_retirement,
             .writer_lock_marker = opts.writer_lock_marker,
             .indexed_reclamation = opts.reclamation.page_reuse,
         };
@@ -1630,7 +1638,7 @@ pub const Store = struct {
         if (self.metadata_ready.load(.acquire)) return self.metadata_pool.allocator(self.allocator, self.resource_manager);
         platform_sync.lockYielding(&self.workspace_mutex);
         if (self.workspace_reclaimer == null) {
-            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch null;
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimerWithOptions(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces, .{ .reclaim_physical = reclaimIdleWorkspacesPhysical }) catch null;
         }
         if (self.resource_manager == null or self.workspace_reclaimer != null) self.metadata_ready.store(true, .release);
         self.workspace_mutex.unlock();
@@ -1638,7 +1646,15 @@ pub const Store = struct {
     }
 
     fn reclaimIdleWorkspaces(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimIdleWorkspacesImpl(context, target_bytes, false);
+    }
+    fn reclaimIdleWorkspacesPhysical(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimIdleWorkspacesImpl(context, target_bytes, true);
+    }
+    fn reclaimIdleWorkspacesImpl(context: *anyopaque, target_bytes: u64, physical_only: bool) u64 {
         const self: *Store = @ptrCast(@alignCast(context));
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.allocator) orelse return 0;
+        defer scope.deinit();
         const metadata = self.metadata_pool.reclaimDetailed(target_bytes);
         var freed = metadata.physical;
         var reported = metadata.total();
@@ -1665,7 +1681,8 @@ pub const Store = struct {
             freed +|= physical;
             reported +|= bytes;
         }
-        return reported;
+        const credit = scope.releaseUnusedCredits(self.resource_manager);
+        return if (physical_only) freed else reported +| credit;
     }
 
     fn checkoutWorkspace(self: *Store, caller: Allocator) !?*ReadWorkspace {
@@ -1673,7 +1690,7 @@ pub const Store = struct {
         if (query_budget == null and !(caller.ptr == self.allocator.ptr and caller.vtable == self.allocator.vtable)) return null;
         platform_sync.lockYielding(&self.workspace_mutex);
         if (self.workspace_reclaimer == null) {
-            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch {
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimerWithOptions(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces, .{ .reclaim_physical = reclaimIdleWorkspacesPhysical }) catch {
                 self.workspace_mutex.unlock();
                 return null;
             };
@@ -1818,7 +1835,7 @@ pub const Store = struct {
         errdefer self.allocator.destroy(generation);
         generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .reader_coordinator = self.file.reader_coordinator, .resource_manager = self.resource_manager }) };
         self.read_generation = generation;
-        self.file.secondary_page_cache = &generation.file.page_cache;
+        self.file.secondary_page_cache = generation.file.pageCache();
         self.file.reader_frontier = &self.reader_frontier;
         self.file.publication_observer = .{ .context = self, .notify = observeReadCheckpoint };
         self.read_outcome_unknown = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
@@ -6270,7 +6287,7 @@ test "lite maintenance snapshots release shared cache accounting on cancellation
         try std.testing.expectError(error.MaintenanceCanceled, store.checkWithCancel(&cancel));
         try std.testing.expect((try store.checkWithCancel(null)).valid);
         _ = try store.vacuum();
-        try std.testing.expectEqual(store.file.page_cache.total_bytes, manager.sliceStats(.lite_native_page_cache).used_bytes);
+        try std.testing.expectEqual(store.file.pageCache().total_bytes, manager.sliceStats(.lite_native_page_cache).used_bytes);
         try std.testing.expect(manager.sliceStats(.lite_native_page_cache).used_bytes <= 65536);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
@@ -8707,7 +8724,7 @@ test "lite prepared cached scores retry after page cache eviction" {
     // decoded hit that intentionally requires no reader growth.
     w.resolved_scores.decoded_ready = false;
     const file = try txn.readFile();
-    try std.testing.expect(file.page_cache.total_bytes > 0);
+    try std.testing.expect(file.pageCache().total_bytes > 0);
 
     manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 1024;
     const Output = struct {
@@ -9613,7 +9630,7 @@ test "lite prepared compact staging retries without duplicate delivery after pag
     // decoded hit that intentionally requires no reader growth.
     w.resolved_scores.decoded_ready = false;
     const file = try txn.readFile();
-    try std.testing.expect(file.page_cache.total_bytes > 0);
+    try std.testing.expect(file.pageCache().total_bytes > 0);
 
     manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 1024;
     const Output = struct {
@@ -11791,4 +11808,56 @@ test "lite reclamation issue1431 canceled automatic rewrites retry without file 
     defer a.free(value);
     try std.testing.expectEqualStrings("retained value", value);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite physical reclamation skips a busy backing allocator and retries after release" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer backing.deinit();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const path = try testPath(a, dir, "skip-busy-parent.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(backing.threadSafeAllocator(), path, .{ .resource_manager = &manager, .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const metadata = store.readMetadataAllocator();
+    const node = try metadata.alloc(u8, 16);
+    metadata.free(node);
+    const Runner = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        freed: u64 = 0,
+        fn run(self: *@This(), m: *resource_manager_mod.ResourceManager) void {
+            self.entered.store(true, .release);
+            self.freed = m.reclaimHostMemory(1);
+            self.done.store(true, .release);
+        }
+    };
+    var runner = Runner{};
+    try std.testing.expect(backing.allocator_mutex.tryLock());
+    const thread = std.Thread.spawn(.{}, Runner.run, .{ &runner, &manager }) catch |err| {
+        backing.allocator_mutex.unlock();
+        return err;
+    };
+    var joined = false;
+    defer if (!joined) {
+        backing.allocator_mutex.unlock();
+        thread.join();
+    };
+    while (!runner.entered.load(.acquire)) @import("antfly_platform").time.yieldBriefly();
+    // A regression still finishes: release the held lock before asserting.
+    for (0..100) |_| {
+        if (runner.done.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const completed_while_busy = runner.done.load(.acquire);
+    backing.allocator_mutex.unlock();
+    thread.join();
+    joined = true;
+    try std.testing.expect(completed_while_busy);
+    try std.testing.expectEqual(@as(u64, 0), runner.freed);
+    try std.testing.expect(manager.reclaimHostMemory(1) > 0);
 }

@@ -12024,14 +12024,22 @@ const RuntimePdfPageTextSpool = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn reclaim(raw: *anyopaque, _: u64) u64 {
+    fn reclaim(raw: *anyopaque, target: u64) u64 {
+        return reclaimImpl(raw, target, false);
+    }
+    fn reclaimPhysical(raw: *anyopaque, target: u64) u64 {
+        return reclaimImpl(raw, target, true);
+    }
+    fn reclaimImpl(raw: *anyopaque, _: u64, physical: bool) u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         // Never enter storage or interrupt serialization/publication. A
         // callback may originate in this object's own allocator operation.
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
         const segment = self.segment orelse return 0;
-        const bytes = if (segment.budgeted) |*budgeted| budgeted.reservation.bytes else 0;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(segment.owner) orelse return 0;
+        defer scope.deinit();
+        const bytes = if (physical) segment.limit.live_bytes else if (segment.budgeted) |*budgeted| budgeted.reservation.bytes else 0;
         self.enabled = false;
         self.clearPending();
         return bytes;
@@ -12126,7 +12134,7 @@ const RuntimePdfPageTextSpool = struct {
 
     fn putPage(self: *@This(), page: usize, value: document_extraction_mod.PdfPageText) !void {
         if (self.reclaimer_id == 0) if (self.manager()) |m| {
-            self.reclaimer_id = try m.registerReclaimer(.document_extraction_working_set, self, reclaim);
+            self.reclaimer_id = try m.registerReclaimerWithOptions(.document_extraction_working_set, self, reclaim, .{ .reclaim_physical = reclaimPhysical });
             self.reclaimer_manager = m;
         };
         // An unrelated executor may reclaim this buffer. Neither its payloads
@@ -13817,12 +13825,20 @@ const DocumentPreparationPipeline = struct {
             self.computed = false;
         }
         fn reclaim(ptr: *anyopaque, target_bytes: u64) u64 {
+            return reclaimImpl(ptr, target_bytes, false);
+        }
+        fn reclaimPhysical(ptr: *anyopaque, target_bytes: u64) u64 {
+            return reclaimImpl(ptr, target_bytes, true);
+        }
+        fn reclaimImpl(ptr: *anyopaque, target_bytes: u64, physical: bool) u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.ready.load(.acquire) or !self.window_mutex.tryLock()) return 0;
             defer self.window_mutex.unlock();
             // A transferred window still uses this job's allocator. Reclaim
             // only optional state, never buffers already borrowed by the owner.
             if (self.consumed) return 0;
+            var scope = resource_manager_mod.ReclamationScope.tryAcquire(if (self.budgeted) |*budget| budget.threadSafeAllocator() else platform.allocator.concurrentFallback()) orelse return 0;
+            defer scope.deinit();
             // Allocator callbacks must not wait on a source-cache map lock
             // (the allocation which triggered us may already hold it).
             if ((self.source != null or self.pdf != null) and self.cache.mutex.tryLock()) {
@@ -13838,16 +13854,18 @@ const DocumentPreparationPipeline = struct {
                 self.source = null;
                 self.cache.mutex.unlock(self.cache.io);
             }
-            const window_bytes = if (self.window) |*w| w.lease.reservedBytes() else 0;
-            const before = if (self.budgeted) |*b| b.reservation.bytes else 0;
+            // Render output uses this job's allocator as its backing. Its
+            // physical bytes are already in live_bytes; count them once.
+            const window_bytes = if (physical) 0 else if (self.window) |*w| w.lease.reservedBytes() else 0;
+            const before = if (self.budgeted) |*b| (if (physical) b.live_bytes else b.reservation.bytes) else 0;
             self.clearPrepared();
             const own_bytes = if (self.budgeted) |*b| blk: {
                 _ = b.releaseUnusedCredit();
-                break :blk before -| b.reservation.bytes;
+                break :blk before -| (if (physical) b.live_bytes else b.reservation.bytes);
             } else 0;
             // Released source/PDF pins become idle immediately. The cache's
             // callback uses tryLock for both map and allocator reentrancy.
-            const cache_bytes = if (self.cache.budgeted != null) PreparedDocumentSourceCache.reclaim(self.cache, target_bytes) else 0;
+            const cache_bytes = if (self.cache.budgeted != null) PreparedDocumentSourceCache.reclaimImpl(self.cache, target_bytes, physical) else 0;
             pipeline_metrics.prefetch(.reclaimed);
             return @as(u64, @intCast(window_bytes)) +| own_bytes +| cache_bytes;
         }
@@ -14058,7 +14076,7 @@ const DocumentPreparationPipeline = struct {
             if (self.runtime.config.resource_manager orelse self.runtime.index_manager.resource_manager) |manager|
                 job.budgeted = resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, backing, 1);
             if (job.budgeted) |*budgeted|
-                job.reclaimer_id = try budgeted.reservation.manager.registerReclaimer(.document_extraction_working_set, job, Job.reclaim);
+                job.reclaimer_id = try budgeted.reservation.manager.registerReclaimerWithOptions(.document_extraction_working_set, job, Job.reclaim, .{ .reclaim_physical = Job.reclaimPhysical });
             applyDocumentExtractionRuntimePolicy(&job.config);
             if (self.runtime.config.remote_content) |remote| job.remote_snapshot = try remote.acquire();
             if (job.remote_snapshot) |snapshot| job.remote_config = snapshot.config.*;
@@ -14316,9 +14334,10 @@ const PreparedDocumentSourceCache = struct {
 
     fn cacheFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.lockAllocator();
+        const reuse = @import("antfly_platform").allocator.reclamation.Guard.reuse(&self.allocator_mutex);
+        if (!reuse) self.lockAllocator();
+        defer if (!reuse) self.allocator_mutex.unlock();
         self.rawAllocator().rawFree(memory, alignment, ret_addr);
-        self.allocator_mutex.unlock();
     }
 
     pub fn deinit(self: *@This()) void {
@@ -14382,10 +14401,16 @@ const PreparedDocumentSourceCache = struct {
 
     fn ensureReclaimerAssumeLocked(self: *@This()) !void {
         if (self.reclaimer_id != 0) return;
-        if (self.budgeted) |*budgeted| self.reclaimer_id = try budgeted.reservation.manager.registerReclaimer(.document_extraction_working_set, self, reclaim);
+        if (self.budgeted) |*budgeted| self.reclaimer_id = try budgeted.reservation.manager.registerReclaimerWithOptions(.document_extraction_working_set, self, reclaim, .{ .reclaim_physical = reclaimPhysical });
     }
 
     fn reclaim(raw: *anyopaque, target_bytes: u64) u64 {
+        return reclaimImpl(raw, target_bytes, false);
+    }
+    fn reclaimPhysical(raw: *anyopaque, target_bytes: u64) u64 {
+        return reclaimImpl(raw, target_bytes, true);
+    }
+    fn reclaimImpl(raw: *anyopaque, target_bytes: u64, physical: bool) u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock(self.io);
@@ -14393,14 +14418,19 @@ const PreparedDocumentSourceCache = struct {
         // A reservation callback may originate inside this very allocator.
         // Detect that case without blocking/reentering its mutex.
         if (!self.allocator_mutex.tryLock()) return 0;
-        const before = self.budgeted.?.reservation.bytes;
+        defer self.allocator_mutex.unlock();
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(if (self.budgeted) |*budget| budget.threadSafeAllocator() else self.backing_alloc) orelse return 0;
+        defer scope.deinit();
+        const guard = @import("antfly_platform").allocator.reclamation.Guard;
+        if (!guard.allowed()) return 0;
+        guard.enterReclamation(&self.allocator_mutex);
+        defer guard.leave();
+        const before = if (physical) self.budgeted.?.live_bytes else self.budgeted.?.reservation.bytes;
         var reclaimed = self.budgeted.?.releaseUnusedCredit();
-        self.allocator_mutex.unlock();
+        if (physical) reclaimed = 0;
         while (reclaimed < target_bytes and self.reclaimIdleAssumeLocked()) {
-            self.lockAllocator();
             _ = self.budgeted.?.releaseUnusedCredit();
-            reclaimed = before -| self.budgeted.?.reservation.bytes;
-            self.allocator_mutex.unlock();
+            reclaimed = before -| (if (physical) self.budgeted.?.live_bytes else self.budgeted.?.reservation.bytes);
         }
         return reclaimed;
     }
@@ -19169,7 +19199,7 @@ const PrecommitResultCache = struct {
             self.budgeted = resource_manager_mod.BudgetedAllocator.init(m, .document_extraction_working_set, alloc, 1);
             errdefer self.budgeted.?.deinit();
             self.staging.backing = self.budgeted.?.allocator();
-            self.reclaimer_id = try m.registerReclaimer(.document_extraction_working_set, self, reclaim);
+            self.reclaimer_id = try m.registerReclaimerWithOptions(.document_extraction_working_set, self, reclaim, .{ .reclaim_physical = reclaimPhysical });
         }
     }
 
@@ -19208,15 +19238,23 @@ const PrecommitResultCache = struct {
     }
 
     fn reclaim(raw: *anyopaque, target_bytes: u64) u64 {
+        return reclaimImpl(raw, target_bytes, false);
+    }
+    fn reclaimPhysical(raw: *anyopaque, target_bytes: u64) u64 {
+        return reclaimImpl(raw, target_bytes, true);
+    }
+    fn reclaimImpl(raw: *anyopaque, target_bytes: u64, physical: bool) u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
         const budget = if (self.budgeted) |*value| value else return 0;
-        const before = budget.reservation.bytes;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(budget.threadSafeAllocator()) orelse return 0;
+        defer scope.deinit();
+        const before = if (physical) budget.live_bytes else budget.reservation.bytes;
         self.releaseSpareCredit();
         const alloc = self.staging.allocator();
         var rows = self.rows.iterator();
-        while (before -| budget.reservation.bytes < target_bytes) {
+        while (before -| (if (physical) budget.live_bytes else budget.reservation.bytes) < target_bytes) {
             const entry = rows.next() orelse break;
             const key = entry.key_ptr.*;
             const value = entry.value_ptr.*;
@@ -19229,7 +19267,7 @@ const PrecommitResultCache = struct {
         }
         if (self.rows.count() == 0) self.rows.clearAndFree(alloc);
         self.releaseSpareCredit();
-        return before -| budget.reservation.bytes;
+        return before -| (if (physical) budget.live_bytes else budget.reservation.bytes);
     }
 
     fn restoreUnit(self: *@This(), alloc: Allocator, key: []const u8, unit: *document_extraction_mod.Unit) !void {
@@ -19363,6 +19401,24 @@ test "shared PDF precommit cache yields to larger render windows and downloads" 
         var after = try manager.reserve(.document_extraction_working_set, 64 * 1024);
         after.release();
     }
+}
+
+test "shared PDF precommit physical reclamation frees payload despite unused credit" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var cache: PrecommitResultCache = .{};
+    try cache.init(alloc, &manager);
+    defer cache.deinit();
+    try cache.stage(&.{ .{ .key = "first", .value = "first retained result" }, .{ .key = "second", .value = "second retained result" } });
+    const scratch = try cache.budgeted.?.reserveScratch(32 * 1024);
+    scratch.release();
+    const live = cache.budgeted.?.live_bytes;
+    try std.testing.expect(cache.budgeted.?.reservation.bytes > live);
+    const freed = manager.reclaimHostMemory(1);
+    try std.testing.expect(freed > 0);
+    try std.testing.expectEqual(live - cache.budgeted.?.live_bytes, freed);
+    try std.testing.expectEqual(@as(usize, 1), cache.rows.count());
 }
 
 test "shared PDF precommit cache reclamation skips locked borrowers and preserves useful peers" {
@@ -45085,15 +45141,22 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(doc_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = doc_key, .value = "{}" }, .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    var request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
     for (0..2) |_| for (0..32) |i| {
         const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
         defer alloc.free(config);
+        const producer = try std.fmt.allocPrint(alloc, "{{\"type\":\"vector_labels\",\"config\":{s}}}", .{config});
+        defer alloc.free(producer);
+        // Exercise real recipe changes while preserving publication fencing.
+        _ = try index_manager.upsertEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = producer });
+        request.producer_json = producer;
         try processVectorLabels(&runtime, request, config, null, "{}", output_key, &window);
     };
     try std.testing.expectEqual(@as(usize, 32), fake.calls);

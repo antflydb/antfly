@@ -589,9 +589,18 @@ const Worker = struct {
 
     fn resourceRequest(raw: *anyopaque, bytes: []const u8) !rpc.ResourceReply {
         const self: *Worker = @ptrCast(@alignCast(raw));
+        if (self.endpoint.closed.load(.acquire)) return error.ResourceOwnerShuttingDown;
         var arena = std.heap.ArenaAllocator.init(self.owner.alloc);
         defer arena.deinit();
         const incoming = try std.json.parseFromSliceLeaky(wire.ResourceRequest, arena.allocator(), bytes, .{});
+        if (incoming.operation == .reclaim_host) {
+            // Storage callbacks can release owner credits. Never hold the RPC
+            // lease/observation mutex across that cross-owner operation.
+            const target = try std.json.parseFromSliceLeaky(u64, arena.allocator(), incoming.data, .{});
+            const budget = self.owner.budget.?;
+            const reclaim = budget.reclaim_host orelse return .{};
+            return .{ .value = reclaim(budget.context, target) };
+        }
         self.resources.lockUncancelable(self.owner.io);
         defer self.resources.unlock(self.owner.io);
         const result = self.resourceOperation(arena.allocator(), .{ .operation = incoming.operation, .data = incoming.data }) catch |err| {
@@ -608,6 +617,11 @@ const Worker = struct {
         if (self.endpoint.closed.load(.acquire)) return error.ResourceOwnerShuttingDown;
         const budget = self.owner.budget.?;
         switch (envelope.operation) {
+            .reclaim_host => {
+                const target = try std.json.parseFromSliceLeaky(u64, arena, envelope.data, .{});
+                const reclaim = budget.reclaim_host orelse return 0;
+                return reclaim(budget.context, target);
+            },
             .reserve => {
                 const reservation = try std.json.parseFromSliceLeaky(wire.Reservation, arena, envelope.data, .{});
                 // No allocation may fail after a successful reserve before it
@@ -949,6 +963,7 @@ const Child = struct {
             .release_admission = release,
             .observe_prompt_cache = observePrompt,
             .observe_tokenizer_cache = observeTokenizer,
+            .reclaim_host = reclaimHost,
         };
     }
     fn retainContext(_: *anyopaque) callconv(.c) u8 {
@@ -989,6 +1004,10 @@ const Child = struct {
         const self: *Child = @ptrCast(@alignCast(raw));
         _ = self.resourceCall(.release, lease);
     }
+    fn reclaimHost(raw: *anyopaque, target: u64) callconv(.c) u64 {
+        const self: *Child = @ptrCast(@alignCast(raw));
+        return self.resourceCall(.reclaim_host, target).value;
+    }
     fn observe(self: *Child, operation: wire.Operation, key: usize, previous: u64, next: u64) u8 {
         const response = self.resourceCall(operation, wire.Observation{ .key = key, .previous = previous, .next = next });
         const status: bridge.Status = .{ .code = response.code, .detail = response.detail };
@@ -1011,7 +1030,7 @@ fn validateResourceReply(operation: wire.Operation, reply_value: rpc.ResourceRep
     if (reply_value.code == 0 and reply_value.detail == 0) {
         if (operation == .reserve) {
             if (reply_value.value == 0 or reply_value.value > std.math.maxInt(usize)) return error.InvalidResourceReply;
-        } else if (reply_value.value != 0) return error.InvalidResourceReply;
+        } else if (operation != .reclaim_host and reply_value.value != 0) return error.InvalidResourceReply;
         return;
     }
     if (operation != .release and reply_value.value == 0) {
@@ -1083,6 +1102,14 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     const Budget = struct {
         leased: bool = false,
         cached: u64 = 0,
+        worker: ?*Worker = null,
+        fn reclaim(raw: *anyopaque, target: u64) callconv(.c) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const worker = self.worker.?;
+            std.debug.assert(worker.resources.tryLock());
+            worker.resources.unlock(worker.owner.io);
+            return target / 2;
+        }
         fn retainContext(_: *anyopaque) callconv(.c) u8 {
             return 1;
         }
@@ -1126,6 +1153,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
             .release_admission = Budget.release,
             .observe_prompt_cache = Budget.observe,
             .observe_tokenizer_cache = Budget.observe,
+            .reclaim_host = Budget.reclaim,
         },
     };
     var worker: Worker = .{
@@ -1134,6 +1162,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
         .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.documentRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
     };
     defer worker.releaseResources();
+    budget.worker = &worker;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const reserve_json = try std.json.Stringify.valueAlloc(arena.allocator(), wire.Reservation{ .amounts = .{
@@ -1154,6 +1183,10 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     }
     const resource_json = try std.json.Stringify.valueAlloc(arena.allocator(), wire.ResourceRequest{ .operation = .reserve, .data = reserve_json }, .{});
     const reserved = try Worker.resourceRequest(&worker, resource_json);
+    const reclaim_json = try std.json.Stringify.valueAlloc(arena.allocator(), wire.ResourceRequest{ .operation = .reclaim_host, .data = "128" }, .{});
+    const reclaimed = try Worker.resourceRequest(&worker, reclaim_json);
+    try validateResourceReply(.reclaim_host, reclaimed);
+    try std.testing.expectEqual(@as(u64, 64), reclaimed.value);
     try validateResourceReply(.reserve, reserved);
     try std.testing.expectEqual(@as(u64, 7), reserved.value);
     const denied = try Worker.resourceRequest(&worker, resource_json);
@@ -1168,6 +1201,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     _ = try worker.resourceOperation(arena.allocator(), .{ .operation = .prompt_cache, .data = "{\"key\":9,\"previous\":0,\"next\":64}" });
     try std.testing.expectError(error.InvalidGenerationAdmission, worker.resourceOperation(arena.allocator(), .{ .operation = .release, .data = "8" }));
     worker.endpoint.closed.store(true, .release);
+    try std.testing.expectError(error.ResourceOwnerShuttingDown, Worker.resourceRequest(&worker, reclaim_json));
     try std.testing.expect(budget.leased);
     try std.testing.expectEqual(@as(u64, 64), budget.cached);
     try std.testing.expectError(error.ResourceOwnerShuttingDown, worker.resourceOperation(arena.allocator(), .{ .operation = .reserve, .data = reserve_json }));
@@ -1243,6 +1277,8 @@ test "inference worker retains reservations until reaped cleanup and owns partia
 }
 
 test "inference worker resource replies distinguish denials from ownership uncertainty" {
+    try validateResourceReply(.reclaim_host, .{ .value = 128 });
+    try validateResourceReply(.reclaim_host, .{});
     for ([_]anyerror{ error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable }) |err| {
         const status = bridge.statusFromError(err);
         const denial: rpc.ResourceReply = .{ .code = status.code, .detail = status.detail };

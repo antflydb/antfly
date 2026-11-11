@@ -49,14 +49,20 @@ pub const Pool = struct {
         const self = try alloc.create(Pool);
         errdefer alloc.destroy(self);
         self.* = .{ .alloc = alloc, .manager = manager };
-        self.identity = try manager.registerReclaimer(.dense_search_working_set, self, reclaimCallback);
+        self.identity = try manager.registerReclaimerWithOptions(.dense_search_working_set, self, reclaimCallback, .{ .reclaim_physical = reclaimPhysical });
         return self;
     }
 
     pub fn destroy(self: *Pool) void {
         self.manager.unregisterReclaimer(self.identity);
         std.debug.assert(self.active.load(.acquire) == 0);
-        _ = self.reclaim(std.math.maxInt(u64));
+        // All users and pressure callbacks have drained. Destruction must
+        // release idle slots even when the backing declines pressure frees.
+        while (self.idle_count != 0) {
+            self.idle_count -= 1;
+            self.destroySlot(self.idle[self.idle_count]);
+        }
+        self.idle_bytes = 0;
         self.alloc.destroy(self);
     }
 
@@ -124,18 +130,28 @@ pub const Pool = struct {
         return self.reclaim(target);
     }
 
+    fn reclaimPhysical(ctx: *anyopaque, target: u64) u64 {
+        const self: *Pool = @ptrCast(@alignCast(ctx));
+        return self.reclaimImpl(target, true);
+    }
     pub fn reclaim(self: *Pool, target: u64) u64 {
+        return self.reclaimImpl(target, false);
+    }
+    fn reclaimImpl(self: *Pool, target: u64, physical: bool) u64 {
+        var scope = resources.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
         var freed: u64 = 0;
         while (freed < target) {
-            self.lock();
+            if (!self.mutex.tryLock()) break;
             if (self.idle_count == 0) {
                 self.mutex.unlock();
                 break;
             }
             self.idle_count -= 1;
             const slot = self.idle[self.idle_count];
-            const bytes = slot.budget.reservation.bytes;
-            self.idle_bytes -= bytes;
+            const credit = slot.budget.reservation.bytes;
+            const bytes = if (physical) slot.budget.live_bytes + @sizeOf(Slot) else credit;
+            self.idle_bytes -= credit;
             self.mutex.unlock();
             self.destroySlot(slot);
             freed +|= bytes;

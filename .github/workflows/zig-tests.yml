@@ -71,6 +71,49 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
       suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
+  inference-memory-pressure:
+    name: zig / bounded inference memory pressure
+    needs: [admission, changes]
+    if: >-
+      ${{ !cancelled() && success() &&
+      needs.admission.result == 'success' &&
+      inputs.validation_scope != 'inference-e2e' &&
+      needs.changes.outputs.zig_tests == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+      - name: Build admission regressions
+        working-directory: zig/pkg/inference
+        run: zig build test-bin -Dtarget=x86_64-linux-musl -Dmetal=false -Dcuda=false -Dblas=off -Dtest-filter=runtime.tier.memory -j2
+      - name: Qualify 1 CPU and 2 GiB without swap
+        env:
+          PRESSURE_IMAGE: python@sha256:4840d514c583a4d3d8cad3940e68dee6f0f6f3635c12fcd0a3d74c21a5b93a54
+        run: |
+          set -euo pipefail
+          docker pull "$PRESSURE_IMAGE"
+          mkdir -p zig/zig-out
+          docker run --rm --network none --cpus 1 --memory 2g --memory-swap 2g \
+            --mount "type=bind,src=$PWD/zig/pkg/inference/zig-out/bin/antfly-inference-tests,dst=/tests,readonly" \
+            --mount "type=bind,src=$PWD/scripts/ci/run_inference_memory_pressure.py,dst=/run.py,readonly" \
+            --mount type=volume,dst=/data \
+            "$PRESSURE_IMAGE" sh -c 'python /run.py --test-binary /tests --directory /data && python /run.py --test-binary /tests --directory /data --hot-offset-mib 3072' \
+            2>&1 | tee zig/zig-out/inference-memory-pressure.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: inference-memory-pressure
+          path: zig/zig-out/inference-memory-pressure.log
+          if-no-files-found: ignore
+
   grep-qualification:
     if: >-
       ${{ !cancelled() &&
@@ -1989,7 +2032,7 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/native-sdk-artifact/"*.tar.gz -C "${RUNNER_TEMP}/native-sdk"
       - name: Set up Go
         if: matrix.sdk == 'go'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.2
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
@@ -2073,7 +2116,7 @@ jobs:
       - name: Install candidate E2E executable
         run: tar -xzf "${RUNNER_TEMP}/pgwire-driver-artifact/"*.tar.gz -C zig
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.2
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false

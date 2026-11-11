@@ -2296,7 +2296,14 @@ fn inferenceAdmissionResourceBudget(
         .try_reserve = reserveInferenceAdmissionResources,
         .retain = retainInferenceAdmissionResources,
         .release = releaseInferenceAdmissionResources,
+        .reclaim_host = reclaimInferenceHostMemory,
     };
+}
+
+fn reclaimInferenceHostMemory(context: *anyopaque, target: usize) usize {
+    const owner: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const reclaim = owner.budget.reclaim_host orelse return 0;
+    return std.math.cast(usize, reclaim(owner.budget.context, target)) orelse std.math.maxInt(usize);
 }
 
 fn retainLinkedResourceBudgetContext(context: *anyopaque) bool {

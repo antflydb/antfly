@@ -998,7 +998,7 @@ pub const GraphPredicateCache = struct {
     fn ensureReclaimer(self: *@This(), manager: *resource_manager_mod.ResourceManager) bool {
         if (!self.mutex.tryLock()) return false;
         defer self.mutex.unlock();
-        if (self.reclaimer_id == 0) self.reclaimer_id = manager.registerReclaimer(.graph_predicate_cache, self, reclaim) catch return false;
+        if (self.reclaimer_id == 0) self.reclaimer_id = manager.registerReclaimerWithOptions(.graph_predicate_cache, self, reclaim, .{ .reclaim_physical = reclaim }) catch return false;
         return true;
     }
     fn reclaim(raw: *anyopaque, target: u64) u64 {
@@ -1006,11 +1006,14 @@ pub const GraphPredicateCache = struct {
         var freed: u64 = 0;
         for (0..self.entries.len) |_| {
             if (freed >= target or !self.mutex.tryLock()) break;
+            var scope: ?resource_manager_mod.ReclamationScope = null;
+            defer if (scope) |*held| held.deinit();
             const retired = blk: {
                 defer self.mutex.unlock();
                 for (self.entries, 0..) |entry, i| if (entry) |value| {
                     // Removing a pinned entry cannot release physical bytes.
                     if (value.refs.load(.acquire) != 1) continue;
+                    scope = resource_manager_mod.ReclamationScope.tryAcquire(value.alloc) orelse continue;
                     break :blk self.remove(i);
                 };
                 break :blk null;

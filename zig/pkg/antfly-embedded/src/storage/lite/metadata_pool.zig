@@ -117,9 +117,9 @@ pub const MetadataPool = struct {
         // A nested backing allocator may request reclamation while our own
         // allocator is busy. Never reenter it through a blocking free.
         const budget = if (self.budget) |*owner| owner else null;
-        if (budget) |owner| if (!owner.allocator_mutex.tryLock()) return .{};
-        defer if (budget) |owner| owner.allocator_mutex.unlock();
-        const a = if (budget) |owner| owner.allocator() else if (self.backing) |backing| backing else return .{};
+        const a = if (budget) |owner| owner.threadSafeAllocator() else if (self.backing) |backing| backing else return .{};
+        var scope = resources.ReclamationScope.tryAcquire(a) orelse return .{};
+        defer scope.deinit();
         var freed: u64 = 0;
         while (freed < target) {
             if (!self.mutex.tryLock()) break;
@@ -134,11 +134,18 @@ pub const MetadataPool = struct {
             freed += @sizeOf(Node);
         }
         const logical = if (budget) |owner| owner.releaseUnusedCredit() else 0;
-        return .{ .physical = freed, .logical = logical };
+        return .{ .physical = freed, .logical = logical +| scope.releaseUnusedCredits(self.residentManager()) };
     }
     pub fn deinit(self: *@This()) void {
         std.debug.assert(self.active == 0);
-        _ = self.reclaim(std.math.maxInt(u64));
+        // Teardown owns the pool exclusively and must free even allocator
+        // chains that decline optional cross-thread pressure reclamation.
+        const a = if (self.budget) |*budget| budget.threadSafeAllocator() else self.backing;
+        if (a) |heap_allocator| while (self.idle) |node| {
+            self.idle = node.next;
+            self.idle_count -= 1;
+            heap_allocator.destroy(node);
+        };
         if (self.budget) |*budget| budget.deinit();
     }
 };

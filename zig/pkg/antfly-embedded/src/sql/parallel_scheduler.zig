@@ -41,28 +41,28 @@ pub const LockedAllocator = struct {
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         @import("spill.zig").Manager.prepareAllocator(self.allocator(), len);
-        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
-        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
+        @import("memory_budget.zig").AllocationGuard.enterLendable(self.shared_mutex orelse &self.mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         return self.backing.rawAlloc(len, alignment, ra);
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
-        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
-        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
+        @import("memory_budget.zig").AllocationGuard.enterLendable(self.shared_mutex orelse &self.mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         return self.backing.rawResize(bytes, alignment, len, ra);
     }
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
-        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
-        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
+        @import("memory_budget.zig").AllocationGuard.enterLendable(self.shared_mutex orelse &self.mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         return self.backing.rawRemap(bytes, alignment, len, ra);
     }
     fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {

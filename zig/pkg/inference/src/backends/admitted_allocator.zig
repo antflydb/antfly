@@ -30,16 +30,17 @@ pub const AdmittedAllocator = struct {
     trim_on_free: bool = false,
     live_bytes: usize = 0,
     reserved_bytes: usize = 0,
-    /// Borrowed from a live execution permit. Its owner must outlive every
-    /// allocation and must not reduce the permit while this credit is bound.
+    /// Capacity and bookkeeping node of the active execution permit.
     prepaid_host_bytes: usize = 0,
+    prepaid_reservation: ?*Reservation = null,
     metadata_bytes: usize = 0,
     admission_error: ?anyerror = null,
     blocks: ?*Header = null,
     reservations: ?*Reservation = null,
+    materialization: memory.HostMaterializationPool = .{},
 
     const quantum = 64 * 1024;
-    const Header = struct { prev: ?*Header, next: ?*Header, bytes: usize, alignment: std.mem.Alignment };
+    const Header = struct { prev: ?*Header, next: ?*Header, bytes: usize, alignment: std.mem.Alignment, materialization: memory.MaterializedHostAllocation = .{}, pooled_credit: memory.PooledHostCredit = .{} };
     const Reservation = struct { next: ?*Reservation, lease: ?memory.AdmissionLease, bytes: usize };
     pub const reservation_overhead = @sizeOf(Reservation);
 
@@ -70,16 +71,10 @@ pub const AdmittedAllocator = struct {
     pub const RunScope = struct {
         permit: sessions.RunPermit,
         owner: ?*AdmittedAllocator = null,
-        reservation: ?*Reservation = null,
 
         pub fn deinit(self: *@This()) void {
             if (self.owner) |owner| {
-                const node = self.reservation.?;
-                node.* = .{ .next = owner.reservations, .lease = self.permit.lease, .bytes = owner.prepaid_host_bytes };
-                owner.reservations = node;
-                owner.reserved_bytes += owner.prepaid_host_bytes;
-                owner.prepaid_host_bytes = 0;
-                self.permit.lease = null;
+                owner.adoptPrepaid(&self.permit);
                 // A failed external reduction conservatively keeps its lease.
                 // Later phases retry trim; final teardown always releases it.
                 owner.trim() catch {};
@@ -89,10 +84,46 @@ pub const AdmittedAllocator = struct {
         }
     };
 
+    fn adoptPrepaid(self: *@This(), permit: *sessions.RunPermit) void {
+        const node = self.prepaid_reservation.?;
+        node.* = .{ .next = self.reservations, .lease = permit.lease, .bytes = self.prepaid_host_bytes };
+        self.reservations = node;
+        self.reserved_bytes += self.prepaid_host_bytes;
+        self.prepaid_reservation = null;
+        self.prepaid_host_bytes = 0;
+        permit.lease = null;
+    }
+
+    fn updatePrepaid(raw: *anyopaque, lease: ?*const memory.AdmissionLease) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.prepaid_host_bytes = if (lease) |held| held.amounts.host_scratch_bytes else 0;
+    }
+
+    fn replacePrepaid(raw: *anyopaque, previous: *sessions.RunPermit, request: sessions.RunRequest) !sessions.RunPermit {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const session = self.session.?;
+        const admission = session.run_admission.?;
+        const amounts = try admission.estimateRequest(request, session.outputInfo());
+        if (amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
+        const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
+        try admission.validateOwnedHostScratch(std.math.add(usize, owned, amounts.host_scratch_bytes) catch return error.ResourceLimitExceeded);
+        var replacement = try session.admit(request);
+        errdefer replacement.deinit();
+        const node = try self.backing.create(Reservation);
+        errdefer self.backing.destroy(node);
+        const lease = &replacement.lease.?;
+        try self.materialization.adopt(lease);
+        self.adoptPrepaid(previous);
+        self.prepaid_reservation = node;
+        self.prepaid_host_bytes = lease.amounts.host_scratch_bytes;
+        self.metadata_bytes += @sizeOf(Reservation);
+        return replacement;
+    }
+
     pub fn admitRun(self: *@This(), request: sessions.RunRequest) !RunScope {
         const session = self.session orelse return error.InvalidAdmissionLeaseReduction;
         const admission = session.run_admission orelse return .{ .permit = try session.admit(request) };
-        if (self.admit != null or self.prepaid_host_bytes != 0 or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
+        if (self.admit != null or self.prepaid_reservation != null or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
         const amounts = try admission.estimateRequest(request, session.outputInfo());
         if (amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
         if (amounts.host_scratch_bytes < @sizeOf(Reservation)) return .{ .permit = try session.admit(request) };
@@ -103,9 +134,13 @@ pub const AdmittedAllocator = struct {
         // The execution lease covers this node too. Allocate it now so cleanup
         // can transfer retained outputs without allocation or reacquisition.
         const node = try self.backing.create(Reservation);
+        errdefer self.backing.destroy(node);
+        if (permit.lease) |*lease| try self.materialization.adopt(lease);
         self.metadata_bytes += @sizeOf(Reservation);
-        self.prepaid_host_bytes = amounts.host_scratch_bytes;
-        return .{ .permit = permit, .owner = self, .reservation = node };
+        self.prepaid_reservation = node;
+        updatePrepaid(self, if (permit.lease) |*lease| lease else null);
+        permit.pooled_execution = .{ .context = self, .retained = updatePrepaid, .replace = replacePrepaid };
+        return .{ .permit = permit, .owner = self };
     }
 
     pub fn ensureCapacity(self: *@This(), extra: usize) !void {
@@ -123,7 +158,13 @@ pub const AdmittedAllocator = struct {
             if (lease) |*active| active.release();
             if (self.rollback_admission) |rollback| rollback(self.admission_context.?, amount);
         }
-        const reservation = try self.backing.create(Reservation);
+        const reservation = blk: {
+            const claim = memory.HostAllocationScope.preserveClaim();
+            defer claim.restore();
+            break :blk try self.backing.create(Reservation);
+        };
+        errdefer self.backing.destroy(reservation);
+        if (lease) |*active| try self.materialization.adopt(active);
         reservation.* = .{ .next = self.reservations, .lease = lease, .bytes = amount };
         self.reservations = reservation;
         self.metadata_bytes += @sizeOf(Reservation);
@@ -148,7 +189,7 @@ pub const AdmittedAllocator = struct {
             const spare = (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes);
             const reduction = @min(spare, reservation.bytes);
             if (reduction != 0) {
-                if (reservation.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = reservation.bytes - reduction });
+                if (reservation.lease) |*lease| try lease.reduce(.{ .host_scratch_bytes = reservation.bytes - reduction });
                 reservation.bytes -= reduction;
                 self.reserved_bytes -= reduction;
             }
@@ -165,6 +206,7 @@ pub const AdmittedAllocator = struct {
     pub fn deinit(self: *@This()) void {
         while (self.blocks) |block| {
             self.blocks = block.next;
+            block.materialization.release();
             self.backing.rawFree(@as([*]u8, @ptrCast(block))[0..block.bytes], block.alignment, @returnAddress());
         }
         while (self.reservations) |reservation| {
@@ -173,6 +215,7 @@ pub const AdmittedAllocator = struct {
             self.backing.destroy(reservation);
             if (lease) |*active| active.release();
         }
+        self.materialization.deinit();
         self.live_bytes = 0;
         self.reserved_bytes = 0;
         self.metadata_bytes = 0;
@@ -186,9 +229,21 @@ pub const AdmittedAllocator = struct {
             self.admission_error = err;
             return null;
         };
+        var allocation = memory.HostAllocationScope.begin();
+        defer allocation.deinit();
+        const tracks_pool = self.materialization.hasMaterializationOwner() and allocation.claimForPool();
         const base = self.backing.rawAlloc(bytes, alignment.max(.of(Header)), ra) orelse return null;
         const header: *Header = @ptrCast(@alignCast(base));
-        header.* = .{ .prev = null, .next = self.blocks, .bytes = bytes, .alignment = alignment.max(.of(Header)) };
+        // Materialization initializes the embedded credit after touching pages.
+        const materialization = if (tracks_pool)
+            self.materialization.materialize(base[0..bytes], &header.pooled_credit)
+        else
+            memory.MaterializedHostAllocation{};
+        header.prev = null;
+        header.next = self.blocks;
+        header.bytes = bytes;
+        header.alignment = alignment.max(.of(Header));
+        header.materialization = materialization;
         if (self.blocks) |old| old.prev = header;
         self.blocks = header;
         self.live_bytes += bytes;
@@ -206,7 +261,11 @@ pub const AdmittedAllocator = struct {
         if (new_len == 0 or new_len > buffer.len) return false;
         const bytes = std.math.add(usize, overhead, new_len) catch return false;
         const old_bytes = header.bytes;
-        if (!self.backing.rawResize(base[0..old_bytes], header.alignment, bytes, ra)) return false;
+        const reduction = header.materialization.prepareShrink(old_bytes - bytes);
+        if (!self.backing.rawResize(base[0..old_bytes], header.alignment, bytes, ra)) {
+            header.materialization.rollbackShrink(reduction);
+            return false;
+        }
         header.bytes = bytes;
         self.live_bytes -= old_bytes - bytes;
         if (self.trim_on_free) self.trim() catch {};
@@ -222,6 +281,7 @@ pub const AdmittedAllocator = struct {
         if (header.prev) |prev| prev.next = header.next else self.blocks = header.next;
         if (header.next) |next| next.prev = header.prev;
         self.live_bytes -= header.bytes;
+        header.materialization.release();
         self.backing.rawFree(base[0..header.bytes], header.alignment, ra);
         if (self.trim_on_free and (self.live_bytes == 0 or (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes) >= quantum)) self.trim() catch {};
     }
@@ -417,4 +477,168 @@ test "admission prepaid workspace grows only its deficit and rolls back failed s
     a.free(payload);
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+const MaterializationTestOwner = struct {
+    controller: memory.AdmissionController = .{},
+    fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var lease = try self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+        lease.live_reserved_bytes = bytes;
+        self.controller.live_pending_bytes += bytes;
+        return lease;
+    }
+};
+
+test "memory chunk admission materializes preprocessing and preserves unused credit after trim" {
+    var owner = MaterializationTestOwner{};
+    defer owner.controller.deinit();
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &owner, .admit = MaterializationTestOwner.admit };
+    defer admitted.deinit();
+    const a = admitted.allocator();
+    var bytes = try a.alloc(u8, 8192);
+    defer a.free(bytes);
+    @memset(bytes, 61);
+    try std.testing.expect(owner.controller.live_pending_bytes < 64 * 1024);
+    try std.testing.expect(owner.controller.live_pending_bytes != 0);
+    try admitted.trim();
+    // Only small reservation metadata remains conservative; trim cannot
+    // convert unallocated promises into fictitious resident bytes.
+    try std.testing.expect(owner.controller.live_pending_bytes <= admitted.metadata_bytes);
+    try std.testing.expect(owner.controller.live_pending_bytes != 0);
+    bytes = try a.realloc(bytes, 4096);
+    try std.testing.expectEqual(@as(u8, 61), bytes[0]);
+    a.free(bytes);
+    bytes = &.{};
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), owner.controller.live_pending_bytes);
+}
+
+test "memory prepaid execution and overflow chunks materialize one backing allocation" {
+    for ([_]bool{ false, true }) |wrapped| {
+        var owner = MaterializationTestOwner{};
+        defer owner.controller.deinit();
+        var admitted = AdmittedAllocator{
+            .backing = std.testing.allocator,
+            .admission_context = &owner,
+            .admit = MaterializationTestOwner.admit,
+        };
+        defer admitted.deinit();
+        var prepaid = try MaterializationTestOwner.admit(&owner, 64 * 1024);
+        defer prepaid.release();
+        try admitted.materialization.adopt(&prepaid);
+        admitted.prepaid_host_bytes = prepaid.amounts.host_scratch_bytes;
+        var execution = try memory.HostExecutionScope.begin(&prepaid);
+        defer execution.deinit();
+
+        const tracker = if (wrapped) try memory.HostAllocator.create(admitted.allocator()) else null;
+        defer if (tracker) |value| value.deinit();
+        const allocator = if (tracker) |value| value.allocator() else admitted.allocator();
+        const payload = try allocator.alloc(u8, 128 * 1024);
+        var payload_live = true;
+        defer if (payload_live) allocator.free(payload);
+        try std.testing.expectEqual(admitted.metadata_bytes, owner.controller.live_pending_bytes);
+        // No duplicate attribution to the current run by the outer tracker.
+        const total = admitted.prepaid_host_bytes + admitted.reserved_bytes;
+        allocator.free(payload);
+        payload_live = false;
+        try std.testing.expectEqual(total, owner.controller.live_pending_bytes);
+        try admitted.trim();
+        try std.testing.expectEqual(admitted.prepaid_host_bytes, owner.controller.live_pending_bytes);
+    }
+}
+
+test "memory pooled allocator credits a nested execution before its own pool" {
+    var owner = MaterializationTestOwner{};
+    defer owner.controller.deinit();
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &owner, .admit = MaterializationTestOwner.admit };
+    defer admitted.deinit();
+    var prepaid = try MaterializationTestOwner.admit(&owner, 64 * 1024);
+    defer prepaid.release();
+    try admitted.materialization.adopt(&prepaid);
+    admitted.prepaid_host_bytes = prepaid.amounts.host_scratch_bytes;
+    try prepaid.reduce(.{});
+
+    var execution_lease = try MaterializationTestOwner.admit(&owner, 64 * 1024);
+    defer execution_lease.release();
+    var execution = try memory.HostExecutionScope.begin(&execution_lease);
+    defer execution.deinit();
+    const tracker = try memory.HostAllocator.create(admitted.allocator());
+    defer tracker.deinit();
+    const allocator = tracker.allocator();
+    const bytes = try allocator.alloc(u8, 32 * 1024);
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(64 * 1024 - admitted.live_bytes, owner.controller.live_pending_bytes);
+}
+
+test "memory pooled execution rebinds a geometry replacement and retains its outputs" {
+    const tensor = @import("tensor.zig");
+    const Probe = struct {
+        controller: *memory.AdmissionController,
+        expected: usize = 0,
+
+        fn run(raw: *anyopaque, _: []const tensor.Tensor, allocator: std.mem.Allocator) ![]tensor.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.expected, self.controller.snapshot().host_scratch_bytes);
+            const outputs = try allocator.alloc(tensor.Tensor, 1);
+            errdefer allocator.free(outputs);
+            outputs[0] = try tensor.Tensor.initFloat32(allocator, "output", &.{1}, &.{3});
+            return outputs;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{};
+        }
+        fn geometry(_: *anyopaque, _: sessions.ShapeInputs, _: usize) !?sessions.RunGeometry {
+            return .{ .sequence = 1, .output_bytes = 4, .workspace_bytes = 64 * 1024 };
+        }
+        fn backend(_: *anyopaque) @import("backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: sessions.Session.VTable = .{
+            .run = run,
+            .inputInfo = info,
+            .outputInfo = info,
+            .runGeometry = geometry,
+            .backend = backend,
+            .close = close,
+        };
+    };
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    var probe = Probe{ .controller = &controller };
+    const session = sessions.Session{ .ptr = &probe, .vtable = &Probe.vtable, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .scratch_limit_bytes = 96 * 1024 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session, .trim_on_free = true };
+    defer admitted.deinit();
+    const a = admitted.allocator();
+    const request: sessions.RunRequest = .{ .workspace_bytes = 16 * 1024, .output_bytes = 0, .input_bytes = 1024 };
+    var scope = try admitted.admitRun(request);
+    defer scope.deinit();
+    const inputs = try a.alloc(u8, 512);
+    defer a.free(inputs);
+    var replanned = request;
+    replanned.pre_admitted_host_bytes = request.input_bytes;
+    replanned.workspace_bytes = 64 * 1024;
+    replanned.output_bytes = 4;
+    const replacement = try session.run_admission.?.estimateRequest(replanned, &.{});
+    probe.expected = request.input_bytes + replacement.host_scratch_bytes;
+
+    controller.configureForcedRunDenialsForTesting(1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, scope.permit.runWithControl(&.{}, a, null));
+    try std.testing.expectEqual(request.input_bytes, admitted.prepaid_host_bytes);
+    try std.testing.expectEqual(request.input_bytes, controller.snapshot().host_scratch_bytes);
+    const outputs = try scope.permit.runWithControl(&.{}, a, null);
+    defer a.free(outputs);
+    defer outputs[0].deinit();
+    try std.testing.expectEqual(replacement.host_scratch_bytes, admitted.prepaid_host_bytes);
+    scope.deinit();
+    try std.testing.expectEqualSlices(f32, &.{3}, outputs[0].asFloat32());
+    try std.testing.expectEqual(admitted.reserved_bytes, controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(admitted.reserved_bytes >= admitted.live_bytes);
 }

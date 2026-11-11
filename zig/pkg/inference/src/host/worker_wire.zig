@@ -17,12 +17,12 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 6;
+pub const version: u32 = 7;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
-pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache, document_store };
+pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache, document_store, reclaim_host };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
     kind: enum { progress, stream_start, stream_write, stream_close },

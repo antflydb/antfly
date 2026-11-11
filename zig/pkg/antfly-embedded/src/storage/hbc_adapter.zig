@@ -328,8 +328,9 @@ const HbcPhysicalAccounting = struct {
 
     fn release(self: *HbcPhysicalAccounting, bytes: u64, was_pinned: bool) void {
         if (bytes == 0) return;
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        const reuse = @import("antfly_platform").allocator.reclamation.Guard.reuse(&self.mutex);
+        if (!reuse) lockAtomic(&self.mutex);
+        defer if (!reuse) self.mutex.unlock();
         if (bytes > self.current_bytes) {
             if (self.resource_manager) |manager| manager.recordAccountingError();
             return;
@@ -1137,11 +1138,7 @@ pub const Cache = struct {
         self.mutex.unlockExclusive();
 
         if (old_manager) |manager| manager.unregisterReclaimer(old_reclaimer);
-        const identity = resource_manager.registerReclaimer(
-            .hbc_node_metadata_cache,
-            self,
-            reclaimForResourceManager,
-        ) catch |err| {
+        const identity = resource_manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, self, reclaimForResourceManager, .{ .reclaim_physical = reclaimPhysicalForResourceManager }) catch |err| {
             std.log.err("failed to register shared HBC cache reclaimer: {s}", .{@errorName(err)});
             return;
         };
@@ -1326,15 +1323,45 @@ pub const Cache = struct {
         std.debug.assert(previous != 0);
     }
 
-    fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+    fn reclaimPhysicalForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Cache = @ptrCast(@alignCast(context));
-        if (target_bytes == 0 or !self.mutex.tryLockExclusive()) return 0;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
+        if (!scope.tryLock(&self.physical_accounting.mutex) or !self.mutex.tryLockExclusive()) return 0;
         defer self.mutex.unlockExclusive();
         const before = self.physical_accounting.current();
-        while (before -| self.physical_accounting.current() < target_bytes) {
-            if (!self.evictOneLocked(.{ .namespace = 0, .id = 0 })) break;
+        const policy = if (self.resource_manager) |manager| manager.hbcCachePolicy() else null;
+        // A fixed number of linear passes preserves class preferences and
+        // CLOCK hot bits. Repeated first-victim scans become quadratic when
+        // pressure must skip many pinned entries.
+        for (0..2) |phase| {
+            inline for (.{ HbcCacheKind.vector, HbcCacheKind.metadata, HbcCacheKind.quantized, HbcCacheKind.node }) |kind| {
+                const name = @tagName(kind);
+                const class_before = self.physical_accounting.current();
+                const remaining = target_bytes -| (before -| class_before);
+                const limit = if (phase == 0 and policy != null)
+                    @min(remaining, hbcKindStats(&self.global_stats, kind).used_bytes -| policy.?.protectedBytes(hbcResourceCacheClass(kind)))
+                else
+                    remaining;
+                for (0..2) |temperature| {
+                    var entries = @field(self, name ++ "_cache").iterator();
+                    while (entries.next()) |entry| {
+                        if (class_before -| self.physical_accounting.current() >= limit) break;
+                        if (entry.value_ptr.*.refs.load(.acquire) != 1) continue;
+                        if (temperature == 0) if (@field(self, name ++ "_slots").get(entry.key_ptr.*)) |slot| {
+                            if (@field(self, name ++ "_clock").items[slot].referenced.load(.acquire)) continue;
+                        };
+                        _ = self.removeKindLocked(kind, entry.key_ptr.*, true);
+                    }
+                }
+            }
         }
+        _ = scope.releaseUnusedCredits(self.resource_manager);
         return before -| self.physical_accounting.current();
+    }
+
+    fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimPhysicalForResourceManager(context, target_bytes);
     }
 
     pub fn namespaceStats(self: *Cache, namespace: u64) HbcCacheStats {
@@ -2891,7 +2918,7 @@ const ExperimentalPostingReadState = struct {
 
     fn attachPatchCacheManager(self: *ExperimentalPostingReadState, manager: *resource_manager_mod.ResourceManager) !void {
         if (self.patch_cache_manager == manager) return;
-        const reclaimer = try manager.registerReclaimer(.hbc_node_metadata_cache, self, reclaimPatchCacheOpaque);
+        const reclaimer = try manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, self, reclaimPatchCacheOpaque, .{ .reclaim_physical = reclaimPatchCachePhysical });
         if (self.patch_cache_manager) |old| old.unregisterReclaimer(self.patch_cache_reclaimer);
         self.patch_cache_reclaimer = reclaimer;
         self.patch_cache_accounting.attach(manager);
@@ -2914,6 +2941,11 @@ const ExperimentalPostingReadState = struct {
     fn compactSubgroupView(self: *ExperimentalPostingReadState, plan: @import("antfly_vectorindex").posting_subgroups.View) ?CompactSubgroups.View {
         const cache = if (self.compact_subgroups) |*owned| owned else return null;
         return cache.getOrCreate(plan.centers, plan.dims) catch null;
+    }
+
+    fn reclaimPatchCachePhysical(ptr: *anyopaque, target: u64) u64 {
+        const self: *ExperimentalPostingReadState = @ptrCast(@alignCast(ptr));
+        return self.reclaimPatchCache(target);
     }
 
     fn reclaimPatchCacheOpaque(ptr: *anyopaque, bytes: u64) u64 {
@@ -3262,6 +3294,9 @@ const ExperimentalPostingReadState = struct {
     }
 
     fn reclaimPatchCache(self: *ExperimentalPostingReadState, target: u64) u64 {
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
+        if (!scope.tryLock(&self.patch_cache_accounting.mutex)) return 0;
         var reclaimed: u64 = 0;
         for (&self.patch_cache) |*shard| {
             if (!shard.mutex.tryLock()) continue;
@@ -7305,8 +7340,9 @@ pub const HBCIndex = struct {
 
     fn releaseFlatCentroidDirectoryAccounting(context: *anyopaque, bytes: u64) void {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
-        lockAtomic(&self.flat_centroid_accounting_mu);
-        defer self.flat_centroid_accounting_mu.unlock();
+        const reuse = @import("antfly_platform").allocator.reclamation.Guard.reuse(&self.flat_centroid_accounting_mu);
+        if (!reuse) lockAtomic(&self.flat_centroid_accounting_mu);
+        defer if (!reuse) self.flat_centroid_accounting_mu.unlock();
         const next = self.flat_centroid_directory_bytes_accounted -| bytes;
         if (self.resource_manager) |manager| {
             manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_directory_bytes_accounted, next);
@@ -7405,11 +7441,7 @@ pub const HBCIndex = struct {
                 return;
             }
             if (self.local_reclaimer_identity == 0) {
-                self.local_reclaimer_identity = resource_manager.registerReclaimer(
-                    .hbc_node_metadata_cache,
-                    self,
-                    reclaimLocalForResourceManager,
-                ) catch |err| blk: {
+                self.local_reclaimer_identity = resource_manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, self, reclaimLocalForResourceManager, .{ .reclaim_physical = reclaimLocalPhysical }) catch |err| blk: {
                     std.log.err("failed to register local HBC cache reclaimer: {s}", .{@errorName(err)});
                     break :blk 0;
                 };
@@ -7464,27 +7496,107 @@ pub const HBCIndex = struct {
             return;
         }
         resource_manager.observeUsage(.hbc_node_metadata_cache, &self.hbc_cache_bytes_accounted, current_hbc_bytes);
-        self.local_reclaimer_identity = resource_manager.registerReclaimer(
-            .hbc_node_metadata_cache,
-            self,
-            reclaimLocalForResourceManager,
-        ) catch |err| blk: {
+        self.local_reclaimer_identity = resource_manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, self, reclaimLocalForResourceManager, .{ .reclaim_physical = reclaimLocalPhysical }) catch |err| blk: {
             std.log.err("failed to register local HBC cache reclaimer: {s}", .{@errorName(err)});
             break :blk 0;
         };
         self.enforceHbcCacheBudget(.none());
     }
 
-    fn reclaimLocalForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+    fn reclaimLocalPhysical(context: *anyopaque, target_bytes: u64) u64 {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
-        if (target_bytes == 0 or self.shared_cache != null or !self.cache_mu.tryLockExclusive()) return 0;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
+        if (self.shared_cache != null or !self.cache_mu.tryLockExclusive()) return 0;
         defer self.cache_mu.unlockExclusive();
-        const before = self.hbcCacheBytes() +| self.detached_hbc_accounting.current();
-        while (before -| (self.hbcCacheBytes() +| self.detached_hbc_accounting.current()) < target_bytes) {
-            if (!self.evictOneHbcCacheEntry(.none())) break;
+        var freed: u64 = 0;
+        for (0..2) |temperature| {
+            var entries = self.vector_cache.iterator();
+            while (entries.next()) |entry| {
+                if (freed >= target_bytes) break;
+                if (entry.value_ptr.*.refs.load(.acquire) != 1) continue;
+                if (temperature == 0) if (self.vector_cache_slots.get(entry.key_ptr.*)) |slot| {
+                    if (self.vector_clock_refs[slot]) continue;
+                };
+                const key = entry.key_ptr.*;
+                const bytes = estimateVectorCacheBytes(entry.value_ptr.*.vector);
+                if (self.vector_cache_slots.fetchRemove(key)) |slot| {
+                    self.vector_clock_keys[slot.value] = 0;
+                    self.vector_clock_refs[slot.value] = false;
+                }
+                const removed = self.vector_cache.fetchRemove(key).?;
+                self.releaseLocalVectorEntry(removed.value);
+                self.noteHbcCacheEviction(.vector);
+                freed +|= bytes;
+            }
+        }
+        for (0..2) |temperature| {
+            var entries = self.metadata_cache.iterator();
+            while (entries.next()) |entry| {
+                if (freed >= target_bytes) break;
+                if (entry.value_ptr.*.refs.load(.acquire) != 1) continue;
+                if (temperature == 0) if (self.metadata_cache_slots.get(entry.key_ptr.*)) |slot| {
+                    if (self.metadata_clock_refs[slot]) continue;
+                };
+                const key = entry.key_ptr.*;
+                const bytes = estimateMetadataCacheBytes(entry.value_ptr.*.metadata);
+                if (self.metadata_cache_slots.fetchRemove(key)) |slot| {
+                    self.metadata_clock_keys[slot.value] = 0;
+                    self.metadata_clock_refs[slot.value] = false;
+                }
+                const removed = self.metadata_cache.fetchRemove(key).?;
+                self.releaseLocalMetadataEntry(removed.value);
+                self.noteHbcCacheEviction(.metadata);
+                freed +|= bytes;
+            }
+        }
+        for (0..2) |temperature| {
+            var entries = self.quantized_cache.iterator();
+            while (entries.next()) |entry| {
+                if (freed >= target_bytes) break;
+                if (entry.value_ptr.*.refs.load(.acquire) != 1) continue;
+                if (temperature == 0) if (self.quantized_cache_slots.get(entry.key_ptr.*)) |slot| {
+                    if (self.quantized_clock_refs[slot]) continue;
+                };
+                const key = entry.key_ptr.*;
+                const bytes = estimateQuantizedCacheBytes(&entry.value_ptr.*.quantized);
+                if (self.quantized_cache_slots.fetchRemove(key)) |slot| {
+                    self.quantized_clock_keys[slot.value] = 0;
+                    self.quantized_clock_refs[slot.value] = false;
+                }
+                const removed = self.quantized_cache.fetchRemove(key).?;
+                self.releaseLocalQuantizedEntry(removed.value);
+                self.noteHbcCacheEviction(.quantized);
+                freed +|= bytes;
+            }
+        }
+        for (0..2) |temperature| {
+            var entries = self.node_cache.iterator();
+            while (entries.next()) |entry| {
+                if (freed >= target_bytes) break;
+                if (entry.value_ptr.*.refs.load(.acquire) != 1) continue;
+                if (temperature == 0) if (self.node_cache_slots.get(entry.key_ptr.*)) |slot| {
+                    if (self.node_clock_refs[slot]) continue;
+                };
+                const key = entry.key_ptr.*;
+                const bytes = estimateNodeCacheBytes(&entry.value_ptr.*.node);
+                if (self.node_cache_slots.fetchRemove(key)) |slot| {
+                    self.node_clock_keys[slot.value] = 0;
+                    self.node_clock_refs[slot.value] = false;
+                }
+                const removed = self.node_cache.fetchRemove(key).?;
+                self.releaseLocalNodeEntry(removed.value);
+                self.noteHbcCacheEviction(.node);
+                freed +|= bytes;
+            }
         }
         self.refreshHbcCacheUsage();
-        return before -| (self.hbcCacheBytes() +| self.detached_hbc_accounting.current());
+        _ = scope.releaseUnusedCredits(self.resource_manager);
+        return freed;
+    }
+
+    fn reclaimLocalForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimLocalPhysical(context, target_bytes);
     }
 
     fn ensureSearchWorkspaceReclaimer(
@@ -7492,11 +7604,7 @@ pub const HBCIndex = struct {
         manager: *resource_manager_mod.ResourceManager,
     ) void {
         if (self.search_workspace_reclaimer_identity != 0) return;
-        self.search_workspace_reclaimer_identity = manager.registerReclaimer(
-            .dense_search_working_set,
-            self,
-            reclaimSearchWorkspaceForResourceManager,
-        ) catch |err| {
+        self.search_workspace_reclaimer_identity = manager.registerReclaimerWithOptions(.dense_search_working_set, self, reclaimSearchWorkspaceForResourceManager, .{ .reclaim_physical = reclaimSearchWorkspacePhysical }) catch |err| {
             std.log.err("failed to register HBC search workspace reclaimer: {s}", .{@errorName(err)});
             return;
         };
@@ -7507,11 +7615,7 @@ pub const HBCIndex = struct {
         manager: *resource_manager_mod.ResourceManager,
     ) void {
         if (self.flat_centroid_reclaimer_identity != 0) return;
-        self.flat_centroid_reclaimer_identity = manager.registerReclaimer(
-            .hbc_node_metadata_cache,
-            self,
-            reclaimFlatCentroidDirectoryForResourceManager,
-        ) catch |err| {
+        self.flat_centroid_reclaimer_identity = manager.registerReclaimerWithOptions(.hbc_node_metadata_cache, self, reclaimFlatCentroidDirectoryForResourceManager, .{ .reclaim_physical = reclaimFlatCentroidPhysical }) catch |err| {
             std.log.err("failed to register HBC flat centroid directory reclaimer: {s}", .{@errorName(err)});
             return;
         };
@@ -7523,35 +7627,42 @@ pub const HBCIndex = struct {
         return self.flat_centroid_directory_bytes_accounted;
     }
 
-    fn reclaimFlatCentroidDirectoryForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+    fn reclaimFlatCentroidPhysical(context: *anyopaque, target_bytes: u64) u64 {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
         if (target_bytes == 0) return 0;
-        const before = self.flatCentroidDirectoryAccountedBytes();
-        var stale_global: ?*vectorindex_spfresh_index.FlatCentroidDirectory = null;
-        if (self.flat_centroid_mu.tryLock()) {
-            stale_global = self.flat_centroid_directory;
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
+        // Hold the generation owner rather than taking a reference whose final
+        // release could destroy an arbitrary generation chain on this path.
+        if (!scope.tryLock(&self.flat_centroid_accounting_mu) or
+            !scope.tryLock(&self.flat_centroid_mu) or
+            !scope.tryLock(&self.experimental_posting_read_generation_mu)) return 0;
+        const generation = self.experimental_posting_read_generation;
+        if (generation) |g| if (!scope.tryLock(&g.routing_mu)) return 0;
+        const before = self.flat_centroid_directory_bytes_accounted;
+        if (self.flat_centroid_directory) |directory| {
             self.flat_centroid_directory = null;
-            self.flat_centroid_mu.unlock();
+            directory.release(self.alloc);
         }
-        if (stale_global) |directory| directory.release(self.alloc);
+        if (generation) |g| if (g.routing_directory) |directory| {
+            g.routing_directory = null;
+            directory.release(self.alloc);
+        };
+        return before -| self.flat_centroid_directory_bytes_accounted;
+    }
 
-        // Native SearchViews own their routing cache. Reclaim the current
-        // generation's owner reference as well; an active query's retained
-        // reference remains valid and releases naturally after the scan.
-        if (self.retainCurrentExperimentalPostingReadGeneration()) |generation| {
-            if (generation.routing_mu.tryLock()) {
-                const stale_generation = generation.routing_directory;
-                generation.routing_directory = null;
-                generation.routing_mu.unlock();
-                if (stale_generation) |directory| directory.release(self.alloc);
-            }
-            generation.release();
-        }
-        return before -| self.flatCentroidDirectoryAccountedBytes();
+    fn reclaimFlatCentroidDirectoryForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimFlatCentroidPhysical(context, target_bytes);
+    }
+
+    fn reclaimSearchWorkspacePhysical(context: *anyopaque, target_bytes: u64) u64 {
+        return reclaimSearchWorkspaceForResourceManager(context, target_bytes);
     }
 
     fn reclaimSearchWorkspaceForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
+        var scope = resource_manager_mod.ReclamationScope.tryAcquire(self.alloc) orelse return 0;
+        defer scope.deinit();
         if (target_bytes == 0 or !self.scratch_mu.tryLock()) return 0;
         defer self.scratch_mu.unlock();
         const max_candidates = @max(
@@ -35960,4 +36071,72 @@ test "hbc rejects multi-bit codes below two dimensions at open" {
         .use_random_ortho_trans = true,
         .quantization_bits = 4,
     }));
+}
+
+test "resource manager physical pressure skips busy HBC accounting and generation owners" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var idx = try HBCIndex.open(a, path, .{ .dims = 2, .leaf_size = 2, .branching_factor = 2, .search_width = 2 });
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    defer idx.close();
+    idx.attachResourceManager(&manager);
+    const Runner = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), m: *resource_manager_mod.ResourceManager) void {
+            self.entered.store(true, .release);
+            _ = m.reclaimHostMemory(1);
+            self.done.store(true, .release);
+        }
+    };
+    for ([_]*std.atomic.Mutex{ &idx.flat_centroid_accounting_mu, &idx.experimental_posting_read_generation_mu }) |busy| {
+        var runner = Runner{};
+        try std.testing.expect(busy.tryLock());
+        const thread = std.Thread.spawn(.{}, Runner.run, .{ &runner, &manager }) catch |err| {
+            busy.unlock();
+            return err;
+        };
+        while (!runner.entered.load(.acquire)) @import("antfly_platform").time.yieldBriefly();
+        for (0..100) |_| {
+            if (runner.done.load(.acquire)) break;
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        const completed = runner.done.load(.acquire);
+        busy.unlock();
+        thread.join();
+        try std.testing.expect(completed);
+    }
+}
+
+test "resource manager physical pressure reclaims shared HBC payload while preserving pinned cache entries" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var budget = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer budget.deinit();
+    var cache = Cache.init(budget.threadSafeAllocator());
+    defer cache.deinit();
+    cache.attachResourceManager(&manager);
+    const ns = hbcCacheNamespace("physical-shared-hbc");
+    _ = try cache.cacheVector(ns, 1, &.{ 1, 2, 3, 4 });
+    _ = try cache.cacheVector(ns, 2, &.{ 5, 6, 7, 8 });
+    var pinned = cache.borrowVector(ns, 1).?;
+    var pin_live = true;
+    defer if (pin_live) pinned.deinit();
+    try std.testing.expect(budget.allocator_mutex.tryLock());
+    const busy_freed = manager.reclaimHostMemory(std.math.maxInt(u64));
+    budget.allocator_mutex.unlock();
+    try std.testing.expectEqual(@as(u64, 0), busy_freed);
+    try std.testing.expectEqual(@as(u32, 2), cache.vector_cache.count());
+    try std.testing.expect(manager.reclaimHostMemory(std.math.maxInt(u64)) > 0);
+    try std.testing.expectEqual(@as(u32, 1), cache.vector_cache.count());
+    pinned.deinit();
+    pin_live = false;
+    try std.testing.expect(manager.reclaimHostMemory(std.math.maxInt(u64)) > 0);
+    try std.testing.expectEqual(@as(u32, 0), cache.vector_cache.count());
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
 }

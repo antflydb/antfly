@@ -4291,9 +4291,6 @@ const PayloadCache = struct {
         self.newest = entry;
     }
     fn evictLocked(self: *PayloadCache) bool {
-        const Guard = @import("memory_budget.zig").AllocationGuard;
-        if (self.registered) Guard.beginReclaim();
-        defer if (self.registered) Guard.endReclaim();
         const entry = self.oldest orelse {
             const freed = self.metadata_bytes != 0;
             self.clearFrequency();
@@ -4326,15 +4323,14 @@ const PayloadCache = struct {
     // for another thread's allocator mutex: it may itself be preflighting.
     // Pre-acquire every known free path, then reuse these locks for teardown.
     const FreeLocks = struct {
-        held: [128]*std.atomic.Mutex = undefined,
+        held: [128]@import("antfly_platform").allocator.reclamation.ReclamationLock = undefined,
         count: usize = 0,
-        fn take(self: *FreeLocks, mutex: *std.atomic.Mutex) bool {
+        fn take(self: *FreeLocks, mutex: *std.atomic.Mutex, allow_borrow: bool) bool {
             const Guard = @import("memory_budget.zig").AllocationGuard;
-            if (Guard.held(mutex)) return true;
-            if (self.count == self.held.len or !Guard.allowed() or !mutex.tryLock()) return false;
-            self.held[self.count] = mutex;
+            if (Guard.reuse(mutex)) return true;
+            if (self.count == self.held.len) return false;
+            self.held[self.count] = @import("antfly_platform").allocator.reclamation.ReclamationLock.tryAcquire(mutex, allow_borrow) orelse return false;
             self.count += 1;
-            Guard.enter(mutex);
             return true;
         }
         fn allocator(self: *FreeLocks, a: Allocator) bool {
@@ -4342,21 +4338,21 @@ const PayloadCache = struct {
             for (0..32) |_| {
                 if (Manager.parentAllocator(current)) |parent| {
                     const manager: *Manager = @ptrCast(@alignCast(current.ptr));
-                    if (!self.take(&manager.allocation_mutex)) return false;
+                    if (!self.take(&manager.allocation_mutex, false)) return false;
                     current = parent;
                 } else if (@import("memory_budget.zig").parentAllocator(current)) |parent| {
                     const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(current.ptr));
-                    if (!self.take(&budget.mutex)) return false;
+                    if (!self.take(&budget.mutex, false)) return false;
                     current = parent;
                 } else if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
                     const locked: *@import("parallel_scheduler.zig").LockedAllocator = @ptrCast(@alignCast(current.ptr));
-                    if (!self.take(locked.shared_mutex orelse &locked.mutex)) return false;
+                    if (!self.take(locked.shared_mutex orelse &locked.mutex, true)) return false;
                     current = parent;
                 } else if (Quota.owner(current)) |owner| {
-                    if (!self.take(&owner.mutex)) return false;
+                    if (!self.take(&owner.mutex, false)) return false;
                     current = owner.backing;
                 } else if (HostBudget.reclamationLayer(current)) |layer| {
-                    if (!self.take(layer.mutex)) return false;
+                    if (!self.take(layer.mutex, false)) return false;
                     current = layer.backing;
                 } else return Manager.reclaimableAllocator(current);
             }
@@ -4371,8 +4367,7 @@ const PayloadCache = struct {
         fn deinit(self: *FreeLocks) void {
             while (self.count != 0) {
                 self.count -= 1;
-                @import("memory_budget.zig").AllocationGuard.leave();
-                self.held[self.count].unlock();
+                self.held[self.count].deinit();
             }
         }
     };
@@ -4384,7 +4379,7 @@ const PayloadCache = struct {
         var locks: FreeLocks = .{};
         defer locks.deinit();
         if (self.registered) {
-            if (!locks.take(&self.manager.?.allocation_mutex) or !locks.allocator(self.metadata_backing.?)) return false;
+            if (!locks.take(&self.manager.?.allocation_mutex, false) or !locks.allocator(self.metadata_backing.?)) return false;
             if (self.oldest) |entry| if (!locks.block(entry.block)) return false;
         }
         return self.evictLocked();
