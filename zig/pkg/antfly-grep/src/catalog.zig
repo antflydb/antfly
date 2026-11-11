@@ -29,6 +29,7 @@ pub const Source = struct {
     document_version: u32 = 1,
     published_revision: ?[]const u8 = null,
     id: []const u8,
+    row_source_id: ?[]const u8 = null,
     alias: ?[]const u8 = null,
     table: []const u8,
     document_field: []const u8 = "grep",
@@ -47,12 +48,29 @@ pub fn table(source: Source) !indexed.Table {
     if ((source.document_version != 1 and source.document_version != 3) or (source.document_version < 3 and std.mem.eql(u8, source.publication, "media"))) return error.UnsupportedSourceKind;
     if (source.filter != .object or (source.document_version < 3 and !std.mem.eql(u8, source.document_field, "grep")) or (source.document_version == 3 and source.fields == null)) return error.InvalidSourceCatalog;
     if (source.id.len == 0 or source.id.len > 512 or std.mem.indexOfAny(u8, source.id, "\x00\r\n") != null or source.table.len == 0 or std.mem.indexOfAny(u8, source.table, "\x00\r\n") != null or std.mem.eql(u8, source.table, ".") or std.mem.eql(u8, source.table, "..")) return error.InvalidSourceCatalog;
+    if (source.row_source_id) |id| {
+        if (id.len != 36) return error.InvalidSourceCatalog;
+        for (id, 0..) |char, i| {
+            switch (i) {
+                8, 13, 18, 23 => if (char != '-') return error.InvalidSourceCatalog,
+                else => if (!std.ascii.isDigit(char) and (char < 'a' or char > 'f')) return error.InvalidSourceCatalog,
+            }
+        }
+        const conjuncts = source.filter.object.get("conjuncts") orelse return error.InvalidSourceCatalog;
+        if (source.filter.object.count() != 1 or conjuncts != .array or conjuncts.array.items.len != 2) return error.InvalidSourceCatalog;
+        for (conjuncts.array.items, [_][]const u8{ "source_id", "doc_type" }, [_][]const u8{ id, "source_item" }) |term, field, value| {
+            if (term != .object or term.object.count() != 2) return error.InvalidSourceCatalog;
+            const actual_field = term.object.get("field") orelse return error.InvalidSourceCatalog;
+            const actual_value = term.object.get("equals") orelse return error.InvalidSourceCatalog;
+            if (actual_field != .string or actual_value != .string or !std.mem.eql(u8, actual_field.string, field) or !std.mem.eql(u8, actual_value.string, value)) return error.InvalidSourceCatalog;
+        }
+    }
     if (source.access_id) |id| {
         if (id.len == 0 or id.len > 128) return error.InvalidSourceCatalog;
         for (id) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidSourceCatalog;
     }
     if (!std.mem.eql(u8, source.status, "searchable") and !std.mem.eql(u8, source.status, "pending") and !std.mem.eql(u8, source.status, "syncing") and !std.mem.eql(u8, source.status, "stale")) return error.InvalidSourceCatalog;
-    return .{ .acquisition_id = source.acquisition_id, .knowledge = source.knowledge, .search_version = source.search_version, .artifacts = source.artifacts, .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
+    return .{ .acquisition_id = source.acquisition_id, .knowledge = source.knowledge, .search_version = source.search_version, .artifacts = source.artifacts, .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .row_source_id = source.row_source_id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
 }
 pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(32 * 1024 * 1024));
@@ -119,6 +137,7 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
                 const auth = if (token) |value| try std.fmt.allocPrint(state, "Bearer {s}", .{value}) else null;
                 var headers: std.ArrayList([2][]const u8) = .empty;
                 try headers.append(state, .{ "Content-Type", "application/json" });
+                try headers.append(state, .{ "User-Agent", "antfly-grep/" ++ @import("grep_build_options").version });
                 if (auth) |value| try headers.append(state, .{ "Authorization", value });
                 if (policy) |value| try headers.append(state, .{ "X-Antfly-Catalog-Access", value });
                 var result = try http.post(url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = timeout_ms, .max_response_size = 1024 * 1024, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });

@@ -131,7 +131,9 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     main.addImport("antfly-grep", lib);
     const version = b.addOptions();
     version.addOption([]const u8, "version", release_version);
-    main.addImport("grep_build_options", version.createModule());
+    const build_options = version.createModule();
+    main.addImport("grep_build_options", build_options);
+    lib.addImport("grep_build_options", build_options);
     main.strip = strip;
     main.link_libc = true;
     lib.link_libc = true;
@@ -200,7 +202,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     // allocation stack unwinding. Keep the shipped CLI's allocator unchanged.
     const cli_test_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/src/cli_test_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cli_test_mod.addImport("antfly-grep", lib);
-    cli_test_mod.addImport("grep_build_options", version.createModule());
+    cli_test_mod.addImport("grep_build_options", build_options);
     const cli_tests = b.addExecutable(.{ .name = "antfly-grep-cli-test", .root_module = cli_test_mod });
     b.step("grep-cli-test-build", "Build the ownership-checking CLI integration driver").dependOn(&b.addInstallArtifact(cli_tests, .{}).step);
     const integration = b.addSystemCommand(&.{"python3"});
