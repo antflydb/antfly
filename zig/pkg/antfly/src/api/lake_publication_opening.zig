@@ -435,6 +435,7 @@ const Worker = struct {
     publication: catalog.Publication,
     bundle: ?catalog.OpeningBundle,
     singleflight: bool = false,
+    speculative: bool = true,
     stopped: std.atomic.Value(bool) = .init(false),
     domain: [32]u8,
     cached: artifacts.CachedRead,
@@ -458,7 +459,7 @@ const Worker = struct {
         const a = arena.allocator();
         // Clients and cloud-generation readers have independent ownership;
         // no request-arena allocator or mutable provider map crosses workers.
-        var store = try self.store.reopenReadOnlyWithPriority(a, true);
+        var store = try self.store.reopenReadOnlyWithAdmission(a, .{ .speculative = self.speculative, .wait_for_speculative_io = self.singleflight });
         defer store.deinit();
         store.implementation.cloud_io = self.cached.context.io;
         // The parent already admitted publication/reader/retention authority.
@@ -534,6 +535,8 @@ pub const Pending = struct {
         if (self.started or publication.opening_bundles.len == 0) return;
         try publication.validate();
         try cached.context.ensureActive();
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer if (cached.context.trace) |trace| trace.add("opening_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
         self.started = true;
         self.arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         errdefer self.deinit();
@@ -546,7 +549,7 @@ pub const Pending = struct {
         const scope = (try stores.uploadScopeFromArtifactId(held.inventory.artifact_id)) orelse return error.InvalidLakeIndexCatalog;
         self.io = cached.context.io;
         for (held.opening_bundles, 0..) |bundle, i| {
-            self.work[i] = .{ .singleflight = true, .backing = std.heap.smp_allocator, .store = owned_store, .publication = held, .bundle = bundle, .domain = scope.domain, .cached = cached, .token = token };
+            self.work[i] = .{ .singleflight = true, .speculative = i != 0, .backing = std.heap.smp_allocator, .store = owned_store, .publication = held, .bundle = bundle, .domain = scope.domain, .cached = cached, .token = token };
             if (self.io) |io| {
                 const cost = 2 * (bundle.artifact.byte_len + bundle.decoded_bytes) + 2 * 1024 * 1024;
                 self.tasks[i] = local.sql_parallel_scheduler.global().submitIo(io, @intCast(cost), Worker.run, .{&self.work[i]});

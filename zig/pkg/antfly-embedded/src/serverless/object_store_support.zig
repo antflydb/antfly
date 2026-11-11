@@ -25,6 +25,7 @@ pub const Transport = struct {
     requests: ?*@import("httpx").RequestLimit = null,
     query_requests: ?*@import("httpx").RequestLimit = null,
     speculative: bool = false,
+    wait_for_speculative_io: bool = false,
 };
 const AwsCredentialContext = @import("aws_credential_context.zig").AwsCredentialContext;
 
@@ -149,6 +150,7 @@ pub const OpenedObjectStore = struct {
         requests: ?*@import("httpx").RequestLimit = null,
         query_requests: ?*@import("httpx").RequestLimit = null,
         speculative: bool = false,
+        wait_for_speculative_io: bool = false,
     };
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
@@ -268,6 +270,7 @@ pub const OpenedObjectStore = struct {
             transport.client.config.request_limit = options.requests;
             transport.client.config.query_request_limit = options.query_requests;
             transport.client.config.speculative_io = options.speculative;
+            transport.client.config.wait_for_speculative_io = options.wait_for_speculative_io;
         }
 
         var owned_client = gcs.client();
@@ -392,6 +395,7 @@ pub const OpenedObjectStore = struct {
             transport.client.config.request_limit = open_options.requests;
             transport.client.config.query_request_limit = open_options.query_requests;
             transport.client.config.speculative_io = open_options.speculative;
+            transport.client.config.wait_for_speculative_io = open_options.wait_for_speculative_io;
         }
         var owned_client = s3.client();
         errdefer owned_client.deinit();

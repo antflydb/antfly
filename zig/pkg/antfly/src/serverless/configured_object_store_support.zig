@@ -425,7 +425,7 @@ fn openCredentialedS3PrefixAlloc(
                 .virtual_hosted => .virtual_hosted,
             },
         },
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false, .wait_for_speculative_io = if (transport) |value| value.wait_for_speculative_io else false },
     );
 }
 
@@ -455,7 +455,7 @@ fn openCredentialedGcsPrefixAlloc(
         bucket,
         prefix,
         bearer_token,
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false, .wait_for_speculative_io = if (transport) |value| value.wait_for_speculative_io else false },
     );
 }
 

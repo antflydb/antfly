@@ -117,6 +117,9 @@ pub const RequestLimit = extern struct {
         return self.acquireBudget(io, deadline_ms, cancellation, 0, false);
     }
     fn acquireBudget(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken, bytes: u64, speculative: bool) !void {
+        return self.acquireBudgetWaiting(io, deadline_ms, cancellation, bytes, speculative, false);
+    }
+    fn acquireBudgetWaiting(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken, bytes: u64, speculative: bool, wait_for_speculation: bool) !void {
         if (!speculative) _ = @atomicRmw(u32, &self.demand_waiters, .Add, 1, .acq_rel);
         defer if (!speculative) {
             _ = @atomicRmw(u32, &self.demand_waiters, .Sub, 1, .acq_rel);
@@ -136,7 +139,7 @@ pub const RequestLimit = extern struct {
                 return;
             }
             self.unlock();
-            if (speculative or self.capacity == 0) return error.ConcurrencyUnavailable;
+            if ((speculative and (!wait_for_speculation or self.capacity <= 2)) or self.capacity == 0) return error.ConcurrencyUnavailable;
             try io.sleep(.fromMilliseconds(1), .awake);
         }
     }
@@ -157,6 +160,9 @@ pub const ClientConfig = struct {
     request_limit: ?*RequestLimit = null,
     query_request_limit: ?*RequestLimit = null,
     speculative_io: bool = false,
+    /// An already admitted seed worker may wait outside the transport executor.
+    /// Demand still has priority and two reserved slots; ordinary hints decline.
+    wait_for_speculative_io: bool = false,
     attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
@@ -1212,16 +1218,23 @@ pub const Client = struct {
         try self.interceptors.append(self.allocator, interceptor);
     }
 
+    fn transferBytes(self: *const Self, method: types.Method, request_options: RequestOptions) usize {
+        // HEAD has no response body, including on errors. Charging the default
+        // 100 MiB ceiling would monopolize a byte gate for a metadata probe.
+        const response = if (method == .HEAD) 0 else @min(request_options.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
+        return response +| (if (request_options.body) |body| body.len else 0);
+    }
+
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
         const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
         var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
-        const transfer_bytes = @min(reqOpts.max_response_size orelse self.config.max_response_size, self.config.max_response_size) +| (if (reqOpts.body) |body| body.len else 0);
-        if (self.config.query_request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        const transfer_bytes = self.transferBytes(method, reqOpts);
+        if (self.config.query_request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
         defer if (self.config.query_request_limit) |limit| limit.releaseBudget(transfer_bytes);
-        if (self.config.request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        if (self.config.request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
         defer if (self.config.request_limit) |limit| limit.releaseBudget(transfer_bytes);
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0, deadline_ms);
 
@@ -1246,10 +1259,10 @@ pub const Client = struct {
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
         var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
-        const transfer_bytes = @min(reqOpts.max_response_size orelse self.config.max_response_size, self.config.max_response_size) +| (if (reqOpts.body) |body| body.len else 0);
-        if (self.config.query_request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        const transfer_bytes = self.transferBytes(method, reqOpts);
+        if (self.config.query_request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
         defer if (self.config.query_request_limit) |limit| limit.releaseBudget(transfer_bytes);
-        if (self.config.request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        if (self.config.request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
         defer if (self.config.request_limit) |limit| limit.releaseBudget(transfer_bytes);
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0, deadline_ms);
 
@@ -7291,4 +7304,77 @@ test "request task admission shares byte quotas and reserves demand capacity ahe
     for (0..8) |_| limit.releaseBudget(1);
     try std.testing.expectEqual(@as(u64, 0), limit.active_bytes);
     try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission keeps HEAD metadata probes independent of full body quotas" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const TestServer = @import("../testing.zig").TestServer;
+    var server = try TestServer.start(a, io, &.{.{ .method = .HEAD, .path = "/metadata", .respond = .{ .status = 200, .body = "" } }});
+    defer server.deinit();
+    var serving = try io.concurrent(TestServer.handleOne, .{&server});
+    defer _ = serving.cancel(io) catch {};
+    var limit: RequestLimit = .{ .capacity = 3, .max_bytes = 16 };
+    try limit.acquireBudget(io, null, null, 16, false);
+    defer limit.releaseBudget(16);
+    var client = Client.initWithConfig(a, io, .{ .request_limit = &limit, .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/metadata", .{server.baseUrl()});
+    defer a.free(url);
+    var response = try client.request(.HEAD, url, .{ .timeout_ms = 1000 });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try serving.await(io);
+    try std.testing.expectEqual(@as(u64, 16), limit.active_bytes);
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission lets admitted seeds wait without displacing demand or extending deadlines" {
+    const io = std.testing.io;
+    var limit: RequestLimit = .{ .capacity = 3, .max_bytes = 16 };
+    try limit.acquireBudget(io, null, null, 16, false);
+    var held = true;
+    defer if (held) limit.releaseBudget(16);
+    var entered = std.atomic.Value(bool).init(false);
+    var acquired = std.atomic.Value(bool).init(false);
+    const Task = struct {
+        fn run(budget: *RequestLimit, started: *std.atomic.Value(bool), ready: *std.atomic.Value(bool), cancellation: ?CancellationToken) !void {
+            started.store(true, .release);
+            try budget.acquireBudgetWaiting(std.testing.io, null, cancellation, 1, true, true);
+            defer budget.releaseBudget(1);
+            ready.store(true, .release);
+        }
+    };
+    var seed = try io.concurrent(Task.run, .{ &limit, &entered, &acquired, null });
+    defer _ = seed.cancel(io) catch {};
+    while (!entered.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(!acquired.load(.acquire));
+    // Already queued demand outranks the waiting seed even after bytes free.
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Add, 1, .acq_rel);
+    limit.releaseBudget(16);
+    held = false;
+    try limit.acquireBudget(io, null, null, 16, false);
+    held = true;
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Sub, 1, .acq_rel);
+    try std.testing.expect(!acquired.load(.acquire));
+    try std.testing.expectError(error.Timeout, limit.acquireBudgetWaiting(io, requestDeadlineMs(io, 5), null, 1, true, true));
+    limit.releaseBudget(16);
+    held = false;
+    try seed.await(io);
+    try std.testing.expect(acquired.load(.acquire));
+    entered.store(false, .release);
+    acquired.store(false, .release);
+    var canceled = std.atomic.Value(bool).init(false);
+    try limit.acquireBudget(io, null, null, 16, false);
+    held = true;
+    var stopped = try io.concurrent(Task.run, .{ &limit, &entered, &acquired, CancellationToken.fromAtomic(&canceled) });
+    defer _ = stopped.cancel(io) catch {};
+    while (!entered.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, stopped.await(io));
+    try std.testing.expect(!acquired.load(.acquire));
+    limit.releaseBudget(16);
+    held = false;
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+    try std.testing.expectEqual(@as(u64, 0), limit.active_bytes);
 }

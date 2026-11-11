@@ -391,8 +391,15 @@ eight requests and a 32 MiB transfer allowance, beneath a process gate of eight
 requests and 64 MiB. Reservations include request bodies and response ceilings.
 A required transfer larger than the allowance runs alone under its response
 limit; these allowances do not claim a hard bound on total query memory. Unknown
-response sizes reserve the whole allowance. Optional warming declines admission
-under pressure and reserves two request slots for demand. Queue time honors the
+response sizes reserve the whole allowance. Ordinary optional warming declines admission
+under pressure and reserves two request slots for demand. The first opening seed
+uses demand admission. Later query-owned seed workers have already reserved their
+working set and may wait cancellably outside the provider executor, with demand
+still taking priority; contention must not permanently discard their seed wave.
+HEAD probes reserve no response-body bytes. GCS object metadata/upload responses
+use a 1 MiB ceiling and object listings use 8 MiB, while media reads retain their
+independent caller limits. This prevents small control calls from exclusively
+reserving the default 100 MiB media ceiling. Queue time honors the
 original deadline and cancellation, without occupying provider transport workers.
 
 Text source opening waits for the first seed pack, then allows ranking and demand

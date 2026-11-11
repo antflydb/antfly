@@ -127,8 +127,14 @@ pub const Store = struct {
         return self.reopenReadOnlyWithPriority(a, false);
     }
     pub fn reopenReadOnlyWithPriority(self: *const Store, a: A, speculative: bool) !Store {
+        return self.reopenReadOnlyWithAdmission(a, .{ .speculative = speculative });
+    }
+    pub fn reopenReadOnlyWithAdmission(self: *const Store, a: A, admission: struct { speculative: bool = false, wait_for_speculative_io: bool = false }) !Store {
         var options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
-        if (options.transport) |*transport| transport.speculative = speculative;
+        if (options.transport) |*transport| {
+            transport.speculative = admission.speculative;
+            transport.wait_for_speculative_io = admission.wait_for_speculative_io;
+        }
         var result = if (options.config) |config|
             try openRetainedNativeWithTransport(a, config, options.secrets, self.locator, true, options.deployment, options.local_base_dir, options.transport)
         else

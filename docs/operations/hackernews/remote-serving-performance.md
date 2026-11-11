@@ -1422,3 +1422,26 @@ Parallel Parquet callers and nested provider HTTP tasks exhaust the shared
 shared whole-request admission, deadline/cancellation/shutdown regressions, and
 retryable readiness classification. Fresh candidate qualification is required;
 the failed setup supplies no new latency evidence.
+
+
+### Pipeline admission regression (9d927b5c5e)
+
+The optimized server/Lite build passes all 98 steps; broad native and linked ABI
+checks pass 251 tests. Both simulator suites pass. Real-GCS stored-source cold
+search takes 5.033 s (407 ms server CPU, 249 MiB peak RSS), versus the earlier
+31ab22461f sample of 2.410 s. Combined provider reads rise from 17 to 42; archive
+preparation falls to 430 ms but its ranking phase rises to 3.545 s. The Parquet
+case measures 5.652 s cold and later fails the unchanged concurrent-write
+publication-readiness deadline. Restart-plus-query totals are 1.837/1.851 s,
+including process startup. These are single samples, not percentiles. Both
+prefixes are fully cleaned: 923/826 deleted versions, zero remaining.
+
+The follow-up makes the first seed a demand read and lets already admitted later
+seed workers wait cancellably with demand priority, instead of discarding them
+on transient transport contention. HEAD probes no longer reserve response-body
+bytes. GCS metadata/upload responses reserve 1 MiB and listings 8 MiB rather than
+the unknown-media default of 100 MiB, which otherwise serializes control traffic
+through the 32/64 MiB gates. Pipeline opening time is now attributed explicitly.
+Transport priority/deadline/cancellation and control-response bounds have focused
+regressions; new optimized latency and publication-readiness qualification are
+required before claiming improvement. No correctness or readiness limit is relaxed.
