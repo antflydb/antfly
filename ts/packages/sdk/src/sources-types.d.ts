@@ -58,6 +58,7 @@ export interface Source {
   knowledge?: KnowledgeDeclaration;
   knowledge_status?: KnowledgeStatus;
   revision?: string;
+  reconciliation_status?: ReconciliationStatus;
 }
 
 export interface Run {
@@ -263,4 +264,8 @@ export interface KnowledgeRequest {
   known_at?: string;
   require_snapshot?: boolean;
   entity?: string;
+}
+
+export interface ReconciliationStatus {
+  state: "pending" | "failed" | "ready";
 }

@@ -203,6 +203,7 @@ func Handler(b Backend) http.Handler {
 						break
 					}
 					source.Revision = ""
+					source.ReconciliationStatus = nil
 					result, err = putSourceConditionally(r.Context(), b, source, r.Header)
 				case http.MethodDelete:
 					purge := r.URL.Query().Get("purge")
@@ -302,6 +303,8 @@ const SourcePageBudget = MaxResponseBytes - 1024
 // SourceBytes measures the actual wire representation, including JSON escaping.
 // Runtime adapters enforce the same budget before materializing a large page.
 func SourceBytes(source Source) (int, error) {
+	// Include the handler-owned fields before enforcing the transport budget.
+	source.Revision = SourceRevision(source)
 	raw, err := json.Marshal(source)
 	if err != nil {
 		return 0, err

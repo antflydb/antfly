@@ -738,6 +738,11 @@
             "readOnly": true,
             "x-go-type-skip-optional-pointer": true,
             "description": "Opaque declaration revision returned by GET and PUT. Covers declared fields only; run state and search status do not change it. Ignored when submitted."
+          },
+          "reconciliation_status": {
+            "$ref": "#/components/schemas/ReconciliationStatus",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": false
           }
         },
         "additionalProperties": false
@@ -1663,6 +1668,23 @@
           "graph",
           "start"
         ]
+      },
+      "ReconciliationStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "failed",
+              "ready"
+            ]
+          }
+        }
       }
     }
   }

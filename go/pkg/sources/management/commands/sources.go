@@ -232,6 +232,9 @@ func Status(ctx context.Context, env Env, ref string) (StatusView, error) {
 	var out strings.Builder
 	fmt.Fprintf(&out, "Source:\t%s (%s)\nTable:\t%s\nConnection:\t%s\nState:\t%s\nPublication:\t%s\n",
 		source.Name, source.Id, source.Table, source.Connection, source.State, source.Publication)
+	if source.ReconciliationStatus != nil {
+		fmt.Fprintf(&out, "Configuration reconciliation:\t%s\n", source.ReconciliationStatus.State)
+	}
 	if run := view.LatestRun; run != nil {
 		fmt.Fprintf(&out, "Acquisition:\t%s/%s (run %s)\n", run.State, run.Outcome, run.Id)
 	} else {

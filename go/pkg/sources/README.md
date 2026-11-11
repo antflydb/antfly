@@ -888,6 +888,13 @@ Optional empty stream/artifact arrays have the same revision as omitted arrays,
 matching their HTTP representation. Clearing either collection converges after
 one write.
 
+Runtimes may expose read-only `reconciliation_status` (`pending`, `failed` or
+`ready`) when desired state is committed before configuration side effects.
+These observations do not change the declaration revision. Matching declarations
+with unfinished recovery plan as `reconcile`; apply retries a conditional PUT and
+reports `reconciled` when ready. A non-ready write response is a failed apply
+result, so partial configuration is never reported as converged.
+
 ### Reusable CLI handlers
 
 `sources/management/commands` packages management operations as framework-neutral
@@ -917,7 +924,8 @@ the shared declaration types:
 ```
 
 Fields an entry omits are left as the server has them. Plan never writes; apply
-writes only changed sources and never deletes one that is absent from the file —
+writes changed sources and retries unfinished configuration reconciliation. It
+never deletes a source that is absent from the file —
 retire sources explicitly with archive or purge.
 
 Omitted names preserve existing display names; a new source defaults to its key.

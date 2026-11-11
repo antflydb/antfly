@@ -62,6 +62,7 @@ class Source(TypedDict):
     knowledge: NotRequired[KnowledgeDeclaration]
     knowledge_status: NotRequired[KnowledgeStatus]
     revision: NotRequired[str]
+    reconciliation_status: NotRequired[ReconciliationStatus]
 
 
 class Run(TypedDict):
@@ -268,3 +269,7 @@ class KnowledgeRequest(TypedDict):
     known_at: NotRequired[str]
     require_snapshot: NotRequired[bool]
     entity: NotRequired[str]
+
+
+class ReconciliationStatus(TypedDict):
+    state: Literal["pending", "failed", "ready"]

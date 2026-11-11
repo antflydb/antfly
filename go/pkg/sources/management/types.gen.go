@@ -180,6 +180,27 @@ func (e ProcessingPresetMetric) Valid() bool {
 	}
 }
 
+// Defines values for ReconciliationStatusState.
+const (
+	ReconciliationStatusStateFailed  ReconciliationStatusState = "failed"
+	ReconciliationStatusStatePending ReconciliationStatusState = "pending"
+	ReconciliationStatusStateReady   ReconciliationStatusState = "ready"
+)
+
+// Valid indicates whether the value is a known member of the ReconciliationStatusState enum.
+func (e ReconciliationStatusState) Valid() bool {
+	switch e {
+	case ReconciliationStatusStateFailed:
+		return true
+	case ReconciliationStatusStatePending:
+		return true
+	case ReconciliationStatusStateReady:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RepresentationStatusState.
 const (
 	RepresentationStatusStateBuilding    RepresentationStatusState = "building"
@@ -660,6 +681,14 @@ type ProcessingPreview struct {
 	Stream     SearchStream          `json:"stream"`
 }
 
+// ReconciliationStatus defines model for ReconciliationStatus.
+type ReconciliationStatus struct {
+	State ReconciliationStatusState `json:"state"`
+}
+
+// ReconciliationStatusState defines model for ReconciliationStatus.State.
+type ReconciliationStatusState string
+
 // RepresentationStatus defines model for RepresentationStatus.
 type RepresentationStatus struct {
 	Name   string                    `json:"name"`
@@ -779,7 +808,8 @@ type Source struct {
 	Processing           *ProcessingDeclaration `json:"processing,omitempty"`
 
 	// Publication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
-	Publication SourcePublication `json:"publication"`
+	Publication          SourcePublication     `json:"publication"`
+	ReconciliationStatus *ReconciliationStatus `json:"reconciliation_status,omitempty"`
 
 	// Rekeys Set only on a PUT response. True when the call makes the next sync re-key this source's existing rows. A new source, or one that already has a namespace, never re-keys.
 	Rekeys bool `json:"rekeys,omitempty,omitzero"`

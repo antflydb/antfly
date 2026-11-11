@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -76,16 +77,12 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 	}
 	response, err := c.http.Do(r)
 	if err != nil {
-		var urlErr *url.Error
-		return &TransportError{
-			Timeout: errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &urlErr) && urlErr.Timeout()),
-			cause:   ctx.Err(),
-		}
+		return transportFailure(ctx, err)
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, MaxResponseBytes+1))
 	if err != nil {
-		return fmt.Errorf("source-management response failed")
+		return transportFailure(ctx, err)
 	}
 	if len(raw) > MaxResponseBytes {
 		return fmt.Errorf("source-management response exceeds limit")
@@ -107,6 +104,16 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 		return fmt.Errorf("invalid management response")
 	}
 	return nil
+}
+
+// Body reads are part of the request, including the client's timeout. Preserve
+// only context causes, never URLs, credentials or transport error messages.
+func transportFailure(ctx context.Context, err error) error {
+	var timeout net.Error
+	return &TransportError{
+		Timeout: errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout(),
+		cause:   ctx.Err(),
+	}
 }
 func (c *Client) Capabilities(ctx context.Context) (out Capabilities, err error) {
 	err = c.call(ctx, "GET", "/capabilities", "", nil, &out)
@@ -140,6 +147,7 @@ func (c *Client) PutSourceIfMatch(ctx context.Context, source Source, revision s
 
 func (c *Client) putSource(ctx context.Context, source Source, headers http.Header) (out Source, err error) {
 	source.Revision = ""
+	source.ReconciliationStatus = nil
 	source.KnowledgeStatus = nil
 	source.SearchStatus = nil // GET observations are never submitted as desired state.
 	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out, headers)

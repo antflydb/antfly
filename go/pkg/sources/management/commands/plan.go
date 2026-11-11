@@ -47,6 +47,7 @@ const (
 	PlanCreate    PlanAction = "create"
 	PlanUpdate    PlanAction = "update"
 	PlanUnchanged PlanAction = "unchanged"
+	PlanReconcile PlanAction = "reconcile"
 )
 
 type PlanItem struct {
@@ -96,6 +97,9 @@ func PlanManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (P
 	}
 	fmt.Fprintf(&out, "Plan: %d to create, %d to update, %d unchanged.\n",
 		counts[PlanCreate], counts[PlanUpdate], counts[PlanUnchanged])
+	if counts[PlanReconcile] > 0 {
+		fmt.Fprintf(&out, "Reconciliation: %d source(s) require retry.\n", counts[PlanReconcile])
+	}
 	out.WriteString("Sources absent from the file are left untouched; use archive or purge to retire them.\n")
 	return plan, Classify(env.writeHuman(out.String()))
 }
@@ -170,6 +174,8 @@ func planManifest(ctx context.Context, api API, m Manifest, opts PlanOptions) (P
 				if err != nil {
 					return Plan{}, c, Classify(err)
 				}
+			} else if current.ReconciliationStatus != nil && current.ReconciliationStatus.State != management.ReconciliationStatusStateReady {
+				item.Action = PlanReconcile
 			}
 		}
 		plan.Items = append(plan.Items, item)
@@ -248,6 +254,7 @@ func manifestDeclaration(source management.Source) management.Source {
 	source.KnowledgeStatus = nil
 	source.Rekeys = false
 	source.Revision = ""
+	source.ReconciliationStatus = nil
 	return source
 }
 
@@ -308,7 +315,7 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 	}
 	if !c.RevisionPreconditions {
 		for _, item := range plan.Items {
-			if item.Action == PlanCreate || item.Action == PlanUpdate {
+			if item.Action != PlanUnchanged {
 				return nil, Unsupported(c.Runtime, "revision_preconditions")
 			}
 		}
@@ -326,6 +333,9 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 			} else {
 				source, err = env.API.PutSourceIfMatch(ctx, item.Desired, item.Revision)
 			}
+			if err == nil && source.ReconciliationStatus != nil && source.ReconciliationStatus.State != management.ReconciliationStatusStateReady {
+				err = &Error{Code: CodeFailed, ServerCode: "source_reconciliation_pending", Message: "declaration saved; configuration reconciliation is " + string(source.ReconciliationStatus.State) + "; inspect source status or rerun apply"}
+			}
 			switch {
 			case hasManifestCode(err, CodeConflict):
 				result.Outcome, result.Error = "conflict", Classify(err).Error()
@@ -333,6 +343,8 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 				result.Outcome, result.Error = "failed", Classify(err).Error()
 			case item.Action == PlanCreate:
 				result.Outcome, result.Revision = "created", sourceRevision(source)
+			case item.Action == PlanReconcile:
+				result.Outcome, result.Revision = "reconciled", sourceRevision(source)
 			default:
 				result.Outcome, result.Revision = "updated", sourceRevision(source)
 			}
@@ -366,6 +378,9 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 		}
 		fmt.Fprintf(&out, "Applied: %d created, %d updated, %d unchanged, %d conflicts, %d failed.\n",
 			counts["created"], counts["updated"], counts["unchanged"], conflicts, failed)
+		if counts["reconciled"] > 0 {
+			fmt.Fprintf(&out, "Reconciled: %d source(s).\n", counts["reconciled"])
+		}
 		outputErr = env.writeHuman(out.String())
 	}
 	if len(failures) != 0 {

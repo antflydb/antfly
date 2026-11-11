@@ -688,3 +688,31 @@ func TestApplyManifestUsesServerRevision(t *testing.T) {
 		t.Fatalf("precondition writes = %#v", api.writes)
 	}
 }
+
+func TestApplyRetriesUnfinishedReconciliation(t *testing.T) {
+	for _, state := range []management.ReconciliationStatusState{"pending", "failed"} {
+		t.Run(string(state), func(t *testing.T) {
+			current := manifestCurrent("existing")
+			current.ReconciliationStatus = &management.ReconciliationStatus{State: state}
+			api := newManifestAPI(t, current)
+			manifest := manifestFile(manifestEntry("existing"))
+			results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifest, PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireApplyOutcomes(t, results, []string{"existing"}, []string{"reconciled"})
+			if len(api.writes) != 1 || !api.writes[0].conditional || api.writes[0].revision != management.SourceRevision(current) {
+				t.Fatalf("recovery must use planned revision: %#v", api.writes)
+			}
+			api.writes = nil
+			results, err = ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifest, PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireApplyOutcomes(t, results, []string{"existing"}, []string{"unchanged"})
+			if len(api.writes) != 0 {
+				t.Fatal("completed reconciliation must converge without another write")
+			}
+		})
+	}
+}

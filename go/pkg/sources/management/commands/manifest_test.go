@@ -1,9 +1,22 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -103,5 +116,19 @@ func TestDecodeManifestOptionalPresenceAndBoundaries(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestManifestPreservesLargeConfigIntegers(t *testing.T) {
+	m, err := DecodeManifest(strings.NewReader(`{"version":1,"sources":[{"key":"docs","connection":"conn","table":"docs","config":{"account_id":9007199254740993,"nested":[9223372036854775807]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(m.Sources[0].Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "9007199254740993") || !strings.Contains(string(raw), "9223372036854775807") {
+		t.Fatalf("rounded manifest integers: %s", raw)
 	}
 }
