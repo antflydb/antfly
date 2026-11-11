@@ -177,6 +177,7 @@ type SyncWriter struct {
 	table, sourceID, namespace      string
 	bounds                          KeyRange
 	inventory, verified             map[string]bool
+	publicationProofs               map[string]string
 	authoritative, finished, failed bool
 }
 
@@ -312,10 +313,79 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		}
 		result.Skipped += len(unchanged)
 	}
-	for id := range documents {
+	for id, doc := range documents {
+		if w.publicationProofs != nil {
+			digest, err := projectionDigest(doc)
+			if err != nil {
+				w.failed = true
+				return MergeResult{}, err
+			}
+			w.publicationProofs[id] = hex.EncodeToString(digest[:])
+		}
 		w.verified[id] = true
 	}
 	return result, nil
+}
+
+// TrackPublicationProofs enables durable checkpoints for this writer. The
+// caller stores the proof map together with its pinned acquisition manifest.
+func (w *SyncWriter) TrackPublicationProofs() {
+	w.publicationProofs = make(map[string]string, len(w.inventory))
+}
+
+func (w *SyncWriter) PublicationProofs() map[string]string {
+	return w.publicationProofs
+}
+
+// RestorePublicationProofs rechecks every expected row in bounded batches.
+// A mismatch leaves the writer unmodified so acquisition can safely replay.
+func (w *SyncWriter) RestorePublicationProofs(ctx context.Context, proofs map[string]string) (bool, error) {
+	if !w.authoritative || w.failed || w.finished || len(proofs) != len(w.inventory) {
+		return false, nil
+	}
+	ids := make([]string, 0, len(proofs))
+	for id, digest := range proofs {
+		if !w.inventory[id] || len(digest) != 64 {
+			return false, nil
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	const proofBatch = 64
+	for start := 0; start < len(ids); start += proofBatch {
+		keys := ids[start:min(start+proofBatch, len(ids))]
+		body, _ := json.Marshal(map[string]any{
+			"query": documentIDsQuery(keys), "fields": sourceRowFields(), "limit": len(keys),
+			"order_by": []any{map[string]any{"field": "_id", "desc": false}},
+		})
+		raw, err := w.client.Query(ctx, w.table, body)
+		if err != nil {
+			return false, err
+		}
+		hits, err := decodeSyncHits(raw)
+		if err != nil {
+			return false, err
+		}
+		if len(hits) != len(keys) {
+			return false, nil
+		}
+		for i, hit := range hits {
+			if hit.ID != keys[i] || !sourceRowMatches(hit, w.sourceID) {
+				return false, nil
+			}
+			digest, err := projectionDigest(hit.Source.Document)
+			if err != nil {
+				return false, err
+			}
+			if hex.EncodeToString(digest[:]) != proofs[hit.ID] {
+				return false, nil
+			}
+		}
+	}
+	for id := range proofs {
+		w.verified[id] = true
+	}
+	return true, nil
 }
 
 // Finish never removes missing rows for partial inventories or repairs. A full
