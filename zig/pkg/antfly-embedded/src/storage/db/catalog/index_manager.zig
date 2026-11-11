@@ -19459,8 +19459,9 @@ pub const IndexManager = struct {
             const residual_start = platform_time.monotonicNs();
             for (candidate_metadata, fallback_doc_keys, 0..) |*metadata, fallback, i| {
                 if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
-                metadata.* = try dense_exact.filterMetadata(req, metadata.* orelse fallback);
+                metadata.* = metadata.* orelse fallback;
             }
+            try dense_exact.filterMetadata(req, candidate_metadata);
             exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
         }
 
@@ -19483,7 +19484,6 @@ pub const IndexManager = struct {
                 var batch_key_bytes: u64 = 0;
                 for (candidate_metadata[key_scan_start..key_scan_end], fallback_doc_keys[key_scan_start..key_scan_end]) |maybe_metadata, fallback_doc_key| {
                     const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
-                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
                     // Internal tuple encoding can escape every byte. Include
                     // fixed namespace/components plus arena alignment slack.
                     batch_key_bytes +|= @as(u64, @intCast(doc_key.len)) *| 2 +| @as(u64, @intCast(artifact_name.len)) +| 64;
@@ -46679,10 +46679,17 @@ test "production external scorers use bounded cache-first artifact batches" {
 
     const Residual = struct {
         key: []const u8,
+        calls: usize = 0,
 
-        fn allows(raw: *anyopaque, key: []const u8) !bool {
-            const context: *const @This() = @ptrCast(@alignCast(raw));
-            return std.mem.eql(u8, context.key, key);
+        fn allows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedScalarPredicate;
+        }
+
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const context: *@This() = @ptrCast(@alignCast(raw));
+            context.calls += 1;
+            try std.testing.expect(keys.len <= 128);
+            for (keys, allowed) |key, *keep| keep.* = std.mem.eql(u8, context.key, key);
         }
     };
     var residual = Residual{ .key = doc_keys[far_query_idx] };
@@ -46690,9 +46697,10 @@ test "production external scorers use bounded cache-first artifact batches" {
         .query = vectors[far_query_idx * dims ..][0..dims],
         .k = 10,
         .filter_ids = candidate_ids,
-        .key_predicate = .{ .ptr = &residual, .allows = Residual.allows },
+        .key_predicate = .{ .ptr = &residual, .allows = Residual.allows, .allows_many = Residual.many },
     });
     defer filtered.results.deinit();
+    try std.testing.expect(residual.calls > 1);
     try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
     try std.testing.expectEqual(@as(u64, 1), filtered.vectors_scored);
     try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
@@ -52627,13 +52635,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         const expected_documents = embedder.documents - before_filtered;
         const before_page_documents = embedder.documents;
         const before_page_batches = embedder.calls;
-        var page = try query_exec.searchDenseProfiled(alloc, .{
-            .index_name = "leann_idx",
-            .limit = 3,
-            .include_stored = false,
-            .filter_ids = &allowlist,
-            .distance_under = 0.001,
-        }, .{ .vector = &vectors[5], .k = 3 }, .{
+        const paging_executor: query_exec.DenseSearchExecutor = .{
             .ctx = &paging,
             .filter_candidate_presence = true,
             .text_index_entry = Paging.text,
@@ -52644,7 +52646,14 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             .hbc_search = Paging.search,
             .hbc_search_profiled = Paging.profiled,
             .postprocess = Paging.postprocess,
-        });
+        };
+        var page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, paging_executor);
         defer page.result.deinit();
         try std.testing.expectEqual(@as(usize, 1), paging.calls);
         try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
@@ -52653,6 +52662,24 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try std.testing.expectEqual(@as(u64, 1), page.result.total_hits);
         try std.testing.expectEqual(expected_documents, embedder.documents - before_page_documents);
         try std.testing.expectEqual(filtered.profile.rerank_batches, embedder.calls - before_page_batches);
+
+        paging.calls = 0;
+        const before_graph_batches = embedder.calls;
+        var graph_page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .profile = true,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, paging_executor);
+        defer graph_page.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), paging.calls);
+        try std.testing.expectEqual(@as(usize, 1), graph_page.result.hits.len);
+        try std.testing.expectEqualStrings(keys[5], graph_page.result.hits[0].id);
+        try std.testing.expectEqual(.exact, graph_page.result.total_hits_relation);
+        try std.testing.expectEqual(@as(u64, n), graph_page.profile.hbc_nodes_visited);
+        try std.testing.expect(embedder.calls > before_graph_batches);
+        try std.testing.expectEqual(graph_page.profile.hbc_rerank_batches, embedder.calls - before_graph_batches);
 
         // Deleting a quarter rebuilds from codes on sync: nothing re-embedded.
         var deleted: [n / 4][]const u8 = undefined;

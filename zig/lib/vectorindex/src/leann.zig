@@ -856,7 +856,12 @@ pub const Index = struct {
             try self.offerFiltered(alloc, source, filter, &work, start, first, opts.bound_scale, approx.query_radius);
 
             const default_ef: u32 = if (self.rabitq != null) 512 else 64;
-            var budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
+            const initial_budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
+            var budget = @min(initial_budget, self.node_count);
+            // Once filled, allow two initial-widths of additional exploration
+            // across sparse gaps. Short pages keep widening until exhausted.
+            var filled_budget: u32 = self.node_count;
+            stats.matches.complete = true;
             // An allowlist is a global count. Start with the usual search
             // width and learn the yield near this query before widening.
             const target = if (filter.eligible_count) |count|
@@ -864,6 +869,7 @@ pub const Index = struct {
             else
                 opts.k *| 12;
             stats.peak_frontier = 1;
+            var discovered_nodes: u32 = 1;
             var eligible_seen: usize = 0;
             var previous_cutoff: ?FilteredCandidate = null;
             while (true) {
@@ -878,6 +884,7 @@ pub const Index = struct {
                         try fresh.append(alloc, id);
                     }
                     const estimates = try approx.score(fresh.items);
+                    discovered_nodes += @intCast(fresh.items.len);
                     stats.approx_evaluated += @intCast(fresh.items.len);
                     for (fresh.items, estimates) |id, estimate| {
                         try frontier.push(alloc, .{ .id = id, .dist = estimate.dist });
@@ -893,7 +900,10 @@ pub const Index = struct {
                     try self.verifyFiltered(alloc, source, q, null, opts, filter, &work, &top, &stats);
                     if (frontier.len() == 0) break;
                     if (top.len() >= opts.k) {
-                        if (discovered >= target) break;
+                        if (previous_cutoff == null) {
+                            filled_budget = @min(self.node_count, stats.expanded +| (initial_budget *| 2));
+                        }
+                        if (discovered >= target or stats.expanded >= filled_budget) break;
                         // Residual filters may have fewer matches than the
                         // target. Confirm the kth result on a wider wave.
                         const cutoff = top.top();
@@ -911,8 +921,9 @@ pub const Index = struct {
                     std.math.divCeil(u64, @as(u64, budget) * target, discovered) catch unreachable;
                 const minimum = @as(u64, budget) + @max(budget / 4, 1);
                 const next_budget = std.math.clamp(projected, minimum, @as(u64, budget) * 2);
-                budget = @intCast(@min(next_budget, self.node_count));
+                budget = @intCast(@min(next_budget, filled_budget));
             }
+            stats.matches.complete = stats.matches.complete and discovered_nodes == self.node_count;
         }
         std.mem.sortUnstable(FilteredCandidate, top.items.items, {}, FilteredCandidate.lessThan);
         const results = try alloc.alloc(Result, top.len());
@@ -3476,7 +3487,10 @@ test "leann: a distance-selective allowlist verifies before the graph is exhaust
         }.allows,
     }, null);
     defer after_gap.deinit(alloc);
+    try testing.expectEqual(@as(usize, 10), after_gap.results.len);
     try testing.expectEqual(@as(u32, 40), after_gap.results[0].id);
+    for (after_gap.results[1..], 0..) |hit, i| try testing.expectEqual(@as(u32, @intCast(i)), hit.id);
+    try testing.expect(after_gap.stats.expanded <= 48);
 }
 
 test "leann: clustered eligibility stops a widened walk before exhausting the graph" {
@@ -3512,7 +3526,8 @@ test "leann: clustered eligibility stops a widened walk before exhausting the gr
         if (known != null) {
             try testing.expect(result.stats.expanded > 16 and result.stats.expanded < count);
         } else {
-            try testing.expectEqual(@as(u32, count), result.stats.expanded);
+            try testing.expect(result.stats.expanded <= 48);
+            try testing.expect(!result.stats.matches.complete);
         }
         try testing.expectEqual(@as(u32, 1), result.stats.peak_frontier);
     }

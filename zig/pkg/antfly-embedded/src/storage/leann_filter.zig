@@ -21,9 +21,26 @@ pub const Filter = struct {
 
     ids: search.RequestFilterState,
     request: search.SearchRequest,
+    included_count: ?u32,
 
     pub fn init(alloc: std.mem.Allocator, request: search.SearchRequest) !Filter {
-        return .{ .ids = try search.RequestFilterState.init(alloc, request), .request = request };
+        const ids = try search.RequestFilterState.init(alloc, request);
+        const include_count = ids.include.count();
+        var remaining = include_count;
+        if (include_count != 0) {
+            if (ids.exclude.count() < include_count) {
+                var excluded = ids.exclude.keyIterator();
+                while (excluded.next()) |id| {
+                    if (ids.include.contains(id.*)) remaining -= 1;
+                }
+            } else {
+                var included = ids.include.keyIterator();
+                while (included.next()) |id| {
+                    if (ids.exclude.contains(id.*)) remaining -= 1;
+                }
+            }
+        }
+        return .{ .ids = ids, .request = request, .included_count = if (include_count != 0) remaining else null };
     }
 
     pub fn deinit(self: *Filter, alloc: std.mem.Allocator) void {
@@ -52,21 +69,16 @@ pub const Filter = struct {
     }
 
     pub fn eligibleCount(self: *const Filter) ?u32 {
-        if (self.ids.include.count() == 0 or self.request.key_predicate != null or self.request.filter_prefix.len != 0) return null;
-        if (self.ids.exclude.count() == 0) return self.ids.include.count();
-        var count: u32 = 0;
-        var ids = self.ids.include.keyIterator();
-        while (ids.next()) |id| {
-            if (!self.ids.exclude.contains(id.*)) count += 1;
-        }
-        return count;
+        if (self.included_count == 0) return 0;
+        if (self.request.key_predicate != null or self.request.filter_prefix.len != 0) return null;
+        return self.included_count;
     }
 
     /// Small sets are exact. A larger, sparse RaBitQ allowlist can avoid
     /// walking unrelated nodes by scoring its codes before loading vectors.
     pub fn directMode(self: *const Filter, dims: usize, live: usize, transient: bool, rabitq: bool) DirectMode {
-        const count: usize = self.ids.include.count();
-        if (count == 0) return .graph;
+        const count: usize = self.included_count orelse return .graph;
+        if (count == 0) return .exact;
         const width = @max(dims, 1);
         const exact_limit: usize = if (transient) 16 else 64;
         if (count <= @min(exact_limit, (64 * 1024) / width)) return .exact;
@@ -106,4 +118,21 @@ test "direct bounds work scales with graph size and requested results" {
     defer filter.deinit(alloc);
     try std.testing.expectEqual(Filter.DirectMode.bounds, filter.directMode(768, 1_000_000, true, true));
     try std.testing.expectEqual(Filter.DirectMode.graph, filter.directMode(768, 4096, true, true));
+}
+
+test "explicit exclusions reduce direct route work to surviving IDs" {
+    const alloc = std.testing.allocator;
+    var ids: [128]u64 = undefined;
+    for (&ids, 0..) |*id, i| id.* = i;
+    for ([_]usize{ 127, 128 }) |excluded| {
+        var filter = try Filter.init(alloc, .{
+            .query = &.{},
+            .k = 1,
+            .filter_ids = &ids,
+            .exclude_ids = ids[0..excluded],
+        });
+        defer filter.deinit(alloc);
+        try std.testing.expectEqual(@as(?u32, @intCast(ids.len - excluded)), filter.eligibleCount());
+        try std.testing.expectEqual(Filter.DirectMode.exact, filter.directMode(768, 256, true, true));
+    }
 }

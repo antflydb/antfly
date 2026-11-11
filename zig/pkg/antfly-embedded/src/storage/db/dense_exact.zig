@@ -17,12 +17,39 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vectorindex = @import("antfly_vectorindex");
 
-/// Resolve the residual on an already-loaded candidate key.
-pub fn filterMetadata(req: vectorindex.SearchRequest, metadata: ?[]const u8) !?[]const u8 {
-    const key = metadata orelse return null;
-    if (!std.mem.startsWith(u8, key, req.filter_prefix)) return null;
-    if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, key)) return null;
-    return key;
+/// Clear rejected keys before scoring. Compact prefix matches into bounded
+/// predicate tiles so storage owners can evaluate them in one callback.
+pub fn filterMetadata(req: vectorindex.SearchRequest, metadata: []?[]const u8) !void {
+    const tile_size = 128;
+    var keys: [tile_size][]const u8 = undefined;
+    var positions: [tile_size]usize = undefined;
+    var allowed: [tile_size]bool = undefined;
+    var offset: usize = 0;
+    while (offset < metadata.len) {
+        try vectorindex.search_types.checkCancelled(req);
+        const tile = metadata[offset..][0..@min(tile_size, metadata.len - offset)];
+        var count: usize = 0;
+        for (tile, 0..) |*slot, i| {
+            const key = slot.* orelse continue;
+            if (!std.mem.startsWith(u8, key, req.filter_prefix)) {
+                slot.* = null;
+                continue;
+            }
+            if (req.key_predicate != null) {
+                keys[count] = key;
+                positions[count] = i;
+                count += 1;
+            }
+        }
+        if (count != 0) {
+            try req.key_predicate.?.allowsMany(keys[0..count], allowed[0..count]);
+            try vectorindex.search_types.checkCancelled(req);
+            for (positions[0..count], allowed[0..count]) |position, keep| {
+                if (!keep) tile[position] = null;
+            }
+        }
+        offset += tile.len;
+    }
 }
 
 /// The result of exact dense scoring together with work measured at the point

@@ -701,6 +701,8 @@ pub const Replica = struct {
                 for (keys) |key| try direct_key_set.put(alloc, key, {});
             }
         }
+        var buffer_loads: u32 = 0;
+        var buffer_batches: u32 = 0;
         var dirty_slots: std.ArrayListUnmanaged(usize) = .empty;
         defer dirty_slots.deinit(alloc);
         for (self.buffer_keys.items, 0..) |key, slot| {
@@ -732,6 +734,8 @@ pub const Replica = struct {
                     const slots = dirty_slots.items[start..][0..@min(batch_size, dirty_slots.items.len - start)];
                     for (slots, keys[0..slots.len]) |slot, *key| key.* = self.buffer_keys.items[slot];
                     @memset(found[0..slots.len], false);
+                    buffer_loads += @intCast(slots.len);
+                    buffer_batches += 1;
                     try load_batch(loader.ctx, alloc, keys[0..slots.len], vectors[0 .. slots.len * query.len], found[0..slots.len]);
                     for (keys[0..slots.len], found[0..slots.len], 0..) |key, ok, i| {
                         if (ok) try self.scoreBufferHit(alloc, q, tmp, key, vectors[i * query.len ..][0..query.len], tuning.filter, &hits);
@@ -743,6 +747,8 @@ pub const Replica = struct {
             for (dirty_slots.items) |slot| {
                 if (tuning.filter) |filter| if (filter.cancelled(filter.ctx)) return error.Cancelled;
                 const key = self.buffer_keys.items[slot];
+                buffer_loads += 1;
+                buffer_batches += 1;
                 const vector = loader.load(loader.ctx, alloc, key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
@@ -808,7 +814,11 @@ pub const Replica = struct {
             if (tuning.stats) |profile| profile.* = resp.stats;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
-        if (tuning.stats) |profile| profile.matches = matches;
+        if (tuning.stats) |profile| {
+            profile.matches = matches;
+            profile.recomputed +|= buffer_loads;
+            profile.batches +|= buffer_batches;
+        }
         std.mem.sortUnstable(Hit, hits.items, tuning.filter, struct {
             fn lt(filter: ?KeyFilter, a: Hit, b: Hit) bool {
                 if (a.distance == b.distance) {

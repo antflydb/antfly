@@ -16599,10 +16599,7 @@ fn exactScoreNativeDenseFilter(
 
     if (candidate_metadata.len > 0) {
         const residual_start = platform_time.monotonicNs();
-        for (candidate_metadata, 0..) |*slot, i| {
-            if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
-            slot.* = try dense_exact.filterMetadata(req, slot.*);
-        }
+        try dense_exact.filterMetadata(req, candidate_metadata);
         exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
     }
 
@@ -16750,6 +16747,43 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     try std.testing.expectEqual(@as(usize, 3), counter.count);
     try std.testing.expectEqual(@as(usize, 1), residual.results.getHits().len);
     try std.testing.expectEqual(@as(u64, 2), residual.results.getHits()[0].vector_id);
+
+    const BatchPredicate = struct {
+        calls: usize = 0,
+        cancel: bool = false,
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn one(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedScalarPredicate;
+        }
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            for (keys, allowed) |key, *keep| {
+                try std.testing.expect(std.mem.startsWith(u8, key, "doc:keep:"));
+                keep.* = std.mem.eql(u8, key, "doc:keep:b");
+            }
+            if (self.cancel) self.cancelled.store(true, .release);
+        }
+    };
+    var predicate = BatchPredicate{};
+    const batch_req: vectorindex_mod.SearchRequest = .{
+        .query = &.{ 0.0, 0.0 },
+        .k = 4,
+        .filter_ids = &.{ 4, 2, 3, 1 },
+        .filter_prefix = "doc:keep:",
+        .key_predicate = .{ .ptr = &predicate, .allows = BatchPredicate.one, .allows_many = BatchPredicate.many },
+        .cancellation = vectorindex_mod.search_types.CancellationToken.fromAtomic(&predicate.cancelled),
+    };
+    var batched = try exactScoreNativeDenseFilter(alloc, &entry, batch_req);
+    defer batched.results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), predicate.calls);
+    try std.testing.expectEqual(@as(usize, 4), counter.count);
+    try std.testing.expectEqual(residual.results.getHits()[0].vector_id, batched.results.getHits()[0].vector_id);
+    predicate.cancel = true;
+    try std.testing.expectError(error.Cancelled, exactScoreNativeDenseFilter(alloc, &entry, batch_req));
+    try std.testing.expectEqual(@as(usize, 4), counter.count);
 }
 
 test "one percent filtered route preserves exact recall with candidate-linear IO" {

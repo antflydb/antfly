@@ -698,12 +698,13 @@ pub const ReplicatedState = struct {
         const filter_ctx = FilterContext{ .state = self, .filter = &filter };
         const direct_mode = filter.directMode(self.opts.replica.config.dims, self.replica.liveCount(), self.opts.transient, self.opts.replica.config.quantizer == .rabitq);
         const direct = direct_mode != .graph;
-        const keys: [][]const u8 = if (direct) try alloc.alloc([]const u8, filter.ids.include.count()) else &.{};
+        const keys: [][]const u8 = if (direct) try alloc.alloc([]const u8, filter.included_count.?) else &.{};
         defer if (direct) alloc.free(keys);
         var key_count: usize = 0;
         if (direct) {
             var ids = filter.ids.include.keyIterator();
             while (ids.next()) |id| {
+                if (filter.ids.exclude.contains(id.*)) continue;
                 const key = self.key_of.get(id.*) orelse continue;
                 keys[key_count] = key;
                 key_count += 1;
@@ -1337,17 +1338,20 @@ test "leann replicated state: search honors the index's tuning settings" {
         }
         counting.loads = 0;
         counting.batches = 0;
-        var result = try buffered.search(alloc, .{
+        var buffer_stats: leann.SearchStats = .{};
+        var result = try buffered.searchWithStats(alloc, .{
             .query = &current,
             .k = 1,
             .filter_ids = &.{ 603, 604 },
-        });
+        }, &buffer_stats);
         defer result.deinit();
         try testing.expectEqual(@as(u64, 603), result.getHits()[0].vector_id);
         try testing.expectEqual(@as(f32, 0), result.getHits()[0].distance);
         try testing.expectEqual(.more, result.candidate_coverage);
         try testing.expectEqual(@as(usize, 2), counting.loads);
         try testing.expectEqual(@as(usize, 1), counting.batches);
+        try testing.expectEqual(@as(u32, 2), buffer_stats.recomputed);
+        try testing.expectEqual(@as(u32, 1), buffer_stats.batches);
     }
     var keys: [600][8]u8 = undefined;
     var vecs: [600][dims]f32 = undefined;

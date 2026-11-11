@@ -633,7 +633,7 @@ pub const LeannStore = struct {
         defer alloc.free(scratch);
         const direct_mode = filter.directMode(self.opts.dims, self.node_of.count() + self.pending.items.len, self.opts.transient, self.opts.quantizer == .rabitq);
         const direct = direct_mode != .graph;
-        const graph_ids: []u32 = if (direct) try alloc.alloc(u32, filter.ids.include.count()) else &.{};
+        const graph_ids: []u32 = if (direct) try alloc.alloc(u32, filter.included_count.?) else &.{};
         defer if (direct) alloc.free(graph_ids);
         var graph_count: usize = 0;
         var pending_matches: usize = 0;
@@ -641,6 +641,7 @@ pub const LeannStore = struct {
         if (direct) {
             var ids = filter.ids.include.keyIterator();
             while (ids.next()) |id| {
+                if (filter.ids.exclude.contains(id.*)) continue;
                 if (self.node_of.get(id.*)) |node_id| {
                     graph_ids[graph_count] = node_id;
                     graph_count += 1;

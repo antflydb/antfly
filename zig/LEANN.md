@@ -454,13 +454,16 @@ and rescores leaf members near the admission cutoff with extended codes
   before exact verification. Selective ID allowlists can score directly.
   Graph search keeps nonmatching nodes available for navigation and widens
   its frontier as needed. An empty verification wave cannot confirm a stable
-  cutoff while the frontier still contains unexplored nodes. Exact distances
-  come from the stored embedding artifact, the document field, or transient
-  re-embedding. Replicas verify
+  cutoff while the frontier still contains unexplored nodes. Once a page
+  fills, the walk can expand up to two additional initial search widths.
+  Short pages keep widening. Exact distances come from the stored embedding
+  artifact, the document field, or transient re-embedding. Replicas verify
   dirty candidates against the current vector before using their distances.
   Filtered top-k breaks distance ties by public vector ID. Direct searches
-  publish exhaustion when verification proves the qualifying count. They
-  also report a proven surplus after pruning, so paging can distinguish a
+  publish exhaustion when verification proves the qualifying count. Graph
+  searches can also prove exhaustion after discovering every node without
+  skipping any eligible candidate by its ranking bound. Both routes report
+  a proven surplus after pruning, so paging can distinguish a
   short complete result window from one that can still grow.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
