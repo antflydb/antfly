@@ -200,7 +200,7 @@ pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.Genera
 }
 
 fn definitionField(comptime name: []const u8) bool {
-    return !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
+    return !std.mem.eql(u8, name, "expected_vector_digest") and !std.mem.eql(u8, name, "expected_source_hash") and !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
 }
 
 /// Stable identity for exactly the fields used by sameDefinition. Framed

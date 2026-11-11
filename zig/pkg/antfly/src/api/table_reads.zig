@@ -12737,7 +12737,7 @@ fn queryLocalDetailed(
                 .lease = lease_value,
                 .alloc = alloc,
             } };
-            return try queryDbDetailed(read_safety_barrier, alloc, group_id, owner, req, consistency);
+            return try queryDbDetailed(read_safety_barrier, alloc, group_id, owner, req, consistency, table_name, runtime_cfg);
         }
     }
 
@@ -12745,11 +12745,11 @@ fn queryLocalDetailed(
     defer alloc.free(path);
     if (cache) |cached| {
         const db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
-        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .cached = db_lease }, req, consistency);
+        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .cached = db_lease }, req, consistency, table_name, runtime_cfg);
     } else {
         const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
         const db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, runtime_cfg, identity_namespace);
-        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .owned = db }, req, consistency);
+        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .owned = db }, req, consistency, table_name, runtime_cfg);
     }
 }
 
@@ -12760,6 +12760,8 @@ fn queryDbDetailed(
     db_owner: LocalQueryDbOwner,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
+    table_name: []const u8,
+    runtime_cfg: ManagedReadRuntimeConfig,
 ) !LocalQueryExecution {
     var owner = db_owner;
     errdefer owner.deinit();
@@ -12767,7 +12769,22 @@ fn queryDbDetailed(
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
     if (req.native_query_cut) |cut| {
-        const retained = try db.openQueryCut(cut, req.cancellation orelse .none);
+        const retained = retained: {
+            var opened = try db.openQueryCut(cut, req.cancellation orelse .none);
+            errdefer opened.close();
+            // DB cuts already fork an attached recipe. A source with no
+            // current transient index still needs the historical recipe here.
+            if (opened.async_context.query_recovery_runtime == null) {
+                for (opened.core.index_manager.dense_indexes.items) |entry| {
+                    if (!entry.leann_transient) continue;
+                    const indexes_json = try retainedRecoveryIndexesJson(alloc, &opened);
+                    defer alloc.free(indexes_json);
+                    try attachProvisionedQueryRecovery(&opened, indexes_json, runtime_cfg.forTable(table_name));
+                    break;
+                }
+            }
+            break :retained opened;
+        };
         owner.deinit();
         owner = .{ .owned = retained };
         db = owner.db();
@@ -13047,10 +13064,6 @@ fn openProvisionedQueryDbForTableWithCache(
     };
     defer alloc.free(indexes_json);
 
-    // Query-readonly DBs never initialize optional enrichment runtimes: those
-    // workers produce derived artifacts and are exclusively writer-owned.
-    // Constructing producer/embedder state here was therefore both wasted work
-    // and an ownership trap—the successful DB open could not consume it.
     var db = try db_mod.DB.open(alloc, path, .{
         .open_mode = .query_readonly,
         .lsm_cache = lsm_cache,
@@ -13068,11 +13081,128 @@ fn openProvisionedQueryDbForTableWithCache(
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = false,
+        .embedding_options = queryRecoveryEmbeddingOptions(runtime_cfg.forTable(table_name), db.backend_runtime.io()),
     });
     // Query opens must never materialize metadata-defined indexes. Writers own
     // that catalog mutation under the root writer lock.
     if (summary.indexManagerCatalogChanged()) return error.ReadOnly;
+    for (db.core.index_manager.dense_indexes.items) |entry| {
+        if (!entry.leann_transient) continue;
+        try attachProvisionedQueryRecovery(&db, indexes_json, runtime_cfg.forTable(table_name));
+        break;
+    }
     return db;
+}
+
+/// Rebuild provider configuration from the retained catalog, including when
+/// forGroup consumed the coordinator recipe before the owner opened the cut.
+fn retainedRecoveryIndexesJson(alloc: std.mem.Allocator, db: *db_mod.DB) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var root: std.json.Value = .{ .object = .{} };
+    for (db.core.index_manager.dense_indexes.items) |entry| {
+        if (!entry.leann_transient) continue;
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, entry.config.config_json, .{});
+        if (value != .object) return error.InvalidManagedEmbeddingIndex;
+        try value.object.put(scratch, "type", .{ .string = "embeddings" });
+        if (value.object.get("dims")) |dims| try value.object.put(scratch, "dimension", dims);
+        if (value.object.get("generator")) |generator| {
+            if (generator != .object) return error.InvalidManagedEmbeddingIndex;
+            if (generator.object.get("source_template")) |template| try value.object.put(scratch, "template", template);
+            if (generator.object.get("chunker")) |chunker| try value.object.put(scratch, "chunker", chunker);
+        }
+        try root.object.put(scratch, entry.config.name, value);
+    }
+    return std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+fn queryRecoveryEmbeddingOptions(cfg: ManagedReadRuntimeConfig, io: ?std.Io) managed_embedder.InitOptions {
+    return .{
+        .antfly_provider = providerWithCapabilityCache(cfg.antfly_provider, cfg.remote_capability_cache),
+        .provider_runtime = cfg.provider_runtime,
+        .remote_capability_cache = cfg.remote_capability_cache,
+        .io = io,
+        .bounded_http_request = true,
+        .secret_store = cfg.secret_store,
+        .remote_content = cfg.remote_content,
+        .inference_api_url = cfg.inference_api_url,
+        .inference_api_key = cfg.inference_api_key,
+        .source_table = cfg.source_table,
+    };
+}
+
+const ProvisionedQueryRecovery = struct {
+    arena: std.heap.ArenaAllocator,
+    indexes_json: []const u8,
+    cfg: ManagedReadRuntimeConfig,
+    io: std.Io,
+
+    fn create(raw: *anyopaque, control: managed_embedder.RequestContext) !db_mod.enrichment_runtime.Config {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const alloc = self.arena.child_allocator;
+        const indexes_json = self.indexes_json;
+        const cfg = self.cfg;
+        const io = self.io;
+        try control.check();
+        const provider = providerWithCapabilityCache(cfg.antfly_provider, cfg.remote_capability_cache);
+        var options = queryRecoveryEmbeddingOptions(cfg, io);
+        options.setup_context = control;
+        var recovery: db_mod.enrichment_runtime.Config = .{
+            .dense_embedder = (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, options)) orelse return error.ReembedUnavailable,
+        };
+        errdefer if (recovery.dense_embedder) |dense| dense.deinit(alloc);
+        try control.check();
+        recovery.chunk_provider = try @import("antfly_local_sources").api_local_table_writes.physical_local_write.chunkProviderForRuntime(
+            alloc,
+            provider,
+            io,
+            cfg.remote_capability_cache,
+            cfg.inference_api_url,
+            cfg.source_table,
+            cfg.inference_api_key,
+            cfg.secret_store,
+        );
+        errdefer if (recovery.chunk_provider) |*provider_value| provider_value.deinit();
+        try control.check();
+        return recovery;
+    }
+
+    fn fork(raw: *anyopaque, alloc: std.mem.Allocator, indexes_json: []const u8) !db_mod.DB.QueryRecoveryFactory {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return try provisionedQueryRecoveryFactory(alloc, indexes_json, self.cfg, self.io);
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
+fn attachProvisionedQueryRecovery(db: *db_mod.DB, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig) !void {
+    const io = db.backend_runtime.io() orelse return;
+    const factory = try provisionedQueryRecoveryFactory(db.runtime_alloc, indexes_json, cfg, io);
+    errdefer factory.release(factory.ptr);
+    try db.attachLazyQueryRecovery(factory);
+}
+
+fn provisionedQueryRecoveryFactory(backing: std.mem.Allocator, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig, io: std.Io) !db_mod.DB.QueryRecoveryFactory {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const owner = try alloc.create(ProvisionedQueryRecovery);
+    var owned_cfg = cfg;
+    owned_cfg.source_table = try alloc.dupe(u8, cfg.source_table);
+    owned_cfg.inference_api_url = if (cfg.inference_api_url) |url| try alloc.dupe(u8, url) else null;
+    owned_cfg.inference_api_key = if (cfg.inference_api_key) |key| try alloc.dupe(u8, key) else null;
+    owner.* = .{
+        .indexes_json = try alloc.dupe(u8, indexes_json),
+        .cfg = owned_cfg,
+        .io = io,
+        .arena = arena,
+    };
+    return .{ .fork = ProvisionedQueryRecovery.fork, .ptr = owner, .create = ProvisionedQueryRecovery.create, .release = ProvisionedQueryRecovery.release };
 }
 
 fn loadTableIndexesJson(
@@ -33555,6 +33685,189 @@ fn implementationTests() type {
                 .shard_id = 7001,
                 .range_id = 7105,
             }));
+        }
+
+        test "provisioned read-only query recovers cold transient leann stubs" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-leann");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path();
+
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+            const indexes =
+                \\{"semantic":{"type":"embeddings","field":"body","dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"},"embedder":{"provider":"antfly","model":"local-model"}}}
+            ;
+            const CatalogState = struct {
+                tables: [1]metadata_table_manager.TableRecord = .{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = indexes,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }},
+                fn iface(self: *@This()) table_catalog.CatalogSource {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = &self.tables,
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                            .group_id = 7001,
+                            .table_id = 7,
+                            .range_id = 7105,
+                            .start_key = "",
+                            .end_key = null,
+                        }})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            const Provider = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+                fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) anyerror![][]f32 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    _ = self.calls.fetchAdd(1, .monotonic);
+                    const vectors = try a.alloc([]f32, texts.len);
+                    var ready: usize = 0;
+                    errdefer {
+                        for (vectors[0..ready]) |vector| a.free(vector);
+                        a.free(vectors);
+                    }
+                    for (texts) |value| {
+                        const i = std.fmt.parseInt(u32, value, 10) catch 1;
+                        const f: f32 = @floatFromInt(i);
+                        vectors[ready] = try a.dupe(f32, &.{ 1, f, f * f, 0 });
+                        ready += 1;
+                    }
+                    return vectors;
+                }
+                fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+                    return error.TestUnexpectedResult;
+                }
+            };
+            var mock = Provider{};
+            const provider: managed_embedder.AntflyProvider = .{ .ptr = &mock, .embed_dense_texts = Provider.dense, .embed_sparse_texts = Provider.sparse };
+            var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+            defer runtime.deinit();
+            const namespace: db_mod.DocIdentityNamespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7105 };
+            var catalog_arena = std.heap.ArenaAllocator.init(alloc);
+            defer catalog_arena.deinit();
+            const catalog_alloc = catalog_arena.allocator();
+            var admitted_root = try std.json.parseFromSliceLeaky(std.json.Value, catalog_alloc, indexes, .{});
+            const original_config = admitted_root.object.get("semantic").?;
+            const admitted_config = (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(alloc, "semantic", original_config, admitted_root, .{ .antfly_provider = provider, .io = runtime.ptr().io() })) orelse return error.TestUnexpectedResult;
+            defer alloc.free(admitted_config);
+            try admitted_root.object.put(catalog_alloc, "semantic", try std.json.parseFromSliceLeaky(std.json.Value, catalog_alloc, admitted_config, .{}));
+            const admitted_indexes = try std.json.Stringify.valueAlloc(alloc, admitted_root, .{});
+            defer alloc.free(admitted_indexes);
+            {
+                const dense = (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, admitted_indexes, .{ .antfly_provider = provider, .io = runtime.ptr().io() })) orelse return error.TestUnexpectedResult;
+                var writer = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .backend_runtime = runtime.ptr(), .enrichment = .{ .dense_embedder = dense } });
+                defer writer.close();
+                _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &writer, admitted_indexes, .{ .drain_resolver_backfill = false, .embedding_options = .{ .antfly_provider = provider, .io = runtime.ptr().io() } });
+                const pinned_config = writer.core.index_manager.denseIndex("semantic").?.config.config_json;
+                var admitted = try std.json.parseFromSlice(std.json.Value, alloc, pinned_config, .{});
+                defer admitted.deinit();
+                const producer_json = admitted.value.object.get("semantic_producer").?.string;
+                var producer_identity = try std.json.parseFromSlice(std.json.Value, alloc, producer_json, .{});
+                defer producer_identity.deinit();
+                try std.testing.expectEqualStrings("antfly:embedded", producer_identity.value.object.get("endpoint").?.string);
+                var writes: [300]db_mod.types.BatchWrite = undefined;
+                var keys: [300][16]u8 = undefined;
+                var values: [300][32]u8 = undefined;
+                for (&writes, &keys, &values, 0..) |*write, *key, *value, i| {
+                    write.* = .{ .key = try std.fmt.bufPrint(key, "doc:{d}", .{i}), .value = try std.fmt.bufPrint(value, "{{\"body\":\"{d}\"}}", .{i}) };
+                }
+                try writer.batch(.{ .writes = &writes, .sync_level = .full_index });
+                try writer.syncIndexes(true);
+                const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:17", "semantic");
+                defer alloc.free(key);
+                const raw = try writer.core.store.get(alloc, key);
+                defer alloc.free(raw);
+                try std.testing.expect(try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+                const stored_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:18", "semantic");
+                defer alloc.free(stored_key);
+                const full = try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, &.{ 1, 18, 324, 0 });
+                defer alloc.free(full);
+                try writer.core.store.put(stored_key, full);
+            }
+            var catalog_state = CatalogState{};
+            catalog_state.tables[0].indexes_json = admitted_indexes;
+            const before = mock.calls.load(.monotonic);
+            var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog_state.iface(), "docs", null, null, backend_current_root_generation, null, .{ .backend_runtime = runtime.ptr(), .antfly_provider = provider }, namespace);
+            defer db.close();
+            try std.testing.expect(!db.async_context.query_recovery_ready.load(.acquire));
+            const entry = db.core.index_manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+            var results = try entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .search_effort = 1 });
+            defer results.deinit();
+            try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
+            try std.testing.expect(mock.calls.load(.monotonic) > before);
+            const retained_config = try retainedRecoveryIndexesJson(alloc, &db);
+            defer alloc.free(retained_config);
+            try attachProvisionedQueryRecovery(&db, retained_config, .{ .backend_runtime = runtime.ptr(), .antfly_provider = provider });
+            // Fork from the retained catalog without initializing the live
+            // catalog. A broken live definition cannot block a historical read.
+            const live_factory = db.async_context.query_recovery_factory.?;
+            const live_recipe: *ProvisionedQueryRecovery = @ptrCast(@alignCast(live_factory.ptr));
+            live_recipe.indexes_json = "{\"unavailable-live-model\":{}}";
+            const forked = try live_factory.fork.?(live_factory.ptr, alloc, retained_config);
+            const before_fork_attach = mock.calls.load(.monotonic);
+            try db.attachLazyQueryRecovery(forked);
+            try std.testing.expectEqual(before_fork_attach, mock.calls.load(.monotonic));
+            db.core.index_manager.leann_reembed_cache.deinit(alloc);
+            const cold_calls = mock.calls.load(.monotonic);
+            var retained_result = try entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .search_effort = 1 });
+            defer retained_result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), retained_result.items.items.len);
+            try std.testing.expect(mock.calls.load(.monotonic) > cold_calls);
+            const retained_dense = db.async_context.query_recovery_runtime.?.config.dense_embedder.?;
+            const cloned_dense = try retained_dense.clone_for_indexes_fn.?(retained_dense.ptr, alloc, retained_config, .{ .io = runtime.ptr().io().?, .deadline_ns = null });
+            defer cloned_dense.deinit(alloc);
+            const cloned_vector = try cloned_dense.embedDense(alloc, "semantic", "17", 4);
+            defer alloc.free(cloned_vector);
+            try std.testing.expectEqual(@as(usize, 4), cloned_vector.len);
+
+            // A filesystem-only runtime cannot initialize query inference.
+            var filesystem_runtime = try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(alloc);
+            defer filesystem_runtime.deinit();
+            var without_recovery = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog_state.iface(), "docs", null, null, backend_current_root_generation, null, .{ .backend_runtime = filesystem_runtime.ptr(), .antfly_provider = provider }, namespace);
+            defer without_recovery.close();
+            var scan = try without_recovery.scan(alloc, "doc:18", "doc:19", .{ .inclusive_from = true, .include_documents = true });
+            defer scan.deinit(alloc);
+            try std.testing.expect(scan.documents.len > 0);
+            const manager = without_recovery.core.index_manager;
+            const stored_id = (try manager.lookupDenseVectorId(without_recovery.core.store, "semantic", "doc:18")) orelse return error.TestUnexpectedResult;
+            const stub_id = (try manager.lookupDenseVectorId(without_recovery.core.store, "semantic", "doc:17")) orelse return error.TestUnexpectedResult;
+            const degraded_entry = manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+            var stored = try degraded_entry.index.searchWithRequest(.{ .query = &.{ 1, 18, 324, 0 }, .k = 1, .filter_ids = &.{stored_id} });
+            defer stored.deinit();
+            try std.testing.expectEqual(@as(usize, 1), stored.items.items.len);
+            try std.testing.expectError(error.ReembedUnavailable, degraded_entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .filter_ids = &.{stub_id} }));
         }
 
         test "provisioned query runtime db rejects stale identity namespace" {
