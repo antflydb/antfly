@@ -1241,6 +1241,7 @@ pub const Store = struct {
         /// Open one stable, range-scoped replay-lane view. The returned
         /// transaction may outlive multiple bounded derived-index windows.
         begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
+        begin_authority_probe: ?*const fn (Allocator, *anyopaque) anyerror!ProbeTxn = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1269,6 +1270,14 @@ pub const Store = struct {
             return try BoundaryAbi.call("begin_probe", self.boundary_dispatch, begin_probe, .{ self.allocator, self.ptr });
         }
         return try probeTxnFrom(self.allocator, try self.beginRead());
+    }
+
+    /// Read the current published checkpoint even when this handle retains a
+    /// snapshot from an earlier external writer.
+    pub fn beginAuthorityProbe(self: *Store) !ProbeTxn {
+        if (self.vtable.begin_authority_probe) |begin|
+            return BoundaryAbi.call("begin_authority_probe", self.boundary_dispatch, begin, .{ self.allocator, self.ptr });
+        return self.beginProbe();
     }
 
     pub fn beginProbeWithBlockCacheAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission) !ProbeTxn {
@@ -2213,6 +2222,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return unbox(ptr).handle.capabilities();
         }
 
+        fn beginAuthorityProbe(alloc: Allocator, ptr: *anyopaque) anyerror!ProbeTxn {
+            if (Handle == Store) return unbox(ptr).handle.beginAuthorityProbe();
+            var probe = try unbox(ptr).handle.beginAuthorityProbe();
+            errdefer probe.abort();
+            return probeTxnFrom(alloc, probe);
+        }
+
         fn beginRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
@@ -2457,6 +2473,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .begin_read = vt.beginRead,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
+            .begin_authority_probe = if (Handle == Store or @hasDecl(Handle, "beginAuthorityProbe")) vt.beginAuthorityProbe else null,
             .begin_probe_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithBlockCacheAdmission")) vt.beginProbeWithBlockCacheAdmission else null,
             .begin_current_scan = if (Handle == Store or @hasDecl(Handle, "beginCurrentScan")) vt.beginCurrentScan else null,
             .begin_replay_lane_scan = if (Handle == Store or @hasDecl(Handle, "beginReplayLaneScan")) vt.beginReplayLaneScan else null,

@@ -23,40 +23,7 @@ const ast = dependencies.sql_ast;
 pub const compiler = dependencies.sql_compiler;
 pub const runtime = dependencies.sql_runtime;
 
-/// Live preparation bytes shared by callers of one database, including plans
-/// queued for its API/writer gate. The owner is a stable path gate (or a pinned
-/// non-Lite root handle), never a serving runtime that admission can replace.
-pub const PreparationAdmission = struct {
-    limit: usize = runtime.resource_limits.preparation_bytes,
-    used: std.atomic.Value(usize) = .init(0),
-    test_after_prepare: if (@import("builtin").is_test) ?struct {
-        ptr: *anyopaque,
-        notify: *const fn (*anyopaque, usize, usize, bool) void,
-    } else void = if (@import("builtin").is_test) null else {},
-
-    pub fn budget(self: *PreparationAdmission, backing: std.mem.Allocator) dependencies.sql_memory_budget {
-        return .{
-            .backing = backing,
-            .limit = runtime.resource_limits.preparation_bytes,
-            .admission = .{ .ptr = self, .reserve = reserve, .release = release },
-        };
-    }
-    fn reserve(ptr: *anyopaque, bytes: usize) bool {
-        if (bytes == 0) return true;
-        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
-        var used = self.used.load(.monotonic);
-        while (true) {
-            if (bytes > self.limit -| used) return false;
-            used = self.used.cmpxchgWeak(used, used + bytes, .acq_rel, .monotonic) orelse return true;
-        }
-    }
-    fn release(ptr: *anyopaque, bytes: usize) void {
-        if (bytes == 0) return;
-        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
-        const previous = self.used.fetchSub(bytes, .release);
-        std.debug.assert(previous >= bytes);
-    }
-};
+pub const PreparationAdmission = @import("../sql/preparation_admission.zig").PreparationAdmission;
 
 /// Locking mode does not indicate whether SQL publishes persistent changes.
 /// EXPLAIN is read-only (ANALYZE rejects mutations); COMMIT can flush staged DML.

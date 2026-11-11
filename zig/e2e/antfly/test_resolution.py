@@ -864,9 +864,15 @@ def _doc_text(doc: dict) -> str:
     return json.dumps(doc)
 
 
-def _transient_poll_error(exc: requests.RequestException) -> bool:
+def _transient_poll_error(
+    exc: requests.RequestException, *, read_only: bool = False
+) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
+        # A read-only poll may spend its per-request deadline while the outer
+        # convergence budget remains live. This never authorizes write replay.
+        if read_only and response.status_code == 504:
+            return True
         # Availability has an explicit contract. Retrying an INTERNAL_ERROR
         # hid an untransportable ReadIndexTimeout until the promotion deadline.
         return response.status_code == 503 and bool(
