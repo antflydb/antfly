@@ -149,7 +149,7 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := "gs://e2e-originals/" + key + "?generation=123"
-	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "metadata": map[string]any{"page_start": 1, "page_end": 1}}
+	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1}}
 	if _, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/batch", map[string]any{"inserts": map[string]any{"evidence": document}, "sync_level": "write"}); err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +187,34 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		t.Fatal("artifact did not fetch from the GCS JSON API")
 	}
 	t.Logf("native GCS PDF fetch, actual text extraction and qualification passed (%d provider reads)", reads.Load())
+	if grepBinary := os.Getenv("ANTFLY_GREPSTEIN_E2E_GREP_BINARY"); grepBinary != "" {
+		grepBinary, err = filepath.Abs(grepBinary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := grepCmd([]string{"--state", root, "--url", endpoint, "--table", "gcs_e2e"}); err != nil {
+			t.Fatal(err)
+		}
+		before := reads.Load()
+		for _, stream := range []string{"extracted", "chunks"} {
+			args := []string{"--table-config", filepath.Join(root, "grep.json"), "--json"}
+			if stream == "chunks" {
+				args = append(args, "--artifact", stream)
+			}
+			args = append(args, "Native GCS extraction evidence")
+			output, err := exec.CommandContext(ctx, grepBinary, args...).CombinedOutput()
+			if err != nil || !bytes.Contains(output, []byte("Native GCS extraction evidence")) {
+				t.Fatalf("native grep %s failed: %v\n%s", stream, err, output)
+			}
+			if !bytes.Contains(output, []byte("evidence.pdf")) {
+				t.Fatalf("native grep %s lost the original source identity: %s", stream, output)
+			}
+		}
+		if reads.Load() != before {
+			t.Fatal("native grep reacquired the original instead of consuming existing artifacts")
+		}
+		t.Log("native default extraction and explicit chunk grep passed without reacquisition")
+	}
 	// Exercise owner-side policy failures and immutable-version rejection without
 	// contaminating the successfully qualified source inventory.
 	badURL := endpoint + "/tables/gcs_e2e_rejections"

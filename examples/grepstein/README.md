@@ -344,8 +344,9 @@ page provenance, detects superseded extraction revisions, and reconciles stale
 unit rows. Relationship neighborhoods/path evidence are model outputs requiring
 inspection, not verified factual claims.
 
-V1 OCR uses the native Vertex reader with explicitly scoped Google identity.
-Colony's managed external gateway currently advertises text generation and
+The default OCR profile uses the native LightOnOCR reader through Antfly shared
+inference. The alternative Vertex profile requires explicitly scoped Google
+identity. Colony's managed external gateway currently advertises text generation and
 rejects image requests whose spend cannot be bounded. Do not point an OCR reader
 at that gateway and assume it works. Managed image billing/capability qualification,
 BYO Vertex connection UI/CLI, and Document AI OCR are separate follow-ups.
@@ -379,6 +380,26 @@ with the binding.
 
 The former `--grep-table`, `--gcs-projection-bucket` and page source-job workflow
 are retired. Existing projection tables/buckets are not automatically deleted.
+
+### Local native smoke test
+
+Build both binaries from the same checkout, then run the real PDF-to-grep path:
+
+```sh
+(cd zig && zig build antfly grep -j2 -Doptimize=ReleaseSafe)
+(cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
+  ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
+  ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
+  go test -run '^TestLocalNativeGCSExtraction$' -count=1 -v)
+```
+
+This starts a standalone Antfly server and a loopback GCS protocol fixture,
+extracts an actual digital-text PDF, qualifies the artifacts, and searches both
+native extraction units and chunks with the real grep CLI. It checks original
+source identity, no content reacquisition during grep, and rejection of
+out-of-scope or changed-generation objects. It does not qualify Cloud Workload
+Identity or GPU OCR, embeddings, or relationship extraction; those need a live
+sample on the deployed shared inference runtime.
 
 ## Explorer and hosting
 
