@@ -1,0 +1,183 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sources
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"strconv"
+	"strings"
+)
+
+const GCSAccessBatchLimit = 100
+
+// validateGCSObjectAccess checks pinned revisions in bounded provider batches.
+func (c *GoogleConnector) validateGCSObjectAccess(ctx context.Context, r Request, items []Item) error {
+	for start := 0; start < len(items); start += GCSAccessBatchLimit {
+		results, err := c.CheckGCSAccessBatch(ctx, r, items[start:min(start+GCSAccessBatchLimit, len(items))])
+		if err != nil {
+			return err
+		}
+		for _, err := range results {
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// CheckGCSAccessBatch verifies the exact revision of each object using metadata
+// requests. Results are ordered and include per-object provider errors.
+func (c *GoogleConnector) CheckGCSAccessBatch(ctx context.Context, r Request, items []Item) ([]error, error) {
+	if c.ProviderName != ProviderGCS || len(items) == 0 || len(items) > GCSAccessBatchLimit {
+		return nil, ErrInvalidInput
+	}
+	cfg, err := decodeSourceConfig[GoogleConfig](r.Config)
+	if err != nil {
+		return nil, err
+	}
+	client, err := c.client(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for i, item := range items {
+		path, err := gcsObjectAccessPath(cfg, item)
+		if err != nil {
+			return nil, err
+		}
+		part, err := writer.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {"application/http"},
+			"Content-Transfer-Encoding": {"binary"},
+			"Content-Id":                {"<" + strconv.Itoa(i) + ">"},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := fmt.Fprintf(part, "GET /storage/v1%s HTTP/1.1\r\n\r\n", path); err != nil {
+			return nil, err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	endpoint := "https://storage.googleapis.com/batch/storage/v1"
+	if c.APIBase != "" {
+		endpoint = c.APIBase + "/batch/storage/v1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "multipart/mixed; boundary="+writer.Boundary())
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, googleRequestError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, googleResponseError(resp)
+	}
+	boundary, err := gcsBatchBoundary(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, err
+	}
+	reader := multipart.NewReader(io.LimitReader(resp.Body, 4<<20), boundary)
+	results := make([]error, len(items))
+	for i, item := range items {
+		part, err := reader.NextPart()
+		if err != nil {
+			return nil, gcsBatchReadError(err)
+		}
+		if part.Header.Get("Content-ID") != "<response-"+strconv.Itoa(i)+">" {
+			return nil, fmt.Errorf("mismatched GCS metadata batch response")
+		}
+		reply, err := http.ReadResponse(bufio.NewReader(part), nil)
+		if err != nil {
+			return nil, gcsBatchReadError(err)
+		}
+		results[i] = checkGCSAccessReply(reply, item)
+	}
+	if part, err := reader.NextPart(); err != io.EOF {
+		if part == nil && err != nil {
+			return nil, gcsBatchReadError(err)
+		}
+		return nil, fmt.Errorf("unexpected trailing GCS metadata batch response")
+	}
+	return results, nil
+}
+
+func checkGCSAccessReply(reply *http.Response, item Item) error {
+	defer reply.Body.Close()
+	if reply.StatusCode != http.StatusOK {
+		return gcsPinnedAccessError(item, googleResponseError(reply))
+	}
+	var object struct {
+		Generation string `json:"generation"`
+	}
+	const maxProofBytes = 4096
+	body, err := io.ReadAll(io.LimitReader(reply.Body, maxProofBytes+1))
+	if err != nil {
+		return gcsBatchReadError(err)
+	}
+	if len(body) > maxProofBytes {
+		return fmt.Errorf("GCS metadata proof exceeds byte limit")
+	}
+	if err := reply.Body.Close(); err != nil {
+		return gcsBatchReadError(err)
+	}
+	if err := json.Unmarshal(body, &object); err != nil {
+		return fmt.Errorf("invalid GCS metadata proof: %w", err)
+	}
+	if object.Generation != item.Revision {
+		return &RevisionChangedError{Expected: item.Revision, Actual: object.Generation}
+	}
+	return nil
+}
+
+func gcsBatchBoundary(contentType string) (string, error) {
+	kind, params, err := mime.ParseMediaType(contentType)
+	if err == nil && kind == "multipart/mixed" && params["boundary"] != "" {
+		return params["boundary"], nil
+	}
+	// GCS documents responses with unquoted "=" characters in the boundary.
+	if raw, ok := strings.CutPrefix(contentType, "multipart/mixed; boundary="); ok && !strings.ContainsAny(raw, " \t;") {
+		if err := multipart.NewWriter(io.Discard).SetBoundary(raw); err == nil {
+			return raw, nil
+		}
+	}
+	return "", fmt.Errorf("invalid GCS metadata batch response")
+}
+
+// A short response is inconclusive. Keep malformed MIME and mismatched
+// identities as verification errors, distinct from interruptions.
+func gcsBatchReadError(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("incomplete GCS metadata batch: %w", io.ErrUnexpectedEOF)
+	}
+	return fmt.Errorf("read GCS metadata batch response: %w", err)
+}

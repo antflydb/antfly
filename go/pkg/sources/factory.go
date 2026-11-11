@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"golang.org/x/oauth2/google"
 )
 
 // Connection contains secret references, never secret values. Applications can
@@ -34,6 +36,7 @@ type Connection struct {
 	Services        []string          `json:"services,omitempty"`
 	Provider        string            `json:"provider"`
 	TokenEnv        string            `json:"token_env,omitempty"`
+	GoogleADC       bool              `json:"google_adc,omitempty"`
 	CredentialsEnv  string            `json:"credentials_env,omitempty"`
 	AccessKeyEnv    string            `json:"access_key_env,omitempty"`
 	SecretKeyEnv    string            `json:"secret_key_env,omitempty"`
@@ -81,6 +84,9 @@ func CredentialFactory(resolve func(context.Context, string) (string, error)) Fa
 			}
 			return value, nil
 		}
+		if connection.GoogleADC && connection.Provider != ProviderGCS {
+			return nil, fmt.Errorf("google_adc is supported only for GCS")
+		}
 		switch connection.Provider {
 		case ProviderLocal:
 			if connection.TokenEnv != "" || connection.CredentialsEnv != "" || connection.AccessKeyEnv != "" || connection.SecretKeyEnv != "" || connection.SessionTokenEnv != "" || len(connection.SecretRefs) != 0 {
@@ -92,11 +98,20 @@ func CredentialFactory(resolve func(context.Context, string) (string, error)) Fa
 			}
 			return &LocalConnector{Root: root}, nil
 		case ProviderGoogleWorkspace, ProviderGCS:
-			raw, err := secret("credentials", connection.CredentialsEnv)
-			if err != nil {
-				return nil, err
+			var auth *google.Credentials
+			var err error
+			if connection.GoogleADC {
+				if connection.Provider != ProviderGCS || connection.CredentialsEnv != "" || connection.SecretRefs["credentials"] != "" {
+					return nil, fmt.Errorf("google_adc requires GCS without a credential reference")
+				}
+				auth, err = google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/devstorage.read_only")
+			} else {
+				raw, readErr := secret("credentials", connection.CredentialsEnv)
+				if readErr != nil {
+					return nil, readErr
+				}
+				auth, err = GoogleCredentialsForServices(ctx, connection.Provider, raw, connection.Services)
 			}
-			auth, err := GoogleCredentialsForServices(ctx, connection.Provider, raw, connection.Services)
 			if err != nil {
 				return nil, err
 			}
