@@ -1017,9 +1017,9 @@ Each object must have `original_pdf_uri`, `original_page`,
 the text digest, retains the projection location in metadata, and cites the
 original PDF URI with its page fragment. Use a generation-pinned original URI
 such as `gs://original-bucket/report.pdf?generation=42`. The cited generation
-must remain available in the original bucket. Projected-page prefix scans skip
-zero-byte directory markers. Ordinary GCS sources and exact-key selections
-retain zero-byte objects.
+must remain available in the original bucket. GCS prefix scans skip zero-byte
+directory markers in native and projected-page modes. Non-marker empty objects
+and explicit exact-key selections are retained.
 
 Projected-page syncs checkpoint each verified publication batch. On resume,
 the sync rechecks the indexed rows and the pinned GCS generations and

@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -367,8 +368,8 @@ func (w *SyncWriter) matchPublicationProofs(ctx context.Context, proofs map[stri
 	}
 	sort.Strings(ids)
 	matched := make(map[string]string, len(proofs))
-	const proofBatch = 64
-	for start := 0; start < len(ids); start += proofBatch {
+	proofBatch := 64
+	for start := 0; start < len(ids); {
 		keys := ids[start:min(start+proofBatch, len(ids))]
 		body, _ := json.Marshal(map[string]any{
 			"query": documentIDsQuery(keys), "fields": sourceRowFields(), "limit": len(keys),
@@ -376,12 +377,19 @@ func (w *SyncWriter) matchPublicationProofs(ctx context.Context, proofs map[stri
 		})
 		raw, err := w.client.Query(ctx, w.table, body)
 		if err != nil {
+			var budget interface{ AntflyResponseBudgetExceeded() bool }
+			if len(keys) > 1 && errors.As(err, &budget) && budget.AntflyResponseBudgetExceeded() {
+				// Keep the learned ceiling for the rest of this acquisition.
+				proofBatch = max(1, len(keys)/2)
+				continue
+			}
 			return nil, err
 		}
 		hits, err := decodeSyncHits(raw)
 		if err != nil {
 			return nil, err
 		}
+		start += len(keys)
 		seen := make(map[string]bool, len(hits))
 		for _, hit := range hits {
 			if seen[hit.ID] {
