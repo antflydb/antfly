@@ -4338,9 +4338,11 @@ fn scoreFilteredRaBitRows(
     query: []const f32,
     scratch: *quantizer_mod.RaBitQuantizer.EstimateScratch,
     positions: []const usize,
+    cancellation: ?search_types.CancellationToken,
     distances: []f32,
     bounds: []f32,
 ) !void {
+    const token: ?quantizer_mod.CancellationToken = if (cancellation) |c| .{ .ptr = c.ptr, .is_cancelled_fn = c.is_cancelled_fn } else null;
     var ranges: [64]quantizer_mod.ScoreRange = undefined;
     var count: usize = 0;
     for (positions) |row| {
@@ -4351,7 +4353,10 @@ fn scoreFilteredRaBitRows(
                 // A sorted cursor masks fragmented matches without allocating
                 // a row bitmap or reading rejected codes.
                 var masked = FilteredRaBitOutput{ .distances = distances, .bounds = bounds, .remaining = positions };
-                return quantizer.estimateDistancesTo(set, query, scratch, null, &masked);
+                return quantizer.estimateDistancesTo(set, query, scratch, token, &masked) catch |err| return switch (err) {
+                    error.Canceled => error.Cancelled,
+                    else => err,
+                };
             }
             ranges[count] = .{ .start = row, .end = row + 1 };
             count += 1;
@@ -4366,10 +4371,13 @@ fn scoreFilteredRaBitRows(
             out.bounds[row] = bound;
         }
     };
-    return quantizer.estimateDistancesInRangesTo(set, query, scratch, null, ranges[0..count], Output{
+    return quantizer.estimateDistancesInRangesTo(set, query, scratch, token, ranges[0..count], Output{
         .distances = distances,
         .bounds = bounds,
-    });
+    }) catch |err| return switch (err) {
+        error.Canceled => error.Cancelled,
+        else => err,
+    };
 }
 
 test "filtered RaBitQ scoring skips fragmented rows past the range limit" {
@@ -4378,6 +4386,7 @@ test "filtered RaBitQ scoring skips fragmented rows past the range limit" {
     const count = 512;
     var quantizer = try quantizer_mod.RaBitQuantizer.init(alloc, dims, 42, .l2_squared);
     defer quantizer.deinit();
+    quantizer.ex_bits = 4;
     var scratch = try quantizer_mod.RaBitQuantizer.EstimateScratch.init(alloc, dims);
     defer scratch.deinit(alloc);
     const centroid: [dims]f32 = @splat(0);
@@ -4397,12 +4406,42 @@ test "filtered RaBitQ scoring skips fragmented rows past the range limit" {
         try quantizer.estimateDistancesWithScratch(&set, q, &expected_distances, &expected_bounds, &scratch);
         var distances: [count]f32 = @splat(-1);
         var bounds: [count]f32 = @splat(-1);
-        try scoreFilteredRaBitRows(&quantizer, &set, q, &scratch, &positions, &distances, &bounds);
+        try scoreFilteredRaBitRows(&quantizer, &set, q, &scratch, &positions, null, &distances, &bounds);
         for (0..count) |row| {
             try std.testing.expectEqual(if (row % 4 == 0) expected_distances[row] else -1, distances[row]);
             try std.testing.expectEqual(if (row % 4 == 0) expected_bounds[row] else -1, bounds[row]);
         }
     }
+
+    var results = search_results.ApproxSearchResults.init(alloc, 10);
+    defer results.deinit();
+    var refine = ExRefine{ .alloc = alloc, .query = &query, .set = &set, .all = true };
+    defer refine.deinit();
+    var dense_distances: [count]f32 = undefined;
+    var dense_bounds: [count]f32 = undefined;
+    var sparse_distances: [count]f32 = @splat(-1);
+    var sparse_bounds: [count]f32 = @splat(-1);
+    try quantizer.estimateDistancesWithScratch(&set, &query, &dense_distances, &dense_bounds, &scratch);
+    try scoreFilteredRaBitRows(&quantizer, &set, &query, &scratch, &positions, null, &sparse_distances, &sparse_bounds);
+    for (positions) |row| {
+        refine.apply(&results, row, &dense_distances[row], &dense_bounds[row]);
+        refine.apply(&results, row, &sparse_distances[row], &sparse_bounds[row]);
+        try std.testing.expectEqual(dense_distances[row], sparse_distances[row]);
+        try std.testing.expectEqual(dense_bounds[row], sparse_bounds[row]);
+    }
+    try std.testing.expectEqual(@as(u64, positions.len * 2), refine.refined);
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, scoreFilteredRaBitRows(
+        &quantizer,
+        &set,
+        &query,
+        &scratch,
+        &positions,
+        search_types.CancellationToken.fromAtomic(&cancelled),
+        &sparse_distances,
+        &sparse_bounds,
+    ));
 }
 
 fn scoreLeafMemberIds(
@@ -4714,6 +4753,7 @@ fn scoreLeafMemberIds(
                         approx_query,
                         &scratch.estimate,
                         original_positions,
+                        req.cancellation,
                         distances,
                         error_bounds,
                     );

@@ -161,8 +161,10 @@ modeled embedding time per query.
 
 With `--filtered 1`, the benchmark compares widening an unfiltered result
 window, admitting only eligible nodes for exact verification, and directly
-scoring the allowlist. It reports recall against filtered exact ground truth,
-p50 and p99, and the number of embeddings loaded per query. A stored-vector
+scoring the allowlist with exact distances or RaBitQ bounds. It reports
+filtered recall, p50 and p99, embedding loads per query, and peak graph
+frontier size. Use `--filter-layout clustered` and `--filter-k N` to
+vary match locality and the result window. A stored-vector
 run measures CPU and vector access. Supply `--cost FILE` to model the
 additional transient re-embedding cost.
 

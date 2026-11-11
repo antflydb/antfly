@@ -631,8 +631,10 @@ pub const LeannStore = struct {
         // Exact buffer.
         const scratch = try alloc.alloc(f32, self.opts.dims);
         defer alloc.free(scratch);
-        const direct = filter.useDirect(self.opts.dims, self.opts.transient);
-        var graph_ids: [Filter.max_direct_candidates]u32 = undefined;
+        const direct_mode = filter.directMode(self.opts.dims, self.node_of.count() + self.pending.items.len, self.opts.transient, self.opts.quantizer == .rabitq);
+        const direct = direct_mode != .graph;
+        const graph_ids: []u32 = if (direct) try alloc.alloc(u32, filter.ids.include.count()) else &.{};
+        defer if (direct) alloc.free(graph_ids);
         var graph_count: usize = 0;
         if (direct) {
             var ids = filter.ids.include.keyIterator();
@@ -682,6 +684,7 @@ pub const LeannStore = struct {
                     .allows = FilterContext.allows,
                     .cancelled = FilterContext.cancelled,
                     .eligible_count = filter.eligibleCount(),
+                    .direct_verify_bounds = direct_mode == .bounds,
                     .distance_over = req.distance_over,
                     .distance_under = req.distance_under,
                 }, if (direct) graph_ids[0..graph_count] else null)

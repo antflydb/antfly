@@ -680,8 +680,10 @@ pub const ReplicatedState = struct {
             }
         };
         const filter_ctx = FilterContext{ .state = self, .filter = &filter };
-        const direct = filter.useDirect(self.opts.replica.config.dims, self.opts.transient);
-        var keys: [Filter.max_direct_candidates][]const u8 = undefined;
+        const direct_mode = filter.directMode(self.opts.replica.config.dims, self.replica.liveCount(), self.opts.transient, self.opts.replica.config.quantizer == .rabitq);
+        const direct = direct_mode != .graph;
+        const keys: [][]const u8 = if (direct) try alloc.alloc([]const u8, filter.ids.include.count()) else &.{};
+        defer if (direct) alloc.free(keys);
         var key_count: usize = 0;
         if (direct) {
             var ids = filter.ids.include.keyIterator();
@@ -702,6 +704,7 @@ pub const ReplicatedState = struct {
                 .allows = FilterContext.allows,
                 .cancelled = FilterContext.cancelled,
                 .eligible_count = filter.eligibleCount(),
+                .direct_verify_bounds = direct_mode == .bounds,
                 .distance_over = req.distance_over,
                 .distance_under = req.distance_under,
                 .direct_keys = if (direct) keys[0..key_count] else null,
@@ -1277,8 +1280,8 @@ test "leann replicated state: search honors the index's tuning settings" {
     var counting = Counting{ .primary = .{ .alloc = alloc } };
     defer counting.primary.deinit();
     state.loader = counting.loader();
-    var keys: [300][8]u8 = undefined;
-    var vecs: [300][dims]f32 = undefined;
+    var keys: [600][8]u8 = undefined;
+    var vecs: [600][dims]f32 = undefined;
     var prng = std.Random.DefaultPrng.init(13);
     for (&vecs, 0..) |*v, i| {
         for (v) |*x| x.* = prng.random().floatNorm(f32);
@@ -1338,6 +1341,25 @@ test "leann replicated state: search honors the index's tuning settings" {
     try testing.expectEqual(@as(u64, 7), filtered_hits[0].vector_id);
     try testing.expect(stats.expanded > 2);
     try testing.expect(counting.loads <= allowed.len);
+
+    // The transient route should verify the selected codes without walking
+    // the graph when the allowlist just exceeds the exact budget.
+    state.opts.transient = true;
+    var transient_ids: [17]u64 = undefined;
+    for (&transient_ids, 0..) |*id, i| id.* = i * 3 + 1;
+    counting.loads = 0;
+    var bounded = try state.searchWithStats(alloc, .{
+        .query = &vecs[7],
+        .k = 3,
+        .filter_ids = &transient_ids,
+        .distance_under = 0.001,
+    }, &stats);
+    defer bounded.deinit();
+    try testing.expectEqual(@as(usize, 1), bounded.getHits().len);
+    try testing.expectEqual(@as(u64, 7), bounded.getHits()[0].vector_id);
+    try testing.expectEqual(@as(u32, 0), stats.expanded);
+    try testing.expectEqual(@as(u32, 17), stats.approx_evaluated);
+    try testing.expect(counting.loads <= transient_ids.len);
 }
 
 test "leann replicated state: randomized replication simulation" {

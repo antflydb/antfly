@@ -18983,10 +18983,9 @@ pub const HBCIndex = struct {
             state.filter_scan_ns_per_candidate,
             perUnit(profile.filter_metadata_batch_ns, profile.filter_candidates),
         );
-        const quantized_ns = profile.leaf_score_ns -| profile.filter_metadata_batch_ns;
         state.quantized_score_ns_per_candidate = routeRateEwma(
             state.quantized_score_ns_per_candidate,
-            perUnit(quantized_ns, profile.approx_vectors_scored),
+            vectorindex_search_types.leafWorkNsPerInspectedRow(profile),
         );
         state.artifact_read_decode_ns_per_vector = routeRateEwma(
             state.artifact_read_decode_ns_per_vector,
@@ -35670,6 +35669,45 @@ test "hbc multi-bit codes refine leaf admission and survive reopen" {
             var refined: u64 = 0;
             recalls[vi] = try multiBitRecall(alloc, &idx, data, queries, dims, &refined);
             if (bits == 1) try std.testing.expectEqual(@as(u64, 0), refined) else try std.testing.expect(refined > 0);
+            if (bits > 1) {
+                const Expected = struct {
+                    id: u64,
+                    distance: f32,
+
+                    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                        return lhs.distance < rhs.distance;
+                    }
+                };
+                const query = data[0..dims];
+                var allowed: [8]u64 = undefined;
+                var expected: [8]Expected = undefined;
+                for (&allowed, &expected, 0..) |*id, *candidate, i| {
+                    const offset = i * 251;
+                    id.* = offset + 1;
+                    var dist: f32 = 0;
+                    for (query, data[offset * dims ..][0..dims]) |a, b| dist += (a - b) * (a - b);
+                    candidate.* = .{ .id = id.*, .distance = dist };
+                }
+                std.mem.sortUnstable(Expected, &expected, {}, Expected.lessThan);
+                const threshold = (expected[3].distance + expected[4].distance) / 2;
+                var filtered = try idx.searchProfiledRequest(.{
+                    .query = query,
+                    .k = allowed.len,
+                    .search_width = 512,
+                    .filter_ids = &allowed,
+                    .distance_under = threshold,
+                    .load_metadata = false,
+                });
+                defer filtered.results.deinit();
+                try std.testing.expect(filtered.profile.ex_refined_vectors > 0);
+                try std.testing.expect(filtered.profile.approx_vectors_scored < filtered.profile.filter_candidates);
+                const hits = filtered.results.getHits();
+                try std.testing.expectEqual(@as(usize, 4), hits.len);
+                for (hits, expected[0..hits.len]) |hit, want| {
+                    try std.testing.expectEqual(want.id, hit.vector_id);
+                    try std.testing.expectApproxEqRel(want.distance, hit.distance, 0.0001);
+                }
+            }
         }
         if (bits > 1) {
             // Persisted payloads carry the extended codes across reopen.

@@ -17,7 +17,7 @@ const std = @import("std");
 const search = @import("antfly_vectorindex").search_types;
 
 pub const Filter = struct {
-    pub const max_direct_candidates = 64;
+    pub const DirectMode = enum { graph, exact, bounds };
 
     ids: search.RequestFilterState,
     request: search.SearchRequest,
@@ -62,12 +62,29 @@ pub const Filter = struct {
         return count;
     }
 
-    /// Bound the exact route by both candidate count and decoded-vector work.
-    /// Transient vectors may require an embedding call, so keep their budget
-    /// smaller even when the dimension is low.
-    pub fn useDirect(self: *const Filter, dims: usize, transient: bool) bool {
-        const count = self.ids.include.count();
-        const max_candidates: usize = if (transient) 16 else max_direct_candidates;
-        return count != 0 and count <= @min(max_candidates, (64 * 1024) / @max(dims, 1));
+    /// Small sets are exact. A larger, sparse RaBitQ allowlist can avoid
+    /// walking unrelated nodes by scoring its codes before loading vectors.
+    pub fn directMode(self: *const Filter, dims: usize, live: usize, transient: bool, rabitq: bool) DirectMode {
+        const count: usize = self.ids.include.count();
+        if (count == 0) return .graph;
+        const width = @max(dims, 1);
+        const exact_limit: usize = if (transient) 16 else 64;
+        if (count <= @min(exact_limit, (64 * 1024) / width)) return .exact;
+        if (rabitq and count *| 8 <= live and count <= @min(1024, (1024 * 1024) / width)) return .bounds;
+        if (!transient and count *| 32 <= live and count <= @min(256, (256 * 1024) / width)) return .exact;
+        return .graph;
     }
 };
+
+test "sparse allowlists use bounded direct work on either side of the exact cutoff" {
+    const alloc = std.testing.allocator;
+    var ids: [65]u64 = undefined;
+    for (&ids, 0..) |*id, i| id.* = i;
+    for ([_]usize{ 16, 17, 64, 65 }) |count| {
+        var filter = try Filter.init(alloc, .{ .query = &.{}, .k = 10, .filter_ids = ids[0..count] });
+        defer filter.deinit(alloc);
+        try std.testing.expectEqual(if (count <= 64) Filter.DirectMode.exact else .bounds, filter.directMode(768, 1_000_000, false, true));
+        try std.testing.expectEqual(if (count <= 16) Filter.DirectMode.exact else .bounds, filter.directMode(768, 1_000_000, true, true));
+        if (count == 65) try std.testing.expectEqual(Filter.DirectMode.graph, filter.directMode(768, 300, false, true));
+    }
+}

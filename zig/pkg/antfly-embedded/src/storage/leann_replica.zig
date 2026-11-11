@@ -658,6 +658,7 @@ pub const Replica = struct {
         allows: *const fn (*const anyopaque, []const u8) anyerror!bool,
         cancelled: *const fn (*const anyopaque) bool,
         eligible_count: ?u32 = null,
+        direct_verify_bounds: bool = false,
         distance_over: ?f32 = null,
         distance_under: ?f32 = null,
         direct_keys: ?[]const []const u8 = null,
@@ -739,6 +740,7 @@ pub const Replica = struct {
                     .allows = FilterContext.allows,
                     .cancelled = FilterContext.cancelled,
                     .eligible_count = filter.eligible_count,
+                    .direct_verify_bounds = filter.direct_verify_bounds,
                     .distance_over = filter.distance_over,
                     .distance_under = filter.distance_under,
                 }, if (direct_keys != null) direct_ids.items else null);

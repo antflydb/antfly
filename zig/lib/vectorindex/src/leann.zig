@@ -199,9 +199,10 @@ pub const Rerank = enum {
 pub const ResultFilter = struct {
     ctx: *const anyopaque,
     allows: *const fn (*const anyopaque, u32) anyerror!bool,
-    /// Upper estimate of the number of eligible graph nodes when an ID
-    /// allowlist is available. Used only to size the initial traversal.
+    /// Upper estimate of eligible graph nodes for an ID allowlist. Bounds
+    /// the verification target while the walk learns the local match rate.
     eligible_count: ?u32 = null,
+    direct_verify_bounds: bool = false,
     distance_over: ?f32 = null,
     distance_under: ?f32 = null,
     cancelled: ?*const fn (*const anyopaque) bool = null,
@@ -252,6 +253,8 @@ pub const SearchStats = struct {
     approx_evaluated: u32 = 0,
     /// Nodes whose neighbor lists were expanded.
     expanded: u32 = 0,
+    /// Largest retained traversal frontier in a filtered search.
+    peak_frontier: u32 = 0,
 };
 
 pub const Result = struct { id: u32, distance: f32 };
@@ -776,16 +779,43 @@ pub const Index = struct {
         defer alloc.free(q);
         if (self.config.metric == .cosine) normalize(q);
 
-        var top: Heap(true) = .{};
+        var top: HeapOrdered(true, true) = .{};
         defer top.deinit(alloc);
         var work: FilteredVerification = .{};
         defer work.deinit(alloc);
         if (direct_ids) |ids| {
-            for (ids) |id| {
-                if (id >= self.node_count or self.isDeleted(id) or !try filter.allows(filter.ctx, id)) continue;
-                try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
+            if (filter.direct_verify_bounds and self.rabitq != null) {
+                var approx = try Approx.init(alloc, self, q);
+                defer approx.deinit();
+                var eligible: [128]u32 = undefined;
+                var offset: usize = 0;
+                while (offset < ids.len) {
+                    try filter.checkCancelled();
+                    const end = @min(offset + eligible.len, ids.len);
+                    var count: usize = 0;
+                    for (ids[offset..end]) |id| {
+                        if (id >= self.node_count or self.isDeleted(id) or !try filter.allows(filter.ctx, id)) continue;
+                        eligible[count] = id;
+                        count += 1;
+                    }
+                    const estimates = try approx.score(eligible[0..count]);
+                    stats.approx_evaluated += @intCast(count);
+                    for (eligible[0..count], estimates) |id, estimate| {
+                        try self.enqueueFiltered(alloc, &work, id, estimate, opts.bound_scale);
+                    }
+                    offset = end;
+                }
+                try self.verifyFiltered(alloc, source, q, null, opts, filter, &work, &top, &stats);
+            } else {
+                for (ids) |id| {
+                    try filter.checkCancelled();
+                    if (id >= self.node_count or self.isDeleted(id) or !try filter.allows(filter.ctx, id)) continue;
+                    try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
+                }
+                const upper_query = if (self.upper_vectors.count() != 0) try self.toDecodeSpace(alloc, q) else null;
+                defer if (upper_query) |rotated| alloc.free(rotated);
+                try self.verifyFiltered(alloc, source, q, upper_query, opts, filter, &work, &top, &stats);
             }
-            try self.verifyFiltered(alloc, source, q, opts, filter, &work, &top, &stats);
         } else {
             var approx = try Approx.init(alloc, self, q);
             defer approx.deinit();
@@ -804,14 +834,15 @@ pub const Index = struct {
 
             const default_ef: u32 = if (self.rabitq != null) 512 else 64;
             var budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
-            const target = opts.k *| 8;
-            if (filter.eligible_count) |count| {
-                if (count != 0) {
-                    const scaled = std.math.divCeil(u64, @as(u64, target) * self.node_count, count) catch unreachable;
-                    budget = @max(budget, @as(u32, @intCast(@min(scaled, self.node_count))));
-                }
-            }
+            // An allowlist is a global count. Start with the usual search
+            // width and learn the yield near this query before widening.
+            const target = if (filter.eligible_count) |count|
+                @min(opts.k *| 12, @max(opts.k, count - count / 4))
+            else
+                opts.k *| 12;
+            stats.peak_frontier = 1;
             var eligible_seen: usize = 0;
+            var previous_cutoff: ?Cand = null;
             while (true) {
                 while (frontier.len() > 0 and stats.expanded < budget) {
                     try filter.checkCancelled();
@@ -829,13 +860,32 @@ pub const Index = struct {
                         try frontier.push(alloc, .{ .id = id, .dist = estimate.dist });
                         try self.offerFiltered(alloc, filter, &work, id, estimate, opts.bound_scale);
                     }
+                    stats.peak_frontier = @max(stats.peak_frontier, @as(u32, @intCast(frontier.len())));
                 }
-                if (filter.eligible_count != null or eligible_seen + work.pending.items.len >= target or frontier.len() == 0) {
+                const discovered = eligible_seen + work.pending.items.len;
+                const unknown_yield = filter.eligible_count == null and discovered >= opts.k;
+                if (discovered >= target or unknown_yield or frontier.len() == 0) {
                     eligible_seen += work.pending.items.len;
-                    try self.verifyFiltered(alloc, source, q, opts, filter, &work, &top, &stats);
-                    if (top.len() >= opts.k or frontier.len() == 0) break;
+                    try self.verifyFiltered(alloc, source, q, null, opts, filter, &work, &top, &stats);
+                    if (frontier.len() == 0) break;
+                    if (top.len() >= opts.k) {
+                        if (discovered >= target) break;
+                        // Residual filters may have fewer matches than the
+                        // target. Confirm the kth result on a wider wave.
+                        const cutoff = top.top();
+                        if (previous_cutoff) |previous| {
+                            if (previous.id == cutoff.id and previous.dist == cutoff.dist) break;
+                        }
+                        previous_cutoff = cutoff;
+                    }
                 }
-                budget *|= 2;
+                const projected = if (discovered == 0)
+                    @as(u64, budget) * 2
+                else
+                    std.math.divCeil(u64, @as(u64, budget) * target, discovered) catch unreachable;
+                const minimum = @as(u64, budget) + @max(budget / 4, 1);
+                const next_budget = std.math.clamp(projected, minimum, @as(u64, budget) * 2);
+                budget = @intCast(@min(next_budget, self.node_count));
             }
         }
         std.mem.sortUnstable(Cand, top.items.items, {}, candLessThan);
@@ -860,11 +910,20 @@ pub const Index = struct {
 
     fn offerFiltered(self: *const Index, alloc: Allocator, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32) !void {
         if (self.isDeleted(id) or !try filter.allows(filter.ctx, id)) return;
-        const lower = if (self.rabitq != null) estimate.dist - @max(bound_scale, 0) * estimate.bound else -std.math.inf(f32);
+        try self.enqueueFiltered(alloc, work, id, estimate, bound_scale);
+    }
+
+    fn enqueueFiltered(self: *const Index, alloc: Allocator, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32) !void {
+        const lower = if (self.upper_vectors.contains(id))
+            estimate.dist
+        else if (self.rabitq != null)
+            estimate.dist - @max(bound_scale, 0) * estimate.bound
+        else
+            -std.math.inf(f32);
         try work.pending.append(alloc, .{ .id = id, .dist = lower });
     }
 
-    fn verifyFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, opts: SearchOptions, filter: ResultFilter, work: *FilteredVerification, top: *Heap(true), stats: *SearchStats) !void {
+    fn verifyFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, upper_query: ?[]const f32, opts: SearchOptions, filter: ResultFilter, work: *FilteredVerification, top: *HeapOrdered(true, true), stats: *SearchStats) !void {
         std.mem.sortUnstable(Cand, work.pending.items, {}, candLessThan);
         defer work.pending.clearRetainingCapacity();
         const batch_size = if (opts.batch_size > 0) opts.batch_size else @max(opts.k, 1);
@@ -876,7 +935,7 @@ pub const Index = struct {
                 const item = work.pending.items[next];
                 if (top.len() >= opts.k and item.dist > top.top().dist) break;
                 if (self.upper_vectors.get(item.id)) |vector| {
-                    try addFilteredResult(alloc, filter, top, opts.k, .{ .id = item.id, .dist = distance(self.config.metric, query, vector) });
+                    try addFilteredResult(alloc, filter, top, opts.k, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, vector) else item.dist });
                 } else {
                     try work.ids.append(alloc, item.id);
                 }
@@ -890,7 +949,7 @@ pub const Index = struct {
         }
     }
 
-    fn addFilteredResult(alloc: Allocator, filter: ResultFilter, top: *Heap(true), k: usize, item: Cand) !void {
+    fn addFilteredResult(alloc: Allocator, filter: ResultFilter, top: *HeapOrdered(true, true), k: usize, item: Cand) !void {
         if (!std.math.isFinite(item.dist) or !filter.distanceAllowed(item.dist)) return;
         if (top.len() < k) {
             try top.push(alloc, item);
@@ -2844,11 +2903,16 @@ fn candLessThan(_: void, a: Cand, b: Cand) bool {
 
 /// Binary heap over candidates: a min-heap, or a max-heap when `is_max`.
 fn Heap(comptime is_max: bool) type {
+    return HeapOrdered(is_max, false);
+}
+
+fn HeapOrdered(comptime is_max: bool, comptime tie_by_id: bool) type {
     return struct {
         items: std.ArrayListUnmanaged(Cand) = .empty,
         const Self = @This();
 
         fn before(a: Cand, b: Cand) bool {
+            if (tie_by_id) return if (is_max) candLessThan({}, b, a) else candLessThan({}, a, b);
             return if (is_max) a.dist > b.dist else a.dist < b.dist;
         }
 
@@ -3155,6 +3219,99 @@ test "leann: upper layers are unpruned and well formed" {
     const exact = try recallAt(alloc, &index, &fx, src.source(), .{ .ef = 64, .exact_descent = true }, 20, std.math.maxInt(usize));
     try testing.expect(approx.recall >= 0.85);
     try testing.expect(exact.recall >= 0.85);
+}
+
+test "leann: filtered graph and direct scoring preserve upper vector distances" {
+    const alloc = testing.allocator;
+    const dims = 32;
+    var fixture = try Fixture.init(alloc, 256, 1, dims, 8, 213);
+    defer fixture.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = dims, .quantizer = .rabitq, .store_upper = true }, fixture.data);
+    defer index.deinit();
+    const Selection = struct {
+        index: *const Index,
+
+        fn allows(raw: *const anyopaque, id: u32) !bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.index.upper_vectors.contains(id);
+        }
+    };
+    const selection = Selection{ .index = &index };
+    const filter = ResultFilter{ .ctx = &selection, .allows = Selection.allows };
+    var ids: std.ArrayListUnmanaged(u32) = .empty;
+    defer ids.deinit(alloc);
+    var upper = index.upper_vectors.keyIterator();
+    while (upper.next()) |id| try ids.append(alloc, id.*);
+    try testing.expect(ids.items.len > 0);
+
+    var source = SliceEmbeddingSource{ .vectors = fixture.data, .dims = dims };
+    const query = fixture.query(0);
+    const k: u32 = @intCast(ids.items.len);
+    for ([_]?[]const u32{ ids.items, ids.items, null }, 0..) |direct, arm| {
+        var selected_filter = filter;
+        selected_filter.direct_verify_bounds = arm == 1;
+        var result = try index.searchFiltered(alloc, source.source(), query, .{ .k = k, .ef = index.node_count }, selected_filter, direct);
+        defer result.deinit(alloc);
+        try testing.expectEqual(ids.items.len, result.results.len);
+        try testing.expectEqual(@as(u32, 0), result.stats.recomputed);
+        for (result.results) |hit| {
+            const vector = fixture.data[@as(usize, hit.id) * dims ..][0..dims];
+            try testing.expectApproxEqRel(distance(.l2_squared, query, vector), hit.distance, 0.0001);
+        }
+    }
+}
+
+test "leann: filtered heap evicts the largest ID on equal distances" {
+    const alloc = testing.allocator;
+    var top: HeapOrdered(true, true) = .{};
+    defer top.deinit(alloc);
+    const filter = ResultFilter{
+        .ctx = &top,
+        .allows = struct {
+            fn allows(_: *const anyopaque, _: u32) !bool {
+                return true;
+            }
+        }.allows,
+    };
+    try Index.addFilteredResult(alloc, filter, &top, 2, .{ .id = 1, .dist = 10 });
+    try Index.addFilteredResult(alloc, filter, &top, 2, .{ .id = 2, .dist = 10 });
+    try Index.addFilteredResult(alloc, filter, &top, 2, .{ .id = 3, .dist = 0 });
+    try testing.expectEqual(@as(u32, 1), top.top().id);
+}
+
+test "leann: clustered eligibility stops a widened walk before exhausting the graph" {
+    const alloc = testing.allocator;
+    const dims = 16;
+    const count = 128;
+    var fixture = try Fixture.init(alloc, count, 1, dims, 8, 107);
+    defer fixture.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = dims, .quantizer = .rabitq }, fixture.data);
+    defer index.deinit();
+    // A chain fixes discovery order independently of the fixture distances.
+    index.entry = 0;
+    index.max_level = 0;
+    for (index.adjacency.items, 0..) |*neighbors, id| {
+        neighbors.clearRetainingCapacity();
+        if (id + 1 < count) try neighbors.append(alloc, @intCast(id + 1));
+    }
+
+    var source = SliceEmbeddingSource{ .vectors = fixture.data, .dims = dims };
+    for ([_]?u32{ 65, null }) |known| {
+        var result = try index.searchFiltered(alloc, source.source(), fixture.query(0), .{ .k = 10, .ef = 16 }, .{
+            .ctx = &known,
+            .eligible_count = known,
+            .allows = struct {
+                fn allows(raw: *const anyopaque, id: u32) !bool {
+                    const count_hint: *const ?u32 = @ptrCast(@alignCast(raw));
+                    return id < (count_hint.* orelse 17);
+                }
+            }.allows,
+        }, null);
+        defer result.deinit(alloc);
+        try testing.expectEqual(@as(usize, 10), result.results.len);
+        try testing.expect(result.stats.expanded > 16 and result.stats.expanded < count);
+        try testing.expectEqual(@as(u32, 1), result.stats.peak_frontier);
+    }
 }
 
 test "leann: filtered search widens without fetching ineligible vectors" {
