@@ -36,6 +36,7 @@ class CatalogTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.mode = "complete"
+        self.content_uri = "s3://docs/manual.txt"
         self.pages = []
         self.content_requests = []
         self.file_catalog = None
@@ -136,7 +137,7 @@ class CatalogTests(unittest.TestCase):
                             "_source": {
                                 "grep": {
                                     "version": 1,
-                                    "uri": "s3://docs/manual.txt",
+                                    "uri": test.content_uri,
                                     "path": "manual.txt",
                                     "content": "retry budget\n",
                                     "revision": "content-1",
@@ -172,7 +173,7 @@ class CatalogTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def search(self):
+    def search(self, *flags):
         env = {
             key: value
             for key, value in os.environ.items()
@@ -194,6 +195,7 @@ class CatalogTests(unittest.TestCase):
                 ),
                 "--source",
                 "manuals",
+                *flags,
                 "retry budget",
             ],
             env=env,
@@ -221,6 +223,12 @@ class CatalogTests(unittest.TestCase):
         self.assertIn(
             self.records[0]["_id"], json.dumps(self.content_requests[0]["filter_query"])
         )
+
+    def test_original_pdf_citation_keeps_generation_and_page(self):
+        self.content_uri = "gs://original/manual.pdf?generation=42#page=12"
+        result = self.search("--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.content_uri.encode(), result.stdout)
 
     def test_publication_changes_before_snapshot_fail_without_output(self):
         for mode, error in (

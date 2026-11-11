@@ -33,6 +33,22 @@ import (
 
 const GCSAccessBatchLimit = 100
 
+// validateGCSObjectAccess checks pinned revisions in bounded provider batches.
+func (c *GoogleConnector) validateGCSObjectAccess(ctx context.Context, r Request, items []Item) error {
+	for start := 0; start < len(items); start += GCSAccessBatchLimit {
+		results, err := c.CheckGCSAccessBatch(ctx, r, items[start:min(start+GCSAccessBatchLimit, len(items))])
+		if err != nil {
+			return err
+		}
+		for _, err := range results {
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // CheckGCSAccessBatch verifies the exact revision of each object using metadata
 // requests. Results are ordered and include per-object provider errors.
 func (c *GoogleConnector) CheckGCSAccessBatch(ctx context.Context, r Request, items []Item) ([]error, error) {

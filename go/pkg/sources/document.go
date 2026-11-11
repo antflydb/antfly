@@ -79,8 +79,8 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 	if item.SourceKind == ProviderGCS && configString(item.Metadata, "projection_uri") != "" {
 		original, err := url.Parse(configString(item.Metadata, "original_pdf_uri"))
 		page, pageErr := strconv.Atoi(configString(item.Metadata, "original_page"))
-		if err != nil || original.User != nil || (original.Scheme != "gs" && original.Scheme != "https") ||
-			original.Host == "" || !validPageCitationQuery(original) || original.Fragment != "" || original.Opaque != "" ||
+		if err != nil || original.User != nil || original.Scheme != "gs" || original.Port() != "" ||
+			original.Hostname() == "" || len(original.Path) < 2 || !validPageCitationQuery(original) || original.Fragment != "" || original.Opaque != "" ||
 			pageErr != nil || page <= 0 || configString(item.Metadata, "extraction_revision") == "" ||
 			configString(item.Metadata, "content_sha256") != digestHex {
 			return fail("source_page_provenance_invalid", "Page provenance is missing or does not match the projected text.")
@@ -193,17 +193,11 @@ func validateDocumentContent(doc Document) error {
 
 // A GCS generation pins the original PDF without carrying signed URL credentials.
 func validPageCitationQuery(uri *url.URL) bool {
-	if uri.RawQuery == "" {
-		return true
-	}
-	if uri.Scheme != "gs" {
-		return false
-	}
 	values, err := url.ParseQuery(uri.RawQuery)
 	generation := values["generation"]
 	if err != nil || len(values) != 1 || len(generation) != 1 {
 		return false
 	}
-	number, err := strconv.ParseUint(generation[0], 10, 64)
+	number, err := strconv.ParseInt(generation[0], 10, 64)
 	return err == nil && number > 0
 }

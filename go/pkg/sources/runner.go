@@ -97,6 +97,7 @@ type runState struct {
 	Endpoint, Table, SourceID, ConfigHash string
 	Owned                                 map[string]string
 	Pending                               *Inventory
+	PublicationProofs                     map[string]string `json:",omitempty"`
 	Published                             *Inventory
 	AcquisitionID                         string
 	StartedAt                             int64
@@ -424,6 +425,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 				return 0, "", fmt.Errorf("source configuration changed during a pinned run; use --restart")
 			}
 			state.Pending = nil
+			state.PublicationProofs = nil
 			state.ConfigHash = hash
 			state.Published = nil
 			state.AcquisitionID = ""
@@ -479,6 +481,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	}
 	if r.Restart {
 		state.Pending = nil
+		state.PublicationProofs = nil
 	}
 	phase = "enumerate"
 	if state.Pending == nil {
@@ -543,6 +546,40 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err != nil {
 		return 0, "", err
 	}
+	// Projected pages can resume from verified rows because both their bytes
+	// and citation metadata have provider revisions. Recheck access before
+	// reusing any published rows.
+	itemsToPublish := state.Pending.Objects
+	if google, ok := connector.(*GoogleConnector); ok && google.ProviderName == ProviderGCS {
+		config, err := decodeSourceConfig[GoogleConfig](request.Config)
+		if err != nil {
+			return 0, "", err
+		}
+		if config.PageProvenance {
+			restored := false
+			if state.PublicationProofs != nil {
+				phase = "restore_publication"
+				restored, err = writer.RestorePublicationProofs(ctx, state.PublicationProofs)
+				if err != nil {
+					return 0, "", err
+				}
+				if restored {
+					if err := google.validateGCSObjectAccess(ctx, request, state.Pending.Objects); err != nil {
+						return 0, "", err
+					}
+					itemsToPublish = nil
+				} else {
+					state.PublicationProofs = nil
+					if err := writeJSON(statePath, state, 256<<20); err != nil {
+						return 0, "", err
+					}
+				}
+			}
+			if !restored {
+				writer.TrackPublicationProofs()
+			}
+		}
+	}
 	legacy := []string{}
 	if state.RecordFormat == 0 {
 		for id := range state.Owned {
@@ -552,12 +589,14 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	}
 	phase = "publish"
 	selected := map[string]bool{}
-	var total int64
 	for _, item := range state.Pending.Objects {
+		selected[item.ID] = true
+	}
+	var total int64
+	for _, item := range itemsToPublish {
 		if err := ctx.Err(); err != nil {
 			return 0, "", err
 		}
-		selected[item.ID] = true
 		item.Metadata = cloneSourceMetadata(item.Metadata)
 		item.Metadata["connection_id"] = s.Connection
 		var doc Document
@@ -611,6 +650,12 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			return 0, "", err
 		}
 		if _, err := writer.Upsert(ctx, map[string]Document{key: doc}); err != nil {
+			return 0, "", err
+		}
+	}
+	if proofs := writer.PublicationProofs(); len(proofs) > 0 {
+		state.PublicationProofs = proofs
+		if err := writeJSON(statePath, state, 256<<20); err != nil {
 			return 0, "", err
 		}
 	}
@@ -674,6 +719,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	phase = "commit_state"
 	state.Published = state.Pending
 	state.Pending = nil
+	state.PublicationProofs = nil
 	state.AcquisitionID = ""
 	state.RecordFormat = 2
 	if err := writeJSON(statePath, state, 256<<20); err != nil {

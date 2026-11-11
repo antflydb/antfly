@@ -213,6 +213,8 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 			q.Set("maxResults", "100")
 		}
 		if config.PageProvenance {
+			// Custom metadata can occupy 8 KiB per object before JSON escaping.
+			q.Set("maxResults", "100")
 			q.Set("fields", "nextPageToken,items(name,generation,metageneration,size,contentType,metadata)")
 		}
 		if config.Key != "" {
@@ -240,7 +242,7 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 				return fmt.Errorf("invalid GCS generation")
 			}
 			// Console-created directory markers are not source documents.
-			if size == 0 && strings.HasSuffix(item.Name, "/") {
+			if config.Key == "" && size == 0 && strings.HasSuffix(item.Name, "/") {
 				continue
 			}
 			canonical := "gs://" + config.Bucket + "/" + escapeSourcePath(item.Name)
@@ -385,15 +387,15 @@ func (c *GoogleConnector) readWithin(ctx context.Context, client *http.Client, r
 	if limit < 0 || limit > maxImportSourceObjectBytes {
 		return nil, ErrInvalidInput
 	}
-	config, err := decodeSourceConfig[GoogleConfig](r.Config)
-	if err != nil {
-		return nil, err
-	}
 	if configString(o.Metadata, "mime_type") == "application/vnd.google-apps.spreadsheet" {
 		return nil, fmt.Errorf("%w: whole-workbook extraction is not supported; first-sheet CSV must not be presented as a complete workbook", ErrInvalidInput)
 	}
 	var path string
 	if c.ProviderName == ProviderGCS {
+		config, err := decodeSourceConfig[GoogleConfig](r.Config)
+		if err != nil {
+			return nil, err
+		}
 		if configString(o.Metadata, "bucket") != config.Bucket {
 			return nil, fmt.Errorf("GCS source is outside configured bucket")
 		}

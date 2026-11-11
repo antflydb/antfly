@@ -1008,8 +1008,11 @@ For self-hosted GCS, a trusted profile may set `google_adc: true` on a
 storage scope. Leave `credentials_env` and the credentials secret reference
 unset for that connection.
 
-A GCS text source may set `page_provenance: true` for projected PDF pages.
+For projected PDF pages, set `publication: "text"` on the GCS source and
+`page_provenance: true` in its config.
 Each object must have `original_pdf_uri`, `original_page`,
 `extraction_revision`, and `content_sha256` custom metadata. The source verifies
 the text digest, retains the projection location in metadata, and cites the
-original PDF URI with its page fragment.
+original PDF URI with its page fragment. Use a generation-pinned original URI
+such as `gs://original-bucket/report.pdf?generation=42`. The cited generation
+must remain available in the original bucket.
