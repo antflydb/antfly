@@ -148,10 +148,29 @@ test "relational index system source publication job survives polling deadlines 
         // another exporter or recapturing the live primary.
         try std.testing.expect(certificate.eql((try db.local_execution.source_publication.poll(db, scope, .none)).?));
         try std.testing.expect(db.local_execution.source_publication.future == null);
+        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 2 });
+        const root = try pin.pathAlloc(alloc, path, scope);
+        defer alloc.free(root);
+        const receipt = try std.fmt.allocPrint(alloc, "{s}/source.certificate", .{root});
+        defer alloc.free(receipt);
+        const artifact = try std.fmt.allocPrint(alloc, "{s}/source.afb2", .{root});
+        defer alloc.free(artifact);
+        try std.Io.Dir.cwd().deleteFile(io, receipt);
+        try std.Io.Dir.cwd().deleteFile(io, artifact);
+        // A follower can apply publication before ever exporting its local
+        // seal. Recover under the same supervised lifetime, not the RPC's.
+        var recovery_gate: Gate = .{};
+        db.local_execution.source_publication.test_gate = &recovery_gate;
+        try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
+        try recovery_gate.entered.wait(io);
+        try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
+        recovery_gate.proceed.set(io);
+        try db.local_execution.source_publication.completed.wait(io);
+        try std.testing.expect(certificate.eql((try db.local_execution.source_publication.poll(db, scope, .none)).?));
         scope.consumer_epoch = 2;
         scope.fence.transition_id = 8;
         scope.copy_attempt.sequence = 2;
-        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 3 });
         var gate: Gate = .{};
         db.local_execution.source_publication.test_gate = &gate;
         try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
@@ -167,12 +186,12 @@ test "relational index system source publication job survives polling deadlines 
         try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
         try db.local_execution.source_publication.completed.wait(io);
         const retried = (try db.local_execution.source_publication.poll(db, scope, .none)).?;
-        try std.testing.expectEqual(@as(u64, 2), retried.cut.applied_index);
+        try std.testing.expectEqual(@as(u64, 3), retried.cut.applied_index);
         const old_scope = scope;
         scope.consumer_epoch = 3;
         scope.fence.transition_id = 9;
         scope.copy_attempt.sequence = 3;
-        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 3 });
+        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 4 });
         var gate: Gate = .{};
         db.local_execution.source_publication.test_gate = &gate;
         try std.testing.expect(try db.local_execution.source_publication.poll(db, scope, .none) == null);
@@ -182,7 +201,7 @@ test "relational index system source publication job survives polling deadlines 
         // Replicated release signals only the matching exporter. It returns
         // without opening its gate or joining the job; the worker observes
         // the cancellation independently and relinquishes its pin resources.
-        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 4 });
+        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 5 });
         try std.testing.expect(db.local_execution.source_publication.canceled.load(.acquire));
         try db.local_execution.source_publication.completed.wait(io);
         try std.testing.expectEqual(error.Canceled, db.local_execution.source_publication.failure.?);

@@ -744,6 +744,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .inference_enable_cuda = inference_enable_cuda,
         .apple_bridge = if (install_apple_bridge) |install| install.source else null,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,

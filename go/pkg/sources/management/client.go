@@ -19,36 +19,38 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // Client targets an explicit source-management mount, not a database listener.
 // Credential installation remains a hosting-runtime operation.
 type Client struct {
-	base, token string
-	http        *http.Client
+	base  string
+	token func(context.Context) (string, error)
+	http  *http.Client
 }
 
 func NewClient(base, token string) (*Client, error) {
-	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("invalid source-management endpoint")
+	opts := Options{}
+	if token != "" && !strings.ContainsAny(token, "\r\n") {
+		opts.Token = func(context.Context) (string, error) { return token, nil }
 	}
-	local := u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"
-	if u.Scheme != "https" && !(u.Scheme == "http" && local) {
-		return nil, fmt.Errorf("source-management endpoint requires HTTPS or loopback HTTP")
+	return NewClientWithOptions(base, opts)
+}
+func (c *Client) call(ctx context.Context, method, path, key string, input, output any, headers ...http.Header) error {
+	token, err := c.token(ctx)
+	if err != nil {
+		return fmt.Errorf("source-management token: %w", err)
 	}
 	if token == "" || strings.ContainsAny(token, "\r\n") {
-		return nil, fmt.Errorf("invalid source-management token")
+		return fmt.Errorf("invalid source-management token")
 	}
-	return &Client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
-}
-func (c *Client) call(ctx context.Context, method, path, key string, input, output any) error {
 	var body io.Reader
 	if input != nil {
 		raw, err := json.Marshal(input)
@@ -61,19 +63,26 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 	if err != nil {
 		return err
 	}
-	r.Header.Set("Authorization", "Bearer "+c.token)
+	r.Header.Set("Authorization", "Bearer "+token)
 	r.Header.Set("Content-Type", "application/json")
 	if key != "" {
 		r.Header.Set("Idempotency-Key", key)
 	}
+	for _, header := range headers {
+		for name, values := range header {
+			for _, value := range values {
+				r.Header.Add(name, value)
+			}
+		}
+	}
 	response, err := c.http.Do(r)
 	if err != nil {
-		return fmt.Errorf("source-management transport failed")
+		return transportFailure(ctx, err)
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, MaxResponseBytes+1))
 	if err != nil {
-		return fmt.Errorf("source-management response failed")
+		return transportFailure(ctx, err)
 	}
 	if len(raw) > MaxResponseBytes {
 		return fmt.Errorf("source-management response exceeds limit")
@@ -96,6 +105,16 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 	}
 	return nil
 }
+
+// Body reads are part of the request, including the client's timeout. Preserve
+// only context causes, never URLs, credentials or transport error messages.
+func transportFailure(ctx context.Context, err error) error {
+	var timeout net.Error
+	return &TransportError{
+		Timeout: errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout(),
+		cause:   ctx.Err(),
+	}
+}
 func (c *Client) Capabilities(ctx context.Context) (out Capabilities, err error) {
 	err = c.call(ctx, "GET", "/capabilities", "", nil, &out)
 	return
@@ -109,10 +128,36 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	err = c.call(ctx, "GET", "/sources/"+url.PathEscape(id), "", nil, &out)
 	return
 }
-func (c *Client) PutSource(ctx context.Context, source Source) (out Source, err error) {
+
+// PutSourceIfAbsent creates a declaration only if its source ID is absent.
+func (c *Client) PutSourceIfAbsent(ctx context.Context, source Source) (Source, error) {
+	return c.putSource(ctx, source, http.Header{"If-None-Match": {"*"}})
+}
+func (c *Client) PutSource(ctx context.Context, source Source) (Source, error) {
+	return c.putSource(ctx, source, nil)
+}
+
+// GetSourceDeclaration requests configuration without native readiness probes.
+// Older servers may ignore the optional view and return full observations.
+func (c *Client) GetSourceDeclaration(ctx context.Context, id string) (out Source, err error) {
+	err = c.call(ctx, "GET", "/sources/"+url.PathEscape(id)+"?view=declaration", "", nil, &out)
+	return
+}
+
+// PutSourceIfMatch requires a matching declaration revision for a PUT.
+func (c *Client) PutSourceIfMatch(ctx context.Context, source Source, revision string) (Source, error) {
+	if revision == "" {
+		return Source{}, Failure(400, "invalid_precondition")
+	}
+	return c.putSource(ctx, source, http.Header{"If-Match": {`"` + revision + `"`}})
+}
+
+func (c *Client) putSource(ctx context.Context, source Source, headers http.Header) (out Source, err error) {
+	source.Revision = ""
+	source.ReconciliationStatus = nil
 	source.KnowledgeStatus = nil
 	source.SearchStatus = nil // GET observations are never submitted as desired state.
-	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out)
+	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out, headers)
 	return
 }
 func (c *Client) RemoveSource(ctx context.Context, id string, purge bool) (out Mutation, err error) {

@@ -30,10 +30,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -85,8 +87,16 @@ func originalMIME(name string) string {
 		return "video/x-matroska"
 	case ".webm":
 		return "video/webm"
-	case ".mpg", ".mpeg":
+	case ".mpg", ".mpeg", ".vob":
 		return "video/mpeg"
+	case ".ts":
+		return "video/mp2t"
+	case ".3gp":
+		return "video/3gpp"
+	case ".opus":
+		return "audio/ogg"
+	case ".amr":
+		return "audio/amr"
 	default:
 		return "application/octet-stream"
 	}
@@ -96,6 +106,7 @@ func stageOriginalsCmd(args []string) error {
 	f := flag.NewFlagSet("stage-originals", flag.ContinueOnError)
 	state := f.String("state", "./grepstein-originals", "Raw catalog and bounded spool directory")
 	bucket := f.String("bucket", "", "Private originals bucket; required for uploads")
+	concurrency := f.Int("concurrency", 8, "Maximum concurrent original uploads (1-16); catalogs retain source order")
 	inventory := f.Bool("inventory-only", false, "Hash and catalog originals without uploading")
 	budget := f.Int64("max-bytes", 10<<30, "Maximum total uncompressed source bytes, including existing objects")
 	maxObject := f.Int64("max-object-bytes", 8<<30, "Maximum bytes in one original/spooled ZIP member")
@@ -103,6 +114,9 @@ func stageOriginalsCmd(args []string) error {
 	f.Var(&selected, "source", "Repeatable dataset=directory or dataset=archive.zip; any release may be stored")
 	if err := f.Parse(args); err != nil {
 		return err
+	}
+	if *concurrency < 1 || *concurrency > 16 {
+		return fmt.Errorf("concurrency must be between 1 and 16")
 	}
 	if len(selected) == 0 || *budget < 1 || *maxObject < 1 {
 		return fmt.Errorf("sources and positive byte budgets are required")
@@ -162,7 +176,21 @@ func stageOriginalsCmd(args []string) error {
 		return err
 	}
 	defer unlock()
-	ctx := context.Background()
+	// The exclusive state lock proves that spools from killed prior invocations
+	// have no live owner. Never delete acquired archives or completed catalogs.
+	entries, err := os.ReadDir(*state)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && (strings.HasPrefix(entry.Name(), ".original-spool-") || strings.HasPrefix(entry.Name(), ".originals-")) {
+			if err := os.Remove(filepath.Join(*state, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	var put originalPut
 	if !*inventory {
 		client, err := storage.NewClient(ctx)
@@ -172,10 +200,17 @@ func stageOriginalsCmd(args []string) error {
 		defer client.Close()
 		put = originalGCSWriter(client)
 	}
-	return stageOriginals(ctx, *state, *bucket, sources, *budget, *maxObject, put)
+	return stageOriginalsConcurrent(ctx, *state, *bucket, sources, *budget, *maxObject, put, *concurrency)
 }
 
 func stageOriginals(ctx context.Context, state, bucket string, sources []corpusSource, budget, maxObject int64, put originalPut) error {
+	return stageOriginalsConcurrent(ctx, state, bucket, sources, budget, maxObject, put, 1)
+}
+
+func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources []corpusSource, budget, maxObject int64, put originalPut, concurrency int) (resultErr error) {
+	if concurrency < 1 || concurrency > 16 {
+		return fmt.Errorf("concurrency must be between 1 and 16")
+	}
 	output, err := os.CreateTemp(state, ".originals-*")
 	if err != nil {
 		return err
@@ -184,6 +219,42 @@ func stageOriginals(ctx context.Context, state, bucket string, sources []corpusS
 	defer output.Close()
 	hash := sha256.New()
 	encoder := json.NewEncoder(io.MultiWriter(output, hash))
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type uploadResult struct {
+		record   originalRecord
+		position int
+		err      error
+	}
+	order, err := newOriginalOrder(state)
+	if err != nil {
+		return err
+	}
+	defer order.Close()
+	completed := make(chan uploadResult, concurrency)
+	pending := 0
+	failures := make(chan error, 1)
+	defer func() {
+		cancel()
+		for pending > 0 {
+			<-completed
+			pending--
+		}
+		select {
+		case err := <-failures:
+			resultErr = errors.Join(resultErr, err)
+		default:
+		}
+	}()
+	drain := func() error {
+		result := <-completed
+		pending--
+		if result.err != nil {
+			return result.err
+		}
+		return order.Add(result.position, result.record)
+	}
+
 	var total int64
 	count := 0
 	types := map[string]int{}
@@ -196,6 +267,14 @@ func stageOriginals(ctx context.Context, state, bucket string, sources []corpusS
 			return err
 		}
 		visit := func(name string, size int64, open func() (io.ReadCloser, error)) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if pending >= concurrency {
+				if err := drain(); err != nil {
+					return err
+				}
+			}
 			if count >= 2_000_000 {
 				return fmt.Errorf("raw staging exceeds the two-million-file inventory budget; use separate source batches")
 			}
@@ -224,8 +303,12 @@ func stageOriginals(ctx context.Context, state, bucket string, sources []corpusS
 				if err != nil {
 					return err
 				}
-				defer os.Remove(spool.Name())
-				defer spool.Close()
+				defer func() {
+					if spool != nil {
+						spool.Close()
+						os.Remove(spool.Name())
+					}
+				}()
 				writers = append(writers, spool)
 			}
 			n, err := io.Copy(io.MultiWriter(writers...), io.LimitReader(reader, size+1))
@@ -246,17 +329,37 @@ func stageOriginals(ctx context.Context, state, bucket string, sources []corpusS
 				if _, err = spool.Seek(0, io.SeekStart); err != nil {
 					return err
 				}
-				record.Generation, err = put(ctx, bucket, record.Object, spool, record)
-				if err != nil {
-					return fmt.Errorf("%s: %w", id, err)
-				}
-				if record.Generation == "" {
-					return fmt.Errorf("missing original object generation")
-				}
-			}
-			if err := encoder.Encode(record); err != nil {
+				owned := spool
+				spool = nil
+				position := count
+				pending++
+				go func() {
+					result := func() uploadResult {
+						defer owned.Close()
+						defer os.Remove(owned.Name())
+						generation, err := put(ctx, bucket, record.Object, owned, record)
+						if err == nil && generation == "" {
+							err = fmt.Errorf("missing original object generation")
+						}
+						if err != nil {
+							return uploadResult{err: fmt.Errorf("%s: %w", id, err)}
+						}
+						record.Generation = generation
+						return uploadResult{record: record, position: position}
+					}()
+					if result.err != nil {
+						select {
+						case failures <- result.err:
+						default:
+						}
+						cancel()
+					}
+					completed <- result
+				}()
+			} else if err := encoder.Encode(record); err != nil {
 				return err
 			}
+
 			total += n
 			count++
 			types[record.MIME]++
@@ -317,6 +420,16 @@ func stageOriginals(ctx context.Context, state, bucket string, sources []corpusS
 			}
 		}
 	}
+	for pending > 0 {
+		if err := drain(); err != nil {
+			return err
+		}
+	}
+	if put != nil {
+		if err := order.Emit(count, io.MultiWriter(output, hash)); err != nil {
+			return err
+		}
+	}
 	if count == 0 {
 		return fmt.Errorf("no originals")
 	}
@@ -324,7 +437,7 @@ func stageOriginals(ctx context.Context, state, bucket string, sources []corpusS
 		return err
 	}
 	digest := hex.EncodeToString(hash.Sum(nil))
-	receipt := map[string]any{"kind": "originals_catalog_v1", "records": count, "bytes": total, "mime_types": types, "sha256": digest, "uploaded": put != nil, "antfly_loaded": false}
+	receipt := map[string]any{"kind": "originals_catalog_v1", "records": count, "bytes": total, "mime_types": types, "sha256": digest, "uploaded": put != nil, "antfly_loaded": false, "upload_concurrency": concurrency}
 	if put != nil {
 		if _, err := output.Seek(0, io.SeekStart); err != nil {
 			return err
@@ -387,29 +500,53 @@ func originalGCSWriter(client *storage.Client) originalPut {
 		if !errors.Is(err, storage.ErrObjectNotExist) {
 			return "", err
 		}
-		writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
-		writer.ChunkSize = 8 << 20
+		// Upload cancellation must not cancel the subsequent integrity read when
+		// another creator wins. Keep a separate bounded operation context alive.
+		uploadCtx, cancelUpload := context.WithCancel(ctx)
+		defer cancelUpload()
+		writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(uploadCtx)
+		writer.ChunkSize = originalUploadChunkSize(record.Bytes)
 		writer.ContentType = record.MIME
 		writer.CRC32C = record.CRC32C
 		writer.SendCRC32C = true
 		writer.Metadata = map[string]string{"sha256": record.SHA256}
-		n, copyErr := io.Copy(writer, io.LimitReader(source, record.Bytes+1))
-		if copyErr != nil || n != record.Bytes {
-			cancel()
-			writer.Close()
-			return "", fmt.Errorf("original upload interrupted or source changed")
-		}
-		if err := writer.Close(); err != nil {
+		resolveUploadError := func(uploadErr error) (string, error) {
 			var apiErr *googleapi.Error
-			if errors.As(err, &apiErr) && apiErr.Code == 412 {
+			if errors.As(uploadErr, &apiErr) && apiErr.Code == 412 {
+				// GCS can reject creation during Write or Close. Either phase
+				// establishes only a collision; size and checksums prove reuse.
 				attrs, err := object.Attrs(ctx)
 				if err != nil {
-					return "", err
+					return "", fmt.Errorf("verify concurrent original creation: %w", err)
 				}
 				return verify(attrs)
 			}
-			return "", err
+			return "", fmt.Errorf("upload original %s: %w", key, uploadErr)
+		}
+		n, copyErr := io.Copy(writer, io.LimitReader(source, record.Bytes+1))
+		if copyErr != nil || n != record.Bytes {
+			// Never finalize an upload after a failed source read or a size
+			// mismatch. Join the SDK worker before returning or verifying reuse.
+			cancelUpload()
+			_ = writer.Close()
+			if copyErr != nil {
+				return resolveUploadError(copyErr)
+			}
+			return "", fmt.Errorf("original source size changed: expected %d bytes, copied %d", record.Bytes, n)
+		}
+		if err := writer.Close(); err != nil {
+			return resolveUploadError(err)
 		}
 		return verify(writer.Attrs())
 	}
+}
+
+// Keep resumable retries while avoiding an 8-MiB allocation for every small PDF.
+func originalUploadChunkSize(size int64) int {
+	const unit = 256 << 10
+	const ceiling = 8 << 20
+	if size >= ceiling {
+		return ceiling
+	}
+	return max(unit, int((size+unit-1)/unit)*unit)
 }

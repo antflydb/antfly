@@ -152,16 +152,21 @@ export function persistentMigrationLock(
           );
         }
       }
+      let rejected = false;
+      let writeError: unknown;
+      let attemptInsert = true;
       for (;;) {
-        let rejected = false;
-        let writeError: unknown;
-        try {
-          await storage.insert(db, claim);
-        } catch (error) {
-          // Unique conflicts and serialization failures guarantee no commit.
-          // Reconcile the token before retrying this internal claim statement.
-          rejected = ["23505", "40001", "53300"].includes(String(state(error)));
-          writeError = error;
+        if (attemptInsert) {
+          rejected = false;
+          writeError = undefined;
+          try {
+            await storage.insert(db, claim);
+          } catch (error) {
+            // Unique conflicts and serialization failures guarantee no commit.
+            // Reconcile the token before retrying this internal claim statement.
+            rejected = ["23505", "40001", "53300"].includes(String(state(error)));
+            writeError = error;
+          }
         }
         let observed: AntflyMigrationClaim | null;
         try {
@@ -208,6 +213,10 @@ export function persistentMigrationLock(
             observed
           );
         }
+        // A rejected contender must not repeatedly enter write admission while
+        // the owner performs DDL. Poll ownership using reads; the next INSERT
+        // still atomically arbitrates races after observing a vacant claim.
+        attemptInsert = observed === null;
         await new Promise((resolve) =>
           setTimeout(resolve, Math.min(100, Math.max(1, deadline - performance.now())))
         );
