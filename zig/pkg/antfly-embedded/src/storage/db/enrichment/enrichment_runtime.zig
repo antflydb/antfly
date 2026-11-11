@@ -1962,11 +1962,20 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
         try legacy_digests.append(alloc, if (require_digest) request.expected_vector_digest else null);
     }
     if (texts.items.len == 0) return;
-    const vectors = dispatch: {
-        const started = try session.beginDispatch();
-        defer session.finishDispatch(started);
-        break :dispatch try embedDenseBatchTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
+    const Accounting = struct {
+        fn begin(raw: *anyopaque) !u64 {
+            const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
+            return active.beginDispatch();
+        }
+
+        fn finish(raw: *anyopaque, started: u64) void {
+            const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
+            active.finishDispatch(started);
+        }
     };
+    var text_embedder = pinned_embedder;
+    text_embedder.text_dispatch_accounting = .{ .ptr = session, .begin = Accounting.begin, .finish = Accounting.finish };
+    const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, text_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
     try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(requests[0]), generation);
     for (vectors) |vector| try validateRecoveredVector(vector, dims);
@@ -6479,6 +6488,19 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         try reembedDenseDocumentsSession(&runtime, alloc, &.{document}, 2, out[0..2], found[0..1], &session);
         try std.testing.expect(!found[0]);
         try std.testing.expectEqual(calls + 1, probe.parts_calls);
+    }
+
+    // The text provider can partition one logical recovery batch.
+    {
+        var chunk = requests[0];
+        chunk.expected_source_hash = retainedTextEmbeddingHashAtRevision(document_request, wanted.text, @splat(probe.revision));
+        chunk.expected_vector_digest = null;
+        var session = @import("../../leann_recovery.zig").Session{ .budget_ns = 1 };
+        defer session.deinit();
+        const calls = probe.batch_calls;
+        try std.testing.expectError(error.ReembedBudgetExceeded, reembedDenseDocumentsSession(&runtime, alloc, &.{ chunk, chunk }, 2, &out, &found, &session));
+        try std.testing.expectEqual(calls + 1, probe.batch_calls);
+        try std.testing.expectEqualSlices(bool, &.{ false, false }, &found);
     }
 
     // Invalid output is rejected before it can be marked found or cached,

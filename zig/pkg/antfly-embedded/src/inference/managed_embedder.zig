@@ -2143,6 +2143,7 @@ pub const ManagedEmbedder = struct {
         const caps = lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
         if (entry.antfly_provider == null and entry.provider == .antfly and entry.model_identity.len == 0 and dims != 0 and caps.numeric_responses_v1)
             return @min(requested, try httpx.numeric_response.maxRows(dims));
+        if (openAiCompatiblePacedBatchLimit(entry)) |limit| return @min(requested, limit);
         return requested;
     }
 
@@ -7936,6 +7937,16 @@ fn embedBatchWithBedrockRequest(
     return try adoptDenseBatchResult(alloc, &result);
 }
 
+/// Keep the planned callback within a single paced provider request.
+fn openAiCompatiblePacedBatchLimit(entry: *const ManagedEmbeddingEntry) ?usize {
+    const burst = @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
+    return switch (entry.provider) {
+        .cloudflare => if (entry.requests_per_minute > 0) @min(100, burst) else 100,
+        .openai, .openrouter, .ollama => if (entry.requests_per_minute > 0) burst else null,
+        else => null,
+    };
+}
+
 fn embedBatchWithOpenAiCompatiblePacedChunks(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -7943,7 +7954,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    const chunk_size = if (entry.provider == .cloudflare) @min(@as(usize, 100), if (entry.requests_per_minute > 0) @max(@as(usize, 1), @as(usize, entry.burst)) else 100) else @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
+    const chunk_size = openAiCompatiblePacedBatchLimit(entry) orelse unreachable;
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
         for (out.items) |vector| alloc.free(vector);
@@ -12402,6 +12413,18 @@ test "managed embedder text batch limits follow provider model and format contra
         try caps.validate();
         try std.testing.expectEqual(case.maximum, caps.batch.max_items);
     }
+}
+
+test "managed embedder planned text dispatch respects paced provider request size" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://example.invalid/v1","requests_per_minute":60,"burst":2}}}
+    ;
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc, json);
+    defer managed.deinit();
+    const dense = managed.denseInterface();
+    const generation = try dense.captureTextGeneration(alloc, "semantic");
+    try std.testing.expectEqual(@as(usize, 2), try dense.withTextGeneration(generation).partBatchLimit("semantic", 3, 10));
 }
 
 test "managed embedder Ollama text batches preserve full HTTP arrays and result order" {

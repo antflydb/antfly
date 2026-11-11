@@ -13070,7 +13070,11 @@ fn openProvisionedQueryDbForTableWithCache(
     if (summary.indexManagerCatalogChanged()) return error.ReadOnly;
     for (db.core.index_manager.dense_indexes.items) |entry| {
         if (!entry.leann_transient) continue;
-        try attachProvisionedQueryRecovery(&db, indexes_json, runtime_cfg.forTable(table_name));
+        attachProvisionedQueryRecovery(&db, indexes_json, runtime_cfg.forTable(table_name)) catch |err| {
+            // Recovery is optional for scans and for candidates with stored
+            // vectors. Only a later stub miss requires the attached runtime.
+            std.log.warn("provisioned query recovery unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+        };
         break;
     }
     return db;
@@ -33695,6 +33699,11 @@ fn implementationTests() type {
                 const raw = try writer.core.store.get(alloc, key);
                 defer alloc.free(raw);
                 try std.testing.expect(try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+                const stored_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:18", "semantic");
+                defer alloc.free(stored_key);
+                const full = try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, &.{ 1, 18, 324, 0 });
+                defer alloc.free(full);
+                try writer.core.store.put(stored_key, full);
             }
             var catalog_state = CatalogState{};
             const before = mock.calls.load(.monotonic);
@@ -33705,6 +33714,23 @@ fn implementationTests() type {
             defer results.deinit();
             try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
             try std.testing.expect(mock.calls.load(.monotonic) > before);
+
+            // A filesystem-only runtime cannot initialize query inference.
+            var filesystem_runtime = try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(alloc);
+            defer filesystem_runtime.deinit();
+            var without_recovery = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog_state.iface(), "docs", null, null, backend_current_root_generation, null, .{ .backend_runtime = filesystem_runtime.ptr(), .antfly_provider = provider }, namespace);
+            defer without_recovery.close();
+            var scan = try without_recovery.scan(alloc, "doc:18", "doc:19", .{ .inclusive_from = true, .include_documents = true });
+            defer scan.deinit(alloc);
+            try std.testing.expect(scan.documents.len > 0);
+            const manager = without_recovery.core.index_manager;
+            const stored_id = (try manager.lookupDenseVectorId(without_recovery.core.store, "semantic", "doc:18")) orelse return error.TestUnexpectedResult;
+            const stub_id = (try manager.lookupDenseVectorId(without_recovery.core.store, "semantic", "doc:17")) orelse return error.TestUnexpectedResult;
+            const degraded_entry = manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+            var stored = try degraded_entry.index.searchWithRequest(.{ .query = &.{ 1, 18, 324, 0 }, .k = 1, .filter_ids = &.{stored_id} });
+            defer stored.deinit();
+            try std.testing.expectEqual(@as(usize, 1), stored.items.items.len);
+            try std.testing.expectError(error.ReembedUnavailable, degraded_entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .filter_ids = &.{stub_id} }));
         }
 
         test "provisioned query runtime db rejects stale identity namespace" {

@@ -1605,14 +1605,29 @@ pub const Index = struct {
         // vectors, so they also cannot prune reranking of quantized copies.
         // Limit a graph walk to its estimated beam in either case.
         const refill_shortlist = opts.score_quantized_source and opts.candidate_ids == null;
-        if ((self.rabitq == null or refill_shortlist) and pool.items.len > ef) {
-            const ByEstimate = struct {
-                fn lessThan(_: void, a: Pooled, b: Pooled) bool {
-                    return a.est < b.est or (a.est == b.est and a.id < b.id);
-                }
-            };
-            std.mem.sortUnstable(Pooled, pool.items, {}, ByEstimate.lessThan);
-            if (!refill_shortlist) pool.items.len = ef;
+        const ByEstimate = struct {
+            fn compare(_: void, a: Pooled, b: Pooled) std.math.Order {
+                if (a.est < b.est) return .lt;
+                if (a.est > b.est) return .gt;
+                return std.math.order(a.id, b.id);
+            }
+
+            fn lessThan(_: void, a: Pooled, b: Pooled) bool {
+                return compare({}, a, b) == .lt;
+            }
+        };
+        const EstimateQueue = std.PriorityQueue(Pooled, void, ByEstimate.compare);
+        var estimates: ?EstimateQueue = null;
+        defer if (estimates) |*queue| queue.deinit(alloc);
+        if (pool.items.len > ef) {
+            if (refill_shortlist) {
+                // Heapify once, then order only the candidates actually
+                // scored. A readable shortlist never sorts the remainder.
+                estimates = EstimateQueue.fromOwnedSlice(try pool.toOwnedSlice(alloc), {});
+            } else if (self.rabitq == null) {
+                std.mem.sortUnstable(Pooled, pool.items, {}, ByEstimate.lessThan);
+                pool.items.len = ef;
+            }
         }
 
         const ByLower = struct {
@@ -1621,6 +1636,7 @@ pub const Index = struct {
             }
         };
         if (!opts.score_quantized_source) std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
+        const candidates_view = if (estimates) |queue| queue.items else pool.items;
 
         var top = Heap(true){};
         defer top.deinit(alloc);
@@ -1633,14 +1649,19 @@ pub const Index = struct {
         const chunk: usize = if (opts.batch_size > 0) opts.batch_size else @max(k, 1);
         var i: usize = 0;
         var unrecomputed_from: ?usize = null;
-        while (i < pool.items.len) {
+        while (i < candidates_view.len) {
             if (refill_shortlist and i >= ef and top.len() >= k) break;
-            const batch_end = if (refill_shortlist and i < ef) @min(ef, pool.items.len) else pool.items.len;
+            const batch_end = if (refill_shortlist and i < ef) @min(ef, candidates_view.len) else candidates_view.len;
             const batch_start = i;
             const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
             ids.clearRetainingCapacity();
             while (i < batch_end and ids.items.len < chunk) : (i += 1) {
-                const p = pool.items[i];
+                const p = if (estimates) |*queue| next: {
+                    const candidate = queue.pop().?;
+                    // Keep the popped item for the estimate-only fallback.
+                    candidates_view[candidates_view.len - 1 - i] = candidate;
+                    break :next candidate;
+                } else candidates_view[i];
                 if (!opts.score_quantized_source and p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
                 if (self.upper_vectors.contains(p.id) and
@@ -1653,7 +1674,7 @@ pub const Index = struct {
                 try ids.append(alloc, p.id);
             }
             if (ids.items.len == 0) {
-                if (!opts.score_quantized_source and i < pool.items.len and pool.items[i].lower >= tau) break;
+                if (!opts.score_quantized_source and i < candidates_view.len and candidates_view[i].lower >= tau) break;
                 continue;
             }
             if (!try RecomputeGate.open(opts.gate)) {
@@ -1678,7 +1699,9 @@ pub const Index = struct {
             stats.budget_exhausted = true;
             // Unscored source-backed candidates may no longer exist.
             if (!opts.verify_source) {
-                for (pool.items[from..], from..) |p, position| {
+                for (from..candidates_view.len) |position| {
+                    const offset = if (estimates != null) candidates_view.len - 1 - position else position;
+                    const p = candidates_view[offset];
                     if (self.isDeleted(p.id) or (!opts.score_quantized_source and position < i and self.upper_vectors.contains(p.id))) continue;
                     const c = Cand{ .dist = p.est, .id = p.id };
                     if (top.len() < k) {

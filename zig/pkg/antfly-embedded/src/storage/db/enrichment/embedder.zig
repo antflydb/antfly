@@ -93,6 +93,13 @@ pub const DenseResultCache = struct {
     remember: *const fn (*anyopaque, [32]u8, []const f32) void,
 };
 
+/// Invocation-local accounting at a text provider callback boundary.
+pub const TextDispatchAccounting = struct {
+    ptr: *anyopaque,
+    begin: *const fn (*anyopaque) anyerror!u64,
+    finish: *const fn (*anyopaque, u64) void,
+};
+
 pub const DenseEmbedder = struct {
     ptr: *anyopaque,
     dense_embed_fn: DenseEmbedFn,
@@ -114,6 +121,7 @@ pub const DenseEmbedder = struct {
     dense_embed_part_items_with_context_fn: ?DenseEmbedPartItemsWithContextFn = null,
     dense_embed_raster_items_with_context_fn: ?DenseEmbedRasterItemsWithContextFn = null,
     part_request_context: ?RequestContext = null,
+    text_dispatch_accounting: ?TextDispatchAccounting = null,
     /// One immutable coordinator-resolved value for admission and execution.
     /// Descriptor and route authority cannot be replaced independently.
     part_lease: ?inference_work.CapabilityLease = null,
@@ -298,23 +306,30 @@ pub const DenseEmbedder = struct {
         return vectors;
     }
 
+    fn accountedTextDispatch(self: DenseEmbedder, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+        const accounting = self.text_dispatch_accounting orelse return @call(.auto, callback, args);
+        const started = try accounting.begin(accounting.ptr);
+        defer accounting.finish(accounting.ptr, started);
+        return @call(.auto, callback, args);
+    }
+
     fn dispatchTexts(self: DenseEmbedder, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, allow_synchronous: bool) ![]const []const f32 {
         if (self.part_request_context) |context| try context.check();
         const vectors = if (self.part_lease != null and self.dense_embed_batch_planned_fn != null)
-            try self.embedLeasedTexts(a, name, texts, dims)
+            try self.accountedTextDispatch(embedLeasedTexts, .{ self, a, name, texts, dims })
         else if (self.part_request_context) |context| blk: {
             if (self.dense_embed_batch_with_context_fn) |embed_batch|
-                break :blk try embed_batch(self.ptr, a, name, texts, dims, context);
+                break :blk try self.accountedTextDispatch(embed_batch, .{ self.ptr, a, name, texts, dims, context });
             if (self.dense_embed_with_context_fn != null)
                 break :blk try fallbackDenseBatchWithContext(self, a, name, texts, dims, context);
             if (allow_synchronous) {
                 if (self.dense_embed_batch_fn) |embed_batch|
-                    break :blk try embed_batch(self.ptr, a, name, texts, dims);
+                    break :blk try self.accountedTextDispatch(embed_batch, .{ self.ptr, a, name, texts, dims });
                 break :blk try fallbackDenseBatch(self, a, name, texts, dims);
             }
             return error.UncancellableInferenceProvider;
         } else if (self.dense_embed_batch_fn) |embed_batch|
-            try embed_batch(self.ptr, a, name, texts, dims)
+            try self.accountedTextDispatch(embed_batch, .{ self.ptr, a, name, texts, dims })
         else
             try fallbackDenseBatch(self, a, name, texts, dims);
         if (self.part_request_context) |context| context.check() catch |err| {
@@ -1023,7 +1038,7 @@ fn fallbackDenseBatch(
         alloc.free(batch);
     }
     for (texts, 0..) |text, i| {
-        batch[i] = try self.embedDense(alloc, embedding_name, text, dims);
+        batch[i] = try self.accountedTextDispatch(DenseEmbedder.embedDense, .{ self, alloc, embedding_name, text, dims });
         initialized += 1;
     }
     return batch;
@@ -1045,7 +1060,7 @@ fn fallbackDenseBatchWithContext(
     }
     for (texts, 0..) |text, i| {
         try context.update(.executing, i, texts.len);
-        batch[i] = try self.embedDenseWithContext(alloc, embedding_name, text, dims, context);
+        batch[i] = try self.accountedTextDispatch(DenseEmbedder.embedDenseWithContext, .{ self, alloc, embedding_name, text, dims, context });
         initialized += 1;
     }
     return batch;
