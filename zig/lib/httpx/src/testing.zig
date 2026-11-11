@@ -37,6 +37,8 @@ pub const ResponseSpec = struct {
     body: ?[]const u8 = null,
     /// Body contains transfer-encoded wire bytes; do not emit Content-Length.
     chunked: bool = false,
+    /// Omit both framing headers; the connection close terminates the body.
+    close_delimited: bool = false,
     content_type: ?[]const u8 = null,
     /// Delay the response on the borrowed `std.Io` clock. This is logical time
     /// under VoprIo and wall time under Threaded.
@@ -273,7 +275,7 @@ pub const TestServer = struct {
         try header_buffer.writer.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n", .{ spec.status, reason, ct });
         if (spec.chunked) {
             try header_buffer.writer.writeAll("Transfer-Encoding: chunked\r\n");
-        } else {
+        } else if (!spec.close_delimited) {
             try header_buffer.writer.print("Content-Length: {d}\r\n", .{body.len});
         }
         try header_buffer.writer.writeAll("Connection: close\r\n");

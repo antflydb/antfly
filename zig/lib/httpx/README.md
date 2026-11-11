@@ -78,6 +78,9 @@ both buffered and writer APIs. Wrapped deflate also verifies Adler-32 while
 retaining raw-deflate fallback. A known oversized encoded Content-Length is
 rejected before body collection. Writer APIs can emit a prefix before discovering
 a late checksum/framing error; callers must treat an error as incomplete output.
+Connection-close framing terminates the HTTP body, but never substitutes for a
+complete compressed stream: truncated raw deflate, zlib, and gzip return errors
+through both APIs, just as they do with Content-Length or chunked framing.
 
 ### Server
 

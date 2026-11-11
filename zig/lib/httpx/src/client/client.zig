@@ -3980,8 +3980,10 @@ pub const Client = struct {
                         try bounded.checkLimit();
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                        // Only the decoder's EndOfStream proves the final
+                        // DEFLATE block completed. HTTP connection-close EOF
+                        // inside a block is ReadFailed, not codec completion.
                         if (err == error.EndOfStream) break;
-                        if (err == error.ReadFailed and close_delimited_body) break;
                         return error.DecompressionFailed;
                     };
                     if (n == 0) break;
@@ -7615,14 +7617,21 @@ test "compressed responses share complete members integrity and bounds across bu
         .{ .wire = zlib_valid, .coding = "deflate", .decoded = "hello world" },
         .{ .wire = zlib_bad, .coding = "deflate", .expected = error.DecompressionFailed },
         .{ .wire = raw_valid, .coding = "deflate", .decoded = "hello world" },
+        .{ .wire = "\x03\x00", .coding = "deflate" }, // valid empty final block
+        .{ .wire = hello[0 .. hello.len - 1], .expected = error.DecompressionFailed },
+        .{ .wire = "\x07", .coding = "deflate", .expected = error.DecompressionFailed }, // reserved block type
+        .{ .wire = raw_valid[0 .. raw_valid.len - 1], .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = raw_valid[0 .. raw_valid.len - 3], .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = zlib_valid[0 .. zlib_valid.len - 1], .coding = "deflate", .expected = error.DecompressionFailed },
         .{ .wire = raw_over, .coding = "deflate", .limit = 64, .expected = error.ResponseTooLarge },
     };
     for ([_]bool{ false, true }) |to_writer| {
-        for ([_]bool{ false, true }) |chunked| {
+        for ([_]enum { content_length, chunked, close_delimited }{ .content_length, .chunked, .close_delimited }) |framing| {
+            const chunked = framing == .chunked;
             for (cases) |case| {
                 const wire = if (chunked) try std.fmt.allocPrint(a, "{x}\r\n{s}\r\n0\r\n\r\n", .{ case.wire.len, case.wire }) else try a.dupe(u8, case.wire);
                 defer a.free(wire);
-                var server = try TestServer.start(a, io, &.{.{ .path = "/", .respond = .{ .body = wire, .chunked = chunked, .headers = &.{.{ .name = "Content-Encoding", .value = case.coding }} } }});
+                var server = try TestServer.start(a, io, &.{.{ .path = "/", .respond = .{ .body = wire, .chunked = chunked, .close_delimited = framing == .close_delimited, .headers = &.{.{ .name = "Content-Encoding", .value = case.coding }} } }});
                 defer server.deinit();
                 var serving = try io.concurrent(TestServer.handleOne, .{&server});
                 defer serving.cancel(io) catch {};
