@@ -565,6 +565,8 @@ pub const RemoteOptions = struct {
     /// Trusted caller-owned recording already resolved under the document source
     /// policy. Borrowed only for this invocation; never parsed from provider JSON.
     resolved_audio: ?[]const u8 = null,
+    /// MIME evidence for a borrowed recording, used by framed transports.
+    resolved_audio_content_type: ?[]const u8 = null,
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
@@ -765,6 +767,7 @@ pub fn transcribeWithConfig(
 
 const AntflyTranscriberState = struct {
     alloc: Allocator,
+    options: RemoteOptions,
     http: *httpx.Client,
     api_url: []const u8,
     auth_header: ?[2][]const u8 = null,
@@ -775,7 +778,6 @@ const AntflyTranscriberState = struct {
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
     max_download_bytes: ?usize = null,
-    timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
     framed_attachments: bool = false,
     /// Provider-level default for speaker labels; a request may override it.
@@ -807,6 +809,7 @@ const AntflyTranscriberState = struct {
 
         state.* = .{
             .alloc = alloc,
+            .options = options,
             .http = http,
             .api_url = api_url,
             .model = model,
@@ -816,7 +819,6 @@ const AntflyTranscriberState = struct {
             .language_code = language_code,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
-            .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
             .framed_attachments = cfg.framed_attachments,
             .diarization = cfg.diarization,
@@ -857,16 +859,18 @@ const AntflyTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
-        var audio_content = try resolveAudioContentAlloc(alloc, req.url, self.max_download_bytes);
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        var audio_content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
         defer audio_content.deinit(alloc);
+        const audio_bytes = audio_content.bytes();
         var encoded: ?[]u8 = null;
         defer if (encoded) |value| alloc.free(value);
         const audio_field = if (self.framed_attachments)
             "attachment:0"
         else blk: {
-            const encoded_len = std.base64.standard.Encoder.calcSize(audio_content.data.len);
+            const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
             encoded = try alloc.alloc(u8, encoded_len);
-            _ = std.base64.standard.Encoder.encode(encoded.?, audio_content.data);
+            _ = std.base64.standard.Encoder.encode(encoded.?, audio_bytes);
             break :blk encoded.?;
         };
 
@@ -902,8 +906,11 @@ const AntflyTranscriberState = struct {
         defer if (framed_body) |*value| value.deinit();
         if (self.framed_attachments) {
             framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, body, &.{.{
-                .mime_type = audio_content.content_type,
-                .data = audio_content.data,
+                .mime_type = switch (audio_content) {
+                    .owned => |content| content.content_type,
+                    .borrowed => self.options.resolved_audio_content_type orelse "application/octet-stream",
+                },
+                .data = audio_bytes,
             }});
             header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
             header_count += 1;
@@ -913,7 +920,7 @@ const AntflyTranscriberState = struct {
             .json = if (self.framed_attachments) null else body,
             .borrowed_body_segments = if (framed_body) |value| value.segments else null,
             .headers = headers,
-            .timeout_ms = self.timeout_ms,
+            .timeout_ms = try control.remainingTimeoutMs(),
             .max_response_size = self.max_response_bytes,
             .cancellation = self.cancellation,
         });
@@ -2317,7 +2324,7 @@ test "Antfly transcriber sends negotiated framed audio attachments" {
                 .model = "whisper",
                 .url = url,
                 .framed_attachments = true,
-            }, .{ .url = "data:audio/wav;base64,ZmFrZQ==" }, .{}) catch |err| {
+            }, .{ .url = "gs://private/must-not-fetch.wav" }, .{ .resolved_audio = "fake", .resolved_audio_content_type = "audio/wav" }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -2581,7 +2588,7 @@ test "remote antfly transcription asks for diarization and keeps the labels" {
                 .provider = .antfly,
                 .model = "whisper",
                 .url = url,
-            }, .{ .url = "data:audio/wav;base64,ZmFrZQ==", .diarization = true }, .{}) catch |err| {
+            }, .{ .url = "gs://private/must-not-fetch.wav", .diarization = true }, .{ .resolved_audio = "fake", .resolved_audio_content_type = "audio/wav" }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -2610,6 +2617,7 @@ test "remote antfly transcription asks for diarization and keeps the labels" {
 }
 
 fn expectAntflyTranscriberDiarization(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"audio\":\"ZmFrZQ==\"") != null);
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"diarization\":true") != null);
 }

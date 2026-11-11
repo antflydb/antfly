@@ -57,11 +57,11 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 		if preset.ContentType != "" && preset.ContentType != "application/json" || preset.OutputField != "" && preset.OutputField != "text" {
 			return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("transcript units require the native JSON text projection")
 		}
-		producer = map[string]any{"type": "document_extraction", "config": map[string]any{
-			"route_preset":  "explicit_only",
-			"transcription": map[string]any{"transcriber": producer["config"]},
-			"routes":        []any{map[string]any{"extractor": map[string]any{"type": "transcript", "unit": "transcript_segment"}}},
-		}}
+		config, ok := producer["config"].(map[string]any)
+		if !ok {
+			return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("transcription requires a native STT configuration object")
+		}
+		producer = NativeTranscriptProducer(config)
 	}
 	if preset.ResourceField != "" && producer == nil {
 		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("resource processing requires an explicit native producer")
@@ -196,4 +196,16 @@ func WithExternalVector(parent map[string]any, index string, space VectorSpace, 
 	}
 	embeddings[index] = vector
 	return out, nil
+}
+
+// NativeTranscriptProducer uses the native extraction-unit protocol for speech:
+// timestamps, speaker evidence and completion debt remain engine-owned. This
+// recipe can be composed with canonical source fields or other native schemas.
+// Configuration is validated with the containing native declaration.
+func NativeTranscriptProducer(transcriber map[string]any) map[string]any {
+	return map[string]any{"type": "document_extraction", "config": map[string]any{
+		"route_preset":  "explicit_only",
+		"transcription": map[string]any{"transcriber": transcriber},
+		"routes":        []any{map[string]any{"extractor": map[string]any{"type": "transcript", "unit": "transcript_segment"}}},
+	}}
 }
