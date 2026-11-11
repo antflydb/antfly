@@ -63057,7 +63057,7 @@ test "retained owner native controls subscription issuer routes poll retry and c
             }
             const loaded = try self.sessions.load(alloc, alloc, position, principal, 2);
             switch (loaded) {
-                .retry_reply => |reply| return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = reply },
+                .retry_reply => |reply| return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = reply.reply },
                 .state => |state| {
                     defer alloc.free(state);
                     return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try self.sessions.commit(alloc, alloc, position, principal, 3, "next-state", "committed-frame") };
@@ -63070,7 +63070,7 @@ test "retained owner native controls subscription issuer routes poll retry and c
     defer issuer.deinit();
     fixture.sessions = &issuer.retained_subscriptions;
     fixture.secret = try issuer.researchStateKey(std.testing.io);
-    try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, "initial-state");
+    try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, .{ .resource = 7, .plan = @splat(8), .definition = @splat(9) }, "initial-state");
     var server = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.uri, .node_base_uri_controlled = Fixture.uriControlled } }, .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined, .system_catalog = Fixture.directory } }, null, null);
     defer server.deinit();
     try std.testing.expectEqualDeep(fixture.secret, try server.researchStateKey(std.testing.io));
@@ -63102,7 +63102,7 @@ test "retained owner native controls subscription issuer routes poll retry and c
     try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, request, .{}));
     fixture.initial.owner_node_id = 3;
     fixture.initial.id = @splat(8);
-    try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, "initial-state");
+    try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, .{ .resource = 7, .plan = @splat(8), .definition = @splat(9) }, "initial-state");
     const metadata_cursor = subscriptions.token(&fixture.secret, fixture.initial);
     const metadata_body = try std.json.Stringify.valueAlloc(a, .{ .cursor = metadata_cursor[0..] }, .{});
     defer a.free(metadata_body);

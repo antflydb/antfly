@@ -475,11 +475,6 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             )
             == caught_up
         )
-        api(
-            "POST",
-            atomic_path + "/subscriptions/cancel",
-            {"cursor": caught_up["cursor"]},
-        )
         # Exact finite contributions may overflow only when projected to SUM.
         # Serving must expose the same permanent numeric error across surfaces.
         sql(
@@ -526,10 +521,31 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             server,
         )
         atomic = api("GET", atomic_path)
+        assert (
+            api(
+                "POST",
+                atomic_path + "/subscriptions/poll",
+                {"cursor": subscription["cursor"]},
+            )
+            == caught_up
+        )
         api(
             "POST",
             atomic_path + "/close",
             {"expected_revision": atomic["revision"], "discard": True},
+        )
+        # A retry of a previously committed frame must recheck lifecycle
+        # authority, even though its reply is already cached at the issuer.
+        with pytest.raises(OSError, match="409.*reset_required"):
+            api(
+                "POST",
+                atomic_path + "/subscriptions/poll",
+                {"cursor": subscription["cursor"]},
+            )
+        api(
+            "POST",
+            atomic_path + "/subscriptions/cancel",
+            {"cursor": caught_up["cursor"]},
         )
         wait_for(
             lambda: api("GET", atomic_path),

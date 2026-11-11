@@ -253,7 +253,7 @@ fn openBudgeted(server: anytype, alloc: A, working: A, sessions: *registry.Regis
     try ctx.ensureActive();
     const output = try alloc.dupe(u8, response);
     errdefer alloc.free(output);
-    try sessions.create(server.alloc, position, principal, platform.monotonicNs(), payload);
+    try sessions.create(server.alloc, position, principal, platform.monotonicNs(), .{ .resource = state.resource, .plan = state.plan, .definition = state.definition }, payload);
     return output;
 }
 
@@ -270,9 +270,17 @@ fn pollBudgeted(server: anytype, alloc: A, working: A, sessions: *registry.Regis
     defer arena.deinit();
     const a = arena.allocator();
     const loaded = try sessions.load(server.alloc, a, position, principal, platform.monotonicNs());
-    if (loaded == .retry_reply) return alloc.dupe(u8, loaded.retry_reply);
-    const original = try std.json.parseFromSliceLeaky(State, a, loaded.state, .{});
+    // Even byte-identical retries require a current serving admission. This
+    // revokes cached frames on discard and logical-name reuse without decoding
+    // the saved multi-megabyte state or touching archived/native data.
     const snapshot = try read.fetchReadCut(server, a, target, ctx);
+    if (loaded == .retry_reply) {
+        const cached = loaded.retry_reply;
+        if (snapshot.resource.id != cached.admission.resource or !std.mem.eql(u8, &snapshot.plan.id, &cached.admission.plan) or !std.mem.eql(u8, &snapshot.plan.definition, &cached.admission.definition)) return error.RetainedSeriesResetRequired;
+        try ctx.ensureActive();
+        return alloc.dupe(u8, cached.reply);
+    }
+    const original = try std.json.parseFromSliceLeaky(State, a, loaded.state, .{});
     if (snapshot.resource.id != original.resource or !std.mem.eql(u8, &snapshot.plan.id, &original.plan) or !std.mem.eql(u8, &snapshot.plan.definition, &original.definition) or snapshot.owners.len != original.parts.len) return error.RetainedSeriesResetRequired;
     var descriptor = try local.system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
     defer descriptor.deinit();
@@ -608,4 +616,58 @@ test "retained subscription snapshot catchup preserves physical producer identit
     fresh.cursor = cursor;
     fresh.cursor.sequence -= 1;
     try std.testing.expectError(error.RetainedSeriesResetRequired, requireSameProducer(old, fresh));
+}
+
+test "retained subscription cached retries revalidate retirement and resource identity without decoding saved state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lineage = try local.system_catalog_retained_datasets.Source.fromTable(a, .{ .table_id = @as(u64, 7), .name = "raw", .schema_json = "" }, "11111111111111111111111111111111".*);
+    var hash: dataset.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &hash, .{});
+    const definition: dataset.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = hash, .schema_json = "{}", .authorization = @splat(2), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = lineage.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } };
+    var descriptor: local.system_catalog_retained_datasets.Descriptor = .{ .definition = definition, .source = lineage, .phase = .active, .catalog_location = @splat(3), .catalog_storage_identity = @splat(4) };
+    var snapshot: read.Snapshot = .{ .resource = .{ .id = 8, .kind = .dataset, .name = "stats", .source_json = try std.json.Stringify.valueAlloc(a, descriptor, .{}), .retained = descriptor.identity() }, .plan = .{ .id = @splat(5), .resource = 8, .dataset = definition.id, .generation = 1, .definition = try definition.fingerprint(a), .source = lineage.identity(), .source_table = 7, .topology_generation = 1, .membership = @splat(6), .phase = .active }, .owners = &.{} };
+    const Fixture = struct {
+        snapshot: *read.Snapshot,
+        calls: usize = 0,
+        missing: bool = false,
+        fn catalog(ptr: *anyopaque, alloc: A, ctx: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(ctx.setting_admin);
+            try std.testing.expect(call == .retained_dataset_read_cut);
+            self.calls += 1;
+            if (self.missing) return error.CatalogNotFound;
+            return std.json.Stringify.valueAlloc(alloc, self.snapshot.*, .{});
+        }
+    };
+    var fixture: Fixture = .{ .snapshot = &snapshot };
+    const Api = @import("http_server.zig").ApiHttpServer;
+    var server = Api.init(std.testing.allocator, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog } }, null, null);
+    defer server.deinit();
+    var sessions: registry.Registry = .{};
+    defer sessions.deinit(std.testing.allocator);
+    const position: registry.Position = .{ .id = @splat(7), .sequence = 0, .binding = @splat(8) };
+    const principal: registry.Digest = @splat(9);
+    const now = platform.monotonicNs();
+    try sessions.create(std.testing.allocator, position, principal, now, .{ .resource = snapshot.resource.id, .plan = snapshot.plan.id, .definition = snapshot.plan.definition }, "intentionally not JSON");
+    const committed = try sessions.commit(std.testing.allocator, a, position, principal, now, "also not JSON", "exact cached frame");
+    const cursor = registry.token("secret", position);
+    const input: Poll = .{ .cursor = &cursor };
+    const target: Target = .{ .table = "stats" };
+    const reply = try poll(&server, a, &sessions, "secret", principal, target, input, .{});
+    try std.testing.expectEqualStrings(committed, reply);
+    descriptor.phase = .retiring;
+    snapshot.resource.source_json = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    try std.testing.expectError(error.RetainedOwnerPlanChanged, poll(&server, a, &sessions, "secret", principal, target, input, .{}));
+    descriptor.phase = .active;
+    snapshot.resource.source_json = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    snapshot.resource.id += 1;
+    try std.testing.expectError(error.RetainedSeriesResetRequired, poll(&server, a, &sessions, "secret", principal, target, input, .{}));
+    snapshot.resource.id -= 1;
+    snapshot.plan.id = @splat(10);
+    try std.testing.expectError(error.RetainedSeriesResetRequired, poll(&server, a, &sessions, "secret", principal, target, input, .{}));
+    fixture.missing = true;
+    try std.testing.expectError(error.CatalogNotFound, poll(&server, a, &sessions, "secret", principal, target, input, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fixture.calls);
 }

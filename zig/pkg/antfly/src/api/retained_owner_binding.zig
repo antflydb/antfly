@@ -49,6 +49,41 @@ fn dimensionType(properties: []const public_schema.DocumentProperty, reference: 
     };
 }
 
+/// Public field names denote literal top-level columns. Freeze that identity
+/// before fingerprinting the definition; never reinterpret dots during capture.
+pub fn publicProjection(a: A, timestamp: []const u8, dimensions: []const []const u8, measures: []const t.Measure, source_json: []const u8) !Projection {
+    var schema = public_schema.parseValidatedTableSchema(a, source_json) catch return error.InvalidDatasetDefinition;
+    defer schema.deinit(a);
+    if (schema.document_schemas.len == 0) return error.InvalidDatasetDefinition;
+    const dimension_refs = try a.alloc(Reference, dimensions.len);
+    const measure_refs = try a.alloc(?Reference, measures.len);
+    for (dimensions, dimension_refs) |name, *reference| reference.* = .{ .column = name };
+    for (measures, measure_refs) |measure, *reference| reference.* = if (measure.field) |name| .{ .column = name } else null;
+    for (schema.document_schemas, 0..) |document, document_index| {
+        const time_property = property(document.properties, timestamp) orelse return error.InvalidDatasetDefinition;
+        // Capture accepts the declared datetime representation and integer
+        // Unix nanoseconds. Untyped strings/numbers cannot certify timestamps.
+        const time_kind = public_schema.runtimeRelationalColumnType(time_property) orelse return error.InvalidDatasetDefinition;
+        const datetime_string = time_kind == .string and time_property.format != null and std.mem.eql(u8, time_property.format.?, "date-time");
+        if (time_kind != .datetime and time_kind != .integer and !datetime_string) return error.InvalidDatasetDefinition;
+        for (dimension_refs) |reference| _ = dimensionType(document.properties, reference) catch return error.InvalidDatasetDefinition;
+        for (measures, measure_refs) |measure, *reference| {
+            if (reference.*) |*field| {
+                const p = property(document.properties, field.column) orelse return error.InvalidDatasetDefinition;
+                const kind = public_schema.runtimeRelationalColumnType(p) orelse return error.InvalidDatasetDefinition;
+                if (measure.law != .count and kind != .number) return error.InvalidDatasetDefinition;
+                const json = kind == .json;
+                if (document_index != 0 and (field.result == .json) != json) return error.InvalidDatasetDefinition;
+                field.result = if (json) .json else .scalar;
+            } else if (measure.law != .count) return error.InvalidDatasetDefinition;
+        }
+    }
+    var projection: Projection = .{ .source_schema = undefined, .timestamp = .{ .column = timestamp }, .dimensions = dimension_refs, .measures = measure_refs };
+    std.crypto.hash.sha2.Sha256.hash(source_json, &projection.source_schema, .{});
+    try projection.validate();
+    return projection;
+}
+
 pub fn specification(a: A, definition: t.Definition, partition: t.Id, incarnation: u64) !local.storage_retained_series.Spec {
     try definition.validate();
     const summary = definition.summary orelse return error.InvalidDatasetDefinition;
@@ -194,4 +229,48 @@ test "retained owner native controls compile snapshot history without changing l
     }
     snapshot.format = 1;
     try std.testing.expectError(error.InvalidDatasetDefinition, snapshot.validate());
+}
+
+test "retained owner native controls public creation freezes literal fields and validates the full extraction schema" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema_json =
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"ts":{"type":"datetime"},"a.b":{"type":"number"},"a":{"type":"object","properties":{"b":{"type":"number"}}},"doc":{"type":"object"},"bad_time":{"type":"boolean"}}}}}}
+    ;
+    const admin = @import("retained_dataset_admin.zig");
+    const source = try local.system_catalog_retained_datasets.Source.fromTable(a, .{ .table_id = @as(u64, 7), .name = "raw", .schema_json = schema_json }, "11111111111111111111111111111111".*);
+    var input: admin.Create = .{ .source = .{ .table = "raw" }, .timestamp = "ts", .dimensions = &.{"a.b"}, .interval_ns = "10", .mutable_for_ns = "100", .retention_ns = "1000", .measures = &.{ .{ .name = "sum_v", .law = .sum, .field = "a.b" }, .{ .name = "json_n", .law = .count, .field = "doc" }, .{ .name = "all_n", .law = .count } } };
+    const descriptor = try admin.descriptor(a, std.testing.io, input, .{ .lineage = source, .schema_json = schema_json, .catalog_revision = 1 }, @splat(3));
+    // Persist/reload before compiling: the schema-bound program must survive
+    // restart and travel with the definition used for archive state identity.
+    const bytes = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    var decoded = try local.system_catalog_retained_datasets.parse(a, bytes);
+    defer decoded.deinit();
+    const binding = try compile(a, decoded.value.definition, schema_json, @splat(4), 1);
+    try std.testing.expect(binding.compiled != null);
+    for ([_][]const u8{
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"a\":{\"b\":7},\"doc\":null}",
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"a.b\":null,\"a\":{\"b\":7},\"doc\":null}",
+    }) |json| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+        const row = try capture.normalizeValue(a, binding, value);
+        try std.testing.expectEqualStrings("[null]", row.dimensions);
+        try std.testing.expect(row.values[0] == null);
+        try std.testing.expectEqual(@as(?f64, 1), row.values[1]);
+    }
+    const present = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"ts\":\"2026-01-01T00:00:00Z\",\"a.b\":3,\"a\":{\"b\":7}}", .{});
+    const row = try capture.normalizeValue(a, binding, present);
+    try std.testing.expectEqual(@as(?f64, 3), row.values[0]);
+    try std.testing.expect(row.values[1] == null);
+    const public_source: admin.Source = .{ .lineage = source, .schema_json = schema_json, .catalog_revision = 1 };
+    input.timestamp = "absent";
+    try std.testing.expectError(error.InvalidDatasetDefinition, admin.descriptor(a, std.testing.io, input, public_source, @splat(3)));
+    input.timestamp = "bad_time";
+    try std.testing.expectError(error.InvalidDatasetDefinition, admin.descriptor(a, std.testing.io, input, public_source, @splat(3)));
+    input.timestamp = "ts";
+    input.measures = &.{.{ .name = "n", .law = .count, .field = "absent" }};
+    try std.testing.expectError(error.InvalidDatasetDefinition, admin.descriptor(a, std.testing.io, input, public_source, @splat(3)));
+    input.measures = &.{.{ .name = "n", .law = .sum, .field = "doc" }};
+    try std.testing.expectError(error.InvalidDatasetDefinition, admin.descriptor(a, std.testing.io, input, public_source, @splat(3)));
 }

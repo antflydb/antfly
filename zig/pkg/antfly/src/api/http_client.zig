@@ -888,7 +888,10 @@ pub const ApiHttpClient = struct {
             200 => {},
             401, 403 => return error.Forbidden,
             410 => return error.RetainedSeriesHistoryExpired,
-            413 => return error.DatasetPageBudgetExceeded,
+            413, 422 => {
+                if (@import("retained_series_errors.zig").remoteReadFailure(response.status, response.body)) |reason| return reason;
+                return if (response.status == 413) error.DatasetPageBudgetExceeded else error.RetainedSeriesNotReady;
+            },
             409 => {
                 if (std.mem.eql(u8, response.body, "RetainedSeriesCoverageMissing")) return error.RetainedSeriesCoverageMissing;
                 if (std.mem.eql(u8, response.body, "RetainedSeriesResolutionMismatch")) return error.RetainedSeriesResolutionMismatch;

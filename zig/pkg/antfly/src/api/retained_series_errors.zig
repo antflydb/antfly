@@ -31,12 +31,21 @@ pub fn classify(err: anyerror) ?Error {
     inline for (@typeInfo(Error).error_set.error_names.?) |name| if (err == @field(Error, name)) return @field(Error, name);
     return null;
 }
-/// Permanent serving failures use the same domain contract as SQL 22003.
+/// Permanent serving failures retain their domain class across HTTP and SQL.
 pub fn readFailure(err: anyerror) ?Spec {
     return switch (err) {
         error.RetainedSeriesNumericOverflow => describe(error.RetainedSeriesNumericOverflow),
+        error.RetainedSeriesTimeOverflow => describe(error.RetainedSeriesTimeOverflow),
+        error.RetainedSeriesBatchTooLarge => .{ .status = 413, .code = "retained_series_batch_too_large", .message = "Retained scan exceeds the read budget; narrow the time range or dimension filter." },
         else => null,
     };
+}
+/// Only accept matching permanent status/reason pairs from a private owner.
+/// Unknown/mismatched reasons must not acquire a trusted domain identity.
+pub fn remoteReadFailure(status: u16, body: []const u8) ?Error {
+    const reason = decode(body) orelse return null;
+    const failure = readFailure(reason) orelse return null;
+    return if (failure.status == status) reason else null;
 }
 pub fn decode(name: []const u8) ?Error {
     inline for (@typeInfo(Error).error_set.error_names.?) |field| if (std.mem.eql(u8, field, name)) return @field(Error, field);
@@ -73,4 +82,16 @@ test "retained owner native controls numeric serving failures are permanent doma
     try std.testing.expectEqualStrings("retained_series_numeric_overflow", failure.code);
     try std.testing.expect(!failure.retryable);
     try std.testing.expect(readFailure(error.Timeout) == null);
+}
+
+test "retained owner native controls permanent read errors survive the private wire boundary" {
+    for ([_]Error{ error.RetainedSeriesBatchTooLarge, error.RetainedSeriesNumericOverflow, error.RetainedSeriesTimeOverflow }) |reason| {
+        const failure = readFailure(reason).?;
+        try std.testing.expect(!failure.retryable);
+        try std.testing.expectEqual(reason, remoteReadFailure(failure.status, @errorName(reason)).?);
+        try std.testing.expect(remoteReadFailure(503, @errorName(reason)) == null);
+    }
+    try std.testing.expectEqual(@as(u16, 413), readFailure(error.RetainedSeriesBatchTooLarge).?.status);
+    try std.testing.expect(remoteReadFailure(422, "InvalidRetainedSeriesRow") == null);
+    try std.testing.expect(remoteReadFailure(413, "unknown") == null);
 }

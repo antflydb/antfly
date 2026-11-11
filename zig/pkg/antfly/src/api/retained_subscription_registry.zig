@@ -79,6 +79,8 @@ fn signingKey(secret: []const u8) Digest {
     return key;
 }
 
+/// Immutable serving identity, independent of the potentially large state.
+pub const Admission = struct { resource: u64, plan: Digest, definition: Digest };
 pub const Registry = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayList(Entry) = .empty,
@@ -86,11 +88,12 @@ pub const Registry = struct {
     const Entry = struct {
         position: Position,
         principal: Digest,
+        admission: Admission,
         expires_ns: u64,
         state: []u8,
         reply: []u8 = &.{},
     };
-    pub const Loaded = union(enum) { state: []u8, retry_reply: []u8 };
+    pub const Loaded = union(enum) { state: []u8, retry_reply: struct { reply: []u8, admission: Admission } };
 
     fn lock(self: *Registry) void {
         while (!self.mutex.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
@@ -127,7 +130,7 @@ pub const Registry = struct {
     fn requireBinding(entry: *const Entry, position: Position, principal: Digest) !void {
         if (entry.position.owner_node_id != position.owner_node_id or !std.mem.eql(u8, &entry.position.binding, &position.binding) or !std.mem.eql(u8, &entry.principal, &principal)) return error.Forbidden;
     }
-    pub fn create(self: *Registry, alloc: A, position: Position, principal: Digest, now: u64, state: []const u8) !void {
+    pub fn create(self: *Registry, alloc: A, position: Position, principal: Digest, now: u64, admission: Admission, state: []const u8) !void {
         if (position.sequence != 0 or std.mem.allEqual(u8, &position.id, 0) or state.len > max_state_bytes) return error.DatasetPageBudgetExceeded;
         self.lock();
         defer self.mutex.unlock();
@@ -135,7 +138,7 @@ pub const Registry = struct {
         if (self.entries.items.len >= max_sessions or state.len > max_total_bytes - self.bytes or self.find(position.id) != null) return error.DatasetReaderBudgetExceeded;
         const owned = try alloc.dupe(u8, state);
         errdefer alloc.free(owned);
-        try self.entries.append(alloc, .{ .position = position, .principal = principal, .expires_ns = now +| idle_ns, .state = owned });
+        try self.entries.append(alloc, .{ .position = position, .principal = principal, .admission = admission, .expires_ns = now +| idle_ns, .state = owned });
         self.bytes += owned.len;
     }
     pub fn load(self: *Registry, alloc: A, output: A, position: Position, principal: Digest, now: u64) !Loaded {
@@ -145,7 +148,7 @@ pub const Registry = struct {
         const entry = self.find(position.id) orelse return error.RetainedSeriesResetRequired;
         try requireBinding(entry, position, principal);
         if (position.sequence == entry.position.sequence) return .{ .state = try output.dupe(u8, entry.state) };
-        if (position.sequence +| 1 == entry.position.sequence and entry.reply.len != 0) return .{ .retry_reply = try output.dupe(u8, entry.reply) };
+        if (position.sequence +| 1 == entry.position.sequence and entry.reply.len != 0) return .{ .retry_reply = .{ .reply = try output.dupe(u8, entry.reply), .admission = entry.admission } };
         return error.RetainedSeriesResetRequired;
     }
     /// A concurrent replay of the same input returns the already committed
@@ -196,7 +199,7 @@ test "retained subscription retries return the exact committed response and reje
     const encoded = token("test-secret", initial);
     try std.testing.expectEqualDeep(initial, try verify("test-secret", &encoded));
     try std.testing.expectError(error.InvalidRetainedSubscriptionToken, verify("other-secret", &encoded));
-    try registry.create(a, initial, principal, 1, "snapshot");
+    try registry.create(a, initial, principal, 1, .{ .resource = 7, .plan = @splat(8), .definition = @splat(9) }, "snapshot");
     const committed = try registry.commit(a, a, initial, principal, 2, "next", "first reply");
     defer a.free(committed);
     const retry = try registry.commit(a, a, initial, principal, 3, "wrong", "wrong");
@@ -204,8 +207,10 @@ test "retained subscription retries return the exact committed response and reje
     try std.testing.expectEqualStrings("first reply", retry);
     try std.testing.expectError(error.Forbidden, registry.load(a, a, initial, @splat(4), 4));
     const after = try registry.load(a, a, initial, principal, 4);
-    defer a.free(after.retry_reply);
-    try std.testing.expectEqualStrings(committed, after.retry_reply);
+    defer a.free(after.retry_reply.reply);
+    try std.testing.expectEqualStrings(committed, after.retry_reply.reply);
+    try std.testing.expectEqual(@as(u64, 7), after.retry_reply.admission.resource);
+    try std.testing.expectEqual(@as(Digest, @splat(8)), after.retry_reply.admission.plan);
     try std.testing.expectError(error.RetainedSeriesResetRequired, registry.load(a, a, initial, principal, idle_ns + 4));
 }
 
