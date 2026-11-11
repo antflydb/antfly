@@ -19454,8 +19454,20 @@ pub const IndexManager = struct {
             }
         }
 
+        const has_residual = req.filter_prefix.len > 0 or req.key_predicate != null;
+        if (has_residual) {
+            const residual_start = platform_time.monotonicNs();
+            for (candidate_metadata, fallback_doc_keys, 0..) |*metadata, fallback, i| {
+                if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
+                metadata.* = metadata.* orelse fallback;
+            }
+            try dense_exact.filterMetadata(req, candidate_metadata);
+            exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
+        }
+
         const query_measure = vector_mod.norm(req.query);
         var vectors_scored: u64 = 0;
+        var matching_vectors: usize = 0;
         const vectors_stored_externally = entry.vector_loader_context != null and
             self.primary_store != null and
             entry.index.hasExternalVectorLoader();
@@ -19471,8 +19483,7 @@ pub const IndexManager = struct {
                 const key_scan_end = @min(key_scan_start + exact_dense_score_batch_size, unique_candidate_ids.len);
                 var batch_key_bytes: u64 = 0;
                 for (candidate_metadata[key_scan_start..key_scan_end], fallback_doc_keys[key_scan_start..key_scan_end]) |maybe_metadata, fallback_doc_key| {
-                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
-                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
                     // Internal tuple encoding can escape every byte. Include
                     // fixed namespace/components plus arena alignment slack.
                     batch_key_bytes +|= @as(u64, @intCast(doc_key.len)) *| 2 +| @as(u64, @intCast(artifact_name.len)) +| 64;
@@ -19521,8 +19532,7 @@ pub const IndexManager = struct {
                 const candidate_end = @min(candidate_start + exact_dense_score_batch_size, unique_candidate_ids.len);
                 var batch_len: usize = 0;
                 for (unique_candidate_ids[candidate_start..candidate_end], candidate_metadata[candidate_start..candidate_end], fallback_doc_keys[candidate_start..candidate_end]) |vector_id, maybe_metadata, fallback_doc_key| {
-                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
-                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
                     batch_ids[batch_len] = vector_id;
                     batch_metadata[batch_len] = doc_key;
                     batch_distances[batch_len] = std.math.inf(f32);
@@ -19553,6 +19563,7 @@ pub const IndexManager = struct {
                         if (req.distance_over) |threshold| if (distance <= threshold) continue;
                         if (req.distance_under) |threshold| if (distance >= threshold) continue;
                         const owned_metadata = if (maybe_doc_key) |doc_key| try self.alloc.dupe(u8, doc_key) else null;
+                        matching_vectors += 1;
                         results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
                     }
                 }
@@ -19576,16 +19587,17 @@ pub const IndexManager = struct {
             defer self.alloc.free(vector_scratch);
             for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
                 if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
-                const doc_key = maybe_metadata orelse fallback_doc_key;
-                if (req.filter_prefix.len > 0) {
-                    const resolved_doc_key = doc_key orelse continue;
-                    if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
-                }
-                const distance_start_ns = platform_time.monotonicNs();
-                const vector = (if (vector_cursor) |*cursor|
+                const doc_key = if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key;
+                if (has_residual and doc_key == null) continue;
+                const lookup_start = platform_time.monotonicNs();
+                exact_profile.raw_scalar_reads += 1;
+                const loaded_vector = if (vector_cursor) |*cursor|
                     entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
                 else
-                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
+                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch);
+                const distance_start_ns = platform_time.monotonicNs();
+                exact_profile.native_lookup_ns += distance_start_ns - lookup_start;
+                const vector = loaded_vector catch |err| switch (err) {
                     error.NotFound => {
                         exact_profile.missing_vectors += 1;
                         continue;
@@ -19600,15 +19612,17 @@ pub const IndexManager = struct {
                 if (req.distance_over) |threshold| if (distance <= threshold) continue;
                 if (req.distance_under) |threshold| if (distance >= threshold) continue;
                 const owned_metadata = if (doc_key) |resolved_doc_key| try self.alloc.dupe(u8, resolved_doc_key) else null;
+                matching_vectors += 1;
                 results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
             }
         }
         if (exact_load_session) |session| {
             exact_profile.request_vector_cache_entries = session.vector_cache.count();
             exact_profile.raw_batch_reads = session.raw_batch_reads;
-            exact_profile.raw_scalar_reads = session.raw_scalar_reads;
+            exact_profile.raw_scalar_reads +|= session.raw_scalar_reads;
         }
         results.sort();
+        results.candidate_coverage = if (matching_vectors > results.getHits().len) .more else .exhausted;
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
             std.log.info("antfly_bench_dense_exact_filter index={s} candidates={d} hits={d} batches={d} batch_reads={d} scalar_reads={d} missing={d}", .{
                 entry.config.name,
@@ -46662,6 +46676,35 @@ test "production external scorers use bounded cache-first artifact batches" {
         try std.testing.expectEqual(expected.vector_id, hit.vector_id);
         try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
     }
+
+    const Residual = struct {
+        key: []const u8,
+        calls: usize = 0,
+
+        fn allows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedScalarPredicate;
+        }
+
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const context: *@This() = @ptrCast(@alignCast(raw));
+            context.calls += 1;
+            try std.testing.expect(keys.len <= 128);
+            for (keys, allowed) |key, *keep| keep.* = std.mem.eql(u8, context.key, key);
+        }
+    };
+    var residual = Residual{ .key = doc_keys[far_query_idx] };
+    var filtered = try manager.exactScoreDenseEntryWithRequest(entry, .{
+        .query = vectors[far_query_idx * dims ..][0..dims],
+        .k = 10,
+        .filter_ids = candidate_ids,
+        .key_predicate = .{ .ptr = &residual, .allows = Residual.allows, .allows_many = Residual.many },
+    });
+    defer filtered.results.deinit();
+    try std.testing.expect(residual.calls > 1);
+    try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
+    try std.testing.expectEqual(@as(u64, 1), filtered.vectors_scored);
+    try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
+    try std.testing.expectEqual(candidate_ids[far_query_idx], filtered.results.getHits()[0].vector_id);
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {
@@ -52530,6 +52573,113 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             try std.testing.expect(embedder.documents - before < 64);
         }
         try std.testing.expect(embedder.calls < embedder.documents);
+
+        // Cross the tiny exact limit with a sparse allowlist of elided rows.
+        // The production loader must re-embed only selected candidates.
+        var allowlist: [17]u64 = undefined;
+        for (&allowlist, 0..) |*id, i| {
+            id.* = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[i])) orelse return error.TestUnexpectedResult;
+        }
+        const before_filtered = embedder.documents;
+        var filtered = try entry.index.searchProfiledRequest(.{
+            .query = &vectors[5],
+            .k = 3,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        });
+        defer filtered.results.deinit();
+        try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
+        try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
+        try std.testing.expectEqual(allowlist[5], filtered.results.getHits()[0].vector_id);
+        try std.testing.expectEqual(@as(u64, 0), filtered.profile.nodes_visited);
+        try std.testing.expectEqual(@as(u64, allowlist.len), filtered.profile.approx_vectors_scored);
+        try std.testing.expect(embedder.documents > before_filtered);
+        try std.testing.expect(embedder.documents - before_filtered <= allowlist.len);
+
+        const query_exec = @import("../query/search_exec.zig");
+        const Paging = struct {
+            entry: *IndexManager.DenseIndex,
+            calls: usize = 0,
+
+            fn dense(raw: ?*anyopaque, _: ?[]const u8) !?*IndexManager.DenseIndex {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                return self.entry;
+            }
+            fn text(_: ?*anyopaque, _: ?[]const u8) !?*IndexManager.TextIndex {
+                return null;
+            }
+            fn docKey(_: ?*anyopaque, _: []const u8, _: u64) !?[]u8 {
+                return error.UnexpectedDocKeyLookup;
+            }
+            fn vectorId(_: ?*anyopaque, _: []const u8, _: []const u8) !?u64 {
+                return error.UnexpectedVectorIdLookup;
+            }
+            fn stored(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) ![]u8 {
+                return error.UnexpectedStoredLoad;
+            }
+            fn search(raw: ?*anyopaque, index: *IndexManager.DenseIndex, req: hbc_mod.SearchRequest) !hbc_mod.SearchResults {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                return index.index.searchWithRequest(req);
+            }
+            fn profiled(raw: ?*anyopaque, index: *IndexManager.DenseIndex, req: hbc_mod.SearchRequest) !hbc_mod.ProfiledSearchResults {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                return index.index.searchProfiledRequest(req);
+            }
+            fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+                return result;
+            }
+        };
+        var paging = Paging{ .entry = entry };
+        const expected_documents = embedder.documents - before_filtered;
+        const before_page_documents = embedder.documents;
+        const before_page_batches = embedder.calls;
+        const paging_executor: query_exec.DenseSearchExecutor = .{
+            .ctx = &paging,
+            .filter_candidate_presence = true,
+            .text_index_entry = Paging.text,
+            .dense_index = Paging.dense,
+            .lookup_doc_key = Paging.docKey,
+            .lookup_vector_id = Paging.vectorId,
+            .load_projected_document = Paging.stored,
+            .hbc_search = Paging.search,
+            .hbc_search_profiled = Paging.profiled,
+            .postprocess = Paging.postprocess,
+        };
+        var page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, paging_executor);
+        defer page.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), paging.calls);
+        try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
+        try std.testing.expectEqualStrings(keys[5], page.result.hits[0].id);
+        try std.testing.expectEqual(.exact, page.result.total_hits_relation);
+        try std.testing.expectEqual(@as(u64, 1), page.result.total_hits);
+        try std.testing.expectEqual(expected_documents, embedder.documents - before_page_documents);
+        try std.testing.expectEqual(filtered.profile.rerank_batches, embedder.calls - before_page_batches);
+
+        paging.calls = 0;
+        const before_graph_batches = embedder.calls;
+        var graph_page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .profile = true,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, paging_executor);
+        defer graph_page.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), paging.calls);
+        try std.testing.expectEqual(@as(usize, 1), graph_page.result.hits.len);
+        try std.testing.expectEqualStrings(keys[5], graph_page.result.hits[0].id);
+        try std.testing.expectEqual(.exact, graph_page.result.total_hits_relation);
+        try std.testing.expectEqual(@as(u64, n), graph_page.profile.hbc_nodes_visited);
+        try std.testing.expect(embedder.calls > before_graph_batches);
+        try std.testing.expectEqual(graph_page.profile.hbc_rerank_batches, embedder.calls - before_graph_batches);
 
         // Deleting a quarter rebuilds from codes on sync: nothing re-embedded.
         var deleted: [n / 4][]const u8 = undefined;

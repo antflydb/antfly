@@ -77,7 +77,15 @@ def test_restart_admission_and_pending_visibility_require_success(clock):
             {"inserted": 1},
         ]
     )
-    assert write(api) == {"inserted": 1}
+    observations = []
+    timings = SimpleNamespace(
+        observe=lambda phase, **fields: observations.append((phase, fields))
+    )
+    assert write(api, timings=timings) == {"inserted": 1}
+    assert observations[0][0] == "batch-visibility"
+    assert observations[0][1]["attempts"] == 3
+    assert observations[0][1]["admission_retries"] == 1
+    assert observations[0][1]["pending_responses"] == 1
     assert len(api.calls) == 3
     assert api.calls == [api.calls[0]] * 3
     assert api.calls[0][1]["sync_level"] == "enrichments"

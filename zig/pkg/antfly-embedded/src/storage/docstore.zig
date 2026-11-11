@@ -101,8 +101,12 @@ fn appendReplayArtifactsForHint(
     hint: change_journal_mod.TargetHint,
 ) !void {
     for (artifact_keys) |key| {
+        // Serving lanes must retain final asset roots even when no postings or
+        // vectors changed: replay settles repair debt from that publication.
+        // Keep only the root descriptor, never its navigation/unit payloads.
+        // A later decoder cannot recover keys discarded from the stored lane.
         const keep = switch (hint) {
-            .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
+            .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key) or internal_keys.isAssetArtifactKey(key),
             .graph => internal_keys.isGraphEdgeArtifactKey(key) or
                 internal_keys.isAssetArtifactKey(key) or
                 internal_keys.isChunkArtifactRecordKey(key) or
@@ -113,7 +117,8 @@ fn appendReplayArtifactsForHint(
             .resolution => internal_keys.isAssetArtifactKey(key) or
                 internal_keys.isResolutionArtifactKey(key),
             .promotion => internal_keys.isResolutionArtifactKey(key),
-            .enrichment, .full_text, .algebraic => false,
+            .full_text, .algebraic => internal_keys.isAssetArtifactKey(key),
+            .enrichment => false,
         };
         if (keep) try out.append(alloc, key);
     }
@@ -142,11 +147,13 @@ fn encodeReplayPayloadForHint(
             filtered.changed_doc_keys = record.changed_doc_keys;
             filtered.deleted_doc_keys = record.deleted_doc_keys;
             filtered.overwritten_doc_keys = record.overwritten_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
         },
         .algebraic => {
             filtered.changed_doc_keys = record.changed_doc_keys;
             filtered.deleted_doc_keys = record.deleted_doc_keys;
             filtered.overwritten_doc_keys = record.overwritten_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
         },
         .dense_vector, .sparse_vector => {
             filtered.changed_doc_keys = record.changed_doc_keys;
@@ -5297,6 +5304,25 @@ test "docstore replay retirement pages keys within bounded memory and preserves 
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
 }
 
+test "docstore replay lanes preserve bounded asset publication metadata" {
+    const a = std.testing.allocator;
+    const root = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(root);
+    const child = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "units", "page:000001");
+    defer a.free(child);
+    const embedding = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "dense");
+    defer a.free(embedding);
+    inline for (.{ change_journal_mod.TargetHint.full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |hint| {
+        const payload = try encodeReplayPayloadForHint(a, .{ .sequence = 9, .changed_artifact_keys = &.{ root, child, embedding } }, hint);
+        defer a.free(payload);
+        var decoded = try change_journal_mod.decodeRecord(a, payload);
+        defer decoded.deinit();
+        const keys = decoded.record.changed_artifact_keys;
+        try std.testing.expectEqualStrings(root, keys[0]);
+        try std.testing.expectEqual(@as(usize, if (hint == .dense_vector or hint == .sparse_vector) 2 else 1), keys.len);
+    }
+}
+
 test "docstore indexes replay rows by hint and truncates them" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -5357,8 +5383,9 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 1), dense_record.record.changed_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), dense_record.record.deleted_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), dense_record.record.overwritten_doc_keys.len);
-    try std.testing.expectEqual(@as(usize, 1), dense_record.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), dense_record.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings(embedding_artifact_key, dense_record.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(graph_asset_artifact_key, dense_record.record.changed_artifact_keys[1]);
 
     const full_text_entries = try store.iterateReplayEntriesFromHint(alloc, 7, .full_text);
     defer {
@@ -5373,7 +5400,8 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 1), full_text_record.record.changed_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), full_text_record.record.deleted_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), full_text_record.record.overwritten_doc_keys.len);
-    try std.testing.expectEqual(@as(usize, 0), full_text_record.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), full_text_record.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(graph_asset_artifact_key, full_text_record.record.changed_artifact_keys[0]);
 
     const graph_entries = try store.iterateReplayEntriesFromHint(alloc, 7, .graph);
     defer {

@@ -509,15 +509,14 @@ pub const Store = struct {
         total.missing_source_docs +|= pass.missing_source_docs;
         total.failed +|= pass.failed;
         total.unsupported +|= pass.unsupported;
-        if (std.mem.eql(u8, previous.target, "index") and previous.index != null) {
-            // Polling one rebuild observes the same debt until publication.
-            // These are current-state gauges, not repeated units of work.
-            total.unresolved = pass.unresolved;
-            total.in_progress = pass.in_progress;
-        } else {
-            total.unresolved +|= pass.unresolved;
-            total.in_progress +|= pass.in_progress;
-        }
+        // Pending work is a snapshot of this bounded pass for every target.
+        // Artifact jobs also poll durable provider submissions; accumulating
+        // these gauges counts the same queued source on every observation and
+        // leaves stale pending work even after successful publication.
+        // Earlier-page failures remain represented by cumulative work counts,
+        // debt_remaining and the authoritative remaining_failures summary.
+        total.unresolved = pass.unresolved;
+        total.in_progress = pass.in_progress;
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         // These are job-level state gauges for the one named index, not work
         // counters. A bounded retry may observe the same index repeatedly;
@@ -791,6 +790,8 @@ pub const Store = struct {
         total.scanned +|= pass.scanned;
         total.groups_scanned +|= pass.groups_scanned;
         total.controls_applied +|= pass.controls_applied;
+        total.unresolved = pass.unresolved;
+        total.in_progress = pass.in_progress;
         total.limit = pass.limit;
         total.has_more = pass.has_more;
         total.debt_remaining = pass.has_more;
@@ -1772,6 +1773,8 @@ test "named index repair cancellation remains nonterminal until durable controls
         .scanned = 64,
         .groups_scanned = 64,
         .controls_applied = 64,
+        .in_progress = 1,
+        .unresolved = 1,
         .has_more = true,
         .next_cursor = try alloc.dupe(u8, "group:65"),
     };
@@ -1782,6 +1785,8 @@ test "named index repair cancellation remains nonterminal until durable controls
     defer parsed_continuing.deinit();
     try std.testing.expectEqualStrings("queued", parsed_continuing.value.phase);
     try std.testing.expectEqualStrings("group:65", parsed_continuing.value.cursor.?);
+    try std.testing.expectEqual(@as(u64, 1), parsed_continuing.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 1), parsed_continuing.value.result.unresolved);
     const continuing_pending = (try store.nextPendingMaintenanceAlloc(alloc)).?;
     defer alloc.free(continuing_pending);
 
@@ -1799,6 +1804,8 @@ test "named index repair cancellation remains nonterminal until durable controls
     defer parsed_cancelled.deinit();
     try std.testing.expectEqualStrings("cancelled", parsed_cancelled.value.phase);
     try std.testing.expect(!requiresDurableCancel(parsed_cancelled.value));
+    try std.testing.expectEqual(@as(u64, 0), parsed_cancelled.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), parsed_cancelled.value.result.unresolved);
 }
 
 test "named index repair cancellation restarts its durable traversal after job store recovery" {
@@ -2189,4 +2196,75 @@ test "repair job waits for pending work despite failed documents" {
     try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
     try std.testing.expectEqual(@as(u64, 0), finished.value.result.in_progress);
     try std.testing.expectEqual(@as(u64, 1), finished.value.result.failed);
+}
+
+test "async repair job pending gauges remain bounded across polls and settle on publication" {
+    const a = std.testing.allocator;
+    for ([_]StartRequest{
+        .{ .target = "artifact", .kind = .asset },
+        .{ .target = "artifact", .kind = .asset, .index = "document_text" },
+        .{ .target = "index", .index = "document_text" },
+    }) |req| {
+        var store = Store.init(a, .{});
+        defer store.deinit();
+        var current = try runOnePassForTest(a, &store, req, .{
+            .scanned = 1,
+            .reprocessed = 1,
+            .in_progress = 1,
+            .unresolved = 1,
+            .has_more = true,
+            .debt_remaining = true,
+        });
+        defer current.deinit();
+        // Polls use serialized state just like separate HTTP requests or a
+        // recovered owner. They must not count another provider submission.
+        for (0..4) |i| {
+            const begin = try store.beginAdvance(a, current.value);
+            defer a.free(begin.encoded);
+            var running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+            defer running.deinit();
+            const complete = i == 3;
+            const encoded = try store.recordPass(a, running.value, if (complete)
+                .{ .scanned = 1, .repaired = 1 }
+            else
+                .{ .scanned = 1, .in_progress = 1, .unresolved = 1, .debt_remaining = true });
+            defer a.free(encoded);
+            const next = try std.json.parseFromSlice(JobState, a, encoded, .{ .allocate = .alloc_always });
+            current.deinit();
+            current = next;
+            try std.testing.expectEqual(@as(u64, 1), current.value.result.reprocessed);
+            try std.testing.expectEqual(@as(u64, if (complete) 0 else 1), current.value.result.in_progress);
+            try std.testing.expectEqual(@as(u64, if (complete) 0 else 1), current.value.result.unresolved);
+            try std.testing.expectEqualStrings(if (complete) "succeeded" else "queued", current.value.phase);
+        }
+        try std.testing.expectEqual(@as(u64, 1), current.value.result.repaired);
+    }
+}
+
+test "artifact repair final pass keeps earlier failures while clearing pending gauges" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var first = try runOnePassForTest(a, &store, .{ .target = "artifact", .kind = .asset }, .{
+        .scanned = 1,
+        .failed = 1,
+        .unresolved = 1,
+        .has_more = true,
+        .debt_remaining = true,
+    });
+    defer first.deinit();
+    const begin = try store.beginAdvance(a, first.value);
+    defer a.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+    defer running.deinit();
+    const encoded = try store.recordPass(a, running.value, .{ .scanned = 1, .repaired = 1 });
+    defer a.free(encoded);
+    var final = try std.json.parseFromSlice(JobState, a, encoded, .{});
+    defer final.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", final.value.phase);
+    try std.testing.expectEqual(@as(u64, 1), final.value.result.failed);
+    try std.testing.expectEqual(@as(u64, 1), final.value.result.repaired);
+    try std.testing.expectEqual(@as(u64, 0), final.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), final.value.result.unresolved);
+    try std.testing.expect(final.value.result.debt_remaining);
 }

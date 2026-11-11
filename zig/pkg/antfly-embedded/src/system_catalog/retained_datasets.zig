@@ -245,3 +245,14 @@ test "retained dataset compiled projections bind source schema without changing 
     compiled.definition.summary.?.projection.?.source_schema = @splat(19);
     try std.testing.expectError(error.InvalidRetainedDatasetResource, compiled.validate());
 }
+
+test "retained dataset output columns share a namespace and activation can be cancelled" {
+    var value = fixture();
+    value.definition.summary.?.dimensions = &.{"n"};
+    try std.testing.expectError(error.InvalidDatasetDefinition, value.definition.validate());
+    value = fixture();
+    var cancelled = value;
+    cancelled.revision += 1;
+    cancelled.phase = .retiring;
+    try value.validateNext(std.testing.allocator, cancelled);
+}

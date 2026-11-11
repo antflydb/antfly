@@ -369,6 +369,11 @@ pub const Codec = struct {
 
     /// Estimated distance (Antfly's metric conventions: l2 squared,
     /// negative inner product, 1 - cosine) and its error bound.
+    /// Norm of the vector residual relative to its quantization centroid.
+    pub fn rowResidualNorm(self: Codec, row: []const u8) f32 {
+        return readF32(row[self.codeBytes()..]);
+    }
+
     pub fn estimate(self: Codec, q: *const Query, row: []const u8) Estimate {
         const pos = self.codeBytes();
         const x_dot_c: f32 = if (self.metric != .l2_squared) readF32(row[pos + 12 ..]) else 0;

@@ -58661,7 +58661,7 @@ pub const TableRepairIssueList = struct {
     }
 };
 
-/// Durable table repair job state.
+/// Durable table repair job state. In result, work counters accumulate across passes, while unresolved and in_progress describe only the latest bounded pass. Earlier failures remain represented by cumulative failure counters, debt_remaining, and the current remaining_failures summary.
 pub const TableRepairJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: u64,
@@ -58960,7 +58960,7 @@ pub const TableRepairRunResult = struct {
     unsupported: u64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: u64,
-    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    /// Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
     in_progress: u64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: u64,

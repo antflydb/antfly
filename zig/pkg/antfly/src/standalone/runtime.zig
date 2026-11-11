@@ -764,6 +764,12 @@ const LocalStandaloneMetadata = struct {
     data_server: ?*antfly.data.runtime.DataServer = null,
     retained_archive: @import("../serverless/datasets/configured_archive.zig").ExpiryMaintenance = .{},
     initial_fk_round_mutex: std.atomic.Mutex = .unlocked,
+    /// An empty coherent cut can be reused until durable metadata changes.
+    /// Never suppress progress or retirement for a resident private owner.
+    empty_provisioning_cut: ?struct {
+        store: *antfly.metadata.RaftApplyStore,
+        revision: u64,
+    } = null,
     relation_reconciliation: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{},
     /// Only private owners actually primed in this process need resident
     /// retirement. Durable terminal metadata remains the authority.
@@ -1213,6 +1219,7 @@ const LocalStandaloneMetadata = struct {
         self.hot_standby_gate = gate;
         self.hot_standby_mirror = mirror;
         self.hot_standby_binding_generation +%= 1;
+        self.empty_provisioning_cut = null;
         self.coordinated_lifecycle_allowed = true;
     }
     fn applyHotStandbyMetadata(ptr: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) !void {
@@ -1227,7 +1234,7 @@ const LocalStandaloneMetadata = struct {
             if (err == error.CatalogPublicationProofPending) return err;
             // Sync can fail after the native transaction commits. No error
             // path may retain an apparently current but stale projection.
-            self.durable_revision = 0;
+            self.invalidateDurableProjection();
             return err;
         };
         // Local initialization/migration and the source's replicated catalog
@@ -1248,7 +1255,7 @@ const LocalStandaloneMetadata = struct {
         }
         // A failed allocation/parse must leave normal snapshot and mutation
         // readers unable to mistake the previous projection for this effect.
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         if (try store.loadStandaloneCatalog(self.alloc)) |raw| {
             defer self.alloc.free(raw);
             try self.loadCatalogBytes(raw);
@@ -4454,11 +4461,11 @@ const LocalStandaloneMetadata = struct {
             try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
             return;
         };
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
         // Scoped publication changes execution bindings, never source DDL.
         // Only lifecycle/bootstrap passes need to refresh the table manager.
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         for (work.refresh_sources) |source_id| {
             const actual = (try store.getTable(a, group, source_id)) orelse continue;
             try self.manager.upsertTable(actual);
@@ -4504,8 +4511,20 @@ const LocalStandaloneMetadata = struct {
         var projection = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
+            const before = try store.standaloneRevision();
+            if (self.initial_fk_primed.count() == 0) {
+                if (self.empty_provisioning_cut) |empty| {
+                    if (empty.store == store and empty.revision == before) return;
+                }
+            }
+            self.empty_provisioning_cut = null;
             var cut = try store.captureProvisioningCatalog(self.alloc, group_ids.main_metadata_group_id);
             errdefer cut.deinit(self.alloc);
+            // The revision brackets capture: a concurrent publication must
+            // force another capture even when this particular cut was empty.
+            if (cut.initial_fk_owners.len == 0 and cut.jobs_json.len == 0 and
+                self.initial_fk_primed.count() == 0 and before == try store.standaloneRevision())
+                self.empty_provisioning_cut = .{ .store = store, .revision = before };
             // Verify the private/public separation against this same local
             // catalog cut with indexed lookups. Never clone and scan every
             // public table on the 100 ms provisioning round.
@@ -5126,11 +5145,18 @@ const LocalStandaloneMetadata = struct {
         self.epoch = @max(parsed.value.epoch, 1);
     }
 
+    fn invalidateDurableProjection(self: *LocalStandaloneMetadata) void {
+        self.durable_revision = 0;
+        // HA imports can replace contents without changing the numeric cut.
+        // Private provisioning must follow the same invalidation as routing.
+        self.empty_provisioning_cut = null;
+    }
+
     fn reloadLifecycleProjectionLocked(self: *LocalStandaloneMetadata) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         // A single read transaction prevents tagging mixed physical/logical
         // generations with a later revision during concurrent restore cutover.
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         const bytes = (try store.loadStandaloneCatalogSnapshot(self.alloc)) orelse return error.InvalidStandaloneCatalog;
         defer self.alloc.free(bytes);
         try self.loadCatalogBytes(bytes);
@@ -5391,7 +5417,7 @@ const LocalStandaloneMetadata = struct {
             }
             if (err == error.MetadataMutationOutcomeUnknown) {
                 mutation.committed = true;
-                self.durable_revision = 0;
+                self.invalidateDurableProjection();
                 // The native commit may be visible while its durable sync is
                 // unresolved. Apply the same fail-closed fence as the legacy
                 // journal; a visible revision alone is not a durability proof.
@@ -5410,7 +5436,7 @@ const LocalStandaloneMetadata = struct {
             if (!self.manager.tables.contains(id.*)) continue;
             const actual = (try self.lifecycle_store.?.getTable(a, group_ids.main_metadata_group_id, id.*)) orelse return error.TableLifecycleConflict;
             self.manager.upsertTable(actual) catch {
-                self.durable_revision = 0;
+                self.invalidateDurableProjection();
                 return error.MetadataMutationOutcomeUnknown;
             };
         }
@@ -13802,6 +13828,16 @@ test "standalone canceled initial self FK retires exact private owners after res
         metadata.deinit();
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
+    try metadata.provisionRestoreOwners();
+    try std.testing.expect(metadata.empty_provisioning_cut != null);
+    {
+        // Unchanged empty rounds must avoid catalog materialization entirely.
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        metadata.alloc = failing.allocator();
+        defer metadata.alloc = alloc;
+        try metadata.provisionRestoreOwners();
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -13844,6 +13880,8 @@ test "standalone canceled initial self FK retires exact private owners after res
     const began = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_begin = plan });
     alloc.free(began);
     try metadata.provisionRestoreOwners();
+    // A new private publication invalidates the empty cut and primes owners.
+    try std.testing.expect(metadata.empty_provisioning_cut == null);
     try std.testing.expectEqual(@as(usize, 2), server.kernel_owner_source.?.ownerCountForTest());
 
     const first_work_json = try metadata.lifecycle_store.?.fkInitialCreateWorkJson(alloc, group_id, 0);
@@ -14183,7 +14221,11 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
     var source = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", source_root, source_path, runtime.ptr(), null, .local);
     defer source.deinit();
     source.vector_source_storage_allowed = false;
+    // A known-empty private catalog may already have a cached cut when HA
+    // changes its authority binding, without changing its durable revision.
+    source.empty_provisioning_cut = .{ .store = source.lifecycle_store.?, .revision = source.durable_revision };
     try LocalStandaloneMetadata.bindHotStandbyMetadata(&source, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
+    try std.testing.expect(source.empty_provisioning_cut == null);
     try LocalStandaloneMetadata.createTable(&source, alloc, "replicated", .{});
     const first_revision = source.durable_revision;
     const first_lsn = primary.lastLsn();
@@ -14214,24 +14256,29 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
         try target.reloadLifecycleProjectionLocked();
         try std.testing.expectEqual(first_revision, target.durable_revision);
         try std.testing.expect(target.findTableByNameLocked("replicated") == null);
+        target.empty_provisioning_cut = .{ .store = target.lifecycle_store.?, .revision = target.durable_revision };
         if (fail_first_refresh) {
             var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
             target.alloc = failing.allocator();
             defer target.alloc = alloc;
             try std.testing.expectError(error.OutOfMemory, LocalStandaloneMetadata.applyHotStandbyMetadata(&target, first.record));
             try std.testing.expectEqual(@as(u64, 0), target.durable_revision);
+            try std.testing.expect(target.empty_provisioning_cut == null);
             try std.testing.expect(target.hot_standby_projected_effect_digest == null);
             try std.testing.expectEqual(first_revision, try target.lifecycle_store.?.standaloneRevision());
         }
         try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, first.record);
         try std.testing.expect(target.findTableByNameLocked("replicated") != null);
         try std.testing.expectEqual(first_revision, target.durable_revision);
+        try std.testing.expect(target.empty_provisioning_cut == null);
+        target.empty_provisioning_cut = .{ .store = target.lifecycle_store.?, .revision = target.durable_revision };
         {
             var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
             target.alloc = failing.allocator();
             defer target.alloc = alloc;
             // An exact duplicate does not allocate a second whole projection.
             try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, first.record);
+            try std.testing.expect(target.empty_provisioning_cut != null);
         }
         var lsn = first_lsn + 1;
         while (lsn <= final_lsn) : (lsn += 1) {
@@ -14243,9 +14290,11 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
                 defer target.alloc = alloc;
                 try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, entry.record);
                 try std.testing.expectEqual(first_revision, target.durable_revision);
+                try std.testing.expect(target.empty_provisioning_cut != null);
             } else {
                 try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, entry.record);
                 try std.testing.expectEqual(first_revision + 1, target.durable_revision);
+                try std.testing.expect(target.empty_provisioning_cut == null);
             }
         }
         var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&target);

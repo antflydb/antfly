@@ -5575,6 +5575,7 @@ pub const DataServer = struct {
     retained_owner_next_ns: u64 = 0,
     retained_resource_cursor: u64 = 0,
     retained_owner_cursor: @import("../metadata/retained_dataset_owners.zig").Cursor = .{},
+    retained_owner_sweep: @import("../metadata/retained_dataset_owners.zig").WorkSweep = .{},
     retained_plan_turn: bool = false,
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
@@ -6762,7 +6763,7 @@ pub const DataServer = struct {
         if (!resource_due and !owner_due) return;
         self.retained_plan_turn = resource_due and (!owner_due or !self.retained_plan_turn);
         if (self.retained_plan_turn) {
-            self.retained_resource_next_ns = now +| std.time.ns_per_s;
+            self.retained_resource_next_ns = now +| 10 * std.time.ns_per_ms;
             const Pending = struct { resource: @import("antfly_local_sources").system_catalog_domain.Resource, coordinator_group: u64 };
             const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_pending = self.retained_resource_cursor });
             const pending = (try std.json.parseFromSliceLeaky(?Pending, a, bytes, .{})) orelse {
@@ -6792,30 +6793,39 @@ pub const DataServer = struct {
         // Cheap keys avoid transferring schemas or opening owners for groups
         // led elsewhere. The subsequent same-cut snapshot uses latest owner
         // revision; the native actor independently validates it again.
-        self.retained_owner_next_ns = now +| std.time.ns_per_s;
-        var first: ?model.Cursor = null;
-        for (0..8) |_| {
+        // Drain a bounded fair sweep without a per-command one-second sleep.
+        // Preserve the cursor between jobs, including on transient failures.
+        self.retained_owner_next_ns = now +| 10 * std.time.ns_per_ms;
+        const turn_deadline = now +| 100 * std.time.ns_per_ms;
+        for (0..64) |_| {
+            if (self.backgroundMonotonicNs() >= turn_deadline) break;
+            var owner_arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer owner_arena.deinit();
+            const owner_alloc = owner_arena.allocator();
             try context.ensureActive();
-            const raw = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .work_key = self.retained_owner_cursor } });
-            const key = (try std.json.parseFromSliceLeaky(?model.WorkKey, a, raw, .{})) orelse {
+            const raw = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_read = .{ .work_key = self.retained_owner_cursor } });
+            const key = (try std.json.parseFromSliceLeaky(?model.WorkKey, owner_alloc, raw, .{})) orelse {
+                self.retained_owner_sweep = .{};
                 self.retained_owner_next_ns = now +| 10 * std.time.ns_per_s;
                 return;
             };
-            if (first) |seen| {
-                if (std.meta.eql(seen, key.cursor)) return;
-            } else first = key.cursor;
+            if (!self.retained_owner_sweep.admit(key.cursor)) {
+                self.retained_owner_next_ns = self.backgroundMonotonicNs() +| self.retained_owner_sweep.finish();
+                return;
+            }
             self.retained_owner_cursor = key.cursor;
             if (!self.retainedMaintenanceLeader(key.cursor.owner_group)) continue;
-            const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .selection = key } });
-            const snapshot = try std.json.parseFromSliceLeaky(control.Snapshot, a, bytes, .{});
+            const bytes = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_read = .{ .selection = key } });
+            const snapshot = try std.json.parseFromSliceLeaky(control.Snapshot, owner_alloc, bytes, .{});
             if (snapshot.plan.phase == .closing and snapshot.owner.mode == .closed and snapshot.owner.independent_receipt == null) {
                 if (self.api_server_cfg.node_config) |config| {
                     if (config.storage.artifacts.connection != null) {
-                        if ((try self.exportRetainedOwnerPage(a, snapshot, context)) != null) {
+                        self.retained_owner_sweep.busy = true;
+                        if ((try self.exportRetainedOwnerPage(owner_alloc, snapshot, context)) != null) {
                             if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
-                            _ = try self.status_source.systemCatalog(a, context, .{ .retained_owner_archive = .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision } });
+                            _ = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_archive = .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision } });
                         }
-                        return;
+                        continue;
                     }
                 }
                 continue;
@@ -6827,18 +6837,38 @@ pub const DataServer = struct {
                 .closed, .retired => continue,
             };
             const table = snapshot.source_table orelse continue;
-            const proof = executeRetainedOwnerControl(self, a, table.name, snapshot.owner.group, .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision, .action = action }, context) catch |err| switch (err) {
-                error.RetainedSeriesNotReady => return,
-                else => return err,
+            const result = self.drainRetainedOwner(owner_alloc, table.name, snapshot.owner.mode, &self.retained_owner_sweep.busy, snapshot.owner.group, .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision, .action = action }, context) catch |err| switch (err) {
+                error.Canceled, error.Timeout => return err,
+                error.RetainedSeriesNotReady => {
+                    self.retained_owner_sweep.busy = true;
+                    continue;
+                },
+                else => {
+                    std.log.warn("retained owner maintenance deferred group={d} err={s}", .{ snapshot.owner.group, @errorName(err) });
+                    continue;
+                },
             };
             // Maintenance ticks do not rewrite the metadata owner journal.
             // Only a logical state transition needs a verified acknowledgement.
-            if (proof.mode != snapshot.owner.mode)
-                _ = try self.status_source.systemCatalog(a, context, .{ .retained_owner_acknowledge = proof });
-            if (snapshot.plan.phase == .activating and proof.mode == .installed)
-                self.retained_owner_next_ns = now +| 100 * std.time.ns_per_ms;
-            return;
+            if (result.mode != snapshot.owner.mode) {
+                self.retained_owner_sweep.busy = true;
+                _ = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_acknowledge = result });
+            }
         }
+    }
+
+    fn drainRetainedOwner(self: *DataServer, alloc: std.mem.Allocator, table: []const u8, expected_mode: @import("../metadata/retained_dataset_owners.zig").Mode, busy: *bool, group: u64, request: antfly.public_api.retained_owner_control.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
+        const deadline = self.backgroundMonotonicNs() +| 25 * std.time.ns_per_ms;
+        var result: antfly.public_api.retained_owner_control.Response = undefined;
+        for (0..32) |_| {
+            var did_work = false;
+            result = try executeRetainedOwnerControlOnce(self, alloc, table, group, request, context, &did_work);
+            if (request.action != .reconcile or result.mode != expected_mode or !did_work) return result;
+            if (self.backgroundMonotonicNs() >= deadline) break;
+        }
+        // Revisit unfinished pages promptly; an idle complete sweep can sleep.
+        busy.* = true;
+        return result;
     }
 
     fn exportRetainedOwnerPage(self: *DataServer, a: std.mem.Allocator, snapshot: antfly.public_api.retained_owner_control.Snapshot, context: antfly.public_api.operation.RequestContext) !?@import("../metadata/retained_dataset_owners.zig").Id {
@@ -12274,6 +12304,10 @@ pub const DataServer = struct {
     }
 
     fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
+        return executeRetainedOwnerControlOnce(ptr, alloc, table_name, group_id, request, input, null);
+    }
+
+    fn executeRetainedOwnerControlOnce(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext, did_work: ?*bool) !antfly.public_api.retained_owner_control.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const series = @import("antfly_local_sources").storage_retained_series;
         const controls = @import("antfly_local_sources").storage_retained_series_control;
@@ -12377,6 +12411,7 @@ pub const DataServer = struct {
         }
         if (command) |native| {
             try context.ensureActive();
+            if (did_work) |value| value.* = true;
             const batch: antfly.db.types.BatchRequest = .{ .retained_series = native, .timestamp_ns = platform_time.realtimeNs() };
             if (term) |leader_term| try self.proposeRaftBatchGroup(a, group_id, table_name, batch, .{
                 .discovery = .cached,

@@ -114,6 +114,7 @@ pub const Definition = struct {
             for (s.measures, 0..) |m, i| {
                 if (m.name.len == 0 or (m.law != .count and (m.field == null or m.field.?.len == 0))) return error.InvalidDatasetDefinition;
                 for (s.measures[0..i]) |prior| if (std.mem.eql(u8, prior.name, m.name)) return error.InvalidDatasetDefinition;
+                for (s.dimensions) |name| if (std.mem.eql(u8, name, m.name)) return error.InvalidDatasetDefinition;
             }
         }
     }

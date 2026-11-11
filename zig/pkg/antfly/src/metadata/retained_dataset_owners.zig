@@ -46,6 +46,32 @@ pub const Registration = struct {
 /// Private reads use distinct tags so older peers reject unknown authority.
 pub const Cursor = struct { resource: u64 = 0, generation: u64 = 0, owner_group: u64 = 0 };
 pub const WorkKey = struct { cursor: Cursor, plan: Id };
+
+/// Ephemeral ordered sweep state survives bounded worker jobs. End a sweep on
+/// wrap even if its original boundary key was removed while it was running.
+pub const WorkSweep = struct {
+    previous: ?Cursor = null,
+    busy: bool = false,
+
+    pub fn admit(self: *WorkSweep, next: Cursor) bool {
+        if (self.previous) |previous| {
+            const ordered = if (next.resource != previous.resource) next.resource > previous.resource else if (next.generation != previous.generation) next.generation > previous.generation else next.owner_group > previous.owner_group;
+            if (!ordered) {
+                self.previous = null;
+                return false;
+            }
+        }
+        self.previous = next;
+        return true;
+    }
+
+    pub fn finish(self: *WorkSweep) u64 {
+        const delay: u64 = if (self.busy) 10 * std.time.ns_per_ms else std.time.ns_per_s;
+        self.* = .{};
+        return delay;
+    }
+};
+
 pub const Read = union(enum) {
     work: Cursor,
     work_key: Cursor,
@@ -407,4 +433,20 @@ test "retained owner reads reject ambiguous cursors and unbound exact requests" 
     try std.testing.expectError(error.InvalidRetainedOwnerPlan, (Read{ .work = .{ .resource = 1 } }).validate());
     try std.testing.expectError(error.InvalidRetainedOwnerPlan, (Read{ .plan = .{ .resource = 1, .generation = 0 } }).validate());
     try std.testing.expectError(error.InvalidRetainedOwnerPlan, (Read{ .owner = .{ .resource = 1, .generation = 1, .plan = @splat(0), .group = 1, .revision = 1 } }).validate());
+}
+
+test "retained owner maintenance sweeps survive job budgets and removed boundary keys without idle spinning" {
+    var sweep: WorkSweep = .{};
+    for (1..130) |i| try std.testing.expect(sweep.admit(.{ .resource = 1, .generation = 1, .owner_group = i }));
+    // After multiple 64-key jobs, removing the first key must still end the
+    // cycle at wrap. The wrapped key is processed at the next sweep.
+    try std.testing.expect(!sweep.admit(.{ .resource = 1, .generation = 1, .owner_group = 2 }));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), sweep.finish());
+    try std.testing.expect(sweep.admit(.{ .resource = 1, .generation = 1, .owner_group = 2 }));
+    sweep.busy = true;
+    try std.testing.expect(!sweep.admit(.{ .resource = 1, .generation = 1, .owner_group = 2 }));
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), sweep.finish());
+    try std.testing.expect(sweep.admit(.{ .resource = 1, .generation = 1, .owner_group = 2 }));
+    try std.testing.expect(sweep.admit(.{ .resource = 1, .generation = 2, .owner_group = 1 }));
+    try std.testing.expect(sweep.admit(.{ .resource = 2, .generation = 1, .owner_group = 1 }));
 }

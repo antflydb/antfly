@@ -84,8 +84,9 @@ def sync_detailed(
 ) -> Response[Any | RetainedDatasetInfo]:
     """Close and archive a retained summary
 
-     Begins asynchronous closure. The source dependency is released after all source owners finish
-    verified archive handoff.
+     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
+    be true to cancel activation and discard partial summary state. The source dependency is released
+    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
 
     Args:
         database_name (str):
@@ -125,8 +126,9 @@ def sync(
 ) -> Any | RetainedDatasetInfo | None:
     """Close and archive a retained summary
 
-     Begins asynchronous closure. The source dependency is released after all source owners finish
-    verified archive handoff.
+     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
+    be true to cancel activation and discard partial summary state. The source dependency is released
+    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
 
     Args:
         database_name (str):
@@ -161,8 +163,9 @@ async def asyncio_detailed(
 ) -> Response[Any | RetainedDatasetInfo]:
     """Close and archive a retained summary
 
-     Begins asynchronous closure. The source dependency is released after all source owners finish
-    verified archive handoff.
+     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
+    be true to cancel activation and discard partial summary state. The source dependency is released
+    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
 
     Args:
         database_name (str):
@@ -200,8 +203,9 @@ async def asyncio(
 ) -> Any | RetainedDatasetInfo | None:
     """Close and archive a retained summary
 
-     Begins asynchronous closure. The source dependency is released after all source owners finish
-    verified archive handoff.
+     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
+    be true to cancel activation and discard partial summary state. The source dependency is released
+    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
 
     Args:
         database_name (str):

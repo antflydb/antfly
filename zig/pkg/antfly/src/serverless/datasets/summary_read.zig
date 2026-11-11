@@ -67,7 +67,7 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
     if (now == 0) return error.DatasetLeaseExpired;
     // File retention follows its newest covered bucket. Older rows in that
     // same file still obey their own bucket lifetime, exactly as native scans.
-    var read_clock = @max(@as(i128, now), limits.read_clock_ns);
+    var read_clock = try store.admitRetentionClock(spec, @max(@as(i128, now), limits.read_clock_ns));
     if (try spec.expired(try range.start(), read_clock)) return error.RetainedSeriesHistoryExpired;
     var scan_range = range;
     var tail_buffer: [40]u8 = undefined;
@@ -105,13 +105,16 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         defer store.context.alloc.free(bytes);
         if (try codec.formatEncoding(bytes) != segment.state_encoding) return error.InvalidDatasetSegment;
         const decoded = try codec.decode(temp, spec, bytes);
-        read_clock = @max(read_clock, decoded.receipt.admitted_ns);
         if (decoded.receipt.source_sequence != segment.source.sequence or !std.meta.eql(decoded.receipt.span, try segment.span())) return error.InvalidDatasetCoverage;
         if (closed) |manifest| {
             if (!decoded.receipt.source_closed or decoded.receipt.source_sequence != manifest.cut.sequence or
                 decoded.receipt.complete_from_ns != manifest.cut.complete_from_ns or decoded.receipt.admitted_ns != manifest.cut.admitted_ns or
                 !std.mem.eql(u8, &segment.id, &closure.segmentId(manifest.cut.closure, decoded.receipt.span))) return error.InvalidDatasetCoverage;
         }
+        // Only a receipt verified against catalog authority may advance the
+        // durable watermark; rejected objects must not expire other history.
+        if (decoded.receipt.admitted_ns > read_clock)
+            read_clock = try store.admitRetentionClock(spec, decoded.receipt.admitted_ns);
         for (decoded.rows) |row| {
             const key = codec.key(row);
             if (std.mem.order(u8, &key, &requested.start) == .lt or std.mem.order(u8, &key, &requested.end) != .lt) continue;

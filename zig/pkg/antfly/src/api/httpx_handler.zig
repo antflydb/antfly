@@ -3015,10 +3015,11 @@ pub const AntflyApiHandler = struct {
         if (action == .get) return retainedDatasetInfo(ctx, 200, name, descriptor.value);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset revision required");
         if (body.len > 4096) return textResponse(ctx, 413, "close request too large");
-        const request = std.json.parseFromSliceLeaky(struct { expected_revision: u64 }, a, body, .{}) catch return textResponse(ctx, 400, "invalid dataset revision");
-        if (descriptor.value.revision != request.expected_revision or descriptor.value.phase != .active) return textResponse(ctx, 409, "dataset phase or revision changed");
+        const request = std.json.parseFromSliceLeaky(struct { expected_revision: u64, cancel_activation: bool = false }, a, body, .{}) catch return textResponse(ctx, 400, "invalid dataset revision");
+        if (descriptor.value.revision != request.expected_revision or descriptor.value.phase != (if (request.cancel_activation) @as(retained.Phase, .activating) else .active)) return textResponse(ctx, 409, "dataset phase or revision changed");
         var next = descriptor.value;
-        next.phase = .closing;
+        // Cancelling activation must revoke installed capture before releasing the source.
+        next.phase = if (request.cancel_activation) .retiring else .closing;
         next.revision += 1;
         const json = try std.json.Stringify.valueAlloc(a, next, .{});
         const applied = source.systemCatalog(a, context, .{ .mutate = .{ .mutation = .{ .action = .set_definition, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json, .expected_dataset_revision = request.expected_revision } } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
@@ -10318,7 +10319,8 @@ pub const AntflyApiHandler = struct {
         if (http_server_mod.permissionsAllow(principal.permissions, .table, table, .admin)) return true;
         const reads = self.api_server.table_reads orelse return true;
         if (reads.vtable.privacy_policy_version == null) return true;
-        const version = try reads.privacyPolicyVersion(ctx.allocator, table, operationContext(ctx, identity).deadline_ns);
+        const native_context = try operationContext(ctx, identity).platformDeadline();
+        const version = try reads.privacyPolicyVersion(ctx.allocator, table, native_context.deadline_ns);
         return std.mem.allEqual(u8, &version, 0);
     }
 

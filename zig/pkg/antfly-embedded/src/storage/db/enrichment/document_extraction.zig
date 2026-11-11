@@ -2650,6 +2650,71 @@ pub fn isValidSha256Hex(value: []const u8) bool {
     return true;
 }
 
+/// Shared byte identity for precommit and supervised extraction. Compose the
+/// already computed download digest when available; policy changes invalidate
+/// both execution paths identically without a second pass over source bytes.
+pub fn contentFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    config: Config,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    data: []const u8,
+) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    var source_url_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_url, &source_url_digest, .{});
+    const identity = source_url_digest;
+    return contentFingerprintFromDigestAlloc(alloc, &identity, config_json, config, configured_content_type, configured_filename, downloaded_content_type, &digest);
+}
+
+/// Source identity is SHA-256 of the fetch URL; content digest is SHA-256 of
+/// the verified download. Hashing parameters identically avoids regenerating
+/// precomputed artifacts when their source first enters background replay.
+pub fn contentFingerprintFromDigestAlloc(
+    alloc: Allocator,
+    source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    config_json: []const u8,
+    config: Config,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ![]u8 {
+    const native_text = config.native_text;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashRenderPolicy(&hasher, config);
+    hasher.update("antfly.document-extraction.fingerprint.v4\x00");
+    hasher.update(source_identity);
+    for ([_][]const u8{ config_json, native_text_extraction_identity, @tagName(native_text.policy), configured_content_type, configured_filename, downloaded_content_type }) |field| {
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, @intCast(field.len), .little);
+        hasher.update(&size);
+        hasher.update(field);
+    }
+    for ([_]u64{
+        @intCast(native_text.quality.min_chars),
+        @intCast(native_text.quality.garbled_min_words),
+        @intCast(native_text.quality.garbled_sample_words),
+        @bitCast(native_text.quality.max_single_char_word_ratio),
+        @intCast(native_text.quality.min_line_chars),
+        @bitCast(native_text.quality.max_corrupted_line_ratio),
+        @bitCast(native_text.quality.max_font_corruption),
+        @bitCast(native_text.quality.max_replacement_ratio),
+    }) |value| {
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, value, .little);
+        hasher.update(&encoded);
+    }
+    hasher.update(content_digest);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
 /// Verified identity binds the digest and extraction inputs, including the URL
 /// extension predicates used for routing. Hosts and signed query parameters
 /// do not affect it. An unresolved response MIME requires download first.

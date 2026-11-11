@@ -517,7 +517,61 @@ pub const Catalog = struct {
 
     /// Register protection before returning an authoritative location. The root
     /// CAS races atomically with migration/retirement; no GET-then-pin gap.
+    // Only conditional conflicts are retryable: every attempt rechecks current
+    // placement, expiry and reader limits against a newly observed root.
+    fn retryConflict(self: Catalog, attempt: usize) !void {
+        if (self.context.cancellation) |token| try token.check();
+        if (attempt >= 63) return error.PreconditionFailed;
+        var random: [1]u8 = undefined;
+        self.context.io.random(&random);
+        const delay_ms = @min(@as(u64, 1) << @intCast(@min(attempt, 6)), 64) + random[0] % 17;
+        try std.Io.sleep(self.context.io, .fromMilliseconds(@intCast(delay_ms)), .awake);
+    }
+
     pub fn acquire(self: Catalog, id: t.Id) !Lease {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return self.acquireOnce(id) catch |err| switch (err) {
+                error.PreconditionFailed => {
+                    try self.retryConflict(attempt);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    /// Retention changes only at bucket boundaries. Persist that boundary once
+    /// per interval, before reporting expiration, rather than writing on every
+    /// read or waiting for a whole multi-bucket file to become collectible.
+    pub fn admitRetentionClock(self: Catalog, spec: series.Spec, proposed: i128) !i128 {
+        try spec.validate();
+        if (!std.mem.eql(u8, &spec.id, &self.dataset)) return error.InvalidDatasetBinding;
+        const threshold = try spec.bucket(try std.math.sub(i128, proposed, spec.retention_ns));
+        const key = try std.fmt.allocPrint(self.context.alloc, "retention_clock/{d}/{s}", .{ spec.generation, std.fmt.bytesToHex(spec.definition, .lower) });
+        defer self.context.alloc.free(key);
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            var session = try self.open(true);
+            defer session.deinit();
+            const previous = try self.get(session.value, i128, key);
+            defer if (previous) |value| value.deinit();
+            if (previous) |value| if (value.value >= threshold)
+                return @max(proposed, try std.math.add(i128, value.value, spec.retention_ns));
+            const bytes = try std.json.Stringify.valueAlloc(self.context.alloc, threshold, .{});
+            defer self.context.alloc.free(bytes);
+            self.commit(session.value, &.{.{ .kind = .put, .key = key, .value = bytes }}) catch |err| switch (err) {
+                error.PreconditionFailed => {
+                    try self.retryConflict(attempt);
+                    continue;
+                },
+                else => return err,
+            };
+            return proposed;
+        }
+    }
+
+    fn acquireOnce(self: Catalog, id: t.Id) !Lease {
         var session = try self.open(true);
         defer session.deinit();
         const current = try self.segment(session.value, id);
@@ -587,6 +641,19 @@ pub const Catalog = struct {
     }
 
     pub fn release(self: Catalog, lease: Lease) !void {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return self.releaseOnce(lease) catch |err| switch (err) {
+                error.PreconditionFailed => {
+                    try self.retryConflict(attempt);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    fn releaseOnce(self: Catalog, lease: Lease) !void {
         var session = try self.open(true);
         defer session.deinit();
         const key = try pinKey(self.context.alloc, lease.pin);

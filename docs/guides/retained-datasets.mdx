@@ -7,7 +7,15 @@ description: Publish immutable datasets, move finalized segments to cold storage
 
 Retained datasets give prepared record snapshots and aggregate-state segments an independent identity, schema, coverage, and lifetime. Local residence is separate from logical retention. The same immutable segment can move from local storage to an object-backed location without becoming an additional query input.
 
-This first lifecycle implementation is an administrative storage API and operator. It accepts already prepared segments. It does not yet capture a live table automatically, continuously maintain a summary, mount segments as SQL tables, or change source-table TTL. Those integrations require committed replay, source finalization, and authorization proofs; see [the lifecycle design](https://github.com/antflydb/antfly/blob/main/docs/design/retained-dataset-lifecycle.md).
+The administrative storage API accepts already prepared segments. Native retained summaries additionally capture source writes and existing rows, run automatic maintenance, serve through HTTP and `retained_summary(...)` SQL, and support bounded HTTP subscriptions. Single-writer standalone local and Lite use the same verified owner and archive handoff protocol. See [the lifecycle design](https://github.com/antflydb/antfly/blob/main/docs/design/retained-dataset-lifecycle.md).
+
+## Activation and cancellation
+
+Creating a summary starts asynchronous activation over retained source rows. Dimensions and measures share one output-column namespace; their names must be distinct and cannot use generated column names. Existing rows must have valid timestamps. The source remains protected while activation or closure is in progress.
+
+To cancel an activating summary, POST its current `expected_revision` and `cancel_activation: true` to `/databases/{database}/namespaces/{namespace}/datasets/{dataset}/close`. Cancellation enters `retiring`, discards partial summary state, and stops further registration. Owners must durably revoke capture and reclaim their state before the source dependency is released. This also recovers activation blocked by invalid historical rows. Closing an active summary instead preserves its summaries through verified archive handoff.
+
+Maintenance drains fair indexed batches with a 64-owner and 100 ms turn budget. Within a visit, an owner drains up to 32 native pages or 25 ms, stopping for verified acknowledgement on each lifecycle transition. A full sweep sleeps only when no owner exhausts its work budget. Each owner uses a separate working arena, and a failed native command does not prevent other owners from progressing. Archive readers retry catalog conflicts with bounded jittered backoff. Archived bucket expiration persists at bucket boundaries, so wall-clock rollback cannot revive an expired bucket within a file that still contains newer live buckets.
 
 ## Administrative operator
 

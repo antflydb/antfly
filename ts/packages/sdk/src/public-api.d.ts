@@ -2537,9 +2537,12 @@ export interface paths {
          *     reader, transcriber, extractor, and document-extraction producers are
          *     all supported, as are dense and sparse embedding producers. Embedding
          *     reprocessing regenerates vectors even when the source chunks are unchanged.
-         *     Embedding requests are committed durably and queued for supervised
-         *     inference. Acceptance does not wait for inference; inspect index coverage
-         *     and repair issues for the eventual outcome.
+         *     Embedding requests and document-extraction requests on servers with an
+         *     enrichment runtime are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference. For extraction, inspect
+         *     the artifact generation, merge status and per-page failures; for embeddings,
+         *     inspect index coverage and repair issues. Embedded databases without an
+         *     enrichment runtime execute document extraction inline.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -3050,7 +3053,7 @@ export interface paths {
         put?: never;
         /**
          * Close and archive a retained summary
-         * @description Begins asynchronous closure. The source dependency is released after all source owners finish verified archive handoff.
+         * @description Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must be true to cancel activation and discard partial summary state. The source dependency is released only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
          */
         post: operations["closeRetainedDataset"];
         delete?: never;
@@ -9536,7 +9539,7 @@ export interface components {
             unresolved: number;
             /**
              * Format: uint64
-             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             * @description Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
              */
             in_progress: number;
             /**
@@ -9656,7 +9659,12 @@ export interface components {
              */
             advance?: boolean;
         };
-        /** @description Durable table repair job state. */
+        /**
+         * @description Durable table repair job state. In result, work counters accumulate across
+         *     passes, while unresolved and in_progress describe only the latest bounded
+         *     pass. Earlier failures remain represented by cumulative failure counters,
+         *     debt_remaining, and the current remaining_failures summary.
+         */
         TableRepairJob: {
             /**
              * Format: uint64
@@ -38833,11 +38841,16 @@ export interface operations {
                 "application/json": {
                     /** Format: uint64 */
                     expected_revision: number;
+                    /**
+                     * @description Explicitly cancel an activating summary and discard partial state. Rejected for an active summary; omit or set false to close and archive an active summary.
+                     * @default false
+                     */
+                    cancel_activation?: boolean;
                 };
             };
         };
         responses: {
-            /** @description Summary is closing. */
+            /** @description Summary is closing or activation is being cancelled. */
             202: {
                 headers: {
                     [name: string]: unknown;

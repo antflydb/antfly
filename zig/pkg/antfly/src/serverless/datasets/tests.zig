@@ -656,12 +656,19 @@ test "retained dataset archived summary serving checks exact state and filters c
     try std.testing.expectEqual(@as(i128, 60), result.rows[0].start_ns);
     try std.testing.expectEqual(metrics[0].count, (try result.rows[0].metrics[0].finalize(.count)).integer);
     try std.testing.expectError(error.DatasetPageBudgetExceeded, api.summary_read.read(a, store, def, spec, range, .{ .bytes = 1 }, resolver));
-    try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.read(a, store, def, spec, range, .{ .read_clock_ns = 1120 }, resolver));
     clock.now = 1100;
     try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.read(a, store, def, spec, .{ .start_ns = "0", .end_ns = "60" }, .{}, resolver));
     var live = try api.summary_read.read(a, store, def, spec, range, .{}, resolver);
     defer live.deinit();
     try std.testing.expectEqual(@as(i128, 60), live.rows[0].start_ns);
+    // A file containing a live later bucket cannot resurrect its expired
+    // earlier bucket after wall-clock rollback or reopening the catalog.
+    clock.now = 1050;
+    const reopened_clock = catalog(&memory, &clock);
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.read(a, reopened_clock, def, spec, .{ .start_ns = "0", .end_ns = "60" }, .{}, resolver));
+    var still_live = try api.summary_read.read(a, reopened_clock, def, spec, range, .{}, resolver);
+    defer still_live.deinit();
+    try std.testing.expectEqual(@as(usize, 1), still_live.rows.len);
     var changed = spec;
     changed.source_incarnation += 1;
     try std.testing.expectError(error.DatasetCoverageUnavailable, api.summary_read.read(a, store, def, changed, range, .{}, resolver));
@@ -783,4 +790,98 @@ test "retained dataset closed export publishes disjoint retry-safe pages within 
     var wrong_cut = cut;
     wrong_cut.sequence += 1;
     try std.testing.expectError(error.InvalidDatasetCoverage, reopened.getClosedExport(spec, wrong_cut));
+}
+
+test "retained dataset pin acquisition rebases after a concurrent reader and release retries CAS" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    try store.create(definition(.records));
+    try store.publish(segment(), location(&memory, false), "states");
+    const Competitor = struct {
+        store: api.Catalog,
+        lease: ?api.catalog.Lease = null,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lease = self.store.acquire(segment().id) catch unreachable;
+        }
+        fn root(_: *anyopaque, _: []const u8, key: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/ROOT");
+        }
+        fn rootPut(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/ROOT");
+        }
+    };
+    var competitor: Competitor = .{ .store = store };
+    var fault = objects.scripted_fault.Client.init(a, memory.client());
+    defer fault.deinit();
+    fault.get_filter = .{ .ptr = &competitor, .matches = Competitor.root };
+    fault.next_get = .{ .complete_then_callback = .{ .ptr = &competitor, .run = Competitor.run } };
+    var reader = store;
+    reader.context.client = fault.client();
+    const lease = try reader.acquire(segment().id);
+    try std.testing.expect(competitor.lease != null);
+    const other_bytes = try store.read(competitor.lease.?, location(&memory, false));
+    a.free(other_bytes);
+    fault.put_filter = .{ .ptr = &competitor, .matches = Competitor.rootPut };
+    fault.next_put = .{ .fail_before = error.PreconditionFailed };
+    try reader.release(lease);
+    try store.release(competitor.lease.?);
+    clock.now = definition(.records).retention_ns + 1000;
+    try store.retire(segment().id, 1);
+}
+
+test "retained dataset retention watermark advances once per bucket and survives rollback" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    var def = definition(.summary);
+    def.retention_ns = 1000;
+    try store.create(def);
+    const series = @import("antfly_local_sources").storage_retained_series;
+    const spec: series.Spec = .{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = 1000, .laws = &.{.count} };
+    _ = try store.admitRetentionClock(spec, 1100);
+    const before = try store.admitRetentionClock(spec, 1101);
+    try std.testing.expectEqual(@as(i128, 1101), before);
+    try std.testing.expectEqual(@as(i128, 1060), try store.admitRetentionClock(spec, 1050));
+    try std.testing.expect(try spec.expired(0, try catalog(&memory, &clock).admitRetentionClock(spec, 1050)));
+    _ = try store.admitRetentionClock(spec, 1120);
+    try std.testing.expect(try spec.expired(60, try store.admitRetentionClock(spec, 1050)));
+}
+
+test "retained dataset rejected archive receipts cannot advance durable retention" {
+    const shared = @import("antfly_local_sources");
+    const series = shared.storage_retained_series;
+    const codec = shared.storage_retained_series_archive;
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    var def = definition(.summary);
+    def.retention_ns = 1000;
+    try store.create(def);
+    const spec: series.Spec = .{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = 1000, .laws = &.{.count} };
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    const rows = [_]series.Bucket{.{ .start_ns = 0, .dimensions = "[]", .rows = 1, .metrics = &metrics }};
+    var value = segment();
+    value.state_encoding = codec.encoding;
+    const bytes = try codec.encode(a, spec, .{ .source_sequence = value.source.sequence + 1, .admitted_ns = 2000, .complete_from_ns = 0, .span = try value.span() }, &rows);
+    defer a.free(bytes);
+    value.byte_len = bytes.len;
+    value.checksum = digest(bytes);
+    const hot = location(&memory, false);
+    try store.publish(value, hot, bytes);
+    const Resolve = struct {
+        hot: api.Location,
+        pub fn location(self: @This(), _: t.Id) !api.Location {
+            return self.hot;
+        }
+    };
+    try std.testing.expectError(error.InvalidDatasetCoverage, api.summary_read.read(a, store, def, spec, value.coverage, .{}, Resolve{ .hot = hot }));
+    try std.testing.expect(!try spec.expired(0, try store.admitRetentionClock(spec, 1000)));
 }
