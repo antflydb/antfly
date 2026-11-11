@@ -789,7 +789,9 @@ destination table is immutable; use a new UUID to move destinations. Restored
 connections can resume without losing their ledger.
 
 Failed job receipts include a safe `failure` object with `source_id`, `phase`,
-`code`, and `retryable`. The same fields are logged without raw provider messages,
+`code`, and `retryable`. A failure with `restart_required: true` needs a
+fresh inventory. Use `--restart` on the CLI or pass `"restart": true` to
+`POST /v1/sync`. The same fields are logged without raw provider messages,
 URLs or credentials. Inspect this receipt before retrying; failed and interrupted
 jobs retain their durable acquisition checkpoint.
 
@@ -1002,3 +1004,23 @@ identity. The receipt is written after successful inventory and catalog
 publication; interrupted publication or older state without a receipt requires a
 normal sync before discovery can be refreshed. Refresh never extends the access
 lease or relabels an old row-key generation.
+
+For self-hosted GCS, a trusted profile may set `google_adc: true` on a
+`gcs` connection to use Application Default Credentials with read-only
+storage scope. Leave `credentials_env` and the credentials secret reference
+unset for that connection.
+
+For projected PDF pages, set `publication: "text"` on the GCS source and
+`page_provenance: true` in its config.
+Each object must have `original_pdf_uri`, `original_page`,
+`extraction_revision`, and `content_sha256` custom metadata. The source verifies
+the text digest, retains the projection location in metadata, and cites the
+original PDF URI with its page fragment. Use a generation-pinned original URI
+such as `gs://original-bucket/report.pdf?generation=42`. The cited generation
+must remain available in the original bucket. GCS prefix scans skip zero-byte
+directory markers in native and projected-page modes. Non-marker empty objects
+and explicit exact-key selections are retained.
+
+Projected-page syncs checkpoint each verified publication batch. On resume,
+the sync rechecks the indexed rows and the pinned GCS generations and
+metagenerations before reusing them.

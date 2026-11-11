@@ -37,6 +37,7 @@ const leann = @import("antfly_vectorindex").leann;
 const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
 const replica_mod = @import("leann_replica.zig");
+const Filter = @import("leann_filter.zig").Filter;
 
 pub const file_name = "leann.replica";
 const magic = "LEANNRST";
@@ -271,6 +272,7 @@ pub const ReplicatedState = struct {
     fetcher: ?replica_mod.GenerationFetcher = null,
 
     pub fn init(alloc: Allocator, opts: Options) !ReplicatedState {
+        if (opts.transient and opts.replica.config.quantizer != .rabitq) return error.InvalidIndexConfig;
         return .{ .alloc = alloc, .opts = opts, .replica = try replica_mod.Replica.init(alloc, opts.replica) };
     }
 
@@ -522,7 +524,17 @@ pub const ReplicatedState = struct {
         loader: VectorLoader,
 
         fn keyLoader(self: *KeyLoader) replica_mod.VectorLoader {
-            return .{ .ctx = self, .load = load, .load_batch = if (self.loader.load_batch != null) loadBatch else null };
+            return .{
+                .ctx = self,
+                .load = load,
+                .load_batch = if (self.loader.load_batch != null) loadBatch else null,
+                .bounds_current = if (self.state.dirty.count() != 0) boundsCurrent else null,
+            };
+        }
+
+        fn boundsCurrent(raw: *anyopaque, key: []const u8) bool {
+            const self: *const KeyLoader = @ptrCast(@alignCast(raw));
+            return !self.state.dirty.contains(key);
         }
 
         fn loadBatch(raw: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void {
@@ -650,51 +662,82 @@ pub const ReplicatedState = struct {
     /// this replica's vector ids through the bindings (keys without a local
     /// binding, e.g. deleted locally ahead of the log, are skipped).
     pub fn search(self: *const ReplicatedState, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
+        return self.searchWithStats(alloc, req, null);
+    }
+
+    pub fn searchWithStats(self: *const ReplicatedState, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
+        if (search_stats) |profile| profile.* = .{};
         var out = search_results.SearchResults.init(alloc, req.k);
         errdefer out.deinit();
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader };
-        var want: u32 = @intCast(@max(req.k, 1));
-        const filtered = req.filter_ids.len > 0 or req.exclude_ids.len > 0 or req.key_predicate != null or
-            req.filter_prefix.len > 0 or req.distance_over != null or req.distance_under != null;
-        if (filtered) want = @intCast(@max(req.k * 4, req.k + 64));
-        const live: u32 = @intCast(@max(self.replica.liveCount(), 1));
-        while (true) {
-            want = @min(want, live);
-            const hits = try self.replica.search(alloc, req.query, want, .{
-                .ef = self.opts.search_ef,
-                .bound_scale = self.opts.bound_scale,
-                .batch_size = self.opts.batch_size,
-            }, ctx.keyLoader());
-            defer alloc.free(hits);
-            var passed: usize = 0;
-            for (hits) |h| {
-                const vector_id = self.bindings.get(h.key) orelse continue;
-                if (!try allows(req, vector_id, h.key, h.distance)) continue;
-                passed += 1;
-            }
-            if (passed >= req.k or want >= live or !filtered) {
-                for (hits) |h| {
-                    const vector_id = self.bindings.get(h.key) orelse continue;
-                    if (!try allows(req, vector_id, h.key, h.distance)) continue;
-                    out.addResultWithOwnedMetadata(vector_id, h.distance, 0, if (req.load_metadata) try alloc.dupe(u8, h.key) else null);
-                }
-                return out;
-            }
-            want *|= 4;
-        }
-    }
+        var filter = try Filter.init(alloc, req);
+        defer filter.deinit(alloc);
+        const FilterContext = struct {
+            state: *const ReplicatedState,
+            filter: *const Filter,
 
-    fn allows(req: search_types.SearchRequest, vector_id: u64, key: []const u8, dist: f32) !bool {
-        if (req.filter_ids.len > 0 and std.mem.indexOfScalar(u64, req.filter_ids, vector_id) == null) return false;
-        if (std.mem.indexOfScalar(u64, req.exclude_ids, vector_id) != null) return false;
-        if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, key, req.filter_prefix)) return false;
-        if (req.key_predicate) |p| if (!try p.allows(p.ptr, key)) return false;
-        if (req.distance_over) |t| if (!(dist > t)) return false;
-        if (req.distance_under) |t| if (!(dist < t)) return false;
-        return true;
+            fn allows(raw: *const anyopaque, key: []const u8) !bool {
+                const context: *const @This() = @ptrCast(@alignCast(raw));
+                const id = context.state.bindings.get(key) orelse return false;
+                return context.filter.allows(id, key);
+            }
+
+            fn order(raw: *const anyopaque, key: []const u8) u64 {
+                const context: *const @This() = @ptrCast(@alignCast(raw));
+                return context.state.bindings.get(key).?;
+            }
+
+            fn cancelled(raw: *const anyopaque) bool {
+                const context: *const @This() = @ptrCast(@alignCast(raw));
+                return context.filter.cancelled();
+            }
+        };
+        const filter_ctx = FilterContext{ .state = self, .filter = &filter };
+        const direct_mode = filter.directMode(self.opts.replica.config.dims, self.replica.liveCount(), self.opts.transient, self.opts.replica.config.quantizer == .rabitq);
+        const direct = direct_mode != .graph;
+        const keys: [][]const u8 = if (direct) try alloc.alloc([]const u8, filter.included_count.?) else &.{};
+        defer if (direct) alloc.free(keys);
+        var key_count: usize = 0;
+        if (direct) {
+            var ids = filter.ids.include.keyIterator();
+            while (ids.next()) |id| {
+                if (filter.ids.exclude.contains(id.*)) continue;
+                const key = self.key_of.get(id.*) orelse continue;
+                keys[key_count] = key;
+                key_count += 1;
+            }
+        }
+
+        var local_stats: leann.SearchStats = .{};
+        const profile = search_stats orelse &local_stats;
+        const hits = try self.replica.search(alloc, req.query, std.math.cast(u32, req.k) orelse std.math.maxInt(u32), .{
+            .ef = self.opts.search_ef,
+            .bound_scale = self.opts.bound_scale,
+            .batch_size = self.opts.batch_size,
+            .stats = profile,
+            .filter = if (filter.active()) .{
+                .ctx = &filter_ctx,
+                .allows = FilterContext.allows,
+                .result_order = FilterContext.order,
+                .cancelled = FilterContext.cancelled,
+                .eligible_count = filter.eligibleCount(),
+                .direct_verify_bounds = direct_mode == .bounds,
+                .distance_over = req.distance_over,
+                .distance_under = req.distance_under,
+                .direct_keys = if (direct) keys[0..key_count] else null,
+            } else null,
+        }, ctx.keyLoader());
+        defer alloc.free(hits);
+        for (hits) |hit| {
+            const vector_id = self.bindings.get(hit.key) orelse continue;
+            out.addResultWithOwnedMetadata(vector_id, hit.distance, 0, if (req.load_metadata) try alloc.dupe(u8, hit.key) else null);
+        }
+        if (filter.active()) out.candidate_coverage = profile.matches.candidateCoverage(out.getHits().len);
+        out.sort();
+        return out;
     }
 
     pub fn getMetadata(self: *const ReplicatedState, alloc: Allocator, vector_id: u64) !?[]u8 {
@@ -1108,7 +1151,7 @@ test "leann replicated state: a new replica bootstraps from the first build's re
 test "leann replicated state: replaying stubs after a recovery install keeps live keys" {
     const alloc = testing.allocator;
     const dims = 8;
-    const opts = Options{ .replica = .{ .config = .{ .dims = dims, .max_degree = 8 }, .build_threshold = 20 }, .transient = true };
+    const opts = Options{ .replica = .{ .config = .{ .dims = dims, .max_degree = 8, .quantizer = .rabitq }, .build_threshold = 20 }, .transient = true };
     var leader = try ReplicatedState.init(alloc, opts);
     defer leader.deinit();
     var primary = TestPrimary{ .alloc = alloc };
@@ -1246,20 +1289,72 @@ test "leann replicated state: search honors the index's tuning settings" {
     const Counting = struct {
         primary: TestPrimary,
         loads: usize = 0,
+        batches: usize = 0,
         fn loader(self: *@This()) VectorLoader {
-            return .{ .ctx = self, .load = load };
+            return .{ .ctx = self, .load = load, .load_batch = loadBatch };
         }
         fn load(raw: *anyopaque, a: Allocator, vector_id: u64, key: []const u8) anyerror![]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.loads += 1;
             return TestPrimary.load(&self.primary, a, vector_id, key);
         }
+        fn loadBatch(raw: *anyopaque, _: Allocator, ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            for (ids, metadata, found, 0..) |id, key, *present, slot| {
+                present.* = false;
+                if (key.len == 0) continue;
+                self.loads += 1;
+                const vector = self.primary.vectors.get(id) orelse continue;
+                @memcpy(out[slot * dims ..][0..dims], vector);
+                present.* = true;
+            }
+        }
     };
     var counting = Counting{ .primary = .{ .alloc = alloc } };
     defer counting.primary.deinit();
     state.loader = counting.loader();
-    var keys: [300][8]u8 = undefined;
-    var vecs: [300][dims]f32 = undefined;
+    {
+        var buffered = try ReplicatedState.init(alloc, opts);
+        defer buffered.deinit();
+        buffered.loader = counting.loader();
+        const old: [dims]f32 = @splat(1);
+        const current: [dims]f32 = @splat(0);
+        const ids = [_]u64{ 601, 602 };
+        const keys = [_][]const u8{ "a", "z" };
+        for (ids, keys) |id, key| {
+            try counting.primary.put(id, &old);
+            try buffered.noteWrites(&[_]TestItem{.{ .vector_id = id, .vector = &old, .metadata = key }}, &.{});
+        }
+        var planned = (try buffered.plan(alloc)).?;
+        defer planned.deinit(alloc);
+        _ = try buffered.applyRecord(planned.record, 1);
+        try testing.expect(buffered.replica.index == null);
+        for (ids, keys) |id, key| {
+            // Swap key order relative to the public result order.
+            const public_id = if (id == 601) @as(u64, 604) else 603;
+            try counting.primary.put(public_id, &current);
+            try buffered.noteWrites(&[_]TestItem{.{ .vector_id = public_id, .vector = &current, .metadata = key }}, &.{});
+        }
+        counting.loads = 0;
+        counting.batches = 0;
+        var buffer_stats: leann.SearchStats = .{};
+        var result = try buffered.searchWithStats(alloc, .{
+            .query = &current,
+            .k = 1,
+            .filter_ids = &.{ 603, 604 },
+        }, &buffer_stats);
+        defer result.deinit();
+        try testing.expectEqual(@as(u64, 603), result.getHits()[0].vector_id);
+        try testing.expectEqual(@as(f32, 0), result.getHits()[0].distance);
+        try testing.expectEqual(.more, result.candidate_coverage);
+        try testing.expectEqual(@as(usize, 2), counting.loads);
+        try testing.expectEqual(@as(usize, 1), counting.batches);
+        try testing.expectEqual(@as(u32, 2), buffer_stats.recomputed);
+        try testing.expectEqual(@as(u32, 1), buffer_stats.batches);
+    }
+    var keys: [600][8]u8 = undefined;
+    var vecs: [600][dims]f32 = undefined;
     var prng = std.Random.DefaultPrng.init(13);
     for (&vecs, 0..) |*v, i| {
         for (v) |*x| x.* = prng.random().floatNorm(f32);
@@ -1286,6 +1381,81 @@ test "leann replicated state: search honors the index's tuning settings" {
         out.* = counting.loads;
     }
     try testing.expect(loads[1] > loads[0]);
+
+    counting.loads = 0;
+    var stats: leann.SearchStats = .{};
+    var direct = try state.searchWithStats(alloc, .{
+        .query = &vecs[7],
+        .k = 3,
+        .filter_ids = &.{ 7, 7, 11, 13, 999 },
+        .exclude_ids = &.{11},
+    }, &stats);
+    defer direct.deinit();
+    try testing.expectEqual(.exhausted, direct.candidate_coverage);
+    const direct_hits = direct.getHits();
+    try testing.expectEqual(@as(usize, 2), direct_hits.len);
+    try testing.expectEqual(@as(u64, 7), direct_hits[0].vector_id);
+    try testing.expectEqual(@as(u64, 13), direct_hits[1].vector_id);
+    try testing.expectEqual(@as(u32, 0), stats.approx_evaluated);
+    try testing.expect(counting.loads <= 2);
+
+    var allowed: [100]u64 = undefined;
+    for (&allowed, 0..) |*id, i| id.* = i * 3 + 1;
+    state.opts.search_ef = 2;
+    counting.loads = 0;
+    var filtered = try state.searchWithStats(alloc, .{
+        .query = &vecs[7],
+        .k = 3,
+        .filter_ids = &allowed,
+        .distance_under = 0.001,
+    }, &stats);
+    defer filtered.deinit();
+    const filtered_hits = filtered.getHits();
+    try testing.expectEqual(@as(usize, 1), filtered_hits.len);
+    try testing.expectEqual(@as(u64, 7), filtered_hits[0].vector_id);
+    try testing.expect(stats.expanded > 2);
+    try testing.expect(counting.loads <= allowed.len);
+
+    // The transient route should verify the selected codes without walking
+    // the graph when the allowlist just exceeds the exact budget.
+    state.opts.transient = true;
+    var transient_ids: [17]u64 = undefined;
+    for (&transient_ids, 0..) |*id, i| id.* = i * 3 + 1;
+    counting.loads = 0;
+    var bounded = try state.searchWithStats(alloc, .{
+        .query = &vecs[7],
+        .k = 3,
+        .filter_ids = &transient_ids,
+        .distance_under = 0.001,
+    }, &stats);
+    defer bounded.deinit();
+    try testing.expectEqual(.exhausted, bounded.candidate_coverage);
+    try testing.expectEqual(@as(usize, 1), bounded.getHits().len);
+    try testing.expectEqual(@as(u64, 7), bounded.getHits()[0].vector_id);
+    try testing.expectEqual(@as(u32, 0), stats.expanded);
+    try testing.expectEqual(@as(u32, 17), stats.approx_evaluated);
+    try testing.expect(counting.loads <= transient_ids.len);
+
+    // The primary has the rewrite while the graph still has the old code.
+    const updated: [dims]f32 = @splat(100);
+    try counting.primary.put(7, &updated);
+    try state.noteWrites(&[_]TestItem{.{ .vector_id = 7, .vector = &updated, .metadata = "k007" }}, &.{});
+    try testing.expect(state.dirty.contains("k007"));
+    counting.loads = 0;
+    counting.batches = 0;
+    var rewritten = try state.searchWithStats(alloc, .{
+        .query = &updated,
+        .k = 3,
+        .filter_ids = &transient_ids,
+        .distance_under = 0.001,
+    }, &stats);
+    defer rewritten.deinit();
+    try testing.expectEqual(@as(usize, 1), rewritten.getHits().len);
+    try testing.expectEqual(@as(u64, 7), rewritten.getHits()[0].vector_id);
+    try testing.expectEqual(@as(f32, 0), rewritten.getHits()[0].distance);
+    try testing.expectEqual(@as(u32, 0), stats.expanded);
+    try testing.expectEqual(@as(usize, 1), counting.loads);
+    try testing.expectEqual(@as(usize, 1), counting.batches);
 }
 
 test "leann replicated state: randomized replication simulation" {

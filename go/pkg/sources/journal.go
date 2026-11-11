@@ -30,9 +30,15 @@ import (
 type ownershipEvent struct {
 	ID, Revision string
 	Delete       []string
+	Add          map[string]string `json:",omitempty"`
+	Proofs       map[string]string `json:",omitempty"`
 }
 
 func replayOwnership(path, namespace string, owned map[string]string) error {
+	return replaySourceJournal(path, namespace, owned, nil)
+}
+
+func replaySourceJournal(path, namespace string, owned, proofs map[string]string) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
@@ -69,12 +75,38 @@ func replayOwnership(path, namespace string, owned map[string]string) error {
 		if err := decoder.Decode(&event); err != nil {
 			return fmt.Errorf("invalid ownership journal: %w", err)
 		}
-		if event.ID != "" {
+		switch {
+		case len(event.Proofs) > 0:
+			if event.ID != "" || event.Revision != "" || len(event.Add) != 0 || len(event.Delete) != 0 || len(event.Proofs) > projectedPageBatchCount {
+				return fmt.Errorf("invalid publication proof journal")
+			}
+			for id, digest := range event.Proofs {
+				if len(digest) != 64 {
+					return fmt.Errorf("invalid publication proof digest")
+				}
+				if proofs != nil {
+					proofs[id] = digest
+				}
+			}
+			if len(proofs) > maxImportSourceObjects {
+				return fmt.Errorf("publication proof count exceeds budget")
+			}
+		case len(event.Add) > 0:
+			if event.ID != "" || event.Revision != "" || len(event.Delete) != 0 || len(event.Add) > projectedPageBatchCount {
+				return fmt.Errorf("invalid ownership batch journal")
+			}
+			for id, revision := range event.Add {
+				if !ownedID(id, namespace) || revision == "" {
+					return fmt.Errorf("invalid ownership journal identity")
+				}
+				owned[id] = revision
+			}
+		case event.ID != "":
 			if !ownedID(event.ID, namespace) || event.Revision == "" || len(event.Delete) > 0 {
 				return fmt.Errorf("invalid ownership journal identity")
 			}
 			owned[event.ID] = event.Revision
-		} else {
+		default:
 			if len(event.Delete) == 0 || len(event.Delete) > 100 {
 				return fmt.Errorf("invalid ownership delete journal")
 			}

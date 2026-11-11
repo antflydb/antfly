@@ -54,6 +54,7 @@ type corpusSource struct {
 	Zip     bool   `json:"zip,omitempty"`
 }
 type corpusConfig struct {
+	IndexedAt      int64          `json:"indexed_at"`
 	Sources        []corpusSource `json:"sources"`
 	Key            string         `json:"key"`
 	BaseURL        string         `json:"base_url"`

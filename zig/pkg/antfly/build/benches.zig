@@ -782,6 +782,21 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     storage_bench_step.dependOn(&b.addInstallArtifact(storage_bench, .{}).step);
 
+    const filtered_vector_tests = b.addTest(.{
+        .root_module = storage_bench_root_mod,
+        .filters = &.{
+            "built-in exact dense scorer filters metadata",
+            "native exact lookup costs affect",
+            "one percent native filter routes through integrated dense search exactly",
+            "transient leann vectors become stubs and are re-embedded on demand",
+            "production external scorers use bounded cache-first artifact batches",
+            "hbc multi-bit codes refine leaf admission and survive reopen",
+            "hbc route observation counts external distance timing once",
+        },
+    });
+    b.step("filtered-vector-integration-test", "Run filtered HBC and LEANN integration regressions")
+        .dependOn(&b.addRunArtifact(filtered_vector_tests).step);
+
     // Keep focused DB workloads in separate compile artifacts under the same
     // owner target. Combining them with the API/HBC driver made a batch-only
     // edit rebuild the entire driver; see the build measurements in BENCHMARKS.md.

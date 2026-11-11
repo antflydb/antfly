@@ -87,8 +87,11 @@ func (r CatalogRecord) Validate() error {
 	if r.DocumentVersion == 1 && r.Source.Publication == "media" {
 		return fmt.Errorf("text catalog cannot advertise media documents")
 	}
+	if r.Source.RowSourceID != "" && !canonicalID(r.Source.RowSourceID) {
+		return fmt.Errorf("invalid catalog row source identity")
+	}
 	var actual, expected any
-	if json.Unmarshal(r.Source.Filter, &actual) != nil || json.Unmarshal(SourceFilter(r.Source.ID), &expected) != nil || !reflect.DeepEqual(actual, expected) {
+	if json.Unmarshal(r.Source.Filter, &actual) != nil || json.Unmarshal(SourceFilter(r.Source.RecordSourceID()), &expected) != nil || !reflect.DeepEqual(actual, expected) {
 		return fmt.Errorf("catalog source filter does not match identity")
 	}
 	switch r.Source.Status {

@@ -149,18 +149,24 @@ version needs no such special case and does better on real data (below).
 
 ```sh
 cd zig
-zig build-exe -OReleaseFast -lc -femit-bin=zig-out/bin/leann-bench \
-  --dep antfly_vector -Mroot=lib/vectorindex/src/leann_bench.zig \
-  --dep protobuf -Mantfly_vector=lib/vector/src/mod.zig \
-  -Mprotobuf=lib/protobuf/src/root.zig
-zig-out/bin/leann-bench --data PREFIX --n 100000 --queries 200 \
-  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE]
+zig build leann-bench -Doptimize=ReleaseFast
+zig-out/bin/leann_bench --data PREFIX --n 100000 --queries 200 \
+  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE] [--filtered 1]
 ```
 
 `PREFIX.train.f32` / `PREFIX.test.f32` hold a u32 row count, u32 dimension,
 then row-major f32s. Without `--data` it uses Gaussian clusters. `--cost`
 takes an embedder cost curve from `scripts/leann_embed_cost.py` and adds
 modeled embedding time per query.
+
+With `--filtered 1`, the benchmark compares widening an unfiltered result
+window, admitting only eligible nodes for exact verification, and directly
+scoring the allowlist with exact distances or RaBitQ bounds. It reports
+filtered recall, p50 and p99, embedding loads per query, and peak graph
+frontier size. Use `--filter-layout clustered` and `--filter-k N` to
+vary match locality and the result window. A stored-vector
+run measures CPU and vector access. Supply `--cost FILE` to model the
+additional transient re-embedding cost.
 
 GloVe-25 (ann-benchmarks `glove-25-angular`), first 100k vectors, 200
 queries, cosine, M=30, efC=128, single thread, recall@10 against brute force.
@@ -445,10 +451,20 @@ and rescores leaf members near the admission cutoff with extended codes
   deletes are idempotent, so replay after a crash is safe. Searches answer
   HBC's `SearchRequest` with HBC's `SearchResults`, applying `filter_ids`,
   `exclude_ids`, the key predicate, the metadata prefix and distance limits
-  to an over-fetched candidate list. Exact distances come from HBC's
-  external vector loader (the stored embedding artifact, or the document
-  field for direct-field indexes). Deleted or missing candidates are pushed
-  to the far end of the metric rather than failing a search.
+  before exact verification. Selective ID allowlists can score directly.
+  Graph search keeps nonmatching nodes available for navigation and widens
+  its frontier as needed. An empty verification wave cannot confirm a stable
+  cutoff while the frontier still contains unexplored nodes. Once a page
+  fills, the walk can expand up to two additional initial search widths.
+  Short pages keep widening. Exact distances come from the stored embedding
+  artifact, the document field, or transient re-embedding. Replicas verify
+  dirty candidates against the current vector before using their distances.
+  Filtered top-k breaks distance ties by public vector ID. Direct searches
+  publish exhaustion when verification proves the qualifying count. Graph
+  searches can also prove exhaustion after discovering every node without
+  skipping any eligible candidate by its ranking bound. Both routes report
+  a proven surplus after pruning, so paging can distinguish a
+  short complete result window from one that can still grow.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least

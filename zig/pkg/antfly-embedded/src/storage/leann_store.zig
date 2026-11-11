@@ -25,7 +25,7 @@
 //! - an exact buffer for the first `build_threshold` vectors, since a graph
 //!   and its codebooks need a build set,
 //! - idempotent upserts and deletes, so replay after a crash is safe,
-//! - HBC request filters applied to an over-fetched candidate list,
+//! - HBC request filters applied before graph result verification,
 //! - a CRC-checked file written atomically on sync,
 //! - a rebuild from stored vectors once deletes exceed a threshold.
 //!
@@ -41,6 +41,7 @@ const search_types = @import("antfly_vectorindex").search_types;
 const vec = @import("antfly_vector").vector;
 const replicated_mod = @import("leann_replicated.zig");
 const replica_mod = @import("leann_replica.zig");
+const Filter = @import("leann_filter.zig").Filter;
 
 pub const file_name = "leann.store";
 const magic = "LEANNSTR";
@@ -133,7 +134,7 @@ pub const LeannStore = struct {
     /// Opens the store kept in `dir_path`, loading its file when present.
     pub fn open(alloc: Allocator, io: std.Io, dir_path: []const u8, opts: Options) !*LeannStore {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (opts.dims == 0) return error.InvalidIndexConfig;
+        if (opts.dims == 0 or (opts.transient and opts.quantizer != .rabitq)) return error.InvalidIndexConfig;
         // Reject a graph configuration the first build would refuse (for
         // example RaBitQ below two dimensions) before any write is accepted;
         // otherwise derived indexing fails forever on committed data.
@@ -605,10 +606,15 @@ pub const LeannStore = struct {
     /// Answers an HBC search request with HBC's result type, so callers map
     /// vector ids and metadata exactly as they do for HBC.
     pub fn search(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
+        return self.searchWithStats(alloc, req, null);
+    }
+
+    pub fn searchWithStats(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
+        if (search_stats) |profile| profile.* = .{};
         if (req.query.len != self.opts.dims) return error.DimensionMismatch;
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
-        if (self.replicated) |state| return try state.search(alloc, req);
+        if (self.replicated) |state| return try state.searchWithStats(alloc, req, search_stats);
 
         var out = search_results.SearchResults.init(alloc, req.k);
         errdefer out.deinit();
@@ -625,51 +631,98 @@ pub const LeannStore = struct {
         // Exact buffer.
         const scratch = try alloc.alloc(f32, self.opts.dims);
         defer alloc.free(scratch);
-        for (self.pending.items) |p| {
-            if (!try filter.allows(p.vector_id, p.metadata)) continue;
-            @memcpy(scratch, p.vector);
-            if (self.opts.metric == .cosine) normalize(scratch);
-            const dist = leann.distance(@fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))), q, scratch);
-            if (!filter.distanceAllowed(dist)) continue;
-            out.addResultWithOwnedMetadata(p.vector_id, dist, 0, if (req.load_metadata) try alloc.dupe(u8, p.metadata) else null);
+        const direct_mode = filter.directMode(self.opts.dims, self.node_of.count() + self.pending.items.len, self.opts.transient, self.opts.quantizer == .rabitq);
+        const direct = direct_mode != .graph;
+        const graph_ids: []u32 = if (direct) try alloc.alloc(u32, filter.included_count.?) else &.{};
+        defer if (direct) alloc.free(graph_ids);
+        var graph_count: usize = 0;
+        var pending_matches: usize = 0;
+        var matches: leann.MatchCoverage = .{ .complete = true };
+        if (direct) {
+            var ids = filter.ids.include.keyIterator();
+            while (ids.next()) |id| {
+                if (filter.ids.exclude.contains(id.*)) continue;
+                if (self.node_of.get(id.*)) |node_id| {
+                    graph_ids[graph_count] = node_id;
+                    graph_count += 1;
+                }
+                if (self.pending_of.get(id.*)) |slot| {
+                    pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
+                }
+            }
+            std.mem.sortUnstable(u32, graph_ids[0..graph_count], {}, std.sort.asc(u32));
+        } else {
+            for (0..self.pending.items.len) |slot| {
+                pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
+            }
         }
 
-        if (self.index == null) return out;
-        const index = &self.index.?;
-        const live: usize = self.node_of.count();
-        if (live == 0) return out;
-
-        // Over-fetch when filters can reject graph results, widening until
-        // k results pass or the whole graph has been considered.
-        var want: usize = if (filter.active()) @max(req.k * 4, req.k + 64) else req.k;
-        var ctx = SourceCtx{ .store = self, .far_from = req.query };
-        while (true) {
-            want = @min(want, live);
-            var resp = try index.search(alloc, ctx.source(), req.query, .{
-                .k = @intCast(want),
-                .ef = if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
+        if (self.index) |*index| {
+            var ctx = SourceCtx{ .store = self, .far_from = if (filter.active()) null else req.query };
+            const opts: leann.SearchOptions = .{
+                .k = std.math.cast(u32, req.k) orelse std.math.maxInt(u32),
+                .ef = self.opts.search_ef,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
-            });
-            defer resp.deinit(alloc);
-            var passed: usize = 0;
-            for (resp.results) |r| {
-                const node = self.nodes.items[r.id];
-                if (!try filter.allows(node.vector_id, node.metadata)) continue;
-                if (!filter.distanceAllowed(r.distance)) continue;
-                passed += 1;
-            }
-            if (passed >= req.k or want >= live or !filter.active()) {
-                for (resp.results) |r| {
-                    const node = self.nodes.items[r.id];
-                    if (!try filter.allows(node.vector_id, node.metadata)) continue;
-                    if (!filter.distanceAllowed(r.distance)) continue;
-                    out.addResultWithOwnedMetadata(node.vector_id, r.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
+            };
+            const FilterContext = struct {
+                store: *const LeannStore,
+                filter: *const Filter,
+
+                fn allows(raw: *const anyopaque, id: u32) !bool {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    const node = context.store.nodes.items[id];
+                    return context.filter.allows(node.vector_id, node.metadata);
                 }
-                return out;
+
+                fn order(raw: *const anyopaque, id: u32) u64 {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    return context.store.nodes.items[id].vector_id;
+                }
+
+                fn cancelled(raw: *const anyopaque) bool {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    return context.filter.cancelled();
+                }
+            };
+            const filter_ctx = FilterContext{ .store = self, .filter = &filter };
+            var resp = if (filter.active())
+                try index.searchFiltered(alloc, ctx.source(), req.query, opts, .{
+                    .ctx = &filter_ctx,
+                    .allows = FilterContext.allows,
+                    .result_order = FilterContext.order,
+                    .cancelled = FilterContext.cancelled,
+                    .eligible_count = filter.eligibleCount(),
+                    .direct_verify_bounds = direct_mode == .bounds,
+                    .distance_over = req.distance_over,
+                    .distance_under = req.distance_under,
+                }, if (direct) graph_ids[0..graph_count] else null)
+            else
+                try index.search(alloc, ctx.source(), req.query, opts);
+            defer resp.deinit(alloc);
+            matches = resp.stats.matches;
+            if (search_stats) |profile| profile.* = resp.stats;
+            for (resp.results) |result| {
+                const node = self.nodes.items[result.id];
+                out.addResultWithOwnedMetadata(node.vector_id, result.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
             }
-            want *= 4;
         }
+        matches.verified += pending_matches;
+        if (filter.active()) out.candidate_coverage = matches.candidateCoverage(out.getHits().len);
+        out.sort();
+        return out;
+    }
+
+    fn scorePending(self: *const LeannStore, alloc: Allocator, filter: *const Filter, q: []const f32, scratch: []f32, slot: usize, out: *search_results.SearchResults) !bool {
+        if (filter.cancelled()) return error.Cancelled;
+        const item = self.pending.items[slot];
+        if (!try filter.allows(item.vector_id, item.metadata)) return false;
+        @memcpy(scratch, item.vector);
+        if (self.opts.metric == .cosine) normalize(scratch);
+        const dist = leann.distance(@fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))), q, scratch);
+        if (!std.math.isFinite(dist) or !filter.distanceAllowed(dist)) return false;
+        out.addResultWithOwnedMetadata(item.vector_id, dist, 0, if (filter.request.load_metadata) try alloc.dupe(u8, item.metadata) else null);
+        return true;
     }
 
     /// Metadata for a live vector id, owned by `alloc`.
@@ -687,7 +740,7 @@ pub const LeannStore = struct {
     /// of every metric instead of failing the search.
     const SourceCtx = struct {
         store: *LeannStore,
-        far_from: []const f32,
+        far_from: ?[]const f32,
 
         fn source(self: *SourceCtx) leann.EmbeddingSource {
             return .{ .ctx = self, .recompute_fn = recompute };
@@ -712,9 +765,9 @@ pub const LeannStore = struct {
                 }
                 @memset(found, false);
                 try load_batch(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
-                for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], self.far_from) |*o, x| {
-                    o.* = -1000 * x;
-                };
+                for (found, 0..) |ok, i| {
+                    if (!ok) leann.fillMissingEmbedding(out[i * d ..][0..d], self.far_from);
+                }
                 return;
             }
             for (ids, 0..) |id, i| {
@@ -732,7 +785,7 @@ pub const LeannStore = struct {
                     if (v.len != d) return error.DimensionMismatch;
                     @memcpy(row, v);
                 } else {
-                    for (row, self.far_from) |*o, x| o.* = -1000 * x;
+                    leann.fillMissingEmbedding(row, self.far_from);
                 }
             }
         }
@@ -863,55 +916,6 @@ pub const LeannStore = struct {
             self.elide_durable = self.elide.items.len;
         }
         if (r.bufferedLen() != 0) return error.InvalidLeannStore;
-    }
-};
-
-/// HBC request filters, applied to graph and buffer candidates.
-const Filter = struct {
-    allowed: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    excluded: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    has_allowed: bool,
-    key_predicate: ?search_types.KeyPredicate,
-    prefix: []const u8,
-    over: ?f32,
-    under: ?f32,
-
-    fn init(alloc: Allocator, req: search_types.SearchRequest) !Filter {
-        var self = Filter{
-            .has_allowed = req.filter_ids.len > 0,
-            .key_predicate = req.key_predicate,
-            .prefix = req.filter_prefix,
-            .over = req.distance_over,
-            .under = req.distance_under,
-        };
-        errdefer self.deinit(alloc);
-        for (req.filter_ids) |id| try self.allowed.put(alloc, id, {});
-        for (req.exclude_ids) |id| try self.excluded.put(alloc, id, {});
-        return self;
-    }
-
-    fn deinit(self: *Filter, alloc: Allocator) void {
-        self.allowed.deinit(alloc);
-        self.excluded.deinit(alloc);
-    }
-
-    fn active(self: *const Filter) bool {
-        return self.has_allowed or self.excluded.count() > 0 or self.key_predicate != null or
-            self.prefix.len > 0 or self.over != null or self.under != null;
-    }
-
-    fn allows(self: *const Filter, vector_id: u64, metadata: []const u8) !bool {
-        if (self.has_allowed and !self.allowed.contains(vector_id)) return false;
-        if (self.excluded.contains(vector_id)) return false;
-        if (self.prefix.len > 0 and !std.mem.startsWith(u8, metadata, self.prefix)) return false;
-        if (self.key_predicate) |p| if (!try p.allows(p.ptr, metadata)) return false;
-        return true;
-    }
-
-    fn distanceAllowed(self: *const Filter, dist: f32) bool {
-        if (self.over) |t| if (!(dist > t)) return false;
-        if (self.under) |t| if (!(dist < t)) return false;
-        return true;
     }
 };
 
@@ -1053,6 +1057,24 @@ test "leann store: buffer, build, search, filters, delete, persist" {
         for (res2.items.items) |item| try testing.expect(item.vector_id >= 3 and item.vector_id <= 5);
     }
 
+    {
+        var filtered = try store.search(alloc, .{
+            .query = data[250 * dims ..][0..dims],
+            .k = 3,
+            .filter_prefix = "doc-25",
+            .exclude_ids = &.{250},
+            .load_metadata = true,
+        });
+        defer filtered.deinit();
+        const hits = filtered.getHits();
+        try testing.expectEqual(@as(usize, 3), hits.len);
+        for (hits) |hit| {
+            try testing.expect(hit.vector_id != 250);
+            try testing.expect(std.mem.startsWith(u8, hit.metadata.?, "doc-25"));
+        }
+        try testing.expect(hits[0].distance <= hits[1].distance and hits[1].distance <= hits[2].distance);
+    }
+
     // Upsert and delete are idempotent.
     try store.apply(&[_]TestItem{.{ .vector_id = 250, .vector = data[250 * dims ..][0..dims], .metadata = "doc-250" }}, &.{});
     try store.apply(&[_]TestItem{}, &.{ 251, 251, 9999 });
@@ -1166,6 +1188,15 @@ test "leann store: rejects graph settings the first build would refuse" {
     // RaBitQ needs at least two dimensions.
     try testing.expectError(error.InvalidIndexConfig, LeannStore.open(alloc, io, dir, .{ .dims = 1, .metric = .l2_squared, .quantizer = .rabitq }));
     try testing.expectError(error.InvalidIndexConfig, LeannStore.open(alloc, io, dir, .{ .dims = 1, .metric = .l2_squared, .quantizer = .rabitq, .replicated = true }));
+    for ([_]bool{ false, true }) |replicated| {
+        try testing.expectError(error.InvalidIndexConfig, LeannStore.open(alloc, io, dir, .{
+            .dims = 8,
+            .metric = .l2_squared,
+            .quantizer = .pq,
+            .transient = true,
+            .replicated = replicated,
+        }));
+    }
     var ok = try LeannStore.open(alloc, io, dir, .{ .dims = 1, .metric = .l2_squared, .quantizer = .pq });
     ok.deinit();
 }

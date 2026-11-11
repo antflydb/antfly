@@ -933,7 +933,7 @@ func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly b
 	if err != nil {
 		s.job.State, s.job.Code = "failed", "sync_failed"
 		s.job.Failure = describeSyncFailure(err)
-		slog.Error("source sync failed", "job_id", s.job.ID, "source_id", s.job.Failure.SourceID, "phase", s.job.Failure.Phase, "code", s.job.Failure.Code, "retryable", s.job.Failure.Retryable)
+		slog.Error("source sync failed", "job_id", s.job.ID, "source_id", s.job.Failure.SourceID, "phase", s.job.Failure.Phase, "code", s.job.Failure.Code, "retryable", s.job.Failure.Retryable, "restart_required", s.job.Failure.RestartRequired)
 		if errors.Is(err, context.Canceled) {
 			s.job.State, s.job.Code = "cancelled", "cancelled"
 		}

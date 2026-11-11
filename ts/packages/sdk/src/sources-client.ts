@@ -70,7 +70,13 @@ export interface SourceSyncJob {
   code?: string;
   operation?: "sync" | "purge";
   purged_source_count?: number;
-  failure?: { source_id?: string; phase: string; code: string; retryable: boolean };
+  failure?: {
+    source_id?: string;
+    phase: string;
+    code: string;
+    retryable: boolean;
+    restart_required?: boolean;
+  };
 }
 
 export class SourceServiceError extends Error {

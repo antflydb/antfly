@@ -59,6 +59,8 @@ pub struct SourceSyncFailure {
     pub phase: String,
     pub code: String,
     pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_required: Option<bool>,
 }
 
 // Deliberately has no Debug implementation: its operator token is private.
