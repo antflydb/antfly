@@ -68,13 +68,13 @@ const BuildCancellation = struct {
     }
 };
 
-fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage, offline: bool) local.storage_lsm_backend.Options {
+fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage) local.storage_lsm_backend.Options {
     return .{
         .storage = storage,
-        .flush_threshold = if (offline) 64 * 1024 else 8 * 1024 * 1024,
-        .flush_threshold_bytes = if (offline) 8 * 1024 * 1024 else 0,
-        .bulk_ingest_flush_threshold_multiplier = if (offline) 1 else 8,
-        .bulk_ingest_flush_threshold_bytes_multiplier = if (offline) 1 else 8,
+        .flush_threshold = 64 * 1024,
+        .flush_threshold_bytes = 8 * 1024 * 1024,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .bulk_ingest_flush_threshold_bytes_multiplier = 1,
     };
 }
 
@@ -181,7 +181,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             options.pinned_tree_depth = 0;
         }
         const vector_path = try std.fmt.allocPrint(ca, "{s}/vectors", .{path});
-        var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, vectorStoreOptions(candidate_storage, build_options != null));
+        var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, vectorStoreOptions(candidate_storage));
         defer vectors.close();
         var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, options, .{ .storage = candidate_storage });
         defer index.close();
@@ -533,7 +533,7 @@ test "external lake execution offline dense source flushes by bytes within its a
     const encoded = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, &vector);
     defer a.free(encoded);
     {
-        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null, true));
+        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null));
         defer backend.close();
         var offset: usize = 0;
         while (offset < count) : (offset += 128) {
@@ -551,7 +551,7 @@ test "external lake execution offline dense source flushes by bytes within its a
         try std.testing.expect(@as(u64, count) * dims * 4 > budget.limit);
         try std.testing.expect(budget.peak <= budget.limit);
     }
-    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null, true));
+    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null));
     defer reopened.close();
     var read = try reopened.beginRead();
     defer read.abort();

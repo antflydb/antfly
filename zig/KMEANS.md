@@ -335,3 +335,48 @@ single-run observations from a shared workstation.
 
 See [`emeans_sampled_cohere_1m.json`](bench/vectors/emeans_sampled_cohere_1m.json)
 for the complete phases and recall/latency sweep.
+
+### Bounded offline native lake builds
+
+The offline builder trains small hierarchical routers, partitions the complete
+corpus through checksummed disk spools, and finishes admitted terminal regions
+in memory. Lloyd and e-means share the same sampling, routing, native leaf
+encoding, and publication path. Fresh lake configurations select this path
+with `lake_bulk_build`. Its managed allocation allowance is 256 MiB.
+
+Cohere 1M measurements use normalized squared-L2 vectors, 768 dimensions,
+production leaf capacity 100, two seeds, and 100 held-out queries.
+
+| Builder | Build and publication s | First tested probes reaching 95.5% recall |
+| --- | ---: | ---: |
+| Full Hilbert | 196.9–200.7 | 8,192 |
+| Sampled hierarchical Lloyd | 40.0–41.7 | 2,048 |
+| Sampled hierarchical e-means | 31.7–31.8 | 2,048 |
+
+The spooled builds admitted less than 178 MiB of allocations. Whole-process
+RSS also includes native mappings and file residency. These serial observations
+come from a shared workstation and cover local normalized inputs through native
+posting publication. Parquet preparation, exact-vector LSM construction, remote
+reads, and lake upload are separate stages. All six completed generations were
+reopened and structurally checked after the final main merge, with identical
+recall across the repeated sweeps.
+
+Run the e-means arm with the prepared fixture.
+
+```sh
+zig build bench-build-quality -Doptimize=ReleaseFast
+zig-out/bin/bench_build_quality \
+  .benchmark-results/cohere-1m/prepared/train.f32 \
+  .benchmark-results/cohere-1m/prepared/queries.f32 \
+  .benchmark-results/cohere-1m/prepared/truth.u64 \
+  768 spool_emeans full .benchmark-results/cohere-1m/spooled-index 100 0 42
+```
+
+Use `spool_lloyd` for the paired sampled Lloyd run. Use `reopen` in place of
+`full` to repeat the extended recall sweep over an existing generation.
+
+The implementation, resource limits, configuration example, and regression
+commands are documented in the
+[offline builder design](../docs/design/vector-store/bulk-builder.md).
+The complete measurements and provenance are in
+[the streamed Cohere result](bench/vectors/emeans_streamed_cohere_1m.json).
