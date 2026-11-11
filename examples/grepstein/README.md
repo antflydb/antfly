@@ -89,8 +89,9 @@ For a small qualification fixture or manually obtained release:
 
 Preparation checkpoints resume with `prepare --state STATE --resume`. Inspect
 `skipped.ndjson`: publication refuses a state that skipped unreadable PDFs. Fix
-or explicitly quarantine those files and prepare a new state. V1 publishes PDFs;
-other media require a separately qualified transcription workflow.
+or explicitly quarantine those files and prepare a new state. The default `pdf` profile publishes PDFs. The opt-in `transcription` profile
+selects audio in a separate state/table and uses native Whisper transcript units
+with timestamp-aware qualification; see Processing profiles below.
 
 ## Publish and load full text
 
@@ -141,7 +142,8 @@ The catalog is sealed and uploaded only after every original succeeds. A failed
 run may leave verified raw objects; rerunning reuses them and rechecks inputs.
 No partial run produces a new completed catalog. Original staging is independent
 of the existing `prepare` → `publish` → `load` path: keep that path restricted to
-the small-release PDF state for v1. Adding raw files to the bucket never adds
+the default small-release PDF state for v1, or a separately qualified processing
+profile. Adding raw files to the bucket never adds
 them to the managed instance or existing source jobs.
 
 For releases 8–11, run bulk acquisition and staging on a separately approved
@@ -196,7 +198,7 @@ OCR failure block qualification, even when full-text search is ready. Run it
 before semantic/graph enrichment; a successful receipt measures extraction
 coverage, not OCR transcription accuracy, source authorization or public readiness.
 
-The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
+The PDF OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
 inference. Qualify both reader sizes on the deployed pool and run a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
@@ -418,7 +420,7 @@ Build both binaries from the same checkout, then run the real PDF-to-grep path:
 (cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
   ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
   ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
-  go test -run '^TestLocalNativeGCSExtraction$' -count=1 -v)
+  go test -run '^TestLocalNativeGCS(Extraction|Transcription)$' -count=1 -v)
 ```
 
 This starts a standalone Antfly server and a loopback GCS protocol fixture,
@@ -612,3 +614,145 @@ an archive becomes a usable source. Staging then verifies acquisition receipts,
 hashes every member, reuses verified GCS objects, and records object generations.
 No table keys, inference credentials, OCR, transcription or index creation are
 part of this command. Keep the current sample load running independently.
+
+
+## Processing profiles
+
+Grepstein selects ordinary native producers and artifact streams; it does not
+extract or transcribe file bytes itself. `prepare --profile pdf` is the default
+and retains the existing PDF/OCR recipe and artifact names. Use
+`prepare --profile transcription` for audio. Preparation filters unsupported
+MIME types before applying file limits, and saves the profile for resume,
+publication, loading and grep configuration. A resume cannot change it.
+Raw `stage-originals` remains independent and preserves every media type.
+
+Each profile uses a separate state and table in the **same Cloud instance**.
+This keeps the accepted PDF table, producer settings and sample OCR unchanged.
+Trying to load a transcription state into the PDF table fails its recipe identity
+check. Within either table, `--append-only --accepted-state ...` grows the same
+profile without rewriting matching documents or repeating their inference.
+
+For a small, authorized audio selection:
+
+```sh
+./grepstein prepare --profile transcription --state ./grepstein-speech \
+  --source 'doj-09=/absolute/path/audio-selection' --limit-files 3
+./grepstein publish --state ./grepstein-speech --bucket antfly-showcases-originals
+./grepstein load --state ./grepstein-speech --url "$ANTFLY_URL" \
+  --table grepstein_transcripts --create-table --source-connection "$GCS_CONNECTION" \
+  --inference-url "$INFERENCE_URL" --inference-secret "$INFERENCE_SECRET_NAME"
+./grepstein qualify --state ./grepstein-speech --url "$ANTFLY_URL" \
+  --table grepstein_transcripts --output ./grepstein-speech/qualification.json
+./grepstein grep --state ./grepstein-speech --url "$ANTFLY_URL" --table grepstein_transcripts
+antfly-grep --table-config ./grepstein-speech/grep.json 'pattern'
+```
+
+`INFERENCE_URL` is the configured shared-inference endpoint. The secret name
+references a credential already available in the server keystore; it is never a
+literal token. The default model is the pinned hosted Whisper-small revision in
+[whisper-transcriber.example.json](whisper-transcriber.example.json). Pass
+`load --transcriber-config FILE` to select another native STT model/provider.
+Do not put credential values in that file; use server secret references. Keep
+exactly the same flags when resuming/adding another batch. Audio originals are
+currently bounded to 64 MiB; oversized recordings fail preparation and need an
+explicitly prepared smaller selection. `--limit-pages` belongs to the PDF profile;
+use `--limit-files` to bound an audio pilot.
+
+Both profiles publish `document_units_v1` and `document_chunks_v1` in their own
+table. The audio default grep stream is `transcript`, with `provenance` containing
+phrase offsets and any provider speaker evidence. `--artifact chunks` selects
+native semantic chunks; timing follows the phrases they overlap. Existing
+`enrich --stage semantic` and `enrich --stage graph` commands target those same
+chunk artifacts in either table. Inference, graph materialization and provider
+admission remain native operations. The current web explorer/original-delivery
+endpoint remains PDF-specific; use native queries and grep for this audio pilot.
+
+To search both profiles on the same instance, combine the two generated table
+bindings (the PDF alias is `grepstein`; transcription uses its table name):
+
+```sh
+jq -s '.[0].tables += .[1].tables | .[0]' \
+  ./grepstein-corpus/grep.json ./grepstein-speech/grep.json > ./grepstein-all.json
+antfly-grep --table-config ./grepstein-all.json 'pattern'
+```
+
+Qualification proves both unit/chunk indexes are complete/queryable and inspects
+the raw native completion manifest. PDF qualification checks the sealed page
+inventory and OCR debt. Transcription qualification enumerates every unit with
+bounded cursor pages, checks text plus valid timestamp/character spans, and
+rechecks its artifact generation. Missing, failed, untimed or stale units remain
+incomplete even if the index is serving. Receipts report audio records, transcript
+segments and native units separately from PDF pages. The local native smoke
+covers GCS fetching, shared Antfly and OpenAI-compatible STT orchestration,
+append/resume, retained sample
+generation and both grep streams; provider outputs are loopback fixtures, so it
+does not establish real-model transcript quality or live Cloud identity exchange.
+
+Profiles live in `profiles.go`; the transcription recipe shares
+`antfly-sources.NativeTranscriptProducer`. Additional profiles must explicitly
+provide source selection, a native recipe, stream provenance and a coverage
+policy. There is no inferred OCR/transcription for newly preserved media. Video
+transcription and summaries can compose existing native producers through further
+profiles, but are not silently enabled here. The `images` profile below
+explicitly enables LightOn grounding for still images.
+
+LightOnOCR-3 supports **grounded image descriptions**: its `grounding` output
+includes image-region descriptions and chart data. The model card recommends
+only an empty prompt (text extraction) or `grounding`; arbitrary caption prompts
+are out of distribution. The `caption` grounding label identifies existing
+figure/table captions; descriptions appear in `image` blocks. The `images` profile
+preserves this labeled output in its own table;
+it does not silently mix descriptions into the accepted PDF extraction table.
+A general scene-caption profile can use the existing source caption preset
+with an appropriate model. See the
+[LightOnOCR-3 model card](https://huggingface.co/lightonai/LightOnOCR-3-4B).
+
+### Grounded images
+
+Use `images` for PNG, JPEG and WebP originals. It uses native document extraction
+with an explicit image route and the shared LightOnOCR-3 reader, sending
+`ocr.prompt: "grounding"` through `/read`. No local captioning or OCR is performed.
+Use a separate state/table on the same Cloud instance:
+
+```sh
+./grepstein prepare --profile images --state ./grepstein-images \
+  --source 'doj-09=/absolute/path/image-selection' --limit-files 3
+./grepstein publish --state ./grepstein-images --bucket antfly-showcases-originals
+./grepstein load --state ./grepstein-images --url "$ANTFLY_URL" \
+  --table grepstein_images --create-table --source-connection "$GCS_CONNECTION" \
+  --reader-config lightonocr-reader.example.json \
+  --inference-url "$INFERENCE_URL" --inference-secret "$INFERENCE_SECRET_NAME"
+./grepstein qualify --state ./grepstein-images --url "$ANTFLY_URL" \
+  --table grepstein_images --output ./grepstein-images/qualification.json
+./grepstein grep --state ./grepstein-images --url "$ANTFLY_URL" --table grepstein_images
+antfly-grep --table-config ./grepstein-images/grep.json 'vehicle'
+antfly-grep --table-config ./grepstein-images/grep.json --artifact chunks 'vehicle'
+```
+
+The default `grounded` stream has purpose `caption`, is marked generated, and exposes the native unit's
+verbatim labeled text, including image descriptions, OCR text and chart data.
+For example, `![image](0,300,1000,1000)` identifies an image-description block.
+These coordinates are **normalized to 0–1000**, not pixels. Labels and boxes
+remain in the unit artifact text; the example does not invent pixel-space
+provenance or claim to expose separately parsed regions. The native `provenance`
+keeps the immutable source identity and reader evidence. Semantic/graph enrichment
+can consume the same chunk artifacts. Combine this table binding with the PDF
+and transcript bindings to search all three profiles with antfly-grep.
+
+Qualification requires one successful native image read, zero extraction debt,
+nonempty text in every labeled block, valid normalized rectangles, native OCR
+provenance and a stable source/artifact generation. It reports image records and
+grounded blocks separately from pages/audio. Images without an `image` label may
+still contain valid text, tables or charts; qualification does not assert model
+accuracy or require an invented description. Missing/unstructured/truncated
+output fails qualification. Originals are bounded to 64 MiB and native inference
+still enforces decoded-pixel and request/admission limits. The public explorer
+continues to serve PDFs only; this profile uses native queries and grep.
+
+
+Both the image reader and hosted transcriber consume the bytes already acquired
+under the source connection's policy. The inference provider does not need bucket
+credentials or a second fetch of the private GCS URL. Native STT preserves the
+recording MIME for negotiated framed transport; older local callbacks receive an
+inline recording at their existing URL boundary. These engine fixes must be in
+the deployed Antfly runtime before using the new profiles against Cloud.
