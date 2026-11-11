@@ -40,6 +40,7 @@ type Binding struct {
 	DocumentVersion   int                   `json:"document_version,omitempty"`
 	PublishedRevision string                `json:"published_revision,omitempty"`
 	ID                string                `json:"id"`
+	RowSourceID       string                `json:"row_source_id,omitempty"`
 	Alias             string                `json:"alias"`
 	Table             string                `json:"table"`
 	DocumentField     string                `json:"document_field,omitempty"`
@@ -47,6 +48,14 @@ type Binding struct {
 	Status            string                `json:"status"`
 	AccessID          string                `json:"access_id,omitempty"`
 	ValidUntil        *int64                `json:"valid_until,omitempty"`
+}
+
+// RecordSourceID is the physical row scope of the published generation.
+func (b Binding) RecordSourceID() string {
+	if b.RowSourceID != "" {
+		return b.RowSourceID
+	}
+	return b.ID
 }
 
 func SourceFilter(id string) json.RawMessage {
