@@ -5379,11 +5379,11 @@ test "unsupported graph diagnostics identify the rejected operation feature acro
             .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
             .params = .{ .direction = .in },
         } },
-        .{ .name = "seed_paths", .query = .{
+        .{ .name = "weighted_incoming", .query = .{
             .query_type = .traverse,
             .index_name = "knowledge",
             .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
-            .params = .{ .direction = .in, .deduplicate = false },
+            .params = .{ .direction = .in, .weight_mode = .min_weight },
         } },
     };
     const req: db_mod.types.SearchRequest = .{
@@ -5394,15 +5394,15 @@ test "unsupported graph diagnostics identify the rejected operation feature acro
     // Planning probes must not publish a rejection into another execution.
     try std.testing.expect(graph_query_diagnostic.take() == null);
     try std.testing.expectError(error.GraphQueryModeUnsupported, distributed_graph.rejectUnsupportedCrossRange(req));
-    const body = try graphQueryUnsupportedBody(std.testing.allocator,
-        \\{"graph_queries":{"supported_incoming":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in"}},"seed_paths":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in","deduplicate_nodes":false}}}}
-    );
+    // The typed execution diagnostic must survive without reverse-engineering
+    // the original request, including strategies from non-canonical callers.
+    const body = try graphQueryUnsupportedBody(std.testing.allocator, "{}");
     defer std.testing.allocator.free(body);
     var parsed = try ant_json.parseFromSlice(metadata_openapi.GraphQueryUnsupportedError, std.testing.allocator, body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("seed_paths", parsed.value.operation);
+    try std.testing.expectEqualStrings("weighted_incoming", parsed.value.operation);
     try std.testing.expectEqualStrings("traverse", parsed.value.feature);
-    try std.testing.expectEqualStrings("deduplicate_nodes_must_be_true", parsed.value.reason);
+    try std.testing.expectEqualStrings("weight_mode_must_be_min_hops", parsed.value.reason);
 }
 
 test "runtime graph capability diagnostics preserve the failing named operation" {

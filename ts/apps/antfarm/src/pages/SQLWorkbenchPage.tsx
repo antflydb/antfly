@@ -11,9 +11,9 @@ import {
 } from "@antfly/design-system";
 import { SQLExecutionError, type SQLResponse } from "@antfly/sdk";
 import { useEffect, useRef, useState } from "react";
+import SQLGraphPreview, { sqlGraphValues } from "@/components/SQLGraphPreview";
 import { useApi } from "@/hooks/use-api-config";
 import { sqlCell, sqlParameters } from "./sql-workbench";
-import SQLGraphPreview, { sqlGraphValues } from "@/components/SQLGraphPreview";
 
 export default function SQLWorkbenchPage({ initialStatement }: { initialStatement?: string } = {}) {
   const client = useApi();
@@ -264,9 +264,9 @@ export default function SQLWorkbenchPage({ initialStatement }: { initialStatemen
                   {result.rows.map((row, ri) => (
                     <tr key={JSON.stringify([ri, row])}>
                       {row.map((_, ci) => (
-                        // biome-ignore lint/suspicious/noArrayIndexKey: immutable SQL cells have positional identity, not unique values.
                         <td
                           className="border p-2 font-mono whitespace-pre-wrap"
+                          // biome-ignore lint/suspicious/noArrayIndexKey: immutable SQL cells have positional identity, not unique values.
                           key={`${ri}:${ci}`}
                         >
                           {sqlCell(result, ri, ci)}
