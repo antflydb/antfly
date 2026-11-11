@@ -739,3 +739,77 @@ func TestPublicManifestWithoutReadersConverges(t *testing.T) {
 		})
 	}
 }
+
+// Model a runtime that assigns an opaque namespace when creating a source.
+type assigningIdentityManifestAPI struct{ *manifestAPI }
+
+func (f assigningIdentityManifestAPI) PutSourceIfAbsent(ctx context.Context, source management.Source) (management.Source, error) {
+	out, err := f.manifestAPI.PutSourceIfAbsent(ctx, source)
+	if err != nil {
+		return out, err
+	}
+	if out.Identity.Namespace == "" {
+		out.Identity.Namespace = "assigned-namespace/"
+	}
+	out.Revision = f.revision(out)
+	f.sources[out.Id] = f.copySource(out)
+	return out, nil
+}
+
+func TestApplyManifestEmptyIdentityConverges(t *testing.T) {
+	for _, identity := range []string{"", `,"identity":{}`, `,"identity":{"namespace":""}`} {
+		t.Run(identity, func(t *testing.T) {
+			manifest, err := DecodeManifest(strings.NewReader(`{"version":1,"sources":[{"key":"docs","connection":"docs-connection","table":"docs","config":{},"permissions":{"readers":["team"]}` + identity + `}]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			api := assigningIdentityManifestAPI{newManifestAPI(t)}
+			env := Env{API: api, Out: io.Discard}
+			results, err := ApplyManifest(t.Context(), env, manifest, PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireApplyOutcomes(t, results, []string{"docs"}, []string{"created"})
+			plan, err := PlanManifest(t.Context(), env, manifest, PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if item := plan.Items[0]; item.Action != PlanUnchanged || len(item.Changes) != 0 || item.Desired.Identity.Namespace != "assigned-namespace/" {
+				t.Fatalf("plan after namespace assignment = %#v", item)
+			}
+			results, err = ApplyManifest(t.Context(), env, manifest, PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireApplyOutcomes(t, results, []string{"docs"}, []string{"unchanged"})
+			if len(api.writes) != 1 {
+				t.Fatalf("unchanged apply wrote again: %#v", api.writes)
+			}
+			manifest.Sources[0].Name = "Renamed"
+			results, err = ApplyManifest(t.Context(), env, manifest, PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireApplyOutcomes(t, results, []string{"docs"}, []string{"updated"})
+			if got := api.writes[1].source.Identity.Namespace; got != "assigned-namespace/" {
+				t.Fatalf("rename sent namespace %q", got)
+			}
+		})
+	}
+}
+
+func TestPlanManifestExplicitIdentityIsRetained(t *testing.T) {
+	for _, existing := range []string{"", "existing-namespace/"} {
+		t.Run(existing, func(t *testing.T) {
+			current := manifestCurrent("docs")
+			current.Identity.Namespace = existing
+			api := newManifestAPI(t, current)
+			entry := manifestEntry("docs")
+			entry.Identity = &management.SourceIdentity{Namespace: "requested-namespace/"}
+			item := planWithoutWrites(t, api, manifestFile(entry), PlanOptions{}).Items[0]
+			if item.Action != PlanUpdate || item.Desired.Identity.Namespace != "requested-namespace/" || !reflect.DeepEqual(item.Changes, []string{"identity"}) {
+				t.Fatalf("explicit identity request = %#v", item)
+			}
+		})
+	}
+}
