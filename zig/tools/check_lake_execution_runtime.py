@@ -187,6 +187,10 @@ def run_logged(command, env, log, timeout):
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
+                    pass
+                finally:
+                    # The wrapper may exit before a compiler child that ignored
+                    # SIGTERM. Reap the whole session even in that case.
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
