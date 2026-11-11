@@ -98,7 +98,7 @@ pub fn run(search: anytype) !void {
     const original_source = search.provenance;
     defer search.provenance = original_source;
     search.provenance = .{ .backend = .antfly, .freshness = .indexed };
-    var http = httpx.Client.initWithConfig(search.a, search.io, .{ .max_response_size = config.max_response_bytes, .pool_max_per_host = @intCast(@max(@as(usize, 5), @min(@as(usize, 8), search.options.providerJobs()) + 1)) });
+    var http = httpx.Client.initWithConfig(search.a, search.io, .{ .default_headers = &.{.{ "User-Agent", "antfly-grep/" ++ @import("grep_build_options").version }}, .max_response_size = config.max_response_bytes, .pool_max_per_host = @intCast(@max(@as(usize, 5), @min(@as(usize, 8), search.options.providerJobs()) + 1)) });
     defer http.deinit();
     var seen_memory: @import("antfly_regex").Budget = .{ .backing = search.a, .limit = config.max_page_memory };
     var seen = Seen.init(seen_memory.allocator());

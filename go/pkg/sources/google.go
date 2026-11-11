@@ -32,6 +32,7 @@ import (
 )
 
 type GoogleConfig struct {
+	PageProvenance  bool     `json:"page_provenance,omitempty"`
 	Bucket          string   `json:"bucket"`
 	Prefix          string   `json:"prefix,omitempty"`
 	Key             string   `json:"key,omitempty"`
@@ -190,15 +191,19 @@ func (c *GoogleConnector) Enumerate(ctx context.Context, r Request) (Inventory, 
 }
 func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client, r Request, config GoogleConfig, add func(Item) (bool, error)) error {
 	type object struct {
-		Name        string `json:"name"`
-		Generation  string `json:"generation"`
-		Size        string `json:"size"`
-		ContentType string `json:"contentType"`
+		Name        string            `json:"name"`
+		Generation  string            `json:"generation"`
+		Size        string            `json:"size"`
+		ContentType string            `json:"contentType"`
+		Metadata    map[string]string `json:"metadata"`
 	}
 	token := ""
 	seen := map[string]bool{}
 	for pages := 0; pages < maxImportSourceObjects; pages++ {
 		q := url.Values{"prefix": {config.Prefix}, "maxResults": {"1000"}, "fields": {"nextPageToken,items(name,generation,size,contentType)"}}
+		if config.PageProvenance {
+			q.Set("fields", "nextPageToken,items(name,generation,size,contentType,metadata)")
+		}
 		if config.Key != "" {
 			q.Set("prefix", config.Key)
 		}
@@ -230,6 +235,12 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 			// Preserve the exact suffix: a leading slash is part of the key.
 			relativeKey := strings.TrimPrefix(item.Name, config.Prefix)
 			o := Item{ID: "gcs://" + r.SourceNamespace + "/" + config.Bucket + "/" + item.Name, Path: item.Name, RelativeKey: relativeKey, RelativeKeySet: true, Filename: filepath.Base(item.Name), URL: canonical, Revision: item.Generation, Size: size, ReadMode: sourceReadBytes, SourceKind: c.ProviderName, Metadata: map[string]any{"bucket": config.Bucket, "key": item.Name, "generation": item.Generation, "mime_type": item.ContentType, "canonical_url": canonical}}
+			if config.PageProvenance {
+				for _, key := range []string{"original_pdf_uri", "original_page", "extraction_revision", "content_sha256"} {
+					o.Metadata[key] = item.Metadata[key]
+				}
+				o.Metadata["projection_uri"] = canonical
+			}
 			stop, err := add(o)
 			if err != nil || stop {
 				return err

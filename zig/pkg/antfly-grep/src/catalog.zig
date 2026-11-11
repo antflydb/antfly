@@ -119,6 +119,7 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
                 const auth = if (token) |value| try std.fmt.allocPrint(state, "Bearer {s}", .{value}) else null;
                 var headers: std.ArrayList([2][]const u8) = .empty;
                 try headers.append(state, .{ "Content-Type", "application/json" });
+                try headers.append(state, .{ "User-Agent", "antfly-grep/" ++ @import("grep_build_options").version });
                 if (auth) |value| try headers.append(state, .{ "Authorization", value });
                 if (policy) |value| try headers.append(state, .{ "X-Antfly-Catalog-Access", value });
                 var result = try http.post(url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = timeout_ms, .max_response_size = 1024 * 1024, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });

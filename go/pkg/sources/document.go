@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -72,7 +73,21 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 	if len(data) > maxImportSourceObjectBytes || !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 		return fail("source_text_extraction_required", "Inline content must be bounded UTF-8; publish binary originals through native media acquisition.")
 	}
+	digest := sha256.Sum256(data)
+	digestHex := hex.EncodeToString(digest[:])
 	uri := configString(item.Metadata, "canonical_url")
+	if item.SourceKind == ProviderGCS && configString(item.Metadata, "projection_uri") != "" {
+		original, err := url.Parse(configString(item.Metadata, "original_pdf_uri"))
+		page, pageErr := strconv.Atoi(configString(item.Metadata, "original_page"))
+		if err != nil || original.User != nil || (original.Scheme != "gs" && original.Scheme != "https") ||
+			original.Host == "" || original.RawQuery != "" || original.Fragment != "" || original.Opaque != "" ||
+			pageErr != nil || page <= 0 || configString(item.Metadata, "extraction_revision") == "" ||
+			configString(item.Metadata, "content_sha256") != digestHex {
+			return fail("source_page_provenance_invalid", "Page provenance is missing or does not match the projected text.")
+		}
+		original.Fragment = "page=" + strconv.Itoa(page)
+		uri = original.String()
+	}
 	// Pinned inventories may contain a URL emitted before S3 key escaping was
 	// fixed. Repair only canonical metadata; retain the selected key/revision.
 	if item.SourceKind == ProviderS3 && item.Path != "" {
@@ -108,8 +123,7 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 	metadata := cloneSourceMetadata(item.Metadata)
 	// Enumeration position is diagnostic bookkeeping, not document identity.
 	delete(metadata, "object_index")
-	digest := sha256.Sum256(data)
-	metadata["sha256"] = hex.EncodeToString(digest[:])
+	metadata["sha256"] = digestHex
 	metadata["provider"] = item.SourceKind
 	metadata["source_id"] = sourceID
 	metadata["identity"] = item.ID

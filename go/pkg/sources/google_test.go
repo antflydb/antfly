@@ -17,12 +17,14 @@ package sources
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -296,5 +298,24 @@ func TestGCSStagedAccessIsBoundToPinnedGeneration(t *testing.T) {
 			}
 			require.Equal(t, 1, calls)
 		})
+	}
+}
+
+func TestGCSProjectedPageProvenance(t *testing.T) {
+	text := []byte("one repaired page\n")
+	item := Item{ID: "page", Path: "page.txt", URL: "gs://projection/page.txt", Revision: "1", SourceKind: ProviderGCS,
+		Metadata: map[string]any{
+			"projection_uri":      "gs://projection/page.txt",
+			"original_pdf_uri":    "gs://original/source.pdf",
+			"original_page":       "12",
+			"extraction_revision": "3",
+			"content_sha256":      fmt.Sprintf("%x", sha256.Sum256(text)),
+		}}
+	doc, err := Normalize("test-source", item, text, Permissions{}, time.Time{})
+	if err != nil || doc.URI != "gs://original/source.pdf#page=12" || doc.Metadata["projection_uri"] != item.URL {
+		t.Fatalf("projected page citation = %q, error = %v", doc.URI, err)
+	}
+	if _, err := Normalize("test-source", item, []byte("different text"), Permissions{}, time.Time{}); err == nil {
+		t.Fatal("mismatched page text was accepted")
 	}
 }

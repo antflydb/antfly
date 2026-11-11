@@ -1002,3 +1002,14 @@ identity. The receipt is written after successful inventory and catalog
 publication; interrupted publication or older state without a receipt requires a
 normal sync before discovery can be refreshed. Refresh never extends the access
 lease or relabels an old row-key generation.
+
+For self-hosted GCS, a trusted profile may set `google_adc: true` on a
+`gcs` connection to use Application Default Credentials with read-only
+storage scope. Leave `credentials_env` and the credentials secret reference
+unset for that connection.
+
+A GCS text source may set `page_provenance: true` for projected PDF pages.
+Each object must have `original_pdf_uri`, `original_page`,
+`extraction_revision`, and `content_sha256` custom metadata. The source verifies
+the text digest, retains the projection location in metadata, and cites the
+original PDF URI with its page fragment.
