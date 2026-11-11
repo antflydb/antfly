@@ -910,7 +910,7 @@ pub const LeannStore = struct {
         if (@as(usize, graph_count) + buffered.items.len > std.math.maxInt(u32)) return error.InvalidLeannStore;
         for (buffered.items, 0..) |*row, offset| {
             row.node_id = @intCast(@as(usize, graph_count) + offset);
-            captured.plan.?.candidates[original_count + offset] = .{ .id = row.node_id, .lower = -std.math.inf(f32), .est = 0 };
+            captured.plan.?.candidates[original_count + offset] = .{ .id = row.node_id, .lower = -std.math.inf(f32), .est = 0, .exact = true };
             captured.rows.appendAssumeCapacity(row.*);
         }
         buffered.clearRetainingCapacity();

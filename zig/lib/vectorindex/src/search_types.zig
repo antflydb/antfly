@@ -93,6 +93,22 @@ pub const KeyPredicate = struct {
 pub const SourceRead = struct {
     ptr: *anyopaque,
     get_owned: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
+    /// Each output belongs to alloc; implementation releases batch read pins.
+    get_many_sorted_owned: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8, []?[]u8) anyerror!void = null,
+
+    pub fn getManySortedOwned(self: SourceRead, alloc: std.mem.Allocator, keys: []const []const u8, values: []?[]u8) !void {
+        if (keys.len != values.len) return error.InvalidArgument;
+        @memset(values, null);
+        errdefer for (values) |*value| {
+            if (value.*) |bytes| alloc.free(bytes);
+            value.* = null;
+        };
+        if (self.get_many_sorted_owned) |read| return read(self.ptr, alloc, keys, values);
+        for (keys, values) |key, *value| value.* = self.get_owned(self.ptr, alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
 };
 
 /// Releases query publication fences only after the scorer owns its inputs.

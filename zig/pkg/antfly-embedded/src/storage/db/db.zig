@@ -989,6 +989,7 @@ const PublishedDenseCatalogLookupTestHook = struct {
     release: std.Io.Event = .unset,
 };
 var test_published_dense_catalog_lookup_hook: ?*PublishedDenseCatalogLookupTestHook = null;
+var test_retained_legacy_catalog_hook: ?*PublishedDenseCatalogLookupTestHook = null;
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
@@ -5721,10 +5722,18 @@ pub const DB = struct {
         }
         // Legacy custom callbacks cannot be reconstructed. Reuse one only
         // when its named index configuration is still the retained version.
-        for (retained.core.index_manager.dense_indexes.items) |entry| {
-            if (!entry.leann_transient) continue;
-            const current = self.core.index_manager.denseIndex(entry.config.name) orelse return error.ReembedRevisionMismatch;
-            if (!std.mem.eql(u8, current.config.config_json, entry.config.config_json)) return error.ReembedRevisionMismatch;
+        {
+            try self.lockApplySharedForPortableRuntime();
+            defer self.core.unlockApplyShared();
+            if (builtin.is_test) if (test_retained_legacy_catalog_hook) |hook| {
+                hook.entered.set(hook.io);
+                hook.release.waitUncancelable(hook.io);
+            };
+            for (retained.core.index_manager.dense_indexes.items) |entry| {
+                if (!entry.leann_transient) continue;
+                const current = self.core.index_manager.denseIndex(entry.config.name) orelse return error.ReembedRevisionMismatch;
+                if (!std.mem.eql(u8, current.config.config_json, entry.config.config_json)) return error.ReembedRevisionMismatch;
+            }
         }
         config.shared_providers = source_config.shared_providers.?.retain();
         defer deinitOwnedEnrichmentConfig(alloc, &config);
@@ -47785,13 +47794,19 @@ pub const DB = struct {
             if (self.providers.runtime == null) self.providers = self.db.retainQueryProviders();
             const accounting = try self.accounting.elapsed.getOrPut(self.db.alloc, index);
             if (!accounting.found_existing) accounting.value_ptr.* = 0;
-            return .{ .reembed_elapsed_ns = accounting.value_ptr, .ptr = self, .enter = enter, .leave = leave, .read = .{ .ptr = self, .get_owned = getSource }, .before_inference = beforeInference, .after_inference = afterInference, .validate = validate };
+            return .{ .reembed_elapsed_ns = accounting.value_ptr, .ptr = self, .enter = enter, .leave = leave, .read = .{ .ptr = self, .get_owned = getSource, .get_many_sorted_owned = getSources }, .before_inference = beforeInference, .after_inference = afterInference, .validate = validate };
         }
 
         fn getSource(raw: *anyopaque, alloc: Allocator, key: []const u8) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const source = if (self.source) |*value| value else return error.InvalidArgument;
-            return alloc.dupe(u8, try source.get(key));
+            return source.getOwnedScoped(alloc, key);
+        }
+
+        fn getSources(raw: *anyopaque, alloc: Allocator, keys: []const []const u8, values: []?[]u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = if (self.source) |*value| value else return error.InvalidArgument;
+            try source.getManySortedOwnedScoped(alloc, keys, values);
         }
 
         fn enter(raw: *anyopaque) !void {
@@ -152534,4 +152549,86 @@ test "metadata replay progress borrows dense admission past a queued capture" {
     try std.testing.expect(capture_done.load(.acquire));
     try std.testing.expect(admission.lock.tryLockExclusive());
     admission.lock.unlockExclusive();
+}
+
+test "retained legacy provider catalog validation fences concurrent index deletion" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = @import("../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    const io = std.testing.io;
+    var directory = try TestDirectory.init("retained-legacy-catalog");
+    defer directory.cleanup();
+    const path = directory.path();
+    defer cleanupTempDir(path.ptr);
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .enrichment = .{ .owner_id = "retained-test", .dense_embedder = deterministic.interface() },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json =
+        \\{"field":"embedding","dims":4,"metric":"l2_squared","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"dense"},"algorithm":"leann","leann":{"vector_storage":"transient"}}
+    });
+    const Request = @import("native_query_cut_contract.zig").Request;
+    const request: Request = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000, .create = true };
+    var initial = try db.openQueryCut(request, .none);
+    initial.close();
+    var hook = PublishedDenseCatalogLookupTestHook{ .io = io };
+    test_retained_legacy_catalog_hook = &hook;
+    defer test_retained_legacy_catalog_hook = null;
+    const Reader = struct {
+        db: *DB,
+        request: Request,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var retained = self.db.openQueryCut(self.request, .none) catch |err| {
+                self.err = err;
+                return;
+            };
+            retained.close();
+        }
+    };
+    var reader = Reader{ .db = &db, .request = request };
+    reader.request.create = false;
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        hook.release.set(io);
+        reader_thread.join();
+    };
+    try hook.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    const Deleter = struct {
+        db: *DB,
+        done: std.Io.Event = .unset,
+        err: ?anyerror = null,
+        removed: bool = false,
+        fn run(self: *@This()) void {
+            defer self.done.set(std.testing.io);
+            self.removed = self.db.deleteIndex("dense") catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var deleter = Deleter{ .db = &db };
+    const delete_thread = try std.Thread.spawn(.{}, Deleter.run, .{&deleter});
+    var delete_joined = false;
+    defer if (!delete_joined) {
+        hook.release.set(io);
+        delete_thread.join();
+    };
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!db.indexCatalogBarrierActive() and !deleter.done.isSet() and monotonicTimeNs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(db.indexCatalogBarrierActive());
+    try std.testing.expect(!deleter.done.isSet());
+    hook.release.set(io);
+    reader_thread.join();
+    reader_joined = true;
+    delete_thread.join();
+    delete_joined = true;
+    if (reader.err) |err| return err;
+    if (deleter.err) |err| return err;
+    try std.testing.expect(deleter.removed);
 }

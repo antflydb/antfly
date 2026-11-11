@@ -33786,17 +33786,7 @@ pub const IndexManager = struct {
         defer if (read) |*txn| txn.abort();
         const raw_by_slot = try scratch.alloc(?[]const u8, metadata.len);
         @memset(raw_by_slot, null);
-        if (source_read) |view| {
-            for (metadata, 0..) |meta, slot| {
-                if (meta.len == 0) continue;
-                const key = try denseVectorArtifactKeyForMetadataAlloc(scratch, entry, meta);
-                raw_by_slot[slot] = view.get_owned(view.ptr, scratch, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-            }
-        }
-        if (read) |*txn| {
+        if (source_read != null or read != null) {
             const Read = struct {
                 key: []const u8,
                 slot: usize,
@@ -33813,7 +33803,13 @@ pub const IndexManager = struct {
             const keys = try scratch.alloc([]const u8, reads.items.len);
             const values = try scratch.alloc(?[]const u8, reads.items.len);
             for (reads.items, keys) |item, *key| key.* = item.key;
-            try txn.getManySorted(keys, values);
+            if (source_read) |view| {
+                const owned = try scratch.alloc(?[]u8, keys.len);
+                try view.getManySortedOwned(scratch, keys, owned);
+                for (owned, values) |bytes, *value| value.* = bytes;
+            } else if (read) |*txn| {
+                try txn.getManySorted(keys, values);
+            } else @memset(values, null);
             for (reads.items, values) |item, value| raw_by_slot[item.slot] = value;
         }
         for (vector_ids, metadata, 0..) |vector_id, meta, i| {
@@ -54612,4 +54608,104 @@ test "privacy text projection retains primary identity and removes private recei
     try std.testing.expect(std.mem.indexOf(u8, projected.stored_data, "private") == null);
     try std.testing.expect(projected.doc_ordinal == null and !projected.schema_less_fast_projection);
     try std.testing.expect(root.object.contains("_privacy"));
+}
+
+test "leann store: dirty transient buffer scores current vectors beyond default ef" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const Primary = struct {
+        vectors: [128][2]f32 = @splat(.{ 1, 1 }),
+        reads: usize = 0,
+        fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return a.dupe(f32, &self.vectors[@intCast(id)]);
+        }
+    };
+    var primary = Primary{};
+    var store = try leann_store_mod.LeannStore.open(alloc, std.testing.io, dir, .{ .dims = 2, .metric = .l2_squared, .transient = true, .replicated = true, .batch_size = 7 });
+    defer store.deinit();
+    store.setLoader(.{ .ctx = &primary, .load = Primary.load });
+    const Item = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+    var keys: [128][8]u8 = undefined;
+    var items: [128]Item = undefined;
+    for (&items, 0..) |*item, id| item.* = .{ .vector_id = id, .vector = &primary.vectors[id], .metadata = try std.fmt.bufPrint(&keys[id], "key{d:0>3}", .{id}) };
+    try store.replicated.?.noteWrites(&items, &.{});
+    var raft: u64 = 1;
+    while (try store.planRecord(alloc)) |value| {
+        var planned = value;
+        defer planned.deinit(alloc);
+        _ = try store.applyRecord(planned.record, raft, null);
+        raft += 1;
+    }
+    try std.testing.expect(store.replicated.?.replica.index == null);
+    // The committed exact buffer contains old values; source writes have
+    // advanced without publishing another LEANN record yet.
+    for (&primary.vectors, 0..) |*vector, id| vector.* = .{ @floatFromInt(127 - id), 0 };
+    try store.replicated.?.noteWrites(&items, &.{});
+    primary.reads = 0;
+    var result = try store.search(alloc, .{ .query = &.{ 0, 0 }, .k = 3 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 128), primary.reads);
+    try std.testing.expectEqual(@as(usize, 3), result.items.items.len);
+    for (result.items.items, 0..) |item, rank| try std.testing.expectEqual(@as(u64, 127 - rank), item.vector_id);
+}
+
+test "leann pinned source loader batches sorted artifact keys and restores candidate slots" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "dense", .kind = .dense_vector, .config_json =
+        \\{"field":"embedding","dims":2,"metric":"l2_squared","embedding_name":"dense","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"dense"},"algorithm":"leann","leann":{"vector_storage":"transient"}}
+    }});
+    const Source = struct {
+        keys: [3][]const u8,
+        calls: usize = 0,
+        fn get(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedScalarRead;
+        }
+        fn many(raw: *anyopaque, a: Allocator, keys: []const []const u8, values: []?[]u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 3), keys.len);
+            for (keys, values, 0..) |key, *value, position| {
+                if (position > 0) try std.testing.expect(std.mem.lessThan(u8, keys[position - 1], key));
+                for (self.keys, 0..) |expected, slot| if (std.mem.eql(u8, key, expected)) {
+                    const coordinate: f32 = @floatFromInt(slot + 1);
+                    value.* = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ coordinate, coordinate + 10 });
+                    break;
+                };
+            }
+        }
+    };
+    const metadata = [_][]const u8{ "z", "a", "m" };
+    var source = Source{ .keys = undefined };
+    for (metadata, &source.keys) |key, *encoded| encoded.* = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "dense");
+    defer for (source.keys) |key| alloc.free(key);
+    var session: LeannRecoverySession = .{ .source_read = .{ .ptr = &source, .get_owned = Source.get, .get_many_sorted_owned = Source.many } };
+    defer session.deinit();
+    const entry = manager.denseIndex("dense").?;
+    var out: [6]f32 = undefined;
+    var found: [3]bool = undefined;
+    var elapsed: u64 = 0;
+    try IndexManager.loadDenseVectorsForLeannSession(entry.vector_loader_context.?, alloc, &.{ 9, 8, 7 }, &metadata, &out, &found, &elapsed, &session);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &found);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 11, 2, 12, 3, 13 }, &out);
 }

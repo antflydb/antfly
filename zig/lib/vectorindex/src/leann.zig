@@ -398,6 +398,8 @@ fn levelFor(seed: u64, id: u32, max_degree: u32) u8 {
 }
 
 pub const PreparedCandidate = struct {
+    /// Exact-buffer rows have no routing estimate and must all be scored.
+    exact: bool = false,
     id: u32,
     lower: f32,
     est: f32,
@@ -431,6 +433,18 @@ pub const PreparedSearch = struct {
         var pool = std.ArrayListUnmanaged(PreparedCandidate).fromOwnedSlice(self.candidates);
         self.candidates = &.{};
         defer pool.deinit(alloc);
+        var exact_ids: std.ArrayListUnmanaged(u32) = .empty;
+        defer exact_ids.deinit(alloc);
+        var routed: usize = 0;
+        for (pool.items) |candidate| {
+            if (candidate.exact) {
+                try exact_ids.append(alloc, candidate.id);
+            } else {
+                pool.items[routed] = candidate;
+                routed += 1;
+            }
+        }
+        pool.items.len = routed;
         // PQ has no admissible bounds. RaBitQ bounds describe the original
         // vectors, so they also cannot prune reranking of quantized copies.
         // Score the estimated shortlist first, then refill if vectors are missing.
@@ -474,6 +488,18 @@ pub const PreparedSearch = struct {
         var buf = std.ArrayListUnmanaged(f32).empty;
         defer buf.deinit(alloc);
         const chunk: usize = if (opts.batch_size > 0) opts.batch_size else if (opts.exhaustive) 128 else @max(k, 1);
+        var exact_offset: usize = 0;
+        const exact_batch: usize = if (opts.batch_size > 0) opts.batch_size else 128;
+        while (exact_offset < exact_ids.items.len) {
+            try RecomputeGate.checkCancellation(opts.gate);
+            if (!try RecomputeGate.open(opts.gate)) return error.ReembedBudgetExceeded;
+            const end = @min(exact_offset + exact_batch, exact_ids.items.len);
+            const batch = exact_ids.items[exact_offset..end];
+            try dists.resize(alloc, batch.len);
+            try recomputePreparedDistances(alloc, self.metric, self.dims, source, q, batch, &buf, dists.items, stats);
+            try admitPreparedDistances(alloc, source, opts, batch, dists.items, &top, stats);
+            exact_offset = end;
+        }
         var i: usize = 0;
         var unrecomputed_from: ?usize = null;
         while (i < candidates_view.len) {
@@ -523,18 +549,7 @@ pub const PreparedSearch = struct {
             }
             try dists.resize(alloc, ids.items.len);
             try recomputePreparedDistances(alloc, self.metric, self.dims, source, q, ids.items, &buf, dists.items, stats);
-            for (ids.items, dists.items) |id, dist| {
-                if (!std.math.isFinite(dist)) continue;
-                if (opts.distance_over) |over| if (!(dist > over)) continue;
-                if (opts.distance_under) |under| if (!(dist < under)) continue;
-                stats.matches.verified += 1;
-                const c = FilteredCandidate{ .dist = dist, .id = id, .order = if (source.result_order) |order| order(source.ctx, id) else id };
-                if (top.len() < k) {
-                    try top.push(alloc, c);
-                } else if (FilteredCandidate.lessThan({}, c, top.top())) {
-                    top.replaceTop(c);
-                }
-            }
+            try admitPreparedDistances(alloc, source, opts, ids.items, dists.items, &top, stats);
         }
         if (unrecomputed_from) |from| {
             // Out of budget: rank the rest by estimate rather than return
@@ -563,6 +578,21 @@ pub const PreparedSearch = struct {
         return .{ .results = results, .stats = stats.* };
     }
 };
+
+fn admitPreparedDistances(alloc: Allocator, source: EmbeddingSource, opts: SearchOptions, ids: []const u32, distances: []const f32, top: *FilteredHeap, stats: *SearchStats) !void {
+    for (ids, distances) |id, dist| {
+        if (!std.math.isFinite(dist)) continue;
+        if (opts.distance_over) |over| if (!(dist > over)) continue;
+        if (opts.distance_under) |under| if (!(dist < under)) continue;
+        stats.matches.verified += 1;
+        const candidate = FilteredCandidate{ .dist = dist, .id = id, .order = if (source.result_order) |order| order(source.ctx, id) else id };
+        if (top.len() < opts.k) {
+            try top.push(alloc, candidate);
+        } else if (FilteredCandidate.lessThan({}, candidate, top.top())) {
+            top.replaceTop(candidate);
+        }
+    }
+}
 
 fn recomputePreparedDistances(alloc: Allocator, metric: Metric, dims: u32, source: EmbeddingSource, q: []const f32, ids: []const u32, buf: *std.ArrayListUnmanaged(f32), out: []f32, stats: *SearchStats) !void {
     if (ids.len == 0) return;
@@ -5092,4 +5122,28 @@ test "leann: prepared scoring breaks ties by the source public identity" {
     var result = try plan.score(alloc, .{ .ctx = &context, .recompute_fn = Source.recompute, .result_order = Source.order }, &.{0}, .{ .k = 1, .ef = 3 });
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), result.results[0].id);
+}
+
+test "leann: exact buffer scoring is independent of the graph shortlist" {
+    const alloc = std.testing.allocator;
+    var plan = PreparedSearch{ .candidates = try alloc.alloc(PreparedCandidate, 131), .metric = .l2_squared, .dims = 1, .has_bounds = false };
+    defer plan.deinit(alloc);
+    for (plan.candidates, 0..) |*candidate, id| candidate.* = .{ .id = @intCast(id), .lower = 0, .est = 0, .exact = id >= 3 };
+    const Source = struct {
+        scored: usize = 0,
+        largest_batch: usize = 0,
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scored += ids.len;
+            self.largest_batch = @max(self.largest_batch, ids.len);
+            for (ids, out) |id, *value| value.* = @floatFromInt(130 - id);
+        }
+    };
+    var source = Source{};
+    var result = try plan.score(alloc, .{ .ctx = &source, .recompute_fn = Source.recompute }, &.{0}, .{ .k = 2, .ef = 2, .batch_size = 7 });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 130), result.results[0].id);
+    try std.testing.expectEqual(@as(u32, 129), result.results[1].id);
+    try std.testing.expectEqual(@as(usize, 130), source.scored);
+    try std.testing.expect(source.largest_batch <= 7);
 }
