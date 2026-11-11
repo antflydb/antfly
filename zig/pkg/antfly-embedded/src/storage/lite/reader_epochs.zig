@@ -62,27 +62,36 @@ const Namespace = struct {
     /// `parentUnchanged`.
     parent_inode: u64,
     fn open(a: Allocator, io: std.Io, path: []const u8, publication: bool, no_sync: bool) !Namespace {
-        // Resolve the `.aflite` file's parent directory *once*, as an
-        // already-open handle, and reuse that same handle for everything
-        // below -- rather than asking the OS to canonicalize a cwd-relative
-        // *string* (`std.fs.path.dirname(path) orelse "."`) and then
-        // re-opening whatever string comes back. A relative `path`
-        // resolved against a cwd that is not exactly what the caller
-        // expects at that instant silently points the whole reader-epoch
-        // namespace, and the "identity" marker inside it, at the wrong
-        // directory entirely -- observed in practice as a bare `identity`
-        // file landing directly in the process's cwd instead of inside its
-        // own `.aflite-readers-*` directory next to the `.aflite` file.
-        // Opening the parent directory *handle* once up front (never a
-        // fresh cwd lookup) removes that dependency for the rest of this
-        // call, including the final `realPathFile` below: resolved against
-        // this already-open, already-pinned `parent`, not cwd, so a
-        // symlink alias still canonicalizes to the same namespace its
-        // target binds (`std.Io.Dir.realPathFile` is "generally advisable
-        // to avoid" per its own doc only because a cwd-relative `sub_path`
-        // reintroduces that same dependency -- `realPath`, used on `parent`
-        // itself until this change, carries the identical caveat).
-        var parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{});
+        // Resolve `path` to an absolute path *once*, before any directory
+        // lookup, and use only that absolute string from here on. A
+        // relative `path` -- including one with its own directory
+        // component, e.g. "subdir/x.aflite", not only a bare filename --
+        // otherwise forces the very first lookup below
+        // (`std.fs.path.dirname(path) orelse "."`, opened via
+        // `Dir.cwd().openDir`) to implicitly re-read whatever the process
+        // cwd happens to be at that exact instant. A concurrent
+        // `chdir`/`setCurrentPath` anywhere else in the process in the
+        // window between this function being entered and that one syscall
+        // can silently resolve the reader-epoch namespace -- and the
+        // "identity" marker inside it -- into the wrong directory entirely:
+        // observed in practice as a bare `identity` file landing directly
+        // in the process's cwd instead of inside its own
+        // `.aflite-readers-*` directory next to the `.aflite` file.
+        // Capturing cwd into an absolute path exactly once, right here,
+        // removes that window: an absolute path's lookup ignores cwd
+        // entirely (POSIX `openat` with an absolute `pathname` ignores
+        // `dirfd`), so nothing below this point depends on cwd again --
+        // including the already-open-handle reuse this function already
+        // did for the rest of the call (see the `target_parent` reopen
+        // below, which only ever receives `dirname(canonical)`, itself
+        // always absolute).
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved_path: []const u8 = if (std.fs.path.isAbsolute(path)) path else blk: {
+            const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
+            break :blk try std.fs.path.join(a, &.{ cwd_buf[0..cwd_len], path });
+        };
+        defer if (resolved_path.ptr != path.ptr) a.free(@constCast(resolved_path));
+        var parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(resolved_path) orelse "/", .{});
         var parent_open = true;
         errdefer if (parent_open) parent.close(io);
         if (!publication) {
