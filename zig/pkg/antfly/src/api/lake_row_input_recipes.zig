@@ -117,6 +117,10 @@ pub fn nativeFragmentsEligible(configs: std.json.Value) bool {
     if (configs != .object) return false;
     for (configs.object.values()) |config| {
         if (!configurationReusable(config)) return false;
+        // Offline construction consumes one complete physical snapshot. A
+        // fragment payload plane would duplicate the vector corpus before that
+        // scan, and can exhaust optional capture admission on large imports.
+        if (@import("lake_enrichment_units.zig").configured(config, "lake_bulk_build") != null) return false;
         const kind = config.object.get("type") orelse return false;
         if (kind != .string or !(std.mem.eql(u8, kind.string, "full_text") or std.mem.eql(u8, kind.string, "embeddings") or std.mem.eql(u8, kind.string, "algebraic"))) return false;
     }
@@ -319,10 +323,10 @@ test "external lake input recipes share cohort evidence but independently bind d
     try std.testing.expect(std.mem.indexOf(u8, wire, "binding") == null);
 }
 
-test "external lake input recipes decline payload capture for enrichment and legacy consumers" {
+test "external lake execution input recipes decline payload capture for enrichment legacy and whole-source consumers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    for ([_][]const u8{ "{}", "{\"text\":{\"type\":\"full_text\",\"field\":\"body\"}}", "{\"graph\":{\"type\":\"graph\"}}", "{\"text\":{\"type\":\"full_text\",\"enrichments\":[{}]}}" }, 0..) |bytes_, i| {
+    for ([_][]const u8{ "{}", "{\"text\":{\"type\":\"full_text\",\"field\":\"body\"}}", "{\"graph\":{\"type\":\"graph\"}}", "{\"text\":{\"type\":\"full_text\",\"enrichments\":[{}]}}", "{\"dense\":{\"type\":\"embeddings\",\"lake_bulk_build\":\"lloyd\"}}", "{\"dense\":{\"type\":\"embeddings\",\"lake_bulk_build\":\"emeans\"}}" }, 0..) |bytes_, i| {
         const config = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes_, .{});
         try std.testing.expectEqual(i < 2, nativeFragmentsEligible(config));
     }

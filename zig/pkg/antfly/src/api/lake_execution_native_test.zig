@@ -22,6 +22,8 @@ const catalog = local.metadata_lake_index_catalog;
 const A = std.mem.Allocator;
 comptime {
     _ = @import("lake_index_native_state.zig");
+    _ = @import("lake_row_fingerprints.zig");
+    _ = @import("lake_row_input_recipes.zig");
     if (!@hasDecl(@import("lake_execution_options"), "external_test_provider")) @import("lake_execution_native_provider.zig").exportOperations();
 }
 

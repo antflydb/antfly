@@ -3,7 +3,10 @@
 Fresh native Parquet lake indexes can select sampled hierarchical Lloyd or
 e-means construction. The build operates on the complete source snapshot.
 Configurations with offline clustering run as whole-source consumers in the
-lake producer pipeline. Subsequent published-generation updates use the native
+lake producer pipeline. They use the physical source provider and skip optional
+logical fragment payload capture and assembly, avoiding another vector-corpus
+copy ahead of the bulk scan. Stable row membership and input evidence remain
+verified. Subsequent published-generation updates use the native
 incremental mutation path.
 
 ## Configuration
@@ -47,7 +50,9 @@ separately to process RSS.
    float32 vectors. Repetition and definition levels preserve rows across page
    boundaries and distinguish null lists from empty lists. The reader retains
    one physical page and a bounded output cohort. Shared producer replay keeps
-   vector values in packed float32 form. SQL and stored-source consumers
+   vector values in packed float32 form. Identity evidence hashes canonical
+   coordinate bits in bounded blocks, preserving its existing digest without
+   issuing a hash update for every coordinate. SQL and stored-source consumers
    materialize JSON arrays when their requested result requires them.
 2. Scan the immutable source with its existing cancellation, identity, enrichment,
    and file-state tracking. Sort bounded 16 MiB batches of original vectors and
