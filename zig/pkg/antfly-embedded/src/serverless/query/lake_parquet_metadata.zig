@@ -2075,7 +2075,7 @@ fn buildSingleColumnMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &rg_prev, 5, .i64);
     try appendI64(&out, alloc, 100);
-    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendField(&out, alloc, &rg_prev, 7, .i16);
     try appendI64(&out, alloc, 0);
     try appendStop(&out, alloc);
 
@@ -2156,7 +2156,7 @@ fn buildSingleColumnMetadataFixtureWithSchema(alloc: Allocator, nullable: bool) 
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &rg_prev, 5, .i64);
     try appendI64(&out, alloc, 100);
-    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendField(&out, alloc, &rg_prev, 7, .i16);
     try appendI64(&out, alloc, 0);
     try appendStop(&out, alloc);
 
@@ -2275,7 +2275,7 @@ fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &rg_prev, 5, .i64);
     try appendI64(&out, alloc, 100);
-    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendField(&out, alloc, &rg_prev, 7, .i16);
     try appendI64(&out, alloc, 0);
     try appendStop(&out, alloc);
 
