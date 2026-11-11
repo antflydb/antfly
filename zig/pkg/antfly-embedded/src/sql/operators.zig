@@ -802,7 +802,9 @@ pub const Aggregate = struct {
                 if (self.selected) |current| {
                     const order = try scalar.compareDatums(value, current.row.values[0]);
                     if (order != (if (self.kind == .min) std.math.Order.lt else .gt)) {
-                        self.count += 1;
+                        // Extrema retain presence even when the incoming value
+                        // does not replace the winner, including legacy weights.
+                        self.count = 1;
                         return;
                     }
                 }
