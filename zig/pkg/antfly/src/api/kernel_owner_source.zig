@@ -7413,13 +7413,13 @@ test "current catalog acquisition replaces a replay-only owner with the same des
     {
         var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
         defer initial.deinit();
-        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+        try applyCommittedForTest(&initial, alloc, 1, "docs", descriptor, .{
             .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
         }, 1, 1);
     }
     var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.deinit();
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, .{
         .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
     }, 1, 2);
     try std.testing.expectEqual(@as(u64, 1), source.cacheStats().miss_count);
