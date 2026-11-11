@@ -53,10 +53,11 @@ Every request includes `format: 1`, `catalog_uri`, `dataset` (32 bytes encoded a
 | `read` | `segment_id`, `source`, `output` | Acquire a bounded reader pin, verify bytes, write the output file |
 | `restore` | `segment_id`, `expected_revision`, `source`, `destination` | Restore an archive into local placement without deleting the archive |
 | `reclaim_local` | `segment_id`, `source` | Advance reader-safe local eviction; repeat until `complete: true` |
+| `reclaim_upload` | `source` | Fence and reclaim one abandoned upload; repeat while `complete: true` reports reclaimed work |
 | `hold` / `release_hold` | `segment_id`, `dependency` | Register/release an exact downstream consumer-generation hold |
 | `retire` | `segment_id`, `expected_revision` | Fence new readers after logical expiration, subject to holds/readers |
 | `compact` | `segment_id` | Replace a fully collected oldest tombstone with the durable partition retirement floor |
-| `collect` | `segment_id`, `source` | Delete one retired physical copy and record completion |
+| `collect` | `segment_id`, `source` | Reclaim one retired physical payload and record completion |
 
 A location binding is `{ "id": [...], "uri": "file:///path/prefix", "access": "local" }`. Access is `local`, `queryable`, or `restore_required`. At this layer `queryable` means directly readable by a host with an admitted decoder; it does not create a SQL table. An archive marked `restore_required` rejects new reader pins until restored.
 

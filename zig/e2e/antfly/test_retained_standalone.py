@@ -114,7 +114,8 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         )
         try:
             with urllib.request.urlopen(request, timeout=5) as response:
-                return json.load(response)
+                content = response.read()
+                return json.loads(content) if content else None
         except urllib.error.HTTPError as exc:
             raise OSError(
                 f"{method} {path} -> {exc.code}: {exc.read().decode()}"
