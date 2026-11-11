@@ -116,9 +116,14 @@ Explicit local copies without acquisition receipts have no asserted official
 provenance. The catalog cannot be used as an Antfly load manifest.
 
 Uploads use ADC and the create-only publisher identity, with resumable GCS
-uploads, an 8 MiB buffer per in-flight upload, and CRC32C validation before
-finalization. Upload concurrency defaults to 8 (`--concurrency 1–16`), while
-catalog order and hashes remain deterministic. Active spool files are bounded
+uploads and CRC32C validation before finalization. Each in-flight upload uses
+a 256 KiB-aligned buffer sized to its object, capped at 8 MiB; tiny objects use
+256 KiB rather than allocating the large-object buffer. Upload concurrency defaults to 8 (`--concurrency 1–16`), while
+catalog order and hashes remain deterministic. Completions refill any available
+worker slot; a slow early object does not stall later uploads. A temporary
+disk-backed ordinal index restores source order at publication, with a fixed
+16-byte slot per object and a metadata log; it retains no corpus-sized reorder
+map in memory. Active spool files are bounded
 by concurrency times the maximum object size; failed workers cancel siblings
 and remove their owned spools before returning.
 SHA-addressed objects are reused only after size/checksum verification; staged
@@ -370,7 +375,8 @@ antfly-grep --table-config ./grepstein-corpus/grep.json 'pattern'
 antfly-grep --table-config ./grepstein-corpus/grep.json --artifact chunks 'pattern'
 ```
 
-Qualification streams the sealed manifest through at most four concurrent
+Qualification checks both extraction-unit and chunk index readiness, then
+streams the sealed manifest through at most four concurrent
 workers by default. Set `qualify --concurrency 1` for a constrained instance or
 choose another limit from 1–32. Each worker still verifies the current source
 and raw native completion evidence; an error cancels sibling requests and the
@@ -501,7 +507,10 @@ python3 benchmark_corpus.py --antfly /absolute/path/antfly \
 
 Inference timings distinguish cold/warm model use, disable prompt caching, use
 distinct embedding/extraction inputs, validate completed work, and record GPU
-contention. A failed or truncated page has no completed-page throughput. The
+contention. Extraction samples require real entity spans with exact input offsets,
+evidenced relation endpoints and the expected John → worked for → Apple
+relationship. A nonempty JSON container alone does not qualify extraction.
+A failed or truncated page has no completed-page throughput. The
 native runner reports extraction time and incomplete units with OCR disabled;
 it does not call an incomplete artifact a successful OCR result. Both runners
 stop their own processes on exit and accept explicit sample/time/byte limits.
@@ -537,7 +546,8 @@ before any writes, saving `append-plan.json` with new/reused counts and the
 manifest/table/configuration binding. Matching existing primary documents are
 reused without any write; a changed existing ID aborts the preflight. Uploader
 `indexed_at` alone is ignored during comparison. All source fields, permissions,
-and metadata remain significant. Newly absent IDs use an OCC transaction with
+and metadata remain significant. Numbers are decoded losslessly, including
+nanosecond timestamps larger than the exact-integer range of a float64. Newly absent IDs use an OCC transaction with
 version-zero predicates, so another writer cannot turn the append into an
 accidental update. A conflict or unknown commit outcome stops the command. Run
 it again with the same state: observed identical primaries are reused, including
@@ -582,8 +592,14 @@ python3 stage_large.py --grepstein /usr/local/bin/grepstein \
   --expected-plan-sha256 750e308470b7046616906dce2c011accdc19422d8964e82ff2d79a1ade5e2f4a
 ```
 
-The driver pins the metadata plan before content transfer; changed metadata
-requires a fresh inventory. Defaults bound compressed and total uncompressed
+The driver serializes orchestration in each state, pins the original in-memory
+metadata plan before content transfer, and rejects changed source identities
+afterward. It holds the CLI acquisition lock while inspecting receipts and
+staging, so a standalone acquisition cannot replace cached revisions midway.
+Every completed acquisition receipt must match the pinned source identity.
+Changed metadata requires a fresh inventory. After a crashed process, verify
+that no acquisition/staging process is running before removing an abandoned
+`archives/.lock` directory; the workflow file lock releases automatically. Defaults bound compressed and total uncompressed
 inputs to 270 GB each, with an 8 GiB maximum member. Each release/revision seals
 its own raw GCS catalog. Downloads retain revision-bound partial files and resume
 only exact HTTP ranges, falling back to a full replacement download when a

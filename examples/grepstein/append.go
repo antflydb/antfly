@@ -17,6 +17,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -99,7 +100,9 @@ func corpusAppendExistingContext(ctx context.Context, client *http.Client, table
 		return false, err
 	}
 	var current map[string]any
-	if err := json.Unmarshal(raw, &current); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&current); err != nil {
 		return false, err
 	}
 	if nested, ok := current["_source"].(map[string]any); ok {

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import unittest
 
 from benchmark_inference import validate
@@ -45,6 +46,64 @@ class CompletedWorkTests(unittest.TestCase):
     def test_empty_extraction_does_not_qualify_the_model_sample(self):
         with self.assertRaises(ValueError):
             validate("extract", {"data": [{"entities": []}]}, 1)
+
+    def test_extraction_requires_real_spans_and_relationship_evidence(self):
+        content = "John works at Apple."
+        item = {
+            "entities": [
+                {"text": "John", "label": "person", "start": 0, "end": 4},
+                {"text": "Apple", "label": "organization", "start": 14, "end": 19},
+            ],
+            "relations": [
+                {
+                    "type": "worked for",
+                    "source": {"text": "John"},
+                    "target": {"text": "Apple"},
+                }
+            ],
+        }
+        inputs = [{"content": content}]
+        validate(
+            "extract",
+            {"data": [item]},
+            1,
+            ("John", "Apple"),
+            inputs,
+            (("John", "worked for", "Apple"),),
+        )
+        for mutation in (
+            "grouped",
+            "empty",
+            "missing-relation",
+            "bad-endpoint",
+            "bad-offset",
+            "missing-entity",
+            "wrong-relation",
+        ):
+            bad = copy.deepcopy(item)
+            if mutation == "grouped":
+                bad["entities"] = {"person": []}
+            elif mutation == "empty":
+                bad["entities"] = [{}]
+            elif mutation == "missing-relation":
+                bad["relations"] = []
+            elif mutation == "bad-endpoint":
+                bad["relations"][0]["target"]["text"] = "Google"
+            elif mutation == "bad-offset":
+                bad["entities"][0]["end"] = 3
+            elif mutation == "missing-entity":
+                bad["entities"] = bad["entities"][:1]
+            elif mutation == "wrong-relation":
+                bad["relations"][0]["type"] = "visited"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate(
+                    "extract",
+                    {"data": [bad]},
+                    1,
+                    ("John", "Apple"),
+                    inputs,
+                    (("John", "worked for", "Apple"),),
+                )
 
 
 if __name__ == "__main__":

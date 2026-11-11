@@ -17,14 +17,48 @@
 """Inventory or preserve the selected large archive snapshots; never index them."""
 
 import argparse
+import fcntl
 import json
-from pathlib import Path
+import re
 import subprocess
 import zipfile
+from pathlib import Path
+
+IDENTITY_FIELDS = (
+    "dataset",
+    "item",
+    "url",
+    "file",
+    "official_status",
+    "mirror_reported_status",
+)
+
+
+def receipt_identity(receipt):
+    return {key: receipt.get(key) for key in IDENTITY_FIELDS}
+
+
+def plan_identity(plan):
+    # Retrieval timestamps are diagnostic; source identities and budgets are pinned.
+    return [
+        (r["destination"], r["bytes"], receipt_identity(r["receipt"]))
+        for r in plan["archives"]
+    ]
 
 
 def run(args):
     root = args.state.resolve()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Serialize the entire orchestration, not just individual CLI subprocesses.
+    with (root / ".stage-large.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("another staging workflow owns this state") from error
+        return stage_locked(args, root)
+
+
+def stage_locked(args, root):
     archives = root / "archives"
     binary = str(args.grepstein.resolve())
     common = [
@@ -48,13 +82,35 @@ def run(args):
         raise ValueError("--execute requires the reviewed --expected-plan-sha256")
     # The CLI repeats the metadata check immediately before any downloads.
     subprocess.run(common + ["--expected-plan-sha256", plan["sha256"]], check=True)
+    # Share the CLI's acquisition lock while inspecting and consuming cached
+    # revisions. A standalone inventory/download cannot replace a receipt midway
+    # through staging. A crashed lock needs explicit removal, as for the CLI.
+    lock = archives / ".lock"
+    try:
+        lock.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise ValueError("archive acquisition state is locked") from error
+    try:
+        return stage_acquired(args, root, archives, binary, plan)
+    finally:
+        lock.rmdir()
+
+
+def stage_acquired(args, root, archives, binary, plan):
     verified = json.loads((archives / "acquisition-plan.json").read_text())
+    if verified.get("sha256") != plan["sha256"] or plan_identity(
+        verified
+    ) != plan_identity(plan):
+        raise ValueError("acquisition plan changed during transfer")
+    # Consume the original in-memory plan, never a later mutable inventory.
     stages = []
     total = 0
-    for archive in verified["archives"]:
+    for archive in plan["archives"]:
         destination = Path(archive["destination"]).resolve()
         receipt = json.loads(Path(str(destination) + ".json").read_text())
-        if not receipt.get("sha256"):
+        if receipt_identity(receipt) != receipt_identity(archive["receipt"]):
+            raise ValueError("acquisition receipt differs from the pinned plan")
+        if not re.fullmatch("[a-f0-9]{64}", receipt.get("sha256", "")):
             raise ValueError("archive has no completed acquisition receipt")
         with zipfile.ZipFile(destination) as source:
             members = [f for f in source.infolist() if not f.is_dir()]
@@ -95,7 +151,7 @@ def run(args):
         )
     output = root / "staging-complete.json"
     payload = {
-        "acquisition_plan_sha256": verified["sha256"],
+        "acquisition_plan_sha256": plan["sha256"],
         "raw_bytes": total,
         "antfly_loaded": False,
         "coverage": "selected archive snapshots only; official/media completeness unverified",

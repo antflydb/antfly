@@ -70,3 +70,28 @@ table replacement, cancelled attempts, dependency retention, process restart,
 replica ownership transfer, and aborted-candidate collection. Until these pass,
 full replacement remains the correct publication path; changed-source updates
 must not be advertised as incremental.
+
+## Append preflight and bulk primary reads
+
+The independent Grepstein append path currently verifies each candidate against
+its linearizable primary before writing. Its four-worker window bounds requests,
+but the number of round trips remains proportional to the manifest. Ordinary
+bulk document-ID search is not a substitute: a query miss need not prove primary
+absence while indexing is pending. Using it for preflight would miss late
+conflicts and permit partial submission of an otherwise conflicting inventory.
+
+The native optimization needs an authenticated, bounded bulk **primary** lookup
+contract. Bind requests and responses to the table UUID, reject duplicates and
+partial results, return an explicit found/absent/error outcome and primary version
+for every requested key, and preserve all source JSON fields and integer
+precision. Read consistency must be explicit and equivalent to the current
+linearizable point lookup; shard transport failures cannot be reported as absent.
+Pagination/body/key budgets and cancellation must bound retained work. Reuse is
+valid only after full document equality; inserts must still carry version-zero
+OCC predicates because the preflight and commit are distinct operations.
+
+Test delayed index visibility, table replacement, concurrent inserts, shard
+failures, oversized requests and lost responses before switching the loader.
+Measure primary read work, HTTP requests and retained bytes at corpus scale.
+This API is not implemented by the current follow-up; the loader deliberately
+retains authoritative point reads until these semantics exist.

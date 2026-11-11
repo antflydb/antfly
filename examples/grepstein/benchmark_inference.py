@@ -21,13 +21,11 @@ contention. This is a stage sample, not an end-to-end corpus or A100 qualificati
 """
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import base64
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import socket
 import subprocess
@@ -35,6 +33,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 
 def hardware():
@@ -45,6 +45,7 @@ def hardware():
     ):
         run = subprocess.run(
             ["nvidia-smi", query, "--format=csv,noheader"],
+            check=False,
             capture_output=True,
             text=True,
             timeout=10,
@@ -67,10 +68,10 @@ def request(base, route, body, timeout):
         return json.loads(response.read())
 
 
-def validate(kind, response, count, required=()):
+def validate(kind, response, count, required=(), inputs=(), expected_relations=()):
     if response.get("error") or len(response.get("data", [])) != count:
         raise ValueError(response)
-    for item in response["data"]:
+    for index, item in enumerate(response["data"]):
         if item.get("error"):
             raise ValueError(item)
         if kind == "ocr":
@@ -84,8 +85,53 @@ def validate(kind, response, count, required=()):
                 if value.casefold() not in item["text"].casefold():
                     raise ValueError("OCR missed required text: " + value)
         elif kind == "extract":
-            if not item.get("entities"):
-                raise ValueError("extraction returned no expected entity groups")
+            entities, relations = item.get("entities"), item.get("relations")
+            if not isinstance(entities, list) or not entities:
+                raise ValueError("extraction returned no entity spans")
+            if not all(
+                isinstance(e, dict)
+                and isinstance(e.get("text"), str)
+                and e["text"]
+                and isinstance(e.get("label"), str)
+                and e["label"]
+                for e in entities
+            ):
+                raise ValueError("malformed extraction entities")
+            for value in required:
+                if not any(value.casefold() == e["text"].casefold() for e in entities):
+                    raise ValueError("extraction missed required entity: " + value)
+            if not isinstance(relations, list) or not relations:
+                raise ValueError("relationship sample returned no relationships")
+            for relation in relations:
+                if not isinstance(relation, dict) or not relation.get("type"):
+                    raise ValueError("malformed extraction relationship")
+                for side in ("source", "target"):
+                    endpoint = relation.get(side)
+                    if not isinstance(endpoint, dict) or not endpoint.get("text"):
+                        raise ValueError("relationship endpoint is missing")
+                    if not any(endpoint["text"] == e["text"] for e in entities):
+                        raise ValueError("relationship endpoint has no entity evidence")
+            for source, relation_type, target in expected_relations:
+                if not any(
+                    r["type"] == relation_type
+                    and r["source"]["text"] == source
+                    and r["target"]["text"] == target
+                    for r in relations
+                ):
+                    raise ValueError(
+                        "extraction missed a required fixture relationship"
+                    )
+            if inputs:
+                content = inputs[index]["content"]
+                for entity in entities:
+                    start, end = entity.get("start"), entity.get("end")
+                    if (
+                        type(start) is not int
+                        or type(end) is not int
+                        or not 0 <= start < end <= len(content)
+                        or content[start:end] != entity["text"]
+                    ):
+                        raise ValueError("entity offsets do not match the input")
         elif kind == "embed":
             vector = item.get("embedding", [])
             if len(vector) != 768 or not all(math.isfinite(x) for x in vector):
@@ -174,7 +220,7 @@ def run(args):
     started = time.monotonic()
     report_lock = threading.Lock()
 
-    def timed(kind, label, route, body, count=1, required=()):
+    def timed(kind, label, route, body, count=1, required=(), expected_relations=()):
         remaining = args.budget_seconds - (time.monotonic() - started)
         if remaining < 5:
             raise TimeoutError("benchmark wall-clock budget exhausted")
@@ -189,7 +235,14 @@ def run(args):
         }
         try:
             response = request(base, route, body, min(args.request_seconds, remaining))
-            validate(kind, response, count, required)
+            validate(
+                kind,
+                response,
+                count,
+                required,
+                body.get("inputs", ()),
+                expected_relations,
+            )
             row.update(
                 complete=True,
                 usage=response.get("usage"),
@@ -322,8 +375,10 @@ def run(args):
                             "long_document": {"mode": "window"},
                         },
                     },
+                    required=("John", "Apple"),
+                    expected_relations=(("John", "worked for", "Apple"),),
                 )
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 -- always preserve failed benchmark evidence
         report["error"] = str(error)
     finally:
         server.terminate()

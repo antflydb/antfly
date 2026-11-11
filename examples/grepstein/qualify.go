@@ -105,16 +105,20 @@ func qualifyCorpusWithConcurrency(ctx context.Context, client *http.Client, tabl
 		return q, err
 	}
 	q.PublicationSHA256 = publication.SHA256
-	raw, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/indexes/"+corpusTextIndex, nil)
-	if err != nil {
-		return q, err
-	}
-	ready, err := indexComplete(raw)
-	if err != nil {
-		return q, err
-	}
-	if !ready {
-		return q, fmt.Errorf("full-text index is not complete and queryable")
+	// Both public grep streams must be ready. Chunk completion alone does not
+	// establish that the extraction-unit index has published its new revision.
+	for _, index := range []string{corpusTextIndex, corpusUnitsIndex} {
+		raw, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/indexes/"+index, nil)
+		if err != nil {
+			return q, err
+		}
+		ready, err := indexComplete(raw)
+		if err != nil {
+			return q, err
+		}
+		if !ready {
+			return q, fmt.Errorf("index %s is not complete and queryable", index)
+		}
 	}
 	file, err := os.Open(filepath.Join(state, "published.ndjson"))
 	if err != nil {

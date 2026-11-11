@@ -372,3 +372,86 @@ func TestStageOriginalsRecoversOnlyOwnedOrphanSpools(t *testing.T) {
 		t.Fatal("cleanup deleted unrelated state")
 	}
 }
+
+func TestOriginalUploadChunkSizing(t *testing.T) {
+	for _, test := range []struct {
+		size int64
+		want int
+	}{
+		{0, 256 << 10}, {1, 256 << 10}, {256 << 10, 256 << 10}, {(256 << 10) + 1, 512 << 10}, {8 << 20, 8 << 20}, {1 << 40, 8 << 20},
+	} {
+		if got := originalUploadChunkSize(test.size); got != test.want {
+			t.Fatalf("size %d: %d != %d", test.size, got, test.want)
+		}
+	}
+}
+
+func TestSlowOriginalDoesNotBlockFreeUploadSlots(t *testing.T) {
+	source := t.TempDir()
+	for i := 0; i < 12; i++ {
+		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("%02d.pdf", i)), []byte(fmt.Sprintf("source-%d", i)))
+	}
+	first, fourth := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(first) })
+	var calls atomic.Int64
+	put := func(ctx context.Context, _ string, key string, _ io.ReadSeeker, record originalRecord) (string, error) {
+		if strings.HasPrefix(key, "originals-catalogs/") {
+			return "42", nil
+		}
+		if calls.Add(1) == 4 {
+			close(fourth)
+		}
+		if strings.HasSuffix(record.Name, "00.pdf") {
+			select {
+			case <-first:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		return "42", nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- stageOriginalsConcurrent(ctx, t.TempDir(), "originals", []corpusSource{{Dataset: "doj-08", Path: source}}, 10000, 1000, put, 3)
+	}()
+	select {
+	case <-fourth:
+	case <-ctx.Done():
+		t.Fatal("slow first upload stalled free slots")
+	}
+	// Release before waiting, without allowing a second close in cleanup.
+	release.Do(func() { close(first) })
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOriginalCompletionIndexOrdersAndRejectsHoles(t *testing.T) {
+	order, err := newOriginalOrder(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer order.Close()
+	a, b := originalRecord{Name: "a"}, originalRecord{Name: "b"}
+	if err := order.Add(1, b); err != nil {
+		t.Fatal(err)
+	}
+	if err := order.Emit(1, io.Discard); err == nil {
+		t.Fatal("accepted missing ordinal")
+	}
+	if err := order.Add(0, a); err != nil {
+		t.Fatal(err)
+	}
+	var got, want bytes.Buffer
+	if err := order.Emit(2, &got); err != nil {
+		t.Fatal(err)
+	}
+	json.NewEncoder(&want).Encode(a)
+	json.NewEncoder(&want).Encode(b)
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatal("completion order changed catalog")
+	}
+}

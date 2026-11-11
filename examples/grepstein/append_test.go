@@ -263,3 +263,23 @@ func TestAppendRejectsRenamedDuplicateAndUnpinnedSources(t *testing.T) {
 		})
 	}
 }
+
+func TestAppendLosslesslyComparesSourceLocatorTimestamp(t *testing.T) {
+	row := appendTestRecord("sample", "sample")
+	row.Document["metadata"].(map[string]any)["source_locator"] = map[string]any{"modified": json.Number("1794400000000000001")}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"_source": row.Document})
+	}))
+	defer server.Close()
+	present, err := corpusAppendExisting(server.Client(), server.URL, row.ID, row.Document)
+	if err != nil || !present {
+		t.Fatalf("identical nanosecond timestamp: present=%t err=%v", present, err)
+	}
+	row.Document["metadata"].(map[string]any)["source_locator"].(map[string]any)["modified"] = json.Number("1794400000000000002")
+	// A one-nanosecond change must remain distinguishable too.
+	original := appendTestRecord("sample", "sample")
+	original.Document["metadata"].(map[string]any)["source_locator"] = map[string]any{"modified": json.Number("1794400000000000001")}
+	if _, err := corpusAppendExisting(server.Client(), server.URL, row.ID, original.Document); err == nil {
+		t.Fatal("accepted changed timestamp")
+	}
+}

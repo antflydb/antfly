@@ -173,7 +173,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 	}
 	tableURL := endpoint + "/tables/gcs_e2e"
 	source := "gs://e2e-originals/" + key + "?generation=123"
-	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1}}
+	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1, "source_locator": map[string]any{"modified": json.Number("1794400000000000001")}}}
 	record := corpusRecord{ID: "evidence", Document: document}
 	manifest, _ := json.Marshal(record)
 	manifest = append(manifest, '\n')

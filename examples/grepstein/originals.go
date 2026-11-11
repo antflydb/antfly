@@ -220,18 +220,25 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 	hash := sha256.New()
 	encoder := json.NewEncoder(io.MultiWriter(output, hash))
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	type uploadResult struct {
-		record originalRecord
-		err    error
+		record   originalRecord
+		position int
+		err      error
 	}
-	var pending []chan uploadResult
+	order, err := newOriginalOrder(state)
+	if err != nil {
+		return err
+	}
+	defer order.Close()
+	completed := make(chan uploadResult, concurrency)
+	pending := 0
 	failures := make(chan error, 1)
-	// All owned spools/uploads finish before the storage client and source state
-	// close, including a parser failure or cancellation midway through a release.
 	defer func() {
 		cancel()
-		for _, done := range pending {
-			<-done
+		for pending > 0 {
+			<-completed
+			pending--
 		}
 		select {
 		case err := <-failures:
@@ -240,13 +247,12 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 		}
 	}()
 	drain := func() error {
-		done := pending[0]
-		pending = pending[1:]
-		result := <-done
+		result := <-completed
+		pending--
 		if result.err != nil {
 			return result.err
 		}
-		return encoder.Encode(result.record)
+		return order.Add(result.position, result.record)
 	}
 
 	var total int64
@@ -264,7 +270,7 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if len(pending) >= concurrency {
+			if pending >= concurrency {
 				if err := drain(); err != nil {
 					return err
 				}
@@ -325,8 +331,8 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 				}
 				owned := spool
 				spool = nil
-				done := make(chan uploadResult, 1)
-				pending = append(pending, done)
+				position := count
+				pending++
 				go func() {
 					result := func() uploadResult {
 						defer owned.Close()
@@ -339,7 +345,7 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 							return uploadResult{err: fmt.Errorf("%s: %w", id, err)}
 						}
 						record.Generation = generation
-						return uploadResult{record: record}
+						return uploadResult{record: record, position: position}
 					}()
 					if result.err != nil {
 						select {
@@ -348,7 +354,7 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 						}
 						cancel()
 					}
-					done <- result
+					completed <- result
 				}()
 			} else if err := encoder.Encode(record); err != nil {
 				return err
@@ -414,8 +420,13 @@ func stageOriginalsConcurrent(ctx context.Context, state, bucket string, sources
 			}
 		}
 	}
-	for len(pending) > 0 {
+	for pending > 0 {
 		if err := drain(); err != nil {
+			return err
+		}
+	}
+	if put != nil {
+		if err := order.Emit(count, io.MultiWriter(output, hash)); err != nil {
 			return err
 		}
 	}
@@ -490,7 +501,7 @@ func originalGCSWriter(client *storage.Client) originalPut {
 			return "", err
 		}
 		writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
-		writer.ChunkSize = 8 << 20
+		writer.ChunkSize = originalUploadChunkSize(record.Bytes)
 		writer.ContentType = record.MIME
 		writer.CRC32C = record.CRC32C
 		writer.SendCRC32C = true
@@ -514,4 +525,14 @@ func originalGCSWriter(client *storage.Client) originalPut {
 		}
 		return verify(writer.Attrs())
 	}
+}
+
+// Keep resumable retries while avoiding an 8-MiB allocation for every small PDF.
+func originalUploadChunkSize(size int64) int {
+	const unit = 256 << 10
+	const ceiling = 8 << 20
+	if size >= ceiling {
+		return ceiling
+	}
+	return max(unit, int((size+unit-1)/unit)*unit)
 }
