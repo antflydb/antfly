@@ -6138,23 +6138,11 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
             } else self.calls += 1;
             const during_replay = root.maintenance_publication != null;
             const store = root.owned_lite_backend.?.native_docstore.?;
-            const file = std.Io.Dir.cwd().openFile(h.handleLockIo(), store.file.path, .{
-                .mode = .read_write,
-                .lock = .exclusive,
-                .lock_nonblocking = true,
-            }) catch |err| {
-                self.failure = err;
+            const region = store.file.regionForInode() orelse {
+                self.failure = error.IndexReplaySnapshotNotFenced;
                 return;
             };
-            defer file.close(h.handleLockIo());
-            const epochs = @import("../storage/lite/reader_epochs.zig").scan(alloc, h.handleLockIo(), store.file.path, store.file.header.reader_epoch_namespace, (file.stat(h.handleLockIo()) catch |err| {
-                self.failure = err;
-                return;
-            }).inode) catch |err| {
-                self.failure = err;
-                return;
-            };
-            if (during_replay != (epochs.data != null)) self.failure = error.IndexReplaySnapshotNotFenced;
+            if (during_replay != (region.minimumPinnedSequence() != null)) self.failure = error.IndexReplaySnapshotNotFenced;
         }
     };
     var probe: Probe = .{};

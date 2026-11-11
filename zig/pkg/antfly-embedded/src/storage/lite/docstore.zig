@@ -2772,7 +2772,7 @@ pub const Store = struct {
         }
         status.allocator_work = self.file.allocator_work;
         if (self.file.reader_coordinator) |coordinator| {
-            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode);
+            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode, self.file.regionForInode());
             status.coordinated_reader_count = readers.count;
             status.poisoned_coordinated_readers = readers.poisoned;
             status.oldest_coordinated_reader_age_ms = readers.oldest_age_ms;
