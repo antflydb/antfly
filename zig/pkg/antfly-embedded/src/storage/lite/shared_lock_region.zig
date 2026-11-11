@@ -13,13 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Step 1 of `docs/design/lite-performance/lite-single-commit-write-path.md`
-//! §8: the shared mmap region (§8.1) and the writer lock (§8.2). Reader
-//! slots (§8.3) and liveness/recovery (§8.4) land in later steps; the
-//! migration/deletion of `inode_lock.zig`, `writer_queue.zig`, and the rest
-//! of §8.7's table happens only once §8.3/§8.4 exist to replace what they
-//! still rely on. Until then this module is additive and unreferenced by
-//! existing callers.
+//! Steps 1 and 2 of `docs/design/lite-performance/lite-single-commit-write-path.md`
+//! §8: the shared mmap region (§8.1), the writer lock (§8.2), and the
+//! reader table (§8.3). Liveness/recovery (§8.4) lands in the next step;
+//! the migration/deletion of `inode_lock.zig`, `writer_queue.zig`,
+//! `reader_epochs.zig`, `ReaderCoordinator`, and the rest of §8.7's table
+//! happens only once §8.4 exists to replace what they still rely on (a
+//! dead reader's never-cleared pin, a dead writer's held lock). Until then
+//! this module is additive and unreferenced by existing callers.
 //!
 //! One `<db>.aflite-lock` file, memory-mapped `MAP_SHARED` by every process
 //! with the database open (SQLite's `-shm`, LMDB's `lock.mdb`). The steady,
@@ -45,9 +46,10 @@ const Io = std.Io;
 const magic: [8]u8 = "AFLLOCK1".*;
 const format_version: u32 = 1;
 
-/// Fixed for step 1 (no reader table yet); grows in step 2 without a
-/// format bump by using the header's own `region_bytes` field, not this
-/// constant, as the source of truth for how much of the file is mapped.
+/// Fixed size of the header itself; grows the *region* (not this
+/// constant) in step 2 by using the header's own `region_bytes` and
+/// `max_readers` fields as the source of truth for how much of the file
+/// is mapped and how many reader slots follow the header.
 const header_bytes = 64;
 
 /// `Header` is the first `header_bytes` of the region, native-endian (the
@@ -69,12 +71,59 @@ const Header = extern struct {
     /// §8.2: the ticket currently eligible to attempt the CAS. Also the
     /// futex word contended waiters park on.
     writer_ticket_head: std.atomic.Value(u32),
-    _reserved: [8]u8 = @splat(0),
+    /// §8.3: number of `ReaderSlot`s immediately following the header
+    /// (at byte offset `header_bytes`). Fixed at creation, grown by
+    /// remapping a larger region under the same one-time `flock` a later
+    /// opener that wants more slots takes (see `openSized`'s "region
+    /// growth" comment) -- this field, not a compile-time constant, is
+    /// the source of truth every opener reads.
+    max_readers: u32,
+    _reserved: [12]u8 = @splat(0),
 };
 
 comptime {
     std.debug.assert(@sizeOf(Header) <= header_bytes);
 }
+
+/// §8.3's fixed reader-slot layout: one per concurrent reader the region
+/// was created (or grown) to support, immediately following the header.
+const ReaderSlot = extern struct {
+    /// 0 = free. Claimed via CAS, the same uncontended-fast-path shape as
+    /// the writer word; a short linear scan under contention is
+    /// acceptable here because claiming happens once per reader lifetime,
+    /// not once per commit.
+    owner: std.atomic.Value(u32),
+    /// Packed `(pid, open-generation)` pair, same encoding as the writer
+    /// word's holder. Step 3's liveness probe (not just `owner != 0`)
+    /// uses this to tell a slot a dead reader never cleared apart from
+    /// one a new process with the same pid legitimately claimed; step 2
+    /// writes a zero generation and nothing yet reads this field back.
+    generation: u64,
+    /// The `commit_sequence` this reader will not let the writer reclaim
+    /// pages behind. 0 means "not currently pinned" (sequence numbers
+    /// start above 0), written once per pin by the slot's own owner,
+    /// cleared to 0 on unpin.
+    pinned_sequence: std.atomic.Value(u64),
+    /// Pads the slot to 32 bytes (the compiler already inserts 4 bytes
+    /// between `owner` and `generation` for `generation`'s 8-byte
+    /// alignment, so 8 explicit bytes here, not 12, reaches 32) and
+    /// leaves room for a second pin (metadata vs. data, matching
+    /// `minimum_reader_sequence` vs. `minimum_metadata_reader_sequence`
+    /// in native.zig today) without another format bump.
+    _reserved: [8]u8 = @splat(0),
+};
+
+const reader_slot_bytes = 32;
+
+comptime {
+    std.debug.assert(@sizeOf(ReaderSlot) == reader_slot_bytes);
+}
+
+/// Every opener that doesn't ask for a specific count gets this many
+/// reader slots. Chosen generously enough that ordinary concurrency never
+/// exhausts it without yet trying to size it from real workload data;
+/// revisit once a caller actually wires this region in (§8.7).
+pub const default_max_readers: u32 = 64;
 
 fn headerChecksum(header: *const Header) u32 {
     const Crc32c = @import("antfly_hash").Crc32c;
@@ -115,13 +164,33 @@ pub const Region = struct {
         return @ptrCast(@alignCast(self.mapping.ptr));
     }
 
-    /// Opens (creating if absent) the region next to `db_path`, e.g.
-    /// `<db_path>.aflite-lock`. Initializes a fresh or corrupt region under
-    /// one `flock` -- the only `flock` this module issues, and only here,
-    /// never per acquire/release. `allocator` is used only for the
-    /// temporary path string; nothing from the region itself is heap
-    /// allocated.
+    /// Opens (creating if absent) the region next to `db_path` with
+    /// `default_max_readers` slots. See `openSized` for a caller that
+    /// needs a specific count.
     pub fn open(allocator: std.mem.Allocator, io: Io, db_path: []const u8) !Region {
+        return openSized(allocator, io, db_path, default_max_readers);
+    }
+
+    /// Opens (creating if absent) the region next to `db_path`, e.g.
+    /// `<db_path>.aflite-lock`, with at least `max_readers` reader slots.
+    /// Initializes a fresh or corrupt region, and grows an existing valid
+    /// one that has fewer slots than `max_readers` asks for, all under
+    /// one `flock` -- the only `flock` this module issues outside of
+    /// region growth, and never per acquire/release/pin/unpin. `allocator`
+    /// is used only for the temporary path string; nothing from the
+    /// region itself is heap allocated.
+    ///
+    /// **Region growth.** `max_readers` is fixed at creation; an opener
+    /// that asks for more slots than the region already has remaps a
+    /// larger region under this same one-time `flock`, same as the
+    /// initial create. Per §8.1, a process that already has an *older,
+    /// smaller* mapping from a previous `openSized` call does not yet
+    /// notice the grown size on its own (that live-remap-while-mapped
+    /// path -- "every other process notices the size change on its own
+    /// next `fstat`-guarded lazy-remap check" -- is deferred past step 2;
+    /// every call in this step reopens fresh, so it is not yet exercised
+    /// by anything reachable from this module).
+    pub fn openSized(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32) !Region {
         const region_path = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{db_path});
         defer allocator.free(region_path);
 
@@ -133,33 +202,55 @@ pub const Region = struct {
 
         const size = (try setup_file.stat(io)).size;
         var need_init = size < header_bytes;
+        var existing_raw: [header_bytes]u8 = undefined;
         if (!need_init) {
-            var raw: [header_bytes]u8 = undefined;
-            const n = try setup_file.readPositionalAll(io, &raw, 0);
-            need_init = n != raw.len or !isValidHeader(&raw);
+            const n = try setup_file.readPositionalAll(io, &existing_raw, 0);
+            need_init = n != existing_raw.len or !isValidHeader(&existing_raw);
         }
         if (need_init) {
-            try setup_file.setLength(io, header_bytes);
+            const region_bytes = header_bytes + @as(u64, max_readers) * reader_slot_bytes;
+            try setup_file.setLength(io, region_bytes);
             var fresh: Header = .{
                 .magic = magic,
                 .format_version = format_version,
                 .header_checksum = 0,
-                .region_bytes = header_bytes,
+                .region_bytes = region_bytes,
                 .writer_holder = .init(0),
                 .writer_ticket_tail = .init(0),
                 .writer_ticket_head = .init(0),
+                .max_readers = max_readers,
             };
             fresh.header_checksum = headerChecksum(&fresh);
             try setup_file.writePositionalAll(io, std.mem.asBytes(&fresh), 0);
             try setup_file.sync(io);
+        } else {
+            const existing: *const Header = @ptrCast(@alignCast(&existing_raw));
+            if (max_readers > existing.max_readers) {
+                const new_region_bytes = header_bytes + @as(u64, max_readers) * reader_slot_bytes;
+                try setup_file.setLength(io, new_region_bytes);
+                var grown = existing.*;
+                grown.region_bytes = new_region_bytes;
+                grown.max_readers = max_readers;
+                grown.header_checksum = headerChecksum(&grown);
+                try setup_file.writePositionalAll(io, std.mem.asBytes(&grown), 0);
+                try setup_file.sync(io);
+            }
         }
+
+        // Re-read the header fresh: `need_init`/the grow branch above may
+        // have just changed `region_bytes`, and this is the only place
+        // that decides how much of the file to map.
+        var final_raw: [header_bytes]u8 = undefined;
+        _ = try setup_file.readPositionalAll(io, &final_raw, 0);
+        const final_header: *const Header = @ptrCast(@alignCast(&final_raw));
+        const map_len: usize = @intCast(final_header.region_bytes);
 
         // mmap needs its own raw fd (platform `mmap` takes a POSIX fd, not
         // an `Io.File`); opened read-write, close-on-exec so a forked-and-
         // exec'd child never inherits a stale mapping-backing descriptor.
         const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch return RegionError.RegionUnavailable;
         errdefer _ = std.posix.system.close(raw_fd);
-        const mapping = std.posix.mmap(null, header_bytes, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
+        const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         return .{ .mapping = mapping, .fd = raw_fd };
     }
 
@@ -242,6 +333,82 @@ pub const Region = struct {
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
             futexWakeShared(&hdr.writer_ticket_head.raw);
         }
+    }
+
+    /// §8.3: the fixed reader-slot array immediately following the
+    /// header, sized by the header's own `max_readers` (not a compile-
+    /// time constant, so a grown region's extra slots are visible to a
+    /// handle that opened before the growth and remapped to pick it up).
+    fn readerSlots(self: *const Region) []ReaderSlot {
+        const max_readers = self.header().max_readers;
+        const base: [*]ReaderSlot = @ptrCast(@alignCast(self.mapping.ptr + header_bytes));
+        return base[0..max_readers];
+    }
+
+    pub const ReaderError = error{NoFreeReaderSlot};
+
+    /// Claims the first free slot (`owner == 0`) via CAS -- the same
+    /// uncontended-fast-path shape as the writer word, acceptable to scan
+    /// linearly under contention because this runs once per reader
+    /// lifetime, not once per commit. Returns the slot index, or
+    /// `error.NoFreeReaderSlot` if every slot is held (by a live reader,
+    /// or -- until §8.4's liveness probe lands in step 3 -- by a dead
+    /// one that never released its slot).
+    pub fn claimReaderSlot(self: *Region, pid: u32) ReaderError!u32 {
+        for (self.readerSlots(), 0..) |*slot, i| {
+            if (slot.owner.cmpxchgStrong(0, pid, .acquire, .monotonic) == null) {
+                slot.generation = packHolder(pid, 0);
+                slot.pinned_sequence.store(0, .monotonic);
+                return @intCast(i);
+            }
+        }
+        return ReaderError.NoFreeReaderSlot;
+    }
+
+    /// Records the `commit_sequence` this reader will not let the writer
+    /// reclaim pages behind. Written once per pin by the slot's own
+    /// owner.
+    pub fn pinReader(self: *Region, slot_index: u32, sequence: u64) void {
+        self.readerSlots()[slot_index].pinned_sequence.store(sequence, .release);
+    }
+
+    /// Clears the pin recorded by `pinReader`, without releasing the slot
+    /// itself -- the same `NativeFile`/pin lifetime may pin again.
+    pub fn unpinReader(self: *Region, slot_index: u32) void {
+        self.readerSlots()[slot_index].pinned_sequence.store(0, .release);
+    }
+
+    /// Frees a slot claimed by `claimReaderSlot` for reuse. Callers must
+    /// unpin first; this clears the pin defensively anyway so a slot
+    /// released while still (incorrectly) pinned never blocks
+    /// `minimumPinnedSequence` after release.
+    pub fn releaseReaderSlot(self: *Region, slot_index: u32) void {
+        const slot = &self.readerSlots()[slot_index];
+        slot.pinned_sequence.store(0, .monotonic);
+        slot.generation = 0;
+        slot.owner.store(0, .release);
+    }
+
+    /// §8.3's writer-side reuse-frontier scan, replacing
+    /// `scanReaderEpochsCached`'s namespace-directory walk: the minimum
+    /// `pinned_sequence` over every slot with a live owner, or `null` if
+    /// no reader is currently pinned. "Live" here is just `owner != 0`;
+    /// step 3's per-slot liveness byte-range probe (§8.4) replaces that
+    /// with a real death check so a crashed reader's never-cleared pin
+    /// cannot block reclamation forever -- until then, a process that
+    /// dies while pinned leaks its pin here, same as it would in
+    /// `reader_epochs.zig` today without a sweep. Nothing calls this from
+    /// a real write path yet (§8.7's migration is a later step); it is
+    /// exercised only by this file's own tests.
+    pub fn minimumPinnedSequence(self: *const Region) ?u64 {
+        var min: ?u64 = null;
+        for (self.readerSlots()) |*slot| {
+            if (slot.owner.load(.acquire) == 0) continue;
+            const seq = slot.pinned_sequence.load(.acquire);
+            if (seq == 0) continue;
+            if (min == null or seq < min.?) min = seq;
+        }
+        return min;
     }
 };
 
@@ -520,6 +687,120 @@ test "shared lock region reopened by a second handle shares the same writer stat
     first.releaseWriter();
     try std.testing.expect(second.tryAcquireWriter(2));
     second.releaseWriter();
+}
+
+test "shared lock region: reader slots claim, pin, and release round-trip" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-readers.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.openSized(a, io, db_path, 4);
+    defer region.close();
+
+    // No reader pinned yet.
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+
+    const slot_a = try region.claimReaderSlot(100);
+    const slot_b = try region.claimReaderSlot(200);
+    try std.testing.expect(slot_a != slot_b);
+
+    region.pinReader(slot_a, 50);
+    region.pinReader(slot_b, 30);
+    // The frontier is the *minimum* pin across live readers.
+    try std.testing.expectEqual(@as(?u64, 30), region.minimumPinnedSequence());
+
+    region.unpinReader(slot_b);
+    try std.testing.expectEqual(@as(?u64, 50), region.minimumPinnedSequence());
+
+    region.releaseReaderSlot(slot_a);
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+
+    // A released slot is claimable again.
+    const slot_c = try region.claimReaderSlot(300);
+    try std.testing.expectEqual(slot_a, slot_c);
+}
+
+test "shared lock region: reader slots exhaust and report NoFreeReaderSlot" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-readers-full.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.openSized(a, io, db_path, 2);
+    defer region.close();
+
+    _ = try region.claimReaderSlot(1);
+    _ = try region.claimReaderSlot(2);
+    try std.testing.expectError(Region.ReaderError.NoFreeReaderSlot, region.claimReaderSlot(3));
+}
+
+test "shared lock region: reader slots are visible across a second handle" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-readers-shared.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var first = try Region.openSized(a, io, db_path, 4);
+    defer first.close();
+    var second = try Region.openSized(a, io, db_path, 4);
+    defer second.close();
+
+    const slot = try first.claimReaderSlot(42);
+    first.pinReader(slot, 7);
+    // The second mapping must observe the first's pin: same pages, not an
+    // independent copy.
+    try std.testing.expectEqual(@as(?u64, 7), second.minimumPinnedSequence());
+
+    second.unpinReader(slot);
+    try std.testing.expectEqual(@as(?u64, null), first.minimumPinnedSequence());
+}
+
+test "shared lock region: a later opener asking for more slots grows the region" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-grow.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    {
+        var small = try Region.openSized(a, io, db_path, 2);
+        const s1 = try small.claimReaderSlot(1);
+        const s2 = try small.claimReaderSlot(2);
+        try std.testing.expectError(Region.ReaderError.NoFreeReaderSlot, small.claimReaderSlot(3));
+        // Release both before closing: the point of this test is that
+        // the *grown* region's extra slots are usable, not that the
+        // original two carry a stale claim across the grow.
+        small.releaseReaderSlot(s1);
+        small.releaseReaderSlot(s2);
+        small.close();
+    }
+
+    // Reopening with a larger count grows the region in place; the
+    // writer lock state from before the grow survives untouched.
+    var grown = try Region.openSized(a, io, db_path, 8);
+    defer grown.close();
+    try std.testing.expect(grown.tryAcquireWriter(1));
+    grown.releaseWriter();
+
+    var claimed: [8]u32 = undefined;
+    for (0..8) |i| claimed[i] = try grown.claimReaderSlot(@intCast(100 + i));
+    try std.testing.expectError(Region.ReaderError.NoFreeReaderSlot, grown.claimReaderSlot(999));
 }
 
 test "shared lock region rejects a corrupt header and reinitializes" {
