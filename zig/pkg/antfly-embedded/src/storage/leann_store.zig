@@ -77,6 +77,7 @@ pub const Options = struct {
     /// the graph covers so the owner can replace their stored vectors by
     /// stubs (`pendingElide` / `clearElided`).
     transient: bool = false,
+    media_int8: bool = false,
 };
 
 pub const ElideEntry = replicated_mod.ElideEntry;
@@ -207,6 +208,7 @@ pub const LeannStore = struct {
             .batch_size = opts.batch_size,
             .reembed_budget_ms = opts.reembed_budget_ms,
             .transient = opts.transient,
+            .media_int8 = opts.media_int8,
         };
     }
 
@@ -694,8 +696,10 @@ pub const LeannStore = struct {
         // before top-k admission. Bounded graph search widens its candidate
         // pool until enough results pass the bounds or coverage is exhausted.
         var want: usize = if (search_types.requiresExhaustiveCoverage(req)) req.k else if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
-        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
-        var recovery = RecoverySession{ .cancellation = req.cancellation };
+        const budget_ms = if (self.opts.transient) self.opts.reembed_budget_ms else 0;
+        const session_loader = if (self.loader) |loader| loader.load_batch_session != null else false;
+        var gate = SearchGate.init(req, if (session_loader) 0 else budget_ms);
+        var recovery = RecoverySession{ .cancellation = req.cancellation, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
         defer recovery.deinit();
         var ctx = SourceCtx{ .recovery = &recovery, .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
@@ -719,6 +723,7 @@ pub const LeannStore = struct {
                 .distance_over = req.distance_over,
                 .distance_under = req.distance_under,
                 .verify_source = true,
+                .score_quantized_source = self.opts.media_int8,
                 .filter_visit_limit = if (filter.nodeActive() and !search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
                 .gate = gate.recomputeGate(),
             });
@@ -1173,19 +1178,24 @@ pub const ReembedCache = struct {
 pub fn useDirectCandidates(req: search_types.SearchRequest, allowed: usize, live: usize, search_ef: u32) bool {
     if (search_types.requiresExhaustiveCoverage(req)) return true;
     const effort = @max(req.k, if (search_ef == 0) @as(usize, 512) else search_ef);
-    // A moderately sized list may still be very sparse on a large graph.
-    // Cap direct work at the minimum budget used by filtered graph search.
-    return allowed <= @min(65536, @max(1024, effort *| 4, live / 16));
+    if (allowed > 65536) return false;
+    if (allowed <= @max(1024, effort *| 4)) return true;
+    // Filling the filtered beam costs roughly effort / selectivity graph
+    // probes, each less cache-friendly than a direct code scan. Favor direct
+    // scoring until its estimated cost exceeds that walk, within the cap.
+    const walk_cost = live *| effort *| 32;
+    return allowed *| allowed <= walk_cost;
 }
 
 test "LEANN allowlist routing bounds direct scoring on large indexes" {
     const req: search_types.SearchRequest = .{ .query = &.{0}, .k = 10 };
     try std.testing.expect(useDirectCandidates(req, 32, 10_000, 0));
-    try std.testing.expect(useDirectCandidates(req, 2048, 10_000, 0));
-    try std.testing.expect(!useDirectCandidates(req, 2049, 10_000, 0));
-    try std.testing.expect(!useDirectCandidates(req, 100_000, 1_000_000, 4096));
-    try std.testing.expect(useDirectCandidates(req, 10_000, 1_000_000, 0));
-    try std.testing.expect(!useDirectCandidates(req, 100_000, 10_000_000, 0));
+    try std.testing.expect(useDirectCandidates(req, 6500, 100_000, 0));
+    try std.testing.expect(useDirectCandidates(req, 40_000, 100_000, 0));
+    try std.testing.expect(!useDirectCandidates(req, 41_000, 100_000, 0));
+    try std.testing.expect(!useDirectCandidates(req, 50_000, 100_000, 0));
+    try std.testing.expect(useDirectCandidates(req, 65_536, 10_000_000, 0));
+    try std.testing.expect(!useDirectCandidates(req, 65_537, 10_000_000, 0));
     var exhaustive = req;
     exhaustive.search_effort = 1;
     try std.testing.expect(useDirectCandidates(exhaustive, 100_000, 1_000_000, 4096));
@@ -1430,13 +1440,27 @@ test "leann search forwards reembedding time from batch loader" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.released = true;
         }
-        fn sessionBatch(ctx: *anyopaque, _: Allocator, _: []const u64, _: []const []const u8, _: []f32, _: []bool, _: *u64, session: *RecoverySession) anyerror!void {
+        fn sessionBatch(ctx: *anyopaque, a: Allocator, ids: []const u64, metas: []const []const u8, out: []f32, found: []bool, elapsed: *u64, session: *RecoverySession) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            try testing.expect(session.cancellation != null);
-            session.state = ctx;
-            session.release = release;
-            self.cancel.?.store(true, .release);
-            try session.check();
+            if (self.cancel) |signal| {
+                try testing.expect(session.cancellation != null);
+                session.state = ctx;
+                session.release = release;
+                signal.store(true, .release);
+                return session.check();
+            }
+            // Only the first batch needs inference. Subsequent batches model
+            // full stored vectors or hits in the re-embedding cache.
+            if (self.calls == 0) {
+                try session.checkDispatch(elapsed.*);
+                try batch(ctx, a, ids, metas, out, found, elapsed);
+            } else {
+                for (ids, 0..) |id, i| {
+                    const start = @as(usize, @intCast(id)) * dims;
+                    @memcpy(out[i * dims ..][0..dims], self.vectors.data[start..][0..dims]);
+                    found[i] = true;
+                }
+            }
         }
         fn batch(ctx: *anyopaque, _: Allocator, ids: []const u64, _: []const []const u8, out: []f32, found: []bool, elapsed: *u64) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -1460,9 +1484,14 @@ test "leann search forwards reembedding time from batch loader" {
     source.calls = 0;
     try testing.expectError(error.ReembedBudgetExceeded, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
     try testing.expectEqual(@as(usize, 1), source.calls);
+    store.setLoader(.{ .ctx = &source, .load = Timed.load, .load_batch_session = Timed.sessionBatch });
+    source.calls = 0;
+    var mixed = try store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 });
+    defer mixed.deinit();
+    try testing.expectEqual(@as(usize, 50), mixed.items.items.len);
+    try testing.expectEqual(@as(usize, 1), source.calls);
     var signal = std.atomic.Value(bool).init(false);
     source.cancel = &signal;
-    store.setLoader(.{ .ctx = &source, .load = Timed.load, .load_batch_session = Timed.sessionBatch });
     try testing.expectError(error.Cancelled, store.search(alloc, .{ .query = data[0..dims], .k = 50, .cancellation = search_types.CancellationToken.fromAtomic(&signal) }));
     try testing.expect(source.released);
 }

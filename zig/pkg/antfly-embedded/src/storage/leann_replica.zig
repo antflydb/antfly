@@ -668,6 +668,7 @@ pub const Replica = struct {
         batch_size: u32 = 0,
         filter: ?KeyFilter = null,
         candidate_ids: ?[]const u32 = null,
+        score_quantized_source: bool = false,
         filter_visit_limit: u32 = 0,
         filter_truncated: ?*bool = null,
         budget_exhausted: ?*bool = null,
@@ -721,6 +722,7 @@ pub const Replica = struct {
                 .distance_over = tuning.distance_over,
                 .distance_under = tuning.distance_under,
                 .verify_source = true,
+                .score_quantized_source = tuning.score_quantized_source,
                 .gate = tuning.gate,
             });
             defer resp.deinit(alloc);

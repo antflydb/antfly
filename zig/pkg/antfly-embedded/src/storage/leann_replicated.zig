@@ -91,6 +91,7 @@ pub const Options = struct {
     /// replaced by stubs (through elide records), so rebuilds use the
     /// RaBitQ codes instead of loading vectors.
     transient: bool = false,
+    media_int8: bool = false,
 };
 
 /// A planned record, plus generation bytes the leader must make fetchable
@@ -720,8 +721,9 @@ pub const ReplicatedState = struct {
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
-        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
-        var recovery = @import("leann_recovery.zig").Session{ .cancellation = req.cancellation };
+        const budget_ms = if (self.opts.transient) self.opts.reembed_budget_ms else 0;
+        var gate = SearchGate.init(req, if (loader.load_batch_session != null) 0 else budget_ms);
+        var recovery = @import("leann_recovery.zig").Session{ .cancellation = req.cancellation, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
         defer recovery.deinit();
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns, .recovery = &recovery };
         var want: u32 = @intCast(@max(req.k, 1));
@@ -750,6 +752,7 @@ pub const ReplicatedState = struct {
             const hits = try self.replica.search(alloc, req.query, want, .{
                 .ef = if (search_types.requiresExhaustiveCoverage(req)) live else self.opts.search_ef,
                 .bound_scale = self.opts.bound_scale,
+                .score_quantized_source = self.opts.media_int8,
                 .batch_size = self.opts.batch_size,
                 .filter = if (key_filtered) .{ .ctx = &key_filter, .allows_fn = KeyRequestFilter.allows } else null,
                 .candidate_ids = if (direct_candidates) candidate_ids.items else null,

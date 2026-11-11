@@ -24178,6 +24178,7 @@ pub const IndexManager = struct {
                         .storage = self.effectiveDenseStorage(),
                         .replicated = self.leann_replication,
                         .transient = leann_opts.vector_storage.elides(),
+                        .media_int8 = leann_opts.vector_storage.elides() and leann_opts.media_int8,
                     });
                     index.attachLeann(leann_store) catch |err| {
                         leann_store.deinit();
@@ -30115,15 +30116,21 @@ pub const IndexManager = struct {
         const recovery_vectors = try self.alloc.alloc(f32, recovery_keys.items.len * @as(usize, entry.dims));
         defer self.alloc.free(recovery_vectors);
         if (recovery_keys.items.len > 0) {
-            const found = try self.alloc.alloc(bool, recovery_keys.items.len);
-            defer self.alloc.free(found);
-            @memset(found, false);
             var local_session: LeannRecoverySession = .{};
             defer local_session.deinit();
-            try self.reembedDenseDocumentsSession(self.alloc, entry, recovery_keys.items, recovery_hashes.items, recovery_digests.items, recovery_vectors, found, recovery_session orelse &local_session);
-            for (recovery_slots.items, 0..) |slot, i| {
-                if (!found[i]) return error.ReembedProvenanceUnavailable;
-                recovered[slot] = recovery_vectors[i * entry.dims ..][0..entry.dims];
+            var found: [128]bool = undefined;
+            var start: usize = 0;
+            while (start < recovery_keys.items.len) {
+                const end = @min(start + found.len, recovery_keys.items.len);
+                const batch_found = found[0 .. end - start];
+                @memset(batch_found, false);
+                const batch_vectors = recovery_vectors[start * entry.dims .. end * entry.dims];
+                try self.reembedDenseDocumentsSession(self.alloc, entry, recovery_keys.items[start..end], recovery_hashes.items[start..end], recovery_digests.items[start..end], batch_vectors, batch_found, recovery_session orelse &local_session);
+                for (recovery_slots.items[start..end], batch_found, start..) |slot, ok, i| {
+                    if (!ok) return error.ReembedProvenanceUnavailable;
+                    recovered[slot] = recovery_vectors[i * entry.dims ..][0..entry.dims];
+                }
+                start = end;
             }
         }
         {
@@ -33707,14 +33714,25 @@ pub const IndexManager = struct {
         const manager = loader.manager;
         const store = manager.primary_store orelse return false;
         const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
-        const embedding_name = entry.embedding_name orelse return false;
-        if (try leannStubIdentity(alloc, store, metadata, embedding_name)) |identity| return identity.digest == digest;
-        // Stored vectors need no inference. Checking their digest also fences
-        // replacements that have not yet reached this graph generation.
-        const vector = manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, embedding_name, null) catch |err| switch (err) {
+        if (entry.embedding_name == null) return false;
+        const key = try denseVectorArtifactKeyForMetadataAlloc(alloc, entry, metadata);
+        defer alloc.free(key);
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const raw = txn.get(key) catch |err| switch (err) {
             error.NotFound => return false,
             else => return err,
         };
+        if (try enrichment_artifact_codec.elidedDenseEmbedding(raw)) |stub| {
+            const header = try enrichment_artifact_codec.decodeHeader(raw);
+            return !header.flags.int8_payload and stub.vector_digest == digest;
+        }
+        const view = enrichment_artifact_codec.denseEmbeddingVectorView(raw) catch |err| {
+            if (isRecoverableEmbeddingArtifactError(err)) return false;
+            return err;
+        };
+        if (view) |vector| return leann_store_mod.vectorDigest(vector) == digest;
+        const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw);
         defer alloc.free(vector);
         return leann_store_mod.vectorDigest(vector) == digest;
     }
@@ -33828,6 +33846,7 @@ pub const IndexManager = struct {
         if (read) |*txn| txn.abort();
         read = null;
         if (elided_keys.items.len == 0) return;
+        if (session) |active| try active.checkDispatch(reembed_ns.*);
         const vectors = try alloc.alloc(f32, elided_keys.items.len * d);
         defer alloc.free(vectors);
         const ok = try alloc.alloc(bool, elided_keys.items.len);
@@ -53342,6 +53361,11 @@ fn testLeannMediaRetention(full_consumer: bool) !void {
         const copy = try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(alloc, raw);
         defer if (copy) |c| alloc.free(c);
         try std.testing.expectEqual(!full_consumer and i % 2 == 1, copy != null);
+        if (i < 2) {
+            const loader = entry.vector_loader_context orelse return error.TestUnexpectedResult;
+            const digest = leann_store_mod.vectorDigest(&vectors[i]);
+            try std.testing.expectEqual(copy == null, try IndexManager.validateLeannRetainedDigest(loader, alloc, keys[i], digest));
+        }
     }
 
     // Searches re-embed text documents only; media vectors come from their int8 copies.
@@ -53584,6 +53608,24 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try expectTop(&manager, &store, entry, &vectors[200], keys[200]);
         try std.testing.expect(embedder.documents > before);
 
+        // A spent budget still allows a real cache hit, but blocks a miss
+        // before dispatching the embedder.
+        {
+            const loader = entry.vector_loader_context orelse return error.TestUnexpectedResult;
+            var session: LeannRecoverySession = .{ .budget_ns = 1 };
+            defer session.deinit();
+            var elapsed: u64 = 1;
+            var loaded: [dims]f32 = undefined;
+            var found = [_]bool{false};
+            const calls = embedder.calls;
+            try IndexManager.loadDenseVectorsForLeannSession(loader, alloc, &.{0}, &.{keys[200]}, &loaded, &found, &elapsed, &session);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqualSlices(f32, &vectors[200], &loaded);
+            manager.leann_reembed_cache.deinit(alloc);
+            try std.testing.expectError(error.ReembedBudgetExceeded, IndexManager.loadDenseVectorsForLeannSession(loader, alloc, &.{0}, &.{keys[200]}, &loaded, &found, &elapsed, &session));
+            try std.testing.expectEqual(calls, embedder.calls);
+        }
+
         // Without an embedder (and nothing cached), reads of elided vectors
         // fail cleanly.
         manager.dense_reembedder = null;
@@ -53591,14 +53633,18 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try std.testing.expectError(error.ReembedUnavailable, entry.index.searchWithRequest(.{ .query = &vectors[200], .k = 5 }));
 
         // A new transient consumer has no graph nodes for existing stubs.
-        // Rebuilding a group must invoke its provider once for the group.
+        // Rebuilding a group uses bounded calls and publishes only on success.
         manager.dense_reembedder = embedder.reembedder();
         try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_copy", .kind = .dense_vector, .config_json = config_json }});
         var writes: [192]mapper.DenseEmbeddingWrite = undefined;
         for (&writes, 0..) |*write, i| write.* = .{ .index_name = @constCast("leann_copy"), .doc_key = keys[(i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1)], .vector = &.{}, .artifact_key = produced[(i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1)] };
+        embedder.wrong_key = 254;
+        try std.testing.expectError(error.ReembedRevisionMismatch, manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes));
+        embedder.wrong_key = null;
+        try std.testing.expectEqual(@as(u64, 0), manager.denseIndex("leann_copy").?.index.stats().active_count);
         const before_calls = embedder.calls;
         try manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes);
-        try std.testing.expectEqual(before_calls + 1, embedder.calls);
+        try std.testing.expectEqual(before_calls + 2, embedder.calls);
         const persistent_config = "{\"field\":\"body\",\"dims\":8,\"metric\":\"l2_squared\",\"embedding_name\":\"leann_idx\",\"external\":true}";
         try manager.addAllNoBackfill(&store, &.{.{ .name = "persistent_copy", .kind = .dense_vector, .config_json = persistent_config }});
         for (&writes) |*write| write.index_name = @constCast("persistent_copy");

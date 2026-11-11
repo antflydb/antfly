@@ -18,12 +18,18 @@ const search_types = @import("antfly_vectorindex").search_types;
 /// Borrowed by each loader call; owned by one search, never shared across queries.
 pub const Session = struct {
     cancellation: ?search_types.CancellationToken = null,
+    budget_ns: u64 = 0,
     state: ?*anyopaque = null,
     release: ?*const fn (*anyopaque) void = null,
 
     pub fn deinit(self: *Session) void {
         if (self.state) |state| self.release.?(state);
         self.state = null;
+    }
+
+    pub fn checkDispatch(self: *const Session, elapsed_ns: u64) !void {
+        try self.check();
+        if (self.budget_ns != 0 and elapsed_ns >= self.budget_ns) return error.ReembedBudgetExceeded;
     }
 
     pub fn check(self: *const Session) !void {

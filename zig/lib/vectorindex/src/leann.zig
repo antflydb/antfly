@@ -235,6 +235,9 @@ pub const SearchOptions = struct {
     distance_under: ?f32 = null,
     /// Load upper-layer candidates to verify their backing vector is available.
     verify_source: bool = false,
+    /// Source vectors can be lossy copies. Original-vector bounds cannot
+    /// prune them, and retained vectors require source validation.
+    score_quantized_source: bool = false,
     gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
     /// rerank mode: 64 for `ratio`, where every beam slot costs
@@ -1598,9 +1601,10 @@ pub const Index = struct {
             }
         }
 
-        // PQ has no admissible bounds. Rerank the best estimated beam rather
-        // than every allowed node encountered during a selective walk.
-        if (self.rabitq == null and pool.items.len > ef) {
+        // PQ has no admissible bounds. RaBitQ bounds describe the original
+        // vectors, so they also cannot prune reranking of quantized copies.
+        // Limit a graph walk to its estimated beam in either case.
+        if ((self.rabitq == null or (opts.score_quantized_source and opts.candidate_ids == null)) and pool.items.len > ef) {
             const ByEstimate = struct {
                 fn lessThan(_: void, a: Pooled, b: Pooled) bool {
                     return a.est < b.est or (a.est == b.est and a.id < b.id);
@@ -1615,10 +1619,7 @@ pub const Index = struct {
                 return a.lower < b.lower;
             }
         };
-        if (opts.exhaustive) {
-            for (pool.items) |*item| item.lower = -std.math.inf(f32);
-        }
-        std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
+        if (!opts.score_quantized_source) std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
 
         var top = Heap(true){};
         defer top.deinit(alloc);
@@ -1637,19 +1638,19 @@ pub const Index = struct {
             ids.clearRetainingCapacity();
             while (i < pool.items.len and ids.items.len < chunk) : (i += 1) {
                 const p = pool.items[i];
-                if (p.lower >= tau) break;
+                if (!opts.score_quantized_source and p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
-                if (!opts.exhaustive and self.upper_vectors.contains(p.id) and
-                    (!opts.verify_source or (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false)))
+                if (self.upper_vectors.contains(p.id) and
+                    (if (opts.verify_source) (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false) else !opts.score_quantized_source))
                 {
-                    const c = Cand{ .dist = p.lower, .id = p.id };
+                    const c = Cand{ .dist = p.est, .id = p.id };
                     if (top.len() < k) try top.push(alloc, c) else if (c.dist < top.top().dist) top.replaceTop(c);
                     continue;
                 }
                 try ids.append(alloc, p.id);
             }
             if (ids.items.len == 0) {
-                if (i < pool.items.len and pool.items[i].lower >= tau) break;
+                if (!opts.score_quantized_source and i < pool.items.len and pool.items[i].lower >= tau) break;
                 continue;
             }
             if (!try RecomputeGate.open(opts.gate)) {
@@ -1675,7 +1676,7 @@ pub const Index = struct {
             // Unscored source-backed candidates may no longer exist.
             if (!opts.verify_source) {
                 for (pool.items[from..], from..) |p, position| {
-                    if (self.isDeleted(p.id) or (!opts.exhaustive and position < i and self.upper_vectors.contains(p.id))) continue;
+                    if (self.isDeleted(p.id) or (!opts.score_quantized_source and position < i and self.upper_vectors.contains(p.id))) continue;
                     const c = Cand{ .dist = p.est, .id = p.id };
                     if (top.len() < k) {
                         try top.push(alloc, c);
@@ -3607,6 +3608,25 @@ test "leann: retained vector validation avoids inference and rejects stale ident
         try testing.expectEqual(a.id, b.id);
         try testing.expectApproxEqRel(a.distance, b.distance, 0.000001);
     }
+
+    // The loader's rounded copy can cross a distance threshold even when
+    // the graph still has the original upper-layer vector.
+    var upper_ids = index.upper_vectors.keyIterator();
+    const upper_id = upper_ids.next().?.*;
+    const original = fx.data[@as(usize, upper_id) * 16 ..][0..16];
+    const query: [16]f32 = @splat(0);
+    const threshold = distance(index.config.metric, &query, original) / 2;
+    const rounded = try alloc.dupe(f32, fx.data);
+    defer alloc.free(rounded);
+    @memset(rounded[@as(usize, upper_id) * 16 ..][0..16], 0);
+    src.vectors = rounded;
+    src.valid = false;
+    const validations = src.validations;
+    var quantized = try index.search(alloc, src.source(), &query, .{ .k = 1, .candidate_ids = &.{upper_id}, .verify_source = true, .score_quantized_source = true });
+    defer quantized.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), quantized.results.len);
+    try testing.expect(quantized.results[0].distance < threshold);
+    try testing.expectEqual(validations + 1, src.validations);
 }
 
 test "leann: rebuild from codes keeps codes and live nodes" {
