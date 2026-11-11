@@ -65,16 +65,21 @@ pub fn inspect(server: anytype, a: A, resource: u64, descriptor: local.system_ca
     if (limit == 0 or limit > 64) return error.InvalidRetainedOwnerPlan;
     var context = try input.platformDeadline();
     context.setting_admin = true;
-    context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
     const raw = try server.source.systemCatalog(a, context, .{ .retained_owner_read = .{ .summary = .{ .resource = resource, .generation = descriptor.definition.generation, .after_group = after, .limit = limit } } });
     const page = try std.json.parseFromSliceLeaky(Page, a, raw, .{});
     if (page.owners.len > limit or page.plan.resource != resource or !std.mem.eql(u8, &page.plan.definition, &try descriptor.definition.fingerprint(a))) return error.RetainedOwnerPlanChanged;
+    // Status is best effort: an unavailable archive must not hide the
+    // authoritative lifecycle metadata or turn GET into an outage probe.
+    context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s);
     const output = try a.alloc(Owner, page.owners.len);
     var archive: ?archive_api.Opened = null;
     defer if (archive) |*opened| opened.deinit();
     for (page.owners, output) |owner, *out| {
-        try context.ensureActive();
         out.* = .{ .group = try decimal(a, owner.group), .mode = owner.mode, .archive_authoritative = owner.independent_receipt != null };
+        context.ensureActive() catch |err| {
+            out.status_error = @errorName(err);
+            continue;
+        };
         if (descriptor.source) |source| if (owner.mode != .revoked) native_status: {
             var bounded = context;
             bounded.deadline_ns = @min(context.deadline_ns.?, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s);
@@ -102,7 +107,7 @@ pub fn inspect(server: anytype, a: A, resource: u64, descriptor: local.system_ca
             if (manifest) |value| out.archive = .{ .pages = try decimal(a, value.pages), .sealed = value.sealed, .next_bucket_ns = try decimal(a, try local.retained_dataset_types.rowKeyTimestamp(value.next)) };
         }
     }
-    try context.ensureActive();
+    try input.ensureActive();
     return .{ .phase = page.plan.phase, .registration_complete = page.plan.registration_complete, .registered_owners = page.plan.registered, .ready_owners = page.plan.ready, .revoked_owners = page.plan.revoked, .archived_owners = page.plan.independent, .owners = output, .next_group = if (page.next_group) |group| try decimal(a, group) else null };
 }
 
