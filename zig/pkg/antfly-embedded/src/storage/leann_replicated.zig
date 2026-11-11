@@ -727,8 +727,12 @@ pub const ReplicatedState = struct {
     }
 
     pub fn searchWithStats(self: *const ReplicatedState, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
+        return self.searchWithWorkingAllocatorAndStats(alloc, alloc, req, search_stats);
+    }
+
+    pub fn searchWithWorkingAllocatorAndStats(self: *const ReplicatedState, result_alloc: Allocator, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
         if (search_stats) |profile| profile.* = .{};
-        var out = search_results.SearchResults.init(alloc, req.k);
+        var out = search_results.SearchResults.init(result_alloc, req.k);
         errdefer out.deinit();
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
@@ -803,7 +807,7 @@ pub const ReplicatedState = struct {
         if (profile.budget_exhausted) return error.ReembedBudgetExceeded;
         for (hits) |hit| {
             const vector_id = self.bindings.get(hit.key) orelse continue;
-            out.addResultWithOwnedMetadata(vector_id, hit.distance, 0, if (req.load_metadata) try alloc.dupe(u8, hit.key) else null);
+            out.addResultWithOwnedMetadata(vector_id, hit.distance, 0, if (req.load_metadata) try result_alloc.dupe(u8, hit.key) else null);
         }
         if (filter.active()) out.candidate_coverage = profile.matches.candidateCoverage(out.getHits().len);
         out.sort();

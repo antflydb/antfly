@@ -718,6 +718,7 @@ Each search owns its recovery session. Cancellation reaches provider discovery
 and inference, and chunk source sets survive scoring batches. Retained source
 sets have a 32 MiB soft limit; a single larger parent remains reusable until a
 different parent is needed, bounding retained data to the limit plus one parent.
+The query working-set cap also applies to that retained parent.
 External helpers, including `transcribeAudio`, never qualify for text elision.
 
 Transient searches capture graph candidates and their keys under the graph
@@ -732,7 +733,13 @@ results or readers, its generation stays fenced for subsequent operations.
 Recovery requests own producer and chunker configuration across the handoff.
 Cache hits and stored-vector reads
 keep their short query fence. Candidate metadata and scoring scratch count against the dense-search working
-set budget. Full-effort plans retain the live candidate list and score vectors
+set budget. Persistent local and replicated searches use that same budget
+for filters, graph traversal, vector-loader scratch, and temporary hits;
+returned results have an independent allocator. Recovery source reads,
+rendered inputs, and retained chunk source sets are charged to the query
+working allocator before provider dispatch. A recovery session retains its
+first allocator for cached sources until the session is destroyed.
+Full-effort plans retain the live candidate list and score vectors
 in bounded batches. Exact-buffer rows are scored independently of the graph
 shortlist, including dirty replicated rows before the first graph build.
 Buffer-only searches publish their exact match count and exhaustion proof,

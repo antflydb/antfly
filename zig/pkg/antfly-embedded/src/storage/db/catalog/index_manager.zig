@@ -54807,3 +54807,100 @@ test "leann exact buffer publishes coverage for local replicated and mixed dirty
         }
     }
 }
+
+test "leann persistent local and replicated searches enforce scratch budgets and return independently owned results" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    const Budget = @import("../../test_allocator.zig").BoundedAllocator;
+    for ([_]bool{ false, true }) |replicated| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(path);
+        const Primary = struct {
+            vectors: [32][8]f32 = undefined,
+            expected: ?Allocator = null,
+            extra_scratch: usize = 0,
+            query_loads: usize = 0,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.expected) |expected| {
+                    self.query_loads += 1;
+                    try std.testing.expectEqual(expected.ptr, a.ptr);
+                    try std.testing.expectEqual(expected.vtable, a.vtable);
+                }
+                const scratch = try a.alloc(u8, self.extra_scratch);
+                defer a.free(scratch);
+                return a.dupe(f32, &self.vectors[@intCast(id)]);
+            }
+            fn batch(raw: *anyopaque, a: Allocator, ids: []const u64, _: []const []const u8, out: []f32, found: []bool) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.expected) |expected| {
+                    self.query_loads += 1;
+                    try std.testing.expectEqual(expected.ptr, a.ptr);
+                    try std.testing.expectEqual(expected.vtable, a.vtable);
+                }
+                const scratch = try a.alloc(u8, self.extra_scratch);
+                defer a.free(scratch);
+                for (ids, found, 0..) |id, *exists, i| {
+                    @memcpy(out[i * 8 ..][0..8], &self.vectors[@intCast(id)]);
+                    exists.* = true;
+                }
+            }
+        };
+        var primary = Primary{};
+        var store = try leann_store_mod.LeannStore.open(alloc, std.testing.io, path, .{ .dims = 8, .metric = .l2_squared, .replicated = replicated, .build_threshold = 16, .max_degree = 8 });
+        defer store.deinit();
+        store.setLoader(.{ .ctx = &primary, .load = Primary.load });
+        const Item = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+        var keys: [32][8]u8 = undefined;
+        var items: [32]Item = undefined;
+        var ids: [32]u64 = undefined;
+        for (&items, &primary.vectors, &ids, 0..) |*item, *vector, *id, index| {
+            for (vector, 0..) |*coordinate, component| coordinate.* = @floatFromInt(index + component);
+            id.* = index;
+            item.* = .{ .vector_id = index, .vector = vector, .metadata = try std.fmt.bufPrint(&keys[index], "key{d:0>3}", .{index}) };
+        }
+        try store.apply(&items, &.{});
+        if (replicated) {
+            var raft: u64 = 1;
+            while (try store.planRecord(alloc)) |value| {
+                var planned = value;
+                defer planned.deinit(alloc);
+                _ = try store.applyRecord(planned.record, raft, null);
+                raft += 1;
+            }
+            try std.testing.expect(store.replicated.?.replica.index != null);
+        } else try std.testing.expect(store.index != null);
+        for ([_]bool{ false, true }) |batched| {
+            store.setLoader(.{ .ctx = &primary, .load = Primary.load, .load_batch = if (batched) Primary.batch else null });
+            const request: @import("antfly_vectorindex").search_types.SearchRequest = .{ .query = &primary.vectors[7], .k = 4, .search_effort = 1, .filter_ids = &ids };
+            try std.testing.expectError(error.OutOfMemory, store.searchWithWorkingAllocator(alloc, std.testing.failing_allocator, request));
+            {
+                var budget = Budget.init(std.heap.page_allocator, 32 * 1024);
+                defer std.debug.assert(budget.deinit() == 0);
+                primary.expected = budget.allocator();
+                primary.extra_scratch = 64 * 1024;
+                primary.query_loads = 0;
+                try std.testing.expectError(error.OutOfMemory, store.searchWithWorkingAllocator(alloc, budget.allocator(), request));
+                try std.testing.expectEqual(@as(usize, 0), budget.live);
+                try std.testing.expect(primary.query_loads > 0);
+            }
+            var result = block: {
+                var budget = Budget.init(std.heap.page_allocator, 256 * 1024);
+                defer std.debug.assert(budget.deinit() == 0);
+                primary.expected = budget.allocator();
+                primary.extra_scratch = 0;
+                const answer = try store.searchWithWorkingAllocator(alloc, budget.allocator(), request);
+                try std.testing.expectEqual(@as(usize, 0), budget.live);
+                break :block answer;
+            };
+            defer result.deinit();
+            primary.expected = null;
+            try std.testing.expectEqual(@as(usize, 4), result.items.items.len);
+            try std.testing.expectEqual(@as(u64, 7), result.items.items[0].vector_id);
+            try std.testing.expectEqualStrings("key007", result.items.items[0].metadata.?);
+        }
+    }
+}

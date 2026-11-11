@@ -764,7 +764,7 @@ pub const Replica = struct {
         const buffer_matches = hits.items.len;
         var matches: leann.MatchCoverage = .{ .verified = buffer_matches, .complete = true };
         if (self.index) |*index| {
-            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = if (tuning.filter != null) null else query, .strict = tuning.exhaustive };
+            var ctx = SearchSource{ .replica = self, .working_alloc = alloc, .loader = loader, .far_from = if (tuning.filter != null) null else query, .strict = tuning.exhaustive };
             const opts: leann.SearchOptions = .{
                 .k = k,
                 .ef = tuning.ef,
@@ -952,6 +952,7 @@ pub const Replica = struct {
     /// Planner source: exact vectors by node id through the key loader.
     const PlanSource = struct {
         replica: *const Replica,
+        working_alloc: ?Allocator = null,
         loader: VectorLoader,
         far_from: ?[]const f32,
         strict: bool = false,
@@ -971,24 +972,24 @@ pub const Replica = struct {
 
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
             const self: *PlanSource = @ptrCast(@alignCast(raw));
-            return recomputeByKey(self.replica, self.loader, self.far_from, ids, out, self.strict);
+            return recomputeByKey(self.replica, self.working_alloc orelse self.replica.alloc, self.loader, self.far_from, ids, out, self.strict);
         }
     };
 
     const SearchSource = PlanSource;
 };
 
-fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: ?[]const f32, ids: []const u32, out: []f32, strict: bool) !void {
+fn recomputeByKey(replica: *const Replica, alloc: Allocator, loader: VectorLoader, far_from: ?[]const f32, ids: []const u32, out: []f32, strict: bool) !void {
     const d: usize = replica.opts.config.dims;
     if (loader.load_batch) |load_batch| {
-        const keys = try replica.alloc.alloc([]const u8, ids.len);
-        defer replica.alloc.free(keys);
-        const found = try replica.alloc.alloc(bool, ids.len);
-        defer replica.alloc.free(found);
+        const keys = try alloc.alloc([]const u8, ids.len);
+        defer alloc.free(keys);
+        const found = try alloc.alloc(bool, ids.len);
+        defer alloc.free(found);
         // Deleted nodes get an empty key, which no loader resolves.
         for (ids, keys) |id, *k| k.* = if (replica.index.?.isDeleted(id)) "" else replica.keys.items[id];
         @memset(found, false);
-        try load_batch(loader.ctx, replica.alloc, keys, out[0 .. ids.len * d], found);
+        try load_batch(loader.ctx, alloc, keys, out[0 .. ids.len * d], found);
         for (found, 0..) |ok, i| {
             if (!ok and strict and keys[i].len != 0) return error.IncompletePublishedSnapshot;
             if (!ok) leann.fillMissingEmbedding(out[i * d ..][0..d], far_from);
@@ -1000,12 +1001,12 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: ?[]co
         const loaded: ?[]f32 = if (replica.index.?.isDeleted(id))
             null
         else
-            loader.load(loader.ctx, replica.alloc, replica.keys.items[id]) catch |err| switch (err) {
+            loader.load(loader.ctx, alloc, replica.keys.items[id]) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
         if (loaded) |v| {
-            defer replica.alloc.free(v);
+            defer alloc.free(v);
             if (v.len != d) return error.DimensionMismatch;
             @memcpy(row, v);
         } else {

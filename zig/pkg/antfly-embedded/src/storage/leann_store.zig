@@ -674,7 +674,7 @@ pub const LeannStore = struct {
         if (!self.opts.transient) {
             try self.acquireSearchRead(req);
             defer self.lock.unlockShared(self.io);
-            var result = if (self.replicated) |state| try state.searchWithStats(result_alloc, req, search_stats) else try self.searchLocalLocked(result_alloc, req, search_stats);
+            var result = if (self.replicated) |state| try state.searchWithWorkingAllocatorAndStats(result_alloc, alloc, req, search_stats) else try self.searchLocalLocked(result_alloc, alloc, req, search_stats);
             result.sort();
             return result;
         }
@@ -995,8 +995,8 @@ pub const LeannStore = struct {
         }
     };
 
-    fn searchLocalLocked(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
-        var out = search_results.SearchResults.init(alloc, req.k);
+    fn searchLocalLocked(self: *LeannStore, result_alloc: Allocator, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
+        var out = search_results.SearchResults.init(result_alloc, req.k);
         errdefer out.deinit();
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
@@ -1027,18 +1027,18 @@ pub const LeannStore = struct {
                     graph_count += 1;
                 }
                 if (self.pending_of.get(id.*)) |slot| {
-                    pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
+                    pending_matches += @intFromBool(try self.scorePending(result_alloc, &filter, q, scratch, slot, &out));
                 }
             }
             std.mem.sortUnstable(u32, graph_ids[0..graph_count], {}, std.sort.asc(u32));
         } else {
             for (0..self.pending.items.len) |slot| {
-                pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
+                pending_matches += @intFromBool(try self.scorePending(result_alloc, &filter, q, scratch, slot, &out));
             }
         }
 
         if (self.index) |*index| {
-            var ctx = SourceCtx{ .store = self, .far_from = if (filter.active()) null else req.query };
+            var ctx = SourceCtx{ .store = self, .working_alloc = alloc, .far_from = if (filter.active()) null else req.query };
             var gate = SearchGate.init(req, 0);
             const opts: leann.SearchOptions = .{
                 .k = std.math.cast(u32, req.k) orelse std.math.maxInt(u32),
@@ -1096,7 +1096,7 @@ pub const LeannStore = struct {
             if (search_stats) |profile| profile.* = resp.stats;
             for (resp.results) |result| {
                 const node = self.nodes.items[result.id];
-                out.addResultWithOwnedMetadata(node.vector_id, result.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
+                out.addResultWithOwnedMetadata(node.vector_id, result.distance, 0, if (req.load_metadata) try result_alloc.dupe(u8, node.metadata) else null);
             }
         }
         matches.verified += pending_matches;
@@ -1161,6 +1161,7 @@ pub const LeannStore = struct {
     /// of every metric instead of failing the search.
     const SourceCtx = struct {
         store: *LeannStore,
+        working_alloc: ?Allocator = null,
         far_from: ?[]const f32,
         reembed_ns: ?*u64 = null,
         strict: bool = false,
@@ -1173,15 +1174,16 @@ pub const LeannStore = struct {
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
             const self: *SourceCtx = @ptrCast(@alignCast(raw));
             const store = self.store;
+            const alloc = self.working_alloc orelse store.alloc;
             const d: usize = store.opts.dims;
             const loader = store.loader orelse return error.MissingVectorLoader;
             if (loader.load_batch != null or loader.load_batch_timed != null or loader.load_batch_session != null) {
-                const vector_ids = try store.alloc.alloc(u64, ids.len);
-                defer store.alloc.free(vector_ids);
-                const metas = try store.alloc.alloc([]const u8, ids.len);
-                defer store.alloc.free(metas);
-                const found = try store.alloc.alloc(bool, ids.len);
-                defer store.alloc.free(found);
+                const vector_ids = try alloc.alloc(u64, ids.len);
+                defer alloc.free(vector_ids);
+                const metas = try alloc.alloc([]const u8, ids.len);
+                defer alloc.free(metas);
+                const found = try alloc.alloc(bool, ids.len);
+                defer alloc.free(found);
                 for (ids, vector_ids, metas) |id, *vid, *m| {
                     const node = store.nodes.items[id];
                     vid.* = node.vector_id;
@@ -1192,10 +1194,10 @@ pub const LeannStore = struct {
                 if (loader.load_batch_session) |load_session| {
                     var fallback: RecoverySession = .{};
                     defer fallback.deinit();
-                    try load_session(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns, self.recovery orelse &fallback);
+                    try load_session(loader.ctx, alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns, self.recovery orelse &fallback);
                 } else if (loader.load_batch_timed) |timed| {
-                    try timed(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns);
-                } else try loader.load_batch.?(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
+                    try timed(loader.ctx, alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns);
+                } else try loader.load_batch.?(loader.ctx, alloc, vector_ids, metas, out[0 .. ids.len * d], found);
                 for (found, 0..) |ok, i| if (!ok) {
                     if (self.strict and metas[i].len != 0) return error.IncompletePublishedSnapshot;
                     @memset(out[i * d ..][0..d], std.math.nan(f32));
@@ -1207,13 +1209,13 @@ pub const LeannStore = struct {
                 const node = store.nodes.items[id];
                 const loaded: ?[]f32 = blk: {
                     if (store.index.?.isDeleted(id) or node.metadata.len == 0) break :blk null;
-                    break :blk loader.load(loader.ctx, store.alloc, node.vector_id, node.metadata) catch |err| switch (err) {
+                    break :blk loader.load(loader.ctx, alloc, node.vector_id, node.metadata) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };
                 };
                 if (loaded) |v| {
-                    defer store.alloc.free(v);
+                    defer alloc.free(v);
                     if (v.len != d) return error.DimensionMismatch;
                     @memcpy(row, v);
                 } else {
