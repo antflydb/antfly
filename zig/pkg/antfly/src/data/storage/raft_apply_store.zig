@@ -5951,4 +5951,11 @@ test "retained series raft projection requires native effects and a durable prot
     try RaftApplyStore.appendDataOperations(a, 1, admission, &operations, true);
     try std.testing.expectEqual(@as(usize, 2), operations.items.len);
     try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_read_admission_protocol_version, operations.items[1].require_raft_batch_protocol);
+    const handoff = try data_raft_batch.encode(a, "docs", .{ .timestamp_ns = 1, .document_version_scheme = .legacy, .retained_series = .{ .action = .revoke, .expected_admitted_ns = 7, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } });
+    defer a.free(handoff);
+    var decoded = try data_raft_batch.decode(a, handoff);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(?i128, 7), decoded.batch.req.retained_series.?.expected_admitted_ns);
+    try RaftApplyStore.appendDataOperations(a, 1, handoff, &operations, true);
+    try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_clock_handoff_protocol_version, operations.items[2].require_raft_batch_protocol);
 }

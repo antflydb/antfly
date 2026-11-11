@@ -112,6 +112,8 @@ pub const Progress = struct {
     closed_at_ns: ?i128 = null,
     /// Terminal producer cancellation; incomplete backfill never becomes coverage.
     revoked: bool = false,
+    /// Freeze retention admission before publishing independent authority.
+    archive_handoff: bool = false,
     /// Stop new admissions while previously prepared transactions drain.
     draining: bool = false,
     backfill_cursor: []const u8 = "",
@@ -124,7 +126,9 @@ pub const Progress = struct {
     last_tick_ns: i128 = 0,
     maintenance_next_slot: u2 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+        const types = @import("../retained_dataset_types.zig");
+        if (!self.archive_handoff) return types.writeFieldsOmitting(self, .{}, .{"archive_handoff"}, writer);
+        try types.writeFields(self, .{}, writer);
     }
     pub fn closureCut(self: Progress) !struct { sequence: u64, complete_from_ns: i128, admitted_ns: i128 } {
         if (self.revoked) return error.RetainedSeriesSourceRevoked;
@@ -175,7 +179,7 @@ pub const Metric = struct {
 pub const Bucket = struct { start_ns: i128, dimensions: []const u8, rows: i64 = 0, metrics: []Metric };
 pub const Edit = struct { key: []const u8, row: ?Bucket };
 pub const Frame = struct { sequence: u64, source_sequence: u64, edits: []const Edit };
-pub const Page = struct { rows: []const Bucket, after: ?[]const u8, cursor: Cursor };
+pub const Page = struct { rows: []const Bucket, after: ?[]const u8, cursor: Cursor, admitted_ns: i128 = 0, source_sequence: u64 = 0 };
 pub const Cursor = struct {
     definition: Id,
     partition: Id,
@@ -757,7 +761,24 @@ pub const Engine = struct {
         if (state.revoked) return error.RetainedSeriesSourceRevoked;
         if (!state.ready) return error.RetainedSeriesNotReady;
         if (admitted_ns <= state.admitted_ns) return;
+        if (state.archive_handoff) return error.RetainedSeriesSourceDraining;
         state.admitted_ns = admitted_ns;
+        try self.save(a, txn, state);
+    }
+
+    /// Stop new expiry decisions before archive authority becomes visible.
+    /// Existing admitted snapshots finish at their immutable cut. The frozen
+    /// watermark is transferred before the metadata publication is issued.
+    pub fn beginArchiveHandoff(self: Engine, txn: anytype, admitted_ns: i128) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var state = try self.load(a, txn);
+        if (state.revoked) return error.RetainedSeriesSourceRevoked;
+        if (!state.closed or !state.ready) return error.RetainedSeriesNotReady;
+        if (state.archive_handoff) return;
+        state.admitted_ns = @max(state.admitted_ns, admitted_ns);
+        state.archive_handoff = true;
         try self.save(a, txn, state);
     }
 
@@ -772,6 +793,7 @@ pub const Engine = struct {
         var state = try self.load(a, txn);
         if (state.revoked) return error.RetainedSeriesSourceRevoked;
         if (!state.ready) return error.RetainedSeriesNotReady;
+        if (state.archive_handoff) return 0;
         state.admitted_ns = @max(state.admitted_ns, admitted_ns);
         state.last_tick_ns = state.admitted_ns;
         var touched = std.StringHashMap(void).init(a);
@@ -865,7 +887,10 @@ pub const Engine = struct {
             if (ts < start_ns or ts >= end_ns) return error.RetainedSeriesResolutionMismatch;
             resume_after = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ p, resume_key[0..32], resume_key[32..] });
         };
-        return self.scanKeyRangeWhere(a, txn, p, lower, start_ns, end_ns, resume_after, limit, cut, dimensions_json);
+        var page = try self.scanKeyRangeWhere(a, txn, p, lower, start_ns, end_ns, resume_after, limit, cut, dimensions_json);
+        page.admitted_ns = state.admitted_ns;
+        page.source_sequence = state.source_sequence;
+        return page;
     }
 
     /// A closed owner exports through the last physical bucket, including
@@ -882,11 +907,13 @@ pub const Engine = struct {
         const start_ns = try types.rowKeyTimestamp(request.first_key);
         if (try self.spec.bucket(start_ns) != start_ns) return error.RetainedSeriesResolutionMismatch;
         if (start_ns < closed.complete_from_ns) return error.RetainedSeriesCoverageMissing;
-        if (try self.spec.expired(start_ns, state.admitted_ns)) return error.RetainedSeriesHistoryExpired;
         const cut = try self.snapshotCursor(txn);
         const bucket_prefix = try self.key(a, "bucket:");
         const lower = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ bucket_prefix, request.first_key[0..32], request.first_key[32..] });
-        return self.scanKeyRange(a, txn, bucket_prefix, lower, start_ns, null, after, limit, cut);
+        var page = try self.scanKeyRange(a, txn, bucket_prefix, lower, start_ns, null, after, limit, cut);
+        page.admitted_ns = state.admitted_ns;
+        page.source_sequence = state.source_sequence;
+        return page;
     }
 
     fn scanKeyRange(self: Engine, a: A, txn: anytype, p: []const u8, lower: []const u8, start_ns: i128, end_ns: ?i128, after: ?[]const u8, limit: usize, cut: Cursor) !Page {

@@ -6903,6 +6903,49 @@ pub const DataServer = struct {
         return result;
     }
 
+    fn freezeRetainedArchiveClock(self: *DataServer, a: std.mem.Allocator, group: u64, table: []const u8, spec: @import("antfly_local_sources").storage_retained_series.Spec, store: @import("../serverless/datasets/catalog.zig").Catalog, context: antfly.public_api.operation.RequestContext) !void {
+        const local = @import("antfly_local_sources");
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const fence: local.storage_retained_series_control.Fence = .{ .id = spec.id, .generation = spec.generation, .definition = spec.definition, .partition = spec.source_partition, .incarnation = spec.source_incarnation };
+        const before = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table, .status, context), .{});
+        const previous = for (before.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &spec.id) and entry.binding.spec.generation == spec.generation) break entry.progress;
+        } else return error.RetainedSeriesNotReady;
+        if (!previous.closed or previous.revoked) return error.RetainedSeriesNotReady;
+        if (previous.archive_handoff) {
+            if (!self.retainedMaintenanceLeader(group)) return error.GroupLeaderUnavailable;
+            _ = try store.admitRetentionClock(spec, previous.admitted_ns);
+            return;
+        }
+        const batch: antfly.db.types.BatchRequest = .{ .retained_series = .{ .action = .archive_handoff, .fence = fence }, .timestamp_ns = platform_time.realtimeNs() };
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const term = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk @as(?u64, null);
+            if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+            const current = raft.host.http_host.host.raftStatus(group) orelse return error.UnknownGroup;
+            break :blk @as(?u64, current.hard.current_term);
+        };
+        if (term) |leader_term| try self.proposeRaftBatchGroup(a, group, table, batch, .{
+            .discovery = .cached,
+            .required_local_term = leader_term,
+            .allow_remote_forward = false,
+            .admission_deadline_ns = context.deadline_ns,
+            .visibility_cancellation = context.cancellation,
+        }) else {
+            if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
+            try owners.applyRetainedSeriesNative(a, group, table, batch, context);
+        }
+        const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table, .status, context), .{});
+        const progress = for (status.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &spec.id) and entry.binding.spec.generation == spec.generation) break entry.progress;
+        } else return error.RetainedSeriesNotReady;
+        if (!progress.archive_handoff or !progress.closed or progress.revoked) return error.RetainedSeriesNotReady;
+        if (!self.retainedMaintenanceLeader(group)) return error.GroupLeaderUnavailable;
+        _ = try store.admitRetentionClock(spec, progress.admitted_ns);
+    }
+
     fn exportRetainedOwnerPage(self: *DataServer, a: std.mem.Allocator, snapshot: antfly.public_api.retained_owner_control.Snapshot, context: antfly.public_api.operation.RequestContext) !?@import("../metadata/retained_dataset_owners.zig").Id {
         const local = @import("antfly_local_sources");
         const exported = @import("../serverless/datasets/closure_export.zig");
@@ -6927,7 +6970,10 @@ pub const DataServer = struct {
             else => return err,
         };
         const progress = (try store.getClosedExport(spec, cut)) orelse try manifest.Manifest.init(spec, cut);
-        if (progress.sealed) return try progress.receipt();
+        if (progress.sealed) {
+            try self.freezeRetainedArchiveClock(a, snapshot.owner.group, source.name, spec, store, context);
+            return try progress.receipt();
+        }
         const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         const fence: local.storage_retained_series_control.Fence = .{ .id = spec.id, .generation = spec.generation, .definition = spec.definition, .partition = spec.source_partition, .incarnation = spec.source_incarnation };
         const bytes = read: {
@@ -6938,11 +6984,13 @@ pub const DataServer = struct {
         const response = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, bytes, .{});
         if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
         try context.ensureActive();
+        _ = try store.admitRetentionClock(spec, @max(cut.admitted_ns, response.page.admitted_ns));
         if (try exported.encode(a, definition, spec, cut, progress.next, response.page.rows, response.page.after != null, location)) |page| {
             defer exported.deinit(a, page);
             try exported.publish(store, spec, cut, page, location);
             return null;
         }
+        try self.freezeRetainedArchiveClock(a, snapshot.owner.group, source.name, spec, store, context);
         return try (try store.sealClosedExport(spec, cut, progress.next)).receipt();
     }
 
@@ -12284,38 +12332,13 @@ pub const DataServer = struct {
         return snapshot;
     }
 
-    fn pollRetainedOwner(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeReplay, input: antfly.public_api.operation.RequestContext) ![]u8 {
-        const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try request.validate(group);
-        var context = try input.platformDeadline();
-        context.setting_admin = true;
-        try context.ensureActive();
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const snapshot = try self.loadRetainedReadOwner(arena.allocator(), table_name, request.scope, context);
+    fn admitRetainedOwnerClock(self: *DataServer, a: std.mem.Allocator, table_name: []const u8, group: u64, fence: @import("antfly_local_sources").storage_retained_series_control.Fence, proposed: i128, context: antfly.public_api.operation.RequestContext) !struct { clock: i128, spec: @import("antfly_local_sources").storage_retained_series.Spec } {
         const local = @import("antfly_local_sources");
-        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
-        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
-        return owner.queryRetainedSeriesJson(alloc, group, table_name, .{ .poll = .{ .fence = fence, .root_incarnation = try std.fmt.parseInt(u128, request.root_incarnation, 10), .cursor = request.cursor, .limit = request.limit } }, context);
-    }
-
-    fn queryRetainedOwnerRows(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeQuery, input: antfly.public_api.operation.RequestContext) ![]u8 {
-        const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try request.validate(group);
-        var context = try input.platformDeadline();
-        try context.ensureActive();
-        context.setting_admin = true;
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const local = @import("antfly_local_sources");
-        const snapshot = try self.loadRetainedReadOwner(a, table_name, request.scope, context);
-        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
         const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         // The read clock must survive failover/rollback before it can hide
         // history. Quantize to bucket expiry boundaries: steady-state reads
         // share one durable admission per interval rather than one write/read.
-        const now = platform_time.realtimeNs();
+        const now = @max(platform_time.realtimeNs(), proposed);
         const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table_name, .status, context), .{});
         const entry = for (status.entries) |entry| {
             if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
@@ -12345,6 +12368,50 @@ pub const DataServer = struct {
                 try owners.applyRetainedSeriesNative(a, group, table_name, batch, context);
             }
         }
+        return .{ .clock = @max(now, entry.progress.admitted_ns), .spec = spec };
+    }
+
+    fn pollRetainedOwner(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeReplay, input: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        var context = try input.platformDeadline();
+        context.setting_admin = true;
+        try context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const snapshot = try self.loadRetainedReadOwner(arena.allocator(), table_name, request.scope, context);
+        const local = @import("antfly_local_sources");
+        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        _ = try self.admitRetainedOwnerClock(arena.allocator(), table_name, group, fence, request.clock_ns, context);
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        return owner.queryRetainedSeriesJson(alloc, group, table_name, .{ .poll = .{ .fence = fence, .root_incarnation = try std.fmt.parseInt(u128, request.root_incarnation, 10), .cursor = request.cursor, .limit = request.limit } }, context);
+    }
+
+    fn queryRetainedOwnerRows(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeQuery, input: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        var context = try input.platformDeadline();
+        try context.ensureActive();
+        context.setting_admin = true;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const local = @import("antfly_local_sources");
+        const snapshot = try self.loadRetainedReadOwner(a, table_name, request.scope, context);
+        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const admission = try self.admitRetainedOwnerClock(a, table_name, group, fence, request.clock_ns, context);
+        const now = admission.clock;
+        const read_api = @import("../api/retained_dataset_read.zig");
+        if (request.observe_only) {
+            const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table_name, .status, context), .{});
+            const entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else return error.RetainedSeriesNotReady;
+            try local.storage_retained_series_control.requireFence(fence, entry.binding.spec);
+            const observed = try read_api.Observation.from(try std.fmt.parseInt(u128, status.root_incarnation, 10), entry.progress, entry.binding.spec);
+            return std.json.Stringify.valueAlloc(alloc, read_api.NativeReply{ .rows = &.{}, .root_incarnation = status.root_incarnation, .cursor = observed.cursor, .admitted_ns = @max(now, entry.progress.admitted_ns), .observation = observed }, .{});
+        }
         var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = now, .dimensions_json = request.dimensions_json, .after = request.after }, context);
         defer reader.deinit();
         var rows: std.ArrayList(local.storage_retained_series.Bucket) = .empty;
@@ -12352,6 +12419,8 @@ pub const DataServer = struct {
         var position: ?local.storage_retained_series.Cursor = null;
         var root: []const u8 = "";
         var next_key: ?local.retained_dataset_types.RowKey = null;
+        var observation: ?read_api.Observation = null;
+        var admitted_ns: i128 = now;
         while (true) {
             const raw = try reader.nextJson(a, @min(128, request.limit - @as(u32, @intCast(rows.items.len))), context);
             if (raw.len > @import("../api/retained_dataset_read.zig").max_result_bytes - encoded_bytes) return error.DatasetPageBudgetExceeded;
@@ -12362,6 +12431,8 @@ pub const DataServer = struct {
             } else {
                 position = page.page.cursor;
                 root = page.root_incarnation;
+                observation = .{ .root = try std.fmt.parseInt(u128, root, 10), .cursor = page.page.cursor, .source_sequence = page.page.source_sequence, .admitted_ns = try read_api.Observation.retentionBoundary(admission.spec, page.page.admitted_ns) };
+                admitted_ns = @max(now, page.page.admitted_ns);
             }
             if (page.page.rows.len > request.limit - rows.items.len) return error.DatasetPageBudgetExceeded;
             try rows.appendSlice(a, page.page.rows);
@@ -12373,7 +12444,7 @@ pub const DataServer = struct {
             }
         }
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items, .root_incarnation = root, .cursor = position orelse return error.RetainedSeriesNotReady, .next = next_key }, .{});
+        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items, .root_incarnation = root, .cursor = position orelse return error.RetainedSeriesNotReady, .next = next_key, .admitted_ns = admitted_ns, .observation = observation }, .{});
     }
 
     fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
@@ -12482,7 +12553,22 @@ pub const DataServer = struct {
                 command = .{ .action = .install, .fence = fence, .binding = binding, .complete_from_ns = try @import("../api/retained_owner_binding.zig").minimumBucketStart(binding.spec), .expected_source_schema = lineage.schema };
             } else return error.RetainedSeriesNotReady;
         }
-        if (command) |native| {
+        if (command) |prepared| {
+            var native = prepared;
+            if (native.action == .revoke and snapshot.plan.phase == .closing and snapshot.owner.independent_receipt != null) {
+                // Transfer the moving read clock before revocation, and fence
+                // the native commit against any racing read admission. No
+                // admitted native clock can disappear at archive handoff.
+                const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+                const progress = for (status.entries) |entry| {
+                    if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry.progress;
+                } else return error.RetainedSeriesNotReady;
+                const spec = try @import("../api/retained_owner_binding.zig").specification(a, descriptor.value.definition, snapshot.owner.partition, snapshot.owner.incarnation);
+                var archive = try @import("../serverless/datasets/configured_archive.zig").Opened.init(a, self.api_server_cfg.node_config orelse return error.InvalidDatasetBinding, self.api_server_cfg.secret_store, descriptor.value, false);
+                defer archive.deinit();
+                _ = try archive.store(io, &context).admitRetentionClock(spec, progress.admitted_ns);
+                native.expected_admitted_ns = progress.admitted_ns;
+            }
             try context.ensureActive();
             if (did_work) |value| value.* = true;
             const batch: antfly.db.types.BatchRequest = .{ .retained_series = native, .timestamp_ns = platform_time.realtimeNs() };
@@ -58429,6 +58515,11 @@ test "retained series lifecycle protocol dominates document revision negotiation
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     req.retained_series.?.action = .admit_retention;
     try std.testing.expectEqual(p.batch_retained_read_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series.?.action = .archive_handoff;
+    try std.testing.expectEqual(p.batch_retained_clock_handoff_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series.?.action = .revoke;
+    req.retained_series.?.expected_admitted_ns = 1;
+    try std.testing.expectEqual(p.batch_retained_clock_handoff_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     req.retained_series = null;
     req.expiration_deletes = &.{"expired"};
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));

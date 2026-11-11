@@ -63,6 +63,9 @@ pub fn parseAfter(raw: []const u8) !dataset.RowKey {
     return raw[0..@sizeOf(dataset.RowKey)].*;
 }
 pub const NativeQuery = struct {
+    version: u8 = 2,
+    observe_only: bool = false,
+    clock_ns: i128 = 0,
     scope: owner_model.ArchiveScope,
     start_ns: []const u8,
     end_ns: []const u8,
@@ -71,6 +74,7 @@ pub const NativeQuery = struct {
     dimensions_json: ?[]const u8 = null,
     allow_more: bool = false,
     pub fn validate(self: NativeQuery, group: u64) !void {
+        if (self.version != 2) return error.InvalidRetainedOwnerPlan;
         try (owner_model.Read{ .owner = self.scope }).validate();
         if (self.scope.group != group or self.start_ns.len > 40 or self.end_ns.len > 40 or self.limit == 0 or self.limit > max_input_rows) return error.InvalidRetainedOwnerPlan;
         const range: dataset.Range = .{ .start_ns = self.start_ns, .end_ns = self.end_ns };
@@ -83,13 +87,31 @@ pub const NativeQuery = struct {
         }
     }
 };
-pub const NativeReply = struct { rows: []const series.Bucket, root_incarnation: []const u8, cursor: series.Cursor, next: ?dataset.RowKey = null };
+pub const Observation = struct {
+    root: u128,
+    source_sequence: u64,
+    cursor: series.Cursor,
+    admitted_ns: i128,
+    pub fn retentionBoundary(spec: series.Spec, clock: i128) !i128 {
+        return std.math.add(i128, try spec.bucket(try std.math.sub(i128, clock, spec.retention_ns)), spec.retention_ns);
+    }
+    pub fn from(root: u128, progress: series.Progress, spec: series.Spec) !Observation {
+        if (progress.revoked) return error.RetainedSeriesSourceRevoked;
+        if (!progress.ready) return error.RetainedSeriesNotReady;
+        return .{ .root = root, .source_sequence = progress.source_sequence, .admitted_ns = try retentionBoundary(spec, progress.admitted_ns), .cursor = .{ .definition = spec.definition, .partition = spec.source_partition, .incarnation = spec.source_incarnation, .sequence = progress.feed_latest } };
+    }
+};
+pub const Capture = struct { table: []const u8, scope: owner_model.ArchiveScope, observation: Observation };
+pub const NativeReply = struct { rows: []const series.Bucket, root_incarnation: []const u8, cursor: series.Cursor, next: ?dataset.RowKey = null, admitted_ns: i128 = 0, observation: ?Observation = null };
 pub const NativeReplay = struct {
+    version: u8 = 2,
     scope: owner_model.ArchiveScope,
     root_incarnation: []const u8,
     cursor: series.Cursor,
     limit: u16 = 8,
+    clock_ns: i128 = 0,
     pub fn validate(self: NativeReplay, group: u64) !void {
+        if (self.version != 2) return error.InvalidRetainedOwnerPlan;
         try (owner_model.Read{ .owner = self.scope }).validate();
         if (self.scope.group != group or self.root_incarnation.len == 0 or self.root_incarnation.len > 40 or self.limit == 0 or self.limit > 32) return error.InvalidRetainedOwnerPlan;
         if ((std.fmt.parseInt(u128, self.root_incarnation, 10) catch return error.InvalidRetainedOwnerPlan) == 0) return error.InvalidRetainedOwnerPlan;
@@ -130,6 +152,7 @@ pub const Result = struct {
     arena: std.heap.ArenaAllocator,
     rows: []const series.Bucket,
     history: dataset.InitialHistory,
+    captures: []const Capture = &.{},
     next: ?dataset.RowKey = null,
     pub fn deinit(self: *Result) void {
         self.arena.deinit();
@@ -280,6 +303,8 @@ pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: datas
         archive: ?*const Archive,
         limit: u32,
         input: Request,
+        captures: *std.ArrayList(Capture),
+        capture_alloc: A,
         const Part = @import("../serverless/datasets/summary_read.zig").Result;
         pub fn readPartition(self: @This(), alloc: A, owner: owner_model.Owner, authority: Authority, range: dataset.Range, ctx: operation.RequestContext) !Part {
             if (authority == .native) {
@@ -290,6 +315,7 @@ pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: datas
                 const scope: owner_model.ArchiveScope = .{ .resource = self.snapshot.plan.resource, .generation = self.snapshot.plan.generation, .plan = self.snapshot.plan.id, .group = owner.group, .revision = owner.revision };
                 const raw = try self.server.readRetainedOwnerRows(temp, source.name, owner.group, .{ .scope = scope, .start_ns = range.start_ns, .end_ns = range.end_ns, .limit = self.limit, .after = self.input.after, .dimensions_json = self.input.dimensions_json, .allow_more = self.input.page }, ctx);
                 const decoded = try std.json.parseFromSliceLeaky(NativeReply, temp, raw, .{});
+                if (decoded.observation) |observed| try self.captures.append(self.capture_alloc, .{ .table = source.name, .scope = scope, .observation = observed });
                 return .{ .arena = part_arena, .rows = decoded.rows, .next = decoded.next };
             }
             const opened = self.archive orelse return error.InvalidDatasetBinding;
@@ -311,7 +337,39 @@ pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: datas
         }
     };
     if (input.max_rows == 0 or input.max_rows > max_input_rows) return error.DatasetPageBudgetExceeded;
-    return read(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = if (input.page) @intCast(@min(input.max_rows + 1, @max(@as(usize, 1), max_input_rows / @max(@as(usize, 1), snapshot.owners.len)))) else input.max_rows, .input = input });
+    var captures = std.ArrayList(Capture).empty;
+    var result = try read(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = if (input.page) @intCast(@min(input.max_rows + 1, @max(@as(usize, 1), max_input_rows / @max(@as(usize, 1), snapshot.owners.len)))) else input.max_rows, .input = input, .captures = &captures, .capture_alloc = scratch });
+    errdefer result.deinit();
+    const owned = result.arena.allocator();
+    const output = try owned.dupe(Capture, captures.items);
+    for (output) |*capture| capture.table = try owned.dupe(u8, capture.table);
+    result.captures = output;
+    return result;
+}
+
+pub fn observeNative(server: anytype, a: A, table: []const u8, scope: owner_model.ArchiveScope, clock_ns: i128, context: operation.RequestContext) !NativeReply {
+    const raw = try server.readRetainedOwnerRows(a, table, scope.group, .{ .scope = scope, .start_ns = "0", .end_ns = "1", .limit = 1, .observe_only = true, .clock_ns = clock_ns }, context);
+    const reply = try std.json.parseFromSliceLeaky(NativeReply, a, raw, .{});
+    if (reply.observation == null) return error.RetainedReadRestartRequired;
+    return reply;
+}
+
+pub fn certify(server: anytype, a: A, captures: []const Capture, context: operation.RequestContext) !bool {
+    var unique: std.AutoHashMapUnmanaged(owner_model.ArchiveScope, Capture) = .empty;
+    defer unique.deinit(a);
+    for (captures) |capture| {
+        const slot = try unique.getOrPut(a, capture.scope);
+        if (slot.found_existing) {
+            if (!std.meta.eql(slot.value_ptr.observation, capture.observation)) return false;
+        } else slot.value_ptr.* = capture;
+    }
+    var values = unique.valueIterator();
+    while (values.next()) |capture| {
+        try context.ensureActive();
+        const now = try observeNative(server, a, capture.table, capture.scope, 0, context);
+        if (!std.meta.eql(capture.observation, now.observation.?)) return false;
+    }
+    return true;
 }
 
 pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Target, input: QueryRequest, context: operation.RequestContext) ![]u8 {
@@ -452,4 +510,44 @@ test "retained owner native controls page only through the common owner frontier
     try std.testing.expectEqual(@as(usize, 2), page.rows.len);
     try std.testing.expectEqual(@as(i64, 2), page.rows[1].rows);
     try std.testing.expectEqual(codec.key(page.rows[1]), page.next.?);
+}
+
+test "retained owner native controls certify duplicate scans once and reject mixed owner observations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const observed: Observation = .{ .root = 7, .source_sequence = 10, .cursor = .{ .definition = @splat(2), .partition = @splat(3), .incarnation = 1, .sequence = 5 }, .admitted_ns = 1000 };
+    const capture: Capture = .{ .table = "raw", .scope = .{ .resource = 41, .generation = 1, .plan = @splat(4), .group = 11, .revision = 1 }, .observation = observed };
+    const Server = struct {
+        value: Observation,
+        calls: usize = 0,
+        pub fn readRetainedOwnerRows(self: *@This(), alloc: A, _: []const u8, _: u64, input: NativeQuery, _: operation.RequestContext) ![]u8 {
+            try std.testing.expect(input.observe_only);
+            self.calls += 1;
+            return std.json.Stringify.valueAlloc(alloc, NativeReply{ .root_incarnation = "7", .cursor = self.value.cursor, .rows = &.{}, .observation = self.value }, .{});
+        }
+    };
+    var server: Server = .{ .value = observed };
+    try std.testing.expect(try certify(&server, a, &.{ capture, capture }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), server.calls);
+    server.value.source_sequence += 1;
+    try std.testing.expect(!try certify(&server, a, &.{capture}, .{}));
+    var stale = capture;
+    stale.observation.root += 1;
+    const before = server.calls;
+    try std.testing.expect(!try certify(&server, a, &.{ capture, stale }, .{}));
+    try std.testing.expectEqual(before, server.calls);
+}
+
+test "retained owner native controls read certification ignores clock changes within an expiry bucket" {
+    const spec: series.Spec = .{ .id = @splat(1), .definition = @splat(2), .generation = 1, .source_partition = @splat(3), .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = 1000, .laws = &.{.count} };
+    var progress: series.Progress = .{ .definition = spec.definition, .source_incarnation = 1, .source_sequence = 5, .admitted_ns = 1000, .complete_from_ns = 0, .ready = true };
+    const first = try Observation.from(7, progress, spec);
+    progress.admitted_ns = 1001;
+    try std.testing.expectEqualDeep(first, try Observation.from(7, progress, spec));
+    progress.admitted_ns = 1060;
+    try std.testing.expect(!std.meta.eql(first, try Observation.from(7, progress, spec)));
+    progress.admitted_ns = 1000;
+    progress.source_sequence += 1;
+    try std.testing.expect(!std.meta.eql(first, try Observation.from(7, progress, spec)));
 }

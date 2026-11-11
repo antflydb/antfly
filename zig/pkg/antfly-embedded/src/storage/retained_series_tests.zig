@@ -835,3 +835,39 @@ test "retained series read admission is durable across rollback and does not alt
     try e.admitRetentionClock(&store, 1000);
     try std.testing.expectError(error.RetainedSeriesHistoryExpired, e.scan(arena.allocator(), &store, 0, 10, 1000, null, 10));
 }
+
+test "retained series closed export preserves its frozen coverage after live clock admission" {
+    var store = Store.init();
+    defer store.deinit();
+    var e = engine();
+    e.spec.retention_ns = 1000;
+    try ready(e, &store);
+    const values = [_]?f64{ null, 1, 1, 1, 1 };
+    try e.apply(&store, 1, 1, .mutation, &.{.{ .key = "row", .after = sample(1, &values) }});
+    try e.close(&store, 100);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const closed = try (try e.status(alloc, &store)).closureCut();
+    const first = if (try e.spec.expired(closed.complete_from_ns, closed.admitted_ns)) try e.spec.bucket(closed.admitted_ns - e.spec.retention_ns) else closed.complete_from_ns;
+    const request: @import("retained_series_read_contract.zig").ArchiveStart = .{ .sequence = closed.sequence, .complete_from_ns = closed.complete_from_ns, .closed_at_ns = closed.admitted_ns, .first_key = @import("../retained_dataset_types.zig").rowKey(first, @splat(0)) };
+    const before = try e.scanArchive(alloc, &store, request, null, 10);
+    try std.testing.expectEqual(@as(usize, 1), before.rows.len);
+    try e.admitRetentionClock(&store, 110);
+    const live = try e.scan(alloc, &store, 0, 10, 110, null, 10);
+    try std.testing.expectEqual(@as(usize, 1), live.rows.len);
+    const after = try e.scanArchive(alloc, &store, request, null, 10);
+    try std.testing.expectEqual(@as(usize, 1), after.rows.len);
+    try std.testing.expectEqual(@as(i128, 110), after.admitted_ns);
+    try std.testing.expectEqualDeep(closed, try (try e.status(alloc, &store)).closureCut());
+    try e.beginArchiveHandoff(&store, 120);
+    try e.beginArchiveHandoff(&store, 130);
+    try std.testing.expectError(error.RetainedSeriesSourceDraining, e.admitRetentionClock(&store, 140));
+    _ = try e.tick(&store, 150, 10);
+    const frozen = try e.status(alloc, &store);
+    try std.testing.expect(frozen.archive_handoff);
+    try std.testing.expectEqual(@as(i128, 120), frozen.admitted_ns);
+    const final_page = try e.scanArchive(alloc, &store, request, null, 10);
+    try std.testing.expectEqual(@as(i128, 120), final_page.admitted_ns);
+    try std.testing.expectEqual(@as(usize, 1), final_page.rows.len);
+}

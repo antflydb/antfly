@@ -24,7 +24,7 @@ const A = std.mem.Allocator;
 pub const Entry = struct { binding: capture.Binding, progress: series.Progress };
 pub const Status = struct { root_incarnation: []const u8, entries: []const Entry };
 pub const Revocation = struct { root_incarnation: []const u8, fence: control.Fence, revoked: bool, reclaimed: bool = false };
-pub const Replay = struct { root_incarnation: []const u8, cursor: series.Cursor, frames: []const series.Frame };
+pub const Replay = struct { root_incarnation: []const u8, cursor: series.Cursor, frames: []const series.Frame, admitted_ns: i128 = 0 };
 pub const max_response_bytes = 6 * 1024 * 1024;
 
 pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract.Request) ![]u8 {
@@ -56,10 +56,12 @@ pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract
                 if (std.mem.eql(u8, &binding.spec.id, &poll.fence.id) and binding.spec.generation == poll.fence.generation) break binding.spec;
             } else return error.RetainedSeriesDefinitionMismatch;
             try control.requireFence(poll.fence, spec);
-            const frames = try (series.Engine{ .alloc = a, .spec = spec }).poll(temp, txn, poll.cursor, poll.limit);
+            const engine = series.Engine{ .alloc = a, .spec = spec };
+            const frames = try engine.poll(temp, txn, poll.cursor, poll.limit);
+            const progress = try engine.status(temp, txn);
             var cursor = poll.cursor;
             if (frames.len != 0) cursor.sequence = frames[frames.len - 1].sequence;
-            break :result try std.json.Stringify.valueAlloc(a, Replay{ .root_incarnation = root, .cursor = cursor, .frames = frames }, .{});
+            break :result try std.json.Stringify.valueAlloc(a, Replay{ .root_incarnation = root, .cursor = cursor, .frames = frames, .admitted_ns = progress.admitted_ns }, .{});
         },
     };
     errdefer a.free(response);

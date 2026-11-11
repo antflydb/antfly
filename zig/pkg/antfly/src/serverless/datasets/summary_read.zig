@@ -90,8 +90,6 @@ const DecodeCache = struct {
     checksum: t.Id = undefined,
     decoded: codec.Decoded = undefined,
     keys: []const t.RowKey = &.{},
-    dimensions: ?[]const u8 = null,
-    tuple_times: []const i128 = &.{},
     read_clock: i128 = 0,
     fn matches(self: *const DecodeCache, segment: t.Segment) bool {
         return if (self.id) |id| std.mem.eql(u8, &id, &segment.id) and std.mem.eql(u8, &self.checksum, &segment.checksum) else false;
@@ -109,26 +107,10 @@ const DecodeCache = struct {
         const owned_bytes = try self.arena.allocator().dupe(u8, bytes);
         self.decoded = try codec.decode(self.arena.allocator(), spec, owned_bytes);
         const keys = try self.arena.allocator().alloc(t.RowKey, self.decoded.rows.len);
-        var times = std.ArrayList(i128).empty;
-        for (keys, self.decoded.rows) |*key, row| {
-            key.* = codec.key(row);
-            if (self.dimensions) |dimensions| if (std.mem.eql(u8, dimensions, row.dimensions)) try times.append(self.arena.allocator(), row.start_ns);
-        }
-        self.tuple_times = times.items;
+        for (keys, self.decoded.rows) |*key, row| key.* = codec.key(row);
         self.keys = keys;
         self.checksum = segment.checksum;
         self.id = segment.id;
-    }
-    fn nextTupleBucket(self: *const DecodeCache, start: i128) !i128 {
-        var lo: usize = 0;
-        var hi = self.tuple_times.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.tuple_times[mid] < start) lo = mid + 1 else hi = mid;
-        }
-        // Absence is certified only through this immutable file's coverage.
-        const end = try @import("antfly_local_sources").retained_dataset_types.rowKeyTimestamp(self.decoded.receipt.span.end);
-        return @max(start, @min(end, if (lo < self.tuple_times.len) self.tuple_times[lo] else end));
     }
     fn lowerBound(self: *const DecodeCache, key: t.RowKey) usize {
         var lo: usize = 0;
@@ -171,7 +153,7 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         if (manifest.expired_before_ns) |floor| if (try range.start() < floor) return error.RetainedSeriesHistoryExpired;
         if (try range.start() < try @import("antfly_local_sources").retained_dataset_types.rowKeyTimestamp(manifest.first)) return error.RetainedSeriesCoverageMissing;
     }
-    var cache: DecodeCache = .{ .arena = std.heap.ArenaAllocator.init(a), .dimensions = limits.dimensions_json, .read_clock = clock };
+    var cache: DecodeCache = .{ .arena = std.heap.ArenaAllocator.init(a), .read_clock = clock };
     defer cache.arena.deinit();
     if (limits.page and limits.dimensions_json == null) return readPage(a, store, definition, spec, range, limits, closed, resolve, &cache);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -181,10 +163,9 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
     var row_bytes: usize = 0;
     var bytes_read: usize = 0;
     var after = limits.after;
-    var start = try range.start();
+    const start = try range.start();
     var end = try range.end();
     if (closed) |manifest| end = @min(end, try @import("antfly_local_sources").retained_dataset_types.rowKeyTimestamp(manifest.next));
-    if (after) |key| start = @max(start, try spec.bucket(try @import("antfly_local_sources").retained_dataset_types.rowKeyTimestamp(key)));
     // A complete materialization also has an operation bound, independent of
     // file/row sizes; empty or very sparse histories cannot monopolize a worker.
     const work_limit = if (limits.page) limits.segments else 8192;
@@ -200,7 +181,7 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         steps += 1;
         var start_buffer: [40]u8 = undefined;
         var end_buffer: [40]u8 = undefined;
-        const part_end = if (limits.dimensions_json != null) @min(end, try std.math.add(i128, start, spec.interval_ns)) else end;
+        const part_end = end;
         var part = readPage(a, store, definition, spec, .{
             .start_ns = try std.fmt.bufPrint(&start_buffer, "{d}", .{start}),
             .end_ns = try std.fmt.bufPrint(&end_buffer, "{d}", .{part_end}),
@@ -223,13 +204,9 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         if (part.next) |key| {
             if (after) |previous| if (std.mem.order(u8, &key, &previous) != .gt) return error.InvalidDatasetCoverage;
             after = key;
-        } else {
-            start = part_end;
-            if (limits.dimensions_json != null and cache.id != null) start = @min(end, try cache.nextTupleBucket(start));
-            if (start < end) after = try predecessor(t.rowKey(start, @splat(0)));
-        }
+        } else break;
         if (limits.page and rows.items.len == limits.rows) {
-            next = if (part.next != null or start < end) after else null;
+            next = after;
             break;
         }
     }
@@ -271,14 +248,21 @@ fn readPage(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         const next = try successor(after);
         if (std.mem.order(u8, &next, &requested.start) == .gt) requested.start = next;
     }
-    // A point dimension tuple in one bucket maps directly to one coverage
-    // extent, even when the bucket spans thousands of immutable files.
-    if (limits.dimensions_json) |dimensions| if ((std.math.add(i128, try range.start(), spec.interval_ns) catch return error.InvalidDatasetCoverage) == try range.end()) {
-        const key = codec.key(.{ .start_ns = try range.start(), .dimensions = dimensions, .rows = 1, .metrics = &.{} });
-        if (std.mem.order(u8, &key, &requested.start) == .lt) return .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{} };
+    // Locate the file containing the next requested tuple key. Its verified
+    // span certifies all following tuple keys in that file, so emit them in
+    // one pass instead of issuing a catalog plan for every bucket.
+    const output_end = requested.end;
+    if (limits.dimensions_json) |dimensions| {
+        var bucket = try spec.bucket(try @import("antfly_local_sources").retained_dataset_types.rowKeyTimestamp(requested.start));
+        var key = codec.key(.{ .start_ns = bucket, .dimensions = dimensions, .rows = 1, .metrics = &.{} });
+        if (std.mem.order(u8, &key, &requested.start) == .lt) {
+            bucket = try std.math.add(i128, bucket, spec.interval_ns);
+            key = codec.key(.{ .start_ns = bucket, .dimensions = dimensions, .rows = 1, .metrics = &.{} });
+        }
+        if (std.mem.order(u8, &key, &output_end) != .lt) return .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{} };
         requested.start = key;
         requested.end = try successor(key);
-    };
+    }
     if (std.mem.order(u8, &requested.start, &requested.end) != .lt) return .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{} };
     var plan = try store.planCoveringKeys(spec.generation, spec.source_partition, spec.source_incarnation, requested, limits.segments, limits.page);
     defer plan.deinit();
@@ -311,7 +295,7 @@ fn readPage(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
             read_clock = try store.admitRetentionClock(spec, decoded.receipt.admitted_ns);
         const offset = cache.lowerBound(requested.start);
         for (decoded.rows[offset..], cache.keys[offset..]) |row, key| {
-            if (std.mem.order(u8, &key, &requested.end) != .lt) break;
+            if (std.mem.order(u8, &key, &output_end) != .lt) break;
             if (limits.dimensions_json) |dimensions| if (!std.mem.eql(u8, dimensions, row.dimensions)) continue;
             if (rows.items.len == limits.rows) {
                 if (!limits.page) return error.DatasetPageBudgetExceeded;
@@ -322,6 +306,10 @@ fn readPage(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
             owned.dimensions = try temp.dupe(u8, row.dimensions);
             owned.metrics = try temp.dupe(series.Metric, row.metrics);
             try rows.append(temp, owned);
+        }
+        if (limits.dimensions_json != null) {
+            const through = (try segment.span()).end;
+            next_key = if (std.mem.order(u8, &through, &output_end) == .lt) try predecessor(through) else null;
         }
     }
     cache.read_clock = @max(cache.read_clock, read_clock);

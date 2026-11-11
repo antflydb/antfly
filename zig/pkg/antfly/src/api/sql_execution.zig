@@ -2517,6 +2517,19 @@ pub const Adapter = struct {
     }
 
     fn openRetainedStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
+        // Read-only optimistic capture: all retained observations precede the
+        // ordinary snapshot capture, and all are certified afterwards. A
+        // monotone owner sequence proves a common visibility interval without
+        // holding primary writers across RPCs or materialization. Retry before
+        // exposing any cursor; contention never produces mixed snapshots.
+        for (0..8) |_| {
+            try self.context.ensureActive();
+            if (try self.captureRetainedStatement(alloc, requests)) |read| return read;
+        }
+        return error.RetainedReadRestartRequired;
+    }
+
+    fn captureRetainedStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !?catalog.StatementRead {
         if (self.range_reads != null or self.active_transaction != null or self.dynamic_snapshot != null or self.read_requirements.after_write != null) return error.UnsupportedSqlExecution;
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
         const owner = try alloc.create(RetainedStatement);
@@ -2527,9 +2540,10 @@ pub const Adapter = struct {
         var ordinary: std.ArrayList(catalog.StatementScan) = .empty;
         var positions: std.ArrayList(usize) = .empty;
         var budget: usize = 32 * 1024 * 1024;
+        var captures = std.ArrayList(@import("retained_dataset_read.zig").Capture).empty;
         for (requests, cursors, 0..) |request, *cursor, index| {
             if (request.table.retained) |binding| {
-                const rows = try self.materializeRetainedRows(a, request.table, request.request, binding.*, &budget);
+                const rows = try self.materializeRetainedRows(a, request.table, request.request, binding.*, &budget, &captures);
                 const reader = try a.create(RetainedCursor);
                 reader.* = .{ .rows = rows };
                 cursor.* = .{ .ptr = reader, .next = RetainedCursor.next, .close = StatementRead.borrowedClose, .estimated_rows = rows.len, .order_satisfied = request.request.order.len == 0 };
@@ -2543,10 +2557,14 @@ pub const Adapter = struct {
             if (owner.raw.?.cursors.len != positions.items.len) return error.InvalidSqlBackendResponse;
             for (owner.raw.?.cursors, positions.items) |cursor, index| cursors[index] = cursor;
         }
+        if ((captures.items.len > 1 or ordinary.items.len != 0) and !try @import("retained_dataset_read.zig").certify(self.server, a, captures.items, self.context)) {
+            RetainedStatement.close(owner);
+            return null;
+        }
         return .{ .ptr = owner, .cursors = cursors, .close = RetainedStatement.close };
     }
 
-    fn materializeRetainedRows(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, scan_request: catalog.Scan, binding: catalog.Table.RetainedBinding, budget: *usize) ![]const catalog.Row {
+    fn materializeRetainedRows(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, scan_request: catalog.Scan, binding: catalog.Table.RetainedBinding, budget: *usize, captures: *std.ArrayList(@import("retained_dataset_read.zig").Capture)) ![]const catalog.Row {
         try self.verify(a, table);
         if (scan_request.after != null or scan_request.include_primary_digest or scan_request.search != null or scan_request.index_equality != null) return error.UnsupportedSqlExecution;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
@@ -2591,6 +2609,20 @@ pub const Adapter = struct {
             result = try read.readResolved(self.server, a, snapshot, definition, request, self.context);
         }
         defer result.deinit();
+        var native_owners: usize = 0;
+        for (snapshot.owners) |owner| if (owner.independent_receipt == null) {
+            native_owners += 1;
+        };
+        if (result.captures.len != native_owners) return error.RetainedReadRestartRequired;
+        if (result.captures.len > 4096 -| captures.items.len) return error.SqlProgramLimitExceeded;
+        for (result.captures) |capture| {
+            const cost = @sizeOf(read.Capture) + capture.table.len;
+            if (cost > budget.*) return error.SqlProgramLimitExceeded;
+            budget.* -= cost;
+            var owned = capture;
+            owned.table = try a.dupe(u8, capture.table);
+            try captures.append(a, owned);
+        }
         var rows: std.ArrayList(catalog.Row) = .empty;
         row_loop: for (result.rows) |row| {
             const cost = @sizeOf(catalog.Row) + row.dimensions.len + table.columns.len * (@sizeOf(std.json.Value) + 32);

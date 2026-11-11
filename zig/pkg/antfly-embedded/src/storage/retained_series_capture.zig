@@ -1079,6 +1079,12 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
         query.archive.?.sequence += 1;
         try std.testing.expectError(error.RetainedSeriesDefinitionMismatch, db.openRetainedSeriesRead(a, query));
     }
+    // Clock transfer and revocation form one compare-and-set boundary.
+    // A read admitted after copying the archive watermark defeats the stale
+    // revoke, without changing the immutable closure receipt.
+    try db.batch(.{ .timestamp_ns = 268, .retained_series = .{ .action = .admit_retention, .fence = fence } });
+    try std.testing.expectError(error.RetainedSeriesResetRequired, db.batch(.{ .timestamp_ns = 268, .retained_series = .{ .action = .revoke, .fence = fence, .expected_admitted_ns = 263 } }));
+    try db.batch(.{ .timestamp_ns = 268, .retained_series = .{ .action = .revoke, .fence = fence, .expected_admitted_ns = 268 } });
     const new_reader = try db.openRetainedSeriesRead(a, .{ .fence = next_fence, .start_ns = 270, .end_ns = 280, .admitted_ns = 268 });
     defer new_reader.close();
     const new_page = try new_reader.next(10);

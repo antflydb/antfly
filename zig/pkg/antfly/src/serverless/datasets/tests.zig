@@ -1134,3 +1134,39 @@ test "retained dataset tuple ranges decode spanning files once within the exact 
     try std.testing.expect(missing.next == null);
     try std.testing.expectEqual(page.bytes.len, missing.bytes_read);
 }
+test "retained dataset tuple metadata work scales with files rather than bucket count" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const series = @import("antfly_local_sources").storage_retained_series;
+    const export_page = @import("closure_export.zig");
+    const spec: series.Spec = .{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    const cut: export_page.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    var rows: [512]series.Bucket = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .start_ns = @intCast(i * 60), .dimensions = "[]", .rows = 1, .metrics = &metrics };
+    const page = (try export_page.encode(a, def, spec, cut, t.rowKey(0, @splat(0)), &rows, false, cold)).?;
+    defer export_page.deinit(a, page);
+    try export_page.publish(store, spec, cut, page, cold);
+    const manifest = try store.sealClosedExport(spec, cut, (try page.segment.span()).end);
+    const Resolver = struct {
+        loc: api.Location,
+        pub fn location(self: @This(), _: t.Id) !api.Location {
+            return self.loc;
+        }
+    };
+    _ = try store.admitRetentionClock(spec, 1000);
+    memory.resetOperationCount();
+    var result = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "30720" }, .{ .dimensions_json = "[]", .bytes = page.bytes.len }, cut, try manifest.receipt(), Resolver{ .loc = cold });
+    defer result.deinit();
+    const operations = memory.operationCount();
+    std.debug.print("RETAINED_TUPLE buckets=512 files=1 provider_operations={d}\n", .{operations});
+    try std.testing.expect(operations < 64);
+    try std.testing.expectEqual(@as(usize, 512), result.rows.len);
+    try std.testing.expectEqual(page.bytes.len, result.bytes_read);
+}

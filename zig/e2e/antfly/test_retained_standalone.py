@@ -23,6 +23,7 @@ import shutil
 import socket
 import subprocess
 import time
+import threading
 import urllib.error
 import urllib.request
 
@@ -346,6 +347,84 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         initial = api("POST", path + "/query", query)
         print("native", initial, flush=True)
         assert initial["rows"], initial
+        # Source and maintained rows commit together. A compound SELECT must
+        # either certify a common capture or return a retryable conflict.
+        sql(
+            "CREATE TABLE atomic_probe (id DOUBLE PRECISION NOT NULL, recorded_at TIMESTAMPTZ)"
+        )
+        sql(f"INSERT INTO atomic_probe (id, recorded_at) VALUES (1, '{timestamp}')")
+        atomic_path = "/databases/default/namespaces/public/datasets/atomic_probe_max"
+        api(
+            "POST",
+            atomic_path,
+            {
+                "source": {"table": "atomic_probe"},
+                "timestamp": "recorded_at",
+                "interval_ns": str(interval),
+                "mutable_for_ns": str(mutable_for),
+                "retention_ns": str(retention),
+                "measures": [{"name": "max_id", "law": "max", "field": "id"}],
+            },
+        )
+        wait_for(
+            lambda: api("GET", atomic_path),
+            lambda row: row["phase"] == "active",
+            process=server,
+        )
+        stop_writes = threading.Event()
+        write_errors = []
+
+        def write_atomic_rows():
+            for value in range(2, 202):
+                if stop_writes.is_set():
+                    break
+                try:
+                    api(
+                        "POST",
+                        "/sql",
+                        {"statement": f"UPDATE atomic_probe SET id = {value}"},
+                    )
+                    time.sleep(0.001)
+                except Exception as exc:
+                    write_errors.append(str(exc))
+                    break
+
+        writer = threading.Thread(target=write_atomic_rows)
+        writer.start()
+        successes = 0
+        concurrent_successes = 0
+        try:
+            statement = f"SELECT s.max_id, r.id FROM retained_summary(public.atomic_probe_max, '{first_bucket}', '{first_bucket + interval}') s CROSS JOIN atomic_probe r"
+            for _ in range(80):
+                try:
+                    result = api("POST", "/sql", {"statement": statement})
+                except OSError as exc:
+                    assert '"code":"40001"' in str(exc), exc
+                    continue
+                assert len(result["rows"]) == 1, result
+                maximum, raw_id = result["rows"][0]
+                assert maximum == raw_id, result
+                successes += 1
+                concurrent_successes += writer.is_alive()
+        finally:
+            stop_writes.set()
+            writer.join(timeout=15)
+        assert not writer.is_alive()
+        assert not write_errors, write_errors
+        assert successes and concurrent_successes, (successes, concurrent_successes)
+        atomic = api("GET", atomic_path)
+        api(
+            "POST",
+            atomic_path + "/close",
+            {"expected_revision": atomic["revision"], "discard": True},
+        )
+        wait_for(
+            lambda: api("GET", atomic_path),
+            lambda row: row["source_released"],
+            45,
+            server,
+        )
+        sql("DROP TABLE atomic_probe")
         export_query = {
             key: value for key, value in query.items() if key != "dimensions"
         }
