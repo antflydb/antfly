@@ -373,24 +373,25 @@ fn writeFieldsSelective(value: anytype, comptime names: anytype, comptime omitte
             for (optional_names) |name| if (std.mem.eql(u8, name, field)) break :blk true;
             break :blk false;
         };
-        if (comptime optional) if (@field(value, field) == null) continue;
-        try writer.objectField(field);
-        const decimal = comptime blk: {
-            for (names) |name| {
-                if (std.mem.eql(u8, name, field)) break :blk true;
+        if (if (comptime optional) @field(value, field) != null else true) {
+            try writer.objectField(field);
+            const decimal = comptime blk: {
+                for (names) |name| {
+                    if (std.mem.eql(u8, name, field)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (decimal) {
+                var buffer: [32]u8 = undefined;
+                try writer.write(std.fmt.bufPrint(&buffer, "{d}", .{@field(value, field)}) catch unreachable);
+            } else {
+                const current = @field(value, field);
+                if (@TypeOf(current) == Id) {
+                    try writeId(current, writer);
+                } else if (@TypeOf(current) == ?Id) {
+                    if (current) |id| try writeId(id, writer) else try writer.write(null);
+                } else try writer.write(current);
             }
-            break :blk false;
-        };
-        if (decimal) {
-            var buffer: [32]u8 = undefined;
-            try writer.write(std.fmt.bufPrint(&buffer, "{d}", .{@field(value, field)}) catch unreachable);
-        } else {
-            const current = @field(value, field);
-            if (@TypeOf(current) == Id) {
-                try writeId(current, writer);
-            } else if (@TypeOf(current) == ?Id) {
-                if (current) |id| try writeId(id, writer) else try writer.write(null);
-            } else try writer.write(current);
         }
     }
     try writer.endObject();

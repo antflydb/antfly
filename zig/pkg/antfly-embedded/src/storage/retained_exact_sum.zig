@@ -31,7 +31,9 @@ pub const Exact = struct {
         return .{ .units = if (bits >> 63 != 0) -magnitude else magnitude };
     }
     pub fn add(self: Exact, other: Exact) !Exact {
-        return .{ .units = std.math.add(Int, self.units, other.units) catch return error.RetainedSeriesNumericOverflow };
+        const units = std.math.add(Int, self.units, other.units) catch return error.RetainedSeriesNumericOverflow;
+        if (units == std.math.minInt(Int)) return error.RetainedSeriesNumericOverflow;
+        return .{ .units = units };
     }
     pub fn parse(bytes: []const u8) !Exact {
         if (bytes.len == 0 or bytes.len > 550) return error.RetainedSeriesCorrupt;
@@ -46,6 +48,20 @@ pub const Exact = struct {
     pub fn encode(self: Exact, a: std.mem.Allocator) ![]const u8 {
         const shift: u12 = if (self.units == 0) 0 else @intCast(@ctz(@as(UInt, @bitCast(self.units))));
         return std.fmt.allocPrint(a, "{x}:{x}", .{ self.units >> shift, shift });
+    }
+    /// Compatibility projection for merging a legacy approximate generation.
+    /// Each conversion is at most 64 bits; LLVM cannot convert i2176 directly.
+    pub fn legacyWide(self: Exact) f128 {
+        const magnitude: UInt = @intCast(if (self.units < 0) -self.units else self.units);
+        var result: f128 = 0;
+        var index: u12 = 34;
+        while (index != 0) {
+            index -= 1;
+            const limb: u64 = @truncate(magnitude >> (index * 64));
+            result = result * 0x1p64 + @as(f128, @floatFromInt(limb));
+        }
+        result *= 0x1p-1074;
+        return if (self.units < 0) -result else result;
     }
     /// Round the exact rational once, including subnormals and AVG ties.
     pub fn number(self: Exact, divisor: u64) f64 {

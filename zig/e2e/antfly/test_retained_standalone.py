@@ -15,6 +15,7 @@
 
 """Public standalone summary cancellation and concurrent archived serving."""
 
+import base64
 import concurrent.futures
 import datetime
 import json
@@ -57,6 +58,7 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
     secret = "retainedfixturepassword"
     env = dict(
         os.environ,
+        ANTFLY_BOOTSTRAP_ADMIN_PASSWORD="e2e-bootstrap-password",
         MINIO_ROOT_USER="retainedfixture",
         MINIO_ROOT_PASSWORD=secret,
         AWS_ACCESS_KEY_ID="retainedfixture",
@@ -97,7 +99,18 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
     def api(method, path, body=None):
         payload = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(
-            base + path, payload, {"content-type": "application/json"}, method=method
+            (
+                f"http://127.0.0.1:{server_port}" + path
+                if path.startswith("/auth/")
+                else base + path
+            ),
+            payload,
+            {
+                "content-type": "application/json",
+                "authorization": "Basic "
+                + base64.b64encode(b"admin:e2e-bootstrap-password").decode(),
+            },
+            method=method,
         )
         try:
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -118,6 +131,8 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             [
                 str(binary),
                 "standalone",
+                "--auth",
+                "true",
                 "--config",
                 str(data / "config.json"),
                 "--secret-store-path",
@@ -328,7 +343,17 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                 path + "/close",
                 {"expected_revision": active["revision"], "cancel_activation": True},
             )
-        assert api("GET", broken_path)["phase"] == "activating"
+        failed_status = wait_for(
+            lambda: api("GET", broken_path),
+            lambda result: any(
+                owner.get("native", {}).get("last_error")
+                for owner in result.get("progress", {}).get("owners", [])
+                if owner.get("native")
+            ),
+            30,
+            server,
+        )
+        assert failed_status["phase"] == "activating"
         with pytest.raises(OSError, match="409"):
             api(
                 "POST",
@@ -422,6 +447,38 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         assert not writer.is_alive()
         assert not write_errors, write_errors
         assert successes and concurrent_successes, (successes, concurrent_successes)
+        subscription = api(
+            "POST",
+            atomic_path + "/subscriptions",
+            {
+                "start_ns": str(first_bucket),
+                "end_ns": str(first_bucket + interval),
+            },
+        )
+        # Exceed both one poll (8 frames) and the native replay history (256).
+        for value in range(1000, 1260):
+            api("POST", "/sql", {"statement": f"UPDATE atomic_probe SET id = {value}"})
+        caught_up = api(
+            "POST",
+            atomic_path + "/subscriptions/poll",
+            {"cursor": subscription["cursor"]},
+        )
+        assert caught_up["resynchronized"] is True
+        changes = [event for event in caught_up["events"] if event["type"] == "upsert"]
+        assert len(changes) == 1 and float(changes[0]["values"][0]) == 1259
+        assert (
+            api(
+                "POST",
+                atomic_path + "/subscriptions/poll",
+                {"cursor": subscription["cursor"]},
+            )
+            == caught_up
+        )
+        api(
+            "POST",
+            atomic_path + "/subscriptions/cancel",
+            {"cursor": caught_up["cursor"]},
+        )
         atomic = api("GET", atomic_path)
         api(
             "POST",
@@ -470,11 +527,26 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         except ImportError:
             psycopg = None
         if psycopg is not None:
+            api(
+                "POST",
+                "/auth/v1/users/retained-reader",
+                {
+                    "password": "retained-reader-password",
+                    "initial_policies": [
+                        {
+                            "resource": "sensor_counts",
+                            "resource_type": "dataset",
+                            "type": "read",
+                        }
+                    ],
+                },
+            )
             with psycopg.connect(
                 host="127.0.0.1",
                 port=pgwire_port,
                 dbname="default",
-                user="admin",
+                user="retained-reader",
+                password="retained-reader-password",
                 sslmode="disable",
                 autocommit=True,
             ) as connection:

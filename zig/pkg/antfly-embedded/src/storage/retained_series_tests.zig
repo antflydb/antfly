@@ -894,8 +894,30 @@ test "retained series exact numeric state survives correction and archive merge"
     const merged = try row.metrics[1].merge(temp, decoded.rows[0].metrics[1]);
     try std.testing.expectEqual(@as(f64, 2), (try merged.finalize(.sum)).number);
     try std.testing.expectEqual(@as(f64, 1), (try merged.finalize(.avg)).number);
+    const mixed = try row.metrics[1].merge(temp, .{ .count = 1, .sum = 2 });
+    try std.testing.expect(mixed.exact_sum == null);
+    try std.testing.expectEqual(@as(f64, 3), (try mixed.finalize(.sum)).number);
     try e.close(&store, 3);
     try std.testing.expectEqual(@as(usize, 0), try e.tick(&store, std.math.maxInt(u64), 10));
     const frozen = try e.scanArchive(temp, &store, .{ .sequence = 2, .complete_from_ns = -1000, .closed_at_ns = 3, .first_key = @import("../retained_dataset_types.zig").rowKey(0, @splat(0)) }, null, 10);
     try std.testing.expectEqual(@as(usize, 1), frozen.rows.len);
+}
+
+test "retained series diagnostics never advance retention or source authority" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const before = try e.status(arena.allocator(), &store);
+    try e.recordDiagnostic(&store, "InvalidRetainedSeriesRow", 100);
+    try e.recordDiagnostic(&store, null, 90);
+    const failed = try e.status(arena.allocator(), &store);
+    try std.testing.expectEqualStrings("InvalidRetainedSeriesRow", failed.last_error.?);
+    try std.testing.expectEqual(before.admitted_ns, failed.admitted_ns);
+    try std.testing.expectEqual(before.source_sequence, failed.source_sequence);
+    try std.testing.expectEqual(before.feed_latest, failed.feed_latest);
+    try e.recordDiagnostic(&store, null, 110);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try e.status(arena.allocator(), &store)).last_error);
 }

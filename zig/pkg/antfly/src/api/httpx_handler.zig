@@ -2954,7 +2954,7 @@ pub const AntflyApiHandler = struct {
     pub fn createRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
         return self.retainedDatasetControl(ctx, .create);
     }
-    pub fn getRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+    pub fn getRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8, _: anytype) !httpx.Response {
         return self.retainedDatasetControl(ctx, .get);
     }
     pub fn closeRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {

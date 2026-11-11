@@ -68,8 +68,8 @@ pub const Spec = struct {
             try self.bucket(b.start_ns) != b.start_ns) return error.RetainedSeriesCorrupt;
         for (self.laws, b.metrics, 0..) |law, m, i| {
             if (m.exact_sum) |bytes| {
-                _ = try ExactSum.parse(bytes);
-                if ((law != .sum and law != .avg) or m.sum != 0) return error.RetainedSeriesCorrupt;
+                const exact = try ExactSum.parse(bytes);
+                if ((m.count == 0 and exact.units != 0) or (law != .sum and law != .avg) or m.sum != 0) return error.RetainedSeriesCorrupt;
             }
             if (m.count < 0 or m.count > b.rows or !std.math.isFinite(m.sum)) return error.RetainedSeriesCorrupt;
             if (m.minimum) |n| if (!std.math.isFinite(n)) return error.RetainedSeriesCorrupt;
@@ -194,14 +194,15 @@ pub const Metric = struct {
     /// AVG remains a mergeable (sum,count) state, never an average of averages.
     pub fn merge(left: Metric, a: A, right: Metric) !Metric {
         if (left.count < 0 or right.count < 0) return error.RetainedSeriesCorrupt;
-        const sum = left.sum + right.sum;
-        if (!std.math.isFinite(sum)) return error.RetainedSeriesNumericOverflow;
+
         var exact: ?[]const u8 = null;
         if ((left.exact_sum != null or left.count == 0) and (right.exact_sum != null or right.count == 0) and (left.exact_sum != null or right.exact_sum != null)) {
             const l = if (left.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
             const r = if (right.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
             exact = try (try l.add(r)).encode(a);
         }
+        const sum = if (exact != null) 0 else (if (left.exact_sum) |bytes| (try ExactSum.parse(bytes)).legacyWide() else left.sum) + (if (right.exact_sum) |bytes| (try ExactSum.parse(bytes)).legacyWide() else right.sum);
+        if (!std.math.isFinite(sum)) return error.RetainedSeriesNumericOverflow;
         return .{
             .exact_sum = exact,
             .count = std.math.add(i64, left.count, right.count) catch return error.RetainedSeriesNumericOverflow,
