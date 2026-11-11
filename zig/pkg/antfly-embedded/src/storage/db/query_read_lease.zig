@@ -24,11 +24,13 @@ pub fn For(comptime DB: type, comptime SearchResult: type) type {
         pub const Result = SearchResult;
         pub const Protocol = Types.query_lease.Protocol(SearchResult);
         db: *DB,
+        generation_exposed: bool = false,
         row_policy_lease: Source.row_policy_gate.Gate.Lease,
 
         /// Capture a primary typed reader under this lease's existing apply
         /// fence. Do not recursively acquire the fence behind a queued writer.
-        pub fn relationalRows(self: *const QueryReadLease, alloc: std.mem.Allocator, fields: []const []const u8, schema_version: u32) !DB.RelationalRows.Reader {
+        pub fn relationalRows(self: *QueryReadLease, alloc: std.mem.Allocator, fields: []const []const u8, schema_version: u32) !DB.RelationalRows.Reader {
+            self.generation_exposed = true;
             var view = self.db.core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
             var reader = try DB.RelationalRows.Reader.open(alloc, self.db.core.store, view, null, .{
@@ -39,25 +41,35 @@ pub fn For(comptime DB: type, comptime SearchResult: type) type {
             return reader;
         }
 
-        pub fn documentRows(self: *const QueryReadLease, alloc: std.mem.Allocator, schema_version: u32) !DB.DocumentRows {
+        pub fn documentRows(self: *QueryReadLease, alloc: std.mem.Allocator, schema_version: u32) !DB.DocumentRows {
+            self.generation_exposed = true;
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             errdefer view.release();
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
             const privacy_backing = Source.platform.allocator.reclaimingScratch(alloc);
-            const privacy_arena = try privacy_backing.create(std.heap.ArenaAllocator);
-            privacy_arena.* = .init(privacy_backing);
-            errdefer {
-                privacy_arena.deinit();
-                privacy_backing.destroy(privacy_arena);
+            var privacy_arena: ?*std.heap.ArenaAllocator = try privacy_backing.create(std.heap.ArenaAllocator);
+            privacy_arena.?.* = .init(privacy_backing);
+            errdefer if (privacy_arena) |arena| {
+                arena.deinit();
+                privacy_backing.destroy(arena);
+            };
+            const privacy_policy = try Source.privacy_read.capture(self.db, privacy_arena.?.allocator());
+            if (privacy_policy == null) {
+                // No captured policy owns parser pointers. Do not retain an
+                // empty arena allocation across otherwise released SQL pages.
+                privacy_arena.?.deinit();
+                privacy_backing.destroy(privacy_arena.?);
+                privacy_arena = null;
             }
-            const privacy_policy = try Source.privacy_read.capture(self.db, privacy_arena.allocator());
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
             return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .privacy_arena = privacy_arena, .privacy_policy = privacy_policy, .window = .init(alloc), .directory_arena = .init(Source.platform.allocator.reclaimingScratch(alloc)), .metadata = .init(Source.platform.allocator.reclaimingScratch(alloc)) };
         }
 
-        pub fn search(self: QueryReadLease, alloc: std.mem.Allocator, req: types.SearchRequest) !SearchResult {
-            return self.db.queryLeaseSearchOwned(alloc, req);
+        pub fn search(self: *QueryReadLease, alloc: std.mem.Allocator, req: types.SearchRequest) !SearchResult {
+            const result = try self.db.queryLeaseSearchOwned(alloc, req, !self.generation_exposed);
+            self.generation_exposed = true;
+            return result;
         }
 
         pub fn release(self: *QueryReadLease) void {

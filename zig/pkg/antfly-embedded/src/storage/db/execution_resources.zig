@@ -174,6 +174,39 @@ pub const ReplayPublication = struct {
     ) anyerror!u64,
 };
 
+/// Read-handle-owned provider construction. Called only on a cold stub miss.
+pub const QueryRecoveryFactory = struct {
+    /// Fork a lazy owner for an immutable retained catalog, without discovery.
+    fork: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!QueryRecoveryFactory = null,
+    ptr: *anyopaque,
+    create: *const fn (*anyopaque, @import("antfly_inference_execution_context").RequestContext) anyerror!enrichment_runtime_mod.Config,
+    release: *const fn (*anyopaque) void,
+
+    /// A failed cold setup must not turn an operational outage into a
+    /// permanently unusable read handle. Keep background repair's shared
+    /// provider policy, with construction/transport errors specific to setup.
+    pub fn isRetryableFailure(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory,
+            error.ConcurrencyUnavailable,
+            error.Canceled,
+            error.Cancelled,
+            error.EmbeddingProbeUnavailable,
+            error.RemoteCapabilityDiscoveryTransient,
+            error.ConnectionRefused,
+            error.NetworkUnreachable,
+            error.HostLacksNetworkAddresses,
+            error.TemporaryNameServerFailure,
+            error.NameServerFailure,
+            error.UnexpectedReadFailure,
+            error.SendFailed,
+            error.RecvFailed,
+            => true,
+            else => types.repair_failure.isTransient(err),
+        };
+    }
+};
+
 pub const AsyncContext = struct {
     apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
@@ -229,9 +262,20 @@ pub const AsyncContext = struct {
     /// enrichment coverage publication. Provider calls never run under this
     /// lock; healthy produced/skipped coverage stays off this path.
     artifact_repair_issue_mutex: std.atomic.Mutex = .unlocked,
+    /// Foreground replay borrows the stable owner's ledger coordination while
+    /// retaining its own projection/capture capabilities.
+    shared_artifact_repair_issue_mutex: ?*std.atomic.Mutex = null,
+
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+    query_recovery_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+    query_recovery_factory: ?QueryRecoveryFactory = null,
+    query_recovery_ready: std.atomic.Value(bool) = .init(false),
+    query_recovery_mutex: std.Io.Mutex = .init,
+    query_recovery_condition: std.Io.Condition = .init,
+    query_recovery_in_progress: bool = false,
+    query_recovery_retry_at: u64 = 0,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
     enrichment_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     target_advance: @import("target_advance_tracker.zig").Tracker = .{},
@@ -244,6 +288,10 @@ pub const AsyncContext = struct {
     repair_options: types.ArtifactRepairRunOptions = .{},
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
+
+    pub fn artifactRepairIssueMutex(self: *const @This()) *std.atomic.Mutex {
+        return self.shared_artifact_repair_issue_mutex orelse &@constCast(self).artifact_repair_issue_mutex;
+    }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         stopNativeProjectionMaintenance(self);
@@ -1688,6 +1736,7 @@ pub const GeneratedBatchWritePlan = struct {
 };
 
 pub const GeneratedDenseMemoJob = struct {
+    generation: embedder_mod.DenseEmbedder.TextGeneration = .{},
     key: GeneratedEmbeddingMemo.Key,
     text: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1711,6 +1760,7 @@ pub const GeneratedEmbeddingMemo = struct {
     alloc: Allocator,
     reuse_stored_artifacts: bool = false,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
+    generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
@@ -1718,6 +1768,9 @@ pub const GeneratedEmbeddingMemo = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        var names = self.generations.keyIterator();
+        while (names.next()) |name| self.alloc.free(name.*);
+        self.generations.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1752,6 +1805,27 @@ pub const GeneratedEmbeddingMemo = struct {
         var digest: Key = undefined;
         hasher.final(&digest);
         return digest;
+    }
+
+    /// One immutable provider lease per model per synchronous preparation.
+    pub fn generation(self: *@This(), provider: embedder_mod.DenseEmbedder, name: []const u8) !embedder_mod.DenseEmbedder.TextGeneration {
+        if (self.generations.get(name)) |captured| return captured;
+        const captured = try provider.captureTextGeneration(self.alloc, name);
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.generations.put(self.alloc, owned, captured);
+        return captured;
+    }
+
+    pub fn keyAtRevision(base: Key, revision: ?[32]u8) Key {
+        const current = revision orelse return base;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("synchronous-dense-generation-v1");
+        hash.update(&base);
+        hash.update(&current);
+        var result: Key = undefined;
+        hash.final(&result);
+        return result;
     }
 
     pub fn adoptDense(self: *@This(), key_value: Key, owned: []f32) ![]const f32 {
@@ -2338,6 +2412,10 @@ pub const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmana
 pub const EmbeddingArtifactOrigin = union(enum) {
     authored,
     generated: ?u64,
+    /// Generated from text alone, so re-embedding the source reproduces it
+    /// (dense artifacts carry `text_input`; sparse ones treat it as
+    /// `generated`).
+    generated_text: ?u64,
 };
 
 pub const StoreWritePositions = std.StringHashMapUnmanaged(usize);

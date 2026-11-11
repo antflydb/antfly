@@ -27,10 +27,11 @@ import (
 // SyncFailure is safe to persist and expose: no raw provider errors, URLs,
 // tokens, object paths, or response bodies enter this contract.
 type SyncFailure struct {
-	SourceID  string `json:"source_id,omitempty"`
-	Phase     string `json:"phase"`
-	Code      string `json:"code"`
-	Retryable bool   `json:"retryable"`
+	SourceID        string `json:"source_id,omitempty"`
+	Phase           string `json:"phase"`
+	Code            string `json:"code"`
+	Retryable       bool   `json:"retryable"`
+	RestartRequired bool   `json:"restart_required,omitempty"`
 }
 type sourceSyncError struct {
 	sourceID, phase string
@@ -50,6 +51,7 @@ func describeSyncFailure(err error) *SyncFailure {
 		cause = source.cause
 	}
 	var changed *RevisionChangedError
+	var restart *restartRequiredError
 	var network net.Error
 	status := 0
 	var publication *PublishHTTPError
@@ -70,6 +72,8 @@ func describeSyncFailure(err error) *SyncFailure {
 		f.Code = "timeout"
 	case errors.As(err, &changed):
 		f.Code = "source_version_changed"
+		f.RestartRequired = errors.As(err, &restart)
+		f.Retryable = !f.RestartRequired
 	case errors.Is(err, ErrInvalidInput):
 		f.Code, f.Retryable = "invalid_configuration", false
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:

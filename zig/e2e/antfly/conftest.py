@@ -1597,14 +1597,18 @@ class StandaloneAntflyServer:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
 
-    def _stop_process(self) -> None:
+    def _stop_process(self, *, crash: bool = False) -> None:
         if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+            if crash:
                 self.proc.kill()
                 self.proc.wait()
+            else:
+                self.proc.send_signal(signal.SIGTERM)
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
         self.proc = None
 
     def restart(self) -> None:
@@ -1613,8 +1617,12 @@ class StandaloneAntflyServer:
         self.log_file = self.log_path.open("a")
         self._start_process(truncate_logs=False)
 
-    def pause(self) -> None:
-        self._stop_process()
+    def pause(self, *, crash: bool = False) -> None:
+        """Stop and reserve endpoints; crash skips graceful worker draining."""
+        if crash:
+            self._stop_process(crash=True)
+        else:
+            self._stop_process()
         self.port_reservations.ensure_reserved(self.port)
         if self.pgwire_port is not None:
             self.port_reservations.ensure_reserved(self.pgwire_port)
@@ -2655,11 +2663,22 @@ class InferenceEmbeddingServer:
         with self._transient_embedding_lock:
             return self._transient_embedding_requests
 
+    @property
+    def embedding_delay_blocked(self) -> bool:
+        """The explicit gate still owns an admitted corpus request."""
+        return (
+            self.response_delay_s is None
+            and self._delay_enabled.is_set()
+            and self._embedding_request_active.is_set()
+            and not self._delay_released.is_set()
+        )
+
     def release_delay(self) -> None:
         self._delay_enabled.clear()
         self._delay_released.set()
 
     def stop(self) -> None:
+        self.release_delay()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)

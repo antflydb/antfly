@@ -89,7 +89,42 @@ pub const KeyPredicate = struct {
         for (keys, output) |key, *result| result.* = try self.allows(self.ptr, key);
     }
 };
+/// Reads owned source bytes from the generation pinned by the query.
+pub const SourceRead = struct {
+    ptr: *anyopaque,
+    get_owned: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
+    /// Each output belongs to alloc; implementation releases batch read pins.
+    get_many_sorted_owned: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8, []?[]u8) anyerror!void = null,
+
+    pub fn getManySortedOwned(self: SourceRead, alloc: std.mem.Allocator, keys: []const []const u8, values: []?[]u8) !void {
+        if (keys.len != values.len) return error.InvalidArgument;
+        @memset(values, null);
+        errdefer for (values) |*value| {
+            if (value.*) |bytes| alloc.free(bytes);
+            value.* = null;
+        };
+        if (self.get_many_sorted_owned) |read| return read(self.ptr, alloc, keys, values);
+        for (keys, values) |key, *value| value.* = self.get_owned(self.ptr, alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+};
+
+/// Releases query publication fences only after the scorer owns its inputs.
+pub const ExternalWork = struct {
+    read: ?SourceRead = null,
+    reembed_elapsed_ns: ?*u64 = null,
+    ptr: *anyopaque,
+    before_inference: *const fn (*anyopaque) anyerror!void,
+    after_inference: *const fn (*anyopaque) void,
+    validate: *const fn (*anyopaque) anyerror!void,
+    enter: *const fn (*anyopaque) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
+
 pub const SearchRequest = struct {
+    external_work: ?ExternalWork = null,
     key_predicate: ?KeyPredicate = null,
     query: []const f32,
     k: usize,
@@ -112,6 +147,8 @@ pub const SearchRequest = struct {
     /// Borrowed request-lifecycle signal. Search loops poll this at bounded
     /// intervals so a disconnected caller does not retain query capacity.
     cancellation: ?CancellationToken = null,
+    /// Absolute monotonic deadline for storage and provider work.
+    deadline_ns: ?u64 = null,
 };
 
 pub fn normalizedSearchEffort(req: SearchRequest) ?f32 {
@@ -376,6 +413,20 @@ pub const HBCDebugNode = struct {
         alloc.free(self.members);
     }
 };
+
+/// Leaf work outside the metadata batch includes ID inspection and scoring.
+/// The route planner projects this rate over inspected candidates.
+pub fn leafWorkNsPerInspectedRow(profile: *const SearchProfile) u64 {
+    const inspected = @max(profile.filter_candidates, profile.approx_vectors_scored);
+    const elapsed = profile.leaf_score_ns -| profile.filter_metadata_batch_ns;
+    return if (inspected == 0 or elapsed == 0) 0 else @max(elapsed / inspected, 1);
+}
+
+test "sparse HBC scores do not inflate leaf work per inspected row" {
+    const sample = SearchProfile{ .leaf_score_ns = 1500, .filter_metadata_batch_ns = 500, .filter_candidates = 100, .approx_vectors_scored = 2 };
+    try std.testing.expectEqual(@as(u64, 10), leafWorkNsPerInspectedRow(&sample));
+    try std.testing.expectEqual(@as(u64, 10), leafWorkNsPerInspectedRow(&.{ .leaf_score_ns = 1000, .approx_vectors_scored = 100 }));
+}
 
 pub const RequestFilterState = struct {
     include: std.AutoHashMapUnmanaged(u64, void) = .empty,

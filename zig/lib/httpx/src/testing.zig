@@ -95,6 +95,8 @@ pub const TestServer = struct {
     route_hits: []usize,
     base_url_buf: [64]u8 = undefined,
     base_url_len: usize = 0,
+    /// Explicit request cap for fixtures exercising large encoded media.
+    max_request_bytes: usize = 8192,
 
     const Self = @This();
 
@@ -159,7 +161,10 @@ pub const TestServer = struct {
         defer sock.close();
 
         // Read full request (request line + headers + optional body).
-        var buf: [8192]u8 = undefined;
+        var stack_buf: [8192]u8 = undefined;
+        const owned = if (self.max_request_bytes > stack_buf.len) try self.allocator.alloc(u8, self.max_request_bytes) else null;
+        defer if (owned) |bytes| self.allocator.free(bytes);
+        const buf = owned orelse stack_buf[0..@min(stack_buf.len, self.max_request_bytes)];
         var total: usize = 0;
         while (total < buf.len) {
             const reader = sock.reader();
@@ -205,6 +210,7 @@ pub const TestServer = struct {
         }
         const body_start = header_end + 4;
         const content_length = contentLength(headers.items);
+        if (content_length > buf.len - body_start) return error.RequestTooLarge;
         while (total < body_start + content_length and total < buf.len) {
             const reader = sock.reader();
             const n = reader.read(buf[total..]) catch break;

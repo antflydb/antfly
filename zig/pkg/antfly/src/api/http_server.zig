@@ -15043,6 +15043,8 @@ pub const ApiHttpServer = struct {
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+            error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation => return error.GraphMaxWeightDomainViolation,
@@ -15398,6 +15400,8 @@ pub const ApiHttpServer = struct {
                 error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+                error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+                error.ReembedSetupRetry => return error.ReembedSetupRetry,
                 error.GraphWorkBudgetExceeded,
                 error.GraphMinWeightDomainViolation,
                 error.GraphMaxWeightDomainViolation,
@@ -15471,6 +15475,8 @@ pub const ApiHttpServer = struct {
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+            error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation,
@@ -15590,6 +15596,8 @@ pub const ApiHttpServer = struct {
             error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+            error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation,
@@ -23806,6 +23814,8 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
             error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .doc_identity_unavailable),
             error.IndexRebuilding => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
+            error.ReembedBudgetExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "reembed_budget_exceeded", "re-embedding budget exceeded; increase reembed_budget_ms or set it to zero", false),
+            error.ReembedSetupRetry => try contextualQueryDependencyErrorResponse(self.alloc, 503, "reembed_setup_retry", "re-embedding provider setup temporarily unavailable", true),
             error.IncompletePublishedSnapshot => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
             error.MetricNotReady => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .metric_not_ready),
             error.MetricStale => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .metric_stale),
@@ -45703,6 +45713,8 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.RerankUpstreamFailure, .status = 502, .body = "{\"code\":\"reranker_upstream_failure\",\"error\":\"reranker_upstream_failure\",\"message\":\"reranker provider failed\",\"retryable\":false}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .query_error = error.ReembedBudgetExceeded, .status = 422, .body = "{\"code\":\"reembed_budget_exceeded\",\"error\":\"reembed_budget_exceeded\",\"message\":\"re-embedding budget exceeded; increase reembed_budget_ms or set it to zero\",\"retryable\":false}", .json = true },
+        .{ .query_error = error.ReembedSetupRetry, .status = 503, .body = "{\"code\":\"reembed_setup_retry\",\"error\":\"reembed_setup_retry\",\"message\":\"re-embedding provider setup temporarily unavailable\",\"retryable\":true}", .json = true, .retry_after = true },
         .{ .query_error = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
     for (cases) |case| {
@@ -59058,10 +59070,10 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expectEqual(@as(usize, 2), aggregations.map.count());
     const version_stats = aggregations.map.get("version_stats").?;
     try std.testing.expectEqual(@as(?i64, 2), version_stats.count);
-    try std.testing.expectEqual(@as(?f32, 1), version_stats.min);
-    try std.testing.expectEqual(@as(?f32, 2), version_stats.max);
-    try std.testing.expectEqual(@as(?f32, 1.5), version_stats.avg);
-    try std.testing.expectEqual(@as(?f32, 3), version_stats.sum);
+    try std.testing.expectEqual(@as(?f64, 1), version_stats.min);
+    try std.testing.expectEqual(@as(?f64, 2), version_stats.max);
+    try std.testing.expectEqual(@as(?f64, 1.5), version_stats.avg);
+    try std.testing.expectEqual(@as(?f64, 3), version_stats.sum);
     const name_terms = aggregations.map.get("name_terms").?;
     try std.testing.expectEqual(@as(usize, 2), name_terms.buckets.?.len);
     try std.testing.expectEqualStrings("Alice", name_terms.buckets.?[0].key);

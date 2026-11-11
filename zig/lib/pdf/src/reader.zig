@@ -35412,7 +35412,9 @@ test "reader inline image bytes cannot alter scopes resources or extraction" {
 }
 
 test "reader nested transparency groups retain effective visibility for every paint" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const group = "/Type /XObject /Subtype /Form /BBox [0 0 400 300] /Group << /S /Transparency /I true /CS /DeviceRGB >>";
     const paints = [_][]const u8{
         "BT /F1 10 Tf 10 150 Td (Middle) Tj ET",
@@ -38386,7 +38388,9 @@ fn exerciseEncryptedNativeFormProjection(a: Allocator, sample: []const u8) !void
 }
 
 test "reader native Form projection decrypts deferred resources exactly once" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const file_key: [16]u8 = @splat(3);
     const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
     var label: [5]u8 = "Label".*;

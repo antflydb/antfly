@@ -28,7 +28,7 @@ import (
 )
 
 func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T) {
-	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest"} {
+	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest", "incomplete", "retryable_incomplete", "unknown_completion", "invalid_completion", "units_index_pending"} {
 		t.Run(problem, func(t *testing.T) {
 			state := t.TempDir()
 			hash := strings.Repeat("a", 64)
@@ -43,9 +43,14 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 			os.WriteFile(filepath.Join(state, "published.ndjson"), raw, 0600)
 			digest := fmt.Sprintf("%x", sha256.Sum256(raw))
 			atomicCorpusJSON(filepath.Join(state, "publication.json"), map[string]any{"sha256": digest, "records": 1})
+			atomicCorpusJSON(filepath.Join(state, "sources.json"), corpusConfig{Profile: "pdf"})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case strings.Contains(r.URL.Path, "/indexes/"):
+					if problem == "units_index_pending" && strings.HasSuffix(r.URL.Path, "/"+corpusUnitsIndex) {
+						fmt.Fprint(w, `{"status":{"readiness":{"complete":false,"queryable":false}}}`)
+						return
+					}
 					fmt.Fprint(w, `{"status":{"readiness":{"complete":true,"queryable":true}},"shard_status":{"one":{"readiness":{"complete":true,"queryable":true}}}}`)
 				case strings.Contains(r.URL.Path, "/artifacts/"):
 					artifact := map[string]any{"source_url": source, "generation": 1, "unit_count": 2, "ocr_attempted_count": 2, "ocr_failed_count": 0, "route_type": "pdf", "merge_status": "converged"}
@@ -71,7 +76,18 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 					case "last_error":
 						artifact["last_error_code"] = "InvalidPdf"
 					}
-					manifest := map[string]any{"ocr_attempted_count": artifact["ocr_attempted_count"], "ocr_failed_count": artifact["ocr_failed_count"]}
+					manifest := map[string]any{"ocr_attempted_count": artifact["ocr_attempted_count"], "ocr_failed_count": artifact["ocr_failed_count"], "incomplete_unit_count": 0, "retryable_incomplete_unit_count": 0}
+					switch problem {
+					case "incomplete":
+						manifest["incomplete_unit_count"] = 1
+					case "retryable_incomplete":
+						manifest["incomplete_unit_count"] = 1
+						manifest["retryable_incomplete_unit_count"] = 1
+					case "unknown_completion":
+						delete(manifest, "incomplete_unit_count")
+					case "invalid_completion":
+						manifest["retryable_incomplete_unit_count"] = 1
+					}
 					if problem == "unknown_raw_ocr" {
 						// The public summary normalizes absent raw counters to zero.
 						artifact["ocr_attempted_count"] = 0

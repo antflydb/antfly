@@ -5129,7 +5129,10 @@ fn expectCreatedObjectAllowlistCovers(
     shape: public_index_contract.CreatedObjectShape,
 ) !void {
     inline for (comptime std.meta.fieldNames(T)) |reflected_name| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, reflected_name));
+        if (!public_index_contract.isAllowedCreatedObjectField(shape, reflected_name)) {
+            std.debug.print("CreatedIndex response shape {s} omits generated field {s}\n", .{ @tagName(shape), reflected_name });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 
@@ -7903,6 +7906,7 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputs, .chunker_outputs);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputTarget, .chunker_output_target);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkDiarizationConfig, .chunker_diarization);
             // Inline skip-window items are generated as std.json.Value. Their
             // closed projection is exercised through the response encoder below.
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
@@ -7936,6 +7940,7 @@ fn consumerTests() type {
                 .chunker_outputs,
                 .chunker_output_targets,
                 .chunker_output_target,
+                .chunker_diarization,
                 .chunker_output_windows,
                 .chunker_output_window,
                 .index_execution,
@@ -7945,7 +7950,7 @@ fn consumerTests() type {
                 try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "settings"));
             }
             const config =
-                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","embedding":{"model":"encoder","dimensions":2,"execute":false,"allow_partial":true,"client_value":"private"},"policy":{"max_frames":8,"target_tokens":"invalid","settings":"private"}}}
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","embedding":{"model":"encoder","dimensions":2,"execute":false,"allow_partial":true,"client_value":"private"},"text":{"target_tokens":64,"min_chars":32,"client_value":"private"},"policy":{"max_frames":8,"target_tokens":"invalid","settings":"private"}}}
             ;
             const created = try encodeCreatedIndexConfig(std.testing.allocator, "media", config);
             defer std.testing.allocator.free(created);
@@ -7958,6 +7963,11 @@ fn consumerTests() type {
             try std.testing.expect(!embedding.get("execute").?.bool);
             try std.testing.expect(embedding.get("allow_partial").?.bool);
             try std.testing.expect(!embedding.contains("client_value"));
+            const text = chunker.get("text").?.object;
+            try std.testing.expectEqual(@as(i64, 32), text.get("min_chars").?.integer);
+            try std.testing.expectEqual(@as(i64, 64), text.get("target_tokens").?.integer);
+            try std.testing.expect(!text.contains("client_value"));
+            try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_text, "min_chars", .{ .string = "32" }));
             const policy = chunker.get("policy").?.object;
             try std.testing.expectEqual(@as(i64, 8), policy.get("max_frames").?.integer);
             try std.testing.expect(!policy.contains("target_tokens"));
@@ -7967,7 +7977,7 @@ fn consumerTests() type {
         test "public index config encoders preserve named media outputs with closed nested schemas" {
             const a = std.testing.allocator;
             const config =
-                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","outputs":{"boundary_model":"embedding","api_key":"private-root","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT","settings":{"token":"private-settings"}},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true,"api_key":"private-target"},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295,"client_value":"private-window"}]}]}}}
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","outputs":{"boundary_model":"embedding","api_key":"private-root","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT","settings":{"token":"private-settings"}},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true,"api_key":"private-target"},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295,"client_value":"private-window"}]},{"name":"speakers","kind":"diarize","model":"speaker","diarization":{"model":"speaker","model_identity":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarity_threshold":0.45,"ambiguity_margin":0.03,"min_rms":0.01,"max_speakers":4,"api_key":"private-key","settings":{"secret":"private-setting"}}}]}}}
             ;
             const encoded = try encodeCreatedIndexConfig(a, "media", config);
             defer a.free(encoded);
@@ -7977,9 +7987,13 @@ fn consumerTests() type {
             const actual = try std.json.Stringify.valueAlloc(a, outputs, .{});
             defer a.free(actual);
             try ant_json.testing.expectEqualJsonText(a,
-                \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]}]}
+                \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]},{"name":"speakers","kind":"diarize","model":"speaker","diarization":{"model":"speaker","model_identity":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarity_threshold":0.45,"ambiguity_margin":0.03,"min_rms":0.01,"max_speakers":4}}]}
             , actual);
             try std.testing.expect(std.mem.indexOf(u8, encoded, "private-") == null);
+            // The optional nested model has no minLength in the public schema.
+            try std.testing.expect(public_index_contract.createdFieldValueMatches(.chunker_diarization, "model", .{ .string = "" }));
+            try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_diarization, "max_speakers", .{ .integer = 0 }));
+            try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_diarization, "similarity_threshold", .{ .float = 1.1 }));
 
             // A persisted malformed required target cannot become a partial
             // public output recipe. Keep the surrounding valid chunker config.

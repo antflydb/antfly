@@ -44,6 +44,8 @@ pub struct Capabilities {
     pub knowledge_versions: Option<Vec<i64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_audience: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_preconditions: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +84,10 @@ pub struct Source {
     pub knowledge: Option<KnowledgeDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_status: Option<KnowledgeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_status: Option<ReconciliationStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,4 +372,9 @@ pub struct KnowledgeRequest {
     pub require_snapshot: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationStatus {
+    pub state: String,
 }

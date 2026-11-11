@@ -83,8 +83,17 @@ pub const HTTPHeader = struct {
 /// default) still applies. File I/O uses caller cancellation when this is null;
 /// a nonzero file deadline fails closed because std.Io files cannot enforce it.
 /// Zero disables that individual ceiling rather than the configured one.
+/// Hard quota for connection state, TLS buffers, trust roots and HTTP metadata.
+/// Bodies have a separate allocation domain and never consume this quota.
+pub const default_download_transport_memory_bytes: usize = 8 << 20;
+
+pub fn downloadMemoryPeakBytes(max_body_bytes: usize, transport_memory_limit_bytes: usize) error{Overflow}!usize {
+    return std.math.add(usize, transport_memory_limit_bytes, try httpx.Client.bufferedResponseBodyPeakBytes(max_body_bytes));
+}
+
 pub const DownloadContext = struct {
     io: std.Io,
+    transport_memory_limit_bytes: usize = default_download_transport_memory_bytes,
     timeout_ms: ?u64 = null,
     cancellation: ?CancellationToken = null,
 
@@ -553,7 +562,10 @@ fn downloadHttpOutcomeAlloc(
 ) !DownloadOutcome {
     try context.check();
     const ceiling = try DownloadCeiling.init(context, security);
-    var client = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security));
+    var transport = httpx.QuotaAllocator{ .backing = alloc, .limit = context.transport_memory_limit_bytes };
+    var client_config = httpClientConfig(security);
+    client_config.http1_response_body_allocator = alloc;
+    var client = httpx.Client.initWithConfig(transport.allocator(), context.io, client_config);
     defer client.deinit();
 
     var headers = std.ArrayListUnmanaged([2][]const u8).empty;
@@ -595,6 +607,7 @@ fn downloadHttpOutcomeAlloc(
         }) catch |err| switch (err) {
             error.AddressRejected => return error.PrivateIpBlocked,
             error.ResponseTooLarge => return error.StreamTooLong,
+            error.OutOfMemory => return if (transport.exceeded) error.DownloadTransportMemoryExceeded else err,
             else => return err,
         };
         defer response.deinit();
@@ -647,6 +660,7 @@ fn takeHttpResponseBodyAlloc(alloc: Allocator, response: *httpx.Response) ![]u8 
     if (!response.body_owned) return try alloc.dupe(u8, body);
     response.body = null;
     response.body_owned = false;
+    response.body_allocator = null;
     return @constCast(body);
 }
 
@@ -895,12 +909,26 @@ fn allocRemainingBounded(reader: *std.Io.Reader, alloc: Allocator, max_size: usi
     return data;
 }
 
+fn transportError(quota: *const httpx.QuotaAllocator, err: anyerror) anyerror {
+    return if (err == error.OutOfMemory and quota.exceeded)
+        error.DownloadTransportMemoryExceeded
+    else
+        normalizeS3DownloadError(err);
+}
+
+fn downloadHttpConfig(security: ?*const ContentSecurityConfig, body_allocator: Allocator) httpx.ClientConfig {
+    var config = httpClientConfig(security);
+    config.http1_response_body_allocator = body_allocator;
+    return config;
+}
+
 /// Version-pinned range transport under the same URI, DNS and credential
 /// boundaries as ordinary downloads. No redirects or mutable-object fallback.
 pub const PinnedRange = struct {
     pub const VersionKind = @import("antfly_source_reference").VersionKind;
     allocator: Allocator,
     context: DownloadContext,
+    transport: httpx.QuotaAllocator,
     security: ?*const ContentSecurityConfig,
     uri: []u8 = &.{},
     version: []u8 = &.{},
@@ -924,8 +952,18 @@ pub const PinnedRange = struct {
         if (headers.len > 128) return error.InvalidSourceReference;
         const parsed = try validateReference(uri, version, kind, length);
         const self = try alloc.create(PinnedRange);
-        self.* = .{ .allocator = alloc, .context = context, .security = security, .kind = kind, .length = length, .headers = headers };
+        self.* = .{ .allocator = alloc, .context = context, .transport = .{ .backing = alloc, .limit = context.transport_memory_limit_bytes }, .security = security, .kind = kind, .length = length, .headers = headers };
         errdefer self.destroy();
+        self.initBackend(uri, version, parsed, credentials) catch |err| return transportError(&self.transport, err);
+        return self;
+    }
+
+    fn initBackend(self: *PinnedRange, uri: []const u8, version: []const u8, parsed: std.Uri, credentials: ?*const S3CredentialsConfig) !void {
+        const alloc = self.allocator;
+        const transport_alloc = self.transport.allocator();
+        const context = self.context;
+        const security = self.security;
+        const headers = self.headers;
         self.uri = try alloc.dupe(u8, uri);
         self.version = try alloc.dupe(u8, version);
         if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
@@ -935,7 +973,7 @@ pub const PinnedRange = struct {
                 if (std.ascii.eqlIgnoreCase(header.name, "Range") or std.ascii.eqlIgnoreCase(header.name, "If-Match") or std.ascii.eqlIgnoreCase(header.name, "Accept-Encoding")) return error.InvalidSourceReference;
                 if (header.credential_base_url) |base| if (!httpUrlMatchesBase(parsed, base)) return error.CredentialUrlMismatch;
             }
-            self.backend = .{ .http = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security)) };
+            self.backend = .{ .http = httpx.Client.initWithConfig(transport_alloc, context.io, downloadHttpConfig(security, alloc)) };
         } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
             if (headers.len != 0) return error.InvalidSourceReference;
             const cfg = credentials orelse return error.MissingS3Credentials;
@@ -948,14 +986,13 @@ pub const PinnedRange = struct {
             const joined = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ bucket, key });
             defer alloc.free(joined);
             try validateS3PathSecurity(joined, security);
-            var owned = try allocS3Credentials(alloc, endpoint.endpoint, endpoint.use_ssl, cfg);
-            const client = objectstore.S3.Client.initWithHttpContext(alloc, .{ .credentials = owned, .addressing_style = .path }, .{ .io = context.io, .timeout_ms = context.timeout_ms, .client_config = httpClientConfig(security) }) catch |err| {
-                owned.deinit(alloc);
+            var owned = try allocS3Credentials(transport_alloc, endpoint.endpoint, endpoint.use_ssl, cfg);
+            const client = objectstore.S3.Client.initWithHttpContext(transport_alloc, .{ .credentials = owned, .addressing_style = .path }, .{ .io = context.io, .timeout_ms = context.timeout_ms, .client_config = downloadHttpConfig(security, alloc) }) catch |err| {
+                owned.deinit(transport_alloc);
                 return err;
             };
             self.backend = .{ .s3 = client };
         } else return error.UnsupportedUrlScheme;
-        return self;
     }
     pub fn destroy(self: *PinnedRange) void {
         if (self.backend) |*backend| switch (backend.*) {
@@ -971,6 +1008,9 @@ pub const PinnedRange = struct {
         a.destroy(self);
     }
     pub fn readAt(self: *PinnedRange, offset: u64, out: []u8) !usize {
+        return self.readAtInternal(offset, out) catch |err| transportError(&self.transport, err);
+    }
+    fn readAtInternal(self: *PinnedRange, offset: u64, out: []u8) !usize {
         try self.context.check();
         if (offset > self.length or out.len == 0 or out.len > self.length - offset) return error.InvalidRemoteRange;
         if (out.len > maxDownloadSize(self.security)) return error.StreamTooLong;
@@ -998,6 +1038,7 @@ pub const PinnedRange = struct {
             },
             .s3 => |*client| {
                 var store = client.client();
+                store.allocator = self.allocator;
                 var result = try store.getObject(self.bucket, self.key, .{ .version_id = if (self.kind == .s3_version_id) self.version else null, .if_match_etag = if (self.kind == .strong_etag) self.version else null, .range = .{ .offset = offset, .length = out.len }, .skip_metadata_probe = true, .max_response_bytes = out.len, .cancellation = self.context.cancellation });
                 defer result.deinit(self.allocator);
                 try self.context.check();
@@ -1046,6 +1087,19 @@ pub fn downloadGcsContentAlloc(
     security: ?*const ContentSecurityConfig,
     connection: *const GcsContentConnection,
 ) !DownloadedContent {
+    var transport: httpx.QuotaAllocator = .{ .backing = alloc, .limit = if (maybe_context) |ctx| ctx.transport_memory_limit_bytes else default_download_transport_memory_bytes };
+    return downloadGcsContentAllocInternal(alloc, maybe_context, uri, security, connection, &transport) catch |err| transportError(&transport, err);
+}
+
+fn downloadGcsContentAllocInternal(
+    alloc: Allocator,
+    maybe_context: ?DownloadContext,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    connection: *const GcsContentConnection,
+    transport: *httpx.QuotaAllocator,
+) !DownloadedContent {
+    const transport_alloc = transport.allocator();
     var location = try parseGcsLocationAlloc(alloc, uri);
     defer location.deinit(alloc);
     if (!connection.allows(&location)) return error.GcsConnectionNotFoundOrOutOfScope;
@@ -1058,7 +1112,7 @@ pub fn downloadGcsContentAlloc(
     const ceiling = try DownloadCeiling.init(context, security);
     try ceiling.check();
     var cfg = try objectstore.Gcs.clientConfigForCredentialsAlloc(
-        alloc,
+        transport_alloc,
         connection.credentials,
         connection.project_id,
         connection.endpoint,
@@ -1067,16 +1121,17 @@ pub fn downloadGcsContentAlloc(
         context.io,
     );
     var config_owned = true;
-    errdefer if (config_owned) cfg.deinit(alloc);
+    errdefer if (config_owned) cfg.deinit(transport_alloc);
     try validateUrlSecurity(try std.Uri.parse(cfg.endpoint), security);
-    cfg.http_client_config = httpClientConfig(security);
+    cfg.http_client_config = downloadHttpConfig(security, alloc);
     const remaining = try ceiling.remainingTimeoutMs();
     cfg.request_timeout_ms = remaining;
     cfg.request_deadline_ns = if (remaining == 0) null else @import("antfly_platform").time.monotonicNs() +| (remaining *| std.time.ns_per_ms);
-    var client = try objectstore.Gcs.JsonApiClient.init(alloc, cfg);
+    var client = try objectstore.Gcs.JsonApiClient.init(transport_alloc, cfg);
     config_owned = false;
     defer client.deinit();
     var store = client.client();
+    store.allocator = alloc;
     const max_bytes = maxDownloadSizeBytes(security);
     const response_ceiling = std.math.add(u64, max_bytes, 1) catch max_bytes;
     var result = store.getObject(location.bucket, location.key, .{
@@ -1102,6 +1157,19 @@ fn downloadS3Alloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadedContent {
+    var transport: httpx.QuotaAllocator = .{ .backing = alloc, .limit = if (maybe_context) |ctx| ctx.transport_memory_limit_bytes else default_download_transport_memory_bytes };
+    return downloadS3AllocInternal(alloc, maybe_context, parsed, security, s3_credentials, &transport) catch |err| transportError(&transport, err);
+}
+
+fn downloadS3AllocInternal(
+    alloc: Allocator,
+    maybe_context: ?DownloadContext,
+    parsed: std.Uri,
+    security: ?*const ContentSecurityConfig,
+    s3_credentials: ?*const S3CredentialsConfig,
+    transport: *httpx.QuotaAllocator,
+) !DownloadedContent {
+    const transport_alloc = transport.allocator();
     try validateS3Uri(parsed, .{});
     var local_io_impl: ?std.Io.Threaded = if (maybe_context == null)
         std.Io.Threaded.init(alloc, .{})
@@ -1132,24 +1200,25 @@ fn downloadS3Alloc(
     defer alloc.free(joined_path);
     try validateS3PathSecurity(joined_path, security);
 
-    var creds = try allocS3Credentials(alloc, resolved_endpoint.endpoint, resolved_endpoint.use_ssl, creds_cfg);
-    var client = objectstore.S3.Client.initWithHttpContext(alloc, .{
+    var creds = try allocS3Credentials(transport_alloc, resolved_endpoint.endpoint, resolved_endpoint.use_ssl, creds_cfg);
+    var client = objectstore.S3.Client.initWithHttpContext(transport_alloc, .{
         .credentials = creds,
         .addressing_style = .path,
     }, .{
         .io = ceiling.io,
         .timeout_ms = ceiling.remainingTimeoutMs() catch |err| {
-            creds.deinit(alloc);
+            creds.deinit(transport_alloc);
             return err;
         },
-        .client_config = httpClientConfig(security),
+        .client_config = downloadHttpConfig(security, alloc),
     }) catch |err| {
-        creds.deinit(alloc);
+        creds.deinit(transport_alloc);
         return err;
     };
     defer client.deinit();
 
     var store_client = client.client();
+    store_client.allocator = alloc;
     const max_size = maxDownloadSizeBytes(security);
     // getObject performs the metadata HEAD needed to populate its result.
     // A second preflight stat would turn every download into HEAD+HEAD+GET.
@@ -2556,4 +2625,67 @@ test "remote fetch retry hints retain delta seconds and validated HTTP dates" {
     try std.testing.expectEqual(@as(?u64, 0), retryAfterMs("Thu, 01 Jan 1970 00:00:02 GMT", 3000));
     try std.testing.expectEqual(@as(?u64, null), retryAfterMs("garbage", 0));
     try std.testing.expectEqual(@as(?u64, null), retryAfterMs(null, 0));
+}
+
+test "HTTP downloader exposes transport quota exhaustion without retaining allocations" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    try std.testing.expectError(error.DownloadTransportMemoryExceeded, downloadContentAllocWithContext(a, .{ .io = io_impl.io(), .transport_memory_limit_bytes = 1 }, "https://example.org/recording.wav", &.{ .max_download_size_bytes = 4096 }, null));
+}
+
+test "object store and pinned range transports enforce the same quota" {
+    const a = std.testing.allocator;
+    const context = DownloadContext{ .io = std.testing.io, .transport_memory_limit_bytes = 1 };
+    const security = ContentSecurityConfig{ .block_private_ips = false, .max_download_size_bytes = 4 };
+    const credentials = S3CredentialsConfig{ .endpoint = @constCast("127.0.0.1:1"), .use_ssl = false, .access_key_id = @constCast("fixture"), .secret_access_key = @constCast("fixture") };
+    try std.testing.expectError(error.DownloadTransportMemoryExceeded, downloadContentAllocWithContext(a, context, "s3://bucket/clip.wav", &security, &credentials));
+    try std.testing.expectError(error.DownloadTransportMemoryExceeded, PinnedRange.create(a, context, "s3://bucket/clip.wav", "v1", .s3_version_id, 4, &security, &credentials, &.{}));
+    const buckets = [_][]u8{@constCast("bucket")};
+    const connection = GcsContentConnection{ .buckets = &buckets, .endpoint = @constCast("http://127.0.0.1:1/storage/v1"), .credentials = .{ .source = .bearer_token, .bearer_token = @constCast("fixture") } };
+    try std.testing.expectError(error.DownloadTransportMemoryExceeded, downloadGcsContentAlloc(a, context, "gs://bucket/clip.wav", &security, &connection));
+    const range = try PinnedRange.create(a, context, "http://127.0.0.1:1/clip.wav", "\"v1\"", .strong_etag, 4, &security, null, &.{});
+    defer range.destroy();
+    var bytes: [4]u8 = undefined;
+    try std.testing.expectError(error.DownloadTransportMemoryExceeded, range.readAt(0, &bytes));
+}
+
+test "S3 downloads and pinned ranges detach results from scoped transport allocators" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var upstream = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .HEAD, .path = "/bucket/clip.wav", .respond = .{ .body = "okay", .headers = &.{.{ .name = "ETag", .value = "\"v1\"" }} } },
+        .{ .method = .GET, .path = "/bucket/clip.wav", .respond = .{ .status = 206, .body = "okay", .content_type = "audio/wav", .headers = &.{ .{ .name = "ETag", .value = "\"v1\"" }, .{ .name = "Content-Range", .value = "bytes 0-3/4" } } } },
+    });
+    defer upstream.deinit();
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            // HEAD+GET for the full read, one GET for the pinned range.
+            for (0..3) |_| server.handleOne() catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var serving: std.Io.Group = .init;
+    defer serving.cancel(io);
+    var failure: ?anyerror = null;
+    try serving.concurrent(io, Serve.run, .{ &upstream, &failure });
+    const credentials = S3CredentialsConfig{ .endpoint = @constCast(upstream.baseUrl()), .use_ssl = false, .access_key_id = @constCast("fixture"), .secret_access_key = @constCast("fixture") };
+    const security = ContentSecurityConfig{ .block_private_ips = false, .max_download_size_bytes = 4 };
+    var downloaded = try downloadContentAllocWithContext(a, .{ .io = io }, "s3://bucket/clip.wav", &security, &credentials);
+    defer downloaded.deinit(a);
+    try std.testing.expectEqualStrings("okay", downloaded.data);
+    try std.testing.expectEqualStrings("audio/wav", downloaded.content_type);
+    const range = try PinnedRange.create(a, .{ .io = io }, "s3://bucket/clip.wav", "\"v1\"", .strong_etag, 4, &security, &credentials, &.{});
+    defer range.destroy();
+    var bytes: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try range.readAt(0, &bytes));
+    try std.testing.expectEqualStrings("okay", &bytes);
+    try serving.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 2), upstream.routeHitCount(1));
 }

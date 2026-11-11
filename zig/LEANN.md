@@ -5,13 +5,11 @@
 Dense `embeddings` indexes accept `algorithm: "leann"` (default `"hbc"`)
 with optional `leann` tuning (`max_degree`, `quantizer`, `vector_storage`,
 `search_ef`, `bound_scale`, `batch_size`). The code width is the dense
-index's top-level `quantization_bits`, shared with HBC (default 4 for LEANN). Embedder-backed
-indexes keep only a small stub per document once the graph covers it and
-re-embed query candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
+index's top-level `quantization_bits`, shared with HBC (default 4 for LEANN). Eligible text embeddings become small stubs once the graph covers them;
+queries re-embed candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
 `lib/vectorindex/src/leann.zig`; the table integration is described in
 [Table integration](#table-integration). Not yet supported for LEANN indexes:
-shard splits, remote dense storage, and native index backups (backups use
-the logical path) ([Remaining work](#remaining-work)).
+native backups of replicated LEANN (local graph files are pinned in native backups) ([Remaining work](#remaining-work)).
 
 ## Overview
 
@@ -129,6 +127,26 @@ entry point. Deletes set a
 flag; deleted nodes stay traversable and are filtered from results. The paper
 suggests rebuilding once `deletedFraction()` passes about 5%.
 
+**Filtered search.** `SearchOptions.filter` restricts results to nodes it
+allows. Both walks still pass through rejected nodes to reach allowed ones,
+but only allowed nodes enter the beam, the results and the recompute pool,
+so a selective filter keeps walking until it holds `ef`
+allowed candidates. Layer-0 edges are directed and reachability is only
+guaranteed from the entry point, so a walk that runs dry restarts there,
+then falls back to scoring the remaining unvisited allowed nodes from their
+codes (no embeddings). `LeannStore` and the replicated state pass id, key
+and prefix filters this way; only distance bounds still over-fetch. PQ filtered
+search walks using code estimates and scores allowed candidates exactly.
+Cancellation is checked during traversal and the fallback scan. The
+re-embedding budget counts time spent regenerating vectors, including
+re-chunking and source preparation, rather than graph or stored-vector reads.
+If it is exhausted before scoring finishes, the search returns a
+`reembed_budget_exceeded` error instead of including unverified candidates.
+Increase `reembed_budget_ms` or set it to zero to remove the limit.
+Best-effort predicate searches cap the walk and fallback scan; full-effort
+queries can inspect all `node_count` nodes. Explicit ID filters look up their
+candidates directly. Rejected nodes are not re-embedded.
+
 ### Differences from the paper
 
 - **RaBitQ and bound-driven reranking** replace the paper's PQ and fixed
@@ -149,18 +167,24 @@ version needs no such special case and does better on real data (below).
 
 ```sh
 cd zig
-zig build-exe -OReleaseFast -lc -femit-bin=zig-out/bin/leann-bench \
-  --dep antfly_vector -Mroot=lib/vectorindex/src/leann_bench.zig \
-  --dep protobuf -Mantfly_vector=lib/vector/src/mod.zig \
-  -Mprotobuf=lib/protobuf/src/root.zig
-zig-out/bin/leann-bench --data PREFIX --n 100000 --queries 200 \
-  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE]
+zig build leann-bench -Doptimize=ReleaseFast
+zig-out/bin/leann_bench --data PREFIX --n 100000 --queries 200 \
+  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE] [--filtered 1]
 ```
 
 `PREFIX.train.f32` / `PREFIX.test.f32` hold a u32 row count, u32 dimension,
 then row-major f32s. Without `--data` it uses Gaussian clusters. `--cost`
 takes an embedder cost curve from `scripts/leann_embed_cost.py` and adds
 modeled embedding time per query.
+
+With `--filtered 1`, the benchmark compares widening an unfiltered result
+window, admitting only eligible nodes for exact verification, and directly
+scoring the allowlist with exact distances or RaBitQ bounds. It reports
+filtered recall, p50 and p99, embedding loads per query, and peak graph
+frontier size. Use `--filter-layout clustered` and `--filter-k N` to
+vary match locality and the result window. A stored-vector
+run measures CPU and vector access. Supply `--cost FILE` to model the
+additional transient re-embedding cost.
 
 GloVe-25 (ann-benchmarks `glove-25-angular`), first 100k vectors, 200
 queries, cosine, M=30, efC=128, single thread, recall@10 against brute force.
@@ -445,10 +469,15 @@ and rescores leaf members near the admission cutoff with extended codes
   deletes are idempotent, so replay after a crash is safe. Searches answer
   HBC's `SearchRequest` with HBC's `SearchResults`, applying `filter_ids`,
   `exclude_ids`, the key predicate, the metadata prefix and distance limits
-  to an over-fetched candidate list. Exact distances come from HBC's
-  external vector loader (the stored embedding artifact, or the document
-  field for direct-field indexes). Deleted or missing candidates are pushed
-  to the far end of the metric rather than failing a search.
+  before exact verification. Selective ID allowlists can score directly.
+  Persistent graph searches keep nonmatching nodes available for navigation
+  and widen their frontier as needed. Dirty replicated candidates load their
+  current vector before ranking. Transient searches capture owned candidates
+  before calling a provider, including dirty exact-buffer entries. Complete
+  effort scores every surviving candidate once in bounded batches. Missing
+  candidates are omitted from best-effort results; complete effort fails if
+  a live vector cannot be loaded. Searches report proven exhaustion or a
+  proven surplus when their verification establishes it.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least
@@ -457,11 +486,11 @@ and rescores leaf members near the admission cutoff with extended codes
   same binary and CPU converge, but floating-point differences across CPUs
   (for example AVX-512 vs. NEON) can pick different neighbors, so graphs
   may drift apart. [Leader replication](#leader-replication) removes that.
-- **Guards.** `pruneDenseSplitRange` and `handoffDenseFrom` fail with
-  `error.UnsupportedLeannSplit` before moving any state.
-  `nativeBackupSupportsImmutableCheckpoint` returns false, so backups take
-  the logical path and restore rebuilds from stored embeddings. Remote dense
-  storage fails with `error.UnsupportedLeannStorage`.
+- **Splits and storage.** Local splits prune the parent and build the child
+  from its own documents. Replicated splits queue graph deletions through Raft.
+  Graph files persist through the configured storage provider. Local native
+  backups pin the immutable graph file when the provider exposes host paths;
+  replicated LEANN requires logical backups until restore resets Raft positions.
 - **Tests.** `leann_store.zig` (buffer, build, filters, idempotent writes,
   persistence, rebuild, corrupt file) and the index-manager test
   `leann dense index applies writes, searches, deletes, and reopens`.
@@ -474,12 +503,26 @@ full-precision rerank vectors HBC keeps) with a graph plus codes. With
 document, which is most of the remaining bytes: at 768 dimensions a stored
 embedding takes 3,100 bytes and its stub 36.
 
-`transient` is the default wherever re-embedding can reproduce the vector:
-the index has its own embedder, one unchunked vector per document (a field
-or template), and the RaBitQ quantizer (rebuilds use the codes). External
-vectors, chunked indexes, indexes fed by other enrichments and PQ resolve to
-`persistent`; asking for `transient` there is rejected. Configs written
-before the option are `persistent`.
+Three modes:
+
+- `auto` (the default when the index has its own embedder and RaBitQ codes)
+  stubs only embeddings the producer computed from text alone: a field, a
+  locally reproducible template, or a plain text chunk. The producer marks those with
+  the artifact header flag `text_input`. Embeddings from media (images via
+  `remoteMedia`, audio windows, PDF pages, model outputs), authored vectors,
+  and vectors written by older builds or copied by restore paths lack the
+  flag and stay stored. Executed remote helpers, including PDF-to-text
+  extraction, also keep their vectors. Recovery checks helper dependencies
+  without remote I/O before rendering or re-chunking any candidate.
+- `transient` stubs covered text embeddings. It requires inputs that
+  re-embed from text: no media chunkers (`audio`, `policy`, `outputs`,
+  `embedding`, or a non-`fixed` model) and no stored chunk inputs. If a
+  template nevertheless produces media, its vector is retained (or kept as
+  an int8 copy when configured), so it remains searchable.
+- `persistent` keeps every embedding. External vectors, indexes fed by other
+  enrichments, and PQ (rebuilds need vectors) resolve to it; asking for
+  `auto` or `transient` there is rejected. Configs written before the option
+  are `persistent`.
 
 - **Lifecycle.** Writes are unchanged: the enricher stores the full
   embedding, derived replay and the leader planner read it, and the graph
@@ -494,15 +537,35 @@ before the option are `persistent`.
     the stubs inside the Raft apply transaction, so every replica changes
     the same data at the same log position. Pending keys are persisted in
     the replicated state.
-  - **Local (Lite):** `LeannStore` lists keys its persisted graph covers;
-    `DB.syncIndexes` writes their stubs under the apply lock after syncing.
+  - **`auto`:** the stub writer skips any embedding whose header lacks
+    `text_input`; the header is replicated data, so replicas agree.
+  - **Local (Lite):** `LeannStore` lists keys its persisted graph covers.
+    Derived replay persists the graph, then writes their stubs under the
+    exclusive apply lock once its own locks are released: at the end of each
+    dense catch-up session with background workers, and after inline replay
+    without them. `DB.syncIndexes` does the same after syncing. Each transaction
+    processes at most 128 entries and releases the apply lock between batches.
+    Stubs may land just after a `full_index` write returns.
 - **Re-embedding.** The index manager's `DenseReembedder` (installed by the
   DB; it calls `enrichment_runtime.reembedDenseDocuments`) renders each
   document's field or template exactly as the dense producer does and
-  embeds the batch in one request-path call. Search recomputes go through a
+  embeds the batch in one request-path call. A chunk vector's key names its
+  chunk: the runtime re-chunks the parent document with the index's chunker
+  (`chunkEmbeddingSourceSetForRequest`, the producer's own path) and embeds
+  that chunk's text, which is all `store_chunks: false` needs. Search recomputes go through a
   batch loader, so one query makes one embedder call per recompute batch;
-  candidates whose embedding is still stored are read instead. Without an
-  enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
+  candidates whose embedding is still stored are read instead. Chunks from
+  the same parent reuse one indexed source set per batch. A recomputed vector
+  enters the LRU only after its source identity is checked against the stub,
+  preventing an edit made ahead of enrichment from poisoning a previous
+  revision's cache entry. When a legacy stub does not bind an immutable
+  provider revision, its recomputed vector must also match the stored digest;
+  a non-identical result is unavailable until the embedding is regenerated.
+  Without an enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
+- **Vector blocks.** LEANN indexes stay out of HBC's shared vector-block
+  plane (`IndexManager.denseIndexUsesVectorBlocks`): it would otherwise keep
+  a float32 copy of every embedding transient storage drops, and its
+  artifact scan would fail on stubs. Their readiness never waits on it.
 - **No vectors needed otherwise.** Graph rebuilds (deletes, checkpoints)
   use `leann.Index.rebuildFromCodes`; 4-bit codes match exact rebuilds
   (see [Multi-bit RaBitQ codes](#multi-bit-rabitq-codes)). Replay of a
@@ -516,28 +579,41 @@ before the option are `persistent`.
   settle (about 14 per query at 4 bits on NYTimes-256): about 0.1 s for
   16 short passages with EmbeddingGemma 2 on an Apple M4 Max (Metal),
   seconds on a small CPU. Restoring a logical backup re-embeds every
-  document, since the graph file is not part of backups yet.
+  document when its graph is not captured. Local native snapshots preserve
+  the graph; logical snapshots preserve stubs and reconstruct graph state.
 - **Tests.** `index_manager.zig`: "transient leann vectors become stubs and
   are re-embedded on demand" (local) and "replicated transient leann
-  replicas stub vectors in log order and rebuild from codes".
+  replicas stub vectors in log order and rebuild from codes";
+  `enrichment_runtime.zig`: "transient leann re-embeds one chunk from its
+  re-chunked parent like the producer"; `db.zig`: "db transient leann stubs
+  covered vectors through ordinary writes".
 
 ## Remaining work
 
-1. **Transient storage follow-ups.** A per-query deadline and
-   cancellation inside re-embedding, a bounded hot-embedding cache, and
-   include `leann.store` in backups so restores need not re-embed.
-2. **Splits.** Rebuild both children from the parent's stored vectors (or
-   re-embedded text) during handoff.
-3. **Remote storage and native backups.** Store `leann.store` through the
-   dense storage abstraction and include it in native checkpoints.
-4. **Filter-aware traversal.** Filters are applied after an over-fetched
-   search today; very selective filters would be better served by passing
-   them into the graph walk.
-5. **Leader replication follow-ups.** See
-   [Leader replication](#leader-replication): splits, a cluster VOPR, and
-   CI verification of the data runtime pieces.
-6. **E2E coverage.** Add a Python e2e test that creates an
-   `algorithm: "leann"` index over HTTP and queries it.
+1. **Native backups of replicated LEANN.** Local `leann.store` files are
+   pinned with native checkpoints, and stores persist through the dense
+   storage provider (Lite, remote dense storage). Replicated `leann.replica`
+   state carries the source group's Raft positions, so it still uses the
+   logical path until restore resets that domain.
+2. **Split follow-ups.** Splits work: when a split narrows a shard, every
+   LEANN key outside the new range is dropped (`IndexManager.updateRange` →
+   `LeannStore.dropKeysWhere`; replicated stores mark them and the leader
+   deletes them through the log), and the child indexes its documents
+   itself. Still open: a bulk first build for large children (today the
+   child buffers to `build_threshold`, then plans per-key deltas) and a
+   production-cluster VOPR that checks replica graph equality across a
+   split.
+3. **Cluster qualification.** Production-cluster VOPR and end-to-end
+   verification (see [Leader replication](#leader-replication)).
+
+Done since the first version: filter-aware traversal (`SearchOptions.filter`),
+a per-query re-embedding budget and cancellation (`leann.reembed_budget_ms`,
+`SearchOptions.gate`), a resource-governed re-embed cache capped at 32 MiB
+including its metadata and keyed by index incarnation, key and stub digest, `vector_storage: auto`, int8 copies for media vectors
+(`leann.media_vectors: int8`), and a Python e2e test
+(`test_leann_index_returns_exact_nearest_first`). The re-embed cache respects
+the retained-vector opt-out, shares the node cache budget, and releases LRU
+entries and empty hash-table capacity under query memory pressure.
 
 ## Leader replication
 
@@ -580,15 +656,15 @@ plan-then-revert is exact; stale and corrupt deltas are rejected) and
 lagging followers, a deposed leader's late record, inline first build,
 out-of-band rebuild, missing and corrupt generations, restart).
 
-### Wiring into Raft (done, server side pending CI)
+### Wiring into Raft
 
 1. **Raft entry.** `BatchRequest.leann_record` (`storage/db/types.zig`)
    travels as the internal `_leann_record` field of the batch wire
    (`api/batch.zig`) and must stand alone in its batch. It requires
-   `batch_leann_record_protocol_version = 25`
-   (`common/data_raft_protocol.zig`); versions are per entry, so older
-   replicas reject only LEANN entries. It is exempt from the timestamp
-   override.
+   `batch_dense_artifact_flags_protocol_version = 29`
+   (`common/data_raft_protocol.zig`). A durable capability barrier certifies
+   every applying replica before new dense flags or graph records are
+   admitted. It is exempt from the timestamp override.
 2. **Apply path.** `db.applyLeannRecordBatch` requires an ordered apply
    receipt, persists the record under `leann_record_prefix` (index name +
    Raft index) together with the receipt in one transaction, then drains
@@ -632,7 +708,74 @@ out-of-band rebuild, missing and corrupt generations, restart).
    changes, restarts, chunked generations) and checks that all replicas end
    with identical state and search results.
 
-Still to do: splits (each child's leader builds a generation from its key
-range), a production-cluster VOPR that checks replica graph equality, and an
-e2e test. The data runtime pieces (step 3) need CI to compile and run: their
-test build declares more memory than the sandbox this was written in.
+Remaining qualification work is the production-cluster VOPR that checks
+replica graph equality across splits, plus native restore support for the
+replicated Raft-position domain. Targeted storage, leader-runtime, and
+protocol regressions run through `leann-regression-test` and
+`leann-replication-runtime-test`.
+
+### Recovery sessions and precision transitions
+
+Each search owns its recovery session. Cancellation reaches provider discovery
+and inference, and chunk source sets survive scoring batches. Retained source
+sets have a 32 MiB soft limit; a single larger parent remains reusable until a
+different parent is needed, bounding retained data to the limit plus one parent.
+The query working-set cap also applies to that retained parent. Under memory
+pressure, optional source sets are reclaimed before retrying the denied
+allocation once, including allocations in later scoring batches and native
+read-buffer admission. Retrying an allocation does not repeat completed
+chunker or embedder calls. Borrowed source bytes and cache-map growth are
+pinned against reentrant reclamation.
+External helpers, including `transcribeAudio`, never qualify for text elision.
+
+Transient searches capture graph candidates and their keys under the graph
+read lock. Scoring uses that owned plan and a pinned primary read generation,
+so writes and replicated graph updates can proceed during provider calls.
+A primary commit during inference restarts the complete query attempt, including
+composed ranking, using the completed recovery cache entries. Re-embedding time
+remains cumulative across these attempts. At most three generation retries
+are admitted; continued churn returns retryable `StorageBusy`. The first
+search on an aggregation lease uses the same handoff. Once a lease exposes
+results or readers, its generation stays fenced for subsequent operations.
+Recovery requests own producer and chunker configuration across the handoff.
+Cache hits and stored-vector reads
+keep their short query fence. Candidate metadata and scoring scratch count against the dense-search working
+set budget. Persistent local and replicated searches use that same budget
+for filters, graph traversal, vector-loader scratch, and temporary hits;
+returned results have an independent allocator. Recovery source reads,
+rendered inputs, and retained chunk source sets are charged to the query
+working allocator before provider dispatch. A recovery session retains its
+first allocator for cached sources until the session is destroyed.
+Full-effort plans retain the live candidate list and score vectors
+in bounded batches. Exact-buffer rows are scored independently of the graph
+shortlist, including dirty replicated rows before the first graph build.
+Buffer-only searches publish their exact match count and exhaustion proof,
+including when clean and dirty replicated rows are scored together.
+Pinned source reads open short-lived read scopes: sorted artifact batches use
+the backend bulk lookup, and source values and external payloads belong to
+the scoring batch allocator. The pinned transaction retains the generation,
+without accumulating payload buffers or read pins across batches.
+
+Retained query cuts read their own sources and lazily reconstruct managed
+providers from their retained index catalog. Cold provisioning recipes fork
+without initializing the live catalog. One reconstruction service owner survives removal of the last live producer.
+Provider service lifetimes use reference counting; legacy custom callbacks can be shared when their named configuration
+still matches under the live catalog apply fence. Custom providers that support changing catalogs can implement
+`clone_for_indexes_fn`. Lazy setup observes the initiating request's deadline
+and cancellation before returning, including during uncached-handle cleanup.
+Operational setup failures retain the lazy recipe behind a short retry backoff;
+only permanent configuration failures retire it.
+
+Int8 media quantization is irreversible. A full-vector consumer added after
+quantization reports `ArtifactRepairRequired` rather than treating a dequantized
+copy as the original vector. Reprocess the embedding producer from its source
+to recreate full artifacts before completing that consumer's backfill. Adding
+a full-vector consumer before elision continues to prevent quantization.
+
+Recovery validates dimensions and finite components before admitting vectors.
+The query's cancellation is composed with the chunk provider's existing control
+on a borrowed invocation-local copy; durable routing, deadlines, and credentials
+remain intact. Parent source sets are indexed across batches, while temporary
+worker chunk state is released after each parent is cloned. Split cleanup pages
+through current and legacy reverse mappings, removes moved document and ordinal
+associations, and remains retryable after graph keys have already been pruned.

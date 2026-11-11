@@ -843,6 +843,11 @@ def test_artifact_assertions_preserve_ownership_and_producer_identity(require_na
                 "query": "MATCH (a:D {name:'a'}),(b:D {name:'b'}) CREATE (a)-[r:LINK {test:1}]->(b) SET r.test=2 RETURN r.test"
             },
         )
+        # The mutation receipt confirms commit, while artifact replay may still
+        # be retrying a concurrent publication. Ownership is the contract here;
+        # establish index visibility explicitly before the independent read.
+        with database.open_table("docs") as table:
+            table.run_until_idle()
         assert database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() WHERE r.test=2 RETURN r.test"})["rows"] == [
             [{"type": "integer", "value": "2"}]
         ]

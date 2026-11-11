@@ -359,3 +359,33 @@ func TestPreflightRejectionAllowsSiblingWritesButCannotAuthorizeDeletion(t *test
 	require.Contains(t, backend.records, secondKey)
 	require.NotContains(t, backend.records, firstKey)
 }
+
+func TestSyncWriterRestoresOnlyMatchingPublicationProofs(t *testing.T) {
+	runner, connector, backend := runnerFixture(t)
+	item := connector.inventory.Objects[0]
+	doc, err := Normalize(testSourceID, item, connector.data[item.ID], Permissions{}, time.Now())
+	require.NoError(t, err)
+	id, err := RecordKey(testSourceID, item.ID)
+	require.NoError(t, err)
+	first, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+	require.NoError(t, err)
+	first.TrackPublicationProofs()
+	_, err = first.Upsert(t.Context(), map[string]Document{id: doc})
+	require.NoError(t, err)
+	proofs := first.PublicationProofs()
+	require.Len(t, proofs, 1)
+	next, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+	require.NoError(t, err)
+	restored, err := next.RestorePublicationProofs(t.Context(), proofs)
+	require.NoError(t, err)
+	require.True(t, restored)
+	backend.mu.Lock()
+	backend.records[id]["permissions"] = map[string]any{"public": true}
+	backend.mu.Unlock()
+	changed, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+	require.NoError(t, err)
+	restored, err = changed.RestorePublicationProofs(t.Context(), proofs)
+	require.NoError(t, err)
+	require.False(t, restored)
+	require.Empty(t, changed.verified)
+}

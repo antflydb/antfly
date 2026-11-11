@@ -1896,6 +1896,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, vector),
                 .generated => |hash| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, vector),
+                .generated_text => |hash| try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, hash, true, vector),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -3021,7 +3022,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             errdefer if (key_owned) alloc.free(key);
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(alloc, indices, values),
-                .generated => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
+                .generated, .generated_text => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -3253,6 +3254,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const advances = try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref);
                 {
                     const async_ctx = AsyncContext{
+                        .shared_artifact_repair_issue_mutex = if (ctx.async_context) |owner| owner.artifactRepairIssueMutex() else null,
                         .apply_exclusive_held = ctx.apply_exclusive_held,
                         .alloc = ctx.alloc,
                         .io = ctx.io,
@@ -3299,6 +3301,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
 
+        /// Borrow an operation's existing admission without reopening the
+        /// shared gate: a queued capture may already have closed that gate.
+        /// The caller keeps the supplied lease alive through this invocation.
+        fn acquireReplayAdmission(
+            ctx: *const AsyncContext,
+            admitted: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        ) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+            if (admitted) |lease| {
+                std.debug.assert(lease.active and lease.admission == ctx.snapshot_replay_admission);
+                return null;
+            }
+            return try acquireSnapshotReplayAsyncContext(ctx);
+        }
+
         pub fn applyDerivedBatchToIndexContextProfiled(
             ctx: *const AsyncContext,
             batch: derived_types.DerivedBatch,
@@ -3310,13 +3326,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Generated files and their publication metadata are one physical
             // generation. Native capture takes the exclusive side of this admission
             // while copying, so no async worker may rewrite an artifact mid-copy.
-            var snapshot_replay = if (admitted_replay) |lease| blk: {
-                std.debug.assert(lease.admission == ctx.snapshot_replay_admission);
-                std.debug.assert(lease.active);
-                // The callback keeps its retained lease alive for this entire call.
-                // Borrow it directly instead of adding another shared-count round trip.
-                break :blk @as(?snapshot_admission_mod.SnapshotAdmission.MutationLease, null);
-            } else try acquireSnapshotReplayAsyncContext(ctx);
+            var snapshot_replay = try acquireReplayAdmission(ctx, admitted_replay);
             defer if (snapshot_replay) |*lease| lease.release();
             if (index_ref.kind == .full_text) {
                 const apply_start_ns = monotonicTimeNs();
@@ -3878,6 +3888,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
             }
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+        }
+
+        pub fn applyAssetPublicationMetadataContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_name: []const u8, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            if (ctx.projection_only) return;
+            const has_asset_root = for (batch.changed_artifact_keys) |key| {
+                if (internal_keys.isAssetArtifactKey(key)) break true;
+            } else false;
+            if (!has_asset_root) return;
+            var replay = try acquireReplayAdmission(ctx, admitted_replay);
+            defer if (replay) |*lease| lease.release();
+            try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_name, batch.changed_artifact_keys, batch.sequence);
         }
 
         pub fn clearPublishedAssetArtifactRepairIssuesContext(ctx: *const AsyncContext, index_name: []const u8, keys: []const []const u8, sequence: u64) !void {
@@ -4590,6 +4611,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 sources.deinit(alloc);
             }
 
+            const locally_replayable = try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value);
             const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
             for (chunks) |chunk| {
                 const chunk_text = chunk.text orelse continue;
@@ -4598,7 +4620,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
                 errdefer alloc.free(key);
                 const text = try alloc.dupe(u8, chunk_text);
-                sources.appendAssumeCapacity(.{ .key = key, .text = text });
+                sources.appendAssumeCapacity(.{ .key = key, .text = text, .has_metadata = chunk.metadata != null, .locally_replayable = locally_replayable });
                 chunks_created.* += 1;
             }
             // Inline chunks are derived from this document revision. An empty set is
@@ -4737,8 +4759,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (asset_plan) |*view| view.release();
 
             const mutable_ctx = @constCast(ctx);
-            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
-            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+            lockAtomicWithBackoff(mutable_ctx.artifactRepairIssueMutex());
+            defer mutable_ctx.artifactRepairIssueMutex().unlock();
 
             const loaded = (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) orelse return;
             var issue = loaded;
@@ -4757,42 +4779,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break producer.type == .document_extraction;
                 } else true; // Missing catalog authority retains conservative validation.
                 if (requires_manifest) {
-                    // Failed extraction retains older children. Their presence
-                    // alone is no proof of repair; require a healthy manifest.
-                    var manifest = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch |err| switch (err) {
+                    const health = @import("enrichment/document_extraction_completion.zig").publicationState(ctx.alloc, raw) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => return,
                     };
-                    defer manifest.deinit();
-                    if (manifest.value != .object) return;
-                    const route = manifest.value.object.get("route_type") orelse return;
-                    if (route != .string or route.string.len == 0) return;
-                    if (manifest.value.object.get("merge_plan") orelse manifest.value.object.get("merge")) |merge| {
-                        if (merge != .object) return;
-                        const state = merge.object.get("status") orelse return;
-                        if (state != .string or !std.mem.eql(u8, state.string, "converged")) {
-                            if (state == .string and std.mem.eql(u8, state.string, "failed"))
-                                try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
-                            return;
-                        }
-                    }
-                    if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) {
-                        try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
-                        return;
-                    }
-                    // Partial OCR may retain valid older units. A non-empty
-                    // artifact is not sufficient to settle a terminal repair.
-                    if (manifest.value.object.get("ocr_failed_count")) |count| {
-                        if (count != .integer or count.integer != 0) {
+                    switch (health) {
+                        .pending => return,
+                        .failed => {
                             try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
                             return;
-                        }
-                    }
-                    if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
-                        if (pages != .array or pages.array.items.len != 0) {
-                            try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
-                            return;
-                        }
+                        },
+                        .complete => {},
                     }
                 }
             }
@@ -5603,9 +5600,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 target_identities.deinit(alloc);
             }
 
+            // Publication metadata needs the same durable target as projection
+            // rows. Otherwise the executor may consider this lane caught up
+            // before the manifest's repair-ledger effect has been applied.
+            const has_asset_publication = for (batch.changed_artifact_keys) |key| {
+                if (internal_keys.isAssetArtifactKey(key)) break true;
+            } else false;
             var target_scope_known = true;
             for (managed_indexes) |candidate| {
-                const applicability = managedIndexBatchApplicabilityWithEmbeddingNames(index_manager, batch, candidate.ref, &changed_embedding_names);
+                const applicability = if (has_asset_publication)
+                    ManagedIndexBatchApplicability.relevant
+                else
+                    managedIndexBatchApplicabilityWithEmbeddingNames(index_manager, batch, candidate.ref, &changed_embedding_names);
                 switch (applicability) {
                     .irrelevant, .missing_dependency => {},
                     .relevant => {
@@ -6208,6 +6214,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, pending_deletes, dense_embeddings, skip_unchanged_artifacts, shared_pending_writes, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
                     return;
                 }
+                const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+                const pinned_embedder = dense_embedder.withTextGeneration(generation);
                 var chunks_created: usize = 0;
                 const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
                 defer freeChunkEmbeddingSources(alloc, sources);
@@ -6228,7 +6236,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const max_batch_bytes = generatedEmbedBatchBytes();
                 var batch_source_bytes: usize = 0;
                 for (sources, 0..) |source, i| {
-                    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                    const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                        enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                    else
+                        enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                     const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                     defer alloc.free(artifact_key);
                     if (skip_unchanged_artifacts) {
@@ -6242,21 +6253,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (chunk_texts.items.len > 0 and
                         (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                     {
-                        try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                        try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
                         batch_source_bytes = 0;
                     }
                     try chunk_texts.append(alloc, source.text);
                     try source_indexes.append(alloc, i);
                     batch_source_bytes += source.text.len;
                     if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                        try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                        try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
                         batch_source_bytes = 0;
                     }
                 }
-                try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                 return;
             }
 
+            const generation = if (memo) |cache_memo| try cache_memo.generation(dense_embedder, embedding_name) else try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = dense_embedder.withTextGeneration(generation);
             if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
                 const source_parts = try renderSourceParts(
                     alloc,
@@ -6268,8 +6282,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (source_parts) |parts| {
                     defer template_mod.freeContentParts(alloc, parts);
 
-                    const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, parts, request.expected_dims);
+                    const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, parts, request.expected_dims);
                     defer alloc.free(vector);
+                    try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
+                    const source_hash = if (parts.len == 1 and parts[0] == .text and dense_embedder.textPartsEquivalent(embedding_name))
+                        enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, parts[0].text, generation.revision)
+                    else
+                        try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision);
                     const artifact_key = try appendEmbeddingArtifactWrite(
                         alloc,
                         artifact_writes,
@@ -6278,7 +6297,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         embedding_name,
                         request.source_field,
                         null,
-                        .{ .generated = null },
+                        if (enrichment_runtime_mod.partsAreText(parts) and try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value))
+                            .{ .generated_text = source_hash }
+                        else
+                            .{ .generated = source_hash },
                         vector,
                     );
                     defer alloc.free(artifact_key);
@@ -6300,14 +6322,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             defer alloc.free(source_text.?);
 
-            const memo_key = GeneratedEmbeddingMemo.key(
+            const memo_key = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
                 .dense_embedding,
                 embedding_name,
                 request.producer_json,
                 request.execution_json,
                 request.expected_dims,
                 source_text.?,
-            );
+            ), generation.revision);
             // Document tables build their generated plan under apply rather than in
             // relational prewarm. Use the same persisted-cache admission in either
             // path before falling back to the external provider.
@@ -6322,7 +6344,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         runtime,
                         consumer_indexes,
                         cache_memo.alloc,
-                        dense_embedder,
+                        pinned_embedder,
                         embedding_name,
                         source_text.?,
                         request.expected_dims,
@@ -6331,9 +6353,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk try cache_memo.adoptDense(memo_key, computed);
                 }
             else blk: {
-                uncached_vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, source_text.?, request.expected_dims);
+                uncached_vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, source_text.?, request.expected_dims);
                 break :blk uncached_vector.?;
             };
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
             const artifact_key = try appendEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
@@ -6342,7 +6365,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
+                if (try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value)) .{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) } else .{ .generated = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) },
                 vector,
             );
             defer alloc.free(artifact_key);
@@ -6500,7 +6523,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const byte_source_fingerprint = if (metadata_fingerprint == null)
-                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try document_extraction_mod.contentFingerprintAlloc(alloc, source_url, config_json, config, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
             else
                 null;
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
@@ -7626,27 +7649,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try out.append(alloc, '}');
             try out.append(alloc, '}');
             return try out.toOwnedSlice(alloc);
-        }
-
-        pub fn documentExtractionFingerprintAlloc(
-            alloc: Allocator,
-            source_url: []const u8,
-            config_json: []const u8,
-            configured_content_type: []const u8,
-            configured_filename: []const u8,
-            downloaded_content_type: []const u8,
-            data: []const u8,
-        ) ![]u8 {
-            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-            hasher.update(source_url);
-            hasher.update(config_json);
-            hasher.update(configured_content_type);
-            hasher.update(configured_filename);
-            hasher.update(downloaded_content_type);
-            hasher.update(data);
-            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            hasher.final(&digest);
-            return try hexBytesAlloc(alloc, &digest);
         }
 
         pub fn documentExtractionKeyIndex(keys: []const []const u8, key: []const u8) ?usize {
@@ -9716,6 +9718,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             record: change_journal_mod.Record,
             index_ref: index_manager_mod.ManagedIndexRef,
         ) ManagedIndexBatchApplicability {
+            // A final asset manifest can carry no projection rows at all,
+            // while proving that a formerly failed producer has published.
+            // Target fast-forward must not skip that repair-ledger effect.
+            // Batch applicability remains projection-only: the replay callback
+            // settles metadata through batched issue probes without rebuilding
+            // postings, vectors, or graph edges for these records.
+            for (record.changed_artifact_keys) |key| {
+                if (internal_keys.isAssetArtifactKey(key)) return .relevant;
+            }
             switch (index_ref.kind) {
                 .full_text, .algebraic => {
                     if (record.changed_doc_keys.len > 0 or
@@ -11172,8 +11183,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer ctx.alloc.free(issue_key);
 
             const mutable_ctx = @constCast(ctx);
-            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
-            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+            lockAtomicWithBackoff(mutable_ctx.artifactRepairIssueMutex());
+            defer mutable_ctx.artifactRepairIssueMutex().unlock();
 
             const now_ns = currentTimeNs();
             const existing = try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key);
@@ -11386,8 +11397,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             reason: types.ArtifactRepairReason,
         ) !void {
             const mutable_ctx = @constCast(ctx);
-            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
-            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+            lockAtomicWithBackoff(mutable_ctx.artifactRepairIssueMutex());
+            defer mutable_ctx.artifactRepairIssueMutex().unlock();
             var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(ctx.alloc, artifact_key)) orelse return;
             defer identity.deinit(ctx.alloc);
 

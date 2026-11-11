@@ -708,11 +708,16 @@ pub const DBCore = struct {
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
         try self.index_manager.validateRangeTransition(byte_range);
         const start = try self.alloc.dupe(u8, byte_range.start);
-        errdefer self.alloc.free(start);
+        var start_owned = true;
+        errdefer if (start_owned) self.alloc.free(start);
         const end = try self.alloc.dupe(u8, byte_range.end);
-        errdefer self.alloc.free(end);
+        var end_owned = true;
+        errdefer if (end_owned) self.alloc.free(end);
         try range_state_mod.saveRange(self.store, .{ .start = start, .end = end });
         self.adoptRangeInMemoryOwned(start, end);
+        start_owned = false;
+        end_owned = false;
+        if (self.index_manager.leann_range_pending.load(.acquire)) try self.index_manager.dropLeannKeysOutOfRange();
     }
 
     pub fn adoptRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {

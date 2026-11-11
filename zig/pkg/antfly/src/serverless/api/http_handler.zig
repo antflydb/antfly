@@ -6208,7 +6208,7 @@ pub const HttpHandler = struct {
         const guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (normalizePublicAggregationError(err)) {
-            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
@@ -6221,6 +6221,8 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+            error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.GraphTraversalQueryBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
@@ -6253,7 +6255,7 @@ pub const HttpHandler = struct {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
-            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
@@ -12616,8 +12618,12 @@ test "serverless index catalog validation rejects malformed configs" {
         \\{"sales_rollup":{"type":"algebraic","version":1,"group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"bad","op":"sum","group_by":["missing"],"measure":"amount"}]}}
     ));
 
+    try validateServerlessIndexCatalog(alloc,
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"weekly","op":"count","time":"created_at","bucket":"week"}]}}
+    );
+
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
-        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"fortnight"}]}}
     ));
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,

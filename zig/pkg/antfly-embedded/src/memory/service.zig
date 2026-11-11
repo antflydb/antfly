@@ -228,9 +228,52 @@ pub const Service = struct {
     backend: Backend,
     context: Context,
 
-    const Execution = struct { expected_revision: ?u64 = null, processing_failure: ?anyerror = null, defer_timeouts: bool = false };
+    const Execution = struct { expected_revision: ?u64 = null, processing_failure: ?anyerror = null, defer_timeouts: bool = false, read_revision_changed: ?*bool = null };
     pub fn execute(self: Service, alloc: A, action: Action, id: []const u8, body: []const u8, idempotency_key: []const u8) ![]u8 {
-        return self.executeInner(alloc, action, id, body, idempotency_key, .{});
+        // Metadata reads are optimistic: background maintenance can publish
+        // between hydration and the final authority fence. Rebuild the whole
+        // view after that private conflict, retaining the caller's deadline and
+        // rechecking permissions. Never replay writes or model-backed recall.
+        const attempts: usize = switch (action) {
+            // Explicit opt-in: a future read action may invoke a provider or
+            // own a frozen paging window, so read-only does not imply replayable.
+            .evaluation_results,
+            .evaluation_dataset,
+            .evaluation_cases,
+            .evaluation_run,
+            .evaluation_tasks,
+            .lineage,
+            .supersession_proposals,
+            .supersession_proposal,
+            .changes,
+            .inspect,
+            .get,
+            .history,
+            .operation,
+            .entities,
+            .resolve_entity,
+            .evidence,
+            .configuration,
+            .explain,
+            .entity_candidates,
+            .entity_proposals,
+            .entity_proposal,
+            .entity_view,
+            .episodes,
+            .episode,
+            .relationship_proposal,
+            .usage,
+            => 4,
+            else => 1,
+        };
+        for (0..attempts) |_| {
+            var read_revision_changed = false;
+            return self.executeInner(alloc, action, id, body, idempotency_key, .{ .read_revision_changed = &read_revision_changed }) catch |err| {
+                if (err != error.MemoryRevisionConflict or !read_revision_changed) return err;
+                continue;
+            };
+        }
+        return error.MemoryRevisionConflict;
     }
     /// Background execution and timeout recovery share one revision and receipt.
     /// A stale worker cannot charge a failure to newer work or replace a result
@@ -523,7 +566,10 @@ pub const Service = struct {
             // Reads spanning pages must not report a mixture of revisions.
             const latest = (try self.backend.get(self.backend.ptr, a, "control")) orelse return error.MemorySpaceNotFound;
             const state = try parse(t.State, a, latest.json);
-            if (state.revision != run.state.revision) return error.MemoryRevisionConflict;
+            if (state.revision != run.state.revision) {
+                if (execution.read_revision_changed) |changed| changed.* = true;
+                return error.MemoryRevisionConflict;
+            }
         }
         return try alloc.dupe(u8, output.?);
     }

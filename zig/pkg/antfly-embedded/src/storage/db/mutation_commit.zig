@@ -3854,11 +3854,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const runtime_stats = runtime.stats();
+            const cut = try runtime.replayCutForVisibility(sequence);
+            if (cut.applied >= sequence) return;
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
-            if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
-                try runtime.markAppliedThrough(sequence);
+            if (try self.noPendingEnrichmentReplayThrough(cut.applied, sequence)) {
+                try runtime.markAppliedThroughAtCut(sequence, cut);
             }
         }
 
@@ -4790,6 +4791,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
                 if (internal_keys.isAssetArtifactKey(key)) {
                     try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+                    // Match generated publication records: even an unchanged
+                    // source can publish a newer healthy manifest whose repair
+                    // effect must reach every consumer before target advance.
+                    inline for (.{ .full_text, .dense_vector, .sparse_vector, .algebraic }) |hint|
+                        try appendUniqueReplayRecordHint(alloc, &target_hints, hint);
                 }
                 // A committed resolution artifact re-drives sibling resolvers over
                 // the same source (compositional event identity composes sibling

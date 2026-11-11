@@ -5632,6 +5632,8 @@ pub const HBCIndex = struct {
         quantized_score_ns_per_candidate: u64 = 0,
         artifact_read_decode_ns_per_vector: u64 = 0,
         exact_distance_ns_per_vector: u64 = 0,
+        exact_native_lookup_ns_per_read: u64 = 0,
+        exact_residual_ns_per_candidate: u64 = 0,
         rerank_cache_hit_permille: u64 = 0,
         rerank_cache_observations: u64 = 0,
         exact_observations: u64 = 0,
@@ -5650,6 +5652,10 @@ pub const HBCIndex = struct {
     pub const ExactRouteCostObservation = struct {
         candidates: u64,
         metadata_ns: u64,
+        native_lookup_ns: u64 = 0,
+        native_reads: u64 = 0,
+        residual_filter_ns: u64 = 0,
+        vectors_scored: ?u64 = null,
         artifact_read_decode_ns: u64,
         distance_ns: u64,
         artifact_cache_hits: u64,
@@ -5955,6 +5961,12 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Physical backup format is independent of graph authority. Upgraded
+    /// LEANN indexes can retain an empty native HBC wrapper from older roots.
+    pub fn nativeBackupUsesPostingFiles(self: *const HBCIndex) bool {
+        return self.experimentalPostingWalAuthoritative() or (self.leann != null and self.env_owner == .native);
+    }
+
     pub const NativeBackupGeneration = struct {
         alloc: Allocator,
         storage: lsm_backend.Storage,
@@ -5983,12 +5995,12 @@ pub const HBCIndex = struct {
         alloc: Allocator,
         expected_source_sequence: u64,
     ) !?NativeBackupGeneration {
-        if (!self.experimentalPostingWalAuthoritative()) return null;
+        if (!self.nativeBackupUsesPostingFiles()) return null;
         if (self.experimentalPostingMutationCaptureActive() or self.write_session_depth != 0)
             return error.NativeBackupProjectionNotQuiescent;
         var store = try self.openExperimentalPostingStore();
         defer store.deinit();
-        if (store.covered_source_sequence != expected_source_sequence)
+        if (self.leann == null and store.covered_source_sequence != expected_source_sequence)
             return error.NativeBackupProjectionNotQuiescent;
         var checkpoint = store.checkpoint orelse return error.MissingPostingCheckpoint;
         checkpoint.wal_committed_bytes = store.wal_committed_bytes;
@@ -8024,6 +8036,13 @@ pub const HBCIndex = struct {
         const loader = self.external_vector_loader orelse return error.MissingVectorLoader;
         store.setLoader(.{ .ctx = self.external_vector_ctx.?, .load = loader });
         self.leann = store;
+        // The wrapper can open an empty native HBC root during restore, but
+        // LEANN owns graph durability and uses the generic replay checkpoint.
+        // It must never claim an authoritative HBC posting generation.
+        self.experimental_posting_wal_authoritative.store(false, .release);
+        self.experimental_posting_wal_authoritative_persisted = false;
+        self.experimental_posting_native_authority_persisted = false;
+        self.experimental_posting_authority_transition_permitted = false;
     }
 
     pub fn setExternalVectorLoader(self: *HBCIndex, ctx: *anyopaque, loader: ExternalVectorLoader) void {
@@ -18866,18 +18885,38 @@ pub const HBCIndex = struct {
         lease.release();
     }
 
+    fn searchLeann(self: *HBCIndex, store: *leann_store_mod.LeannStore, req: SearchRequest, search_stats: ?*@import("antfly_vectorindex").leann.SearchStats) !SearchResults {
+        var working = if (self.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .dense_search_working_set, self.alloc, 1)
+        else
+            null;
+        defer if (working) |*budget| budget.deinit();
+        return store.searchWithWorkingAllocatorAndStats(self.alloc, if (working) |*budget| budget.allocator() else self.alloc, req, search_stats);
+    }
+
     pub fn searchWithRequest(self: *HBCIndex, req: SearchRequest) !SearchResults {
-        if (self.leann) |store| return try store.search(self.alloc, req);
+        if (self.leann) |store| return try self.searchLeann(store, req, null);
         return try vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince);
     }
 
     pub fn searchProfiled(self: *HBCIndex, query: []const f32, k: usize) !ProfiledSearchResults {
-        if (self.leann) |store| return .{ .results = try store.search(self.alloc, .{ .query = query, .k = k }), .profile = .{} };
+        if (self.leann != null) return self.searchProfiledRequest(.{ .query = query, .k = k });
         return try vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince);
     }
 
     pub fn searchProfiledRequest(self: *HBCIndex, req: SearchRequest) !ProfiledSearchResults {
-        if (self.leann) |store| return .{ .results = try store.search(self.alloc, req), .profile = .{} };
+        if (self.leann) |store| {
+            const start = nowNs();
+            var search_stats: @import("antfly_vectorindex").leann.SearchStats = .{};
+            const results = try self.searchLeann(store, req, &search_stats);
+            return .{ .results = results, .profile = .{
+                .total_ns = elapsedSince(start),
+                .nodes_visited = search_stats.expanded,
+                .approx_vectors_scored = search_stats.approx_evaluated,
+                .reranked_vectors = search_stats.recomputed,
+                .rerank_batches = search_stats.batches,
+            } };
+        }
         return try vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince);
     }
 
@@ -18917,6 +18956,14 @@ pub const HBCIndex = struct {
             state.filter_scan_ns_per_candidate,
             perUnit(observation.metadata_ns, observation.candidates),
         );
+        state.exact_native_lookup_ns_per_read = routeRateEwma(
+            state.exact_native_lookup_ns_per_read,
+            perUnit(observation.native_lookup_ns, observation.native_reads),
+        );
+        state.exact_residual_ns_per_candidate = routeRateEwma(
+            state.exact_residual_ns_per_candidate,
+            perUnit(observation.residual_filter_ns, observation.candidates),
+        );
         state.artifact_read_decode_ns_per_vector = routeRateEwma(
             state.artifact_read_decode_ns_per_vector,
             perUnit(
@@ -18926,7 +18973,7 @@ pub const HBCIndex = struct {
         );
         state.exact_distance_ns_per_vector = routeRateEwma(
             state.exact_distance_ns_per_vector,
-            perUnit(observation.distance_ns, observation.candidates),
+            perUnit(observation.distance_ns, observation.vectors_scored orelse observation.candidates),
         );
         const cache_total = observation.artifact_cache_hits +| observation.artifact_vectors_loaded;
         if (cache_total > 0) {
@@ -18972,10 +19019,9 @@ pub const HBCIndex = struct {
             state.filter_scan_ns_per_candidate,
             perUnit(profile.filter_metadata_batch_ns, profile.filter_candidates),
         );
-        const quantized_ns = profile.leaf_score_ns -| profile.filter_metadata_batch_ns;
         state.quantized_score_ns_per_candidate = routeRateEwma(
             state.quantized_score_ns_per_candidate,
-            perUnit(quantized_ns, profile.approx_vectors_scored),
+            vectorindex_search_types.leafWorkNsPerInspectedRow(profile),
         );
         state.artifact_read_decode_ns_per_vector = routeRateEwma(
             state.artifact_read_decode_ns_per_vector,
@@ -22317,6 +22363,21 @@ test "hbc route observation counts external distance timing once" {
     defer tp.cleanup();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
     defer idx.close();
+
+    idx.observeExactDenseRouteCost(.{
+        .candidates = 100,
+        .metadata_ns = 0,
+        .native_lookup_ns = 1000,
+        .native_reads = 10,
+        .residual_filter_ns = 500,
+        .artifact_read_decode_ns = 0,
+        .distance_ns = 0,
+        .artifact_cache_hits = 0,
+        .artifact_vectors_loaded = 0,
+    });
+    const exact = idx.denseRouteCostSnapshot();
+    try std.testing.expectEqual(@as(u64, 100), exact.exact_native_lookup_ns_per_read);
+    try std.testing.expectEqual(@as(u64, 5), exact.exact_residual_ns_per_candidate);
 
     var profile: SearchProfile = .{
         .reranked_vectors = 2,
@@ -35659,6 +35720,45 @@ test "hbc multi-bit codes refine leaf admission and survive reopen" {
             var refined: u64 = 0;
             recalls[vi] = try multiBitRecall(alloc, &idx, data, queries, dims, &refined);
             if (bits == 1) try std.testing.expectEqual(@as(u64, 0), refined) else try std.testing.expect(refined > 0);
+            if (bits > 1) {
+                const Expected = struct {
+                    id: u64,
+                    distance: f32,
+
+                    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                        return lhs.distance < rhs.distance;
+                    }
+                };
+                const query = data[0..dims];
+                var allowed: [8]u64 = undefined;
+                var expected: [8]Expected = undefined;
+                for (&allowed, &expected, 0..) |*id, *candidate, i| {
+                    const offset = i * 251;
+                    id.* = offset + 1;
+                    var dist: f32 = 0;
+                    for (query, data[offset * dims ..][0..dims]) |a, b| dist += (a - b) * (a - b);
+                    candidate.* = .{ .id = id.*, .distance = dist };
+                }
+                std.mem.sortUnstable(Expected, &expected, {}, Expected.lessThan);
+                const threshold = (expected[3].distance + expected[4].distance) / 2;
+                var filtered = try idx.searchProfiledRequest(.{
+                    .query = query,
+                    .k = allowed.len,
+                    .search_width = 512,
+                    .filter_ids = &allowed,
+                    .distance_under = threshold,
+                    .load_metadata = false,
+                });
+                defer filtered.results.deinit();
+                try std.testing.expect(filtered.profile.ex_refined_vectors > 0);
+                try std.testing.expect(filtered.profile.approx_vectors_scored < filtered.profile.filter_candidates);
+                const hits = filtered.results.getHits();
+                try std.testing.expectEqual(@as(usize, 4), hits.len);
+                for (hits, expected[0..hits.len]) |hit, want| {
+                    try std.testing.expectEqual(want.id, hit.vector_id);
+                    try std.testing.expectApproxEqRel(want.distance, hit.distance, 0.0001);
+                }
+            }
         }
         if (bits > 1) {
             // Persisted payloads carry the extended codes across reopen.

@@ -511,6 +511,30 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
 
+    const leann_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/leann_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    leann_storage_mod.addImport("antfly_vector", vector_mod);
+    leann_storage_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    leann_storage_mod.addImport("antfly_hash", hash_mod);
+    leann_storage_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    const leann_storage_tests = b.addTest(.{ .root_module = leann_storage_mod });
+    b.step("leann-storage-test", "Run local and replicated LEANN storage tests")
+        .dependOn(&b.addRunArtifact(leann_storage_tests).step);
+
+    const leann_bench_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vectorindex/src/leann_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    leann_bench_mod.addImport("antfly_vector", vector_mod);
+    leann_bench_mod.addImport("antfly_hash", hash_mod);
+    const leann_bench = b.addExecutable(.{ .name = "leann_bench", .root_module = leann_bench_mod });
+    b.step("leann-bench", "Build the LEANN search and churn benchmark")
+        .dependOn(&b.addInstallArtifact(leann_bench, .{}).step);
+
     const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
     vector_kernel_mod.addImport("protobuf", protobuf_mod);
     const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = buildArguments(b) orelse &.{} });
@@ -716,6 +740,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .inference_enable_cuda = inference_enable_cuda,
         .apple_bridge = if (install_apple_bridge) |install| install.source else null,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,

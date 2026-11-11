@@ -27,6 +27,28 @@ function fixture() {
 }
 
 describe("persistent migration ownership", () => {
+  it("waits with reads while another runner owns the claim, then arbitrates atomically", async () => {
+    vi.useFakeTimers();
+    try {
+      const { store, db } = fixture();
+      const owner = persistentMigrationLock(store);
+      const contender = persistentMigrationLock(store);
+      await owner.acquire(db);
+      const waiting = contender.acquire(db);
+      await vi.advanceTimersByTimeAsync(500);
+      // One owner INSERT and one definitively rejected contender INSERT.
+      // Repeated waiting must not compete with the owner's DDL for a writer.
+      expect(store.insert).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(store.read).mock.calls.length).toBeGreaterThan(3);
+      await owner.release(db);
+      await vi.advanceTimersByTimeAsync(200);
+      await waiting;
+      expect(store.insert).toHaveBeenCalledTimes(3);
+      await contender.release(db);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("excludes another runner and only releases confirmed ownership", async () => {
     const { store, db, claim } = fixture();
     const first = persistentMigrationLock(store, { waitTimeoutMs: 0 });
@@ -119,4 +141,34 @@ it("retries a definitely rejected serialization conflict after reading ownership
   expect(store.read).toHaveBeenCalledTimes(2);
   expect(store.insert).toHaveBeenCalledTimes(2);
   await lock.release(db);
+});
+
+it.each([
+  "40001",
+  "53300",
+])("retries a definitely rejected %s release without abandoning the claim", async (code) => {
+  const { store, db, claim } = fixture();
+  const remove = store.remove;
+  let attempts = 0;
+  store.remove = vi.fn(async (...args) => {
+    if (attempts++ === 0) throw { code };
+    return remove(...args);
+  });
+  const lock = persistentMigrationLock(store, { waitTimeoutMs: 1000 });
+  await lock.acquire(db);
+  await lock.release(db);
+  expect(store.remove).toHaveBeenCalledTimes(2);
+  expect(claim()).toBeNull();
+});
+
+it("stops release retries at its deadline and preserves recoverable ownership", async () => {
+  const { store, db, claim } = fixture();
+  const lock = persistentMigrationLock(store, { waitTimeoutMs: 0 });
+  await lock.acquire(db);
+  store.remove = vi.fn(async () => {
+    throw { code: "40001" };
+  });
+  await expect(lock.release(db)).rejects.toMatchObject({ code: "ANTFLY_MIGRATION_LOCK_UNKNOWN" });
+  expect(store.remove).toHaveBeenCalledTimes(1);
+  expect(claim()).not.toBeNull();
 });

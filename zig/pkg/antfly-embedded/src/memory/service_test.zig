@@ -9821,3 +9821,85 @@ test "memory preparation bounds policy support hydration and rejects atomically"
     try std.testing.expectEqual(revision, store.revision);
     try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "supersession-proposal/", null, 32)).rows.len);
 }
+
+test "memory metadata reads retry bounded authority changes without replaying mutations" {
+    const Race = struct {
+        store: *Store,
+        remaining: usize,
+        calls: usize = 0,
+        fn finish(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.remaining == 0) return;
+            self.remaining -= 1;
+            const a = self.store.arena.allocator();
+            const row = self.store.values.getPtr("control").?;
+            var state = try std.json.parseFromSliceLeaky(m.types.State, a, row.*, .{});
+            state.revision += 1;
+            row.* = try std.json.Stringify.valueAlloc(a, state, .{});
+            self.store.revision += 1;
+        }
+    };
+    for ([_]usize{ 1, 3, 4 }) |changes| {
+        var store = Store.init();
+        defer store.deinit();
+        try setup(&store);
+        var race: Race = .{ .store = &store, .remaining = changes };
+        var svc = store.service("alice", true, 100);
+        svc.context.final_check_ptr = &race;
+        svc.context.final_check_fn = Race.finish;
+        const result = svc.execute(std.testing.allocator, .inspect, "", "{}", "");
+        if (changes == 4) {
+            try std.testing.expectError(error.MemoryRevisionConflict, result);
+            try std.testing.expectEqual(@as(usize, 4), race.calls);
+        } else {
+            const output = try result;
+            defer std.testing.allocator.free(output);
+            const inspection = try std.json.parseFromSlice(m.types.Inspection, std.testing.allocator, output, .{});
+            defer inspection.deinit();
+            try std.testing.expectEqual(@as(usize, changes + 1), race.calls);
+            try std.testing.expectEqual(@as(usize, 0), race.remaining);
+        }
+    }
+}
+
+test "memory semantic supersession final revision conflict never replays inference" {
+    const Race = struct {
+        store: *Store,
+        calls: usize = 0,
+        fn finish(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls != 2) return;
+            const a = self.store.arena.allocator();
+            const row = self.store.values.getPtr("control").?;
+            var state = try std.json.parseFromSliceLeaky(m.types.State, a, row.*, .{});
+            state.revision += 1;
+            row.* = try std.json.Stringify.valueAlloc(a, state, .{});
+            self.store.revision += 1;
+        }
+        fn embed(ptr: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.neighbor_calls += 1;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = IndexedRecallFixture.service(&store, 10);
+    svc.backend.embed = fakeEmbed;
+    svc.backend.embed_document = fakeEmbed;
+    svc.backend.validate_models = fakeValidate;
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "helm");
+    try IndexedRecallFixture.drain(svc, a, "index");
+    var race: Race = .{ .store = &store };
+    svc.context.final_check_ptr = &race;
+    svc.context.final_check_fn = Race.finish;
+    svc.backend.embed = Race.embed;
+    try std.testing.expectError(error.MemoryRevisionConflict, svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"semantic\"}", ""));
+    try std.testing.expectEqual(@as(usize, 1), store.neighbor_calls);
+}

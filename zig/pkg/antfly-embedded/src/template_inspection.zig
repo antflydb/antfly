@@ -230,3 +230,33 @@ pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     if (directives[0].isPermanent()) return error.PermanentPromptFailure;
     return error.TransientPromptFailure;
 }
+
+/// Evaluate helper dependencies without performing remote work. This follows
+/// conditional branches and subexpressions through the normal template engine.
+pub fn canReplayLocally(alloc: Allocator, source: []const u8, document: []const u8) !bool {
+    if (std.mem.indexOf(u8, source, "remote") == null and std.mem.indexOf(u8, source, "transcribeAudio") == null) return true;
+    const Probe = struct {
+        fn remote(ctx: HelperContext) anyerror!Value {
+            const used: *bool = @ptrCast(@alignCast(ctx.userdata.?));
+            used.* = true;
+            return .{ .string = "" };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var used = false;
+    var helpers: hbs.HelperMap = .{};
+    for ([_][]const u8{ "remoteMedia", "remotePDF", "remoteText", "transcribeAudio" }) |name|
+        try helpers.put(arena.allocator(), name, hbs.Helper.withData(&Probe.remote, @ptrCast(&used)));
+    const rendered = try @import("template.zig").renderDocumentWithHelpers(alloc, source, document, &helpers);
+    defer alloc.free(rendered);
+    return !used;
+}
+
+test "leann local replay inspects executed helpers without remote work" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try canReplayLocally(a, "remote literal {{remote_field}}", "{\"remote_field\":\"text\"}"));
+    try std.testing.expect(try canReplayLocally(a, "{{#if image}}{{remoteMedia url=image}}{{else}}{{body}}{{/if}}", "{\"body\":\"alpha\"}"));
+    for ([_][]const u8{ "{{transcribeAudio url=image}}", "remote literal {{transcribeAudio url=image}}", "{{remoteMedia url=image mode=extract}}", "{{remotePDF url=image}}", "{{remoteText url=image}}", "{{#if (remoteText url=image)}}yes{{/if}}" }) |source|
+        try std.testing.expect(!try canReplayLocally(a, source, "{\"image\":\"https://example.invalid/file.pdf\"}"));
+}
