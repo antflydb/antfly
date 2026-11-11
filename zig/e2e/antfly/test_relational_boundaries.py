@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# https://www.antfly.io/licensing/ELv2-license
-
 """Exact typed values and least-privilege integrity across public boundaries."""
 
 import json
