@@ -1654,6 +1654,10 @@ fn objectListUrlAlloc(alloc: Allocator, cfg: JsonApiConfig, bucket: []const u8, 
         try parts.append(alloc, try std.fmt.allocPrint(alloc, "pageToken={s}", .{escaped}));
     }
     try parts.append(alloc, try std.fmt.allocPrint(alloc, "maxResults={d}", .{opts.max_keys}));
+    // Exclude arbitrary custom metadata and ACLs from each listed object.
+    // Include every field used by both listing decoders, including retention
+    // and generation, and preserve opaque continuation and prefix results.
+    try parts.append(alloc, try alloc.dupe(u8, "fields=items(name,etag,size,retentionExpirationTime,generation),prefixes,nextPageToken"));
 
     var query = std.ArrayListUnmanaged(u8).empty;
     defer query.deinit(alloc);
@@ -2421,7 +2425,7 @@ test "json api client lists objects and prefixes" {
             _ = body;
             _ = content_type;
             try std.testing.expectEqual(HttpMethod.GET, method);
-            try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o?prefix=docs%2F&delimiter=%2F&startOffset=docs%2Fa&maxResults=10", url);
+            try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o?prefix=docs%2F&delimiter=%2F&startOffset=docs%2Fa&maxResults=10&fields=items(name,etag,size,retentionExpirationTime,generation),prefixes,nextPageToken", url);
             return .{
                 .status = 200,
                 .body = try request_alloc.dupe(u8,
