@@ -415,15 +415,34 @@ func TestGCSBatchTruncationIsDistinctFromMismatchedResponse(t *testing.T) {
 
 func TestGCSListSkipsDirectoryMarkersAndPreservesLiteralObjectKeys(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"items":[{"name":"pages/","size":"0","generation":"1"},{"name":"pages/a//b.txt","size":"1","generation":"2"}]}`)
+		switch r.URL.EscapedPath() {
+		case "/b/docs/o":
+			fmt.Fprint(w, `{"items":[{"name":"pages/","size":"0","generation":"1"},{"name":"pages/a//b.txt","size":"1","generation":"2"}]}`)
+		case "/b/docs/o/pages%2Fa%2F%2Fb.txt":
+			if r.URL.Query().Get("alt") == "media" {
+				w.Header().Set("X-Goog-Generation", "2")
+				fmt.Fprint(w, "x")
+			} else {
+				fmt.Fprint(w, `{"generation":"2"}`)
+			}
+		default:
+			t.Errorf("unexpected escaped path %q", r.URL.EscapedPath())
+			http.NotFound(w, r)
+		}
 	}))
 	defer server.Close()
 	c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
 	for _, preview := range []bool{true, false} {
-		inventory, err := c.Enumerate(t.Context(), Request{Mode: ImportModeSource, Preview: preview, SourceNamespace: "test",
-			Config: SourceConfig(`{"bucket":"docs","prefix":"pages/"}`)})
+		request := Request{Mode: ImportModeSource, Preview: preview, SourceNamespace: "test",
+			Config: SourceConfig(`{"bucket":"docs","prefix":"pages/"}`)}
+		inventory, err := c.Enumerate(t.Context(), request)
 		require.NoError(t, err)
 		require.Len(t, inventory.Objects, 1)
-		require.Equal(t, "pages/a//b.txt", inventory.Objects[0].Path)
+		item := inventory.Objects[0]
+		require.Equal(t, "pages/a//b.txt", item.Path)
+		payload, err := c.Read(t.Context(), request, item)
+		require.NoError(t, err)
+		require.Equal(t, "x", string(payload))
+		require.NoError(t, c.CheckAccess(t.Context(), request, item))
 	}
 }
