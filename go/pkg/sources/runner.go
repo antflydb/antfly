@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -55,6 +56,7 @@ type Identity struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 type Source struct {
+	Knowledge     *KnowledgeDeclaration  `json:"knowledge,omitempty"`
 	Processing    *ProcessingDeclaration `json:"processing,omitempty"`
 	SearchVersion int                    `json:"search_version,omitempty"`
 	Artifacts     []ArtifactBinding      `json:"artifacts,omitempty"`
@@ -72,6 +74,7 @@ type Source struct {
 	Identity             Identity        `json:"identity,omitzero"`
 }
 type Runner struct {
+	KnowledgeAudience string // Trusted deployment boundary, never source configuration.
 	// SourceID selects one source while retaining the complete profile/catalog.
 	// Filtering Profile.Sources would incorrectly retire unrelated bindings.
 	SourceID string
@@ -88,12 +91,17 @@ type Runner struct {
 	Publisher             *Publisher
 	Restart               bool
 }
+
+const projectedPageBatchCount = 64
+const projectedPageBatchBytes = 2 << 20
+
 type runState struct {
 	RecordFormat                          int
 	Version                               int
 	Endpoint, Table, SourceID, ConfigHash string
 	Owned                                 map[string]string
 	Pending                               *Inventory
+	PublicationProofs                     map[string]string `json:",omitempty"`
 	Published                             *Inventory
 	AcquisitionID                         string
 	StartedAt                             int64
@@ -186,7 +194,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		binding := Binding{Knowledge: source.Knowledge, SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
 		if len(binding.Streams) == 0 && source.Publication != "media" {
 			binding.Streams = DefaultSearchStreams(source.SearchVersion)
 		}
@@ -195,6 +203,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			binding.Publication = "native"
 		}
 		if prior, ok := old[source.ID]; ok && prior.Table == source.Table && binding.SameRecordLayout(prior) {
+			binding.AcquisitionID = prior.AcquisitionID
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
 			binding.PublishedRevision = prior.PublishedRevision
@@ -226,10 +235,15 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			if err := r.Publisher.EnsureTable(ctx, source.Table); err != nil {
 				return err
 			}
-			if err := ReconcileProcessing(ctx, r.Publisher, source.Table, source.Processing); err != nil {
+			if err := ReconcileSourceSearch(ctx, r.Publisher, source, r.KnowledgeAudience); err != nil {
+				return err
+			}
+		} else if source.Knowledge != nil {
+			if err := ValidateInstalledKnowledge(ctx, r.Publisher, Binding{Table: source.Table, Knowledge: source.Knowledge}, r.KnowledgeAudience); err != nil {
 				return err
 			}
 		}
+		catalog.Sources[i].AcquisitionID = ""
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
 		catalog.Sources[i].ValidUntil = nil
@@ -252,6 +266,12 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		until := started + int64(ttl)
 		// Each successful publication gets a new fence even for an unchanged inventory.
 		revision += ":" + rand.Text()
+		if source.Knowledge != nil {
+			catalog.Sources[i].AcquisitionID, err = sourceAcquisitionIdentity(source, connection)
+			if err != nil {
+				return err
+			}
+		}
 		catalog.Sources[i].PublishedRevision = revision
 		catalog.Sources[i].Status = "searchable"
 		catalog.Sources[i].ValidUntil = &until
@@ -259,6 +279,16 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			return err
 		}
 		if err := writeJSON(r.CatalogPath, catalog, 32<<20); err != nil {
+			return err
+		}
+		// Tie the completed acquisition to the catalog fence only after both
+		// publications succeed. A crash before this checkpoint fails closed.
+		identity, err := sourceAcquisitionIdentity(source, connection)
+		if err != nil {
+			return err
+		}
+		receipt := completedPublication{Identity: identity, Revision: revision, Endpoint: r.Profile.Endpoint, Table: source.Table, SourceID: source.ID}
+		if err := writeJSON(filepath.Join(r.StateDir, source.ID+".publication.json"), receipt, 1<<20); err != nil {
 			return err
 		}
 	}
@@ -286,6 +316,9 @@ func (r *Runner) validate() error {
 		}
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
+		}
+		if err := ValidateKnowledgeProcessing(s.Knowledge, s.Processing, r.KnowledgeAudience); err != nil {
+			return err
 		}
 		if err := ValidateProcessing(s.Processing); err != nil {
 			return err
@@ -337,6 +370,7 @@ func canonicalID(id string) bool {
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
 	source.Streams = nil // Search/producer bindings do not change acquired bytes.
+	source.Knowledge = nil
 	source.Artifacts = nil
 	source.SearchVersion = 0
 	source.Processing = nil
@@ -395,6 +429,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 				return 0, "", fmt.Errorf("source configuration changed during a pinned run; use --restart")
 			}
 			state.Pending = nil
+			state.PublicationProofs = nil
 			state.ConfigHash = hash
 			state.Published = nil
 			state.AcquisitionID = ""
@@ -418,7 +453,14 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 	}
 	journalPath := statePath + ".owned"
-	if err := replayOwnership(journalPath, request.SourceNamespace, state.Owned); err != nil {
+	// A committed or restarted run has no proofs to recover. Ownership
+	// events still apply, even when their publication never completed.
+	if state.Pending == nil || r.Restart {
+		state.PublicationProofs = nil
+	} else if state.PublicationProofs == nil {
+		state.PublicationProofs = map[string]string{}
+	}
+	if err := replaySourceJournal(journalPath, request.SourceNamespace, state.Owned, state.PublicationProofs); err != nil {
 		return 0, "", err
 	}
 	phase = "connect"
@@ -450,6 +492,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	}
 	if r.Restart {
 		state.Pending = nil
+		state.PublicationProofs = nil
 	}
 	phase = "enumerate"
 	if state.Pending == nil {
@@ -514,6 +557,53 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err != nil {
 		return 0, "", err
 	}
+	// Projected pages can resume from verified rows because both their bytes
+	// and citation metadata have provider revisions. Recheck access before
+	// reusing any published rows.
+	var projectedPages bool
+	itemsToPublish := state.Pending.Objects
+	if google, ok := connector.(*GoogleConnector); ok && google.ProviderName == ProviderGCS {
+		config, err := decodeSourceConfig[GoogleConfig](request.Config)
+		if err != nil {
+			return 0, "", err
+		}
+		projectedPages = config.PageProvenance
+		if projectedPages {
+			if len(state.PublicationProofs) > 0 {
+				phase = "restore_publication"
+				restored, err := writer.matchPublicationProofs(ctx, state.PublicationProofs)
+				if err != nil {
+					return 0, "", err
+				}
+				if len(restored) > 0 {
+					restoredItems := make([]Item, 0, len(restored))
+					itemsToPublish = make([]Item, 0, len(state.Pending.Objects)-len(restored))
+					for _, item := range state.Pending.Objects {
+						key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
+						if err != nil {
+							return 0, "", err
+						}
+						if _, ok := restored[key]; ok {
+							restoredItems = append(restoredItems, item)
+						} else {
+							itemsToPublish = append(itemsToPublish, item)
+						}
+					}
+					if err := google.validateGCSObjectAccess(ctx, request, restoredItems); err != nil {
+						return 0, "", err
+					}
+					writer.markPublicationVerified(restored)
+				}
+				if len(restored) != len(state.PublicationProofs) {
+					state.PublicationProofs = restored
+					if err := writeJSON(statePath, state, 256<<20); err != nil {
+						return 0, "", err
+					}
+				}
+			}
+			writer.TrackPublicationProofs()
+		}
+	}
 	legacy := []string{}
 	if state.RecordFormat == 0 {
 		for id := range state.Owned {
@@ -523,12 +613,49 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	}
 	phase = "publish"
 	selected := map[string]bool{}
-	var total int64
 	for _, item := range state.Pending.Objects {
+		selected[item.ID] = true
+	}
+	var total int64
+	var pageBytes int
+	page := map[string]Document{}
+	pageOwners := map[string]string{}
+	flush := func() error {
+		if len(page) == 0 {
+			return nil
+		}
+		if err := journalOwnership(journalPath, ownershipEvent{Add: pageOwners}); err != nil {
+			return err
+		}
+		if _, err := writer.Upsert(ctx, page); err != nil {
+			return err
+		}
+		proofs := make(map[string]string, len(page))
+		for key := range page {
+			proofs[key] = writer.PublicationProofs()[key]
+		}
+		if err := journalOwnership(journalPath, ownershipEvent{Proofs: proofs}); err != nil {
+			return err
+		}
+		clear(page)
+		clear(pageOwners)
+		pageBytes = 0
+		return nil
+	}
+	// Keep the aggregate read budget across retries as well as fresh reads.
+	if projectedPages {
+		for _, item := range state.Pending.Objects {
+			if item.Size < 0 || item.Size > 10<<30-total {
+				return 0, "", fmt.Errorf("invalid projected page size or source run exceeds 10 GiB")
+			}
+			total += item.Size
+		}
+		total = 0
+	}
+	for _, item := range itemsToPublish {
 		if err := ctx.Err(); err != nil {
 			return 0, "", err
 		}
-		selected[item.ID] = true
 		item.Metadata = cloneSourceMetadata(item.Metadata)
 		item.Metadata["connection_id"] = s.Connection
 		var doc Document
@@ -570,20 +697,37 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if _, exists := state.Owned[item.ID]; !exists && len(state.Owned) >= maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget; complete reconciliation before selecting more items")
 		}
-		if err := journalOwnership(journalPath, ownershipEvent{ID: item.ID, Revision: item.Revision}); err != nil {
-			return 0, "", err
-		}
-		state.Owned[item.ID] = item.Revision
-		if len(state.Owned) > maxOwnedSourceObjects {
-			return 0, "", fmt.Errorf("source ownership exceeds budget")
-		}
 		key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
 		if err != nil {
 			return 0, "", err
 		}
+		if projectedPages {
+			if len(page) > 0 && pageBytes+len(doc.Content) > projectedPageBatchBytes {
+				if err := flush(); err != nil {
+					return 0, "", err
+				}
+			}
+			page[key], pageOwners[item.ID] = doc, item.Revision
+			state.Owned[item.ID] = item.Revision
+			pageBytes += len(doc.Content)
+			if len(page) == projectedPageBatchCount || pageBytes >= projectedPageBatchBytes {
+				if err := flush(); err != nil {
+					return 0, "", err
+				}
+			}
+			continue
+		}
+		if err := journalOwnership(journalPath, ownershipEvent{ID: item.ID, Revision: item.Revision}); err != nil {
+			return 0, "", err
+		}
+		state.Owned[item.ID] = item.Revision
 		if _, err := writer.Upsert(ctx, map[string]Document{key: doc}); err != nil {
 			return 0, "", err
 		}
+	}
+	phase = "publish"
+	if err := flush(); err != nil {
+		return 0, "", err
 	}
 	absent := []string{}
 	for id := range state.Owned {
@@ -622,7 +766,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	}
 	_, isCollaboration := connector.(*CollaborationConnector)
 	_, isDriveMedia := connector.(*driveMediaConnector)
-	if isCollaboration || isDriveMedia {
+	google, isGoogle := connector.(*GoogleConnector)
+	isGCS := isGoogle && google.ProviderName == ProviderGCS
+	if isCollaboration || isDriveMedia || isGCS {
 		phase = "audit_permissions"
 		ttl := s.PermissionTTLSeconds
 		if ttl == 0 {
@@ -630,10 +776,15 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		checkedAt := time.Now()
 		auditCtx, cancel := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
-		err := connector.ValidateInventory(auditCtx, request, *state.Pending)
+		var auditErr error
+		if isGCS {
+			auditErr = google.validateGCSObjectAccess(auditCtx, request, state.Pending.Objects)
+		} else {
+			auditErr = connector.ValidateInventory(auditCtx, request, *state.Pending)
+		}
 		cancel()
-		if err != nil {
-			return 0, "", err
+		if auditErr != nil {
+			return 0, "", auditErr
 		}
 		if time.Since(checkedAt) >= time.Duration(ttl)*time.Second {
 			return 0, "", fmt.Errorf("%w: source permission audit exceeded lease duration", context.DeadlineExceeded)
@@ -645,6 +796,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	phase = "commit_state"
 	state.Published = state.Pending
 	state.Pending = nil
+	state.PublicationProofs = nil
 	state.AcquisitionID = ""
 	state.RecordFormat = 2
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
@@ -691,7 +843,7 @@ func loadJSON(path string, out any, limit int64) error {
 	if int64(len(raw)) > limit {
 		return fmt.Errorf("JSON state exceeds budget")
 	}
-	return json.Unmarshal(raw, out)
+	return decodeJSONExact(raw, out)
 }
 func writeJSON(path string, value any, limit int64) error {
 	raw, err := json.Marshal(value)
@@ -738,6 +890,15 @@ func writeJSON(path string, value any, limit int64) error {
 // Drive media uses the same inventory, access checks and revision-checked binary
 // reads as GoogleConnector, bypassing collaboration's text/OCR extraction.
 func publicationConnector(connector Connector, source Source) (Connector, error) {
+	if google, ok := connector.(*GoogleConnector); ok && google.ProviderName == ProviderGCS {
+		config, err := decodeSourceConfig[GoogleConfig](source.Config)
+		if err != nil {
+			return nil, err
+		}
+		if err := ValidatePageProvenancePublication(google.ProviderName, config, source.Publication); err != nil {
+			return nil, err
+		}
+	}
 	if source.Publication == "text" {
 		return connector, nil
 	}
@@ -843,4 +1004,49 @@ func UsesNativeResource(source Source, item Item) bool {
 // Provider authentication and resource allowlists remain the runtime's job.
 func PublicationConnector(connector Connector, source Source) (Connector, error) {
 	return publicationConnector(connector, source)
+}
+
+// Preserve opaque native configuration integers throughout profile persistence
+// and copying. Typed integer fields continue to use their ordinary decoders.
+func decodeJSONExact(raw []byte, out any) error {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	if err := d.Decode(out); err != nil {
+		return err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("expected exactly one JSON value")
+	}
+	return nil
+}
+
+// Publication identity includes row keying as well as acquired content/access.
+// Processing-only edits are deliberately excluded; key migrations and provider
+// selection edits cannot reuse a previous publication's authority.
+func sourceAcquisitionIdentity(source Source, connection Connection) (string, error) {
+	// A management client may reorder JSON object keys without changing the
+	// selected acquisition. Preserve numbers while canonicalizing that witness.
+	if len(source.Config) > 0 {
+		var config any
+		if err := decodeJSONExact(source.Config, &config); err != nil {
+			return "", err
+		}
+		canonical, err := json.Marshal(config)
+		if err != nil {
+			return "", err
+		}
+		source.Config = canonical
+	}
+	if connection.Provider == ProviderGoogleWorkspace {
+		connection.Services = nil
+	}
+	hash, err := sourceConfigurationHash(source, connection)
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal([]string{hash, source.Identity.Namespace})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw)), nil
 }

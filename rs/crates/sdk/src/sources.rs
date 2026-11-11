@@ -59,6 +59,8 @@ pub struct SourceSyncFailure {
     pub phase: String,
     pub code: String,
     pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_required: Option<bool>,
 }
 
 // Deliberately has no Debug implementation: its operator token is private.
@@ -331,6 +333,20 @@ impl SourcesClient {
         )
         .await
     }
+    pub async fn query_knowledge(
+        &self,
+        id: &str,
+        request: &types::KnowledgeRequest,
+    ) -> Result<Value, SourceServiceError> {
+        let body = serde_json::to_value(request)
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid knowledge query"))?;
+        self.request(
+            Method::POST,
+            &["sources", id, "knowledge-query"],
+            Some(&body),
+        )
+        .await
+    }
     pub async fn processing_job(
         &self,
         id: &str,
@@ -351,6 +367,7 @@ impl SourcesClient {
     ) -> Result<types::Source, SourceServiceError> {
         let mut desired = source.clone();
         desired.search_status = None;
+        desired.knowledge_status = None;
         let body = serde_json::to_value(desired)
             .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source"))?;
         self.request(Method::PUT, &["sources", &source.id], Some(&body))

@@ -48,6 +48,66 @@ func (e ErrorVersion) Valid() bool {
 	}
 }
 
+// Defines values for GraphTemporalBindingHistory.
+const (
+	CurrentState GraphTemporalBindingHistory = "current_state"
+)
+
+// Valid indicates whether the value is a known member of the GraphTemporalBindingHistory enum.
+func (e GraphTemporalBindingHistory) Valid() bool {
+	switch e {
+	case CurrentState:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for GraphTemporalBindingMapping.
+const (
+	NativeIntervalsV1 GraphTemporalBindingMapping = "native_intervals_v1"
+)
+
+// Valid indicates whether the value is a known member of the GraphTemporalBindingMapping enum.
+func (e GraphTemporalBindingMapping) Valid() bool {
+	switch e {
+	case NativeIntervalsV1:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for KnowledgeDeclarationMode.
+const (
+	InstanceOneAudience KnowledgeDeclarationMode = "instance_one_audience"
+)
+
+// Valid indicates whether the value is a known member of the KnowledgeDeclarationMode enum.
+func (e KnowledgeDeclarationMode) Valid() bool {
+	switch e {
+	case InstanceOneAudience:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for KnowledgeDeclarationVersion.
+const (
+	KnowledgeDeclarationVersionN1 KnowledgeDeclarationVersion = 1
+)
+
+// Valid indicates whether the value is a known member of the KnowledgeDeclarationVersion enum.
+func (e KnowledgeDeclarationVersion) Valid() bool {
+	switch e {
+	case KnowledgeDeclarationVersionN1:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ProcessingJobRequestAction.
 const (
 	Advance ProcessingJobRequestAction = "advance"
@@ -400,10 +460,14 @@ type ArtifactBinding struct {
 
 // Capabilities defines model for Capabilities.
 type Capabilities struct {
-	ArtifactDiscovery bool                `json:"artifact_discovery,omitempty,omitzero"`
-	CancelRuns        bool                `json:"cancel_runs"`
-	ConfigurationUrl  string              `json:"configuration_url,omitempty,omitzero"`
-	ConfigureSources  bool                `json:"configure_sources,omitempty,omitzero"`
+	ArtifactDiscovery bool   `json:"artifact_discovery,omitempty,omitzero"`
+	CancelRuns        bool   `json:"cancel_runs"`
+	ConfigurationUrl  string `json:"configuration_url,omitempty,omitzero"`
+	ConfigureSources  bool   `json:"configure_sources,omitempty,omitzero"`
+
+	// KnowledgeAudience Runtime deployment boundary, absent when knowledge is disabled.
+	KnowledgeAudience string              `json:"knowledge_audience,omitempty,omitzero"`
+	KnowledgeVersions []int               `json:"knowledge_versions,omitempty,omitzero"`
 	MediaProxy        bool                `json:"media_proxy,omitempty,omitzero"`
 	PerSourceRuns     bool                `json:"per_source_runs"`
 	ProcessingJobs    bool                `json:"processing_jobs,omitempty,omitzero"`
@@ -417,6 +481,22 @@ type Capabilities struct {
 
 // CapabilitiesVersion defines model for Capabilities.Version.
 type CapabilitiesVersion int
+
+// EntityBinding defines model for EntityBinding.
+type EntityBinding struct {
+	// Index Native graph index owning the resolver.
+	Index         string `json:"index"`
+	LocationField string `json:"location_field,omitempty,omitzero"`
+	Name          string `json:"name"`
+
+	// Namespace Stable key prefix ending in /. Candidate enumeration/order is never part of identity.
+	Namespace          string `json:"namespace"`
+	ResolutionArtifact string `json:"resolution_artifact"`
+	Resolver           string `json:"resolver"`
+	SchemaUri          string `json:"schema_uri,omitempty,omitzero"`
+	SourceArtifact     string `json:"source_artifact"`
+	Table              string `json:"table"`
+}
 
 // Error defines model for Error.
 type Error struct {
@@ -436,6 +516,72 @@ type ExactRetrieval struct {
 type FullTextRetrieval struct {
 	Default bool   `json:"default,omitempty,omitzero"`
 	Index   string `json:"index"`
+}
+
+// GraphBinding defines model for GraphBinding.
+type GraphBinding struct {
+	Artifacts     []string             `json:"artifacts"`
+	Entities      []string             `json:"entities,omitempty,omitzero"`
+	Index         string               `json:"index"`
+	LocationField string               `json:"location_field,omitempty,omitzero"`
+	Name          string               `json:"name"`
+	SchemaUri     string               `json:"schema_uri,omitempty,omitzero"`
+	Temporal      GraphTemporalBinding `json:"temporal"`
+}
+
+// GraphTemporalBinding defines model for GraphTemporalBinding.
+type GraphTemporalBinding struct {
+	// History Filters retained current relationship metadata; no complete historical replay promise. Missing valid bounds are open; known_at requires created_at.
+	History GraphTemporalBindingHistory `json:"history"`
+	Mapping GraphTemporalBindingMapping `json:"mapping"`
+}
+
+// GraphTemporalBindingHistory Filters retained current relationship metadata; no complete historical replay promise. Missing valid bounds are open; known_at requires created_at.
+type GraphTemporalBindingHistory string
+
+// GraphTemporalBindingMapping defines model for GraphTemporalBinding.Mapping.
+type GraphTemporalBindingMapping string
+
+// KnowledgeDeclaration defines model for KnowledgeDeclaration.
+type KnowledgeDeclaration struct {
+	// Audience Opaque runtime-controlled audience identity; all participating inputs, entities, curation and graph outputs must share this audience.
+	Audience string          `json:"audience"`
+	Entities []EntityBinding `json:"entities,omitempty,omitzero"`
+	Graphs   []GraphBinding  `json:"graphs,omitempty,omitzero"`
+
+	// Mode Requires an independently configured runtime deployment boundary; never grants authorization. Mixed-audience matching/promotion is unsupported.
+	Mode    KnowledgeDeclarationMode    `json:"mode"`
+	Version KnowledgeDeclarationVersion `json:"version"`
+}
+
+// KnowledgeDeclarationMode Requires an independently configured runtime deployment boundary; never grants authorization. Mixed-audience matching/promotion is unsupported.
+type KnowledgeDeclarationMode string
+
+// KnowledgeDeclarationVersion defines model for KnowledgeDeclaration.Version.
+type KnowledgeDeclarationVersion int
+
+// KnowledgeRequest defines model for KnowledgeRequest.
+type KnowledgeRequest struct {
+	Depth int `json:"depth,omitempty,omitzero"`
+
+	// Entity Optional entity binding from the selected graph. Derives the native start table; arbitrary table qualifiers are not accepted.
+	Entity          string   `json:"entity,omitempty,omitzero"`
+	Graph           string   `json:"graph"`
+	KnownAt         string   `json:"known_at,omitempty,omitzero"`
+	Limit           int      `json:"limit,omitempty,omitzero"`
+	RequireSnapshot bool     `json:"require_snapshot,omitempty,omitzero"`
+	Start           []string `json:"start"`
+	ValidAt         string   `json:"valid_at,omitempty,omitzero"`
+}
+
+// KnowledgeStatus defines model for KnowledgeStatus.
+type KnowledgeStatus struct {
+	Audience   string                 `json:"audience,omitempty,omitzero"`
+	Entities   []RepresentationStatus `json:"entities"`
+	Graphs     []RepresentationStatus `json:"graphs"`
+	Mode       string                 `json:"mode"`
+	ObservedAt int                    `json:"observed_at"`
+	Version    int                    `json:"version"`
 }
 
 // Mutation defines model for Mutation.
@@ -607,6 +753,8 @@ type Source struct {
 	Connection           string                 `json:"connection"`
 	Id                   string                 `json:"id"`
 	Identity             SourceIdentity         `json:"identity,omitempty,omitzero"`
+	Knowledge            *KnowledgeDeclaration  `json:"knowledge,omitempty"`
+	KnowledgeStatus      *KnowledgeStatus       `json:"knowledge_status,omitempty"`
 	Name                 string                 `json:"name"`
 	PermissionTtlSeconds int                    `json:"permission_ttl_seconds,omitempty,omitzero"`
 	Permissions          Permissions            `json:"permissions"`
@@ -694,6 +842,9 @@ type StartSourceRunParams struct {
 
 // PutSourceJSONRequestBody defines body for PutSource for application/json ContentType.
 type PutSourceJSONRequestBody = Source
+
+// QuerySourceKnowledgeJSONRequestBody defines body for QuerySourceKnowledge for application/json ContentType.
+type QuerySourceKnowledgeJSONRequestBody = KnowledgeRequest
 
 // OperateProcessingJobJSONRequestBody defines body for OperateProcessingJob for application/json ContentType.
 type OperateProcessingJobJSONRequestBody = ProcessingJobRequest

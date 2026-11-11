@@ -3881,6 +3881,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // WithOptions` -> `applyBatchWritesLocked` call takes, so the two
             // are already mutually exclusive without needing `!hasWorkers()`
             // as a proxy for "no concurrent worker apply".
+            //
+            // `opts.transaction_resolution == null`, matching text's/
+            // graph's/sparse's/dense's own gates above: a transaction-
+            // resolution commit below stages only `authored_acceptance`'s
+            // participant into `resolveTransactionIntentsWithExtraBatchStaged`
+            // (not `combined_commit_participant`), so a publication prepared
+            // here would never have `stage` run and would still be installed
+            // by the unconditional install loop further down -- tripping
+            // `InlineAlgebraicPublication.install`'s `apply_guard == null`
+            // assertion, since only `stage`'s own `defer` clears it.
             var inline_algebraic_publications: [2]?*InlineAlgebraicPublication = @splat(null);
             var inline_algebraic_handled_names: [2][]const u8 = undefined;
             var inline_algebraic_publication_count: usize = 0;
@@ -3888,7 +3898,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (maybe_prepared) |prepared| prepared.abort();
             };
             if (append_derived_replay and effective_req.sync_level == .full_index and
-                materialized_derived_batch != null)
+                opts.transaction_resolution == null and materialized_derived_batch != null)
             {
                 for (sync_targets.all_indexes) |target_name| {
                     if (inline_algebraic_publication_count >= inline_algebraic_publications.len) break;
@@ -5068,11 +5078,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const runtime_stats = runtime.stats();
+            const cut = try runtime.replayCutForVisibility(sequence);
+            if (cut.applied >= sequence) return;
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
-            if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
-                try runtime.markAppliedThrough(sequence);
+            if (try self.noPendingEnrichmentReplayThrough(cut.applied, sequence)) {
+                try runtime.markAppliedThroughAtCut(sequence, cut);
             }
         }
 
@@ -6011,6 +6022,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
                 if (internal_keys.isAssetArtifactKey(key)) {
                     try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+                    // Match generated publication records: even an unchanged
+                    // source can publish a newer healthy manifest whose repair
+                    // effect must reach every consumer before target advance.
+                    inline for (.{ .full_text, .dense_vector, .sparse_vector, .algebraic }) |hint|
+                        try appendUniqueReplayRecordHint(alloc, &target_hints, hint);
                 }
                 // A committed resolution artifact re-drives sibling resolvers over
                 // the same source (compositional event identity composes sibling
@@ -6222,6 +6238,108 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const backoff_step = @min(attempts - 128, 5);
                 const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
                 sleepNs(sleep_ns);
+                sleep_loops += 1;
+            }
+
+            const wait_ns = elapsedSince(wait_start_ns);
+            _ = stats.spin_loops.fetchAdd(spin_loops, .monotonic);
+            _ = stats.yield_loops.fetchAdd(yield_loops, .monotonic);
+            _ = stats.sleep_loops.fetchAdd(sleep_loops, .monotonic);
+            _ = stats.wait_ns.fetchAdd(wait_ns, .monotonic);
+            atomicMaxU64(&stats.max_wait_ns, wait_ns);
+            return .{
+                .mutex = mutex,
+                .stats = stats,
+                .hold_start_ns = monotonicTimeNs(),
+                .profiled = true,
+            };
+        }
+
+        /// Like `lockAtomicWithBackoff`, but yields through the given Io
+        /// instead of a raw OS `nanosleep` once spinning/yielding alone
+        /// stops being productive. VOPR's cooperative scheduler runs its
+        /// deterministic scenario on a single logical thread; a raw
+        /// `nanosleep` there blocks the exact thread a contending lock
+        /// holder needs to run again (to finish its own work and release
+        /// the lock), starving it forever instead of just slowing it down.
+        /// Production backends see no behavior change: `io.sleep` resolves
+        /// to the real OS clock there too. Used only for
+        /// `applied_sequence_mutex`; see `DETERMINISM_AUDIT.md` for why the
+        /// other `lockAtomicWithBackoff(Profiled)` callers were left alone.
+        pub fn lockAtomicWithBackoffIo(mutex: *std.atomic.Mutex, io: std.Io) void {
+            var attempts: usize = 0;
+            while (!mutex.tryLock()) : (attempts += 1) {
+                if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                if (attempts < 64) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                if (attempts < 128) {
+                    @import("antfly_platform").time.yieldNow();
+                    continue;
+                }
+                const backoff_step = @min(attempts - 128, 5);
+                const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+            }
+        }
+
+        /// Io-aware counterpart to `lockAtomicWithBackoffProfiled`; see
+        /// `lockAtomicWithBackoffIo`'s doc comment for why this variant
+        /// exists and is intentionally not a drop-in replacement for the
+        /// general helper above.
+        pub fn lockAtomicWithBackoffProfiledIo(mutex: *std.atomic.Mutex, stats: *MutexContentionStats, io: std.Io) ProfiledLock {
+            if (!asyncIndexProfileEnabled()) {
+                lockAtomicWithBackoffIo(mutex, io);
+                return .{
+                    .mutex = mutex,
+                    .stats = stats,
+                    .hold_start_ns = 0,
+                    .profiled = false,
+                };
+            }
+            _ = stats.lock_calls.fetchAdd(1, .monotonic);
+            if (mutex.tryLock()) {
+                return .{
+                    .mutex = mutex,
+                    .stats = stats,
+                    .hold_start_ns = monotonicTimeNs(),
+                    .profiled = true,
+                };
+            }
+
+            _ = stats.contended_calls.fetchAdd(1, .monotonic);
+            const current_waiters = stats.current_waiters.fetchAdd(1, .monotonic) + 1;
+            atomicMaxU64(&stats.max_waiters, current_waiters);
+            defer _ = stats.current_waiters.fetchSub(1, .monotonic);
+
+            const wait_start_ns = monotonicTimeNs();
+            var attempts: usize = 0;
+            var spin_loops: u64 = 0;
+            var yield_loops: u64 = 0;
+            var sleep_loops: u64 = 0;
+            while (!mutex.tryLock()) : (attempts += 1) {
+                if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                    std.atomic.spinLoopHint();
+                    spin_loops += 1;
+                    continue;
+                }
+                if (attempts < 64) {
+                    std.atomic.spinLoopHint();
+                    spin_loops += 1;
+                    continue;
+                }
+                if (attempts < 128) {
+                    @import("antfly_platform").time.yieldNow();
+                    yield_loops += 1;
+                    continue;
+                }
+                const backoff_step = @min(attempts - 128, 5);
+                const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
                 sleep_loops += 1;
             }
 

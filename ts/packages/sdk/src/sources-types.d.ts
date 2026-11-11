@@ -29,6 +29,8 @@ export interface Capabilities {
   artifact_discovery?: boolean;
   processing_presets?: boolean;
   processing_jobs?: boolean;
+  knowledge_versions?: Array<number>;
+  knowledge_audience?: string;
 }
 
 export interface SourceIdentity {
@@ -52,6 +54,8 @@ export interface Source {
   artifacts?: Array<ArtifactBinding>;
   search_status?: SearchStatus;
   processing?: ProcessingDeclaration;
+  knowledge?: KnowledgeDeclaration;
+  knowledge_status?: KnowledgeStatus;
 }
 
 export interface Run {
@@ -202,4 +206,59 @@ export interface ProcessingJobRequest {
   action: "start" | "status" | "advance" | "cancel";
   job_id?: string;
   limit?: number;
+}
+
+export interface KnowledgeDeclaration {
+  version: 1;
+  mode: "instance_one_audience";
+  audience: string;
+  entities?: Array<EntityBinding>;
+  graphs?: Array<GraphBinding>;
+}
+
+export interface EntityBinding {
+  name: string;
+  index: string;
+  resolver: string;
+  table: string;
+  namespace: string;
+  source_artifact: string;
+  resolution_artifact: string;
+  schema_uri?: string;
+  location_field?: string;
+}
+
+export interface GraphBinding {
+  name: string;
+  index: string;
+  artifacts: Array<string>;
+  entities?: Array<string>;
+  temporal: GraphTemporalBinding;
+  location_field?: string;
+  schema_uri?: string;
+}
+
+export interface GraphTemporalBinding {
+  mapping: "native_intervals_v1";
+  history: "current_state";
+}
+
+export interface KnowledgeStatus {
+  version: number;
+  entities: Array<RepresentationStatus>;
+  graphs: Array<RepresentationStatus>;
+  observed_at: number;
+  mode: string;
+  audience?: string;
+}
+
+export interface KnowledgeRequest {
+  graph: string;
+  start: Array<string>;
+  depth?: number;
+  limit?: number;
+  valid_at?: string;
+  known_at?: string;
+  require_snapshot?: boolean;
+  entity?: string;
 }

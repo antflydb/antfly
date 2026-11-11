@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -60,6 +61,9 @@ func VectorSpaceIdentity(space VectorSpace) string {
 type nativeSearchIndex struct {
 	Config map[string]any `json:"config"`
 	Status struct {
+		ResolverReplay *struct {
+			Resolvers []nativeKnowledgeResolver `json:"resolvers"`
+		} `json:"resolver_replay"`
 		Readiness struct {
 			State     string `json:"state"`
 			Complete  bool   `json:"complete"`
@@ -75,7 +79,9 @@ type nativeSearchIndex struct {
 
 func decodeSearchIndex(raw []byte) (nativeSearchIndex, error) {
 	var out nativeSearchIndex
-	err := json.Unmarshal(raw, &out)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	err := decoder.Decode(&out)
 	if err == nil && out.Config == nil {
 		err = fmt.Errorf("native index configuration missing")
 	}
@@ -442,8 +448,13 @@ func ValidateProcessing(plan *ProcessingDeclaration) error {
 func ObserveSearch(ctx context.Context, client SearchIndexClient, binding Binding) management.SearchStatus {
 	ctx, stop := context.WithTimeout(ctx, 5*time.Second)
 	defer stop()
-	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
 	cache, failures := observeSearchIndexes(ctx, client, binding)
+	return searchStatusFromIndexes(binding, cache, failures)
+}
+
+func searchStatusFromIndexes(binding Binding, cache map[string]nativeSearchIndex, failures map[string]error) management.SearchStatus {
+	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
+
 	inspect := func(name string) (nativeSearchIndex, error) {
 		if index, ok := cache[name]; ok {
 			return index, nil
@@ -547,11 +558,21 @@ var _ SearchIndexClient = (*Publisher)(nil)
 
 // Processing is driven independently of acquisition. Runtime adapters can call
 // this after desired state persistence, and retry it without provider downloads.
-func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source Source) error {
+func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source Source, audiences ...string) error {
+	audience := ""
+	if len(audiences) == 1 {
+		audience = audiences[0]
+	}
+	if err := ValidateKnowledgeProcessing(source.Knowledge, source.Processing, audience); err != nil {
+		return err
+	}
 	if err := ValidateSearchBindings(source.SearchVersion, source.Streams, source.Artifacts); err != nil {
 		return err
 	}
-	return ReconcileProcessing(ctx, client, source.Table, source.Processing)
+	if err := ReconcileProcessing(ctx, client, source.Table, source.Processing); err != nil {
+		return err
+	}
+	return ValidateInstalledKnowledge(ctx, client, Binding{Table: source.Table, Knowledge: source.Knowledge}, audience)
 }
 
 func validateProcessingSecrets(value any) error { return validateProcessingSecretsDepth(value, 0) }
@@ -690,6 +711,14 @@ func observeSearchIndexes(ctx context.Context, client SearchIndexClient, binding
 			}
 		} else {
 			add(stream.Index)
+		}
+	}
+	if binding.Knowledge != nil {
+		for _, g := range binding.Knowledge.Graphs {
+			add(g.Index)
+		}
+		for _, e := range binding.Knowledge.Entities {
+			add(e.Index)
 		}
 	}
 	close(jobs)

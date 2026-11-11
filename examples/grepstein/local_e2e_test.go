@@ -43,6 +43,7 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	if binary == "" {
 		t.Skip("set ANTFLY_GREPSTEIN_E2E_BINARY to the native Antfly binary")
 	}
+	t.Setenv("ANTFLY_API_KEY", "")
 	binary, err := filepath.Abs(binary)
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +150,7 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := "gs://e2e-originals/" + key + "?generation=123"
-	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "metadata": map[string]any{"page_start": 1, "page_end": 1}}
+	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1}}
 	if _, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/batch", map[string]any{"inserts": map[string]any{"evidence": document}, "sync_level": "write"}); err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +188,37 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		t.Fatal("artifact did not fetch from the GCS JSON API")
 	}
 	t.Logf("native GCS PDF fetch, actual text extraction and qualification passed (%d provider reads)", reads.Load())
+	if grepBinary := os.Getenv("ANTFLY_GREPSTEIN_E2E_GREP_BINARY"); grepBinary != "" {
+		grepBinary, err = filepath.Abs(grepBinary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := grepCmd([]string{"--state", root, "--url", endpoint, "--table", "gcs_e2e"}); err != nil {
+			t.Fatal(err)
+		}
+		before := reads.Load()
+		for _, stream := range []string{"extracted", "chunks"} {
+			args := []string{"--table-config", filepath.Join(root, "grep.json"), "--json"}
+			if stream == "chunks" {
+				args = append(args, "--artifact", stream)
+			}
+			args = append(args, "Native GCS extraction evidence")
+			command := exec.CommandContext(ctx, grepBinary, args...)
+			command.Dir = root
+			command.Env = append(os.Environ(), "XDG_CACHE_HOME="+filepath.Join(root, "grep-cache"))
+			output, err := command.CombinedOutput()
+			if err != nil || !bytes.Contains(output, []byte("Native GCS extraction evidence")) {
+				t.Fatalf("native grep %s failed: %v\n%s", stream, err, output)
+			}
+			if !bytes.Contains(output, []byte("evidence.pdf")) {
+				t.Fatalf("native grep %s lost the original source identity: %s", stream, output)
+			}
+		}
+		if reads.Load() != before {
+			t.Fatal("native grep reacquired the original instead of consuming existing artifacts")
+		}
+		t.Log("native default extraction and explicit chunk grep passed without reacquisition")
+	}
 	// Exercise owner-side policy failures and immutable-version rejection without
 	// contaminating the successfully qualified source inventory.
 	badURL := endpoint + "/tables/gcs_e2e_rejections"
@@ -252,7 +284,11 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 }
 
 func nativeGCSFixturePDF() []byte {
-	content := "BT /F1 12 Tf 40 700 Td (Native GCS extraction evidence) Tj ET\n"
+	// A complete digital-text page must pass the default native-text quality
+	// policy. A short title alone intentionally needs OCR and cannot qualify.
+	content := "BT /F1 12 Tf 40 700 Td (Native GCS extraction evidence) Tj\n" +
+		"0 -18 Td (This digital document contains ordinary readable evidence text.) Tj\n" +
+		"0 -18 Td (Its native units and chunks retain the original source identity.) Tj ET\n"
 	objects := []string{"<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content)}
 	var out bytes.Buffer
 	out.WriteString("%PDF-1.4\n")

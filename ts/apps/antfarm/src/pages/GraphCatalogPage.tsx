@@ -17,6 +17,7 @@ import GraphQueryWorkbench from "@/components/GraphQueryWorkbench";
 import { useApi } from "@/hooks/use-api-config";
 
 type NodeMapping = {
+  editorId: string;
   name: string;
   table: string;
   predicate: string;
@@ -30,6 +31,7 @@ const sourceMappingKey = (labels: NodeMapping[], name: string) => {
   return label ? mappingKey(label) : "";
 };
 type EdgeMapping = {
+  editorId: string;
   name: string;
   index: string;
   source_label: string;
@@ -42,12 +44,14 @@ export default function GraphCatalogPage() {
   const client = useApi();
   const current = useRef(client);
   current.current = client;
+  const nextEditorId = useRef(0);
+  const newEditorId = useCallback(() => String(nextEditorId.current++), []);
   const [graphs, setGraphs] = useState<GraphCatalogEntry[]>([]);
   const [tables, setTables] = useState<string[]>([]);
   const [graphIndexes, setGraphIndexes] = useState<Record<string, string[]>>({});
   const [name, setName] = useState("");
-  const [labels, setLabels] = useState<NodeMapping[]>([
-    { name: "Document", table: "", predicate: "" },
+  const [labels, setLabels] = useState<NodeMapping[]>(() => [
+    { editorId: newEditorId(), name: "Document", table: "", predicate: "" },
   ]);
   const [relationships, setRelationships] = useState<EdgeMapping[]>([]);
   const [busy, setBusy] = useState(false);
@@ -63,6 +67,7 @@ export default function GraphCatalogPage() {
     setName(entry.name);
     setLabels(
       entry.definition.labels.map((label) => ({
+        editorId: newEditorId(),
         name: label.name,
         table: typeof label.table === "string" ? label.table : label.table.table,
         database: typeof label.table === "string" ? undefined : label.table.database,
@@ -70,7 +75,12 @@ export default function GraphCatalogPage() {
         predicate: label.where ? JSON.stringify(label.where, null, 2) : "",
       }))
     );
-    setRelationships((entry.definition.relationships ?? []).map((edge) => ({ ...edge })));
+    setRelationships(
+      (entry.definition.relationships ?? []).map((edge) => ({
+        ...edge,
+        editorId: newEditorId(),
+      }))
+    );
     setMessage("");
   }
   const refresh = useCallback(async () => {
@@ -97,13 +107,23 @@ export default function GraphCatalogPage() {
     setSelected(undefined);
     setEditing(undefined);
     setName("");
-    setLabels([{ name: "Document", table: "", predicate: "" }]);
+    setLabels([{ editorId: newEditorId(), name: "Document", table: "", predicate: "" }]);
     setRelationships([]);
     setMessage("");
     void refresh();
-  }, [refresh]);
+  }, [refresh, newEditorId]);
   const activeGraph = graphs.find((entry) => entry.name === selected);
+  const readinessScope = useRef({
+    client,
+    graphId: activeGraph?.graph_id,
+    revision: activeGraph?.revision,
+  });
   useEffect(() => {
+    readinessScope.current = {
+      client,
+      graphId: activeGraph?.graph_id,
+      revision: activeGraph?.revision,
+    };
     readinessSequence.current += 1;
     readinessRequest.current?.abort();
     setReadiness("");
@@ -114,6 +134,7 @@ export default function GraphCatalogPage() {
     readinessRequest.current?.abort();
     const controller = new AbortController();
     readinessRequest.current = controller;
+    const scope = readinessScope.current;
     const sequence = ++readinessSequence.current;
     setCheckingReadiness(true);
     setReadiness("");
@@ -128,7 +149,12 @@ export default function GraphCatalogPage() {
         },
         { signal: controller.signal }
       );
-      if (current.current !== client || sequence !== readinessSequence.current) return;
+      if (
+        current.current !== client ||
+        scope !== readinessScope.current ||
+        sequence !== readinessSequence.current
+      )
+        return;
       setReadiness(
         result.complete
           ? `Ready at definition revision ${result.graph_revision}. Every query checks readiness again.`
@@ -137,6 +163,7 @@ export default function GraphCatalogPage() {
     } catch (error) {
       if (
         current.current === client &&
+        scope === readinessScope.current &&
         sequence === readinessSequence.current &&
         !controller.signal.aborted
       )
@@ -218,7 +245,7 @@ export default function GraphCatalogPage() {
     }
     let mappings: GraphDefinition["labels"];
     try {
-      mappings = labels.map(({ predicate, database, namespace, ...label }) => {
+      mappings = labels.map(({ editorId: _editorId, predicate, database, namespace, ...label }) => {
         const mapped = {
           ...label,
           table:
@@ -240,7 +267,10 @@ export default function GraphCatalogPage() {
       setMessage(`Check the label filters: ${String(error)}`);
       return;
     }
-    const definition: GraphDefinition = { labels: mappings, relationships };
+    const definition: GraphDefinition = {
+      labels: mappings,
+      relationships: relationships.map(({ editorId: _editorId, ...edge }) => edge),
+    };
     setBusy(true);
     setMessage("");
     try {
@@ -383,7 +413,7 @@ export default function GraphCatalogPage() {
             <fieldset className="space-y-3" disabled={busy}>
               <legend className="mb-2 font-medium">Node labels</legend>
               {labels.map((label, i) => (
-                <div key={i} className="grid grid-cols-2 gap-2 rounded-md border p-3">
+                <div key={label.editorId} className="grid grid-cols-2 gap-2 rounded-md border p-3">
                   <Label htmlFor={`label-name-${i}`}>Label</Label>
                   <Label htmlFor={`label-table-${i}`}>Document table</Label>
                   <Input
@@ -472,7 +502,12 @@ export default function GraphCatalogPage() {
               <Button
                 variant="outline"
                 disabled={labels.length >= 64}
-                onClick={() => setLabels([...labels, { name: "", table: "", predicate: "" }])}
+                onClick={() =>
+                  setLabels([
+                    ...labels,
+                    { editorId: newEditorId(), name: "", table: "", predicate: "" },
+                  ])
+                }
               >
                 Add label
               </Button>
@@ -480,7 +515,7 @@ export default function GraphCatalogPage() {
             <fieldset className="space-y-3" disabled={busy}>
               <legend className="mb-2 font-medium">Relationship types</legend>
               {relationships.map((edge, i) => (
-                <div key={i} className="space-y-2 rounded-md border p-3">
+                <div key={edge.editorId} className="space-y-2 rounded-md border p-3">
                   {(["name", "index", "stored_type"] as const).map((field) => (
                     <div key={field} className="space-y-1">
                       <Label htmlFor={`edge-${field}-${i}`}>
@@ -554,6 +589,7 @@ export default function GraphCatalogPage() {
                   setRelationships([
                     ...relationships,
                     {
+                      editorId: newEditorId(),
                       name: "",
                       index: "",
                       source_label: "",
@@ -577,7 +613,9 @@ export default function GraphCatalogPage() {
                   onClick={() => {
                     setEditing(undefined);
                     setName("");
-                    setLabels([{ name: "Document", table: "", predicate: "" }]);
+                    setLabels([
+                      { editorId: newEditorId(), name: "Document", table: "", predicate: "" },
+                    ]);
                     setRelationships([]);
                     setMessage("");
                   }}

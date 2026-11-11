@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -177,6 +178,7 @@ type SyncWriter struct {
 	table, sourceID, namespace      string
 	bounds                          KeyRange
 	inventory, verified             map[string]bool
+	publicationProofs               map[string]string
 	authoritative, finished, failed bool
 }
 
@@ -312,10 +314,102 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		}
 		result.Skipped += len(unchanged)
 	}
-	for id := range documents {
+	for id, doc := range documents {
+		if w.publicationProofs != nil {
+			digest, err := projectionDigest(doc)
+			if err != nil {
+				w.failed = true
+				return MergeResult{}, err
+			}
+			w.publicationProofs[id] = hex.EncodeToString(digest[:])
+		}
 		w.verified[id] = true
 	}
 	return result, nil
+}
+
+// TrackPublicationProofs enables durable checkpoints for this writer. The
+// caller stores the proof map together with its pinned acquisition manifest.
+func (w *SyncWriter) TrackPublicationProofs() {
+	w.publicationProofs = make(map[string]string, len(w.inventory))
+}
+
+func (w *SyncWriter) PublicationProofs() map[string]string {
+	return w.publicationProofs
+}
+
+// RestorePublicationProofs rechecks the supplied inventory subset in bounded
+// batches. A mismatch leaves the writer unmodified.
+func (w *SyncWriter) RestorePublicationProofs(ctx context.Context, proofs map[string]string) (bool, error) {
+	matched, err := w.matchPublicationProofs(ctx, proofs)
+	if err != nil || len(matched) == 0 || len(matched) != len(proofs) {
+		return false, err
+	}
+	w.markPublicationVerified(matched)
+	return true, nil
+}
+
+func (w *SyncWriter) markPublicationVerified(proofs map[string]string) {
+	for id := range proofs {
+		w.verified[id] = true
+	}
+}
+
+func (w *SyncWriter) matchPublicationProofs(ctx context.Context, proofs map[string]string) (map[string]string, error) {
+	if !w.authoritative || w.failed || w.finished || len(proofs) == 0 || len(proofs) > len(w.inventory) {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(proofs))
+	for id, digest := range proofs {
+		if !w.inventory[id] || len(digest) != 64 {
+			return nil, nil
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	matched := make(map[string]string, len(proofs))
+	proofBatch := 64
+	for start := 0; start < len(ids); {
+		keys := ids[start:min(start+proofBatch, len(ids))]
+		body, _ := json.Marshal(map[string]any{
+			"query": documentIDsQuery(keys), "fields": sourceRowFields(), "limit": len(keys),
+			"order_by": []any{map[string]any{"field": "_id", "desc": false}},
+		})
+		raw, err := w.client.Query(ctx, w.table, body)
+		if err != nil {
+			var budget interface{ AntflyResponseBudgetExceeded() bool }
+			if len(keys) > 1 && errors.As(err, &budget) && budget.AntflyResponseBudgetExceeded() {
+				// Keep the learned ceiling for the rest of this acquisition.
+				proofBatch = max(1, len(keys)/2)
+				continue
+			}
+			return nil, err
+		}
+		hits, err := decodeSyncHits(raw)
+		if err != nil {
+			return nil, err
+		}
+		start += len(keys)
+		seen := make(map[string]bool, len(hits))
+		for _, hit := range hits {
+			if seen[hit.ID] {
+				return nil, fmt.Errorf("duplicate source publication proof identity")
+			}
+			seen[hit.ID] = true
+			i := sort.SearchStrings(keys, hit.ID)
+			if i == len(keys) || keys[i] != hit.ID || !sourceRowMatches(hit, w.sourceID) {
+				continue
+			}
+			digest, err := projectionDigest(hit.Source.Document)
+			if err != nil {
+				return nil, err
+			}
+			if expected := proofs[hit.ID]; hex.EncodeToString(digest[:]) == expected {
+				matched[hit.ID] = expected
+			}
+		}
+	}
+	return matched, nil
 }
 
 // Finish never removes missing rows for partial inventories or repairs. A full

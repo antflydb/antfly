@@ -88,6 +88,7 @@ pub const CandidateSource = struct {
     pub const Consume = *const fn (ctx: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void;
     pub const CandidateDocument = struct { key: []const u8, json: []const u8 };
     pub const NearestQuery = struct {
+        key_prefix: []const u8 = "",
         fields: []const []const u8 = &.{},
         index_name: []const u8,
         embedding: []const f32,

@@ -217,6 +217,17 @@ pub const AsyncContext = struct {
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes the drain-then-commit applied-sequence flush as a whole
+    /// (flushPendingAppliedSequencesLocked / flushFinishedDenseAppliedSequenceLocked),
+    /// including the durable commit they run, which can yield through Io for
+    /// a WAL group-commit wait. applied_sequence_mutex above protects only
+    /// the coalescer's pending map itself (note/drain), a brief critical
+    /// section that never yields -- it must not be held across that commit.
+    /// std.Io.Mutex is safe to hold across a cooperative yield: a contending
+    /// caller parks through the DB's Io instead of busy-waiting the OS
+    /// thread the lock holder needs to run again to finish and release it.
+    /// See DETERMINISM_AUDIT.md.
+    applied_sequence_flush_mutex: std.Io.Mutex = .init,
     dense_admission: @import("dense_publication_admission.zig").Owner = .{},
     native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
@@ -228,6 +239,10 @@ pub const AsyncContext = struct {
     /// enrichment coverage publication. Provider calls never run under this
     /// lock; healthy produced/skipped coverage stays off this path.
     artifact_repair_issue_mutex: std.atomic.Mutex = .unlocked,
+    /// Foreground replay borrows the stable owner's ledger coordination while
+    /// retaining its own projection/capture capabilities.
+    shared_artifact_repair_issue_mutex: ?*std.atomic.Mutex = null,
+
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
@@ -243,6 +258,10 @@ pub const AsyncContext = struct {
     repair_options: types.ArtifactRepairRunOptions = .{},
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
+
+    pub fn artifactRepairIssueMutex(self: *const @This()) *std.atomic.Mutex {
+        return self.shared_artifact_repair_issue_mutex orelse &@constCast(self).artifact_repair_issue_mutex;
+    }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         stopNativeProjectionMaintenance(self);
@@ -2404,3 +2423,59 @@ pub const NoProgressDiagnostic = struct {
         self.* = undefined;
     }
 };
+
+test "a mutex held across a cooperative yield does not deadlock a single-worker Io scheduler" {
+    // Regression for the full-cluster VOPR hang this field's doc comment
+    // describes: flushPendingAppliedSequencesLocked holds
+    // applied_sequence_flush_mutex across the durable commit it runs,
+    // which can yield through Io for the WAL group-commit wait. VOPR's
+    // deterministic scenario runs on a single logical worker, the same
+    // shape `.async_limit = .nothing` forces here. Task A acquires the
+    // mutex, then cooperatively yields (io.sleep) while still holding it
+    // -- exactly `flushPendingAppliedSequencesLocked`'s shape -- before
+    // releasing. Task B starts after A has the lock and contends for it.
+    // A raw std.atomic.Mutex-style spin-then-real-`nanosleep` backoff
+    // (`lockAtomicWithBackoff`, used for every *other* mutex in this
+    // file) would deadlock here: that backoff's `nanosleep` blocks the
+    // only OS thread available to run task A forward to its own
+    // `io.sleep` wakeup and release, so task B would spin forever
+    // waiting for a lock whose holder can never run again. This test
+    // hangs (and the surrounding build step times out) if
+    // `std.Io.Mutex.lockUncancelable` regresses to anything that blocks
+    // the underlying OS thread instead of cooperatively parking.
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var mutex: std.Io.Mutex = .init;
+    var a_released = false;
+    var b_observed_a_released = false;
+
+    const TaskA = struct {
+        fn run(m: *std.Io.Mutex, task_io: std.Io, released: *bool) void {
+            m.lockUncancelable(task_io);
+            task_io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+            released.* = true;
+            m.unlock(task_io);
+        }
+    };
+    const TaskB = struct {
+        fn run(m: *std.Io.Mutex, task_io: std.Io, released: *const bool, observed: *bool) void {
+            // Give task A a chance to acquire the mutex first; this task
+            // must then block on the mutex itself, not on this sleep.
+            task_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            m.lockUncancelable(task_io);
+            observed.* = released.*;
+            m.unlock(task_io);
+        }
+    };
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, TaskA.run, .{ &mutex, io, &a_released });
+    try group.concurrent(io, TaskB.run, .{ &mutex, io, &a_released, &b_observed_a_released });
+    try group.await(io);
+
+    try std.testing.expect(a_released);
+    try std.testing.expect(b_observed_a_released);
+}

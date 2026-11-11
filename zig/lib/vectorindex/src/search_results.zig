@@ -75,6 +75,12 @@ pub const CandidateCoverage = enum {
 };
 
 fn resultWorseThan(_: void, a: SearchResult, b: SearchResult) std.math.Order {
+    const a_nan = std.math.isNan(a.distance);
+    const b_nan = std.math.isNan(b.distance);
+    if (a_nan or b_nan) {
+        if (a_nan != b_nan) return if (a_nan) .lt else .gt;
+        return std.math.order(b.vector_id, a.vector_id);
+    }
     const primary = std.math.order(b.distance, a.distance);
     if (primary != .eq) return primary;
     return std.math.order(b.vector_id, a.vector_id);
@@ -131,7 +137,7 @@ pub const SearchResults = struct {
             };
         } else {
             const worst = self.items.peek() orelse return;
-            if (candidate.distance < worst.distance) {
+            if (resultWorseThan({}, candidate, worst) == .gt) {
                 if (self.items.pop()) |removed| {
                     if (removed.metadata) |owned| self.alloc.free(owned);
                 }
@@ -186,7 +192,7 @@ pub const SearchResults = struct {
     pub fn sort(self: *SearchResults) void {
         std.mem.sort(SearchResult, self.items.items, {}, struct {
             fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-                return a.distance < b.distance;
+                return resultWorseThan({}, a, b) == .gt;
             }
         }.lessThan);
     }
@@ -715,4 +721,15 @@ test "owned metadata is released when result is not retained" {
     top_one.addResultWithOwnedMetadata(2, 2.0, 0, try std.testing.allocator.dupe(u8, "doc:b"));
     try std.testing.expectEqual(@as(usize, 1), top_one.getHits().len);
     try std.testing.expectEqual(@as(u64, 1), top_one.getHits()[0].vector_id);
+}
+
+test "exact result admission and sorting agree on equal distances" {
+    var results = SearchResults.init(std.testing.allocator, 2);
+    defer results.deinit();
+    results.addResult(3, 10, 0);
+    results.addResult(2, 10, 0);
+    results.addResult(1, 10, 0);
+    results.sort();
+    try std.testing.expectEqual(@as(u64, 1), results.getHits()[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 2), results.getHits()[1].vector_id);
 }

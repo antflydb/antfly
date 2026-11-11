@@ -142,7 +142,7 @@ def _wait_for_docs(
             try:
                 doc = api.lookup(table, key, timeout=timeout)
             except requests.RequestException as exc:
-                if not _transient_poll_error(exc):
+                if not _transient_poll_error(exc, read_only=True):
                     raise
                 last_error = repr(exc)
                 continue
@@ -264,7 +264,7 @@ def _one_query_walk(
     try:
         response = api.query_table("documents", payload, timeout=timeout)
     except requests.RequestException as exc:
-        if not _transient_poll_error(exc):
+        if not _transient_poll_error(exc, read_only=True):
             raise
         return None
     result = (
@@ -293,7 +293,7 @@ def _one_query_walk(
             if document is None or nodes[key].get("document") != document:
                 return None
     except requests.RequestException as exc:
-        if not _transient_poll_error(exc):
+        if not _transient_poll_error(exc, read_only=True):
             raise
         return None
     return event_key
@@ -305,7 +305,7 @@ def _live_events(api: _Api, timeout: float) -> tuple[list[str], dict[str, str]] 
     try:
         response = api.query_table("events", payload, timeout=timeout)
     except requests.RequestException as exc:
-        if not _transient_poll_error(exc):
+        if not _transient_poll_error(exc, read_only=True):
             raise
         return None
     hits = (response.get("responses") or [{}])[0].get("hits", {}).get("hits", [])
@@ -371,7 +371,7 @@ def _wait_for_seeded_mass(
                 "documents", payload, timeout=deadline.request_timeout()
             )
         except requests.RequestException as exc:
-            if not _transient_poll_error(exc):
+            if not _transient_poll_error(exc, read_only=True):
                 raise
             deadline.sleep(0.5)
             continue

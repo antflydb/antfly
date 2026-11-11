@@ -338,6 +338,7 @@ components:
           type: array
           maxItems: 64
           items: {$ref: './management.yaml#/components/schemas/ArtifactBinding'}
+        knowledge: {$ref: './management.yaml#/components/schemas/KnowledgeDeclaration'}
         processing: {$ref: './management.yaml#/components/schemas/ProcessingDeclaration'}
         identity: {$ref: '#/components/schemas/SourceIdentity'}
     Profile:
@@ -391,5 +392,6 @@ components:
             phase: {type: string}
             code: {type: string}
             retryable: {type: boolean}
+            restart_required: {type: boolean, description: "The sync needs a fresh inventory."}
     MediaReference:
       $ref: '../shared/chunking.yaml#/components/schemas/ChunkSourceReference'

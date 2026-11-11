@@ -51,6 +51,41 @@ fn isAllowedReplayKey(key: []const u8) bool {
     return false;
 }
 
+/// `algebraic/index.zig`'s entire keyspace lives under the private
+/// `\x00\x00__algebraic__:` namespace (see `storagePrefixAlloc`), but its
+/// keys are built by `algebraic/token.zig`'s `canonicalTupleAlloc`, which
+/// length-prefixes every tuple component -- including that leading
+/// `\x00\x00` sentinel -- as `"<len>:<component>"` rather than placing the
+/// sentinel at the raw key's first two bytes. A literal byte check (`put`'s
+/// `key[0] != 0 or key[1] != 0`) therefore rejects every algebraic write
+/// staged through this restricted view (WS3.2b's inline algebraic
+/// publication, `mutation_materialization.zig`'s `InlineAlgebraicPublication`)
+/// even though its whole keyspace is exactly as private as a literal
+/// `\x00\x00`-prefixed key. Recognize the encoded form directly instead of
+/// importing `algebraic/token.zig` here (this file stays index-encoding
+/// agnostic): skip the tuple's own `<len>:` header and check whether the
+/// first `len` payload bytes themselves start with the sentinel.
+fn isTupleEncodedPrivateKey(key: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, key, ':') orelse return false;
+    if (colon == 0) return false;
+    for (key[0..colon]) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    const component_len = std.fmt.parseInt(usize, key[0..colon], 10) catch return false;
+    const payload_start = colon + 1;
+    if (component_len < 2 or payload_start + component_len > key.len) return false;
+    return key[payload_start] == 0 and key[payload_start + 1] == 0;
+}
+
+/// Private metadata, in either of the two shapes this restricted commit
+/// view's producers actually write: a literal `\x00\x00`-prefixed key (every
+/// non-algebraic private key in this tree), or `algebraic/index.zig`'s
+/// tuple-encoded equivalent (see `isTupleEncodedPrivateKey`).
+fn isPrivateMetadataKey(key: []const u8) bool {
+    if (key.len >= 2 and key[0] == 0 and key[1] == 0) return true;
+    return isTupleEncodedPrivateKey(key);
+}
+
 /// Read-only cursor type returned by `View.openCursor`. `backend_erased.zig`
 /// is itself backend-agnostic (a type-erased vtable, not a Lite-specific
 /// module), so referencing its `Cursor` here keeps this file's "never import
@@ -108,13 +143,13 @@ pub const View = struct {
         // Public rows and derived artifacts must not change after their
         // revision stamps were finalized. Only the private metadata namespace
         // is writable through this restricted commit view.
-        if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
+        if (!isPrivateMetadataKey(key)) return error.InvalidCommitMetadata;
         return self.put_fn(self.ptr, key, value);
     }
 
     /// Same private-metadata-only restriction as `put`, for the same reason.
     pub fn delete(self: View, key: []const u8) !void {
-        if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
+        if (!isPrivateMetadataKey(key)) return error.InvalidCommitMetadata;
         const delete_fn = self.delete_fn orelse return error.DeleteUnsupported;
         return delete_fn(self.ptr, key);
     }
@@ -133,7 +168,7 @@ pub const View = struct {
     /// `error.AppendPutUnsupported` when the host transaction does not
     /// expose one (a participant may always fall back to `put`).
     pub fn appendPut(self: View, key: []const u8, value: []const u8) !void {
-        if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
+        if (!isPrivateMetadataKey(key)) return error.InvalidCommitMetadata;
         const append_put_fn = self.append_put_fn orelse return error.AppendPutUnsupported;
         return append_put_fn(self.ptr, key, value);
     }
@@ -339,6 +374,37 @@ test "view putReplay/deleteReplay allow only the derived-coverage and repair-iss
 
     // `put`'s own `\x00\x00` surface still rejects a replay-namespaced key.
     try std.testing.expectError(error.InvalidCommitMetadata, view.put(coverage_key, "nope"));
+}
+
+test "view put/delete accept algebraic/index.zig's tuple-encoded private keys" {
+    var txn = DeletingTxn{};
+    defer txn.deinit();
+    const view = View.from(&txn);
+
+    // Shape produced by `algebraic/token.zig`'s `canonicalTupleAlloc` for
+    // `algebraic/index.zig`'s `keyAlloc`: every component, including the
+    // leading `\x00\x00__algebraic__` namespace sentinel, is wrapped as
+    // `"<len>:<component>"` rather than placed at the raw key's first two
+    // bytes. This is the exact key shape `InlineAlgebraicPublication`
+    // (`mutation_materialization.zig`) stages through this restricted view.
+    const algebraic_key = "15:\x00\x00__algebraic__|13:canonical/alg|2:v4|6:symbol|1:x";
+    try view.put(algebraic_key, "sym-bytes");
+    try std.testing.expectEqualStrings("sym-bytes", try txn.get(algebraic_key));
+    try view.delete(algebraic_key);
+    try std.testing.expectError(error.NotFound, txn.get(algebraic_key));
+    try std.testing.expectError(error.AppendPutUnsupported, view.appendPut(algebraic_key, "x"));
+
+    // A tuple-encoded key whose first component is NOT the private sentinel
+    // (e.g. a public document row accidentally tuple-encoded) is still
+    // rejected -- the exception is narrowly for the encoded private
+    // namespace, not for every tuple-shaped key.
+    const public_tuple_key = "5:doc:a|2:v1";
+    try std.testing.expectError(error.InvalidCommitMetadata, view.put(public_tuple_key, "nope"));
+
+    // A malformed length header (non-digit, or a length that overruns the
+    // key) is rejected rather than panicking or misreading past the end.
+    try std.testing.expectError(error.InvalidCommitMetadata, view.put("x:\x00\x00oops", "nope"));
+    try std.testing.expectError(error.InvalidCommitMetadata, view.put("99:\x00\x00short", "nope"));
 }
 
 const RecordingParticipant = struct {

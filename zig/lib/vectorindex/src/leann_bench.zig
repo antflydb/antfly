@@ -18,7 +18,7 @@
 //!   zig run -OReleaseFast lib/vectorindex/src/leann_bench.zig -- \
 //!       [--data PREFIX] [--n 100000] [--queries 200] [--dims 64] \
 //!       [--metric l2|cosine|ip] [--m 30] [--efc 128] [--quantizer pq|rabitq|both] \
-//!       [--unpruned 1] [--cost FILE]
+//!       [--unpruned 1] [--cost FILE] [--filtered 1] [--filter-layout spaced|clustered] [--filter-k N]
 //!       [--churn ROUNDS] [--churn-frac 0.05] [--rebuild-at 0.2]
 //!       [--churn-set maintenance|rebuild|codes|int4] [--bits 1..8]
 //!
@@ -44,6 +44,8 @@ const std = @import("std");
 const leann = @import("leann.zig");
 const Allocator = std.mem.Allocator;
 
+const FilterLayout = enum { spaced, clustered };
+
 const Args = struct {
     data: ?[]const u8 = null,
     n: usize = 100_000,
@@ -54,6 +56,9 @@ const Args = struct {
     efc: u32 = 128,
     quantizer: ?leann.Quantizer = null,
     unpruned: bool = false,
+    filtered: bool = false,
+    filter_layout: FilterLayout = .spaced,
+    filter_k: u32 = 10,
     cost: ?[]const u8 = null,
     churn: usize = 0,
     churn_frac: f64 = 0.05,
@@ -142,6 +147,12 @@ pub fn main(init: std.process.Init) !void {
             args.efc = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--quantizer")) {
             args.quantizer = if (std.mem.eql(u8, value, "pq")) .pq else if (std.mem.eql(u8, value, "rabitq")) .rabitq else null;
+        } else if (std.mem.eql(u8, flag, "--filter-layout")) {
+            args.filter_layout = std.meta.stringToEnum(FilterLayout, value) orelse return error.InvalidFilterLayout;
+        } else if (std.mem.eql(u8, flag, "--filter-k")) {
+            args.filter_k = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--filtered")) {
+            args.filtered = std.mem.eql(u8, value, "1");
         } else if (std.mem.eql(u8, flag, "--unpruned")) {
             args.unpruned = std.mem.eql(u8, value, "1");
         } else if (std.mem.eql(u8, flag, "--churn")) {
@@ -174,14 +185,15 @@ pub fn main(init: std.process.Init) !void {
     }
     defer alloc.free(train.data);
     defer alloc.free(test_set.data);
+    if (train.rows == 0 or test_set.rows == 0 or train.dims != test_set.dims) return error.InvalidBenchmarkSize;
     const dims = train.dims;
     const k = 10;
 
     try out.print("dataset rows={d} dims={d} queries={d} metric={s} M={d} efC={d}\n", .{ train.rows, dims, test_set.rows, @tagName(args.metric), args.m, args.efc });
     try out.flush();
 
-    const truth = try groundTruth(alloc, train, test_set, args.metric, k);
-    defer alloc.free(truth);
+    const truth = if (args.filtered) null else try groundTruth(alloc, train, test_set, args.metric, k);
+    defer if (truth) |ids| alloc.free(ids);
 
     var curve: ?CostCurve = null;
     defer if (curve) |c| {
@@ -233,9 +245,15 @@ pub fn main(init: std.process.Init) !void {
             100 * @as(f64, @floatFromInt(bytes.len)) / @as(f64, @floatFromInt(raw_bytes)),
             mib(raw_bytes),
         });
-        try out.print("{s:<22} {s:>5} {s:>9} {s:>12} {s:>9} {s:>9} {s:>11}\n", .{ "mode", "ef", "recall@10", "recomputed/q", "batches/q", "cpu ms/q", "embed ms/q" });
         try out.flush();
 
+        if (args.filtered) {
+            try benchFilters(alloc, io, out, &index, train, test_set, args, &src);
+            continue;
+        }
+
+        try out.print("{s:<22} {s:>5} {s:>9} {s:>12} {s:>9} {s:>9} {s:>11}\n", .{ "mode", "ef", "recall@10", "recomputed/q", "batches/q", "cpu ms/q", "embed ms/q" });
+        try out.flush();
         const Mode = struct { name: []const u8, opts: leann.SearchOptions };
         const pq_modes = [_]Mode{
             .{ .name = "plain", .opts = .{ .two_level = false } },
@@ -272,7 +290,7 @@ pub fn main(init: std.process.Init) !void {
                     defer resp.deinit(alloc);
                     recomputed += resp.stats.recomputed;
                     batches += resp.stats.batches;
-                    const gt = truth[qi * k ..][0..k];
+                    const gt = truth.?[qi * k ..][0..k];
                     for (resp.results) |r| {
                         if (std.mem.indexOfScalar(u32, gt, r.id) != null) hits += 1;
                     }
@@ -282,7 +300,7 @@ pub fn main(init: std.process.Init) !void {
                 try out.print("{s:<22} {d:>5} {d:>9.3} {d:>12.1} {d:>9.1} {d:>9.3} {d:>11.1}\n", .{
                     mode.name,
                     ef,
-                    @as(f64, @floatFromInt(hits)) / (nq * k),
+                    @as(f64, @floatFromInt(hits)) / (nq * @as(f64, @floatFromInt(k))),
                     @as(f64, @floatFromInt(recomputed)) / nq,
                     @as(f64, @floatFromInt(batches)) / nq,
                     @as(f64, @floatFromInt(ns)) / 1e6 / nq,
@@ -290,6 +308,137 @@ pub fn main(init: std.process.Init) !void {
                 });
                 try out.flush();
             }
+        }
+    }
+}
+
+fn benchFilters(alloc: Allocator, io: std.Io, out: *std.Io.Writer, index: *const leann.Index, train: Matrix, queries: Matrix, args: Args, source: *CostSource) !void {
+    const k = args.filter_k;
+    if (k == 0 or k > train.rows) return error.InvalidBenchmarkSize;
+    const Selection = struct {
+        ids: []const u32,
+
+        fn allows(raw: *const anyopaque, id: u32) !bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return std.sort.binarySearch(u32, self.ids, id, struct {
+                fn compare(key: u32, value: u32) std.math.Order {
+                    return std.math.order(key, value);
+                }
+            }.compare) != null;
+        }
+    };
+    const Mode = enum { post_filter, graph_filter, direct, direct_bounds };
+    const latencies = try alloc.alloc(i96, queries.rows);
+    defer alloc.free(latencies);
+    try out.print("filter_layout={s} k={d}\neligible mode recall approx/q loads/q batches/q frontier_max p50_ms p99_ms embed_ms/q\n", .{ @tagName(args.filter_layout), k });
+    const found = try alloc.alloc(u32, k);
+    defer alloc.free(found);
+    const ranked = if (args.filter_layout == .clustered) blk: {
+        const Row = struct {
+            id: u32,
+            distance: f32,
+
+            fn lessThan(_: void, a: @This(), b: @This()) bool {
+                if (a.distance == b.distance) return a.id < b.id;
+                return a.distance < b.distance;
+            }
+        };
+        const rows = try alloc.alloc(Row, train.rows);
+        defer alloc.free(rows);
+        const anchor = try alloc.dupe(f32, train.row(0));
+        defer alloc.free(anchor);
+        const scratch = try alloc.alloc(f32, train.dims);
+        defer alloc.free(scratch);
+        if (args.metric == .cosine) normalize(anchor);
+        for (rows, 0..) |*row, id| {
+            @memcpy(scratch, train.row(id));
+            if (args.metric == .cosine) normalize(scratch);
+            row.* = .{ .id = @intCast(id), .distance = leann.distance(args.metric, anchor, scratch) };
+        }
+        std.mem.sortUnstable(Row, rows, {}, Row.lessThan);
+        const ids = try alloc.alloc(u32, rows.len);
+        for (ids, rows) |*id, row| id.* = row.id;
+        break :blk ids;
+    } else null;
+    defer if (ranked) |ids| alloc.free(ids);
+    for ([_]usize{ 16, 17, 64, 65, 256, 1024, train.rows / 2 }) |count| {
+        if (count > train.rows or count < k) continue;
+        const ids = try alloc.alloc(u32, count);
+        defer alloc.free(ids);
+        if (ranked) |neighbors| {
+            @memcpy(ids, neighbors[0..count]);
+            std.mem.sortUnstable(u32, ids, {}, std.sort.asc(u32));
+        } else {
+            for (ids, 0..) |*id, i| id.* = @intCast(i * train.rows / count);
+        }
+        const selection = Selection{ .ids = ids };
+        const filter = leann.ResultFilter{ .ctx = &selection, .allows = Selection.allows, .eligible_count = @intCast(count) };
+        const truth = try truthOver(alloc, train, queries, args.metric, ids, k);
+        defer alloc.free(truth);
+        for (std.enums.values(Mode)) |mode| {
+            if (mode == .direct_bounds and index.config.quantizer != .rabitq) continue;
+            var hits: usize = 0;
+            var loads: u64 = 0;
+            var batches: u64 = 0;
+            var estimates: u64 = 0;
+            var peak_frontier: u32 = 0;
+            source.modeled_ms = 0;
+            for (0..queries.rows) |qi| {
+                const query = queries.row(qi);
+                const started = std.Io.Timestamp.now(io, .awake);
+                var found_count: usize = 0;
+                var stats: leann.SearchStats = .{};
+                if (mode == .post_filter) {
+                    var want: u32 = @intCast(@min(train.rows, @max(k * 4, k + 64)));
+                    while (true) {
+                        var result = try index.search(alloc, source.source(), query, .{ .k = want });
+                        defer result.deinit(alloc);
+                        stats.approx_evaluated += result.stats.approx_evaluated;
+                        stats.recomputed += result.stats.recomputed;
+                        stats.batches += result.stats.batches;
+                        found_count = 0;
+                        for (result.results) |hit| {
+                            if (!try Selection.allows(&selection, hit.id)) continue;
+                            found[found_count] = hit.id;
+                            found_count += 1;
+                            if (found_count == k) break;
+                        }
+                        if (found_count == k or want >= train.rows) break;
+                        want = @intCast(@min(train.rows, @as(usize, want) * 4));
+                    }
+                } else {
+                    var selected_filter = filter;
+                    selected_filter.direct_verify_bounds = mode == .direct_bounds;
+                    var result = try index.searchFiltered(alloc, source.source(), query, .{ .k = k }, selected_filter, if (mode == .graph_filter) null else ids);
+                    defer result.deinit(alloc);
+                    stats = result.stats;
+                    found_count = result.results.len;
+                    for (result.results, found[0..found_count]) |hit, *id| id.* = hit.id;
+                }
+                latencies[qi] = started.untilNow(io, .awake).nanoseconds;
+                loads += stats.recomputed;
+                batches += stats.batches;
+                estimates += stats.approx_evaluated;
+                peak_frontier = @max(peak_frontier, stats.peak_frontier);
+                for (found[0..found_count]) |id| {
+                    if (std.mem.indexOfScalar(u32, truth[qi * k ..][0..k], id) != null) hits += 1;
+                }
+            }
+            std.mem.sortUnstable(i96, latencies, {}, std.sort.asc(i96));
+            const nq: f64 = @floatFromInt(queries.rows);
+            try out.print("{d} {s} {d:.4} {d:.1} {d:.1} {d:.1} {d} {d:.3} {d:.3} {d:.3}\n", .{
+                count,
+                @tagName(mode),
+                @as(f64, @floatFromInt(hits)) / (nq * k),
+                @as(f64, @floatFromInt(estimates)) / nq,
+                @as(f64, @floatFromInt(loads)) / nq,
+                @as(f64, @floatFromInt(batches)) / nq,
+                peak_frontier,
+                @as(f64, @floatFromInt(latencies[(latencies.len - 1) / 2])) / 1e6,
+                @as(f64, @floatFromInt(latencies[(latencies.len * 99 - 1) / 100])) / 1e6,
+                source.modeled_ms / nq,
+            });
+            try out.flush();
         }
     }
 }
