@@ -12,7 +12,7 @@ Definitions are immutable by generation. Evolution installs a new current defini
 
 Segments contain a content digest/length, dataset/generation/schema identity, state-encoding version, half-open event coverage, source partition/incarnation/applied sequence, finalization state, and placement revision. Producers supply complete immutable segment contents. The operator does not certify that arbitrary supplied bytes were captured transactionally from a source table.
 
-This layer accepts already produced record or aggregate-state segments. The native producer and decoder integrations described below build on this layer; Provisioned deployments mount summaries through a read-only SQL relation and a bounded JSON API. A closed summary can serve from its independent archive after source detachment. In particular, creating this resource does not make ordinary source-table TTL preserve historical aggregates. Hosts must establish those producer and retention proofs before connecting automatic source deletion.
+This layer accepts already produced record or aggregate-state segments. The native producer and decoder integrations described below build on this layer; Provisioned deployments mount summaries through a read-only SQL relation and a bounded JSON API. A closed summary can serve from its independent archive after source detachment. Native summary creation installs transactional capture before enabling ordinary source-table TTL to release raw observations. Administrative publication of externally prepared segments alone does not establish that proof.
 
 ## Placement and access
 
