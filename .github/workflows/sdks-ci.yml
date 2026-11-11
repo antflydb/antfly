@@ -85,8 +85,15 @@ jobs:
 
       - name: Prepare SDK build caches
         run: |
-          mkdir -p "$SDK_CI_WORK_DIR"/{tmp,cargo-phases,cargo-target,cargo-home,rustup,go-build,go-mod,gopath,uv-cache,python,pnpm-store,xdg}
+          set -euo pipefail
+          mkdir -p "$SDK_CI_WORK_DIR"/{tmp,cargo-phases,cargo-target,cargo-home,rustup,go-build,go-mod,gopath,uv-cache,python,pnpm-store,xdg,zig-cache,zig-out}
+          # Native policy tests and release fixtures compile Zig too. Preserve
+          # worktree-relative paths while keeping their output off the overlay.
+          ln -s "$SDK_CI_WORK_DIR/zig-cache" zig/.zig-cache
+          ln -s "$SDK_CI_WORK_DIR/zig-out" zig/zig-out
           {
+            echo "ZIG_LOCAL_CACHE_DIR=$GITHUB_WORKSPACE/zig/.zig-cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/zig/.zig-cache/global"
             echo "TMPDIR=$SDK_CI_WORK_DIR/tmp"
             echo "ANTFLY_CARGO_TARGET_PARENT=$SDK_CI_WORK_DIR/cargo-phases"
             echo "CARGO_TARGET_DIR=$SDK_CI_WORK_DIR/cargo-target"

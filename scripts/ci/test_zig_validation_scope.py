@@ -30,6 +30,42 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ZigValidationScopeTests(unittest.TestCase):
+    def test_sdk_zig_outputs_use_the_existing_build_volume(self):
+        workflow = (ROOT / ".github/workflows/sdks-ci.yml").read_text()
+        block = workflow.split("      - name: Prepare SDK build caches\n", 1)[1]
+        command = textwrap.dedent(
+            block.split("run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, volume = root / "checkout", root / "volume"
+            (checkout / "zig").mkdir(parents=True)
+            env_file = root / "env"
+            subprocess.run(
+                ["bash", "-c", command],
+                cwd=checkout,
+                check=True,
+                env={
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(checkout),
+                    "SDK_CI_WORK_DIR": str(volume),
+                    "GITHUB_ENV": str(env_file),
+                },
+            )
+            for local, destination in (
+                (".zig-cache", "zig-cache"),
+                ("zig-out", "zig-out"),
+            ):
+                output = checkout / "zig" / local / "probe"
+                output.write_text("artifact")
+                self.assertEqual(
+                    (volume / destination / "probe").read_text(), "artifact"
+                )
+            self.assertIn(
+                f"ZIG_GLOBAL_CACHE_DIR={checkout}/zig/.zig-cache/global",
+                env_file.read_text(),
+            )
+
     def test_vopr_qualification_is_an_optional_admitted_suite(self):
         config = json.loads((ROOT / ".github/scripts/pr-ci-config.json").read_text())
         suite = next(suite for suite in config["suites"] if suite["id"] == "vopr")
@@ -292,7 +328,7 @@ class ZigValidationScopeTests(unittest.TestCase):
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
         self.assertIn(
-            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]",
+            "e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]",
             aggregate,
         )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
@@ -322,6 +358,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
+                        "SOURCE_SDK_RESULT": "success",
                         "PGWIRE_DRIVER_RESULT": "success",
                         "BETTER_AUTH_RESULT": "success",
                     },
@@ -336,6 +373,18 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertFalse(
             selected(
                 "better-auth",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
+        self.assertTrue(selected("source-sdk-native"))
+        self.assertTrue(selected("source-sdk-native", full=True))
+        self.assertTrue(selected("source-sdk-native", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "source-sdk-native",
                 **{
                     "needs.e2e-base-build.result": "failure",
                     "needs.e2e-full-build.result": "skipped",
@@ -372,12 +421,14 @@ class ZigValidationScopeTests(unittest.TestCase):
         for job in ("e2e-base", "e2e-full"):
             command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
             command = command.split("\n- uses:", 1)[0]
-            for driver, auth in (
-                ("success", "success"),
-                ("failure", "success"),
-                ("skipped", "success"),
-                ("success", "failure"),
-                ("success", "skipped"),
+            for driver, auth, source in (
+                ("success", "success", "success"),
+                ("failure", "success", "success"),
+                ("skipped", "success", "success"),
+                ("success", "failure", "success"),
+                ("success", "skipped", "success"),
+                ("success", "success", "failure"),
+                ("success", "success", "skipped"),
             ):
                 with self.subTest(job=job, driver=driver):
                     result = subprocess.run(
@@ -390,6 +441,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                             "LOW_FD_RESULT": "success",
                             "REQUIRE_LOW_FD": "true",
                             "NATIVE_SDK_RESULT": "success",
+                            "SOURCE_SDK_RESULT": source,
                             "PGWIRE_DRIVER_RESULT": driver,
                             "BETTER_AUTH_RESULT": auth,
                         },
@@ -398,7 +450,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         result.returncode == 0,
-                        driver == auth == "success",
+                        driver == auth == source == "success",
                         result.stderr,
                     )
 
@@ -603,6 +655,9 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig/pkg/antfly-embedded/src/capi/sql.zig",
             "scripts/ci/test-embedded-sdk-native.sh",
             "scripts/ci/test_embedded_sdk_native.py",
+            "scripts/ci/check_source_native.py",
+            "go/pkg/sources/native_integration_test.go",
+            "examples/grepstein/main.go",
             "scripts/pgwire_drivers/rust/src/main.rs",
             "scripts/test_pgwire_drivers.py",
         }
