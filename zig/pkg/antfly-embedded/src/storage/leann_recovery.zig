@@ -17,6 +17,8 @@ const search_types = @import("antfly_vectorindex").search_types;
 
 /// Borrowed by each loader call; owned by one search, never shared across queries.
 pub const Session = struct {
+    source_read: ?search_types.SourceRead = null,
+    execution: ?search_types.ExternalWork = null,
     cancellation: ?search_types.CancellationToken = null,
     deadline_ns: ?u64 = null,
     budget_ns: u64 = 0,

@@ -134,6 +134,46 @@ pub const NeighborContextGraphSource = struct {
     acquire_fn: *const fn (*anyopaque, []const u8) anyerror!Lease,
 };
 
+/// Provider lifetime is independent of the source DB and its worker runtime.
+pub const SharedProviders = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    alloc: Allocator,
+    dense: ?embedder_mod.DenseEmbedder,
+    sparse: ?embedder_mod.SparseEmbedder,
+    asset: ?asset_producer_mod.Producer,
+    chunk: ?ChunkProvider,
+
+    pub fn retain(self: *SharedProviders) *SharedProviders {
+        _ = self.references.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn release(self: *SharedProviders) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        if (self.dense) |dense| dense.deinit(self.alloc);
+        if (self.sparse) |sparse| sparse.deinit(self.alloc);
+        if (self.asset) |asset| asset.deinit(self.alloc);
+        if (self.chunk) |*chunk| chunk.deinit();
+        self.alloc.destroy(self);
+    }
+};
+
+pub fn releaseConfigProviders(alloc: Allocator, config: *Config) void {
+    if (config.shared_providers) |shared| {
+        shared.release();
+    } else {
+        if (config.dense_embedder) |dense| dense.deinit(alloc);
+        if (config.sparse_embedder) |sparse| sparse.deinit(alloc);
+        if (config.asset_producer) |asset| asset.deinit(alloc);
+        if (config.chunk_provider) |*chunk| chunk.deinit();
+    }
+    config.shared_providers = null;
+    config.dense_embedder = null;
+    config.sparse_embedder = null;
+    config.asset_producer = null;
+    config.chunk_provider = null;
+}
+
 pub const Config = struct {
     neighbor_context_graph_source: ?NeighborContextGraphSource = null,
     owner_id: []const u8 = "local",
@@ -149,6 +189,7 @@ pub const Config = struct {
     enable_without_producers: bool = false,
     /// Query recovery borrows the source store without replay or a producer lease.
     recovery_only: bool = false,
+    shared_providers: ?*SharedProviders = null,
     relational_base_rows: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -1833,8 +1874,17 @@ fn validateRecoveredVector(vector: []const f32, dims: u32) !void {
     for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
 }
 
+const RecoverySourceRead = struct {
+    runtime: *EnrichmentRuntime,
+    view: @import("antfly_vectorindex").search_types.SourceRead,
+};
+threadlocal var active_recovery_source: ?RecoverySourceRead = null;
+
 pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../../leann_recovery.zig").Session) !void {
     try session.check();
+    const previous_source = active_recovery_source;
+    if (session.source_read) |view| active_recovery_source = .{ .runtime = runtime, .view = view };
+    defer active_recovery_source = previous_source;
     if (requests.len == 0) return;
     if (out.len != requests.len * @as(usize, dims) or found.len != requests.len) return error.InvalidArgument;
     @memset(found, false);
@@ -8007,6 +8057,7 @@ const UnsupportedEnrichmentRuntime = struct {
                 .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
+                .shared_providers = config.shared_providers,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
                 .chunk_provider = config.chunk_provider,
@@ -8053,10 +8104,7 @@ const UnsupportedEnrichmentRuntime = struct {
         self.inference_recovery.deinit(self.alloc);
         if (self.pending_scoped_retries) |*state| state.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
-        if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
-        if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
-        if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
-        if (self.config.chunk_provider) |*provider| provider.deinit();
+        releaseConfigProviders(self.alloc, &self.config);
         self.* = undefined;
     }
 
@@ -8579,6 +8627,7 @@ const PlatformEnrichmentRuntime = struct {
                 .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
+                .shared_providers = config.shared_providers,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
                 .chunk_provider = config.chunk_provider,
@@ -8642,10 +8691,7 @@ const PlatformEnrichmentRuntime = struct {
         if (self.pending_scoped_retries) |*state| state.deinit(self.alloc);
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
-        if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
-        if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
-        if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
-        if (self.config.chunk_provider) |*provider| provider.deinit();
+        releaseConfigProviders(self.alloc, &self.config);
         self.* = undefined;
     }
 
@@ -38951,6 +38997,8 @@ const AllocatedStoreReader = struct {
     alloc: Allocator,
 
     pub fn read(self: *@This(), key: []const u8) ![]u8 {
+        if (active_recovery_source) |source| if (source.runtime == self.runtime)
+            return source.view.get_owned(source.view.ptr, self.alloc, key);
         // This read returns one owned value and needs no transaction-wide
         // snapshot. A short point lease avoids retaining a full read view
         // while copying the source value for the caller.

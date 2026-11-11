@@ -89,7 +89,26 @@ pub const KeyPredicate = struct {
         for (keys, output) |key, *result| result.* = try self.allows(self.ptr, key);
     }
 };
+/// Reads owned source bytes from the generation pinned by the query.
+pub const SourceRead = struct {
+    ptr: *anyopaque,
+    get_owned: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
+};
+
+/// Releases query publication fences only after the scorer owns its inputs.
+pub const ExternalWork = struct {
+    read: ?SourceRead = null,
+    reembed_elapsed_ns: ?*u64 = null,
+    ptr: *anyopaque,
+    before_inference: *const fn (*anyopaque) anyerror!void,
+    after_inference: *const fn (*anyopaque) void,
+    validate: *const fn (*anyopaque) anyerror!void,
+    enter: *const fn (*anyopaque) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
+
 pub const SearchRequest = struct {
+    external_work: ?ExternalWork = null,
     key_predicate: ?KeyPredicate = null,
     query: []const f32,
     k: usize,

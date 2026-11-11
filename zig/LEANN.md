@@ -714,6 +714,21 @@ sets have a 32 MiB soft limit; a single larger parent remains reusable until a
 different parent is needed, bounding retained data to the limit plus one parent.
 External helpers, including `transcribeAudio`, never qualify for text elision.
 
+Transient searches capture graph candidates and their keys under the graph
+read lock. Scoring uses that owned plan and a pinned primary read generation,
+so writes and replicated graph updates can proceed during provider calls.
+A primary commit during inference restarts the complete query attempt, including
+composed ranking, using the completed recovery cache entries. Re-embedding time
+remains cumulative across these attempts. Cache hits and stored-vector reads
+keep their short query fence. Candidate metadata and scoring scratch count against the dense-search working
+set budget. Full-effort plans retain the live candidate list and score vectors
+in bounded batches.
+
+Retained query cuts read their own sources and share reference-counted provider
+ownership. Provisioned readers reconstruct provider configuration from the
+retained index catalog. Lazy setup observes the initiating request's deadline
+and cancellation before returning, including during uncached-handle cleanup.
+
 Int8 media quantization is irreversible. A full-vector consumer added after
 quantization reports `ArtifactRepairRequired` rather than treating a dequantized
 copy as the original vector. Reprocess the embedding producer from its source

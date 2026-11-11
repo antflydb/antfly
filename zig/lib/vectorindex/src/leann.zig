@@ -343,6 +343,169 @@ fn levelFor(seed: u64, id: u32, max_degree: u32) u8 {
     return @intFromFloat(@min(level, @as(f64, max_level_cap)));
 }
 
+pub const PreparedCandidate = struct {
+    id: u32,
+    lower: f32,
+    est: f32,
+    retained: bool = false,
+};
+
+pub const PreparedSearch = struct {
+    candidates: []PreparedCandidate,
+    metric: Metric,
+    dims: u32,
+    has_bounds: bool,
+    stats: SearchStats = .{},
+
+    pub fn deinit(self: *PreparedSearch, alloc: Allocator) void {
+        alloc.free(self.candidates);
+        self.candidates = &.{};
+    }
+
+    /// Consumes candidate storage. Only request-owned bytes and the source
+    /// callbacks are used after graph preparation.
+    pub fn score(self: *PreparedSearch, alloc: Allocator, source: EmbeddingSource, query: []const f32, input_opts: SearchOptions) !SearchResponse {
+        var opts = input_opts;
+        if (opts.ef == 0) opts.ef = if (self.has_bounds) 512 else 64;
+        const q = try alloc.dupe(f32, query);
+        defer alloc.free(q);
+        if (self.metric == .cosine) normalize(q);
+        const ef: usize = if (opts.exhaustive) self.candidates.len else @max(opts.ef, opts.k);
+        const k: usize = opts.k;
+        var local_stats = self.stats;
+        const stats = &local_stats;
+        var pool = std.ArrayListUnmanaged(PreparedCandidate).fromOwnedSlice(self.candidates);
+        self.candidates = &.{};
+        defer pool.deinit(alloc);
+        // PQ has no admissible bounds. RaBitQ bounds describe the original
+        // vectors, so they also cannot prune reranking of quantized copies.
+        // Score the estimated shortlist first, then refill if vectors are missing.
+        const use_bounds = self.has_bounds and !opts.score_quantized_source;
+        const refill_shortlist = !use_bounds;
+        const ByEstimate = struct {
+            fn compare(_: void, a: PreparedCandidate, b: PreparedCandidate) std.math.Order {
+                if (a.est < b.est) return .lt;
+                if (a.est > b.est) return .gt;
+                return std.math.order(a.id, b.id);
+            }
+        };
+        const EstimateQueue = std.PriorityQueue(PreparedCandidate, void, ByEstimate.compare);
+        var estimates: ?EstimateQueue = null;
+        defer if (estimates) |*queue| queue.deinit(alloc);
+        if (refill_shortlist and pool.items.len > ef) {
+            // Heapify once, then order only the candidates actually scored.
+            estimates = EstimateQueue.fromOwnedSlice(try pool.toOwnedSlice(alloc), {});
+        }
+
+        const ByLower = struct {
+            fn lessThan(_: void, a: PreparedCandidate, b: PreparedCandidate) bool {
+                return a.lower < b.lower;
+            }
+        };
+        if (use_bounds) std.mem.sortUnstable(PreparedCandidate, pool.items, {}, ByLower.lessThan);
+        const candidates_view = if (estimates) |queue| queue.items else pool.items;
+
+        var top = Heap(true){};
+        defer top.deinit(alloc);
+        var ids = std.ArrayListUnmanaged(u32).empty;
+        defer ids.deinit(alloc);
+        var dists = std.ArrayListUnmanaged(f32).empty;
+        defer dists.deinit(alloc);
+        var buf = std.ArrayListUnmanaged(f32).empty;
+        defer buf.deinit(alloc);
+        const chunk: usize = if (opts.batch_size > 0) opts.batch_size else if (opts.exhaustive) 128 else @max(k, 1);
+        var i: usize = 0;
+        var unrecomputed_from: ?usize = null;
+        while (i < candidates_view.len) {
+            if (refill_shortlist and i >= ef and top.len() >= k) break;
+            const refilling = refill_shortlist and i >= ef;
+            const batch_end = if (refill_shortlist and !refilling) @min(ef, candidates_view.len) else candidates_view.len;
+            const batch_size = if (refilling) @min(chunk, k - top.len()) else chunk;
+            const batch_start = i;
+            const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
+            ids.clearRetainingCapacity();
+            while (i < batch_end and ids.items.len < batch_size) : (i += 1) {
+                const p = if (estimates) |*queue| next: {
+                    const candidate = queue.pop().?;
+                    // Keep the popped item for the estimate-only fallback.
+                    candidates_view[candidates_view.len - 1 - i] = candidate;
+                    break :next candidate;
+                } else candidates_view[i];
+                if (i % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (use_bounds and p.lower >= tau) break;
+                if (p.retained and
+                    (if (opts.verify_source) (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false) else !opts.score_quantized_source))
+                {
+                    const c = Cand{ .dist = p.est, .id = p.id };
+                    if (top.len() < k) try top.push(alloc, c) else if (c.dist < top.top().dist) top.replaceTop(c);
+                    continue;
+                }
+                try ids.append(alloc, p.id);
+            }
+            if (ids.items.len == 0) {
+                if (use_bounds and i < candidates_view.len and candidates_view[i].lower >= tau) break;
+                continue;
+            }
+            if (!try RecomputeGate.open(opts.gate)) {
+                unrecomputed_from = batch_start;
+                break;
+            }
+            try dists.resize(alloc, ids.items.len);
+            try recomputePreparedDistances(alloc, self.metric, self.dims, source, q, ids.items, &buf, dists.items, stats);
+            for (ids.items, dists.items) |id, dist| {
+                if (!std.math.isFinite(dist)) continue;
+                if (opts.exhaustive) {
+                    if (opts.distance_over) |over| if (!(dist > over)) continue;
+                    if (opts.distance_under) |under| if (!(dist < under)) continue;
+                }
+                const c = Cand{ .dist = dist, .id = id };
+                if (top.len() < k) {
+                    try top.push(alloc, c);
+                } else if (c.dist < top.top().dist) {
+                    top.replaceTop(c);
+                }
+            }
+        }
+        if (unrecomputed_from) |from| {
+            // Out of budget: rank the rest by estimate rather than return
+            // fewer than k results.
+            stats.budget_exhausted = true;
+            // Unscored source-backed candidates may no longer exist.
+            if (!opts.verify_source) {
+                for (from..candidates_view.len) |position| {
+                    const offset = if (estimates != null) candidates_view.len - 1 - position else position;
+                    const p = candidates_view[offset];
+                    if ((!opts.score_quantized_source and position < i and p.retained)) continue;
+                    const c = Cand{ .dist = p.est, .id = p.id };
+                    if (top.len() < k) {
+                        try top.push(alloc, c);
+                    } else if (c.dist < top.top().dist) {
+                        top.replaceTop(c);
+                    }
+                }
+            }
+        }
+
+        std.mem.sortUnstable(Cand, top.items.items, {}, candLessThan);
+        const results = try alloc.alloc(Result, top.len());
+        for (top.items.items, results) |candidate, *result| result.* = .{ .id = candidate.id, .distance = candidate.dist };
+        return .{ .results = results, .stats = stats.* };
+    }
+};
+
+fn recomputePreparedDistances(alloc: Allocator, metric: Metric, dims: u32, source: EmbeddingSource, q: []const f32, ids: []const u32, buf: *std.ArrayListUnmanaged(f32), out: []f32, stats: *SearchStats) !void {
+    if (ids.len == 0) return;
+    try buf.resize(alloc, ids.len * @as(usize, dims));
+    try source.recompute(ids, buf.items);
+    stats.batches += 1;
+    stats.recomputed += @intCast(ids.len);
+    for (out, 0..) |*value, offset| {
+        const row = buf.items[offset * dims ..][0..dims];
+        if (metric == .cosine) normalize(row);
+        value.* = if (std.math.isNan(row[0])) std.math.inf(f32) else distance(metric, q, row);
+    }
+}
+
 pub const Index = struct {
     alloc: Allocator,
     config: Config,
@@ -786,6 +949,44 @@ pub const Index = struct {
             try out.append(alloc, .{ .id = c.id, .distance = c.dist });
         }
         return .{ .results = try out.toOwnedSlice(alloc), .stats = stats };
+    }
+
+    /// Captures routing candidates while the caller owns the graph generation.
+    /// The returned plan can score with no reference to the mutable index.
+    pub fn prepareSearch(self: *const Index, alloc: Allocator, query: []const f32, opts: SearchOptions) !PreparedSearch {
+        if (query.len != self.config.dims) return error.DimensionMismatch;
+        // Retained exact vectors are a library-only, unserializable mode.
+        if (self.config.store_upper) return error.UnsupportedStoreUpper;
+        var stats: SearchStats = .{};
+        if (self.node_count == 0 or opts.k == 0)
+            return .{ .candidates = try alloc.alloc(PreparedCandidate, 0), .metric = self.config.metric, .dims = self.config.dims, .has_bounds = self.rabitq != null };
+        if (opts.exhaustive) {
+            var candidates: std.ArrayListUnmanaged(PreparedCandidate) = .empty;
+            errdefer candidates.deinit(alloc);
+            const count = if (opts.candidate_ids) |ids| ids.len else self.node_count;
+            for (0..count) |offset| {
+                if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                const id = if (opts.candidate_ids) |ids| ids[offset] else @as(u32, @intCast(offset));
+                if (id >= self.node_count or self.isDeleted(id) or !try allowedNode(opts.filter, id)) continue;
+                try candidates.append(alloc, .{ .id = id, .lower = -std.math.inf(f32), .est = 0 });
+            }
+            return .{ .candidates = try candidates.toOwnedSlice(alloc), .metric = self.config.metric, .dims = self.config.dims, .has_bounds = false };
+        }
+        const q = try alloc.dupe(f32, query);
+        defer alloc.free(q);
+        if (self.config.metric == .cosine) normalize(q);
+        var approx = try Approx.init(alloc, self, q);
+        defer approx.deinit();
+        var effective = opts;
+        if (effective.ef == 0) effective.ef = if (self.rabitq != null) 512 else 64;
+        const start = if (effective.candidate_ids != null) self.entry else try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, if (effective.filter != null and effective.filter_visit_limit > 0) @max(effective.filter_visit_limit / 4, 1) else 0, effective.gate);
+        return .{
+            .candidates = try self.prepareBoundedCandidates(alloc, &approx, start, effective, &stats),
+            .metric = self.config.metric,
+            .dims = self.config.dims,
+            .has_bounds = self.rabitq != null,
+            .stats = stats,
+        };
     }
 
     /// Full coverage uses a streaming exact scan, independent of graph
@@ -1501,13 +1702,26 @@ pub const Index = struct {
         out: *std.ArrayListUnmanaged(Cand),
         stats: *SearchStats,
     ) !void {
+        var prepared = PreparedSearch{
+            .candidates = try self.prepareBoundedCandidates(alloc, approx, start, opts, stats),
+            .metric = self.config.metric,
+            .dims = self.config.dims,
+            .has_bounds = self.rabitq != null,
+            .stats = stats.*,
+        };
+        defer prepared.deinit(alloc);
+        var response = try prepared.score(alloc, source, q, opts);
+        defer response.deinit(alloc);
+        stats.* = response.stats;
+        for (response.results) |candidate| try out.append(alloc, .{ .id = candidate.id, .dist = candidate.distance });
+    }
+
+    fn prepareBoundedCandidates(self: *const Index, alloc: Allocator, approx: *Approx, start: u32, opts: SearchOptions, stats: *SearchStats) ![]PreparedCandidate {
         const ef: usize = @max(opts.ef, opts.k);
-        const k: usize = opts.k;
         const scale = @max(opts.bound_scale, 0);
 
-        const Pooled = struct { id: u32, lower: f32, est: f32 };
-        var pool = std.ArrayListUnmanaged(Pooled).empty;
-        defer pool.deinit(alloc);
+        var pool = std.ArrayListUnmanaged(PreparedCandidate).empty;
+        errdefer pool.deinit(alloc);
         if (opts.candidate_ids) |ids| {
             for (ids, 0..) |id, offset| {
                 if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
@@ -1601,115 +1815,15 @@ pub const Index = struct {
             }
         }
 
-        // PQ has no admissible bounds. RaBitQ bounds describe the original
-        // vectors, so they also cannot prune reranking of quantized copies.
-        // Score the estimated shortlist first, then refill if vectors are missing.
-        const use_bounds = self.rabitq != null and !opts.score_quantized_source;
-        const refill_shortlist = !use_bounds;
-        const ByEstimate = struct {
-            fn compare(_: void, a: Pooled, b: Pooled) std.math.Order {
-                if (a.est < b.est) return .lt;
-                if (a.est > b.est) return .gt;
-                return std.math.order(a.id, b.id);
-            }
-        };
-        const EstimateQueue = std.PriorityQueue(Pooled, void, ByEstimate.compare);
-        var estimates: ?EstimateQueue = null;
-        defer if (estimates) |*queue| queue.deinit(alloc);
-        if (refill_shortlist and pool.items.len > ef) {
-            // Heapify once, then order only the candidates actually scored.
-            estimates = EstimateQueue.fromOwnedSlice(try pool.toOwnedSlice(alloc), {});
+        var live: usize = 0;
+        for (pool.items) |candidate| {
+            if (self.isDeleted(candidate.id)) continue;
+            pool.items[live] = candidate;
+            pool.items[live].retained = self.upper_vectors.contains(candidate.id);
+            live += 1;
         }
-
-        const ByLower = struct {
-            fn lessThan(_: void, a: Pooled, b: Pooled) bool {
-                return a.lower < b.lower;
-            }
-        };
-        if (use_bounds) std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
-        const candidates_view = if (estimates) |queue| queue.items else pool.items;
-
-        var top = Heap(true){};
-        defer top.deinit(alloc);
-        var ids = std.ArrayListUnmanaged(u32).empty;
-        defer ids.deinit(alloc);
-        var dists = std.ArrayListUnmanaged(f32).empty;
-        defer dists.deinit(alloc);
-        var buf = std.ArrayListUnmanaged(f32).empty;
-        defer buf.deinit(alloc);
-        const chunk: usize = if (opts.batch_size > 0) opts.batch_size else @max(k, 1);
-        var i: usize = 0;
-        var unrecomputed_from: ?usize = null;
-        while (i < candidates_view.len) {
-            if (refill_shortlist and i >= ef and top.len() >= k) break;
-            const refilling = refill_shortlist and i >= ef;
-            const batch_end = if (refill_shortlist and !refilling) @min(ef, candidates_view.len) else candidates_view.len;
-            const batch_size = if (refilling) @min(chunk, k - top.len()) else chunk;
-            const batch_start = i;
-            const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
-            ids.clearRetainingCapacity();
-            while (i < batch_end and ids.items.len < batch_size) : (i += 1) {
-                const p = if (estimates) |*queue| next: {
-                    const candidate = queue.pop().?;
-                    // Keep the popped item for the estimate-only fallback.
-                    candidates_view[candidates_view.len - 1 - i] = candidate;
-                    break :next candidate;
-                } else candidates_view[i];
-                if (i % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
-                if (use_bounds and p.lower >= tau) break;
-                if (self.isDeleted(p.id)) continue;
-                if (self.upper_vectors.contains(p.id) and
-                    (if (opts.verify_source) (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false) else !opts.score_quantized_source))
-                {
-                    const c = Cand{ .dist = p.est, .id = p.id };
-                    if (top.len() < k) try top.push(alloc, c) else if (c.dist < top.top().dist) top.replaceTop(c);
-                    continue;
-                }
-                try ids.append(alloc, p.id);
-            }
-            if (ids.items.len == 0) {
-                if (use_bounds and i < candidates_view.len and candidates_view[i].lower >= tau) break;
-                continue;
-            }
-            if (!try RecomputeGate.open(opts.gate)) {
-                unrecomputed_from = batch_start;
-                break;
-            }
-            try dists.resize(alloc, ids.items.len);
-            try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
-            for (ids.items, dists.items) |id, dist| {
-                if (!std.math.isFinite(dist)) continue;
-                const c = Cand{ .dist = dist, .id = id };
-                if (top.len() < k) {
-                    try top.push(alloc, c);
-                } else if (c.dist < top.top().dist) {
-                    top.replaceTop(c);
-                }
-            }
-        }
-        if (unrecomputed_from) |from| {
-            // Out of budget: rank the rest by estimate rather than return
-            // fewer than k results.
-            stats.budget_exhausted = true;
-            // Unscored source-backed candidates may no longer exist.
-            if (!opts.verify_source) {
-                for (from..candidates_view.len) |position| {
-                    const offset = if (estimates != null) candidates_view.len - 1 - position else position;
-                    const p = candidates_view[offset];
-                    if (self.isDeleted(p.id) or (!opts.score_quantized_source and position < i and self.upper_vectors.contains(p.id))) continue;
-                    const c = Cand{ .dist = p.est, .id = p.id };
-                    if (top.len() < k) {
-                        try top.push(alloc, c);
-                    } else if (c.dist < top.top().dist) {
-                        top.replaceTop(c);
-                    }
-                }
-            }
-        }
-
-        out.clearRetainingCapacity();
-        try out.appendSlice(alloc, top.items.items);
-        std.mem.sortUnstable(Cand, out.items, {}, candLessThan);
+        pool.items.len = live;
+        return pool.toOwnedSlice(alloc);
     }
 
     /// Algorithm 2 on layer 0, starting at `start`. Fills `out` with up to
@@ -3709,6 +3823,22 @@ test "leann: quantized scoring refills a stale estimated shortlist" {
     defer response.deinit(alloc);
     try testing.expectEqual(@as(usize, 4), response.results.len);
     try testing.expectEqual(@as(usize, 5), src.calls);
+}
+
+test "leann: prepared search survives destruction of its graph" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq }, fx.data);
+    var plan = try index.prepareSearch(alloc, fx.data[0..16], .{ .k = 3, .exhaustive = true });
+    defer plan.deinit(alloc);
+    index.deinit();
+    var source = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var results = try plan.score(alloc, source.source(), fx.data[0..16], .{ .k = 3, .exhaustive = true });
+    defer results.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), results.results.len);
+    try testing.expectEqual(@as(u32, 0), results.results[0].id);
+    try testing.expectEqual(@as(f32, 0), results.results[0].distance);
 }
 
 test "leann: rebuild from codes keeps codes and live nodes" {

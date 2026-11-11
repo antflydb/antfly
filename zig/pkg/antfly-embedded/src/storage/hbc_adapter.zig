@@ -18879,18 +18879,27 @@ pub const HBCIndex = struct {
         lease.release();
     }
 
+    fn searchLeann(self: *HBCIndex, store: *leann_store_mod.LeannStore, req: SearchRequest) !SearchResults {
+        var working = if (self.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .dense_search_working_set, self.alloc, 1)
+        else
+            null;
+        defer if (working) |*budget| budget.deinit();
+        return store.searchWithWorkingAllocator(self.alloc, if (working) |*budget| budget.allocator() else self.alloc, req);
+    }
+
     pub fn searchWithRequest(self: *HBCIndex, req: SearchRequest) !SearchResults {
-        if (self.leann) |store| return try store.search(self.alloc, req);
+        if (self.leann) |store| return try self.searchLeann(store, req);
         return try vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince);
     }
 
     pub fn searchProfiled(self: *HBCIndex, query: []const f32, k: usize) !ProfiledSearchResults {
-        if (self.leann) |store| return .{ .results = try store.search(self.alloc, .{ .query = query, .k = k }), .profile = .{} };
+        if (self.leann) |store| return .{ .results = try self.searchLeann(store, .{ .query = query, .k = k }), .profile = .{} };
         return try vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince);
     }
 
     pub fn searchProfiledRequest(self: *HBCIndex, req: SearchRequest) !ProfiledSearchResults {
-        if (self.leann) |store| return .{ .results = try store.search(self.alloc, req), .profile = .{} };
+        if (self.leann) |store| return .{ .results = try self.searchLeann(store, req), .profile = .{} };
         return try vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince);
     }
 

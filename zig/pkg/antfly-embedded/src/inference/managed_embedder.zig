@@ -543,6 +543,8 @@ pub const ProviderRuntime = struct {
 };
 
 pub const InitOptions = struct {
+    /// Used only while constructing the provider. Never retained by entries.
+    setup_context: ?RequestContext = null,
     antfly_provider: ?AntflyProvider = null,
     /// Runtime-owned cache shared by distributed task adapters. Managed
     /// embedders borrow it; standalone callers retain an owned fallback.
@@ -1220,6 +1222,24 @@ pub const ManagedEmbedder = struct {
         };
 
         var options = supplied_options;
+        const SetupCancellation = struct {
+            original: ?CancellationToken,
+            request: ?CancellationToken,
+            fn cancelled(raw: *const anyopaque) bool {
+                const value: *const @This() = @ptrCast(@alignCast(raw));
+                if (value.original) |token| if (token.isCancelled()) return true;
+                return if (value.request) |token| token.isCancelled() else false;
+            }
+        };
+        const setup_cancel = SetupCancellation{
+            .original = supplied_options.cancellation,
+            .request = if (options.setup_context) |control| control.cancellation else null,
+        };
+        if (options.setup_context) |control| {
+            try control.check();
+            if (control.deadline_ns) |deadline| options.deadline_ns = @min(deadline, options.deadline_ns orelse deadline);
+            options.cancellation = .{ .ptr = &setup_cancel, .is_cancelled_fn = SetupCancellation.cancelled };
+        }
         const owned_http_io = try bindOwnedHttpIoIfNeeded(alloc, &options);
         errdefer deinitOwnedHttpIo(alloc, owned_http_io);
 
@@ -1231,6 +1251,7 @@ pub const ManagedEmbedder = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
+            if (options.setup_context) |control| try control.check();
             if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
             var managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options, sparse_kind) orelse continue;
             entries.append(alloc, managed) catch |err| {
@@ -1245,7 +1266,10 @@ pub const ManagedEmbedder = struct {
         try collectEmbeddingVectorSpaces(root, &vector_spaces, alloc);
         try validateManagedEmbeddingLookupNames(alloc, entries.items, &vector_spaces);
 
-        for (entries.items) |*entry| try attachProviderQuota(entry, options);
+        for (entries.items) |*entry| {
+            if (options.setup_context) |control| try control.check();
+            try attachProviderQuota(entry, options);
+        }
 
         const owned_google_credentials = try attachManagedGoogleCredentialManager(
             alloc,
@@ -1280,6 +1304,11 @@ pub const ManagedEmbedder = struct {
         if (owned_http_client) |client| for (owned_entries) |*entry| {
             if (entry.antfly_provider == null) entry.shared_http_client = client;
         };
+        if (options.setup_context) |control| try control.check();
+        for (owned_entries) |*entry| {
+            entry.deadline_ns = supplied_options.deadline_ns;
+            entry.cancellation = supplied_options.cancellation;
+        }
         return .{
             .alloc = alloc,
             .entries = owned_entries,
@@ -1424,8 +1453,10 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         options: InitOptions,
     ) !?db_embedder.DenseEmbedder {
+        if (options.setup_context) |control| try control.check();
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
         defer parsed.deinit();
+        if (options.setup_context) |control| try control.check();
         return try createDenseEmbedderFromIndexValueWithOptions(alloc, parsed.value, options);
     }
 

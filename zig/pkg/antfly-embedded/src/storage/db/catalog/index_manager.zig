@@ -33767,10 +33767,21 @@ pub const IndexManager = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var read = if (entry.leann_transient and entry.embedding_name != null) try store.beginProbeTxn() else null;
+        const source_read = if (session) |active| active.source_read else null;
+        var read = if (source_read == null and entry.leann_transient and entry.embedding_name != null) try store.beginProbeTxn() else null;
         defer if (read) |*txn| txn.abort();
         const raw_by_slot = try scratch.alloc(?[]const u8, metadata.len);
         @memset(raw_by_slot, null);
+        if (source_read) |view| {
+            for (metadata, 0..) |meta, slot| {
+                if (meta.len == 0) continue;
+                const key = try denseVectorArtifactKeyForMetadataAlloc(scratch, entry, meta);
+                raw_by_slot[slot] = view.get_owned(view.ptr, scratch, key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+            }
+        }
         if (read) |*txn| {
             const Read = struct {
                 key: []const u8,

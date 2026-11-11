@@ -177,7 +177,7 @@ pub const ReplayPublication = struct {
 /// Read-handle-owned provider construction. Called only on a cold stub miss.
 pub const QueryRecoveryFactory = struct {
     ptr: *anyopaque,
-    create: *const fn (*anyopaque) anyerror!enrichment_runtime_mod.Config,
+    create: *const fn (*anyopaque, @import("antfly_inference_execution_context").RequestContext) anyerror!enrichment_runtime_mod.Config,
     release: *const fn (*anyopaque) void,
 };
 
@@ -248,7 +248,6 @@ pub const AsyncContext = struct {
     query_recovery_ready: std.atomic.Value(bool) = .init(false),
     query_recovery_mutex: std.Io.Mutex = .init,
     query_recovery_condition: std.Io.Condition = .init,
-    query_recovery_setup: std.Io.Group = .init,
     query_recovery_in_progress: bool = false,
     query_recovery_retry_at: u64 = 0,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
