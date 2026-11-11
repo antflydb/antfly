@@ -151,12 +151,17 @@ pub fn chunkTextWithConfigJsonAndProvider(
             defer sanitized.deinit(alloc);
             const name = if (cfg.model.len != 0) cfg.model else "fixed";
             const input = shared.Input{ .text = sanitized.text };
-            const remote = if (provider.chunk_input_with_context_callback) |raw| blk: {
-                const callback: provider_mod.ChunkInputWithContextFn = @ptrCast(@alignCast(raw));
-                break :blk try provider_mod.CallbackBoundary.call("chunk_input_with_context", dispatch, callback, .{ ptr, alloc, name, input, cfg, context });
-            } else blk: {
-                const callback: provider_mod.ChunkInputFn = @ptrCast(@alignCast(provider.chunk_input_callback.?));
-                break :blk try provider_mod.CallbackBoundary.call("chunk_input", dispatch, callback, .{ ptr, alloc, name, input, cfg });
+            const remote = dispatch_call: {
+                const accounting = provider.dispatch_accounting;
+                const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+                defer if (accounting) |hook| hook.finish(hook.ptr, started);
+                break :dispatch_call if (provider.chunk_input_with_context_callback) |raw| blk: {
+                    const callback: provider_mod.ChunkInputWithContextFn = @ptrCast(@alignCast(raw));
+                    break :blk try provider_mod.CallbackBoundary.call("chunk_input_with_context", dispatch, callback, .{ ptr, alloc, name, input, cfg, context });
+                } else blk: {
+                    const callback: provider_mod.ChunkInputFn = @ptrCast(@alignCast(provider.chunk_input_callback.?));
+                    break :blk try provider_mod.CallbackBoundary.call("chunk_input", dispatch, callback, .{ ptr, alloc, name, input, cfg });
+                };
             };
             defer shared.types.freeChunks(alloc, remote);
             try context.check();

@@ -190,6 +190,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         .binary => |binary| if (binary.data.len == 0) return try alloc.alloc(RemoteChunk, 0),
     };
     const execution: execution_context.Context = if (antfly_provider) |provider| provider.execution else .{};
+    const accounting = if (antfly_provider) |provider| provider.dispatch_accounting else null;
     try execution.check(platform_time.monotonicNs());
     const linked_callback_available = if (antfly_provider) |provider|
         if (paged) provider.chunk_page_with_context_callback != null else provider.chunk_input_with_context_callback != null or provider.chunk_input_callback != null
@@ -213,6 +214,8 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             std.Io.Threaded.global_single_threaded.io();
         const request_context = execution.requestContext(io);
         try request_context.check();
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
         if (paged) {
             const callback: ChunkPageWithContextFn = @ptrCast(@alignCast(provider.chunk_page_with_context_callback orelse return error.InvalidChunkProvider));
             var page = try ChunkProviderBoundary.call("chunk_page_with_context", dispatch, callback, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
@@ -298,14 +301,18 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     }
     routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
-    var capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
-        http,
-        endpoint,
-        model,
-        capability_task,
-        routing_headers,
-        execution.waitContext(),
-    );
+    var capability_lease = dispatch: {
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
+        break :dispatch try capability_cache.?.getOrDiscoverLeaseWithContext(
+            http,
+            endpoint,
+            model,
+            capability_task,
+            routing_headers,
+            execution.waitContext(),
+        );
+    };
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
         if (cfg.isModelAware() and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
@@ -359,18 +366,22 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
     }
-    var resp = try http.post(url, .{
-        .follow_redirects = false,
-        .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
-        .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
-        .headers = header_storage[0..header_count],
-        .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
-        .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
-        .cancellation = httpx.CancellationToken.fromCallback(
-            execution.cancellation.ptr,
-            execution.cancellation.is_cancelled_fn,
-        ),
-    });
+    var resp = dispatch: {
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
+        break :dispatch try http.post(url, .{
+            .follow_redirects = false,
+            .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
+            .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
+            .headers = header_storage[0..header_count],
+            .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
+            .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
+            .cancellation = httpx.CancellationToken.fromCallback(
+                execution.cancellation.ptr,
+                execution.cancellation.is_cancelled_fn,
+            ),
+        });
+    };
     defer resp.deinit();
     if (!resp.ok()) {
         // Never log the request payload (it embeds the full source document)

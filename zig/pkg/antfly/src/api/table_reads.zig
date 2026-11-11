@@ -13070,47 +13070,77 @@ fn openProvisionedQueryDbForTableWithCache(
     if (summary.indexManagerCatalogChanged()) return error.ReadOnly;
     for (db.core.index_manager.dense_indexes.items) |entry| {
         if (!entry.leann_transient) continue;
-        attachProvisionedQueryRecovery(&db, indexes_json, runtime_cfg.forTable(table_name)) catch |err| {
-            // Recovery is optional for scans and for candidates with stored
-            // vectors. Only a later stub miss requires the attached runtime.
-            std.log.warn("provisioned query recovery unavailable table={s} err={s}", .{ table_name, @errorName(err) });
-        };
+        try attachProvisionedQueryRecovery(&db, indexes_json, runtime_cfg.forTable(table_name));
         break;
     }
     return db;
 }
 
+const ProvisionedQueryRecovery = struct {
+    arena: std.heap.ArenaAllocator,
+    indexes_json: []const u8,
+    cfg: ManagedReadRuntimeConfig,
+    io: std.Io,
+
+    fn create(raw: *anyopaque) !db_mod.enrichment_runtime.Config {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const alloc = self.arena.child_allocator;
+        const indexes_json = self.indexes_json;
+        const cfg = self.cfg;
+        const io = self.io;
+        const provider = providerWithCapabilityCache(cfg.antfly_provider, cfg.remote_capability_cache);
+        var recovery: db_mod.enrichment_runtime.Config = .{
+            .dense_embedder = (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, .{
+                .antfly_provider = provider,
+                .provider_runtime = cfg.provider_runtime,
+                .remote_capability_cache = cfg.remote_capability_cache,
+                .io = io,
+                .bounded_http_request = true,
+                .secret_store = cfg.secret_store,
+                .remote_content = cfg.remote_content,
+                .inference_api_url = cfg.inference_api_url,
+                .inference_api_key = cfg.inference_api_key,
+                .source_table = cfg.source_table,
+            })) orelse return error.ReembedUnavailable,
+        };
+        errdefer if (recovery.dense_embedder) |dense| dense.deinit(alloc);
+        recovery.chunk_provider = try @import("antfly_local_sources").api_local_table_writes.physical_local_write.chunkProviderForRuntime(
+            alloc,
+            provider,
+            io,
+            cfg.remote_capability_cache,
+            cfg.inference_api_url,
+            cfg.source_table,
+            cfg.inference_api_key,
+            cfg.secret_store,
+        );
+        return recovery;
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
 fn attachProvisionedQueryRecovery(db: *db_mod.DB, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig) !void {
-    const alloc = db.runtime_alloc;
-    const io = db.backend_runtime.io();
-    const provider = providerWithCapabilityCache(cfg.antfly_provider, cfg.remote_capability_cache);
-    var recovery: db_mod.enrichment_runtime.Config = .{
-        .dense_embedder = (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, .{
-            .antfly_provider = provider,
-            .provider_runtime = cfg.provider_runtime,
-            .remote_capability_cache = cfg.remote_capability_cache,
-            .io = io,
-            .bounded_http_request = io != null,
-            .secret_store = cfg.secret_store,
-            .remote_content = cfg.remote_content,
-            .inference_api_url = cfg.inference_api_url,
-            .inference_api_key = cfg.inference_api_key,
-            .source_table = cfg.source_table,
-        })) orelse return,
+    const io = db.backend_runtime.io() orelse return;
+    var arena = std.heap.ArenaAllocator.init(db.runtime_alloc);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const owner = try alloc.create(ProvisionedQueryRecovery);
+    var owned_cfg = cfg;
+    owned_cfg.source_table = try alloc.dupe(u8, cfg.source_table);
+    owned_cfg.inference_api_url = if (cfg.inference_api_url) |url| try alloc.dupe(u8, url) else null;
+    owned_cfg.inference_api_key = if (cfg.inference_api_key) |key| try alloc.dupe(u8, key) else null;
+    owner.* = .{
+        .indexes_json = try alloc.dupe(u8, indexes_json),
+        .cfg = owned_cfg,
+        .io = io,
+        .arena = arena,
     };
-    defer if (recovery.dense_embedder) |dense| dense.deinit(alloc);
-    recovery.chunk_provider = try @import("antfly_local_sources").api_local_table_writes.physical_local_write.chunkProviderForRuntime(
-        alloc,
-        provider,
-        io,
-        cfg.remote_capability_cache,
-        cfg.inference_api_url,
-        cfg.source_table,
-        cfg.inference_api_key,
-        cfg.secret_store,
-    );
-    defer if (recovery.chunk_provider) |*chunker| chunker.deinit();
-    try db.attachQueryRecovery(&recovery);
+    try db.attachLazyQueryRecovery(.{ .ptr = owner, .create = ProvisionedQueryRecovery.create, .release = ProvisionedQueryRecovery.release });
 }
 
 fn loadTableIndexesJson(
@@ -33709,6 +33739,7 @@ fn implementationTests() type {
             const before = mock.calls.load(.monotonic);
             var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog_state.iface(), "docs", null, null, backend_current_root_generation, null, .{ .backend_runtime = runtime.ptr(), .antfly_provider = provider }, namespace);
             defer db.close();
+            try std.testing.expect(!db.async_context.query_recovery_ready.load(.acquire));
             const entry = db.core.index_manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
             var results = try entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .search_effort = 1 });
             defer results.deinit();

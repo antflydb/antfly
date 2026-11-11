@@ -87,6 +87,15 @@ test "online direct vector artifacts validate exact bounded values and tombstone
     defer alloc.free(stub);
     try validate(key, stub);
     try std.testing.expectError(error.InvalidMergePage, validate(key, stub[0 .. stub.len - 1]));
+
+    const quantized = try codec.encodeInt8ElidedDenseEmbeddingAlloc(alloc, try codec.decodeHeader(dense), &.{ 1, 2 }, 99);
+    defer alloc.free(quantized);
+    try validate(key, quantized);
+    const scale_offset = codec.header_len + @sizeOf(u32) + @sizeOf(u64);
+    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32), std.math.floatMax(f32) }) |invalid| {
+        std.mem.writeInt(u32, quantized[scale_offset..][0..4], @bitCast(invalid), .little);
+        try std.testing.expectError(error.InvalidMergePage, validate(key, quantized));
+    }
     const sparse = try codec.encodeSparseEmbeddingAlloc(alloc, 10, &.{ 2, 7 }, &.{ 1, 3 });
     defer alloc.free(sparse);
     try validate(key, sparse);

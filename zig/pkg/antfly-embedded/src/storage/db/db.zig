@@ -5569,6 +5569,18 @@ pub const DB = struct {
     const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
     pub const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
 
+    pub const QueryRecoveryFactory = execution_resources.QueryRecoveryFactory;
+
+    /// Register a provider factory before publishing the query handle. A
+    /// provider-free runtime shell owns the read context and no worker.
+    pub fn attachLazyQueryRecovery(self: *DB, factory: QueryRecoveryFactory) !void {
+        if (self.open_mode != .query_readonly or self.query_recovery_owner.runtime != null) return error.InvalidArgument;
+        var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+        self.query_recovery_owner = (try self.createDetachedEnrichmentRuntime(&config)) orelse return error.ReembedUnavailable;
+        self.async_context.query_recovery_runtime = self.query_recovery_owner.runtime;
+        self.async_context.query_recovery_factory = factory;
+    }
+
     /// Install a query-owned provider before publishing the read handle.
     /// The runtime cannot acquire a producer lease or publish artifacts.
     pub fn attachQueryRecovery(self: *DB, config: *enrichment_runtime_mod.Config) !void {
@@ -5576,6 +5588,7 @@ pub const DB = struct {
         if (config.dense_embedder == null or config.sparse_embedder != null or config.asset_producer != null) return error.InvalidArgument;
         self.query_recovery_owner = (try self.createDetachedEnrichmentRuntime(config)) orelse return error.ReembedUnavailable;
         self.async_context.query_recovery_runtime = self.query_recovery_owner.runtime;
+        self.async_context.query_recovery_ready.store(true, .release);
     }
 
     pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
@@ -6193,6 +6206,8 @@ pub const DB = struct {
         self.ttl_owner.deinit(self.runtime_alloc);
         self.ttl_runtime = null;
         self.ttl_cleanup_context = null;
+        if (self.async_context.query_recovery_factory) |factory| factory.release(factory.ptr);
+        self.async_context.query_recovery_factory = null;
         self.async_context.query_recovery_runtime = null;
         self.query_recovery_owner.deinit(self.runtime_alloc);
         self.enrichment_owner.deinit(self.runtime_alloc);
@@ -27446,6 +27461,47 @@ pub const DB = struct {
     /// Re-embeds documents for transient LEANN indexes through the attached
     /// enrichment runtime's document embedder. The runtime is looked up per
     /// call, so reconfiguring or detaching it needs no extra bookkeeping.
+    fn queryRecoveryRuntime(context: *AsyncContext, session: ?*const @import("../leann_recovery.zig").Session) !*enrichment_runtime_mod.EnrichmentRuntime {
+        if (context.enrichment_runtime) |runtime| return runtime;
+        const runtime = context.query_recovery_runtime orelse return error.ReembedUnavailable;
+        if (context.query_recovery_ready.load(.acquire)) return runtime;
+        // Provider construction is local and bounded. A concurrent miss can
+        // wait for that attempt without holding the lock during inference.
+        while (!context.query_recovery_mutex.tryLock()) {
+            if (session) |active| try active.check();
+            platform_time.yieldNow();
+        }
+        defer context.query_recovery_mutex.unlock();
+        if (context.query_recovery_ready.load(.acquire)) return runtime;
+        if (session) |active| try active.check();
+        const factory = context.query_recovery_factory orelse return error.ReembedUnavailable;
+        if (monotonicTimeNs() < context.query_recovery_retry_at) return error.ReembedUnavailable;
+        var config = factory.create(factory.ptr) catch |err| {
+            if (err == error.OutOfMemory) {
+                context.query_recovery_retry_at = monotonicTimeNs() +| 100 * std.time.ns_per_ms;
+            } else {
+                factory.release(factory.ptr);
+                context.query_recovery_factory = null;
+            }
+            std.log.warn("query recovery provider setup failed err={s}", .{@errorName(err)});
+            return error.ReembedUnavailable;
+        };
+        defer deinitOwnedEnrichmentConfig(runtime.alloc, &config);
+        const dense = config.dense_embedder orelse {
+            factory.release(factory.ptr);
+            context.query_recovery_factory = null;
+            return error.ReembedUnavailable;
+        };
+        runtime.config.dense_embedder = dense;
+        config.dense_embedder = null;
+        runtime.config.chunk_provider = config.chunk_provider;
+        config.chunk_provider = null;
+        factory.release(factory.ptr);
+        context.query_recovery_factory = null;
+        context.query_recovery_ready.store(true, .release);
+        return runtime;
+    }
+
     fn reembedDenseForIndexManager(
         ctx: *anyopaque,
         alloc: std.mem.Allocator,
@@ -27455,13 +27511,13 @@ pub const DB = struct {
         found: []bool,
     ) anyerror!void {
         const context: *AsyncContext = @ptrCast(@alignCast(ctx));
-        const runtime = context.enrichment_runtime orelse context.query_recovery_runtime orelse return error.ReembedUnavailable;
+        const runtime = try queryRecoveryRuntime(context, null);
         try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, requests, dims, out, found);
     }
 
     fn reembedDenseForIndexManagerSession(ctx: *anyopaque, alloc: std.mem.Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../leann_recovery.zig").Session) anyerror!void {
         const context: *AsyncContext = @ptrCast(@alignCast(ctx));
-        const runtime = context.enrichment_runtime orelse context.query_recovery_runtime orelse return error.ReembedUnavailable;
+        const runtime = try queryRecoveryRuntime(context, session);
         try enrichment_runtime_mod.reembedDenseDocumentsSession(runtime, alloc, requests, dims, out, found, session);
     }
 
@@ -134656,9 +134712,26 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
     defer generation.deinit();
     var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = .query_readonly, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
     defer restored.close();
-    if (enrichment) |provider| {
-        var recovery = provider;
-        try restored.attachQueryRecovery(&recovery);
+    const Factory = struct {
+        config: enrichment_runtime_mod.Config,
+        attempts: usize = 0,
+        released: bool = false,
+
+        fn create(raw: *anyopaque) !enrichment_runtime_mod.Config {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            if (self.attempts == 1) return error.OutOfMemory;
+            return self.config;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released = true;
+        }
+    };
+    var factory = Factory{ .config = enrichment orelse .{} };
+    if (transient) {
+        try restored.attachLazyQueryRecovery(.{ .ptr = &factory, .create = Factory.create, .release = Factory.release });
         try std.testing.expect(restored.enrichment_runtime == null);
         try std.testing.expectError(error.ReadOnly, restored.query_recovery_owner.runtime.?.start());
     }
@@ -134674,12 +134747,24 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
         defer alloc.free(raw);
         try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
     }
+    if (transient) {
+        try std.testing.expectEqual(@as(usize, 0), factory.attempts);
+        try std.testing.expectError(error.ReembedUnavailable, entry.index.searchWithRequest(.{ .query = query, .k = 1, .search_effort = 1 }));
+        try std.testing.expectEqual(@as(usize, 1), factory.attempts);
+        try std.testing.expect(!factory.released);
+        // Advance past the retry deadline without sleeping in the test.
+        restored.async_context.query_recovery_retry_at = 0;
+    }
     var results = try entry.index.searchWithRequest(.{ .query = query, .k = 1, .search_effort = if (transient) 1 else null });
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
     const doc = (try restored.core.index_manager.lookupDenseDocKey(restored.core.store, "leann_idx", results.items.items[0].vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(doc);
     try std.testing.expectEqualStrings(keys[123], doc);
+    if (transient) {
+        try std.testing.expectEqual(@as(usize, 2), factory.attempts);
+        try std.testing.expect(factory.released);
+    }
 }
 
 test "db native snapshot rejects storage without atomic host generation publication" {

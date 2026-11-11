@@ -1836,7 +1836,19 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
     if (requests.len == 0) return;
     if (out.len != requests.len * @as(usize, dims) or found.len != requests.len) return error.InvalidArgument;
     @memset(found, false);
+    const Accounting = struct {
+        fn begin(raw: *anyopaque) !u64 {
+            const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
+            return active.beginDispatch();
+        }
+
+        fn finish(raw: *anyopaque, started: u64) void {
+            const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
+            active.finishDispatch(started);
+        }
+    };
     var scoped_chunker = runtime.config.chunk_provider orelse ChunkProvider{};
+    scoped_chunker.dispatch_accounting = .{ .ptr = session, .begin = Accounting.begin, .finish = Accounting.finish };
     const chunk_control = RecoveryChunkControl{ .session = session, .parent = scoped_chunker.execution.cancellation };
     scoped_chunker.execution.cancellation = .{ .ptr = &chunk_control, .is_cancelled_fn = RecoveryChunkControl.cancelled, .check_fn = RecoveryChunkControl.check };
     var dense_embedder = runtime.config.dense_embedder orelse return error.ReembedUnavailable;
@@ -1962,17 +1974,6 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
         try legacy_digests.append(alloc, if (require_digest) request.expected_vector_digest else null);
     }
     if (texts.items.len == 0) return;
-    const Accounting = struct {
-        fn begin(raw: *anyopaque) !u64 {
-            const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
-            return active.beginDispatch();
-        }
-
-        fn finish(raw: *anyopaque, started: u64) void {
-            const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
-            active.finishDispatch(started);
-        }
-    };
     var text_embedder = pinned_embedder;
     text_embedder.text_dispatch_accounting = .{ .ptr = session, .begin = Accounting.begin, .finish = Accounting.finish };
     const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, text_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
@@ -6542,6 +6543,28 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         try std.testing.expectEqual(@as(usize, 1024), probe.chunk_calls);
         const state: *ReembedSessionState = @ptrCast(@alignCast(session.state.?));
         try std.testing.expectEqual(@as(usize, 1024), state.sources.builds);
+        {
+            var budgeted = @import("../../leann_recovery.zig").Session{ .budget_ns = 1, .elapsed_ns = 1 };
+            defer budgeted.deinit();
+            const first_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "leann_idx_chunks", 0);
+            defer alloc.free(first_chunk);
+            request.doc_key = first_chunk;
+            const chunk_calls = probe.chunk_calls;
+            const embed_calls = probe.batch_calls;
+            try std.testing.expectError(error.ReembedBudgetExceeded, reembedDenseDocumentsSession(&runtime, alloc, &.{request}, 2, out[0..2], found[0..1], &budgeted));
+            try std.testing.expectEqual(chunk_calls, probe.chunk_calls);
+            budgeted.elapsed_ns = 0;
+            try std.testing.expectError(error.ReembedBudgetExceeded, reembedDenseDocumentsSession(&runtime, alloc, &.{request}, 2, out[0..2], found[0..1], &budgeted));
+            try std.testing.expectEqual(chunk_calls + 1, probe.chunk_calls);
+            try std.testing.expectEqual(embed_calls, probe.batch_calls);
+            // The cached source can still be checked against the stub after
+            // the chunk provider spends the budget.
+            request.expected_source_hash = 1;
+            try reembedDenseDocumentsSession(&runtime, alloc, &.{request}, 2, out[0..2], found[0..1], &budgeted);
+            try std.testing.expect(!found[0]);
+            try std.testing.expectEqual(chunk_calls + 1, probe.chunk_calls);
+            request.expected_source_hash = null;
+        }
         var signal = std.atomic.Value(bool).init(false);
         var cancelled = @import("../../leann_recovery.zig").Session{ .cancellation = @import("antfly_vectorindex").search_types.CancellationToken.fromAtomic(&signal) };
         defer cancelled.deinit();

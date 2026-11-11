@@ -282,20 +282,28 @@ pub fn encodeInt8ElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, vec
 pub fn int8ElidedDenseEmbeddingAlloc(alloc: Allocator, data: []const u8) !?[]f32 {
     const header = try decodeHeader(data);
     if (header.kind != .dense_embedding or !header.flags.vector_elided or !header.flags.int8_payload) return null;
-    const payload = data[header_len..];
-    if (payload.len < elided_payload_len + @sizeOf(f32)) return error.InvalidArtifactPayload;
+    const payload = try int8StubPayload(data[header_len..]);
+    const out = try alloc.alloc(f32, payload.codes.len);
+    for (out, payload.codes) |*o, b| o.* = @as(f32, @floatFromInt(@as(i8, @bitCast(b)))) * payload.scale;
+    return out;
+}
+
+fn int8StubPayload(payload: []const u8) !struct { codes: []const u8, scale: f32 } {
+    const prefix = elided_payload_len + @sizeOf(f32);
+    if (payload.len < prefix) return error.InvalidArtifactPayload;
     const dims: usize = std.mem.readInt(u32, payload[0..4], .little);
-    if (payload.len != elided_payload_len + @sizeOf(f32) + dims) return error.InvalidArtifactPayload;
+    const codes = payload[prefix..];
+    if (codes.len != dims) return error.InvalidArtifactPayload;
     const scale: f32 = @bitCast(std.mem.readInt(u32, payload[elided_payload_len..][0..4], .little));
     if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidArtifactPayload;
-    const codes = payload[elided_payload_len + 4 ..][0..dims];
-    const out = try alloc.alloc(f32, dims);
-    errdefer alloc.free(out);
-    for (out, codes) |*o, b| {
-        o.* = @as(f32, @floatFromInt(@as(i8, @bitCast(b)))) * scale;
-        if (!std.math.isFinite(o.*)) return error.InvalidArtifactPayload;
+    // Most scales prove every code finite without scanning the payload.
+    if (!std.math.isFinite(scale * 128.0)) {
+        for (codes) |code| {
+            const value = @as(f32, @floatFromInt(@as(i8, @bitCast(code)))) * scale;
+            if (!std.math.isFinite(value)) return error.InvalidArtifactPayload;
+        }
     }
-    return out;
+    return .{ .codes = codes, .scale = scale };
 }
 
 pub const ElidedDenseEmbedding = struct { dims: u32, vector_digest: u64 };
@@ -307,9 +315,7 @@ pub fn elidedDenseEmbedding(data: []const u8) !?ElidedDenseEmbedding {
     if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
     if (!header.flags.vector_elided) return null;
     if (header.flags.int8_payload) {
-        if (header.payload_len < elided_payload_len + @sizeOf(f32)) return error.InvalidArtifactPayload;
-        const dims: usize = std.mem.readInt(u32, data[header_len..][0..4], .little);
-        if (header.payload_len != elided_payload_len + @sizeOf(f32) + dims) return error.InvalidArtifactPayload;
+        _ = try int8StubPayload(data[header_len..]);
     } else if (header.payload_len != elided_payload_len) return error.InvalidArtifactPayload;
     const payload = data[header_len..][0..elided_payload_len];
     return .{
