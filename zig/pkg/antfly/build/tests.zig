@@ -1370,7 +1370,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedded db openLite persists schema json in aflite file",
             "embedded db portable relational restore is immediately readable and validated",
             "embedded db openLite persists index and enrichment catalogs in aflite file",
-            "embedded db createLite files are openable through the CLI's lite Connection and vice versa",
+            // Quote-free prefix preserves the case with Zig 0.17 response files.
+            "embedded db createLite files are openable through the CLI",
         },
     });
     const run_embedded_db_tests = addFilteredTestRunArtifact(b, embedded_db_tests);
@@ -7769,6 +7770,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
             "storage.hbc_adapter.",
+            "storage.leann_filter.",
             "storage.leann_store.",
             "storage.leann_replica.",
             "storage.leann_replicated.",

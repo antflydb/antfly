@@ -47,13 +47,20 @@ pub fn For(comptime DB: type, comptime SearchResult: type) type {
             errdefer view.release();
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
             const privacy_backing = Source.platform.allocator.reclaimingScratch(alloc);
-            const privacy_arena = try privacy_backing.create(std.heap.ArenaAllocator);
-            privacy_arena.* = .init(privacy_backing);
-            errdefer {
-                privacy_arena.deinit();
-                privacy_backing.destroy(privacy_arena);
+            var privacy_arena: ?*std.heap.ArenaAllocator = try privacy_backing.create(std.heap.ArenaAllocator);
+            privacy_arena.?.* = .init(privacy_backing);
+            errdefer if (privacy_arena) |arena| {
+                arena.deinit();
+                privacy_backing.destroy(arena);
+            };
+            const privacy_policy = try Source.privacy_read.capture(self.db, privacy_arena.?.allocator());
+            if (privacy_policy == null) {
+                // No captured policy owns parser pointers. Do not retain an
+                // empty arena allocation across otherwise released SQL pages.
+                privacy_arena.?.deinit();
+                privacy_backing.destroy(privacy_arena.?);
+                privacy_arena = null;
             }
-            const privacy_policy = try Source.privacy_read.capture(self.db, privacy_arena.allocator());
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
             return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .privacy_arena = privacy_arena, .privacy_policy = privacy_policy, .window = .init(alloc), .directory_arena = .init(Source.platform.allocator.reclaimingScratch(alloc)), .metadata = .init(Source.platform.allocator.reclaimingScratch(alloc)) };

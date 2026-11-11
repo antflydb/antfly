@@ -12618,8 +12618,12 @@ test "serverless index catalog validation rejects malformed configs" {
         \\{"sales_rollup":{"type":"algebraic","version":1,"group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"bad","op":"sum","group_by":["missing"],"measure":"amount"}]}}
     ));
 
+    try validateServerlessIndexCatalog(alloc,
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"weekly","op":"count","time":"created_at","bucket":"week"}]}}
+    );
+
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
-        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"fortnight"}]}}
     ));
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,

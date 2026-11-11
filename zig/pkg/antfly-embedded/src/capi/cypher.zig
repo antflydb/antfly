@@ -39,7 +39,7 @@ fn failureScope(out: *h.capi.Buffer, err: anyerror, diagnostic: cypher.compiler.
         error.CatalogGenerationChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed, error.VersionConflict, error.SqlWriteConflict => .version_conflict,
         error.SqlMutationOutcomeUnknown => .outcome_unknown,
         error.OutOfMemory => .internal,
-        error.CypherMemoryBudgetExceeded, error.CypherSnapshotNotReady, error.WouldBlock, error.FileBusy => .busy,
+        error.CypherMemoryBudgetExceeded, error.CypherSnapshotNotReady, error.EnrichmentRetryInProgress, error.WouldBlock, error.FileBusy => .busy,
         error.ReadOnly => .unsupported,
         else => .invalid_argument,
     };
@@ -498,6 +498,23 @@ fn executeInternal(handle: *h.Handle, name: []const u8, json: []const u8, out: *
     try Read.checkpoint(&read);
     out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
 }
+test "capi embedded graph retry readiness preserves status and mutation outcome" {
+    const a = std.testing.allocator;
+    const Scope = @import("cypher_write.zig").Scope;
+    for ([_]anyerror{ error.EnrichmentRetryInProgress, error.CypherSnapshotNotReady }) |err| {
+        for ([_]@FieldType(Scope, "outcome"){ .not_started, .committed }) |outcome| {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            try std.testing.expectEqual(h.capi.ErrorCode.busy, failureScope(&output, err, .{}, .{ .outcome = outcome, .transaction_id = @splat(7) }));
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(@errorName(err), parsed.value.object.get("code").?.string);
+            try std.testing.expectEqualStrings(@tagName(outcome), parsed.value.object.get("write_outcome").?.string);
+            try std.testing.expectEqual(@as(usize, 32), parsed.value.object.get("transaction_id").?.string.len);
+        }
+    }
+}
+
 test "capi Cypher authority fast checkpoints observe schema policy and expiry changes" {
     const a = std.testing.allocator;
     // The checkpoint touches only the registry in this otherwise inert owner.

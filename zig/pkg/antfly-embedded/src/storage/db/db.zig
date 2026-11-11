@@ -66835,7 +66835,10 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
     try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }}, .sync_level = .write });
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
     try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
-    try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
+    // Current revisions remain monotonic even for an explicit older clock.
+    try std.testing.expect((try db.getTimestamp(alloc, "doc:c")) > 10 * std.time.ns_per_s);
+    try db.batch(.{ .document_version_scheme = .legacy, .writes = &.{.{ .key = "doc:d", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:d"));
     // Persisted advisory status affects compression and disk-usage reports too;
     // its timestamp must remain in the same runtime as the owning DB.
     vopr_io.monotonic_ns = 123 * std.time.ns_per_ms;
@@ -84389,14 +84392,16 @@ test "producer readiness cached graph relations survive metadata overwrite and r
             try std.testing.expectEqual(@as(usize, 1), edges.len);
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+    // Each primary revision needs fresh accepted producer provenance. Reopen
+    // must reuse that acceptance, without invoking the provider again.
+    try std.testing.expectEqual(@as(usize, 2), fake.extractor_calls);
     var reopened = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
     defer reopened.close();
     try reopened.runUntilIdle();
     const edges = try reopened.getEdges(alloc, config.name, "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
-    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.extractor_calls);
 }
 
 test "db graph artifact external node targets return ids without document hydration" {
@@ -85148,6 +85153,7 @@ test "db derived target advance does not skip unseen matching replay records" {
         \\}
         ,
     });
+    try db.addIndex(.{ .name = "unrelated_graph", .kind = .graph, .config_json = "{}" });
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -85173,9 +85179,16 @@ test "db derived target advance does not skip unseen matching replay records" {
         0,
         1,
     ));
-    try std.testing.expect(try canAdvanceDerivedToTargetAsync(
+    // Canonical resolution affects relation endpoints even without mention edges.
+    try std.testing.expect(!try canAdvanceDerivedToTargetAsync(
         db.async_context,
         .{ .name = "plain_relations_graph", .kind = .graph },
+        0,
+        1,
+    ));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "unrelated_graph", .kind = .graph },
         0,
         1,
     ));
@@ -86315,6 +86328,9 @@ test "db hierarchy cursor binds every unit artifact revision under its source" {
     // the unchanged first artifact must still be rejected because traversal is
     // bound to the complete source hierarchy revision.
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "z_units_v1"));
+    // Extraction reprocess admission is asynchronous; the cursor binds the
+    // published hierarchy, so settle its replacement before testing staleness.
+    try db.runUntilIdle();
     try std.testing.expectError(error.HierarchyCursorStale, db.search(alloc, .{
         .hierarchy_children = .{ .parent_id = "doc:a" },
         .return_mode = .unit,
@@ -119979,7 +119995,9 @@ test "db reverse graph probe rejects a deleted or replaced index incarnation" {
 }
 
 test "db graph indexed admission reuses compressed membership and honors cancellation and memory" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = try TestDirectory.init("graph-filter-budget");
     defer tmp.cleanup();
     var db = try DB.open(a, std.mem.span(tmp.path().ptr), .{});
@@ -143021,7 +143039,9 @@ test "db graph endpoint cleanup pages progress through row policy phases without
 }
 
 test "db graph endpoint cleanup pages weak sync has one page budget and full index drains" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const Capture = struct {
         calls: usize = 0,
         fn observe(ptr: *anyopaque, _: []const u8) !void {
@@ -145897,7 +145917,9 @@ test "db graph endpoint cleanup graph-only prepares reserve source ranges across
 }
 
 test "db graph endpoint cleanup pages Cypher preparation drains weak-sync hosted deletions" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var directory = try TestDirectory.init("cypher-hosted-prepare-cleanup");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });

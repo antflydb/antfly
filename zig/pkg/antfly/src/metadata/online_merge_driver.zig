@@ -170,6 +170,12 @@ fn validatePreparedFields(request: types.BatchRequest, comptime allowed: []const
             const actual = @field(request, reflected_name);
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (actual.len != 0) return error.OnlineMergeReceiptMismatch;
+            } else if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) {
+                // admit_current is an ingress sentinel, not a persisted effect.
+                // An absent wire field decodes as legacy for old commands.
+                // Neither changes these private controls; explicit document
+                // revision activation remains outside the prepared receipt.
+                if (actual != .admit_current and actual != .legacy) return error.OnlineMergeReceiptMismatch;
             } else if (!std.meta.eql(actual, @field(empty, reflected_name))) return error.OnlineMergeReceiptMismatch;
         }
     }
@@ -684,6 +690,9 @@ test "metadata transition driver online constructs every native checkpoint witho
         defer parsed.deinit(alloc);
         try validatePrepared(state, operation_kind, .{ .scope = state.scope, .request = parsed.req });
         var wrong = response;
+        wrong.request.?.document_version_scheme = .revision_v1;
+        try std.testing.expectError(error.OnlineMergeReceiptMismatch, validatePrepared(state, operation_kind, wrong));
+        wrong = response;
         wrong.request.?.merge_checkpoint.?.transition_id += 1;
         try std.testing.expectError(error.OnlineMergeReceiptMismatch, validatePrepared(state, operation_kind, wrong));
         wrong = response;

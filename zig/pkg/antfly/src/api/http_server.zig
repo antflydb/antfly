@@ -58862,10 +58862,10 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expectEqual(@as(usize, 2), aggregations.map.count());
     const version_stats = aggregations.map.get("version_stats").?;
     try std.testing.expectEqual(@as(?i64, 2), version_stats.count);
-    try std.testing.expectEqual(@as(?f32, 1), version_stats.min);
-    try std.testing.expectEqual(@as(?f32, 2), version_stats.max);
-    try std.testing.expectEqual(@as(?f32, 1.5), version_stats.avg);
-    try std.testing.expectEqual(@as(?f32, 3), version_stats.sum);
+    try std.testing.expectEqual(@as(?f64, 1), version_stats.min);
+    try std.testing.expectEqual(@as(?f64, 2), version_stats.max);
+    try std.testing.expectEqual(@as(?f64, 1.5), version_stats.avg);
+    try std.testing.expectEqual(@as(?f64, 3), version_stats.sum);
     const name_terms = aggregations.map.get("name_terms").?;
     try std.testing.expectEqual(@as(usize, 2), name_terms.buckets.?.len);
     try std.testing.expectEqualStrings("Alice", name_terms.buckets.?[0].key);
