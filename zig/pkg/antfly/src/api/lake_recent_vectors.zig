@@ -387,7 +387,7 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
             const hbc = local.storage_hbc_adapter;
             var hbc_config: hbc.HBCConfig = .{ .dims = archive.dims };
             hbc_config.metric = std.meta.stringToEnum(@TypeOf(hbc_config.metric), archive.metric) orelse return error.InvalidIndexConfig;
-            try dense.applyQuantizationJson(a, &hbc_config, archive.config_json);
+            try dense.applyStoredQuantization(a, &hbc_config, archive);
             var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), try std.fmt.allocPrint(out, "{s}/vectors", .{path}), .{ .flush_threshold = 8 * 1024 * 1024 });
             defer vectors.close();
             var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, hbc_config, .{});

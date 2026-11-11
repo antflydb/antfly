@@ -54,6 +54,18 @@ pub fn applyQuantizationJson(a: A, config: *local.storage_hbc_adapter.HBCConfig,
     try applyQuantization(config, parsed.value);
 }
 
+// v4 lake writers ignored quantization recipe fields and emitted the default
+// one-bit, unrotated codec. Preserve that actual representation on reopen.
+pub fn applyStoredQuantization(a: A, config: *local.storage_hbc_adapter.HBCConfig, root: Root) !void {
+    if (root.version >= 5) return applyQuantizationJson(a, config, root.config_json);
+    config.quantization_bits = 1;
+    config.quantization_refine = .near_cutoff;
+    config.use_random_ortho_trans = false;
+}
+pub fn canReuseQuantization(version: u16, desired: local.storage_hbc_adapter.HBCConfig) bool {
+    return version >= 5 or (desired.quantization_bits == 1 and !desired.use_random_ortho_trans and desired.quantization_refine == .near_cutoff);
+}
+
 pub const Root = struct {
     version: u16 = metadata_version,
     binding: local.serverless_segment_source_binding.Binding,
@@ -162,6 +174,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
         const configuration = configs.object.get(wanted.name).?;
         const whole_row = @import("lake_enrichment_units.zig").configured(configuration, "template") != null or !@import("lake_row_input_recipes.zig").configurationReusable(configuration);
+        const config = try local.api_table_index_config.parseIndexConfig(ca, wanted.name, public_config);
+        const normalized = try std.json.parseFromSliceLeaky(std.json.Value, ca, config.config_json, .{});
+        const dims = std.math.cast(u32, normalized.object.get("dims").?.integer) orelse return error.InvalidVectorDimensions;
+        const metric = normalized.object.get("metric").?.string;
+        const hbc = local.storage_hbc_adapter;
+        var options: hbc.HBCConfig = .{ .dims = dims };
+        options.metric = std.meta.stringToEnum(@TypeOf(options.metric), metric) orelse return error.InvalidIndexConfig;
+        try applyQuantization(&options, normalized);
         const recipe = try state.recipe(ca, table, public_config, if (whole_row) null else wanted.binding.column_bindings);
         var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.vector.vector_column, configs.object.get(wanted.name).?, provider.embedding_options);
         defer producer.deinit();
@@ -171,7 +191,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         } else null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (canReuseQuantization(root.version, options) and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try result.append(out, declaration);
                 continue;
             }
@@ -183,6 +203,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!rebuild.bindingsEqual(binding, previous_binding)) continue;
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (!std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) continue;
+            if (!canReuseQuantization(root.version, options)) continue;
             break root;
         } else null;
         if (provider.resume_work) |work| if (work.file != null and seed != null) {
@@ -210,14 +231,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer if (overlay) |candidate| candidate.release();
         const candidate_storage = if (overlay) |candidate| candidate.storage() else null;
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 256 * 1024 * 1024 };
-        const config = try local.api_table_index_config.parseIndexConfig(ca, wanted.name, public_config);
-        const normalized = try std.json.parseFromSliceLeaky(std.json.Value, ca, config.config_json, .{});
-        const dims = std.math.cast(u32, normalized.object.get("dims").?.integer) orelse return error.InvalidVectorDimensions;
-        const metric = normalized.object.get("metric").?.string;
-        const hbc = local.storage_hbc_adapter;
-        var options: hbc.HBCConfig = .{ .dims = dims };
-        options.metric = std.meta.stringToEnum(@TypeOf(options.metric), metric) orelse return error.InvalidIndexConfig;
-        try applyQuantization(&options, normalized);
         var build_cancellation: BuildCancellation = .{ .token = cancellation, .provider = provider };
         var build_options: ?hbc.HBCIndex.SpoolBuildOptions = null;
         if (@import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build")) |algorithm| {

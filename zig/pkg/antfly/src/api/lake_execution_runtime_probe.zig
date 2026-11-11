@@ -272,7 +272,7 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     var vectors = try local.storage_lsm_backend.Backend.open(a, "/parquet-bulk/vectors", .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
     defer vectors.close();
     var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = @intCast(dims), .max_cached_nodes = 256, .max_cached_vectors = 0, .max_cached_metadata = 0 };
-    try dense.applyQuantizationJson(a, &config, root.config_json);
+    try dense.applyStoredQuantization(a, &config, root);
     config.metric = std.meta.stringToEnum(@TypeOf(config.metric), root.metric) orelse return error.InvalidProbeWorkload;
     var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/parquet-bulk", config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
     defer index.close();

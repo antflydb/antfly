@@ -202,7 +202,7 @@ pub const Entry = struct {
             const index = try a.create(local.storage_hbc_adapter.HBCIndex);
             var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = root.dims };
             config.metric = std.meta.stringToEnum(@TypeOf(config.metric), root.metric) orelse return error.InvalidNativeLakeDenseRoot;
-            try dense.applyQuantizationJson(a, &config, root.config_json);
+            try dense.applyStoredQuantization(a, &config, root);
             index.* = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(self.budget.allocator(), path, config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
             errdefer index.close();
             index.setIo(server.embedding_provider_runtime.io);

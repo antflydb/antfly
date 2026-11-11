@@ -203,7 +203,7 @@ fn testNativeExecution(typed_vectors: bool) !void {
         defer vectors.close();
         var loader: native.VectorLoader = .{ .backend = &vectors, .dims = 2 };
         var hbc_config: local.storage_hbc_adapter.HBCConfig = .{ .dims = 2 };
-        try native.applyQuantizationJson(a, &hbc_config, root.config_json);
+        try native.applyStoredQuantization(a, &hbc_config, root);
         try std.testing.expectEqual(@as(u8, if (typed_vectors) 4 else 1), hbc_config.quantization_bits);
         var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/published-bulk", hbc_config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
         defer index.close();
@@ -369,4 +369,17 @@ test "external lake execution dense quantization reconstructs defaults and rejec
     for ([_][]const u8{ "{\"quantization_bits\":0}", "{\"quantization_bits\":9}", "{\"quantization_bits\":true}", "{\"quantization_refine\":\"invalid\"}", "{\"use_random_ortho_trans\":1}" }) |json| {
         try std.testing.expectError(error.InvalidIndexConfig, dense.applyQuantizationJson(std.testing.allocator, &config, json));
     }
+}
+
+test "external lake execution legacy quantization reopens actual codec and rebuilds changed options" {
+    const dense = @import("lake_index_native_dense.zig");
+    var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = 768 };
+    const root: dense.Root = .{ .version = 4, .binding = undefined, .config_json = "{\"quantization_bits\":4,\"quantization_refine\":\"all\"}", .dims = 768, .metric = "l2_squared", .generation = undefined };
+    try dense.applyStoredQuantization(std.testing.allocator, &config, root);
+    try std.testing.expectEqual(@as(u8, 1), config.quantization_bits);
+    try std.testing.expect(!config.use_random_ortho_trans);
+    try std.testing.expect(dense.canReuseQuantization(4, config));
+    try dense.applyQuantizationJson(std.testing.allocator, &config, root.config_json);
+    try std.testing.expect(!dense.canReuseQuantization(4, config));
+    try std.testing.expect(dense.canReuseQuantization(5, config));
 }

@@ -34,7 +34,10 @@ omitted.
 Quantization settings remain part of the generation recipe. Build, archived
 mutation, and serving reopen all reconstruct `quantization_bits` and
 `quantization_refine`. Multi-bit quantization enables the required deterministic
-rotation; exact reranking continues to use original coordinates.
+rotation; exact reranking continues to use original coordinates. Version 4
+lake writers ignored these recipe fields, so those generations reopen with
+their actual one-bit, unrotated defaults. A rebuild requesting nondefault
+quantization cannot seed from such a generation.
 
 The input allowance counts vector bytes and 128 identity bytes per member. It
 defaults to 512 MiB. Generation output has twice that allowance. Identity tracking uses the same
