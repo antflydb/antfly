@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -94,18 +95,21 @@ func (c *GoogleConnector) CheckGCSAccessBatch(ctx context.Context, r Request, it
 	for i, item := range items {
 		part, err := reader.NextPart()
 		if err != nil {
-			return nil, fmt.Errorf("read GCS metadata batch response: %w", err)
+			return nil, gcsBatchReadError(err)
 		}
 		if part.Header.Get("Content-ID") != "<response-"+strconv.Itoa(i)+">" {
 			return nil, fmt.Errorf("mismatched GCS metadata batch response")
 		}
 		reply, err := http.ReadResponse(bufio.NewReader(part), nil)
 		if err != nil {
-			return nil, err
+			return nil, gcsBatchReadError(err)
 		}
 		results[i] = checkGCSAccessReply(reply, item)
 	}
-	if _, err := reader.NextPart(); err != io.EOF {
+	if part, err := reader.NextPart(); err != io.EOF {
+		if part == nil && err != nil {
+			return nil, gcsBatchReadError(err)
+		}
 		return nil, fmt.Errorf("unexpected trailing GCS metadata batch response")
 	}
 	return results, nil
@@ -120,7 +124,7 @@ func checkGCSAccessReply(reply *http.Response, item Item) error {
 		Generation string `json:"generation"`
 	}
 	if err := json.NewDecoder(io.LimitReader(reply.Body, 4096)).Decode(&object); err != nil {
-		return err
+		return gcsBatchReadError(err)
 	}
 	if object.Generation != item.Revision {
 		return &RevisionChangedError{Expected: item.Revision, Actual: object.Generation}
@@ -140,4 +144,13 @@ func gcsBatchBoundary(contentType string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("invalid GCS metadata batch response")
+}
+
+// A short response is inconclusive. Keep malformed MIME and mismatched
+// identities as verification errors, distinct from interruptions.
+func gcsBatchReadError(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("incomplete GCS metadata batch: %w", io.ErrUnexpectedEOF)
+	}
+	return fmt.Errorf("read GCS metadata batch response: %w", err)
 }

@@ -239,6 +239,10 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 			if _, err := strconv.ParseInt(item.Generation, 10, 64); err != nil {
 				return fmt.Errorf("invalid GCS generation")
 			}
+			// Console-created directory markers are not source documents.
+			if size == 0 && strings.HasSuffix(item.Name, "/") {
+				continue
+			}
 			canonical := "gs://" + config.Bucket + "/" + escapeSourcePath(item.Name)
 			// item.Name is the full bucket object name, including config.Prefix
 			// when the source is scoped to one; strip it so the relative key

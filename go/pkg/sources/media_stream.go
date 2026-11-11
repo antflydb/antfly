@@ -357,11 +357,11 @@ func parseMediaRanges(header string, size int64) ([]MediaRange, error) {
 // VerifyMediaDigest streams original bytes with bounded memory and requires both
 // the exact length and the connector's successful Close/version postconditions.
 func VerifyMediaDigest(ctx context.Context, media MediaConnector, request Request, item Item) (string, error) {
-	if media == nil || item.Size < 1 {
-		return "", fmt.Errorf("%w: invalid media representation", ErrInvalidInput)
+	if media == nil {
+		return "", fmt.Errorf("%w: media connector required", ErrInvalidInput)
 	}
-	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || (configString(item.Metadata, "export_mime_type") != "" && !validContentSHA(configString(item.Metadata, "representation_sha256"))) {
-		return "", fmt.Errorf("%w: original binary representation required", ErrInvalidInput)
+	if err := ValidateMediaRepresentation(item); err != nil {
+		return "", err
 	}
 	if err := media.CheckMedia(ctx, request, item); err != nil {
 		return "", mediaProviderError(err)
@@ -383,6 +383,17 @@ func VerifyMediaDigest(ctx context.Context, media MediaConnector, request Reques
 		return "", io.ErrUnexpectedEOF
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// ValidateMediaRepresentation checks eligibility without reading the body.
+func ValidateMediaRepresentation(item Item) error {
+	if item.Size < 1 {
+		return fmt.Errorf("%w: invalid media representation", ErrInvalidInput)
+	}
+	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || (configString(item.Metadata, "export_mime_type") != "" && !validContentSHA(configString(item.Metadata, "representation_sha256"))) {
+		return fmt.Errorf("%w: original binary representation required", ErrInvalidInput)
+	}
+	return nil
 }
 
 // ValidateMediaInventory proves that an entire selected representation inventory
