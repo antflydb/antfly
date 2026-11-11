@@ -767,6 +767,15 @@ func writeJSON(path string, value any, limit int64) error {
 // Drive media uses the same inventory, access checks and revision-checked binary
 // reads as GoogleConnector, bypassing collaboration's text/OCR extraction.
 func publicationConnector(connector Connector, source Source) (Connector, error) {
+	if connector.Provider() == ProviderGCS {
+		config, err := decodeSourceConfig[GoogleConfig](source.Config)
+		if err != nil {
+			return nil, err
+		}
+		if err := ValidatePageProvenancePublication(connector.Provider(), config, source.Publication); err != nil {
+			return nil, err
+		}
+	}
 	if source.Publication == "text" {
 		return connector, nil
 	}

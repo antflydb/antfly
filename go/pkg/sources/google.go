@@ -76,6 +76,9 @@ func (c *GoogleConnector) Validate(_ context.Context, r Request) error {
 	if r.Mode != ImportModeSource {
 		return fmt.Errorf("%w: Google sources require source mode and a matching connection", ErrInvalidInput)
 	}
+	if config.PageProvenance && c.ProviderName != ProviderGCS {
+		return fmt.Errorf("%w: page provenance requires GCS", ErrInvalidInput)
+	}
 	if config.MaxObjects < 0 || config.MaxObjects > maxImportSourceObjects {
 		return fmt.Errorf("%w: invalid max_objects", ErrInvalidInput)
 	}
@@ -528,19 +531,12 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 	if err != nil {
 		return err
 	}
-	if o.Revision == "" || configString(o.Metadata, "bucket") != config.Bucket {
-		return fmt.Errorf("invalid pinned GCS source")
-	}
-	if _, err := strconv.ParseUint(o.Revision, 10, 64); err != nil {
-		return fmt.Errorf("invalid pinned GCS generation")
+	path, err := gcsObjectAccessPath(config, o)
+	if err != nil {
+		return err
 	}
 	var object struct {
 		Generation string `json:"generation"`
-	}
-	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(o.Path) + "?generation=" + url.QueryEscape(o.Revision) + "&ifGenerationMatch=" + url.QueryEscape(o.Revision) + "&fields=generation"
-	path, err = gcsMetadataFence(path, config, o)
-	if err != nil {
-		return err
 	}
 	if err := c.get(ctx, client, path, &object); err != nil {
 		return err
@@ -637,4 +633,25 @@ func gcsMetadataFence(path string, config GoogleConfig, item Item) (string, erro
 		return "", fmt.Errorf("%w: missing GCS page metadata revision; start a new sync", ErrInvalidInput)
 	}
 	return path + "&ifMetagenerationMatch=" + url.QueryEscape(meta), nil
+}
+
+// ValidatePageProvenancePublication applies to both Cloud and self-hosted sources.
+func ValidatePageProvenancePublication(provider string, config GoogleConfig, publication string) error {
+	if config.PageProvenance && (provider != ProviderGCS || publication != "text") {
+		return fmt.Errorf("%w: page_provenance requires a GCS source with text publication", ErrInvalidInput)
+	}
+	return nil
+}
+
+func gcsObjectAccessPath(config GoogleConfig, item Item) (string, error) {
+	if configString(item.Metadata, "bucket") != config.Bucket {
+		return "", fmt.Errorf("%w: invalid pinned GCS source", ErrInvalidInput)
+	}
+	if generation, err := strconv.ParseUint(item.Revision, 10, 64); err != nil || generation == 0 {
+		return "", fmt.Errorf("%w: invalid pinned GCS generation", ErrInvalidInput)
+	}
+	generation := url.QueryEscape(item.Revision)
+	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(item.Path) +
+		"?generation=" + generation + "&ifGenerationMatch=" + generation + "&fields=generation"
+	return gcsMetadataFence(path, config, item)
 }
