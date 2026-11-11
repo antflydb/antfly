@@ -14839,9 +14839,20 @@ const ManifestBuilder = struct {
     /// against it.
     reserved_page: ?u64 = null,
 
-    fn deinit(self: *ManifestBuilder, allocator: Allocator) void {
-        self.entries.deinit(allocator);
-        self.reused_pages.deinit(allocator);
+    /// `entries`/`reused_pages` always use `std.heap.page_allocator`,
+    /// never a caller-supplied allocator (see `reserveCapacity`'s doc
+    /// comment for why: this struct's own, intentional "ran out of
+    /// reserved room, fall back to the presynced two-sync path" shape is
+    /// indistinguishable from a real allocation failure to
+    /// `std.testing.checkAllAllocationFailures`' exhaustive sweep, the same
+    /// reason `inode_lock.zig`'s process-wide registry fixes on
+    /// `page_allocator` instead of a caller's). Both call sites still take
+    /// an `allocator` parameter for API continuity (and because dropping it
+    /// everywhere would be a larger, riskier mechanical change); it is
+    /// otherwise unused.
+    fn deinit(self: *ManifestBuilder, _: Allocator) void {
+        self.entries.deinit(std.heap.page_allocator);
+        self.reused_pages.deinit(std.heap.page_allocator);
     }
 
     /// Reserve room for `additional` more `note` calls before the page
@@ -14855,9 +14866,21 @@ const ManifestBuilder = struct {
     /// A reservation failure here is still the same safe fallback, just made
     /// explicitly, at the one place capacity is actually grown, rather than
     /// implicitly inside every subsequent `put`.
-    fn reserveCapacity(self: *ManifestBuilder, allocator: Allocator, additional: u32) void {
+    ///
+    /// That fix alone turned out not to be enough: moving *which* call
+    /// catches the failure doesn't change *what* it catches it from --
+    /// `entries`/`reused_pages` still grew through the caller's (test-
+    /// wrapped, in `checkAllAllocationFailures`' sweep) allocator, so a
+    /// deliberately benign overflow and a real induced `OutOfMemory` were
+    /// still the same event as far as the sweep could tell. See `deinit`'s
+    /// doc comment: both hashmaps now always grow through
+    /// `std.heap.page_allocator` instead, so nothing on this path is ever
+    /// subject to that sweep at all, and `self.overflowed = true` here is
+    /// unambiguously "this window's own bounded capacity, not memory,
+    /// ran out."
+    fn reserveCapacity(self: *ManifestBuilder, _: Allocator, additional: u32) void {
         if (self.overflowed) return;
-        self.entries.ensureUnusedCapacity(allocator, additional) catch {
+        self.entries.ensureUnusedCapacity(std.heap.page_allocator, additional) catch {
             self.overflowed = true;
         };
     }
@@ -14879,9 +14902,11 @@ const ManifestBuilder = struct {
     /// flush. Reserves capacity for the whole merge up front (see
     /// `reserveCapacity`'s doc comment) instead of risking an ordinary
     /// `put` failure reading as this window simply overflowing.
-    fn noteReused(self: *ManifestBuilder, allocator: Allocator, reused: *const std.AutoHashMapUnmanaged(u64, void)) !void {
+    fn noteReused(self: *ManifestBuilder, _: Allocator, reused: *const std.AutoHashMapUnmanaged(u64, void)) !void {
         if (self.overflowed) return;
-        self.reused_pages.ensureUnusedCapacity(allocator, reused.count()) catch {
+        // See `deinit`'s doc comment: always page_allocator, never the
+        // passed-in (possibly test-wrapped) allocator.
+        self.reused_pages.ensureUnusedCapacity(std.heap.page_allocator, reused.count()) catch {
             self.overflowed = true;
             return;
         };
