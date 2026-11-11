@@ -358,6 +358,10 @@ test "SQL phase outputs preserve grouping and child cardinality diagnostics" {
 }
 
 test "SQL phase outputs release every allocation with prepared grouped demand" {
+    // Retain leak/safety checks and every fault position without collecting
+    // allocation/free stack traces on the successful allocation path.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
     const Faults = struct {
         fn run(a: std.mem.Allocator) !void {
             var backend: Backend = .{};
@@ -370,7 +374,7 @@ test "SQL phase outputs release every allocation with prepared grouped demand" {
             try std.testing.expectEqualStrings("5", result.output.rows[0][1].string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), Faults.run, .{});
 }
 
 test "SQL row bounds validate negative parameters at execution in their own domain" {

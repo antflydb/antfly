@@ -48,6 +48,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     const probe = b.addExecutable(.{ .name = "lake-execution-runtime-probe", .root_module = runtime_module, .max_rss = 12 * 1024 * 1024 * 1024, .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result) });
     probe.root_module.linkLibrary(archive);
     imports.build_info.link(probe.root_module);
+    b.step("lake-execution-runtime-probe-build", "Build and install the non-test lake runtime probe").dependOn(&b.addInstallArtifact(probe, .{}).step);
     b.step("lake-execution-runtime-probe", "Compare non-test source/native whole-attempt timings, quota peaks and artifact/cache reuse").dependOn(&b.addRunArtifact(probe).step);
     const run = tests.run(b);
     b.step("lake-execution-abi-integration-test", "Run complete lake builds across independently compiled error and executor domains").dependOn(&run.step);

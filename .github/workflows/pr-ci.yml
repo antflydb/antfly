@@ -105,6 +105,11 @@ jobs:
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
   sdks:
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'sdks')
     uses: ./.github/workflows/sdks-ci.yml

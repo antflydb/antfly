@@ -1017,8 +1017,10 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         config = _resolver_graph("knowledge", "concepts")
         config["resolvers"][0]["promote"] = True
         db.add_index(config)
-        # Durable Lite resolver projection work requires reader epoch 15.
-        assert db.capabilities()["minimum_reader_version"] == 15
+        # Durable resolver projection needs at least epoch 15; subsequent
+        # resolver features may raise that floor. The historical reader must
+        # still reject the database, checked below against its real library.
+        assert db.capabilities()["minimum_reader_version"] >= 15
     # Hosted maintenance leaves the shadow pending deterministically. The old
     # writer must fail open before it can truncate the retained journal.
     with antfly_embedded.create_hosted(pending) as db:

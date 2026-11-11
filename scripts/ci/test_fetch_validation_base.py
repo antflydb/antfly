@@ -219,6 +219,7 @@ class ValidationBaseTests(unittest.TestCase):
         with (
             patch.object(previous.subprocess, "run") as run,
             patch.object(previous, "prepare_previous_reader_build"),
+            patch.object(previous, "prepare_previous_reader_dependencies"),
             patch.object(previous.Path, "exists", return_value=False),
             patch.object(previous.Path, "is_file", return_value=True),
         ):

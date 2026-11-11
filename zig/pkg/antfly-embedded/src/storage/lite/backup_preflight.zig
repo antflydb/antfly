@@ -1994,7 +1994,11 @@ test "backup preflight grouped PDF embedding uses runtime unit text" {
     const group_json = try std.json.Stringify.valueAlloc(a, group, .{});
     defer a.free(group_json);
     const producer = "{\"version\":2,\"provider\":\"antfly\",\"model\":\"mock\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}";
-    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "pages", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .embedding_input = .pdf_page_images, .expected_dims = 3, .producer_json = producer });
+    // Older catalogs can contain PDF consumers of grouped text chunks.
+    // Inspect their live source dependencies even though current declaration
+    // admission correctly requires an original document for rasterization.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "pages", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .embedding_input = .pdf_page_images, .expected_dims = 3, .producer_json = producer }));
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "pages", .kind = .embedding, .field = "body", .embedding_input = .pdf_page_images, .expected_dims = 3, .producer_json = producer });
     const projected = try std.json.parseFromSlice(Value, a, "{\"_group_unit\":{\"text\":\"file:///private/group.pdf\"}}", .{});
     defer projected.deinit();
     try std.testing.expectEqualStrings("file:///private/group.pdf", enrichment_types.sourceFieldValue(projected.value, "_group_unit.text", true).string);

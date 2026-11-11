@@ -52,6 +52,23 @@ class SdkCiContractTests(unittest.TestCase):
         self.assertIn("actions: read", auth)
         self.assertNotIn("id-token: write", auth)
 
+    def test_native_dependencies_use_immutable_policy_before_native_checks(
+        self,
+    ) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/sdks-ci.yml").read_text()
+        policy = workflow.index("- name: Check out executing dependency policy")
+        prepare = workflow.index("- name: Prepare verified Zig source dependencies")
+        native = workflow.index("- name: Install glibc-linked Zig for native checks")
+        self.assertLess(native, policy)
+        self.assertLess(policy, prepare)
+        self.assertLess(prepare, workflow.index("- name: Check memory"))
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow[policy:prepare])
+        self.assertIn("persist-credentials: false", workflow[policy:prepare])
+        self.assertIn(
+            "uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies",
+            workflow[prepare:],
+        )
+
     def test_zig_consumers_have_one_matching_compiler_for_every_scope(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/sdks-ci.yml").read_text()
         steps = dict(
@@ -79,16 +96,23 @@ class SdkCiContractTests(unittest.TestCase):
                 for alternative in condition[1].split("||")
             )
 
-        scopes = ("sdk", "memory", "release", "format_zig")
+        scopes = ("sdk", "memory", "sources", "release", "format_zig")
         for flags in itertools.product((False, True), repeat=len(scopes)):
             active = {scope for scope, flag in zip(scopes, flags) if flag}
             with self.subTest(scopes=sorted(active)):
-                compiling = bool(active & {"sdk", "memory", "release"})
+                compiling = bool(active & {"sdk", "memory", "sources", "release"})
                 nix = enabled("Install Nix for native checks", active)
                 native = enabled("Install glibc-linked Zig for native checks", active)
                 formatting = enabled("Set up Zig for formatting", active)
                 self.assertEqual(nix, compiling)
                 self.assertEqual(native, compiling)
+                self.assertEqual(
+                    enabled("Check out executing dependency policy", active), compiling
+                )
+                self.assertEqual(
+                    enabled("Prepare verified Zig source dependencies", active),
+                    compiling,
+                )
                 self.assertEqual(formatting, "format_zig" in active and not compiling)
                 for consumer in (
                     "Check SDKs",

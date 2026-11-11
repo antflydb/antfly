@@ -10242,7 +10242,11 @@ test "external lake leased sort payloads retain physical columns across spill an
 }
 
 test "SQL shared spill runs retain balanced tiers independently of descriptor caps" {
-    const a = std.testing.allocator;
+    // Retain leak/safety checks and every fault position without collecting
+    // allocation/free stack traces on the successful allocation path.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     var state: u8 = 0;
     var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &state, .checkpoint = struct {
         fn check(_: *anyopaque) !void {}
