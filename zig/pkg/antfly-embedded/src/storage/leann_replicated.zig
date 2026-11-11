@@ -272,6 +272,7 @@ pub const ReplicatedState = struct {
     fetcher: ?replica_mod.GenerationFetcher = null,
 
     pub fn init(alloc: Allocator, opts: Options) !ReplicatedState {
+        if (opts.transient and opts.replica.config.quantizer != .rabitq) return error.InvalidIndexConfig;
         return .{ .alloc = alloc, .opts = opts, .replica = try replica_mod.Replica.init(alloc, opts.replica) };
     }
 
@@ -523,7 +524,17 @@ pub const ReplicatedState = struct {
         loader: VectorLoader,
 
         fn keyLoader(self: *KeyLoader) replica_mod.VectorLoader {
-            return .{ .ctx = self, .load = load, .load_batch = if (self.loader.load_batch != null) loadBatch else null };
+            return .{
+                .ctx = self,
+                .load = load,
+                .load_batch = if (self.loader.load_batch != null) loadBatch else null,
+                .bounds_current = if (self.state.dirty.count() != 0) boundsCurrent else null,
+            };
+        }
+
+        fn boundsCurrent(raw: *anyopaque, key: []const u8) bool {
+            const self: *const KeyLoader = @ptrCast(@alignCast(raw));
+            return !self.state.dirty.contains(key);
         }
 
         fn loadBatch(raw: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void {
@@ -1130,7 +1141,7 @@ test "leann replicated state: a new replica bootstraps from the first build's re
 test "leann replicated state: replaying stubs after a recovery install keeps live keys" {
     const alloc = testing.allocator;
     const dims = 8;
-    const opts = Options{ .replica = .{ .config = .{ .dims = dims, .max_degree = 8 }, .build_threshold = 20 }, .transient = true };
+    const opts = Options{ .replica = .{ .config = .{ .dims = dims, .max_degree = 8, .quantizer = .rabitq }, .build_threshold = 20 }, .transient = true };
     var leader = try ReplicatedState.init(alloc, opts);
     defer leader.deinit();
     var primary = TestPrimary{ .alloc = alloc };
@@ -1268,13 +1279,26 @@ test "leann replicated state: search honors the index's tuning settings" {
     const Counting = struct {
         primary: TestPrimary,
         loads: usize = 0,
+        batches: usize = 0,
         fn loader(self: *@This()) VectorLoader {
-            return .{ .ctx = self, .load = load };
+            return .{ .ctx = self, .load = load, .load_batch = loadBatch };
         }
         fn load(raw: *anyopaque, a: Allocator, vector_id: u64, key: []const u8) anyerror![]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.loads += 1;
             return TestPrimary.load(&self.primary, a, vector_id, key);
+        }
+        fn loadBatch(raw: *anyopaque, _: Allocator, ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            for (ids, metadata, found, 0..) |id, key, *present, slot| {
+                present.* = false;
+                if (key.len == 0) continue;
+                self.loads += 1;
+                const vector = self.primary.vectors.get(id) orelse continue;
+                @memcpy(out[slot * dims ..][0..dims], vector);
+                present.* = true;
+            }
         }
     };
     var counting = Counting{ .primary = .{ .alloc = alloc } };
@@ -1360,6 +1384,27 @@ test "leann replicated state: search honors the index's tuning settings" {
     try testing.expectEqual(@as(u32, 0), stats.expanded);
     try testing.expectEqual(@as(u32, 17), stats.approx_evaluated);
     try testing.expect(counting.loads <= transient_ids.len);
+
+    // The primary has the rewrite while the graph still has the old code.
+    const updated: [dims]f32 = @splat(100);
+    try counting.primary.put(7, &updated);
+    try state.noteWrites(&[_]TestItem{.{ .vector_id = 7, .vector = &updated, .metadata = "k007" }}, &.{});
+    try testing.expect(state.dirty.contains("k007"));
+    counting.loads = 0;
+    counting.batches = 0;
+    var rewritten = try state.searchWithStats(alloc, .{
+        .query = &updated,
+        .k = 3,
+        .filter_ids = &transient_ids,
+        .distance_under = 0.001,
+    }, &stats);
+    defer rewritten.deinit();
+    try testing.expectEqual(@as(usize, 1), rewritten.getHits().len);
+    try testing.expectEqual(@as(u64, 7), rewritten.getHits()[0].vector_id);
+    try testing.expectEqual(@as(f32, 0), rewritten.getHits()[0].distance);
+    try testing.expectEqual(@as(u32, 0), stats.expanded);
+    try testing.expectEqual(@as(usize, 1), counting.loads);
+    try testing.expectEqual(@as(usize, 1), counting.batches);
 }
 
 test "leann replicated state: randomized replication simulation" {

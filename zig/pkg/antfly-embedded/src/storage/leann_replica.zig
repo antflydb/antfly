@@ -57,6 +57,7 @@ pub const Options = struct {
 /// Loads the exact vector for a key (the stored embedding). Used only by
 /// the planner and by generation builds.
 pub const VectorLoader = struct {
+    bounds_current: ?*const fn (*anyopaque, []const u8) bool = null,
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8) anyerror![]f32,
     /// Optional batch form: fills `out[i * dims ..]` for each key and sets
@@ -695,11 +696,11 @@ pub const Replica = struct {
         if (direct_keys) |keys| {
             for (keys) |key| {
                 const slot = self.bufferIndex(key) orelse continue;
-                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, &hits);
+                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, loader, &hits);
             }
         } else {
             for (0..self.buffer_keys.items.len) |slot| {
-                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, &hits);
+                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, loader, &hits);
             }
         }
         if (self.index) |*index| {
@@ -759,14 +760,24 @@ pub const Replica = struct {
         return hits.toOwnedSlice(alloc);
     }
 
-    fn scoreBufferHit(self: *const Replica, alloc: Allocator, query: []const f32, scratch: []f32, slot: usize, filter: ?KeyFilter, hits: *std.ArrayListUnmanaged(Hit)) !void {
+    fn scoreBufferHit(self: *const Replica, alloc: Allocator, query: []const f32, scratch: []f32, slot: usize, filter: ?KeyFilter, loader: VectorLoader, hits: *std.ArrayListUnmanaged(Hit)) !void {
         const key = self.buffer_keys.items[slot];
         if (filter) |f| {
             if (f.cancelled(f.ctx)) return error.Cancelled;
             if (!try f.allows(f.ctx, key)) return;
         }
         const metric = self.opts.config.metric;
-        @memcpy(scratch, self.buffer_vectors.items[slot]);
+        const current = if (loader.bounds_current) |check| blk: {
+            if (check(loader.ctx, key)) break :blk null;
+            break :blk loader.load(loader.ctx, alloc, key) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+        } else null;
+        defer if (current) |vector| alloc.free(vector);
+        const vector = current orelse self.buffer_vectors.items[slot];
+        if (vector.len != scratch.len) return error.DimensionMismatch;
+        @memcpy(scratch, vector);
         if (metric == .cosine) normalize(scratch);
         const dist = leann.distance(metric, query, scratch);
         if (!std.math.isFinite(dist)) return;
@@ -872,7 +883,16 @@ pub const Replica = struct {
         far_from: ?[]const f32,
 
         fn source(self: *PlanSource) leann.EmbeddingSource {
-            return .{ .ctx = self, .recompute_fn = recompute };
+            return .{
+                .ctx = self,
+                .recompute_fn = recompute,
+                .bounds_current = if (self.loader.bounds_current != null) boundsCurrent else null,
+            };
+        }
+
+        fn boundsCurrent(raw: *anyopaque, id: u32) bool {
+            const self: *PlanSource = @ptrCast(@alignCast(raw));
+            return self.loader.bounds_current.?(self.loader.ctx, self.replica.keys.items[id]);
         }
 
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) anyerror!void {

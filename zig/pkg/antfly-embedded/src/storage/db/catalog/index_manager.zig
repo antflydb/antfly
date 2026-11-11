@@ -19456,6 +19456,7 @@ pub const IndexManager = struct {
 
         const query_measure = vector_mod.norm(req.query);
         var vectors_scored: u64 = 0;
+        var matching_vectors: usize = 0;
         const vectors_stored_externally = entry.vector_loader_context != null and
             self.primary_store != null and
             entry.index.hasExternalVectorLoader();
@@ -19554,6 +19555,7 @@ pub const IndexManager = struct {
                         if (req.distance_over) |threshold| if (distance <= threshold) continue;
                         if (req.distance_under) |threshold| if (distance >= threshold) continue;
                         const owned_metadata = if (maybe_doc_key) |doc_key| try self.alloc.dupe(u8, doc_key) else null;
+                        matching_vectors += 1;
                         results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
                     }
                 }
@@ -19609,6 +19611,7 @@ pub const IndexManager = struct {
                 if (req.distance_over) |threshold| if (distance <= threshold) continue;
                 if (req.distance_under) |threshold| if (distance >= threshold) continue;
                 const owned_metadata = if (doc_key) |resolved_doc_key| try self.alloc.dupe(u8, resolved_doc_key) else null;
+                matching_vectors += 1;
                 results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
             }
         }
@@ -19618,6 +19621,7 @@ pub const IndexManager = struct {
             exact_profile.raw_scalar_reads +|= session.raw_scalar_reads;
         }
         results.sort();
+        results.candidate_coverage = if (matching_vectors > results.getHits().len) .more else .exhausted;
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
             std.log.info("antfly_bench_dense_exact_filter index={s} candidates={d} hits={d} batches={d} batch_reads={d} scalar_reads={d} missing={d}", .{
                 entry.config.name,
@@ -46688,6 +46692,7 @@ test "production external scorers use bounded cache-first artifact batches" {
         .key_predicate = .{ .ptr = &residual, .allows = Residual.allows },
     });
     defer filtered.results.deinit();
+    try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
     try std.testing.expectEqual(@as(u64, 1), filtered.vectors_scored);
     try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
     try std.testing.expectEqual(candidate_ids[far_query_idx], filtered.results.getHits()[0].vector_id);
@@ -52559,6 +52564,27 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             try std.testing.expect(embedder.documents - before < 64);
         }
         try std.testing.expect(embedder.calls < embedder.documents);
+
+        // Cross the tiny exact limit with a sparse allowlist of elided rows.
+        // The production loader must re-embed only selected candidates.
+        var allowlist: [17]u64 = undefined;
+        for (&allowlist, 0..) |*id, i| {
+            id.* = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[i])) orelse return error.TestUnexpectedResult;
+        }
+        const before_filtered = embedder.documents;
+        var filtered = try entry.index.searchProfiledRequest(.{
+            .query = &vectors[5],
+            .k = 3,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        });
+        defer filtered.results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
+        try std.testing.expectEqual(allowlist[5], filtered.results.getHits()[0].vector_id);
+        try std.testing.expectEqual(@as(u64, 0), filtered.profile.nodes_visited);
+        try std.testing.expectEqual(@as(u64, allowlist.len), filtered.profile.approx_vectors_scored);
+        try std.testing.expect(embedder.documents > before_filtered);
+        try std.testing.expect(embedder.documents - before_filtered <= allowlist.len);
 
         // Deleting a quarter rebuilds from codes on sync: nothing re-embedded.
         var deleted: [n / 4][]const u8 = undefined;

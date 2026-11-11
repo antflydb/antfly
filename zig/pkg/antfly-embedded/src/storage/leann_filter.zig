@@ -92,6 +92,7 @@ test "sparse allowlists use bounded direct work on either side of the exact cuto
         defer filter.deinit(alloc);
         try std.testing.expectEqual(if (count <= 64) Filter.DirectMode.exact else .bounds, filter.directMode(768, 1_000_000, false, true));
         try std.testing.expectEqual(if (count <= 16) Filter.DirectMode.exact else .bounds, filter.directMode(768, 1_000_000, true, true));
+        if (count == 65) try std.testing.expectEqual(Filter.DirectMode.exact, filter.directMode(768, 1_000_000, false, false));
         if (count == 65) try std.testing.expectEqual(Filter.DirectMode.graph, filter.directMode(768, 300, false, true));
     }
 }

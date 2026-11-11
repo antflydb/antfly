@@ -145,6 +145,13 @@ pub const EmbeddingSource = struct {
     ctx: *anyopaque,
     recompute_fn: *const fn (ctx: *anyopaque, ids: []const u32, out: []f32) anyerror!void,
 
+    /// Reports whether an exact load will return the revision encoded in the graph.
+    bounds_current: ?*const fn (*anyopaque, u32) bool = null,
+
+    fn boundsCurrent(self: EmbeddingSource, id: u32) bool {
+        return if (self.bounds_current) |check| check(self.ctx, id) else true;
+    }
+
     pub fn recompute(self: EmbeddingSource, ids: []const u32, out: []f32) !void {
         return self.recompute_fn(self.ctx, ids, out);
     }
@@ -801,7 +808,7 @@ pub const Index = struct {
                     const estimates = try approx.score(eligible[0..count]);
                     stats.approx_evaluated += @intCast(count);
                     for (eligible[0..count], estimates) |id, estimate| {
-                        try self.enqueueFiltered(alloc, &work, id, estimate, opts.bound_scale, filter.distance_under, approx.query_radius);
+                        try self.enqueueFiltered(alloc, source, &work, id, estimate, opts.bound_scale, filter, approx.query_radius);
                     }
                     offset = end;
                 }
@@ -830,7 +837,7 @@ pub const Index = struct {
             visited.set(start);
             stats.approx_evaluated += 1;
             try frontier.push(alloc, .{ .id = start, .dist = first.dist });
-            try self.offerFiltered(alloc, filter, &work, start, first, opts.bound_scale, approx.query_radius);
+            try self.offerFiltered(alloc, source, filter, &work, start, first, opts.bound_scale, approx.query_radius);
 
             const default_ef: u32 = if (self.rabitq != null) 512 else 64;
             var budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
@@ -858,7 +865,7 @@ pub const Index = struct {
                     stats.approx_evaluated += @intCast(fresh.items.len);
                     for (fresh.items, estimates) |id, estimate| {
                         try frontier.push(alloc, .{ .id = id, .dist = estimate.dist });
-                        try self.offerFiltered(alloc, filter, &work, id, estimate, opts.bound_scale, approx.query_radius);
+                        try self.offerFiltered(alloc, source, filter, &work, id, estimate, opts.bound_scale, approx.query_radius);
                     }
                     stats.peak_frontier = @max(stats.peak_frontier, @as(u32, @intCast(frontier.len())));
                 }
@@ -908,14 +915,18 @@ pub const Index = struct {
         }
     };
 
-    fn offerFiltered(self: *const Index, alloc: Allocator, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, query_radius: ?ThresholdRadius) !void {
+    fn offerFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, query_radius: ?ThresholdRadius) !void {
         if (self.isDeleted(id) or !try filter.allows(filter.ctx, id)) return;
-        try self.enqueueFiltered(alloc, work, id, estimate, bound_scale, filter.distance_under, query_radius);
+        try self.enqueueFiltered(alloc, source, work, id, estimate, bound_scale, filter, query_radius);
     }
 
-    fn enqueueFiltered(self: *const Index, alloc: Allocator, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, distance_under: ?f32, query_radius: ?ThresholdRadius) !void {
+    fn enqueueFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, filter: ResultFilter, query_radius: ?ThresholdRadius) !void {
+        if (!source.boundsCurrent(id)) {
+            try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
+            return;
+        }
         const stored_upper = self.upper_vectors.contains(id);
-        if (distance_under) |threshold| {
+        if (filter.distance_under) |threshold| {
             if (stored_upper) {
                 if (estimate.dist >= threshold) return;
             } else if (query_radius) |radius| {
@@ -948,8 +959,9 @@ pub const Index = struct {
             while (next < work.pending.items.len and work.ids.items.len < batch_size) : (next += 1) {
                 const item = work.pending.items[next];
                 if (top.len() >= opts.k and item.dist > top.top().dist) break;
-                if (self.upper_vectors.get(item.id)) |vector| {
-                    try addFilteredResult(alloc, filter, top, opts.k, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, vector) else item.dist });
+                const upper_vector = self.upper_vectors.get(item.id);
+                if (upper_vector != null and source.boundsCurrent(item.id)) {
+                    try addFilteredResult(alloc, filter, top, opts.k, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector.?) else item.dist });
                 } else {
                     try work.ids.append(alloc, item.id);
                 }
@@ -1560,7 +1572,7 @@ pub const Index = struct {
 
         const first = try approx.scoreOne(start);
         visited.set(start);
-        try pool.append(alloc, .{ .id = start, .lower = first.dist - scale * first.bound });
+        try pool.append(alloc, .{ .id = start, .lower = if (source.boundsCurrent(start)) first.dist - scale * first.bound else -std.math.inf(f32) });
         try candidates.push(alloc, .{ .dist = first.dist, .id = start });
         try beam.push(alloc, .{ .dist = first.dist, .id = start });
         stats.approx_evaluated += 1;
@@ -1577,7 +1589,7 @@ pub const Index = struct {
             const ests = try approx.score(fresh.items);
             stats.approx_evaluated += @intCast(fresh.items.len);
             for (fresh.items, ests) |nb, e| {
-                try pool.append(alloc, .{ .id = nb, .lower = e.dist - scale * e.bound });
+                try pool.append(alloc, .{ .id = nb, .lower = if (source.boundsCurrent(nb)) e.dist - scale * e.bound else -std.math.inf(f32) });
                 const nc = Cand{ .dist = e.dist, .id = nb };
                 if (beam.len() < ef) {
                     try beam.push(alloc, nc);
@@ -1612,7 +1624,7 @@ pub const Index = struct {
                 const p = pool.items[i];
                 if (p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
-                if (self.upper_vectors.contains(p.id)) {
+                if (self.upper_vectors.contains(p.id) and source.boundsCurrent(p.id)) {
                     // Stored exactly (bound 0): no recomputation needed.
                     const c = Cand{ .dist = p.lower, .id = p.id };
                     if (top.len() < k) {

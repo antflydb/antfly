@@ -134,7 +134,7 @@ pub const LeannStore = struct {
     /// Opens the store kept in `dir_path`, loading its file when present.
     pub fn open(alloc: Allocator, io: std.Io, dir_path: []const u8, opts: Options) !*LeannStore {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (opts.dims == 0) return error.InvalidIndexConfig;
+        if (opts.dims == 0 or (opts.transient and opts.quantizer != .rabitq)) return error.InvalidIndexConfig;
         // Reject a graph configuration the first build would refuse (for
         // example RaBitQ below two dimensions) before any write is accepted;
         // otherwise derived indexing fails forever on committed data.
@@ -1175,6 +1175,15 @@ test "leann store: rejects graph settings the first build would refuse" {
     // RaBitQ needs at least two dimensions.
     try testing.expectError(error.InvalidIndexConfig, LeannStore.open(alloc, io, dir, .{ .dims = 1, .metric = .l2_squared, .quantizer = .rabitq }));
     try testing.expectError(error.InvalidIndexConfig, LeannStore.open(alloc, io, dir, .{ .dims = 1, .metric = .l2_squared, .quantizer = .rabitq, .replicated = true }));
+    for ([_]bool{ false, true }) |replicated| {
+        try testing.expectError(error.InvalidIndexConfig, LeannStore.open(alloc, io, dir, .{
+            .dims = 8,
+            .metric = .l2_squared,
+            .quantizer = .pq,
+            .transient = true,
+            .replicated = replicated,
+        }));
+    }
     var ok = try LeannStore.open(alloc, io, dir, .{ .dims = 1, .metric = .l2_squared, .quantizer = .pq });
     ok.deinit();
 }

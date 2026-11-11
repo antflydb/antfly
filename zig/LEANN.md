@@ -451,10 +451,11 @@ and rescores leaf members near the admission cutoff with extended codes
   deletes are idempotent, so replay after a crash is safe. Searches answer
   HBC's `SearchRequest` with HBC's `SearchResults`, applying `filter_ids`,
   `exclude_ids`, the key predicate, the metadata prefix and distance limits
-  to an over-fetched candidate list. Exact distances come from HBC's
-  external vector loader (the stored embedding artifact, or the document
-  field for direct-field indexes). Deleted or missing candidates are pushed
-  to the far end of the metric rather than failing a search.
+  before exact verification. Selective ID allowlists can score directly.
+  Graph search keeps nonmatching nodes available for navigation and widens
+  its frontier as needed. Exact distances come from the stored embedding
+  artifact, the document field, or transient re-embedding. Replicas verify
+  dirty candidates against the current vector before using their distances.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least

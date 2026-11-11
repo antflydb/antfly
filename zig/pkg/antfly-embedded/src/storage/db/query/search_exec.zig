@@ -16912,6 +16912,7 @@ test "one percent native filter routes through integrated dense search exactly" 
         entry: *index_manager_mod.IndexManager.DenseIndex,
         include_ids: []const u64 = &.{},
         exclude_ids: []const u64 = &.{},
+        exact_calls: usize = 0,
         fn selectDense(raw: *anyopaque, a: Allocator) !?types.DenseIdSelection {
             const state: *@This() = @ptrCast(@alignCast(raw));
             const include = try a.dupe(u64, state.include_ids);
@@ -16945,6 +16946,10 @@ test "one percent native filter routes through integrated dense search exactly" 
         }
         fn unexpectedHbcProfiled(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
             return error.UnexpectedHbcRoute;
+        }
+        fn exact(ctx: ?*anyopaque, dense_entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!dense_exact.SearchOutcome {
+            self(ctx).exact_calls += 1;
+            return exactScoreNativeDenseFilter(dense_entry.index.alloc, dense_entry, req);
         }
         fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
             return raw;
@@ -17009,6 +17014,21 @@ test "one percent native filter routes through integrated dense search exactly" 
     }, .{ .vector = &query, .k = result_count }, executor);
     defer empty.result.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.result.hits.len);
+
+    var paging_executor = executor;
+    paging_executor.exact_dense_search = Harness.exact;
+    paging_executor.filter_candidate_presence = true;
+    var page = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .filter_ids = filter_ids,
+        .distance_under = 0.5,
+    }, .{ .vector = &query, .k = result_count }, paging_executor);
+    defer page.result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), harness.exact_calls);
+    try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
+    try std.testing.expectEqual(.exact, page.result.total_hits_relation);
 }
 
 fn countActiveDenseVectorIdsAlloc(
