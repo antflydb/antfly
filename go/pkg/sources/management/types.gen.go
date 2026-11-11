@@ -447,6 +447,21 @@ func (e VectorSpaceQueryModality) Valid() bool {
 	}
 }
 
+// Defines values for PutSourceParamsIfNoneMatch.
+const (
+	Asterisk PutSourceParamsIfNoneMatch = "*"
+)
+
+// Valid indicates whether the value is a known member of the PutSourceParamsIfNoneMatch enum.
+func (e PutSourceParamsIfNoneMatch) Valid() bool {
+	switch e {
+	case Asterisk:
+		return true
+	default:
+		return false
+	}
+}
+
 // ArtifactBinding defines model for ArtifactBinding.
 type ArtifactBinding struct {
 	Artifact      string `json:"artifact"`
@@ -474,7 +489,7 @@ type Capabilities struct {
 	ProcessingPresets bool   `json:"processing_presets,omitempty,omitzero"`
 	PurgeSources      bool   `json:"purge_sources,omitempty,omitzero"`
 
-	// RevisionPreconditions PUT /sources/{source_id} honors If-Match declaration revisions.
+	// RevisionPreconditions PUT /sources/{source_id} honors If-Match declaration revisions and If-None-Match: * create-only writes.
 	RevisionPreconditions bool                `json:"revision_preconditions,omitempty,omitzero"`
 	Runtime               string              `json:"runtime"`
 	SearchVersions        []int               `json:"search_versions,omitempty,omitzero"`
@@ -839,7 +854,13 @@ type RemoveSourceParams struct {
 type PutSourceParams struct {
 	// IfMatch Quoted declaration revision from a prior GET (strong tag only).
 	IfMatch string `json:"If-Match,omitempty,omitzero"`
+
+	// IfNoneMatch Use * to create the source only if it does not already exist.
+	IfNoneMatch PutSourceParamsIfNoneMatch `json:"If-None-Match,omitempty,omitzero"`
 }
+
+// PutSourceParamsIfNoneMatch defines parameters for PutSource.
+type PutSourceParamsIfNoneMatch string
 
 // ListSourceRunsParams defines parameters for ListSourceRuns.
 type ListSourceRunsParams struct {

@@ -149,7 +149,7 @@
             }
           }
         },
-        "description": "Replaces the source declaration. With If-Match, the write succeeds only when the current declaration revision matches; runtimes that advertise revision_preconditions compare under the same lock as the write. If-Match never creates a source.",
+        "description": "Replaces the source declaration. Runtimes that advertise revision_preconditions honor two standard HTTP preconditions, evaluated atomically with the write: If-Match (update only when the current declaration revision matches; never creates) and If-None-Match: * (create only when no source with this ID exists). A failed precondition returns 412.",
         "parameters": [
           {
             "name": "If-Match",
@@ -160,6 +160,18 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 160
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "description": "Use * to create the source only if it does not already exist.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "*"
+              ]
             }
           }
         ]
@@ -605,7 +617,7 @@
           },
           "revision_preconditions": {
             "type": "boolean",
-            "description": "PUT /sources/{source_id} honors If-Match declaration revisions."
+            "description": "PUT /sources/{source_id} honors If-Match declaration revisions and If-None-Match: * create-only writes."
           }
         }
       },
