@@ -170,7 +170,7 @@ func TestCorpusResumeTruncatesUncommittedTail(t *testing.T) {
 func TestCorpusAudioZIPRangeAndSourceSecurity(t *testing.T) {
 	dir := t.TempDir()
 	archive := createTestZip(t, map[string][]byte{"nested/EFTA00000001.wav": []byte("RIFFaudio"), "EFTA00000002.mp4": []byte("video"), "__MACOSX/._noise.pdf": []byte("noise")})
-	cfg := corpusConfig{Key: "test-key", Sources: []corpusSource{{Dataset: "ds11", Path: archive, Zip: true}}}
+	cfg := corpusConfig{Profile: "transcription", Key: "test-key", Sources: []corpusSource{{Dataset: "ds11", Path: archive, Zip: true}}}
 	inventory := filepath.Join(dir, "inventory")
 	if err := discoverCorpus(cfg, inventory); err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func TestCorpusExternalSort(t *testing.T) {
 		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.wav", i)), []byte("audio"))
 	}
 	output := filepath.Join(dir, "out")
-	if err := discoverCorpus(corpusConfig{Sources: []corpusSource{{Dataset: "ds9", Path: source}}}, output); err != nil {
+	if err := discoverCorpus(corpusConfig{Profile: "transcription", Sources: []corpusSource{{Dataset: "ds9", Path: source}}}, output); err != nil {
 		t.Fatal(err)
 	}
 	file, _ := os.Open(output)
@@ -267,7 +267,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.wav", i)), []byte("audio"))
 	}
-	if err := corpusPrepareCmd([]string{"--state", state, "--source", "ds9=" + source}); err != nil {
+	if err := corpusPrepareCmd([]string{"--profile", "transcription", "--state", state, "--source", "ds9=" + source}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(state, "records.ndjson"))
@@ -280,7 +280,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	if err = atomicCorpusJSON(filepath.Join(state, "publication.json"), map[string]any{"sha256": fmt.Sprintf("%x", sha256.Sum256(data)), "records": 2}); err != nil {
 		t.Fatal(err)
 	}
-	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "", false, false)
+	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "", false, false, corpusIndexOptions{Profile: "transcription"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 		io.WriteString(w, `{}`)
 	}))
 	defer server.Close()
-	args := []string{"--state", state, "--url", server.URL, "--batch-size", "1", "--semantic=false"}
+	args := []string{"--state", state, "--url", server.URL, "--inference-url", DefaultInferenceURL, "--batch-size", "1", "--semantic=false"}
 	if err := corpusLoadCmd(append(append([]string{}, args...), "--create-table", "--create-only")); err != nil || !created {
 		t.Fatalf("public table creation contract failed: %v", err)
 	}

@@ -37,16 +37,19 @@ import (
 )
 
 type extractionQualification struct {
-	PublicationSHA256 string  `json:"publication_sha256"`
-	At                string  `json:"at"`
-	Complete          bool    `json:"complete"`
-	Records           int     `json:"records"`
-	Pages             int     `json:"pages"`
-	OCRAttempted      int     `json:"ocr_attempted"`
-	OCRFailed         int     `json:"ocr_failed"`
-	IncompleteUnits   int     `json:"incomplete_units"`
-	Concurrency       int     `json:"concurrency"`
-	Seconds           float64 `json:"seconds"`
+	PublicationSHA256  string  `json:"publication_sha256"`
+	At                 string  `json:"at"`
+	Complete           bool    `json:"complete"`
+	Records            int     `json:"records"`
+	Pages              int     `json:"pages"`
+	Units              int     `json:"units"`
+	AudioRecords       int     `json:"audio_records"`
+	TranscriptSegments int     `json:"transcript_segments"`
+	OCRAttempted       int     `json:"ocr_attempted"`
+	OCRFailed          int     `json:"ocr_failed"`
+	IncompleteUnits    int     `json:"incomplete_units"`
+	Concurrency        int     `json:"concurrency"`
+	Seconds            float64 `json:"seconds"`
 }
 
 // Index readiness and successful document extraction are separate milestones.
@@ -153,6 +156,9 @@ func qualifyCorpusWithConcurrency(ctx context.Context, client *http.Client, tabl
 			counts.Lock()
 			q.Records += result.Records
 			q.Pages += result.Pages
+			q.Units += result.Units
+			q.AudioRecords += result.AudioRecords
+			q.TranscriptSegments += result.TranscriptSegments
 			q.OCRAttempted += result.OCRAttempted
 			q.OCRFailed += result.OCRFailed
 			q.IncompleteUnits += result.IncompleteUnits
@@ -182,10 +188,19 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	source, _ := record.Document["url"].(string)
 	version, _ := record.Document["version"].(string)
 	uri, parseErr := url.Parse(source)
-	if parseErr != nil || !validOriginalLocator(uri, uri.Host) || uri.Scheme != "gs" || uri.Fragment != "" {
+	if parseErr != nil || !validProcessingLocator(uri) {
 		return q, fmt.Errorf("%s: qualification requires a generation-pinned native GCS source", record.ID)
 	}
-	hash := strings.TrimSuffix(path.Base(uri.Path), ".pdf")
+	mime, _ := record.Document["mime_type"].(string)
+	profileName := "pdf"
+	if strings.HasPrefix(mime, "audio/") {
+		profileName = "transcription"
+	}
+	profile, _ := processingProfile(profileName)
+	if mime != "" && !profile.accepts(mime) {
+		return q, fmt.Errorf("%s: unsupported qualification MIME %s", record.ID, mime)
+	}
+	hash := strings.TrimSuffix(path.Base(uri.Path), path.Ext(uri.Path))
 	if version != hash+":"+uri.Query().Get("generation") {
 		return q, fmt.Errorf("%s: source version does not match the immutable locator", record.ID)
 	}
@@ -195,7 +210,7 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	}
 	first, okFirst := corpusMetadataNumber(meta["page_start"])
 	last, okLast := corpusMetadataNumber(meta["page_end"])
-	if !okFirst || !okLast || first < 1 || last < first || first != float64(int(first)) || last != float64(int(last)) {
+	if profile.Name == "pdf" && (!okFirst || !okLast || first < 1 || last < first || first != float64(int(first)) || last != float64(int(last))) {
 		return q, fmt.Errorf("%s: invalid PDF page inventory", record.ID)
 	}
 	current, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"?fields=url,version", nil)
@@ -228,8 +243,8 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	if err = json.Unmarshal(raw, &artifact); err != nil {
 		return q, err
 	}
-	if artifact.Source != source || artifact.Generation == 0 || artifact.Units == nil || *artifact.Units != int(last-first+1) {
-		return q, fmt.Errorf("%s: artifact source/generation/page inventory is incomplete or changed", record.ID)
+	if artifact.Source != source || artifact.Generation == 0 || artifact.Units == nil || *artifact.Units < 1 || (profile.Name == "pdf" && *artifact.Units != int(last-first+1)) {
+		return q, fmt.Errorf("%s: artifact source/generation/unit inventory is incomplete or changed", record.ID)
 	}
 	// The summary API defaults absent OCR counters to zero. Only the raw
 	// manifest can distinguish known zero coverage from missing evidence.
@@ -254,13 +269,55 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	if *coverage.Incomplete != 0 {
 		return q, fmt.Errorf("%s: %d extraction units remain incomplete", record.ID, *coverage.Incomplete)
 	}
-	if artifact.Route != "pdf" || artifact.Merge != "converged" || artifact.LastError != "" {
+	if artifact.Route != profile.Route || artifact.Merge != "converged" || artifact.LastError != "" {
 		return q, fmt.Errorf("%s: extraction is failed, incomplete or unsupported (route=%q, merge=%q, error=%q)", record.ID, artifact.Route, artifact.Merge, artifact.LastError)
 	}
 	if *coverage.Failed != 0 {
 		return q, fmt.Errorf("%s: %d OCR pages failed; index readiness does not establish extraction coverage", record.ID, *coverage.Failed)
 	}
+	if profile.Name == "transcription" {
+		segments, err := qualifyTranscriptUnits(ctx, client, tableURL, record.ID, source, *artifact.Units)
+		if err != nil {
+			return q, err
+		}
+		// The unit cursor is retained, but it must also describe the current
+		// artifact generation rather than an accepted predecessor.
+		latest, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"/artifacts/"+corpusUnits+"?detail=raw", nil)
+		if err != nil {
+			return q, err
+		}
+		var after struct {
+			Generation uint64 `json:"generation"`
+			Source     string `json:"source_url"`
+			Merge      string `json:"merge_status"`
+			LastError  string `json:"last_error_code"`
+		}
+		if err := json.Unmarshal(latest, &after); err != nil {
+			return q, err
+		}
+		if after.Generation != artifact.Generation || after.Source != source || after.Merge != "converged" || after.LastError != "" {
+			return q, fmt.Errorf("%s: transcription changed during qualification", record.ID)
+		}
+		current, err = corpusRequestWithContext(ctx, client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"?fields=url,version", nil)
+		if err != nil {
+			return q, err
+		}
+		var finalDoc map[string]any
+		if err := json.Unmarshal(current, &finalDoc); err != nil {
+			return q, err
+		}
+		if nested, ok := finalDoc["_source"].(map[string]any); ok {
+			finalDoc = nested
+		}
+		if finalDoc["url"] != source || finalDoc["version"] != version {
+			return q, fmt.Errorf("%s: source changed during transcript qualification", record.ID)
+		}
+		q.AudioRecords = 1
+		q.TranscriptSegments = segments
+	} else {
+		q.Pages = *artifact.Units
+	}
 	q.Records++
-	q.Pages += *artifact.Units
+	q.Units = *artifact.Units
 	return q, nil
 }

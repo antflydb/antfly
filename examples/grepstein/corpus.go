@@ -128,11 +128,19 @@ func corpusPrepareCmd(args []string) error {
 	pages := flags.Int("pages-per-record", 25, "Maximum PDF pages per source record")
 	limitPages := flags.Int("limit-pages", 0, "Pilot PDF page budget (0 means unlimited; applied before extraction)")
 	limitFiles := flags.Int("limit-files", 0, "Pilot source file budget (0 means unlimited, includes audio)")
+	profileName := flags.String("profile", "pdf", "Native processing profile: pdf or transcription")
 	resume := flags.Bool("resume", false, "Continue an existing preparation with its saved configuration")
 	var sources StringSliceFlag
 	flags.Var(&sources, "source", "Repeatable dataset=directory or dataset=archive.zip")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	requestedProfile, profileErr := processingProfile(*profileName)
+	if profileErr != nil {
+		return profileErr
+	}
+	if !*resume && requestedProfile.Name == "transcription" && *limitPages > 0 {
+		return fmt.Errorf("limit-pages applies only to the pdf profile; use limit-files for transcription")
 	}
 	if *pages < 1 || *limitPages < 0 || *limitFiles < 0 {
 		return fmt.Errorf("page size must be positive; limits cannot be negative")
@@ -148,7 +156,7 @@ func corpusPrepareCmd(args []string) error {
 	cfgPath := filepath.Join(*state, "sources.json")
 	var cfg corpusConfig
 	if *resume {
-		if len(sources) > 0 || flagChanged(flags, "base-url") || flagChanged(flags, "pages-per-record") || flagChanged(flags, "limit-pages") || flagChanged(flags, "limit-files") {
+		if len(sources) > 0 || flagChanged(flags, "profile") || flagChanged(flags, "base-url") || flagChanged(flags, "pages-per-record") || flagChanged(flags, "limit-pages") || flagChanged(flags, "limit-files") {
 			return fmt.Errorf("resume uses saved source configuration; start a new state to change it")
 		}
 		if err = readCorpusJSON(cfgPath, &cfg); err != nil {
@@ -162,7 +170,10 @@ func corpusPrepareCmd(args []string) error {
 		if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.Trim(u.Path, "/") != "" {
 			return fmt.Errorf("base-url must be an HTTP(S) origin without credentials, path, or query")
 		}
-		cfg = corpusConfig{IndexedAt: time.Now().Unix(), BaseURL: *base, PagesPerRecord: *pages, LimitPages: *limitPages, LimitFiles: *limitFiles}
+		if _, err := processingProfile(*profileName); err != nil {
+			return err
+		}
+		cfg = corpusConfig{Profile: *profileName, IndexedAt: time.Now().Unix(), BaseURL: *base, PagesPerRecord: *pages, LimitPages: *limitPages, LimitFiles: *limitFiles}
 		cfg.Key, err = newCorpusKey()
 		if err != nil {
 			return err
@@ -192,6 +203,13 @@ func corpusPrepareCmd(args []string) error {
 		if err = atomicCorpusJSON(cfgPath, cfg); err != nil {
 			return err
 		}
+	}
+	profile, err := processingProfile(cfg.Profile)
+	if err != nil {
+		return err
+	}
+	if profile.Name == "transcription" && cfg.LimitPages > 0 {
+		return fmt.Errorf("limit-pages applies only to the pdf profile; use limit-files for transcription")
 	}
 	if cfg.IndexedAt <= 0 {
 		return fmt.Errorf("saved preparation is missing indexed_at; start a new --state")
@@ -308,7 +326,7 @@ func corpusPrepareCmd(args []string) error {
 				continue
 			}
 		} else if entry.Locator.Size > corpusMaxBytes {
-			return fmt.Errorf("audio %s exceeds 128 MiB; split it before preparation", entry.ID)
+			return fmt.Errorf("audio %s exceeds 64 MiB; split it before preparation", entry.ID)
 		}
 		selectedPages := totalPages
 		if cfg.LimitPages > 0 {
@@ -410,6 +428,9 @@ func corpusPrepareCmd(args []string) error {
 			fmt.Printf("Prepared %d sources, %d pages, %d audio, %d records\n", progress.Files, progress.Pages, progress.Audio, progress.Records)
 		}
 	}
+	if progress.Records == 0 {
+		return fmt.Errorf("profile %s selected no processable source records", profile.Name)
+	}
 	if err = save(); err != nil {
 		return err
 	}
@@ -431,9 +452,11 @@ func printCorpusJSON(value any) error {
 }
 
 type corpusIndexOptions struct {
-	Embedder         map[string]any
-	InferenceSecret  string
-	SourceConnection string
+	Embedder          map[string]any
+	InferenceSecret   string
+	SourceConnection  string
+	Profile           string
+	TranscriberConfig string
 }
 
 func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool, overrides ...corpusIndexOptions) (map[string]any, error) {
@@ -452,6 +475,16 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 			}
 		}
 		secretRef = "${secret:" + options.InferenceSecret + "}"
+	}
+	profile, err := processingProfile(options.Profile)
+	if err != nil {
+		return nil, err
+	}
+	if profile.Name != "pdf" && language != "" {
+		return nil, fmt.Errorf("reader-config belongs to the pdf profile")
+	}
+	if profile.Name != "transcription" && options.TranscriberConfig != "" {
+		return nil, fmt.Errorf("transcriber-config requires the transcription profile")
 	}
 	// Without a reader config, extraction keeps native text only.
 	var ocr map[string]any
@@ -489,6 +522,13 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	}
 	extraction := map[string]any{
 		"source": map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
+	}
+	if profile.Name == "transcription" {
+		extraction, err = nativeTranscriptionConfig(options.TranscriberConfig, inferenceURL, secretRef)
+		if err != nil {
+			return nil, err
+		}
+		extraction["source"] = map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"}
 	}
 	if ocr != nil {
 		extraction["ocr"] = ocr
@@ -655,6 +695,7 @@ func corpusLoadCmd(args []string) error {
 	model := flags.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Embedding model (%d dimensions; use embedder-config for another dimension)", DefaultEmbeddingDims))
 	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
+	transcriberConfig := flags.String("transcriber-config", "", "Native STT JSON for the transcription profile (default: hosted Whisper-small)")
 	language := flags.String("reader-config", "", "Native OCR reader JSON file (lightonocr-reader.example.json for hosted inference); empty disables OCR")
 	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
@@ -697,7 +738,7 @@ func corpusLoadCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret, SourceConnection: *sourceConnection})
+	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret, SourceConnection: *sourceConnection, Profile: sourceConfig.Profile, TranscriberConfig: *transcriberConfig})
 	if err != nil {
 		return err
 	}

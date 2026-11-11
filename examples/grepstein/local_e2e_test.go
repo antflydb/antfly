@@ -19,8 +19,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -44,7 +46,15 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	}
 }
 
-func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
+func TestLocalNativeGCSTranscription(t *testing.T) { testLocalNativeGCSExtraction(t, false, true) }
+
+func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool) {
+	speech := len(transcription) > 0 && transcription[0]
+	hostedSTT := len(transcription) > 1 && transcription[1]
+	profile, extension, mime := "pdf", ".pdf", "application/pdf"
+	if speech {
+		profile, extension, mime = "transcription", ".wav", "audio/wav"
+	}
 	binary := os.Getenv("ANTFLY_GREPSTEIN_E2E_BINARY")
 	if binary == "" {
 		t.Skip("set ANTFLY_GREPSTEIN_E2E_BINARY to the native Antfly binary")
@@ -62,12 +72,17 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 		pdf = createMinimalPDF()
 	}
 	newPDF := bytes.Replace(nativeGCSFixturePDF(), []byte("evidence"), []byte("appendix"), -1)
+	if speech {
+		pdf = nativeTranscriptFixtureAudio()
+		newPDF = append([]byte(nil), pdf...)
+		newPDF[len(newPDF)-1] = 1
+	}
 	newDigest := fmt.Sprintf("%x", sha256.Sum256(newPDF))
-	newKey := "objects/sha256/" + newDigest + ".pdf"
+	newKey := "objects/sha256/" + newDigest + extension
 	var ocrCalls atomic.Int64
 	readerServer := nativeAppendReaderFixture(t, &ocrCalls)
 	digest := fmt.Sprintf("%x", sha256.Sum256(pdf))
-	key := "objects/sha256/" + digest + ".pdf"
+	key := "objects/sha256/" + digest + extension
 	var reads atomic.Int64
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" || (r.URL.Path != "/storage/v1/b/e2e-originals/o/"+key && r.URL.Path != "/storage/v1/b/e2e-originals/o/"+newKey) || r.URL.Query().Get("alt") != "media" || r.Header.Get("Authorization") != "Bearer local-gcs-e2e-token" {
@@ -81,7 +96,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 		}
 		reads.Add(1)
 		w.Header().Set("x-goog-generation", "123")
-		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Type", mime)
 		content := pdf
 		if strings.HasSuffix(r.URL.Path, newKey) {
 			content = newPDF
@@ -114,7 +129,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 	}
 	command := exec.CommandContext(ctx, binary, "standalone", "--config", configPath, "--host", "127.0.0.1", "--port", strconv.Itoa(port), "--data-dir", filepath.Join(root, "data"), "--control-tick-ms", "5", "--health", "false", "--auth", "false")
 	command.Dir = root
-	command.Env = append(os.Environ(), "ANTFLY_E2E_GCS_TOKEN=local-gcs-e2e-token")
+	command.Env = append(os.Environ(), "ANTFLY_E2E_GCS_TOKEN=local-gcs-e2e-token", "ANTFLY_E2E_STT_KEY=local-stt-e2e-token")
 	command.Stdout = logFile
 	command.Stderr = logFile
 	if err := command.Start(); err != nil {
@@ -167,13 +182,26 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 			t.Fatal(err)
 		}
 	}
-	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, inferenceURL, readerConfig, false, false, corpusIndexOptions{SourceConnection: "gcs-e2e"})
+	transcriberConfig, inferenceSecret := "", ""
+	if speech {
+		transcriber := nativeAppendTranscriberFixture(t, &ocrCalls, hostedSTT)
+		if hostedSTT {
+			inferenceURL = transcriber.URL
+			inferenceSecret = "antfly.e2e.stt.key"
+		} else {
+			transcriberConfig = filepath.Join(root, "transcriber.json")
+			if err := atomicCorpusJSON(transcriberConfig, map[string]any{"provider": "openai", "model": "whisper-1", "base_url": transcriber.URL + "/v1", "api_key": "${secret:antfly.e2e.stt.key}"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, inferenceURL, readerConfig, false, false, corpusIndexOptions{SourceConnection: "gcs-e2e", Profile: profile, TranscriberConfig: transcriberConfig, InferenceSecret: inferenceSecret})
 	if err != nil {
 		t.Fatal(err)
 	}
 	tableURL := endpoint + "/tables/gcs_e2e"
 	source := "gs://e2e-originals/" + key + "?generation=123"
-	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1, "source_locator": map[string]any{"modified": json.Number("1794400000000000001")}}}
+	document := map[string]any{"url": source, "original_url": source, "filename": "evidence" + extension, "mime_type": mime, "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1, "source_locator": map[string]any{"modified": json.Number("1794400000000000001")}}}
 	record := corpusRecord{ID: "evidence", Document: document}
 	manifest, _ := json.Marshal(record)
 	manifest = append(manifest, '\n')
@@ -189,10 +217,10 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 	if err := atomicCorpusJSON(filepath.Join(root, "prepare.json"), corpusProgress{Complete: true, Records: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := atomicCorpusJSON(filepath.Join(root, "sources.json"), corpusConfig{IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25}); err != nil {
+	if err := atomicCorpusJSON(filepath.Join(root, "sources.json"), corpusConfig{Profile: profile, IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25}); err != nil {
 		t.Fatal(err)
 	}
-	loadArgs := []string{"--state", root, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--inference-url", inferenceURL}
+	loadArgs := []string{"--state", root, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--transcriber-config", transcriberConfig, "--inference-secret", inferenceSecret, "--inference-url", inferenceURL}
 	if err := corpusLoadCmd(append(append([]string{}, loadArgs...), "--create-table")); err != nil {
 		t.Fatalf("native corpus load: %v", err)
 	}
@@ -208,7 +236,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if last != nil || !qualification.Complete || qualification.Pages != 1 {
+	if last != nil || !qualification.Complete || (profile == "pdf" && qualification.Pages != 1) || (speech && (qualification.AudioRecords != 1 || qualification.TranscriptSegments != 2)) {
 		t.Fatalf("native GCS qualification: %+v %v", qualification, last)
 	}
 	// Expand through a separate sealed catalog containing both the accepted
@@ -224,7 +252,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 		t.Fatal("missing accepted extraction generation", err)
 	}
 	readsBefore, callsBefore := reads.Load(), ocrCalls.Load()
-	if ocr && callsBefore != 1 {
+	if (ocr || speech) && callsBefore != 1 {
 		t.Fatalf("sample must actually OCR once, got %d", callsBefore)
 	}
 	appendState := t.TempDir()
@@ -233,9 +261,9 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 	for k, v := range document {
 		newDocument[k] = v
 	}
-	newDocument["url"], newDocument["original_url"], newDocument["version"], newDocument["filename"] = newSource, newSource, newDigest+":123", "appendix.pdf"
-	writeAppendState(t, appendState, []corpusRecord{record, {ID: "appendix", Document: newDocument}}, corpusConfig{IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25})
-	appendArgs := []string{"--state", appendState, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--inference-url", inferenceURL, "--append-only", "--accepted-state", root}
+	newDocument["url"], newDocument["original_url"], newDocument["version"], newDocument["filename"] = newSource, newSource, newDigest+":123", "appendix"+extension
+	writeAppendState(t, appendState, []corpusRecord{record, {ID: "appendix", Document: newDocument}}, corpusConfig{Profile: profile, IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25})
+	appendArgs := []string{"--state", appendState, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--transcriber-config", transcriberConfig, "--inference-secret", inferenceSecret, "--inference-url", inferenceURL, "--append-only", "--accepted-state", root}
 	if err := corpusLoadCmd(append(append([]string{}, appendArgs...), "--plan-only")); err != nil {
 		t.Fatal("append preflight", err)
 	}
@@ -269,7 +297,11 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 	if err := json.Unmarshal(afterArtifact, &after); err != nil || before.Generation != after.Generation {
 		t.Fatal("append changed sample generation", err)
 	}
-	if ocrCalls.Load() != callsBefore {
+	expectedCalls := callsBefore
+	if speech {
+		expectedCalls++
+	}
+	if ocrCalls.Load() != expectedCalls {
 		t.Fatalf("append repeated sample OCR: %d -> %d", callsBefore, ocrCalls.Load())
 	}
 	if reads.Load() != readsBefore+1 {
@@ -310,7 +342,10 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 			if err != nil || !bytes.Contains(output, []byte("Native GCS extraction evidence")) {
 				t.Fatalf("native grep %s failed: %v\n%s", stream, err, output)
 			}
-			if !bytes.Contains(output, []byte("evidence.pdf")) {
+			if speech && !bytes.Contains(output, []byte("transcript_spans")) {
+				t.Fatalf("native grep %s lost transcript timing: %s", stream, output)
+			}
+			if !bytes.Contains(output, []byte("evidence"+extension)) {
 				t.Fatalf("native grep %s lost the original source identity: %s", stream, output)
 			}
 		}
@@ -404,4 +439,57 @@ func nativeGCSFixturePDF() []byte {
 	}
 	fmt.Fprintf(&out, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets), xref)
 	return out.Bytes()
+}
+
+func nativeTranscriptFixtureAudio() []byte {
+	data := make([]byte, 44+32000)
+	copy(data, "RIFF")
+	binary.LittleEndian.PutUint32(data[4:], uint32(len(data)-8))
+	copy(data[8:], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(data[16:], 16)
+	binary.LittleEndian.PutUint16(data[20:], 1)
+	binary.LittleEndian.PutUint16(data[22:], 1)
+	binary.LittleEndian.PutUint32(data[24:], 16000)
+	binary.LittleEndian.PutUint32(data[28:], 32000)
+	binary.LittleEndian.PutUint16(data[32:], 2)
+	binary.LittleEndian.PutUint16(data[34:], 16)
+	copy(data[36:], "data")
+	binary.LittleEndian.PutUint32(data[40:], 32000)
+	return data
+}
+func nativeAppendTranscriberFixture(t *testing.T, calls *atomic.Int64, hosted bool) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer local-stt-e2e-token" {
+			http.Error(w, "invalid STT credential", 403)
+			return
+		}
+		if hosted && r.Method == "GET" && strings.Contains(r.URL.Path, "/models") {
+			caps := map[string]any{"version": 4, "task": "transcribe", "input_modalities": []string{"audio"}, "accepted_mime_types": []string{"audio/wav"}, "input_granularity": "item", "output": "transcription", "result_cardinality": "one_per_request", "prompt_policy": "explicit", "borrowed_attachments": false, "task_limits": map[string]any{"max_text_bytes_per_item": 65536, "max_input_tokens_per_item": 8192, "max_output_tokens_per_item": 8192, "max_candidates_per_request": nil, "max_schema_bytes": nil}, "batch": map[string]any{"mode": "serial_compatibility", "preferred_items": 1, "max_items": 1, "max_encoded_media_bytes": 67108864, "max_decoded_pixels": 0, "max_media_parts_per_item": 1, "per_item_failures": false}}
+			json.NewEncoder(w).Encode(map[string]any{"transcribers": map[string]any{defaultTranscriberModel: map[string]any{"inputs": []string{"audio"}, "inference_capabilities": caps}}})
+			return
+		}
+		expected := "/v1/audio/transcriptions"
+		if hosted {
+			expected = "/ai/v1/read"
+		}
+		if r.Method != "POST" || r.URL.Path != expected {
+			http.Error(w, "invalid transcription route", 404)
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+		if err != nil || (!hosted && !bytes.Contains(raw, []byte("whisper-1"))) || (hosted && !bytes.Contains(raw, []byte(defaultTranscriberModel))) {
+			http.Error(w, "invalid audio form", 400)
+			return
+		}
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if hosted {
+			fmt.Fprintf(w, `{"object":"list","model":%q,"data":[{"object":"read","index":0,"source_id":"audio-0","number":1,"kind":"audio","coordinate_space":"none","origin":"transcription","text":"Native GCS extraction evidence. Launch at dawn.","status":"complete","audio":{"duration_ms":1000,"language":"en","language_source":"detected","segments":[{"text":"Native GCS extraction evidence.","granularity":"phrase","text_start":0,"text_end":31,"start_ms":0,"end_ms":400},{"text":"Launch at dawn.","granularity":"phrase","text_start":32,"text_end":47,"start_ms":500,"end_ms":1000}]}}]}`, defaultTranscriberModel)
+			return
+		}
+		fmt.Fprint(w, `{"text":"Native GCS extraction evidence. Launch at dawn.","language":"en","duration":1,"segments":[{"start":0,"end":0.4,"text":"Native GCS extraction evidence."},{"start":0.5,"end":1,"text":"Launch at dawn."}]}`)
+	}))
+	t.Cleanup(server.Close)
+	return server
 }

@@ -1757,6 +1757,33 @@ pub const Runtime = struct {
         return .{ .config = cfg, .credential = credential };
     }
 
+    const ResolvedTranscriberConfig = struct {
+        config: transcribing.Config,
+        credential: ?[]u8 = null,
+        fn deinit(self: *ResolvedTranscriberConfig, alloc: Allocator) void {
+            if (self.credential) |value| alloc.free(value);
+        }
+    };
+
+    // Durable recipes retain references. Resolve once per invocation before
+    // discovery and execution, without lending a node credential to other URLs.
+    fn resolveTranscriberConfig(self: *Runtime, alloc: Allocator, raw: transcribing.Config) !ResolvedTranscriberConfig {
+        var cfg = self.routedTranscriberConfig(raw);
+        if (isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) return .{ .config = cfg };
+        const reference = cfg.bearer_token orelse cfg.api_key orelse
+            (if (cfg.provider == .antfly) self.defaultInferenceCredentialReference(cfg.resolvedUrl()) else null);
+        var secret = if (cfg.provider == .cloudflare)
+            try common_secrets.SecretValue.initConfigOrEnv(alloc, reference, "CLOUDFLARE_API_TOKEN")
+        else
+            (try common_secrets.SecretValue.initConfig(alloc, reference)) orelse return .{ .config = cfg };
+        defer secret.deinit(alloc);
+        const credential = try secret.resolveOwned(alloc, self.secret_store);
+        if (cfg.provider == .cloudflare and credential == null) return error.CloudflareCredentialMissing;
+        cfg.api_key = credential;
+        cfg.bearer_token = null;
+        return .{ .config = cfg, .credential = credential };
+    }
+
     fn readerCapabilities(
         self: *Runtime,
         alloc: Allocator,
@@ -4115,15 +4142,9 @@ pub const Runtime = struct {
         cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
-        // `transcribing` sends `api_key` verbatim: resolve the node default
-        // credential for this request only when it routed to the default endpoint.
-        const default_transcriber_credential = if (cfg_parsed.value.provider == .antfly and
-            cfg_parsed.value.api_key == null and cfg_parsed.value.bearer_token == null)
-            try self.resolveDefaultInferenceCredential(alloc, cfg_parsed.value.resolvedUrl())
-        else
-            null;
-        defer if (default_transcriber_credential) |token| alloc.free(token);
-        if (default_transcriber_credential) |token| cfg_parsed.value.api_key = token;
+        var resolved_transcriber = try self.resolveTranscriberConfig(alloc, cfg_parsed.value);
+        defer resolved_transcriber.deinit(alloc);
+        cfg_parsed.value = resolved_transcriber.config;
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
             if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
@@ -4206,16 +4227,7 @@ pub const Runtime = struct {
             capability_lease_fields.apply(&cfg_parsed.value);
         }
 
-        var cloudflare_token: ?[]u8 = null;
-        defer if (cloudflare_token) |token| alloc.free(token);
-        var execution_cfg = cfg_parsed.value;
-        if (execution_cfg.provider == .cloudflare) {
-            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
-            defer secret.deinit(alloc);
-            cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
-            execution_cfg.api_key = cloudflare_token;
-            execution_cfg.bearer_token = null;
-        }
+        const execution_cfg = cfg_parsed.value;
         var result = transcribing.transcribeWithConfig(
             alloc,
             self.http,
@@ -9916,4 +9928,44 @@ test "index document checkpoint producer execution identity rejects missing fenc
     try std.testing.expect(!immutableAntflyModel("/tmp/model@1111111111111111111111111111111111111111"));
     try std.testing.expect(!immutableAntflyModel("../model@1111111111111111111111111111111111111111"));
     try std.testing.expect(immutableAntflyModel("owner/model@1111111111111111111111111111111111111111"));
+}
+
+test "asset producer runtime transcriber credentials resolve references and retain endpoint authority" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "speech-secrets.json" });
+    defer alloc.free(path);
+    var secrets = try common_secrets.FileStore.initWithIo(alloc, io, path);
+    defer secrets.deinit();
+    var stored = try secrets.put(alloc, "speech.test", "first-token");
+    stored.deinit(alloc);
+    var client = httpx.Client.initWithConfig(alloc, io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .secret_store = &secrets, .inference_api_url = "https://shared.example/ai/v1", .inference_api_key = "${secret:speech.test}" });
+    defer runtime.deinit();
+    for ([_]transcribing.Provider{ .antfly, .openai, .cloudflare }) |provider| {
+        const raw = transcribing.Config{ .provider = provider, .model = "whisper", .api_key = "${secret:speech.test}", .api_url = "https://shared.example/ai/v1", .base_url = "https://third.example/v1" };
+        var resolved = try runtime.resolveTranscriberConfig(alloc, raw);
+        defer resolved.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", resolved.config.api_key.?);
+        try std.testing.expectEqualStrings("${secret:speech.test}", raw.api_key.?);
+    }
+    var default = try runtime.resolveTranscriberConfig(alloc, .{ .provider = .antfly, .model = "whisper" });
+    defer default.deinit(alloc);
+    try std.testing.expectEqualStrings("first-token", default.config.api_key.?);
+    var other = try runtime.resolveTranscriberConfig(alloc, .{ .provider = .antfly, .model = "whisper", .api_url = "https://third.example/ai/v1" });
+    defer other.deinit(alloc);
+    try std.testing.expect(other.config.api_key == null);
+    stored = try secrets.put(alloc, "speech.test", "rotated-token");
+    stored.deinit(alloc);
+    var rotated = try runtime.resolveTranscriberConfig(alloc, .{ .provider = .antfly, .model = "whisper", .bearer_token = "${secret:speech.test}" });
+    defer rotated.deinit(alloc);
+    try std.testing.expectEqualStrings("rotated-token", rotated.config.api_key.?);
+    try std.testing.expect(rotated.config.bearer_token == null);
 }

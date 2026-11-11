@@ -54,6 +54,7 @@ type corpusSource struct {
 	Zip     bool   `json:"zip,omitempty"`
 }
 type corpusConfig struct {
+	Profile        string         `json:"profile,omitempty"`
 	IndexedAt      int64          `json:"indexed_at"`
 	Sources        []corpusSource `json:"sources"`
 	Key            string         `json:"key"`
@@ -86,6 +87,12 @@ func corpusMIME(name string) string {
 	switch strings.ToLower(path.Ext(name)) {
 	case ".pdf":
 		return "application/pdf"
+	case ".ogg", ".opus":
+		return "audio/ogg"
+	case ".aac":
+		return "audio/aac"
+	case ".amr":
+		return "audio/amr"
 	case ".wav":
 		return "audio/wav"
 	case ".mp3":
@@ -129,6 +136,10 @@ func includedSource(name string) bool {
 // A bounded external merge sort deduplicates source IDs without keeping the corpus
 // in a map. Only duplicate candidates require a full content comparison.
 func discoverCorpus(cfg corpusConfig, output string) error {
+	profile, err := processingProfile(cfg.Profile)
+	if err != nil {
+		return err
+	}
 	scratch, err := os.MkdirTemp(filepath.Dir(output), "inventory-sort-")
 	if err != nil {
 		return err
@@ -163,7 +174,7 @@ func discoverCorpus(cfg corpusConfig, output string) error {
 		return err
 	}
 	add := func(i int, name string, size, modified int64, crc uint32) error {
-		if !includedSource(name) {
+		if !includedSource(name) || !profile.accepts(corpusMIME(name)) {
 			return nil
 		}
 		entries = append(entries, corpusEntry{ID: corpusID(cfg.Sources[i].Dataset, name), Dataset: cfg.Sources[i].Dataset, MIME: corpusMIME(name), Locator: sourceLocator{Source: i, Name: name, Size: size, Modified: modified, CRC: crc}})
