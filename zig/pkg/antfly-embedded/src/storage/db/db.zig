@@ -33500,10 +33500,10 @@ pub const DB = struct {
     fn markEnrichmentAppliedIfNoPendingThrough(self: *DB, sequence: u64) !void {
         if (sequence == 0) return;
         const runtime = self.enrichment_runtime orelse return;
-        const applied = runtime.appliedSequence();
-        if (applied >= sequence) return;
-        if (try self.noPendingEnrichmentReplayThrough(applied, sequence)) {
-            try runtime.markAppliedThrough(sequence);
+        const cut = runtime.replayCut();
+        if (cut.applied >= sequence) return;
+        if (try self.noPendingEnrichmentReplayThrough(cut.applied, sequence)) {
+            try runtime.markAppliedThroughAtCut(sequence, cut);
         }
     }
 
@@ -54826,10 +54826,10 @@ fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !
 fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
     if (sync_level != .enrichments or sequence == 0) return;
     const runtime = ctx.enrichment_runtime orelse return;
-    const applied = runtime.appliedSequence();
-    if (applied >= sequence) return;
-    if (try noPendingEnrichmentReplayThroughContext(ctx, applied, sequence)) {
-        try runtime.markAppliedThrough(sequence);
+    const cut = runtime.replayCut();
+    if (cut.applied >= sequence) return;
+    if (try noPendingEnrichmentReplayThroughContext(ctx, cut.applied, sequence)) {
+        try runtime.markAppliedThroughAtCut(sequence, cut);
     }
 }
 
