@@ -1940,6 +1940,10 @@ fn collectEmbedding(
     // metadata via the existing binary artifact envelope, even offline.
     if (enrichment_artifact_codec.decodeHeader(value)) |header| {
         if (header.flags.authored) return false;
+        // A transient LEANN stub has no vector to batch. Keep its envelope
+        // (source hash, digest) so a restore re-embeds it on demand instead
+        // of silently losing the embedding.
+        if (header.flags.vector_elided) return false;
     } else |_| {}
     const parsed_key = (try internal_keys.parseEmbeddingArtifactKeyAlloc(alloc, key)) orelse return true;
     defer alloc.free(parsed_key.doc_key);

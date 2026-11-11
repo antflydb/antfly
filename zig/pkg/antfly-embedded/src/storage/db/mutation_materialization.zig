@@ -1912,6 +1912,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, vector),
                 .generated => |hash| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, vector),
+                .generated_text => |hash| try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, hash, true, vector),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -3037,7 +3038,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             errdefer if (key_owned) alloc.free(key);
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(alloc, indices, values),
-                .generated => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
+                .generated, .generated_text => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -5640,6 +5641,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 sources.deinit(alloc);
             }
 
+            const locally_replayable = try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value);
             const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
             for (chunks) |chunk| {
                 const chunk_text = chunk.text orelse continue;
@@ -5648,7 +5650,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
                 errdefer alloc.free(key);
                 const text = try alloc.dupe(u8, chunk_text);
-                sources.appendAssumeCapacity(.{ .key = key, .text = text });
+                sources.appendAssumeCapacity(.{ .key = key, .text = text, .has_metadata = chunk.metadata != null, .locally_replayable = locally_replayable });
                 chunks_created.* += 1;
             }
             // Inline chunks are derived from this document revision. An empty set is
@@ -7252,6 +7254,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, pending_deletes, dense_embeddings, skip_unchanged_artifacts, shared_pending_writes, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
                     return;
                 }
+                const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+                const pinned_embedder = dense_embedder.withTextGeneration(generation);
                 var chunks_created: usize = 0;
                 const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
                 defer freeChunkEmbeddingSources(alloc, sources);
@@ -7272,7 +7276,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const max_batch_bytes = generatedEmbedBatchBytes();
                 var batch_source_bytes: usize = 0;
                 for (sources, 0..) |source, i| {
-                    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                    const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                        enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                    else
+                        enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                     const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                     defer alloc.free(artifact_key);
                     if (skip_unchanged_artifacts) {
@@ -7286,21 +7293,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (chunk_texts.items.len > 0 and
                         (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                     {
-                        try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                        try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
                         batch_source_bytes = 0;
                     }
                     try chunk_texts.append(alloc, source.text);
                     try source_indexes.append(alloc, i);
                     batch_source_bytes += source.text.len;
                     if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                        try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                        try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
                         batch_source_bytes = 0;
                     }
                 }
-                try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                 return;
             }
 
+            const generation = if (memo) |cache_memo| try cache_memo.generation(dense_embedder, embedding_name) else try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = dense_embedder.withTextGeneration(generation);
             if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
                 const source_parts = try renderSourceParts(
                     alloc,
@@ -7312,8 +7322,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (source_parts) |parts| {
                     defer template_mod.freeContentParts(alloc, parts);
 
-                    const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, parts, request.expected_dims);
+                    const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, parts, request.expected_dims);
                     defer alloc.free(vector);
+                    try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
+                    const source_hash = if (parts.len == 1 and parts[0] == .text and dense_embedder.textPartsEquivalent(embedding_name))
+                        enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, parts[0].text, generation.revision)
+                    else
+                        try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision);
                     const artifact_key = try appendEmbeddingArtifactWrite(
                         alloc,
                         artifact_writes,
@@ -7322,7 +7337,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         embedding_name,
                         request.source_field,
                         null,
-                        .{ .generated = null },
+                        if (enrichment_runtime_mod.partsAreText(parts) and try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value))
+                            .{ .generated_text = source_hash }
+                        else
+                            .{ .generated = source_hash },
                         vector,
                     );
                     defer alloc.free(artifact_key);
@@ -7344,14 +7362,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             defer alloc.free(source_text.?);
 
-            const memo_key = GeneratedEmbeddingMemo.key(
+            const memo_key = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
                 .dense_embedding,
                 embedding_name,
                 request.producer_json,
                 request.execution_json,
                 request.expected_dims,
                 source_text.?,
-            );
+            ), generation.revision);
             // Document tables build their generated plan under apply rather than in
             // relational prewarm. Use the same persisted-cache admission in either
             // path before falling back to the external provider.
@@ -7366,7 +7384,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         runtime,
                         consumer_indexes,
                         cache_memo.alloc,
-                        dense_embedder,
+                        pinned_embedder,
                         embedding_name,
                         source_text.?,
                         request.expected_dims,
@@ -7375,9 +7393,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk try cache_memo.adoptDense(memo_key, computed);
                 }
             else blk: {
-                uncached_vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, source_text.?, request.expected_dims);
+                uncached_vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, source_text.?, request.expected_dims);
                 break :blk uncached_vector.?;
             };
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
             const artifact_key = try appendEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
@@ -7386,7 +7405,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
+                if (try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value)) .{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) } else .{ .generated = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) },
                 vector,
             );
             defer alloc.free(artifact_key);

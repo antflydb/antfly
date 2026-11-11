@@ -4220,7 +4220,11 @@ pub const LeaseTiming = struct {
 pub const PathWriterLock = struct {
     io_impl: std.Io.Threaded,
     borrowed_io: ?std.Io = null,
-    file: std.Io.File,
+    /// `null` for a lease whose only safety authority is `region` below
+    /// (not yet the case for any constructor -- see `region`'s own doc
+    /// comment); every constructor today still takes the real sidecar
+    /// `flock`, so this is populated whenever `region` is too.
+    file: ?std.Io.File,
     /// Admission owns this scope. Closing/yielding the kernel lease drops all
     /// idle anchors; escaped readers retain independent marker references.
     reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
@@ -4229,6 +4233,29 @@ pub const PathWriterLock = struct {
     queue_turn: ?writer_queue.Turn = null,
     /// Set instead of `queue_turn` when the lease was taken with the queue idle.
     queue_watch: ?writer_queue.Watch = null,
+    /// §8.2's shared mmap lock region, set by `fairWriterLockWithIo` (and,
+    /// as later steps migrate them, the other constructors) in place of
+    /// `queue_turn`/`queue_watch`. Heap-allocated (`std.heap.page_allocator`,
+    /// matching `inode_lock.Entry.region`'s own convention) rather than
+    /// stored by value, because unlike `inode_lock.Entry` (always accessed
+    /// through one `*Entry`, never copied) a `PathWriterLock` value is
+    /// copied and moved pervasively by its own callers (`var lease = held;`,
+    /// `self.retained = lease.*;`) -- a `Region` copied that way would let
+    /// two independent values both believe they own the one mapping/fd and
+    /// both try to tear it down.
+    ///
+    /// During this transitional step the region's own `writer_holder` CAS
+    /// is *not yet* the real safety authority: it only decides fairness
+    /// order among the constructors already migrated onto it (today, just
+    /// `fairWriterLockWithIo`), the same narrow role `writer_queue.Queue`'s
+    /// own ticket/turn played. The sidecar `flock` (`file` above) remains
+    /// the actual mutual-exclusion mechanism every constructor -- migrated
+    /// or not -- still takes, so a caller on the old path and a caller on
+    /// the new one still exclude each other correctly. Only once every
+    /// constructor (and every other remaining flock caller) has moved onto
+    /// the region does a later step retire the flock itself and let the
+    /// region's CAS become the real authority.
+    region: ?*shared_lock_region.Region = null,
     /// When the kernel lease was first taken; kept across in-process handoffs.
     acquired_ns: i96 = 0,
     /// Where `close` records this holder's hold time. Cleared on handoff
@@ -4254,6 +4281,7 @@ pub const PathWriterLock = struct {
     /// Whether a writer in another process has queued behind this lease.
     /// Unknown (no queue) answers true so callers release instead of keeping it.
     pub fn othersWaiting(self: *const PathWriterLock) bool {
+        if (self.region) |region| return region.othersWaiting();
         const io = self.borrowed_io orelse return true;
         if (self.queue_turn) |*turn| return turn.hasSuccessor(io);
         if (self.queue_watch) |*watch| return watch.hasArrivals(io);
@@ -4272,6 +4300,7 @@ pub const PathWriterLock = struct {
     /// queued" and never actually goes away on its own -- use this
     /// instead.
     pub fn othersWaitingAcrossProcesses(self: *const PathWriterLock, own_pid: u32) bool {
+        if (self.region) |region| return region.othersWaitingAcrossProcesses(own_pid);
         const io = self.borrowed_io orelse return true;
         if (self.queue_turn) |*turn| return turn.hasForeignSuccessor(io, own_pid);
         if (self.queue_watch) |*watch| return watch.hasForeignArrivals(io, own_pid);
@@ -4281,12 +4310,19 @@ pub const PathWriterLock = struct {
     pub fn close(self: *PathWriterLock) void {
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
-        self.file.close(io);
+        if (self.file) |f| f.close(io);
         // The hold ends when the descriptor (and its flock) is released, so
         // it covers reader-marker cleanup done under the lock, as handoffs do.
         self.endHold();
         if (self.queue_turn) |*turn| turn.release(io);
         if (self.queue_watch) |*watch| watch.release(io);
+        if (self.region) |region| {
+            // Mirrors `turn.release(io)`'s own timing: held for this
+            // lease's whole lifetime, released only here.
+            region.releaseWriter();
+            region.close();
+            std.heap.page_allocator.destroy(region);
+        }
         if (self.borrowed_io == null) self.io_impl.deinit();
         self.* = undefined;
     }
@@ -14397,12 +14433,65 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
     return .{ .io_impl = undefined, .borrowed_io = io, .file = held };
 }
 
-/// FIFO cross-process writer admission. Writers take turns through
-/// `writer_queue` and then take the sidecar `flock`, which stays the safety
-/// authority. When nobody is queued, an uncontended writer skips the ticket
-/// entirely. An expired deadline still permits that immediate acquisition.
-/// `wait_io` must be able to run a concurrent kernel wait.
+/// FIFO cross-process writer admission. Fairness order is decided by
+/// `shared_lock_region`'s own ticket (§8.2), not `writer_queue` -- the
+/// first of this design's six constructors to migrate onto it. The sidecar
+/// `flock`, taken after the region grants this lease its turn, is still the
+/// *actual* safety authority: the other five constructors haven't moved
+/// onto the region yet, so it alone is what every caller, old path or new,
+/// still excludes against (see `PathWriterLock.region`'s own doc comment).
+/// When nobody is queued, an uncontended writer skips the ticket entirely.
+/// An expired deadline still permits that immediate acquisition. `wait_io`
+/// must be able to run a concurrent kernel wait.
+///
+/// Falls back to `fairWriterLockLegacy` (today's `writer_queue`-based
+/// implementation, unchanged) whenever the region itself can't be used --
+/// the same set of conditions that already sent the old implementation to
+/// `plainWriterLockUntil`, plus the region's own "can't use it here"
+/// errors. §8.6's own dedicated fallback flag (detected once at open and
+/// recorded on `inode_lock.Entry`, not re-probed on every acquire) is a
+/// later step; this is a narrower, call-by-call version of the same idea.
 pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
+    const pid = antfly_platform.process.currentId() orelse 0;
+    // A read-only or otherwise uncooperative filesystem (the same
+    // conditions that already send the legacy implementation to
+    // `plainWriterLockUntil`), proven corruption, or exhausted liveness
+    // slots fall back to the proven legacy path rather than surfacing a
+    // region-specific error to callers that have never had to handle one.
+    // Anything else (notably `OutOfMemory`) propagates instead of being
+    // swallowed into a fallback that would likely fail the same way. See
+    // `inode_lock.isRegionUnusable`'s own doc comment: every migrated
+    // caller, writer or reader side, shares this one check.
+    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+        if (inode_lock.isRegionUnusable(err)) return fairWriterLockLegacy(allocator, io, wait_io, path, deadline_ns);
+        return err;
+    };
+    errdefer region.close();
+    region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
+        error.Timeout => return error.FileBusy,
+        error.Canceled => return error.Canceled,
+    };
+    errdefer region.releaseWriter();
+
+    // Our turn, per the region's own ticket: take the real (still
+    // authoritative) sidecar lock exactly as the pre-region
+    // ticket-won path always did.
+    var lease = try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
+    // Without this, a `create` failure just below would return holding
+    // the sidecar flock forever: `lease` is a local the caller never
+    // sees, so only this function can close it on that path.
+    errdefer lease.close();
+    const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
+    owned_region.* = region;
+    lease.region = owned_region;
+    lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
+    return lease;
+}
+
+/// Today's `writer_queue`-based FIFO cross-process writer admission,
+/// unchanged -- `fairWriterLockWithIo`'s own fallback for when the region
+/// can't be used (see its doc comment).
+fn fairWriterLockLegacy(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
     var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
@@ -17067,13 +17156,17 @@ test "lite fair writer lock grants contended writers in arrival order" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, probe.order[0..probe.len]);
 }
 
-test "lite fair writer lock queues writers of a database with a 250-byte file name" {
+test "lite fair writer lock queues writers of a database with a 243-byte file name" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(16) });
     defer threaded.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The sidecar `<name>.lock` is exactly 255 bytes, the platform limit.
-    var name_buf: [250]u8 = @splat('n');
+    // The region's sidecar `<name>.aflite-lock` is exactly 255 bytes, the
+    // platform limit for one path component -- 12 bytes longer than the
+    // writer_queue-era `<name>.lock`, so this name is 7 bytes shorter than
+    // that older test's own 250 to land on the same boundary for the
+    // region's own naming.
+    var name_buf: [243]u8 = @splat('n');
     @memcpy(name_buf[name_buf.len - ".aflite".len ..], ".aflite");
     const name: []const u8 = &name_buf;
     const path = try testPath(std.testing.allocator, tmp, name);
@@ -17087,9 +17180,9 @@ test "lite fair writer lock queues writers of a database with a 250-byte file na
         t.* = try std.Thread.spawn(.{}, FairLockProbe.takeOnce, .{ &probe, @as(u8, @intCast(i)) });
         try io.sleep(.fromMilliseconds(30), .awake);
     }
-    // The queue is in use (not the plain fallback) and sees both waiters.
-    try std.testing.expect(holder.queue_watch != null);
-    try std.testing.expect(holder.queue_watch.?.hasArrivals(io));
+    // The region is in use (not the plain fallback) and sees both waiters.
+    try std.testing.expect(holder.region != null);
+    try std.testing.expect(holder.region.?.othersWaiting());
     holder.close();
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(usize, 0), probe.failures);

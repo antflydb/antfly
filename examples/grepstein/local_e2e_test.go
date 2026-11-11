@@ -39,6 +39,12 @@ import (
 // artifact indexes. Only Google storage is a loopback protocol fixture; this
 // does not qualify GKE identity exchange or a real-model OCR/embedding workload.
 func TestLocalNativeGCSExtraction(t *testing.T) {
+	for _, ocr := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ocr=%t", ocr), func(t *testing.T) { testLocalNativeGCSExtraction(t, ocr) })
+	}
+}
+
+func testLocalNativeGCSExtraction(t *testing.T, ocr bool) {
 	binary := os.Getenv("ANTFLY_GREPSTEIN_E2E_BINARY")
 	if binary == "" {
 		t.Skip("set ANTFLY_GREPSTEIN_E2E_BINARY to the native Antfly binary")
@@ -52,11 +58,19 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	defer cancel()
 	root := t.TempDir()
 	pdf := nativeGCSFixturePDF()
+	if ocr {
+		pdf = createMinimalPDF()
+	}
+	newPDF := bytes.Replace(nativeGCSFixturePDF(), []byte("evidence"), []byte("appendix"), -1)
+	newDigest := fmt.Sprintf("%x", sha256.Sum256(newPDF))
+	newKey := "objects/sha256/" + newDigest + ".pdf"
+	var ocrCalls atomic.Int64
+	readerServer := nativeAppendReaderFixture(t, &ocrCalls)
 	digest := fmt.Sprintf("%x", sha256.Sum256(pdf))
 	key := "objects/sha256/" + digest + ".pdf"
 	var reads atomic.Int64
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" || r.URL.Path != "/storage/v1/b/e2e-originals/o/"+key || r.URL.Query().Get("alt") != "media" || r.Header.Get("Authorization") != "Bearer local-gcs-e2e-token" {
+		if r.Method != "GET" || (r.URL.Path != "/storage/v1/b/e2e-originals/o/"+key && r.URL.Path != "/storage/v1/b/e2e-originals/o/"+newKey) || r.URL.Query().Get("alt") != "media" || r.Header.Get("Authorization") != "Bearer local-gcs-e2e-token" {
 			http.Error(w, "invalid scoped GCS request", 403)
 			return
 		}
@@ -68,8 +82,12 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		reads.Add(1)
 		w.Header().Set("x-goog-generation", "123")
 		w.Header().Set("Content-Type", "application/pdf")
-		w.Header().Set("Content-Length", strconv.Itoa(len(pdf)))
-		w.Write(pdf)
+		content := pdf
+		if strings.HasSuffix(r.URL.Path, newKey) {
+			content = newPDF
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.Write(content)
 	}))
 	t.Cleanup(provider.Close)
 	config := map[string]any{
@@ -117,8 +135,8 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		logFile.Close()
 		if t.Failed() {
 			data, _ := os.ReadFile(logPath)
-			if len(data) > 12000 {
-				data = data[len(data)-12000:]
+			if len(data) > 24000 {
+				data = append(append(data[:12000:12000], []byte("\n...\n")...), data[len(data)-12000:]...)
 			}
 			t.Logf("native server log:\n%s", data)
 		}
@@ -141,19 +159,21 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	if !ready {
 		t.Fatal("local native server did not become ready")
 	}
-	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", "", false, false, corpusIndexOptions{SourceConnection: "gcs-e2e"})
+	readerConfig, inferenceURL := "", ""
+	if ocr {
+		readerConfig = filepath.Join(root, "reader.json")
+		inferenceURL = readerServer.URL
+		if err := atomicCorpusJSON(readerConfig, map[string]any{"provider": "antfly", "model": "e2e-reader", "max_tokens": 8192}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, inferenceURL, readerConfig, false, false, corpusIndexOptions{SourceConnection: "gcs-e2e"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	tableURL := endpoint + "/tables/gcs_e2e"
-	if _, err := corpusRequestWithContext(ctx, client, "POST", tableURL, map[string]any{"num_shards": 1, "schema": corpusTableSchema(), "indexes": indexes}); err != nil {
-		t.Fatal(err)
-	}
 	source := "gs://e2e-originals/" + key + "?generation=123"
-	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1}}
-	if _, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/batch", map[string]any{"inserts": map[string]any{"evidence": document}, "sync_level": "write"}); err != nil {
-		t.Fatal(err)
-	}
+	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1, "source_locator": map[string]any{"modified": json.Number("1794400000000000001")}}}
 	record := corpusRecord{ID: "evidence", Document: document}
 	manifest, _ := json.Marshal(record)
 	manifest = append(manifest, '\n')
@@ -163,6 +183,21 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	}
 	if err := atomicCorpusJSON(filepath.Join(root, "publication.json"), map[string]any{"sha256": manifestHash, "records": 1}); err != nil {
 		t.Fatal(err)
+	}
+	// Exercise the real table/configuration binding and durable load checkpoint,
+	// rather than inserting rows through a test-only shortcut.
+	if err := atomicCorpusJSON(filepath.Join(root, "prepare.json"), corpusProgress{Complete: true, Records: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicCorpusJSON(filepath.Join(root, "sources.json"), corpusConfig{IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25}); err != nil {
+		t.Fatal(err)
+	}
+	loadArgs := []string{"--state", root, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--inference-url", inferenceURL}
+	if err := corpusLoadCmd(append(append([]string{}, loadArgs...), "--create-table")); err != nil {
+		t.Fatalf("native corpus load: %v", err)
+	}
+	if err := corpusLoadCmd(loadArgs); err != nil {
+		t.Fatalf("native corpus resume: %v", err)
 	}
 	var qualification extractionQualification
 	var last error
@@ -176,6 +211,71 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	if last != nil || !qualification.Complete || qualification.Pages != 1 {
 		t.Fatalf("native GCS qualification: %+v %v", qualification, last)
 	}
+	// Expand through a separate sealed catalog containing both the accepted
+	// sample and one new PDF. Conditional insertion must never rewrite sample.
+	beforeArtifact, err := corpusRequest(client, "GET", tableURL+"/documents/evidence/artifacts/"+corpusUnits+"?detail=raw", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before struct {
+		Generation uint64 `json:"generation"`
+	}
+	if err := json.Unmarshal(beforeArtifact, &before); err != nil || before.Generation == 0 {
+		t.Fatal("missing accepted extraction generation", err)
+	}
+	readsBefore, callsBefore := reads.Load(), ocrCalls.Load()
+	if ocr && callsBefore != 1 {
+		t.Fatalf("sample must actually OCR once, got %d", callsBefore)
+	}
+	appendState := t.TempDir()
+	newSource := "gs://e2e-originals/" + newKey + "?generation=123"
+	newDocument := make(map[string]any)
+	for k, v := range document {
+		newDocument[k] = v
+	}
+	newDocument["url"], newDocument["original_url"], newDocument["version"], newDocument["filename"] = newSource, newSource, newDigest+":123", "appendix.pdf"
+	writeAppendState(t, appendState, []corpusRecord{record, {ID: "appendix", Document: newDocument}}, corpusConfig{IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25})
+	appendArgs := []string{"--state", appendState, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--inference-url", inferenceURL, "--append-only", "--accepted-state", root}
+	if err := corpusLoadCmd(append(append([]string{}, appendArgs...), "--plan-only")); err != nil {
+		t.Fatal("append preflight", err)
+	}
+	if reads.Load() != readsBefore || ocrCalls.Load() != callsBefore {
+		t.Fatal("append planning triggered extraction")
+	}
+	if err := corpusLoadCmd(appendArgs); err != nil {
+		t.Fatal("append load", err)
+	}
+	if err := corpusLoadCmd(appendArgs); err != nil {
+		t.Fatal("append resume", err)
+	}
+	last = nil
+	for started := time.Now(); time.Since(started) < 90*time.Second; {
+		_, last = qualifyCorpus(client, tableURL, appendState)
+		if last == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if last != nil {
+		t.Fatal("append qualification", last)
+	}
+	afterArtifact, err := corpusRequest(client, "GET", tableURL+"/documents/evidence/artifacts/"+corpusUnits+"?detail=raw", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after struct {
+		Generation uint64 `json:"generation"`
+	}
+	if err := json.Unmarshal(afterArtifact, &after); err != nil || before.Generation != after.Generation {
+		t.Fatal("append changed sample generation", err)
+	}
+	if ocrCalls.Load() != callsBefore {
+		t.Fatalf("append repeated sample OCR: %d -> %d", callsBefore, ocrCalls.Load())
+	}
+	if reads.Load() != readsBefore+1 {
+		t.Fatalf("append fetched more than the new PDF: %d -> %d", readsBefore, reads.Load())
+	}
+	t.Log("append preserved sample extraction generation and OCR call count; only new PDF fetched")
 	query := map[string]any{"fields": []string{"text", "provenance"}, "hierarchy": map[string]any{"children": map[string]any{"level": "unit", "parent": map[string]any{"level": "source", "id": "evidence"}}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 2}
 	data, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/query", query)
 	if err != nil {

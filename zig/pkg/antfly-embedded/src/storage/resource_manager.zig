@@ -3949,19 +3949,32 @@ pub const BudgetedAllocator = struct {
         pub fn growTo(self: *BorrowedScratch, bytes: usize) !void {
             if (self.reservation.released) return error.ReservationReleased;
             if (bytes <= self.bytes) return;
-            lockAtomic(&self.owner.allocator_mutex);
-            defer self.owner.allocator_mutex.unlock();
             const growth = bytes - self.bytes;
-            const other_borrowed = std.math.sub(u64, self.owner.borrowed_bytes, self.bytes) catch return error.ResourceAccountingMismatch;
-            const other = std.math.add(u64, self.owner.reservation.bytes, other_borrowed) catch return error.ResourceBudgetExceeded;
-            _ = self.reservation.manager.growReservationAmortized(&self.reservation, growth, growth, self.owner.max_hard_limit_multiple, other) catch |err| {
+            while (true) {
+                const failure: anyerror = attempt: {
+                    lockAtomic(&self.owner.allocator_mutex);
+                    defer self.owner.allocator_mutex.unlock();
+                    const other_borrowed = std.math.sub(u64, self.owner.borrowed_bytes, self.bytes) catch return error.ResourceAccountingMismatch;
+                    const other = std.math.add(u64, self.owner.reservation.bytes, other_borrowed) catch return error.ResourceBudgetExceeded;
+                    _ = self.reservation.manager.growReservationAmortized(&self.reservation, growth, growth, self.owner.max_hard_limit_multiple, other) catch |err| break :attempt err;
+                    self.owner.borrowed_bytes += growth;
+                    self.owner.live_bytes += growth;
+                    self.bytes = bytes;
+                    return;
+                };
+                // Borrowed buffers need independent credit: allocator spare
+                // cannot satisfy their admission until returned to the manager.
+                // Retry actual admission after each release, outside owner locks.
+                if (failure == error.ResourceBudgetExceeded and allocator_residency.Guard.allowed()) {
+                    if (self.owner.releaseUnusedCreditThreadSafe() != 0) continue;
+                    if (self.owner.residency.active() and self.owner.residency.reclaimOne()) continue;
+                }
+                lockAtomic(&self.owner.allocator_mutex);
+                defer self.owner.allocator_mutex.unlock();
                 self.owner.recordDenial();
                 self.owner.recordAllocationFailure(.admission, growth, @returnAddress());
-                return err;
-            };
-            self.owner.borrowed_bytes += growth;
-            self.owner.live_bytes += growth;
-            self.bytes = bytes;
+                return failure;
+            }
         }
 
         pub fn shrinkTo(self: *BorrowedScratch, bytes: usize) void {
@@ -4111,8 +4124,8 @@ pub const BudgetedAllocator = struct {
         self.* = undefined;
     }
 
-    /// Recognize only our own allocator and standard arena wrappers. Unknown
-    /// wrappers retain their original allocation path and budget semantics.
+    /// Recognize our allocator through standard arenas and transparent
+    /// pressure layers. Unknown quota/failure wrappers remain boundaries.
     pub fn fromAllocator(candidate: std.mem.Allocator) ?*BudgetedAllocator {
         var current = candidate;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -4120,6 +4133,10 @@ pub const BudgetedAllocator = struct {
         for (0..8) |_| {
             if (current.vtable.alloc == alloc or current.vtable.alloc == lockedAlloc)
                 return @ptrCast(@alignCast(current.ptr));
+            if (@import("antfly_platform").allocator.PressureAllocator.parentAllocator(current)) |parent| {
+                current = parent;
+                continue;
+            }
             if (current.vtable != arena_vtable) return null;
             const wrapped: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
             current = wrapped.child_allocator;
@@ -6899,4 +6916,105 @@ test "external lake native chunk reclamation preserves pins and skips contended 
     try std.testing.expectEqual(@as(u64, 0), ResourceManager.NativeChunks.reclaim(owner, MiB));
     try std.testing.expectEqualStrings("pinned native extent", bytes);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+}
+
+test "leann pressure layers preserve borrowed native read budget recognition" {
+    const PressureLayer = @import("antfly_platform").allocator.PressureAllocator;
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.dense_search_working_set)] = .{ .soft_limit_bytes = 64, .hard_limit_bytes = 128 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var budget = BudgetedAllocator.init(&manager, .dense_search_working_set, std.testing.allocator, 1);
+    defer budget.deinit();
+    const Layer = struct {
+        layer: PressureLayer,
+        retained: ?[]u8 = null,
+        reclaims: usize = 0,
+        hook: allocator_residency.Reclaimer = undefined,
+        fn reclaimResidency(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return reclaim(&self.layer);
+        }
+        fn reclaim(layer: *PressureLayer) bool {
+            const self: *@This() = @fieldParentPtr("layer", layer);
+            const retained = self.retained orelse return false;
+            self.retained = null;
+            self.layer.parent.free(retained);
+            self.reclaims += 1;
+            return true;
+        }
+    };
+    var inner = Layer{ .layer = .{ .parent = budget.allocator(), .reclaim = Layer.reclaim } };
+    inner.retained = try budget.allocator().alloc(u8, 80);
+    defer if (inner.retained) |bytes| budget.allocator().free(bytes);
+    var outer = Layer{ .layer = .{ .parent = inner.layer.allocator(), .reclaim = Layer.reclaim } };
+    const alloc = outer.layer.allocator();
+    try std.testing.expectEqual(&budget, BudgetedAllocator.fromAllocator(alloc).?);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try std.testing.expectEqual(&budget, BudgetedAllocator.fromAllocator(arena.allocator()).?);
+    {
+        const bytes = try alloc.alloc(u8, 96);
+        defer alloc.free(bytes);
+        try std.testing.expectEqual(@as(usize, 1), inner.reclaims);
+        try std.testing.expectEqual(@as(usize, 0), outer.reclaims);
+        var borrowed = try BudgetedAllocator.fromAllocator(alloc).?.borrowResidentScratch(16, null);
+        defer borrowed.release();
+        try std.testing.expectEqual(@as(u64, 16), budget.borrowed_bytes);
+        try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 32));
+    }
+    inner.retained = try budget.allocator().alloc(u8, 80);
+    inner.hook = .{ .ptr = &inner, .reclaim = Layer.reclaimResidency };
+    budget.residency.register(&inner.hook);
+    defer budget.residency.unregister(&inner.hook);
+    var borrowed = try BudgetedAllocator.fromAllocator(alloc).?.borrowResidentScratch(96, null);
+    defer borrowed.release();
+    try std.testing.expectEqual(@as(usize, 2), inner.reclaims);
+    try std.testing.expectEqual(@as(u64, 96), budget.borrowed_bytes);
+}
+
+test "leann borrowed admission returns amortized credit and reclaims sources before retry" {
+    const Retained = struct {
+        owner: *BudgetedAllocator,
+        bytes: ?[]u8,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = self.bytes orelse return false;
+            self.bytes = null;
+            self.owner.allocator().free(bytes);
+            self.calls += 1;
+            return true;
+        }
+    };
+    for ([_]bool{ false, true }) |host_pressure| {
+        for ([_]usize{ 16, 48 }) |demand| {
+            var budgets = Options.defaultBudgets();
+            budgets[sliceIndex(.dense_search_working_set)] = .{ .soft_limit_bytes = 64, .hard_limit_bytes = if (host_pressure) 256 else 128 };
+            var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = if (host_pressure) 128 else 256 } });
+            var owner = BudgetedAllocator.init(&manager, .dense_search_working_set, std.testing.allocator, 1);
+            defer owner.deinit();
+            owner.credit_quantum = 64;
+            const live = try owner.allocator().alloc(u8, 1);
+            defer owner.allocator().free(live);
+            var retained = Retained{ .owner = &owner, .bytes = try owner.allocator().alloc(u8, 31) };
+            defer if (retained.bytes) |bytes| owner.allocator().free(bytes);
+            var hook = allocator_residency.Reclaimer{ .ptr = &retained, .reclaim = Retained.reclaim };
+            owner.residency.register(&hook);
+            defer owner.residency.unregister(&hook);
+            var competing = BudgetedAllocator.init(&manager, .dense_search_working_set, std.testing.allocator, 1);
+            defer competing.deinit();
+            const occupied = try competing.allocator().alloc(u8, 64);
+            defer competing.allocator().free(occupied);
+            try std.testing.expectEqual(@as(u64, 64), owner.reservation.bytes);
+            var borrowed = try owner.borrowResidentScratch(demand, null);
+            defer borrowed.release();
+            try std.testing.expectEqual(@as(usize, if (demand == 16) 0 else 1), retained.calls);
+            try std.testing.expectEqual(@as(u64, @intCast(demand)), owner.borrowed_bytes);
+            try std.testing.expect(!owner.denied());
+            // Impossible demand remains bounded and preserves the active lease.
+            try std.testing.expectError(error.ResourceBudgetExceeded, borrowed.growTo(128));
+            try std.testing.expectEqual(demand, borrowed.bytes);
+            try std.testing.expect(owner.denied());
+        }
+    }
 }

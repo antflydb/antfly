@@ -24,7 +24,8 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
-pub const max_effect_protocol: u16 = 18;
+pub const dense_artifact_flags_protocol: u16 = 19;
+pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
 
 pub const Binding = struct {
     epoch: u64,
@@ -75,7 +76,8 @@ pub const Catalogs = struct {
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
             for (configs) |cfg| {
-                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) return 18;
+                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
+                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
                 if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
         }
@@ -192,6 +194,8 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     extended.effect_protocol = 18;
     try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 19;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 20;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
@@ -242,6 +246,29 @@ fn get(txn: anytype, key: []const u8) ![]const u8 {
 pub const SemanticDigestCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entry: ?struct { catalog: [32]u8, semantic: [32]u8 } = null,
+    protocol_entry: ?struct { catalog: [32]u8, required: u16 } = null,
+
+    /// Reader floors below the latest capability still need feature discovery.
+    /// Cache that discovery by immutable catalog content so an upgrade does not
+    /// add catalog parsing to every ordinary readiness poll.
+    pub fn effectProtocolFor(self: *SemanticDigestCache, alloc: std.mem.Allocator, value: Catalogs, previous: ?Binding, minimum: u16) !u16 {
+        const floor = @max(minimum, if (previous) |binding| binding.effect_protocol else 14);
+        if (floor == max_effect_protocol) return floor;
+        const identity = value.digest();
+        {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
+            if (self.protocol_entry) |cached| if (std.mem.eql(u8, &cached.catalog, &identity)) return @max(floor, cached.required);
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const required = try value.requiredEffectProtocol(arena.allocator());
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.protocol_entry = .{ .catalog = identity, .required = required };
+        return @max(floor, required);
+    }
+
     pub fn get(self: *SemanticDigestCache, alloc: std.mem.Allocator, value: Catalogs) ![32]u8 {
         const identity = value.digest();
         {
@@ -258,6 +285,19 @@ pub const SemanticDigestCache = struct {
         return semantic;
     }
 };
+
+test "leann protocol readiness caches catalog discovery across floor upgrades" {
+    var cache = SemanticDigestCache{};
+    const catalogs_value = Catalogs{};
+    try std.testing.expectEqual(@as(u16, 18), try cache.effectProtocolFor(std.testing.allocator, catalogs_value, null, 18));
+    // A cache hit needs no allocator, including after a semantic-cache lookup.
+    _ = try cache.get(std.testing.allocator, catalogs_value);
+    try std.testing.expectEqual(@as(u16, 18), try cache.effectProtocolFor(std.testing.failing_allocator, catalogs_value, null, 18));
+    // Another immutable catalog cannot inherit that cached requirement.
+    if (cache.effectProtocolFor(std.testing.allocator, .{ .enrichments = "[" }, null, 18)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
 
 pub fn catalogs(txn: anytype) !Catalogs {
     return .{ .indexes = try get(txn, index_key), .enrichments = try get(txn, enrichment_key), .resolvers = try get(txn, resolver_key) };

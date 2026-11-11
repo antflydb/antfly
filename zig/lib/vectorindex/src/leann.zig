@@ -142,14 +142,26 @@ pub const Config = struct {
 /// production this calls the embedder on the stored source text; a cache of
 /// hot embeddings can sit in front of it.
 pub const EmbeddingSource = struct {
+    /// Stable public identity used to order equal exact distances.
+    result_order: ?*const fn (*anyopaque, u32) u64 = null,
     ctx: *anyopaque,
     recompute_fn: *const fn (ctx: *anyopaque, ids: []const u32, out: []f32) anyerror!void,
 
+    /// Proves that a retained exact vector still matches its current source.
+    validate_retained_fn: ?*const fn (ctx: *anyopaque, id: u32) anyerror!bool = null,
     /// Reports whether an exact load will return the revision encoded in the graph.
     bounds_current: ?*const fn (*anyopaque, u32) bool = null,
 
     fn boundsCurrent(self: EmbeddingSource, id: u32) bool {
         return if (self.bounds_current) |check| check(self.ctx, id) else true;
+    }
+
+    /// A retained original cannot stand in for a lossy source copy. When
+    /// source verification is requested, absence of proof requires a load.
+    fn canUseRetained(self: EmbeddingSource, id: u32, opts: SearchOptions) !bool {
+        if (opts.score_quantized_source) return false;
+        if (opts.verify_source) return if (self.validate_retained_fn) |validate| try validate(self.ctx, id) else false;
+        return true;
     }
 
     pub fn recompute(self: EmbeddingSource, ids: []const u32, out: []f32) !void {
@@ -203,6 +215,37 @@ pub const Rerank = enum {
     bounds,
 };
 
+/// Restricts results to nodes it allows. The walk still passes through
+/// rejected nodes, so a selective filter keeps exploring until `ef` allowed
+/// candidates are found instead of returning a short page.
+pub const Filter = struct {
+    ctx: *const anyopaque,
+    allows_fn: *const fn (ctx: *const anyopaque, id: u32) anyerror!bool,
+
+    pub fn allows(self: Filter, id: u32) !bool {
+        return self.allows_fn(self.ctx, id);
+    }
+};
+
+/// Consulted before each recompute (embedding) batch of a search. An error
+/// aborts the search (cancellation); `false` ends recomputation (a spent
+/// time budget): `bounds` mode then ranks the candidates it has not
+/// recomputed by their estimates, `ratio` mode returns what it has.
+pub const RecomputeGate = struct {
+    ctx: *const anyopaque,
+    check_fn: *const fn (ctx: *const anyopaque) anyerror!bool,
+    cancel_fn: ?*const fn (ctx: *const anyopaque) anyerror!void = null,
+
+    pub fn checkCancellation(gate: ?RecomputeGate) !void {
+        if (gate) |g| if (g.cancel_fn) |f| try f(g.ctx);
+    }
+
+    pub fn open(gate: ?RecomputeGate) !bool {
+        const g = gate orelse return true;
+        return g.check_fn(g.ctx);
+    }
+};
+
 pub const ResultFilter = struct {
     ctx: *const anyopaque,
     allows: *const fn (*const anyopaque, u32) anyerror!bool,
@@ -228,6 +271,23 @@ pub const ResultFilter = struct {
 
 pub const SearchOptions = struct {
     k: u32 = 10,
+    /// Only nodes this allows are returned or recomputed during filtered search.
+    filter: ?Filter = null,
+    /// Known graph node IDs to score directly; callers must provide unique IDs.
+    candidate_ids: ?[]const u32 = null,
+    /// Maximum graph candidates and fallback positions inspected for an
+    /// opaque filter. Zero leaves the search exhaustive.
+    filter_visit_limit: u32 = 0,
+    /// Score every eligible candidate instead of pruning by estimates.
+    exhaustive: bool = false,
+    distance_over: ?f32 = null,
+    distance_under: ?f32 = null,
+    /// Load upper-layer candidates to verify their backing vector is available.
+    verify_source: bool = false,
+    /// Source vectors can be lossy copies. Original-vector bounds cannot
+    /// prune them, and retained originals cannot replace source copies.
+    score_quantized_source: bool = false,
+    gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
     /// rerank mode: 64 for `ratio`, where every beam slot costs
     /// recomputation, and 512 for `bounds`, where the walk only costs
@@ -244,7 +304,10 @@ pub const SearchOptions = struct {
     two_level: bool = true,
     /// Descend the upper layers with recomputed exact distances instead of
     /// PQ distances. Costs roughly levels x M recomputations per query but
-    /// avoids starting layer 0 in the wrong region when PQ is coarse.
+    /// avoids starting layer 0 in the wrong region when PQ is coarse. Filtered
+    /// searches use approximate descent to avoid loading rejected vectors.
+    /// A closed recomputation gate also falls back to approximate descent;
+    /// cancellation aborts before dispatching the next exact batch.
     exact_descent: bool = false,
     rerank: Rerank = .auto,
     /// Multiplies RaBitQ error bounds in `bounds` mode. Larger is safer and
@@ -261,6 +324,11 @@ pub const SearchStats = struct {
     approx_evaluated: u32 = 0,
     /// Nodes whose neighbor lists were expanded.
     expanded: u32 = 0,
+    /// The gate closed before recomputation finished; some results are
+    /// ranked by estimate.
+    budget_exhausted: bool = false,
+    /// The opaque-filter work limit ended the walk or fallback scan.
+    filter_truncated: bool = false,
     /// Largest retained traversal frontier in a filtered search.
     peak_frontier: u32 = 0,
     matches: MatchCoverage = .{},
@@ -337,6 +405,229 @@ fn levelFor(seed: u64, id: u32, max_degree: u32) u8 {
     const ml = 1.0 / @log(@as(f64, @floatFromInt(max_degree)));
     const level = @floor(-@log(u) * ml);
     return @intFromFloat(@min(level, @as(f64, max_level_cap)));
+}
+
+pub const PreparedCandidate = struct {
+    /// Exact-buffer rows have no routing estimate and must all be scored.
+    exact: bool = false,
+    id: u32,
+    lower: f32,
+    est: f32,
+    retained: bool = false,
+};
+
+pub const PreparedSearch = struct {
+    candidates: []PreparedCandidate,
+    metric: Metric,
+    dims: u32,
+    has_bounds: bool,
+    stats: SearchStats = .{},
+
+    pub fn deinit(self: *PreparedSearch, alloc: Allocator) void {
+        alloc.free(self.candidates);
+        self.candidates = &.{};
+    }
+
+    /// Consumes candidate storage. Only request-owned bytes and the source
+    /// callbacks are used after graph preparation.
+    pub fn score(self: *PreparedSearch, alloc: Allocator, source: EmbeddingSource, query: []const f32, input_opts: SearchOptions) !SearchResponse {
+        // Match Index.search's argument contract before allocation or callbacks.
+        // Invalid dimensions leave the plan available for a corrected call.
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (input_opts.k == 0 or self.candidates.len == 0) {
+            var stats = self.stats;
+            stats.matches.complete = input_opts.k != 0;
+            self.deinit(alloc);
+            return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        }
+        var opts = input_opts;
+        if (opts.ef == 0) opts.ef = if (self.has_bounds) 512 else 64;
+        const q = try alloc.dupe(f32, query);
+        defer alloc.free(q);
+        if (self.metric == .cosine) normalize(q);
+        const ef: usize = if (opts.exhaustive) self.candidates.len else @max(opts.ef, opts.k);
+        const k: usize = opts.k;
+        var local_stats = self.stats;
+        const stats = &local_stats;
+        var pool = std.ArrayListUnmanaged(PreparedCandidate).fromOwnedSlice(self.candidates);
+        self.candidates = &.{};
+        defer pool.deinit(alloc);
+        var exact_ids: std.ArrayListUnmanaged(u32) = .empty;
+        defer exact_ids.deinit(alloc);
+        var routed: usize = 0;
+        for (pool.items) |candidate| {
+            if (candidate.exact) {
+                try exact_ids.append(alloc, candidate.id);
+            } else {
+                pool.items[routed] = candidate;
+                routed += 1;
+            }
+        }
+        pool.items.len = routed;
+        // PQ has no admissible bounds. RaBitQ bounds describe the original
+        // vectors, so they also cannot prune reranking of quantized copies.
+        // Score the estimated shortlist first, then refill if vectors are missing.
+        const use_bounds = self.has_bounds and !opts.score_quantized_source;
+        for (pool.items, 0..) |*candidate, offset| {
+            if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+            if ((use_bounds and !source.boundsCurrent(candidate.id)) or
+                (candidate.retained and !try source.canUseRetained(candidate.id, opts)))
+            {
+                candidate.lower = -std.math.inf(f32);
+                candidate.retained = false;
+            }
+        }
+        const refill_shortlist = !use_bounds;
+        const ByEstimate = struct {
+            fn compare(_: void, a: PreparedCandidate, b: PreparedCandidate) std.math.Order {
+                if (a.est < b.est) return .lt;
+                if (a.est > b.est) return .gt;
+                return std.math.order(a.id, b.id);
+            }
+        };
+        const EstimateQueue = std.PriorityQueue(PreparedCandidate, void, ByEstimate.compare);
+        var estimates: ?EstimateQueue = null;
+        defer if (estimates) |*queue| queue.deinit(alloc);
+        if (refill_shortlist and pool.items.len > ef) {
+            // Heapify once, then order only the candidates actually scored.
+            estimates = EstimateQueue.fromOwnedSlice(try pool.toOwnedSlice(alloc), {});
+        }
+
+        const ByLower = struct {
+            fn lessThan(_: void, a: PreparedCandidate, b: PreparedCandidate) bool {
+                return a.lower < b.lower;
+            }
+        };
+        if (use_bounds) std.mem.sortUnstable(PreparedCandidate, pool.items, {}, ByLower.lessThan);
+        const candidates_view = if (estimates) |queue| queue.items else pool.items;
+
+        var top = FilteredHeap{};
+        defer top.deinit(alloc);
+        var ids = std.ArrayListUnmanaged(u32).empty;
+        defer ids.deinit(alloc);
+        var dists = std.ArrayListUnmanaged(f32).empty;
+        defer dists.deinit(alloc);
+        var buf = std.ArrayListUnmanaged(f32).empty;
+        defer buf.deinit(alloc);
+        const chunk: usize = if (opts.batch_size > 0) opts.batch_size else if (opts.exhaustive) 128 else @max(k, 1);
+        var exact_offset: usize = 0;
+        const exact_batch: usize = if (opts.batch_size > 0) opts.batch_size else 128;
+        while (exact_offset < exact_ids.items.len) {
+            try RecomputeGate.checkCancellation(opts.gate);
+            if (!try RecomputeGate.open(opts.gate)) return error.ReembedBudgetExceeded;
+            const end = @min(exact_offset + exact_batch, exact_ids.items.len);
+            const batch = exact_ids.items[exact_offset..end];
+            try dists.resize(alloc, batch.len);
+            try recomputePreparedDistances(alloc, self.metric, self.dims, source, q, batch, &buf, dists.items, stats);
+            try admitPreparedDistances(alloc, source, opts, batch, dists.items, &top, stats);
+            exact_offset = end;
+        }
+        var i: usize = 0;
+        var unrecomputed_from: ?usize = null;
+        while (i < candidates_view.len) {
+            if (refill_shortlist and i >= ef and top.len() >= k) break;
+            const refilling = refill_shortlist and i >= ef;
+            const batch_end = if (refill_shortlist and !refilling) @min(ef, candidates_view.len) else candidates_view.len;
+            const batch_size = if (refilling) @min(chunk, k - top.len()) else chunk;
+            const batch_start = i;
+            const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
+            ids.clearRetainingCapacity();
+            while (i < batch_end and ids.items.len < batch_size) : (i += 1) {
+                const p = if (estimates) |*queue| next: {
+                    const candidate = queue.pop().?;
+                    // Keep the popped item for the estimate-only fallback.
+                    candidates_view[candidates_view.len - 1 - i] = candidate;
+                    break :next candidate;
+                } else candidates_view[i];
+                if (i % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (use_bounds and !opts.exhaustive) if (opts.distance_under) |under| {
+                    if (p.lower >= under) {
+                        // Sorted admissible bounds exclude the remaining
+                        // candidates from this radius, including count proofs.
+                        i = candidates_view.len;
+                        break;
+                    }
+                };
+                if (use_bounds and p.lower > tau) break;
+                if (p.retained) {
+                    if (opts.distance_over) |over| if (!(p.est > over)) continue;
+                    if (opts.distance_under) |under| if (!(p.est < under)) continue;
+                    stats.matches.verified += 1;
+                    const c = FilteredCandidate{ .dist = p.est, .id = p.id, .order = if (source.result_order) |order| order(source.ctx, p.id) else p.id };
+                    if (top.len() < k) try top.push(alloc, c) else if (FilteredCandidate.lessThan({}, c, top.top())) top.replaceTop(c);
+                    continue;
+                }
+                try ids.append(alloc, p.id);
+            }
+            if (ids.items.len == 0) {
+                if (use_bounds and i < candidates_view.len and candidates_view[i].lower > tau) break;
+                continue;
+            }
+            if (!try RecomputeGate.open(opts.gate)) {
+                unrecomputed_from = batch_start;
+                break;
+            }
+            try dists.resize(alloc, ids.items.len);
+            try recomputePreparedDistances(alloc, self.metric, self.dims, source, q, ids.items, &buf, dists.items, stats);
+            try admitPreparedDistances(alloc, source, opts, ids.items, dists.items, &top, stats);
+        }
+        if (unrecomputed_from) |from| {
+            // Out of budget: rank the rest by estimate rather than return
+            // fewer than k results.
+            stats.budget_exhausted = true;
+            // Unscored source-backed candidates may no longer exist.
+            if (!opts.verify_source) {
+                for (from..candidates_view.len) |position| {
+                    const offset = if (estimates != null) candidates_view.len - 1 - position else position;
+                    const p = candidates_view[offset];
+                    if ((!opts.score_quantized_source and position < i and p.retained)) continue;
+                    if (!std.math.isFinite(p.est)) continue;
+                    if (opts.distance_over) |over| if (!(p.est > over)) continue;
+                    if (opts.distance_under) |under| if (!(p.est < under)) continue;
+                    const c = FilteredCandidate{ .dist = p.est, .id = p.id, .order = if (source.result_order) |order| order(source.ctx, p.id) else p.id };
+                    if (top.len() < k) {
+                        try top.push(alloc, c);
+                    } else if (FilteredCandidate.lessThan({}, c, top.top())) {
+                        top.replaceTop(c);
+                    }
+                }
+            }
+        }
+
+        stats.matches.complete = i >= candidates_view.len and unrecomputed_from == null;
+        std.mem.sortUnstable(FilteredCandidate, top.items.items, {}, FilteredCandidate.lessThan);
+        const results = try alloc.alloc(Result, top.len());
+        for (top.items.items, results) |candidate, *result| result.* = .{ .id = candidate.id, .distance = candidate.dist };
+        return .{ .results = results, .stats = stats.* };
+    }
+};
+
+fn admitPreparedDistances(alloc: Allocator, source: EmbeddingSource, opts: SearchOptions, ids: []const u32, distances: []const f32, top: *FilteredHeap, stats: *SearchStats) !void {
+    for (ids, distances) |id, dist| {
+        if (!std.math.isFinite(dist)) continue;
+        if (opts.distance_over) |over| if (!(dist > over)) continue;
+        if (opts.distance_under) |under| if (!(dist < under)) continue;
+        stats.matches.verified += 1;
+        const candidate = FilteredCandidate{ .dist = dist, .id = id, .order = if (source.result_order) |order| order(source.ctx, id) else id };
+        if (top.len() < opts.k) {
+            try top.push(alloc, candidate);
+        } else if (FilteredCandidate.lessThan({}, candidate, top.top())) {
+            top.replaceTop(candidate);
+        }
+    }
+}
+
+fn recomputePreparedDistances(alloc: Allocator, metric: Metric, dims: u32, source: EmbeddingSource, q: []const f32, ids: []const u32, buf: *std.ArrayListUnmanaged(f32), out: []f32, stats: *SearchStats) !void {
+    if (ids.len == 0) return;
+    try buf.resize(alloc, ids.len * @as(usize, dims));
+    try source.recompute(ids, buf.items);
+    stats.batches += 1;
+    stats.recomputed += @intCast(ids.len);
+    for (out, 0..) |*value, offset| {
+        const row = buf.items[offset * dims ..][0..dims];
+        if (metric == .cosine) normalize(row);
+        value.* = if (std.math.isNan(row[0])) std.math.inf(f32) else distance(metric, q, row);
+    }
 }
 
 pub const Index = struct {
@@ -741,6 +1032,7 @@ pub const Index = struct {
         if (query.len != self.dimension()) return error.DimensionMismatch;
         var stats = SearchStats{};
         if (self.node_count == 0 or opts.k == 0) return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        if (opts.exhaustive) return self.exhaustiveSearch(alloc, source, query, opts);
         const rerank: Rerank = switch (opts.rerank) {
             .auto => if (self.rabitq != null) .bounds else .ratio,
             else => opts.rerank,
@@ -755,16 +1047,23 @@ pub const Index = struct {
         var approx = try Approx.init(alloc, self, q);
         defer approx.deinit();
 
-        const start = if (eff.exact_descent)
-            try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
+        // A filtered search must not load rejected upper-layer vectors.
+        const start = if (eff.candidate_ids != null) self.entry else if (eff.exact_descent and eff.filter == null)
+            (try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats, eff.gate)) orelse
+                try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, 0, eff.gate)
         else
-            try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
+            try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, if (eff.filter != null and eff.filter_visit_limit > 0) @max(eff.filter_visit_limit / 4, 1) else 0, eff.gate);
 
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
-        switch (rerank) {
+        if (eff.candidate_ids != null) {
+            try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats);
+        } else switch (rerank) {
             .bounds => try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats),
-            else => try self.twoLevelSearch(alloc, source, q, &approx, start, eff, &found, &stats),
+            else => if (eff.filter != null)
+                try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats)
+            else
+                try self.twoLevelSearch(alloc, source, q, &approx, start, eff, &found, &stats),
         }
 
         var out = std.ArrayListUnmanaged(Result).empty;
@@ -775,6 +1074,184 @@ pub const Index = struct {
             try out.append(alloc, .{ .id = c.id, .distance = c.dist });
         }
         return .{ .results = try out.toOwnedSlice(alloc), .stats = stats };
+    }
+
+    /// Captures routing candidates while the caller owns the graph generation.
+    /// The returned plan can score with no reference to the mutable index.
+    pub fn prepareSearch(self: *const Index, alloc: Allocator, query: []const f32, opts: SearchOptions) !PreparedSearch {
+        if (query.len != self.config.dims) return error.DimensionMismatch;
+        // Retained exact vectors are a library-only, unserializable mode.
+        if (self.config.store_upper) return error.UnsupportedStoreUpper;
+        var stats: SearchStats = .{};
+        if (self.node_count == 0 or opts.k == 0)
+            return .{ .candidates = try alloc.alloc(PreparedCandidate, 0), .metric = self.config.metric, .dims = self.config.dims, .has_bounds = self.rabitq != null };
+        if (opts.exhaustive) {
+            var candidates: std.ArrayListUnmanaged(PreparedCandidate) = .empty;
+            errdefer candidates.deinit(alloc);
+            const count = if (opts.candidate_ids) |ids| ids.len else self.node_count;
+            for (0..count) |offset| {
+                if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                const id = if (opts.candidate_ids) |ids| ids[offset] else @as(u32, @intCast(offset));
+                if (id >= self.node_count or self.isDeleted(id) or !try allowedNode(opts.filter, id)) continue;
+                try candidates.append(alloc, .{ .id = id, .lower = -std.math.inf(f32), .est = 0 });
+            }
+            return .{ .candidates = try candidates.toOwnedSlice(alloc), .metric = self.config.metric, .dims = self.config.dims, .has_bounds = false };
+        }
+        const q = try alloc.dupe(f32, query);
+        defer alloc.free(q);
+        if (self.config.metric == .cosine) normalize(q);
+        var approx = try Approx.init(alloc, self, q);
+        defer approx.deinit();
+        var effective = opts;
+        if (effective.ef == 0) effective.ef = if (self.rabitq != null) 512 else 64;
+        const start = if (effective.candidate_ids != null) self.entry else try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, if (effective.filter != null and effective.filter_visit_limit > 0) @max(effective.filter_visit_limit / 4, 1) else 0, effective.gate);
+        return .{
+            .candidates = try self.prepareBoundedCandidates(alloc, &approx, start, effective, &stats),
+            .metric = self.config.metric,
+            .dims = self.config.dims,
+            .has_bounds = self.rabitq != null,
+            .stats = stats,
+        };
+    }
+
+    /// Full coverage uses a streaming exact scan, independent of graph
+    /// connectivity, deleted routing nodes, quantizer estimates and beam size.
+    fn exhaustiveSearch(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, opts: SearchOptions) !SearchResponse {
+        const q = try alloc.dupe(f32, query);
+        defer alloc.free(q);
+        if (self.config.metric == .cosine) normalize(q);
+        var stats = SearchStats{};
+        var top = Heap(true){};
+        defer top.deinit(alloc);
+        var ids = std.ArrayListUnmanaged(u32).empty;
+        defer ids.deinit(alloc);
+        var vectors = std.ArrayListUnmanaged(f32).empty;
+        defer vectors.deinit(alloc);
+        var distances = std.ArrayListUnmanaged(f32).empty;
+        defer distances.deinit(alloc);
+        const batch: usize = if (opts.batch_size != 0) opts.batch_size else 128;
+        const count = if (opts.candidate_ids) |candidates| candidates.len else self.node_count;
+        var next: usize = 0;
+        while (next < count) {
+            ids.clearRetainingCapacity();
+            while (next < count and ids.items.len < batch) : (next += 1) {
+                if (next % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                const id: u32 = if (opts.candidate_ids) |candidates| candidates[next] else @intCast(next);
+                if (id >= self.node_count or self.isDeleted(id) or !try allowedNode(opts.filter, id)) continue;
+                try ids.append(alloc, id);
+            }
+            if (ids.items.len == 0) continue;
+            if (!try RecomputeGate.open(opts.gate)) {
+                stats.budget_exhausted = true;
+                break;
+            }
+            try distances.resize(alloc, ids.items.len);
+            try self.recomputeDistances(alloc, source, q, ids.items, &vectors, distances.items, &stats);
+            for (ids.items, distances.items) |id, dist| {
+                if (!std.math.isFinite(dist)) continue;
+                if (opts.distance_over) |over| if (!(dist > over)) continue;
+                if (opts.distance_under) |under| if (!(dist < under)) continue;
+                const candidate = Cand{ .id = id, .dist = dist };
+                if (top.len() < opts.k) try top.push(alloc, candidate) else if (candLessThan({}, candidate, top.top())) top.replaceTop(candidate);
+            }
+        }
+        std.mem.sortUnstable(Cand, top.items.items, {}, candLessThan);
+        const results = try alloc.alloc(Result, top.len());
+        for (top.items.items, results) |candidate, *result| result.* = .{ .id = candidate.id, .distance = candidate.dist };
+        return .{ .results = results, .stats = stats };
+    }
+
+    /// Sparse tracking keeps bounded predicate walks independent of index size;
+    /// exhaustive walks use a compact bitmap.
+    const FilterVisited = struct {
+        alloc: Allocator,
+        bits: ?std.DynamicBitSetUnmanaged = null,
+        sparse: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+        fn init(alloc: Allocator, count: u32, bounded: bool) !FilterVisited {
+            return .{ .alloc = alloc, .bits = if (bounded) null else try std.DynamicBitSetUnmanaged.initEmpty(alloc, count) };
+        }
+
+        fn deinit(self: *FilterVisited) void {
+            if (self.bits) |*bits| bits.deinit(self.alloc);
+            self.sparse.deinit(self.alloc);
+        }
+
+        fn isSet(self: *const FilterVisited, id: u32) bool {
+            if (self.bits) |bits| return bits.isSet(id);
+            return self.sparse.contains(id);
+        }
+
+        fn set(self: *FilterVisited, id: u32) !void {
+            if (self.bits) |*bits| bits.set(id) else try self.sparse.put(self.alloc, id, {});
+        }
+    };
+
+    /// Filtered-search fallback: adds every unvisited, live, allowed node to
+    /// the recompute pool by its estimate.
+    fn scoreUnvisitedAllowed(
+        self: *const Index,
+        alloc: Allocator,
+        approx: *Approx,
+        filter: Filter,
+        visited: *FilterVisited,
+        scale: f32,
+        pool: anytype,
+        stats: *SearchStats,
+        gate: ?RecomputeGate,
+        scan_limit: u32,
+    ) !void {
+        var chunk = std.ArrayListUnmanaged(u32).empty;
+        defer chunk.deinit(alloc);
+        var next: u32 = 0;
+        const end = if (scan_limit == 0) self.node_count else @min(self.node_count, scan_limit);
+        while (next < end) {
+            chunk.clearRetainingCapacity();
+            while (next < end and chunk.items.len < 1024) : (next += 1) {
+                if (next % 256 == 0) try RecomputeGate.checkCancellation(gate);
+                if (visited.isSet(next) or self.isDeleted(next)) continue;
+                try visited.set(next);
+                if (try filter.allows(next)) try chunk.append(alloc, next);
+            }
+            const ests = try approx.score(chunk.items);
+            stats.approx_evaluated += @intCast(chunk.items.len);
+            for (chunk.items, ests) |id, e| try pool.append(alloc, .{ .id = id, .lower = if (self.rabitq == null and !self.upper_vectors.contains(id)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
+        }
+        if (end < self.node_count) stats.filter_truncated = true;
+    }
+
+    /// Two-level fallback: queues every unvisited, live, allowed node by its
+    /// estimate, to be promoted for recomputation as the beam has room.
+    fn queueUnvisitedAllowed(
+        self: *const Index,
+        alloc: Allocator,
+        approx: *Approx,
+        filter: Filter,
+        visited: *std.DynamicBitSetUnmanaged,
+        queue: anytype,
+        stats: *SearchStats,
+        gate: ?RecomputeGate,
+    ) !void {
+        var chunk = std.ArrayListUnmanaged(u32).empty;
+        defer chunk.deinit(alloc);
+        var next: u32 = 0;
+        while (next < self.node_count) {
+            chunk.clearRetainingCapacity();
+            while (next < self.node_count and chunk.items.len < 1024) : (next += 1) {
+                if (next % 256 == 0) try RecomputeGate.checkCancellation(gate);
+                if (visited.isSet(next) or self.isDeleted(next)) continue;
+                visited.set(next);
+                if (try filter.allows(next)) try chunk.append(alloc, next);
+            }
+            const ests = try approx.score(chunk.items);
+            stats.approx_evaluated += @intCast(chunk.items.len);
+            for (chunk.items, ests) |id, e| try queue.push(alloc, .{ .dist = e.dist, .id = id });
+        }
+    }
+
+    fn allowedNode(filter: ?Filter, id: u32) !bool {
+        const f = filter orelse return true;
+        return f.allows(id);
     }
 
     /// Keep ineligible graph nodes available for navigation. Exact vector
@@ -792,6 +1269,7 @@ pub const Index = struct {
     ) !SearchResponse {
         if (query.len != self.dimension()) return error.DimensionMismatch;
         try filter.checkCancelled();
+        try RecomputeGate.checkCancellation(opts.gate);
         var stats = SearchStats{};
         if (self.node_count == 0 or opts.k == 0 or filter.eligible_count == 0) {
             if (opts.k != 0) stats.matches.complete = true;
@@ -814,6 +1292,7 @@ pub const Index = struct {
                 var offset: usize = 0;
                 while (offset < ids.len) {
                     try filter.checkCancelled();
+                    try RecomputeGate.checkCancellation(opts.gate);
                     const end = @min(offset + eligible.len, ids.len);
                     var count: usize = 0;
                     for (ids[offset..end]) |id| {
@@ -824,7 +1303,7 @@ pub const Index = struct {
                     const estimates = try approx.score(eligible[0..count]);
                     stats.approx_evaluated += @intCast(count);
                     for (eligible[0..count], estimates) |id, estimate| {
-                        try self.enqueueFiltered(alloc, source, &work, id, estimate, opts.bound_scale, filter, approx.query_radius);
+                        try self.enqueueFiltered(alloc, source, &work, id, estimate, opts, filter, approx.query_radius);
                     }
                     offset = end;
                 }
@@ -832,8 +1311,9 @@ pub const Index = struct {
             } else {
                 for (ids) |id| {
                     try filter.checkCancelled();
+                    try RecomputeGate.checkCancellation(opts.gate);
                     if (id >= self.node_count or self.isDeleted(id) or !try filter.allows(filter.ctx, id)) continue;
-                    try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
+                    try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32), .retained = self.upper_vectors.contains(id) and source.boundsCurrent(id) and try source.canUseRetained(id, opts) });
                 }
                 const upper_query = if (self.upper_vectors.count() != 0) try self.toDecodeSpace(alloc, q) else null;
                 defer if (upper_query) |rotated| alloc.free(rotated);
@@ -842,7 +1322,7 @@ pub const Index = struct {
         } else {
             var approx = try Approx.initWithRadius(alloc, self, q, filter.distance_under != null);
             defer approx.deinit();
-            const start = try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
+            const start = try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, 0, opts.gate);
             var frontier: Heap(false) = .{};
             defer frontier.deinit(alloc);
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
@@ -853,7 +1333,7 @@ pub const Index = struct {
             visited.set(start);
             stats.approx_evaluated += 1;
             try frontier.push(alloc, .{ .id = start, .dist = first.dist });
-            try self.offerFiltered(alloc, source, filter, &work, start, first, opts.bound_scale, approx.query_radius);
+            try self.offerFiltered(alloc, source, filter, &work, start, first, opts, approx.query_radius);
 
             const default_ef: u32 = if (self.rabitq != null) 512 else 64;
             const initial_budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
@@ -875,6 +1355,7 @@ pub const Index = struct {
             while (true) {
                 while (frontier.len() > 0 and stats.expanded < budget) {
                     try filter.checkCancelled();
+                    try RecomputeGate.checkCancellation(opts.gate);
                     const next = frontier.pop();
                     stats.expanded += 1;
                     fresh.clearRetainingCapacity();
@@ -888,7 +1369,7 @@ pub const Index = struct {
                     stats.approx_evaluated += @intCast(fresh.items.len);
                     for (fresh.items, estimates) |id, estimate| {
                         try frontier.push(alloc, .{ .id = id, .dist = estimate.dist });
-                        try self.offerFiltered(alloc, source, filter, &work, id, estimate, opts.bound_scale, approx.query_radius);
+                        try self.offerFiltered(alloc, source, filter, &work, id, estimate, opts, approx.query_radius);
                     }
                     stats.peak_frontier = @max(stats.peak_frontier, @as(u32, @intCast(frontier.len())));
                 }
@@ -931,8 +1412,17 @@ pub const Index = struct {
         return .{ .results = results, .stats = stats };
     }
 
+    const FilteredPending = struct {
+        id: u32,
+        dist: f32,
+        retained: bool = false,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return a.dist < b.dist;
+        }
+    };
+
     const FilteredVerification = struct {
-        pending: std.ArrayListUnmanaged(Cand) = .empty,
+        pending: std.ArrayListUnmanaged(FilteredPending) = .empty,
         ids: std.ArrayListUnmanaged(u32) = .empty,
         vectors: std.ArrayListUnmanaged(f32) = .empty,
         distances: std.ArrayListUnmanaged(f32) = .empty,
@@ -945,17 +1435,21 @@ pub const Index = struct {
         }
     };
 
-    fn offerFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, query_radius: ?ThresholdRadius) !void {
+    fn offerFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, opts: SearchOptions, query_radius: ?ThresholdRadius) !void {
         if (self.isDeleted(id) or !try filter.allows(filter.ctx, id)) return;
-        try self.enqueueFiltered(alloc, source, work, id, estimate, bound_scale, filter, query_radius);
+        try self.enqueueFiltered(alloc, source, work, id, estimate, opts, filter, query_radius);
     }
 
-    fn enqueueFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, filter: ResultFilter, query_radius: ?ThresholdRadius) !void {
-        if (!source.boundsCurrent(id)) {
+    fn enqueueFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, work: *FilteredVerification, id: u32, estimate: Est, opts: SearchOptions, filter: ResultFilter, query_radius: ?ThresholdRadius) !void {
+        const stored_upper = self.upper_vectors.contains(id);
+        const current = source.boundsCurrent(id);
+        const retained = stored_upper and current and try source.canUseRetained(id, opts);
+        // Original-vector bounds cannot prune a lossy or unverified retained
+        // source. Validate before radius pruning, not only before admission.
+        if (opts.score_quantized_source or !current or (stored_upper and !retained)) {
             try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
             return;
         }
-        const stored_upper = self.upper_vectors.contains(id);
         if (filter.distance_under) |threshold| {
             if (stored_upper) {
                 if (estimate.dist >= threshold) return;
@@ -972,19 +1466,20 @@ pub const Index = struct {
         const lower = if (stored_upper)
             estimate.dist
         else if (self.rabitq != null)
-            estimate.dist - @max(bound_scale, 0) * estimate.bound
+            estimate.dist - @max(opts.bound_scale, 0) * estimate.bound
         else
             -std.math.inf(f32);
-        try work.pending.append(alloc, .{ .id = id, .dist = lower });
+        try work.pending.append(alloc, .{ .id = id, .dist = lower, .retained = retained });
     }
 
     fn verifyFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, upper_query: ?[]const f32, opts: SearchOptions, filter: ResultFilter, work: *FilteredVerification, top: *FilteredHeap, stats: *SearchStats) !void {
-        std.mem.sortUnstable(Cand, work.pending.items, {}, candLessThan);
+        std.mem.sortUnstable(FilteredPending, work.pending.items, {}, FilteredPending.less);
         defer work.pending.clearRetainingCapacity();
         const batch_size = if (opts.batch_size > 0) opts.batch_size else @max(opts.k, 1);
         var next: usize = 0;
         while (next < work.pending.items.len) {
             try filter.checkCancelled();
+            try RecomputeGate.checkCancellation(opts.gate);
             work.ids.clearRetainingCapacity();
             while (next < work.pending.items.len and work.ids.items.len < batch_size) : (next += 1) {
                 const item = work.pending.items[next];
@@ -992,15 +1487,16 @@ pub const Index = struct {
                     stats.matches.complete = false;
                     break;
                 }
-                const upper_vector = self.upper_vectors.get(item.id);
-                if (upper_vector != null and source.boundsCurrent(item.id)) {
-                    try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector.?) else item.dist });
+                if (item.retained) {
+                    const upper_vector = self.upper_vectors.get(item.id).?;
+                    try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector) else item.dist });
                 } else {
                     try work.ids.append(alloc, item.id);
                 }
             }
             if (work.ids.items.len == 0) break;
             try work.distances.resize(alloc, work.ids.items.len);
+            if (!try RecomputeGate.open(opts.gate)) return error.ReembedBudgetExceeded;
             try self.recomputeDistances(alloc, source, query, work.ids.items, &work.vectors, work.distances.items, stats);
             for (work.ids.items, work.distances.items) |id, dist| {
                 try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = id, .dist = dist });
@@ -1090,7 +1586,7 @@ pub const Index = struct {
         if (self.config.store_upper and level > 0) delta.upper_vector = try self.toDecodeSpace(alloc, v);
 
         var stats = SearchStats{};
-        var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats);
+        var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats, 0, null);
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
         var picked = std.ArrayListUnmanaged(u32).empty;
@@ -1452,7 +1948,7 @@ pub const Index = struct {
 
     /// Greedy descent with approximate distances from layer `from` down to
     /// layer `to + 1`. Costs no recomputation.
-    fn greedyDescentApprox(self: *const Index, approx: *Approx, start: u32, from: u8, to: u8, stats: *SearchStats) !u32 {
+    fn greedyDescentApprox(self: *const Index, approx: *Approx, start: u32, from: u8, to: u8, stats: *SearchStats, limit: u32, gate: ?RecomputeGate) !u32 {
         if (from <= to) return start;
         var cur = start;
         var cur_d = (try approx.scoreOne(cur)).dist;
@@ -1460,8 +1956,11 @@ pub const Index = struct {
         while (layer > to) : (layer -= 1) {
             var improved = true;
             while (improved) {
+                try RecomputeGate.checkCancellation(gate);
+                if (limit != 0 and stats.approx_evaluated >= limit) return cur;
                 improved = false;
-                const nbs = self.upper.items[cur][layer - 1].items;
+                const all_nbs = self.upper.items[cur][layer - 1].items;
+                const nbs = if (limit == 0) all_nbs else all_nbs[0..@min(all_nbs.len, limit - stats.approx_evaluated)];
                 const ests = try approx.score(nbs);
                 stats.approx_evaluated += @intCast(nbs.len);
                 for (nbs, ests) |nb, e| {
@@ -1478,7 +1977,7 @@ pub const Index = struct {
 
     /// Greedy descent to layer 1 with exact distances. Each step recomputes
     /// the unseen neighbors of the current node in one batch.
-    fn greedyDescentRecompute(self: *const Index, alloc: Allocator, source: EmbeddingSource, q: []const f32, start: u32, from: u8, stats: *SearchStats) !u32 {
+    fn greedyDescentRecompute(self: *const Index, alloc: Allocator, source: EmbeddingSource, q: []const f32, start: u32, from: u8, stats: *SearchStats, gate: ?RecomputeGate) !?u32 {
         if (from == 0) return start;
         var seen = std.AutoHashMapUnmanaged(u32, f32).empty;
         defer seen.deinit(alloc);
@@ -1491,6 +1990,11 @@ pub const Index = struct {
 
         try ids.append(alloc, start);
         try dists.resize(alloc, 1);
+        try RecomputeGate.checkCancellation(gate);
+        if (!try RecomputeGate.open(gate)) {
+            stats.budget_exhausted = true;
+            return null;
+        }
         try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
         try seen.put(alloc, start, dists.items[0]);
         var cur = start;
@@ -1504,6 +2008,11 @@ pub const Index = struct {
                 ids.clearRetainingCapacity();
                 for (nbs) |nb| if (!seen.contains(nb)) try ids.append(alloc, nb);
                 try dists.resize(alloc, ids.items.len);
+                try RecomputeGate.checkCancellation(gate);
+                if (ids.items.len != 0 and !try RecomputeGate.open(gate)) {
+                    stats.budget_exhausted = true;
+                    return null;
+                }
                 try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
                 for (ids.items, dists.items) |id, dist| try seen.put(alloc, id, dist);
                 for (nbs) |nb| {
@@ -1531,7 +2040,7 @@ pub const Index = struct {
         for (out, 0..) |*o, i| {
             const row = buf.items[i * d ..][0..d];
             if (self.config.metric == .cosine) normalize(row);
-            o.* = distance(self.config.metric, q, row);
+            o.* = if (std.math.isNan(row[0])) std.math.inf(f32) else distance(self.config.metric, q, row);
         }
     }
 
@@ -1593,107 +2102,128 @@ pub const Index = struct {
         out: *std.ArrayListUnmanaged(Cand),
         stats: *SearchStats,
     ) !void {
+        var prepared = PreparedSearch{
+            .candidates = try self.prepareBoundedCandidates(alloc, approx, start, opts, stats),
+            .metric = self.config.metric,
+            .dims = self.config.dims,
+            .has_bounds = self.rabitq != null,
+            .stats = stats.*,
+        };
+        defer prepared.deinit(alloc);
+        var response = try prepared.score(alloc, source, q, opts);
+        defer response.deinit(alloc);
+        stats.* = response.stats;
+        for (response.results) |candidate| try out.append(alloc, .{ .id = candidate.id, .dist = candidate.distance });
+    }
+
+    fn prepareBoundedCandidates(self: *const Index, alloc: Allocator, approx: *Approx, start: u32, opts: SearchOptions, stats: *SearchStats) ![]PreparedCandidate {
         const ef: usize = @max(opts.ef, opts.k);
-        const k: usize = opts.k;
         const scale = @max(opts.bound_scale, 0);
 
-        const Pooled = struct { id: u32, lower: f32 };
-        var pool = std.ArrayListUnmanaged(Pooled).empty;
-        defer pool.deinit(alloc);
-        var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
-        defer visited.deinit(alloc);
-        var candidates = Heap(false){};
-        defer candidates.deinit(alloc);
-        var beam = Heap(true){};
-        defer beam.deinit(alloc);
-        var fresh = std.ArrayListUnmanaged(u32).empty;
-        defer fresh.deinit(alloc);
-
-        const first = try approx.scoreOne(start);
-        visited.set(start);
-        try pool.append(alloc, .{ .id = start, .lower = if (source.boundsCurrent(start)) first.dist - scale * first.bound else -std.math.inf(f32) });
-        try candidates.push(alloc, .{ .dist = first.dist, .id = start });
-        try beam.push(alloc, .{ .dist = first.dist, .id = start });
-        stats.approx_evaluated += 1;
-        while (candidates.len() > 0) {
-            const c = candidates.pop();
-            if (beam.len() >= ef and c.dist > beam.top().dist) break;
-            stats.expanded += 1;
-            fresh.clearRetainingCapacity();
-            for (self.adjacency.items[c.id].items) |nb| {
-                if (visited.isSet(nb)) continue;
-                visited.set(nb);
-                try fresh.append(alloc, nb);
+        var pool = std.ArrayListUnmanaged(PreparedCandidate).empty;
+        errdefer pool.deinit(alloc);
+        if (opts.candidate_ids) |ids| {
+            for (ids, 0..) |id, offset| {
+                if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (id >= self.node_count or self.isDeleted(id) or !try allowedNode(opts.filter, id)) continue;
+                const e = try approx.scoreOne(id);
+                stats.approx_evaluated += 1;
+                try pool.append(alloc, .{ .id = id, .lower = if (self.rabitq == null and !self.upper_vectors.contains(id)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
             }
-            const ests = try approx.score(fresh.items);
-            stats.approx_evaluated += @intCast(fresh.items.len);
-            for (fresh.items, ests) |nb, e| {
-                try pool.append(alloc, .{ .id = nb, .lower = if (source.boundsCurrent(nb)) e.dist - scale * e.bound else -std.math.inf(f32) });
-                const nc = Cand{ .dist = e.dist, .id = nb };
-                if (beam.len() < ef) {
-                    try beam.push(alloc, nc);
-                } else if (nc.dist < beam.top().dist) {
-                    beam.replaceTop(nc);
-                } else continue;
-                try candidates.push(alloc, nc);
-            }
-        }
+        } else {
+            var visited = try FilterVisited.init(alloc, self.node_count, opts.filter != null and opts.filter_visit_limit != 0);
+            defer visited.deinit();
+            var candidates = Heap(false){};
+            defer candidates.deinit(alloc);
+            var beam = Heap(true){};
+            defer beam.deinit(alloc);
+            var fresh = std.ArrayListUnmanaged(u32).empty;
+            defer fresh.deinit(alloc);
 
-        const ByLower = struct {
-            fn lessThan(_: void, a: Pooled, b: Pooled) bool {
-                return a.lower < b.lower;
+            // `beam` holds the best `ef` allowed estimates; it bounds the walk.
+            // Rejected nodes are still expanded while they could lead to better
+            // allowed ones, but never enter the beam or the recompute pool.
+            const first = try approx.scoreOne(start);
+            try visited.set(start);
+            if (try allowedNode(opts.filter, start)) {
+                try pool.append(alloc, .{ .id = start, .lower = if (self.rabitq == null and !self.upper_vectors.contains(start)) -std.math.inf(f32) else first.dist - scale * first.bound, .est = first.dist });
+                try beam.push(alloc, .{ .dist = first.dist, .id = start });
             }
-        };
-        std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
-
-        var top = Heap(true){};
-        defer top.deinit(alloc);
-        var ids = std.ArrayListUnmanaged(u32).empty;
-        defer ids.deinit(alloc);
-        var dists = std.ArrayListUnmanaged(f32).empty;
-        defer dists.deinit(alloc);
-        var buf = std.ArrayListUnmanaged(f32).empty;
-        defer buf.deinit(alloc);
-        const chunk: usize = if (opts.batch_size > 0) opts.batch_size else @max(k, 1);
-        var i: usize = 0;
-        while (i < pool.items.len) {
-            const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
-            ids.clearRetainingCapacity();
-            while (i < pool.items.len and ids.items.len < chunk) : (i += 1) {
-                const p = pool.items[i];
-                if (p.lower >= tau) break;
-                if (self.isDeleted(p.id)) continue;
-                if (self.upper_vectors.contains(p.id) and source.boundsCurrent(p.id)) {
-                    // Stored exactly (bound 0): no recomputation needed.
-                    const c = Cand{ .dist = p.lower, .id = p.id };
-                    if (top.len() < k) {
-                        try top.push(alloc, c);
-                    } else if (c.dist < top.top().dist) {
-                        top.replaceTop(c);
+            try candidates.push(alloc, .{ .dist = first.dist, .id = start });
+            stats.approx_evaluated += 1;
+            // Layer-0 edges are directed and only reachability from the entry
+            // point is guaranteed, so a filtered walk that runs dry before
+            // finding `ef` allowed nodes restarts from the entry point, then
+            // scores what is still unvisited (codes only, no embeddings).
+            var reseeded = false;
+            walk: while (true) {
+                if (opts.filter != null and opts.filter_visit_limit != 0 and stats.approx_evaluated >= opts.filter_visit_limit) {
+                    stats.filter_truncated = true;
+                    break :walk;
+                }
+                if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (candidates.len() == 0) {
+                    if (opts.filter == null or beam.len() >= ef) break :walk;
+                    if (!reseeded) {
+                        reseeded = true;
+                        if (!visited.isSet(self.entry)) {
+                            try visited.set(self.entry);
+                            const e = try approx.scoreOne(self.entry);
+                            stats.approx_evaluated += 1;
+                            if (try allowedNode(opts.filter, self.entry)) {
+                                try pool.append(alloc, .{ .id = self.entry, .lower = if (self.rabitq == null and !self.upper_vectors.contains(self.entry)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
+                                if (beam.len() < ef) try beam.push(alloc, .{ .dist = e.dist, .id = self.entry });
+                            }
+                            try candidates.push(alloc, .{ .dist = e.dist, .id = self.entry });
+                            continue :walk;
+                        }
                     }
-                    continue;
+                    const remaining = if (opts.filter_visit_limit == 0) 0 else opts.filter_visit_limit -| stats.approx_evaluated;
+                    if (opts.filter_visit_limit != 0 and remaining == 0) {
+                        stats.filter_truncated = true;
+                        break :walk;
+                    }
+                    try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats, opts.gate, remaining);
+                    break :walk;
                 }
-                try ids.append(alloc, p.id);
-            }
-            if (ids.items.len == 0) {
-                if (i < pool.items.len and pool.items[i].lower >= tau) break;
-                continue;
-            }
-            try dists.resize(alloc, ids.items.len);
-            try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
-            for (ids.items, dists.items) |id, dist| {
-                const c = Cand{ .dist = dist, .id = id };
-                if (top.len() < k) {
-                    try top.push(alloc, c);
-                } else if (c.dist < top.top().dist) {
-                    top.replaceTop(c);
+                const c = candidates.pop();
+                if (beam.len() >= ef and c.dist > beam.top().dist) break;
+                stats.expanded += 1;
+                fresh.clearRetainingCapacity();
+                for (self.adjacency.items[c.id].items) |nb| {
+                    if (opts.filter != null and opts.filter_visit_limit != 0 and
+                        @as(usize, stats.approx_evaluated) + fresh.items.len >= opts.filter_visit_limit) break;
+                    if (visited.isSet(nb)) continue;
+                    try visited.set(nb);
+                    try fresh.append(alloc, nb);
+                }
+                const ests = try approx.score(fresh.items);
+                stats.approx_evaluated += @intCast(fresh.items.len);
+                for (fresh.items, ests) |nb, e| {
+                    const nc = Cand{ .dist = e.dist, .id = nb };
+                    const allowed = try allowedNode(opts.filter, nb);
+                    // Every allowed estimate joins the pool, as without a filter.
+                    if (allowed) try pool.append(alloc, .{ .id = nb, .lower = if (self.rabitq == null and !self.upper_vectors.contains(nb)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
+                    if (beam.len() >= ef and nc.dist >= beam.top().dist) continue;
+                    if (allowed) {
+                        if (beam.len() < ef) {
+                            try beam.push(alloc, nc);
+                        } else beam.replaceTop(nc);
+                    }
+                    try candidates.push(alloc, nc);
                 }
             }
         }
 
-        out.clearRetainingCapacity();
-        try out.appendSlice(alloc, top.items.items);
-        std.mem.sortUnstable(Cand, out.items, {}, candLessThan);
+        var live: usize = 0;
+        for (pool.items) |candidate| {
+            if (self.isDeleted(candidate.id)) continue;
+            pool.items[live] = candidate;
+            pool.items[live].retained = self.upper_vectors.contains(candidate.id);
+            live += 1;
+        }
+        pool.items.len = live;
+        return pool.toOwnedSlice(alloc);
     }
 
     /// Algorithm 2 on layer 0, starting at `start`. Fills `out` with up to
@@ -1743,45 +2273,84 @@ pub const Index = struct {
                 res: *Heap(true),
                 limit: usize,
                 st: *SearchStats,
+                filter: ?Filter,
+                gate: ?RecomputeGate,
+                stopped: *bool,
             ) !void {
-                if (ids.items.len == 0) return;
+                if (ids.items.len == 0 or stopped.*) return;
+                if (!try RecomputeGate.open(gate)) {
+                    stopped.* = true;
+                    st.budget_exhausted = true;
+                    ids.clearRetainingCapacity();
+                    return;
+                }
                 try ds.resize(a, ids.items.len);
                 try index.recomputeDistances(a, src, query, ids.items, vectors, ds.items, st);
                 for (ids.items, ds.items) |id, dist| {
+                    if (!std.math.isFinite(dist)) {
+                        // Missing nodes still connect the graph; do not return them.
+                        try eq.push(a, .{ .dist = std.math.inf(f32), .id = id });
+                        continue;
+                    }
                     const c = Cand{ .dist = dist, .id = id };
-                    if (res.len() < limit) {
-                        try res.push(a, c);
-                    } else if (c.dist < res.top().dist) {
-                        res.replaceTop(c);
-                    } else continue;
+                    const full = res.len() >= limit;
+                    if (full and c.dist >= res.top().dist) continue;
+                    // Rejected nodes still steer the walk; only allowed ones
+                    // enter the results that bound it.
+                    if (try allowedNode(filter, id)) {
+                        if (full) res.replaceTop(c) else try res.push(a, c);
+                    }
                     try eq.push(a, c);
                 }
                 ids.clearRetainingCapacity();
             }
         };
 
+        var reseeded = false;
+        var queued_unvisited = false;
+        var stopped = false;
         visited.set(start);
         try pending.append(alloc, start);
-        try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+        try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
 
-        while (true) {
+        while (!stopped) {
+            if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
             if (exact_queue.len() == 0) {
                 if (pending.items.len > 0) {
-                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
                     continue;
                 }
                 // The exact queue ran dry. Like the paper, stop once the beam
                 // is full; only keep promoting while it still has room.
-                if (approx_queue.len() == 0 or results.len() >= ef) break;
+                if (results.len() >= ef) break;
+                if (approx_queue.len() == 0) {
+                    // A filtered walk that ran dry restarts from the entry
+                    // point (layer-0 reachability is only guaranteed from
+                    // there), then queues what is still unvisited.
+                    const filter = opts.filter orelse break;
+                    if (!reseeded) {
+                        reseeded = true;
+                        if (!visited.isSet(self.entry)) {
+                            visited.set(self.entry);
+                            try pending.append(alloc, self.entry);
+                            try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
+                            continue;
+                        }
+                    }
+                    if (queued_unvisited) break;
+                    queued_unvisited = true;
+                    try self.queueUnvisitedAllowed(alloc, approx, filter, &visited, &approx_queue, stats, opts.gate);
+                    if (approx_queue.len() == 0) break;
+                }
                 try promote(alloc, &approx_queue, &pending, ratio);
-                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
                 continue;
             }
 
             const c = exact_queue.pop();
             if (results.len() >= ef and c.dist > results.top().dist) {
                 if (pending.items.len > 0) {
-                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
                     continue;
                 }
                 break;
@@ -1804,7 +2373,7 @@ pub const Index = struct {
                 while (approx_queue.len() > 0) try pending.append(alloc, approx_queue.pop().id);
             }
             if (opts.batch_size == 0 or pending.items.len >= opts.batch_size) {
-                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
             }
         }
 
@@ -3844,6 +4413,156 @@ test "leann: stored upper vectors avoid recomputing upper nodes" {
     try testing.expectEqual(before, index.upper_vectors.count());
 }
 
+test "leann: retained vector validation avoids inference and rejects stale identities" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq, .store_upper = true }, fx.data);
+    defer index.deinit();
+    const Verified = struct {
+        index: *const Index,
+        vectors: []const f32,
+        valid: bool = true,
+        validations: usize = 0,
+        upper_recomputes: usize = 0,
+
+        fn validate(raw: *anyopaque, _: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.validations += 1;
+            return self.valid;
+        }
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (ids, 0..) |id, i| {
+                if (self.index.upper_vectors.contains(id)) self.upper_recomputes += 1;
+                @memcpy(out[i * 16 ..][0..16], self.vectors[id * 16 ..][0..16]);
+            }
+        }
+        fn source(self: *@This()) EmbeddingSource {
+            return .{ .ctx = self, .recompute_fn = recompute, .validate_retained_fn = validate };
+        }
+    };
+    var src = Verified{ .index = &index, .vectors = fx.data };
+    var first = try index.search(alloc, src.source(), fx.query(0), .{ .k = 400, .ef = 400, .verify_source = true });
+    defer first.deinit(alloc);
+    try testing.expect(src.validations > 0);
+    try testing.expectEqual(@as(usize, 0), src.upper_recomputes);
+    src.valid = false;
+    var second = try index.search(alloc, src.source(), fx.query(0), .{ .k = 400, .ef = 400, .verify_source = true });
+    defer second.deinit(alloc);
+    try testing.expect(src.upper_recomputes > 0);
+    try testing.expectEqual(first.results.len, second.results.len);
+    for (first.results, second.results) |a, b| {
+        try testing.expectEqual(a.id, b.id);
+        try testing.expectApproxEqRel(a.distance, b.distance, 0.000001);
+    }
+
+    // The loader's rounded copy can cross a distance threshold even when
+    // the graph still has the original upper-layer vector.
+    var upper_ids = index.upper_vectors.keyIterator();
+    const upper_id = upper_ids.next().?.*;
+    const original = fx.data[@as(usize, upper_id) * 16 ..][0..16];
+    const query: [16]f32 = @splat(0);
+    const threshold = distance(index.config.metric, &query, original) / 2;
+    const rounded = try alloc.dupe(f32, fx.data);
+    defer alloc.free(rounded);
+    @memset(rounded[@as(usize, upper_id) * 16 ..][0..16], 0);
+    src.vectors = rounded;
+    src.valid = true; // Even a valid original must not replace a lossy copy.
+    const validations = src.validations;
+    var quantized = try index.search(alloc, src.source(), &query, .{ .k = 1, .candidate_ids = &.{upper_id}, .verify_source = true, .score_quantized_source = true });
+    defer quantized.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), quantized.results.len);
+    try testing.expect(quantized.results[0].distance < threshold);
+    try testing.expectEqual(validations, src.validations);
+    // Invalid retained identities must be checked before original-vector
+    // radius bounds can exclude a now-closer current source.
+    src.valid = false;
+    var changed = try index.search(alloc, src.source(), &query, .{ .k = 1, .candidate_ids = &.{upper_id}, .verify_source = true, .distance_under = threshold });
+    defer changed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), changed.results.len);
+    try testing.expect(changed.results[0].distance < threshold);
+    try testing.expectEqual(validations + 1, src.validations);
+}
+
+test "leann: quantized scoring refills a stale estimated shortlist" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    const Source = struct {
+        backing: SliceEmbeddingSource,
+        calls: usize = 0,
+
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) {
+                @memset(out, std.math.nan(f32));
+                return;
+            }
+            try self.backing.source().recompute(ids, out);
+        }
+    };
+    const All = struct {
+        fn allows(_: *const anyopaque, _: u32) !bool {
+            return true;
+        }
+    };
+    var dummy: u8 = 0;
+    const filter: Filter = .{ .ctx = &dummy, .allows_fn = All.allows };
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = quantizer }, fx.data);
+        defer index.deinit();
+        var src = Source{ .backing = .{ .vectors = fx.data, .dims = 16 } };
+        var response = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, fx.query(0), .{
+            .k = 1,
+            .ef = 1,
+            .batch_size = 1,
+            .filter = filter,
+            .verify_source = true,
+            .score_quantized_source = quantizer == .rabitq,
+        });
+        defer response.deinit(alloc);
+        try testing.expectEqual(@as(usize, 1), response.results.len);
+        try testing.expectEqual(@as(usize, 2), src.calls);
+    }
+
+    // An allowlist much larger than the shortlist scores only the shortlist
+    // and one replacement, even when the first vector is stale.
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq }, fx.data);
+    defer index.deinit();
+    var candidates: [400]u32 = undefined;
+    for (&candidates, 0..) |*id, offset| id.* = @intCast(offset);
+    var src = Source{ .backing = .{ .vectors = fx.data, .dims = 16 } };
+    var response = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, fx.query(0), .{
+        .k = 4,
+        .ef = 4,
+        .batch_size = 1,
+        .candidate_ids = &candidates,
+        .verify_source = true,
+        .score_quantized_source = true,
+    });
+    defer response.deinit(alloc);
+    try testing.expectEqual(@as(usize, 4), response.results.len);
+    try testing.expectEqual(@as(usize, 5), src.calls);
+}
+
+test "leann: prepared search survives destruction of its graph" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq }, fx.data);
+    var plan = try index.prepareSearch(alloc, fx.data[0..16], .{ .k = 3, .exhaustive = true });
+    defer plan.deinit(alloc);
+    index.deinit();
+    var source = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var results = try plan.score(alloc, source.source(), fx.data[0..16], .{ .k = 3, .exhaustive = true });
+    defer results.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), results.results.len);
+    try testing.expectEqual(@as(u32, 0), results.results[0].id);
+    try testing.expectEqual(@as(f32, 0), results.results[0].distance);
+}
+
 test "leann: rebuild from codes keeps codes and live nodes" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc, 2000, 20, 32, 24, 41);
@@ -3920,6 +4639,275 @@ test "leann: rabitq bounds search recall and recompute budget" {
     var pq_index = try Index.build(alloc, .{ .dims = 128, .max_degree = 8 }, fx.data[0 .. 300 * 128]);
     defer pq_index.deinit();
     try testing.expectError(error.BoundsRequireRaBitQ, pq_index.search(alloc, src.source(), fx.query(0), .{ .rerank = .bounds }));
+}
+
+test "leann: filtered search walks past rejected nodes to fill k allowed results" {
+    const alloc = testing.allocator;
+    const n = 2000;
+    const dims = 64;
+    var fx = try Fixture.init(alloc, n, 20, dims, 24, 41);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = dims };
+
+    // 5% of nodes pass: a filter that an over-fetch of 4k would mostly miss.
+    const EveryTwentieth = struct {
+        fn allows(_: *const anyopaque, id: u32) anyerror!bool {
+            return id % 20 == 0;
+        }
+    };
+    const filter = Filter{ .ctx = undefined, .allows_fn = EveryTwentieth.allows };
+
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = dims, .quantizer = quantizer, .max_degree = 16, .ef_construction = 64 }, fx.data);
+        defer index.deinit();
+        var hits: usize = 0;
+        const k = 10;
+        for (0..20) |qi| {
+            const q = fx.query(qi);
+            var resp = try index.search(alloc, src.source(), q, .{ .k = k, .ef = 64, .filter = filter });
+            defer resp.deinit(alloc);
+            if (resp.results.len != k) std.debug.print("filtered short quantizer={s} q={d} got={d} expanded={d} approx={d} recomputed={d}\n", .{ @tagName(quantizer), qi, resp.results.len, resp.stats.expanded, resp.stats.approx_evaluated, resp.stats.recomputed });
+            try testing.expectEqual(@as(usize, k), resp.results.len);
+            for (resp.results) |r| try testing.expect(r.id % 20 == 0);
+            for (resp.results[1..], resp.results[0 .. k - 1]) |r, prev| try testing.expect(prev.distance <= r.distance);
+
+            // Exact top k among allowed nodes.
+            var allowed = std.ArrayListUnmanaged(Cand).empty;
+            defer allowed.deinit(alloc);
+            const qn = try alloc.dupe(f32, q);
+            defer alloc.free(qn);
+            var id: u32 = 0;
+            while (id < n) : (id += 20) try allowed.append(alloc, .{ .id = id, .dist = distance(index.config.metric, qn, fx.data[id * dims ..][0..dims]) });
+            std.mem.sortUnstable(Cand, allowed.items, {}, candLessThan);
+            for (resp.results) |r| for (allowed.items[0..k]) |g| if (g.id == r.id) {
+                hits += 1;
+                break;
+            };
+        }
+        const recall = @as(f64, @floatFromInt(hits)) / (20.0 * k);
+        testing.expect(recall >= 0.85) catch |err| {
+            std.debug.print("filtered recall quantizer={s} recall={d:.3}\n", .{ @tagName(quantizer), recall });
+            return err;
+        };
+    }
+}
+
+test "leann: explicit candidates avoid the graph walk" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    var result = try index.search(alloc, src.source(), fx.query(0), .{ .k = 3, .candidate_ids = &.{ 10, 123, 500 } });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), result.results.len);
+    try testing.expectEqual(@as(u32, 3), result.stats.approx_evaluated);
+    try testing.expectEqual(@as(u32, 0), result.stats.expanded);
+}
+
+test "leann: exhaustive distance bounds scan every live vector once independent of topology" {
+    const alloc = testing.allocator;
+    const n = 300;
+    const dims = 8;
+    const data = try alloc.alloc(f32, n * dims);
+    defer alloc.free(data);
+    for (0..n) |i| @memset(data[i * dims ..][0..dims], @as(f32, @floatFromInt(i)));
+    for ([_]Quantizer{ .pq, .rabitq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = dims, .quantizer = quantizer, .max_degree = 8 }, data);
+        defer index.deinit();
+        try index.markDeleted(0);
+        try index.markDeleted(290);
+        // Full coverage must not depend on a route to any live member.
+        for (index.adjacency.items) |*neighbors| neighbors.clearRetainingCapacity();
+        var source = SliceEmbeddingSource{ .vectors = data, .dims = dims };
+        var response = try index.search(alloc, source.source(), &@as([dims]f32, @splat(0)), .{
+            .k = 3,
+            .exhaustive = true,
+            .distance_over = 8 * 289 * 289,
+            .distance_under = 8 * 295 * 295,
+        });
+        defer response.deinit(alloc);
+        try testing.expectEqual(@as(usize, 3), response.results.len);
+        for (response.results, [_]u32{ 291, 292, 293 }) |hit, expected| try testing.expectEqual(expected, hit.id);
+        try testing.expectEqual(@as(u64, n - 2), source.recomputed);
+        try testing.expectEqual(@as(u64, 3), source.calls);
+        try testing.expectEqual(@as(u32, 0), response.stats.approx_evaluated);
+    }
+}
+
+test "leann: opaque filter work is bounded unless exhaustive" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const Predicate = struct {
+        calls: usize = 0,
+        target: u32,
+        fn allows(raw: *const anyopaque, id: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return id == self.target;
+        }
+    };
+    var predicate = Predicate{ .target = 1999 };
+    const filter = Filter{ .ctx = &predicate, .allows_fn = Predicate.allows };
+    var bounded = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .filter = filter, .filter_visit_limit = 32 });
+    defer bounded.deinit(alloc);
+    try testing.expect(bounded.stats.filter_truncated);
+    try testing.expect(predicate.calls <= 32);
+    predicate.calls = 0;
+    var exhaustive = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .ef = 2000, .filter = filter });
+    defer exhaustive.deinit(alloc);
+    try testing.expect(!exhaustive.stats.filter_truncated);
+    try testing.expectEqual(@as(usize, 1), exhaustive.results.len);
+    try testing.expectEqual(@as(u32, 1999), exhaustive.results[0].id);
+}
+
+test "leann: missing vectors are not returned even for zero queries" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 128, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    const Source = struct {
+        vectors: []const f32,
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (ids, 0..) |id, i| {
+                if (id == 3) @memset(out[i * 16 ..][0..16], std.math.nan(f32)) else @memcpy(out[i * 16 ..][0..16], self.vectors[@as(usize, id) * 16 ..][0..16]);
+            }
+        }
+    };
+    var src = Source{ .vectors = fx.data };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    var result = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, &@as([16]f32, @splat(0)), .{ .k = 2, .candidate_ids = &.{ 3, 7 }, .exhaustive = true });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), result.results.len);
+    try testing.expectEqual(@as(u32, 7), result.results[0].id);
+}
+
+test "leann: cancellation interrupts an empty filtered walk" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const State = struct {
+        count: usize = 0,
+        fn allows(raw: *const anyopaque, _: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.count += 1;
+            return false;
+        }
+        fn open(_: *const anyopaque) anyerror!bool {
+            return true;
+        }
+        fn cancel(raw: *const anyopaque) anyerror!void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.count >= 256) return error.Cancelled;
+        }
+    };
+    var state = State{};
+    try testing.expectError(error.Cancelled, index.search(alloc, src.source(), fx.query(0), .{
+        .k = 1,
+        .filter = .{ .ctx = &state, .allows_fn = State.allows },
+        .gate = .{ .ctx = &state, .check_fn = State.open, .cancel_fn = State.cancel },
+    }));
+    try testing.expectEqual(@as(u64, 0), src.recomputed);
+}
+
+test "leann: pq filtered search reads only allowed vectors" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 50);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .pq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const One = struct {
+        fn allows(_: *const anyopaque, id: u32) anyerror!bool {
+            return id == 123;
+        }
+    };
+    const dummy: u8 = 0;
+    var result = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .exact_descent = true, .filter = .{ .ctx = &dummy, .allows_fn = One.allows } });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), result.results.len);
+    try testing.expectEqual(@as(u32, 123), result.results[0].id);
+    try testing.expect(src.recomputed <= 1);
+}
+
+test "leann: sparse filter exhausts the graph without extra recomputes" {
+    const alloc = testing.allocator;
+    const n = 10000;
+    const dims = 16;
+    var fx = try Fixture.init(alloc, n, 1, dims, 16, 47);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = dims };
+    const One = struct {
+        fn allows(_: *const anyopaque, id: u32) anyerror!bool {
+            return id == 1;
+        }
+    };
+    var index = try Index.build(alloc, .{ .dims = dims, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const dummy: u8 = 0;
+    var resp = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .ef = 64, .filter = .{ .ctx = &dummy, .allows_fn = One.allows } });
+    defer resp.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(u32, 1), resp.results[0].id);
+    try testing.expect(resp.stats.expanded > n / 2);
+    try testing.expect(resp.stats.recomputed <= 1);
+    std.debug.print("sparse filter n={d} expanded={d} estimates={d} recomputed={d}\n", .{ n, resp.stats.expanded, resp.stats.approx_evaluated, resp.stats.recomputed });
+}
+
+test "leann: a closed recompute gate ranks the rest by estimate, an error cancels" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 1000, 5, 64, 16, 43);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 64 };
+    const Budget = struct {
+        batches: u32,
+        fn check(raw: *const anyopaque) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.batches == 0) return false;
+            self.batches -= 1;
+            return true;
+        }
+        fn cancel(_: *const anyopaque) anyerror!bool {
+            return error.Cancelled;
+        }
+    };
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 64, .quantizer = quantizer, .max_degree = 16 }, fx.data);
+        defer index.deinit();
+        var budget = Budget{ .batches = 1 };
+        var resp = try index.search(alloc, src.source(), fx.query(0), .{ .k = 10, .batch_size = 4, .gate = .{ .ctx = &budget, .check_fn = Budget.check } });
+        defer resp.deinit(alloc);
+        try testing.expect(resp.stats.budget_exhausted);
+        try testing.expect(resp.stats.batches <= 1);
+        // bounds mode still fills k from estimates; ratio mode returns what it has.
+        if (quantizer == .rabitq) try testing.expectEqual(@as(usize, 10), resp.results.len);
+        for (resp.results, 0..) |result, i| {
+            for (resp.results[0..i]) |previous| try testing.expect(result.id != previous.id);
+        }
+        for (resp.results[1..], resp.results[0 .. resp.results.len - 1]) |r, prev| try testing.expect(prev.distance <= r.distance);
+
+        if (quantizer == .rabitq) {
+            var closed = Budget{ .batches = 0 };
+            var estimated = try index.search(alloc, src.source(), fx.query(0), .{ .k = 10, .batch_size = 4, .gate = .{ .ctx = &closed, .check_fn = Budget.check } });
+            defer estimated.deinit(alloc);
+            try testing.expectEqual(@as(usize, 10), estimated.results.len);
+            for (estimated.results, 0..) |result, i| {
+                for (estimated.results[0..i]) |previous| try testing.expect(result.id != previous.id);
+            }
+        }
+
+        const dummy: u8 = 0;
+        try testing.expectError(error.Cancelled, index.search(alloc, src.source(), fx.query(0), .{ .k = 10, .gate = .{ .ctx = &dummy, .check_fn = Budget.cancel } }));
+    }
 }
 
 test "leann: rabitq serialization and inserts without recomputation" {
@@ -4169,5 +5157,220 @@ test "leann: a planned batch reverts exactly, then applies identically" {
         const b = try follower.serialize(alloc);
         defer alloc.free(b);
         try testing.expectEqualSlices(u8, a, b);
+    }
+}
+
+test "leann: prepared scoring breaks ties by the source public identity" {
+    const alloc = std.testing.allocator;
+    var plan = PreparedSearch{ .candidates = try alloc.alloc(PreparedCandidate, 3), .metric = .l2_squared, .dims = 1, .has_bounds = false };
+    defer plan.deinit(alloc);
+    for (plan.candidates, 0..) |*candidate, id| candidate.* = .{ .id = @intCast(id), .lower = 0, .est = 0 };
+    const Source = struct {
+        fn recompute(_: *anyopaque, _: []const u32, out: []f32) !void {
+            @memset(out, 0);
+        }
+        fn order(_: *anyopaque, id: u32) u64 {
+            return 3 - id;
+        }
+    };
+    var context: u8 = 0;
+    var result = try plan.score(alloc, .{ .ctx = &context, .recompute_fn = Source.recompute, .result_order = Source.order }, &.{0}, .{ .k = 1, .ef = 3 });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.results[0].id);
+}
+
+test "leann: exact buffer scoring is independent of the graph shortlist" {
+    const alloc = std.testing.allocator;
+    var plan = PreparedSearch{ .candidates = try alloc.alloc(PreparedCandidate, 131), .metric = .l2_squared, .dims = 1, .has_bounds = false };
+    defer plan.deinit(alloc);
+    for (plan.candidates, 0..) |*candidate, id| candidate.* = .{ .id = @intCast(id), .lower = 0, .est = 0, .exact = id >= 3 };
+    const Source = struct {
+        scored: usize = 0,
+        largest_batch: usize = 0,
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scored += ids.len;
+            self.largest_batch = @max(self.largest_batch, ids.len);
+            for (ids, out) |id, *value| value.* = @floatFromInt(130 - id);
+        }
+    };
+    var source = Source{};
+    var result = try plan.score(alloc, .{ .ctx = &source, .recompute_fn = Source.recompute }, &.{0}, .{ .k = 2, .ef = 2, .batch_size = 7 });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 130), result.results[0].id);
+    try std.testing.expectEqual(@as(u32, 129), result.results[1].id);
+    try std.testing.expectEqual(@as(usize, 130), source.scored);
+    try std.testing.expect(source.largest_batch <= 7);
+}
+
+test "leann: prepared scoring validates dimensions and consumes zero-k and empty plans without source work" {
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        fn recompute(_: *anyopaque, _: []const u32, _: []f32) !void {
+            return error.UnexpectedSourceWork;
+        }
+    };
+    var context: u8 = 0;
+    const source = EmbeddingSource{ .ctx = &context, .recompute_fn = Source.recompute };
+    var plan = PreparedSearch{ .candidates = try alloc.alloc(PreparedCandidate, 2), .metric = .l2_squared, .dims = 2, .has_bounds = true };
+    defer plan.deinit(alloc);
+    plan.candidates[0] = .{ .id = 0, .lower = 0, .est = 0 };
+    plan.candidates[1] = .{ .id = 1, .lower = 0, .est = 0, .exact = true };
+    for ([_][]const f32{ &.{}, &.{0}, &.{ 0, 0, 0 } }) |query| {
+        try testing.expectError(error.DimensionMismatch, plan.score(std.testing.failing_allocator, source, query, .{ .k = 1 }));
+        try testing.expectError(error.DimensionMismatch, plan.score(std.testing.failing_allocator, source, query, .{ .k = 0 }));
+        try testing.expectEqual(@as(usize, 2), plan.candidates.len);
+    }
+    var zero = try plan.score(alloc, source, &.{ 0, 0 }, .{ .k = 0 });
+    defer zero.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), zero.results.len);
+    try testing.expectEqual(@as(usize, 0), plan.candidates.len);
+    try testing.expectEqual(@as(u32, 0), zero.stats.recomputed);
+    var empty = try plan.score(std.testing.failing_allocator, source, &.{ 0, 0 }, .{ .k = 3 });
+    defer empty.deinit(std.testing.failing_allocator);
+    try testing.expectEqual(@as(usize, 0), empty.results.len);
+    try testing.expect(empty.stats.matches.complete);
+}
+
+test "leann: estimate fallback preserves distance predicates and finite scores" {
+    const Gate = struct {
+        remaining: usize = 1,
+        fn open(raw: *const anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return false;
+            self.remaining -= 1;
+            return true;
+        }
+        fn recompute(_: *anyopaque, ids: []const u32, out: []f32) !void {
+            for (ids, out) |id, *value| value.* = @floatFromInt(id);
+        }
+    };
+    const alloc = testing.allocator;
+    for ([_]bool{ false, true }) |bounds| {
+        const estimates = [_]f32{ 0, 1, 2, 3, 4, std.math.nan(f32), std.math.inf(f32), -1, 5 };
+        const candidates = try alloc.alloc(PreparedCandidate, estimates.len);
+        for (candidates, estimates, 0..) |*candidate, estimate, id| candidate.* = .{ .id = @intCast(id), .lower = @as(f32, @floatFromInt(id)) - 1000, .est = estimate };
+        var plan = PreparedSearch{ .candidates = candidates, .metric = .l2_squared, .dims = 1, .has_bounds = bounds };
+        defer plan.deinit(alloc);
+        var gate = Gate{};
+        var response = try plan.score(alloc, .{ .ctx = &gate, .recompute_fn = Gate.recompute }, &.{0}, .{ .k = 8, .ef = 8, .batch_size = 2, .distance_over = 1, .distance_under = 4, .gate = .{ .ctx = &gate, .check_fn = Gate.open } });
+        defer response.deinit(alloc);
+        try testing.expect(response.stats.budget_exhausted);
+        try testing.expect(response.results.len > 0);
+        for (response.results) |result| {
+            try testing.expect(std.math.isFinite(result.distance));
+            try testing.expect(result.distance > 1 and result.distance < 4);
+        }
+    }
+}
+
+test "leann: exact descent gates every source batch and falls back on budget closure" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 256, 1, 8, 8, 43);
+    defer fx.deinit(alloc);
+    const Gate = struct {
+        remaining: usize,
+        cancel: bool,
+        fn open(raw: *const anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) {
+                if (self.cancel) return error.Cancelled;
+                return false;
+            }
+            self.remaining -= 1;
+            return true;
+        }
+    };
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 8, .quantizer = quantizer, .max_degree = 8 }, fx.data);
+        defer index.deinit();
+        try testing.expect(index.max_level > 0);
+        for ([_]usize{ 0, 1 }) |allowed| {
+            for ([_]bool{ false, true }) |cancel| {
+                var source = SliceEmbeddingSource{ .vectors = fx.data, .dims = 8 };
+                var gate = Gate{ .remaining = allowed, .cancel = cancel };
+                const options = SearchOptions{ .k = 4, .exact_descent = true, .gate = .{ .ctx = &gate, .check_fn = Gate.open } };
+                if (cancel) {
+                    try testing.expectError(error.Cancelled, index.search(alloc, source.source(), fx.query(0), options));
+                } else {
+                    var response = try index.search(alloc, source.source(), fx.query(0), options);
+                    defer response.deinit(alloc);
+                    try testing.expect(response.stats.budget_exhausted);
+                    if (quantizer == .rabitq) try testing.expectEqual(@as(usize, 4), response.results.len);
+                }
+                try testing.expectEqual(@as(u64, @intCast(allowed)), source.recomputed);
+            }
+        }
+    }
+}
+
+test "leann: filtered source modes validate before pruning and score current copies" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 256, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = quantizer, .store_upper = true }, fx.data);
+        defer index.deinit();
+        var upper = index.upper_vectors.keyIterator();
+        const upper_id = upper.next().?.*;
+        var lower_id: u32 = 0;
+        while (index.upper_vectors.contains(lower_id)) lower_id += 1;
+        const Source = struct {
+            id: u32,
+            vector: []const f32,
+            valid: bool,
+            retained: bool,
+            validations: usize = 0,
+            loads: usize = 0,
+            fn current(raw: *anyopaque, _: u32) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.retained or self.valid;
+            }
+            fn allows(raw: *const anyopaque, id: u32) !bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return id == self.id;
+            }
+            fn validate(raw: *anyopaque, id: u32) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try testing.expectEqual(self.id, id);
+                self.validations += 1;
+                return self.valid;
+            }
+            fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (ids, 0..) |id, i| {
+                    try testing.expectEqual(self.id, id);
+                    self.loads += 1;
+                    @memcpy(out[i * 16 ..][0..16], self.vector);
+                }
+            }
+        };
+        const query: [16]f32 = @splat(0);
+        const missing: [16]f32 = @splat(std.math.nan(f32));
+        for ([_]u32{ upper_id, lower_id }) |id| {
+            const original = fx.data[@as(usize, id) * 16 ..][0..16];
+            const original_distance = distance(index.config.metric, &query, original);
+            try testing.expect(original_distance > 0);
+            for (0..3) |route| { // graph, direct with bounds, direct without bounds
+                for (0..5) |scenario| { // valid, missing, changed, quantized, no validator
+                    var source = Source{ .id = id, .vector = switch (scenario) {
+                        0 => original,
+                        1 => &missing,
+                        else => &query,
+                    }, .valid = scenario == 0 or scenario == 3, .retained = id == upper_id };
+                    const options = SearchOptions{ .k = 1, .ef = 256, .verify_source = true, .score_quantized_source = scenario == 3 };
+                    var response = try index.searchFiltered(alloc, .{ .ctx = &source, .recompute_fn = Source.recompute, .bounds_current = Source.current, .validate_retained_fn = if (scenario == 4) null else Source.validate }, &query, options, .{ .ctx = &source, .allows = Source.allows, .eligible_count = 1, .direct_verify_bounds = route == 1, .distance_under = if (scenario >= 2) original_distance / 2 else null }, if (route == 0) null else &.{id});
+                    defer response.deinit(alloc);
+                    try testing.expectEqual(@as(usize, if (scenario == 1) 0 else 1), response.results.len);
+                    const reused = id == upper_id and scenario == 0;
+                    try testing.expectEqual(@as(usize, if (reused) 0 else 1), source.loads);
+                    try testing.expectEqual(@as(usize, if (id == upper_id and scenario != 3 and scenario != 4) 1 else 0), source.validations);
+                    if (scenario != 1) {
+                        try testing.expectEqual(id, response.results[0].id);
+                        try testing.expectApproxEqAbs(if (scenario == 0) original_distance else 0, response.results[0].distance, 0.0001);
+                    }
+                }
+            }
+        }
     }
 }

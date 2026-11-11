@@ -20,24 +20,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const background = @import("../background_runtime.zig");
 
-pub fn deinitConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Config) void {
-    if (cfg.dense_embedder) |dense_embedder| {
-        dense_embedder.deinit(alloc);
-        cfg.dense_embedder = null;
-    }
-    if (cfg.sparse_embedder) |sparse_embedder| {
-        sparse_embedder.deinit(alloc);
-        cfg.sparse_embedder = null;
-    }
-    if (cfg.asset_producer) |producer| {
-        producer.deinit(alloc);
-        cfg.asset_producer = null;
-    }
-    if (cfg.chunk_provider) |*provider| {
-        provider.deinit();
-        cfg.chunk_provider = null;
-    }
-}
+pub const deinitConfig = enrichment_runtime_mod.releaseConfigProviders;
 
 /// Owns runtime/context allocation and provider adoption as one bundle. The
 /// resident DB supplies durable recovery operations and borrowed execution
@@ -53,6 +36,27 @@ fn ManagedOwner(comptime Context: type, comptime RuntimeType: type) type {
         pub const Bundle = struct {
             append_ctx: ?*Context = null,
             runtime: ?*RuntimeType = null,
+            lifetime: ?*Lifetime = null,
+            const Lifetime = struct {
+                references: std.atomic.Value(usize) = .init(1),
+                append_ctx: *Context,
+                runtime: *RuntimeType,
+                alloc: Allocator,
+
+                fn release(self: *Lifetime) void {
+                    if (self.references.fetchSub(1, .acq_rel) != 1) return;
+                    self.runtime.deinit();
+                    self.alloc.destroy(self.runtime);
+                    self.alloc.destroy(self.append_ctx);
+                    self.alloc.destroy(self);
+                }
+            };
+
+            pub fn retain(self: Bundle) Bundle {
+                if (self.lifetime) |lifetime| _ = lifetime.references.fetchAdd(1, .monotonic);
+                return self;
+            }
+
             pub const Construction = struct {
                 backend_runtime: *background.BackendRuntime,
                 neighbor_acquire: @TypeOf(@as(enrichment_runtime_mod.NeighborContextGraphSource, undefined).acquire_fn),
@@ -71,21 +75,37 @@ fn ManagedOwner(comptime Context: type, comptime RuntimeType: type) type {
                 errdefer alloc.destroy(ctx);
                 ctx.* = context;
                 var cfg = config;
+                const provider_owner: ?*enrichment_runtime_mod.SharedProviders = if (cfg.shared_providers) |shared| shared else if (RuntimeType == Runtime) create: {
+                    const shared = try alloc.create(enrichment_runtime_mod.SharedProviders);
+                    shared.* = .{ .alloc = alloc, .dense = cfg.dense_embedder, .sparse = cfg.sparse_embedder, .asset = cfg.asset_producer, .chunk = cfg.chunk_provider };
+                    break :create shared;
+                } else null;
+                errdefer if (config.shared_providers == null) if (provider_owner) |shared| alloc.destroy(shared);
+                cfg.shared_providers = provider_owner;
                 cfg.neighbor_context_graph_source = .{ .ptr = ctx, .acquire_fn = ops.neighbor_acquire };
                 const runtime = try alloc.create(RuntimeType);
                 errdefer alloc.destroy(runtime);
+                const lifetime = try alloc.create(Lifetime);
+                errdefer alloc.destroy(lifetime);
                 runtime.* = try RuntimeType.init(alloc, ctx.store, ctx.change_journal, ctx.replay_source, ctx.index_manager, ctx.apply_mutex, ctx, ops.write, ctx, ops.failure, ops.failure_pending, ops.failure_range_pending, .{ .ptr = ctx, .lock_fn = ops.failure_lock, .unlock_fn = ops.failure_unlock }, ops.notify_ctx, ops.notify, ops.backend_runtime, cfg);
                 // Successful init adopts providers. Clear the source before
                 // any subsequent fallible operation; Bundle is now sole owner.
+                source.shared_providers = null;
                 source.dense_embedder = null;
                 source.sparse_embedder = null;
                 source.asset_producer = null;
                 source.chunk_provider = null;
                 runtime.artifact_publication_dispatcher = ctx.artifact_publication_dispatcher;
                 runtime.artifact_unit_turn_commit = .{ .ptr = ctx, .commit = ops.commit };
-                return .{ .append_ctx = ctx, .runtime = runtime };
+                lifetime.* = .{ .append_ctx = ctx, .runtime = runtime, .alloc = alloc };
+                return .{ .append_ctx = ctx, .runtime = runtime, .lifetime = lifetime };
             }
             pub fn deinit(self: *Bundle, alloc: Allocator) void {
+                if (self.lifetime) |lifetime| {
+                    lifetime.release();
+                    self.* = .{};
+                    return;
+                }
                 if (self.runtime) |runtime| {
                     runtime.deinit();
                     alloc.destroy(runtime);

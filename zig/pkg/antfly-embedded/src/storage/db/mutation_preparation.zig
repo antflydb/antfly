@@ -52,6 +52,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const Allocator = execution_resources.Allocator;
         const ChunkCacheEntry = execution_resources.ChunkCacheEntry;
         const ChunkEmbeddingSource = execution_resources.ChunkEmbeddingSource;
+        const EmbeddingArtifactOrigin = execution_resources.EmbeddingArtifactOrigin;
         const GeneratedBatchWritePlan = execution_resources.GeneratedBatchWritePlan;
         const GeneratedDenseMemoJob = execution_resources.GeneratedDenseMemoJob;
         const GeneratedEmbeddingMemo = execution_resources.GeneratedEmbeddingMemo;
@@ -597,12 +598,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (chunk_texts.items.len == 0) return;
 
-            const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, chunk_texts.items, request.expected_dims);
+            const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder.withTextGeneration(generation), embedding_name, chunk_texts.items, request.expected_dims);
             defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
             if (vectors.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
             for (source_indexes.items, vectors) |source_index, vector| {
                 const source = sources[source_index];
+                const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try appendEmbeddingArtifactWrite(
                     alloc,
                     artifact_writes,
@@ -611,7 +618,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     embedding_name,
                     request.source_field,
                     source.key,
-                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
+                    // Inline text chunks re-embed by re-chunking the parent;
+                    // stored chunk inputs cannot.
+                    if (request.input_kind == .inline_chunks and !source.has_metadata and source.locally_replayable)
+                        EmbeddingArtifactOrigin{ .generated_text = source_hash }
+                    else
+                        EmbeddingArtifactOrigin{ .generated = source_hash },
                     vector,
                 );
                 defer alloc.free(artifact_key);
@@ -640,13 +652,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (sources.items.len == 0) return;
             defer clearChunkEmbeddingSourceList(alloc, sources);
 
+            const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = dense_embedder.withTextGeneration(generation);
             var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
             defer chunk_texts.deinit(alloc);
             var source_indexes = std.ArrayListUnmanaged(usize).empty;
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
                 if (skip_unchanged_artifacts) {
@@ -661,7 +678,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try source_indexes.append(alloc, i);
             }
 
-            try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+            try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
         }
 
         pub fn flushGeneratedDenseMemoJobs(
@@ -681,12 +699,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 runtime,
                 first.consumer_indexes,
                 memo.alloc,
-                embedder,
+                embedder.withTextGeneration(jobs.items[0].generation),
                 requestEmbeddingName(first),
                 texts,
                 first.expected_dims,
             );
             defer embedder_mod.freeDenseEmbeddingBatch(memo.alloc, vectors);
+            try embedder.requireTextGeneration(memo.alloc, requestEmbeddingName(first), jobs.items[0].generation);
             for (jobs.items, vectors) |job, vector| try memo.putDenseCopy(job.key, vector);
         }
 
@@ -1289,14 +1308,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     var text_owned = true;
                     errdefer if (text_owned) memo.alloc.free(text);
-                    const key_value = GeneratedEmbeddingMemo.key(
+                    const generation = try memo.generation(embedder, requestEmbeddingName(request));
+                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
                         .dense_embedding,
                         requestEmbeddingName(request),
                         request.producer_json,
                         request.execution_json,
                         request.expected_dims,
                         text,
-                    );
+                    ), generation.revision);
                     if (memo.dense.contains(key_value) or pending.contains(key_value)) {
                         memo.alloc.free(text);
                         text_owned = false;
@@ -1323,7 +1343,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         batch_bytes = 0;
                     }
                     try pending.put(memo.alloc, key_value, {});
-                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request });
+                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request, .generation = generation });
                     text_owned = false;
                     batch_bytes += text.len;
                     if (jobs.items.len >= max_items or batch_bytes >= max_bytes) {
@@ -1352,7 +1372,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             defer memo.alloc.free(raw);
             const source_hash = enrichment_artifact_codec.sourceHash(raw) catch return false;
-            if (source_hash == null or source_hash.? != enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation)) return false;
+            const expected_hash = if (request.kind == .dense_embedding) dense: {
+                const revision = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
+                    if (runtime.config.dense_embedder) |provider| (try memo.generation(provider, requestEmbeddingName(request))).revision else null
+                else
+                    null;
+                break :dense enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, revision);
+            } else enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+            if (source_hash == null or source_hash.? != expected_hash) return false;
             switch (request.kind) {
                 .dense_embedding => {
                     const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch return false;

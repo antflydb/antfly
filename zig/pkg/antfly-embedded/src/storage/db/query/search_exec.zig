@@ -15375,6 +15375,7 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
+            .deadline_ns = req.execution_deadline_ns,
             .cancellation = if (req.cancellation) |token|
                 vectorindex_mod.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else

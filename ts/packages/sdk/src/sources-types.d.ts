@@ -31,6 +31,7 @@ export interface Capabilities {
   processing_jobs?: boolean;
   knowledge_versions?: Array<number>;
   knowledge_audience?: string;
+  revision_preconditions?: boolean;
 }
 
 export interface SourceIdentity {
@@ -56,6 +57,8 @@ export interface Source {
   processing?: ProcessingDeclaration;
   knowledge?: KnowledgeDeclaration;
   knowledge_status?: KnowledgeStatus;
+  revision?: string;
+  reconciliation_status?: ReconciliationStatus;
 }
 
 export interface Run {
@@ -261,4 +264,8 @@ export interface KnowledgeRequest {
   known_at?: string;
   require_snapshot?: boolean;
   entity?: string;
+}
+
+export interface ReconciliationStatus {
+  state: "pending" | "failed" | "ready";
 }
