@@ -1611,7 +1611,9 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         , .{mode});
         defer alloc.free(schema);
         try database.setSchemaJson(alloc, schema);
-        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        // Legacy replicated writes can retain the same timestamp while their
+        // bytes change. Exercise the digest fence independently of revision_v1.
+        try database.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
         var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "items" };
         const backend = adapter.backend();
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1624,7 +1626,7 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         try std.testing.expectEqual(@as(usize, 1), page.rows.len);
         const before = page.rows[0];
         try std.testing.expect(before.expected_content_digest != null);
-        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        try database.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
         try std.testing.expectEqual(before.version, try database.getTimestamp(alloc, "a"));
         try std.testing.expectError(error.SqlWriteConflict, backend.vtable.mutate(backend.ptr, arena.allocator(), alloc, table, &.{.{ .key = "a", .expected_version = before.version, .expected_content_digest = before.expected_content_digest, .row = null }}));
         try std.testing.expectError(error.PreparedGenerationChanged, database.batch(.{ .schema_version = 2, .deletes = &.{"a"} }));
@@ -4991,6 +4993,8 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 return .{ .ptr = self, .dense_embed_fn = embed, .computation_key_fn = computationKey, .dense_embed_with_context_fn = embedWithContext, .foreground_bounded = true };
             }
         };
+        var clock: antfly.platform_clock.ManualClock = .{};
+        clock.setRealtimeNs(antfly.platform_clock.Clock.real().nowRealtimeNs());
         var gate: Gate = .{};
         defer gate.allowed.set(shared.handleLockIo());
         var directory = try TestDirectory.init("capi-sql-detached-maintenance");
@@ -5023,7 +5027,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 .kind = .dense_vector,
                 .config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"progressive\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
             });
-            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
+            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface(), .clock = clock.clock() });
             captured_runtime = guard.handle.db.enrichment_runtime.?;
             captured_database = &guard.handle.db;
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
@@ -5134,12 +5138,16 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             // A completed result survives unrelated commits, while an updated
             // source fails its live transactional digest/incarnation guard.
             try std.testing.expect((completed == null) == source_changed);
-            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
+            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface(), .clock = clock.clock() });
             connection.maintenance_pending = true;
         }
         try std.testing.expectEqual(@as(usize, 1), gate.calls.load(.monotonic));
         var idle = false;
         for (0..64) |_| {
+            // A refused publication may persist retry backoff even after its
+            // data checkpoint advances. Drive that clock explicitly; tight
+            // polling must not assume a wall-clock retry deadline has elapsed.
+            clock.advanceMs(1_000);
             if (!try connection.maintenanceTurnForTest()) {
                 idle = true;
                 break;
@@ -7530,7 +7538,7 @@ test "capi SQL detached index publication rejects a recreated table namespace" {
             try sqlFkRecoveryStatement(self.handle, "DROP TABLE docs");
             try sqlFkRecoveryStatement(self.handle, "CREATE TABLE docs (body TEXT)");
             table.core.index_manager.text_lsm_storage.?.writeFileAbsolute(file, "old namespace") catch |err| {
-                try std.testing.expect(err == error.EnrichmentWaitCanceled);
+                try std.testing.expectEqual(@as(anyerror, error.EnrichmentSourceChanged), err);
                 self.rejected = true;
                 return;
             };
