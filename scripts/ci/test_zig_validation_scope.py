@@ -66,6 +66,64 @@ class ZigValidationScopeTests(unittest.TestCase):
                 env_file.read_text(),
             )
 
+    def test_owner_cache_policy_overrides_setup_zig_defaults(self):
+        workflow = (ROOT / ".github/workflows/zig-owner-qualification.yml").read_text()
+        jobs = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
+        )
+        selected = [
+            block
+            for block in jobs.values()
+            if "Place compiler caches on the build runner volume" in block
+        ]
+        self.assertEqual(len(selected), 3)
+        for index, block in enumerate(selected):
+            self.assertLess(
+                block.index("uses: mlugg/setup-zig"),
+                block.index("Place compiler caches"),
+            )
+            step = block.split(
+                "      - name: Place compiler caches on the build runner volume\n", 1
+            )[1]
+            command = textwrap.dedent(
+                step.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+            )
+            with self.subTest(job=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout, volume = root / "checkout", root / "volume"
+                (checkout / "zig").mkdir(parents=True)
+                volume.mkdir()
+                env_file = root / "env"
+                # Reproduce the preceding action's cache override. The step
+                # must replace it rather than relying on workflow-level env.
+                env_file.write_text(
+                    f"ZIG_LOCAL_CACHE_DIR={checkout}/.zig-cache\nZIG_GLOBAL_CACHE_DIR={checkout}/.zig-cache\n"
+                )
+                subprocess.run(
+                    ["bash", "-c", command.replace("/mnt/cache", str(volume))],
+                    cwd=checkout,
+                    check=True,
+                    env={
+                        **os.environ,
+                        "GITHUB_WORKSPACE": str(checkout),
+                        "GITHUB_ENV": str(env_file),
+                    },
+                )
+                actual = dict(
+                    line.split("=", 1) for line in env_file.read_text().splitlines()
+                )
+                self.assertEqual(
+                    actual["ZIG_LOCAL_CACHE_DIR"], str(checkout / "zig/.zig-cache")
+                )
+                self.assertEqual(
+                    Path(actual["ZIG_LOCAL_CACHE_DIR"]).resolve(),
+                    (volume / "operation-owners/zig-cache").resolve(),
+                )
+                self.assertEqual(
+                    actual["ZIG_GLOBAL_CACHE_DIR"],
+                    str(checkout / "zig/.zig-cache/global"),
+                )
+
     def test_vopr_qualification_is_an_optional_admitted_suite(self):
         config = json.loads((ROOT / ".github/scripts/pr-ci-config.json").read_text())
         suite = next(suite for suite in config["suites"] if suite["id"] == "vopr")
