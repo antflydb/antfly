@@ -45677,7 +45677,13 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    catalog.binding.effect_protocol = 15;
+    // This catalog's "vectors" index is exactly artifact_inventory.zig's
+    // onlineGeneratedChunkVectorConfig shape, which computes to the current
+    // max (18), not the stale floor (15) a sibling test deliberately pins.
+    // Pinning 15 here trips processOrderedChunkVectorWithAllocator's
+    // execution_revision-gated floor check before reaching the terminal
+    // failure this test means to exercise.
+    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -45900,12 +45906,26 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    // The primary document's stored digest is this request's fencing
+    // guard against (via applyAssetProducerBatchOutput's
+    // storePutBatchGuarded -> validateLocalSourceFence); it must exist
+    // and equal `raw_doc` ("{}" below) or every publish fences as
+    // EnrichmentSourceChanged before producer_json is ever compared.
+    //
+    // Must match the registered catalog entry's producer_json byte-for-byte
+    // (the "labels" enrichment added above): the fencing check this
+    // request's dispatch goes through compares the request's declared
+    // producer config against the catalog's, and a bare "{\"type\":...}"
+    // without the catalog's own "config" object is a mismatch, not a
+    // narrower-but-compatible config.
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     for (0..2) |_| for (0..32) |i| {
         const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
         defer alloc.free(config);
@@ -46003,12 +46023,17 @@ test "model aware media labels authenticate independently refreshed retained tex
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, payload);
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    // Must match the registered catalog entry's producer_json byte-for-byte
+    // (the "labels" enrichment added above): see the sibling vocabulary
+    // cache test's identical fix.
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     const output = try storeGetAlloc(&runtime, output_key);
