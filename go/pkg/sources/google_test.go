@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -382,5 +383,47 @@ func TestGCSPageProvenanceRequiresTextPublication(t *testing.T) {
 		if (err == nil) != (publication == "text") {
 			t.Errorf("publication %q returned %v", publication, err)
 		}
+	}
+}
+
+func TestGCSBatchTruncationIsDistinctFromMismatchedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name, id, tail string
+		interrupted    bool
+	}{
+		{"truncated", "<response-0>", "", true},
+		{"mismatched identity", "<response-1>", "\r\n--fixture--\r\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "multipart/mixed; boundary=fixture")
+				fmt.Fprintf(w, "--fixture\r\nContent-Type: application/http\r\nContent-ID: %s\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n%s%s", tc.id, `{"generation":"1"}`, tc.tail)
+			}))
+			defer server.Close()
+			c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+			_, err := c.CheckGCSAccessBatch(t.Context(), Request{Config: SourceConfig(`{"bucket":"docs"}`)},
+				[]Item{{Path: "p.txt", Revision: "1", Metadata: map[string]any{"bucket": "docs"}}})
+			require.Error(t, err)
+			if tc.interrupted {
+				require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			} else {
+				require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+			}
+		})
+	}
+}
+
+func TestGCSListSkipsDirectoryMarkersAndPreservesLiteralObjectKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"pages/","size":"0","generation":"1"},{"name":"pages/a//b.txt","size":"1","generation":"2"}]}`)
+	}))
+	defer server.Close()
+	c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+	for _, preview := range []bool{true, false} {
+		inventory, err := c.Enumerate(t.Context(), Request{Mode: ImportModeSource, Preview: preview, SourceNamespace: "test",
+			Config: SourceConfig(`{"bucket":"docs","prefix":"pages/"}`)})
+		require.NoError(t, err)
+		require.Len(t, inventory.Objects, 1)
+		require.Equal(t, "pages/a//b.txt", inventory.Objects[0].Path)
 	}
 }
