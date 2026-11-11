@@ -156,6 +156,14 @@ pub const EmbeddingSource = struct {
         return if (self.bounds_current) |check| check(self.ctx, id) else true;
     }
 
+    /// A retained original cannot stand in for a lossy source copy. When
+    /// source verification is requested, absence of proof requires a load.
+    fn canUseRetained(self: EmbeddingSource, id: u32, opts: SearchOptions) !bool {
+        if (opts.score_quantized_source) return false;
+        if (opts.verify_source) return if (self.validate_retained_fn) |validate| try validate(self.ctx, id) else false;
+        return true;
+    }
+
     pub fn recompute(self: EmbeddingSource, ids: []const u32, out: []f32) !void {
         return self.recompute_fn(self.ctx, ids, out);
     }
@@ -277,7 +285,7 @@ pub const SearchOptions = struct {
     /// Load upper-layer candidates to verify their backing vector is available.
     verify_source: bool = false,
     /// Source vectors can be lossy copies. Original-vector bounds cannot
-    /// prune them, and retained vectors require source validation.
+    /// prune them, and retained originals cannot replace source copies.
     score_quantized_source: bool = false,
     gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
@@ -460,11 +468,14 @@ pub const PreparedSearch = struct {
         // vectors, so they also cannot prune reranking of quantized copies.
         // Score the estimated shortlist first, then refill if vectors are missing.
         const use_bounds = self.has_bounds and !opts.score_quantized_source;
-        if (use_bounds and source.bounds_current != null) {
-            for (pool.items) |*candidate| if (!source.boundsCurrent(candidate.id)) {
+        for (pool.items, 0..) |*candidate, offset| {
+            if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+            if ((use_bounds and !source.boundsCurrent(candidate.id)) or
+                (candidate.retained and !try source.canUseRetained(candidate.id, opts)))
+            {
                 candidate.lower = -std.math.inf(f32);
                 candidate.retained = false;
-            };
+            }
         }
         const refill_shortlist = !use_bounds;
         const ByEstimate = struct {
@@ -538,9 +549,7 @@ pub const PreparedSearch = struct {
                     }
                 };
                 if (use_bounds and p.lower > tau) break;
-                if (p.retained and
-                    (if (opts.verify_source) (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false) else !opts.score_quantized_source))
-                {
+                if (p.retained) {
                     if (opts.distance_over) |over| if (!(p.est > over)) continue;
                     if (opts.distance_under) |under| if (!(p.est < under)) continue;
                     stats.matches.verified += 1;
@@ -1294,7 +1303,7 @@ pub const Index = struct {
                     const estimates = try approx.score(eligible[0..count]);
                     stats.approx_evaluated += @intCast(count);
                     for (eligible[0..count], estimates) |id, estimate| {
-                        try self.enqueueFiltered(alloc, source, &work, id, estimate, opts.bound_scale, filter, approx.query_radius);
+                        try self.enqueueFiltered(alloc, source, &work, id, estimate, opts, filter, approx.query_radius);
                     }
                     offset = end;
                 }
@@ -1304,7 +1313,7 @@ pub const Index = struct {
                     try filter.checkCancelled();
                     try RecomputeGate.checkCancellation(opts.gate);
                     if (id >= self.node_count or self.isDeleted(id) or !try filter.allows(filter.ctx, id)) continue;
-                    try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
+                    try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32), .retained = self.upper_vectors.contains(id) and source.boundsCurrent(id) and try source.canUseRetained(id, opts) });
                 }
                 const upper_query = if (self.upper_vectors.count() != 0) try self.toDecodeSpace(alloc, q) else null;
                 defer if (upper_query) |rotated| alloc.free(rotated);
@@ -1324,7 +1333,7 @@ pub const Index = struct {
             visited.set(start);
             stats.approx_evaluated += 1;
             try frontier.push(alloc, .{ .id = start, .dist = first.dist });
-            try self.offerFiltered(alloc, source, filter, &work, start, first, opts.bound_scale, approx.query_radius);
+            try self.offerFiltered(alloc, source, filter, &work, start, first, opts, approx.query_radius);
 
             const default_ef: u32 = if (self.rabitq != null) 512 else 64;
             const initial_budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
@@ -1360,7 +1369,7 @@ pub const Index = struct {
                     stats.approx_evaluated += @intCast(fresh.items.len);
                     for (fresh.items, estimates) |id, estimate| {
                         try frontier.push(alloc, .{ .id = id, .dist = estimate.dist });
-                        try self.offerFiltered(alloc, source, filter, &work, id, estimate, opts.bound_scale, approx.query_radius);
+                        try self.offerFiltered(alloc, source, filter, &work, id, estimate, opts, approx.query_radius);
                     }
                     stats.peak_frontier = @max(stats.peak_frontier, @as(u32, @intCast(frontier.len())));
                 }
@@ -1403,8 +1412,17 @@ pub const Index = struct {
         return .{ .results = results, .stats = stats };
     }
 
+    const FilteredPending = struct {
+        id: u32,
+        dist: f32,
+        retained: bool = false,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return a.dist < b.dist;
+        }
+    };
+
     const FilteredVerification = struct {
-        pending: std.ArrayListUnmanaged(Cand) = .empty,
+        pending: std.ArrayListUnmanaged(FilteredPending) = .empty,
         ids: std.ArrayListUnmanaged(u32) = .empty,
         vectors: std.ArrayListUnmanaged(f32) = .empty,
         distances: std.ArrayListUnmanaged(f32) = .empty,
@@ -1417,17 +1435,21 @@ pub const Index = struct {
         }
     };
 
-    fn offerFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, query_radius: ?ThresholdRadius) !void {
+    fn offerFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, opts: SearchOptions, query_radius: ?ThresholdRadius) !void {
         if (self.isDeleted(id) or !try filter.allows(filter.ctx, id)) return;
-        try self.enqueueFiltered(alloc, source, work, id, estimate, bound_scale, filter, query_radius);
+        try self.enqueueFiltered(alloc, source, work, id, estimate, opts, filter, query_radius);
     }
 
-    fn enqueueFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, filter: ResultFilter, query_radius: ?ThresholdRadius) !void {
-        if (!source.boundsCurrent(id)) {
+    fn enqueueFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, work: *FilteredVerification, id: u32, estimate: Est, opts: SearchOptions, filter: ResultFilter, query_radius: ?ThresholdRadius) !void {
+        const stored_upper = self.upper_vectors.contains(id);
+        const current = source.boundsCurrent(id);
+        const retained = stored_upper and current and try source.canUseRetained(id, opts);
+        // Original-vector bounds cannot prune a lossy or unverified retained
+        // source. Validate before radius pruning, not only before admission.
+        if (opts.score_quantized_source or !current or (stored_upper and !retained)) {
             try work.pending.append(alloc, .{ .id = id, .dist = -std.math.inf(f32) });
             return;
         }
-        const stored_upper = self.upper_vectors.contains(id);
         if (filter.distance_under) |threshold| {
             if (stored_upper) {
                 if (estimate.dist >= threshold) return;
@@ -1444,14 +1466,14 @@ pub const Index = struct {
         const lower = if (stored_upper)
             estimate.dist
         else if (self.rabitq != null)
-            estimate.dist - @max(bound_scale, 0) * estimate.bound
+            estimate.dist - @max(opts.bound_scale, 0) * estimate.bound
         else
             -std.math.inf(f32);
-        try work.pending.append(alloc, .{ .id = id, .dist = lower });
+        try work.pending.append(alloc, .{ .id = id, .dist = lower, .retained = retained });
     }
 
     fn verifyFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, upper_query: ?[]const f32, opts: SearchOptions, filter: ResultFilter, work: *FilteredVerification, top: *FilteredHeap, stats: *SearchStats) !void {
-        std.mem.sortUnstable(Cand, work.pending.items, {}, candLessThan);
+        std.mem.sortUnstable(FilteredPending, work.pending.items, {}, FilteredPending.less);
         defer work.pending.clearRetainingCapacity();
         const batch_size = if (opts.batch_size > 0) opts.batch_size else @max(opts.k, 1);
         var next: usize = 0;
@@ -1465,9 +1487,9 @@ pub const Index = struct {
                     stats.matches.complete = false;
                     break;
                 }
-                const upper_vector = self.upper_vectors.get(item.id);
-                if (upper_vector != null and source.boundsCurrent(item.id)) {
-                    try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector.?) else item.dist });
+                if (item.retained) {
+                    const upper_vector = self.upper_vectors.get(item.id).?;
+                    try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector) else item.dist });
                 } else {
                     try work.ids.append(alloc, item.id);
                 }
@@ -4446,12 +4468,20 @@ test "leann: retained vector validation avoids inference and rejects stale ident
     defer alloc.free(rounded);
     @memset(rounded[@as(usize, upper_id) * 16 ..][0..16], 0);
     src.vectors = rounded;
-    src.valid = false;
+    src.valid = true; // Even a valid original must not replace a lossy copy.
     const validations = src.validations;
     var quantized = try index.search(alloc, src.source(), &query, .{ .k = 1, .candidate_ids = &.{upper_id}, .verify_source = true, .score_quantized_source = true });
     defer quantized.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), quantized.results.len);
     try testing.expect(quantized.results[0].distance < threshold);
+    try testing.expectEqual(validations, src.validations);
+    // Invalid retained identities must be checked before original-vector
+    // radius bounds can exclude a now-closer current source.
+    src.valid = false;
+    var changed = try index.search(alloc, src.source(), &query, .{ .k = 1, .candidate_ids = &.{upper_id}, .verify_source = true, .distance_under = threshold });
+    defer changed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), changed.results.len);
+    try testing.expect(changed.results[0].distance < threshold);
     try testing.expectEqual(validations + 1, src.validations);
 }
 
@@ -5269,6 +5299,77 @@ test "leann: exact descent gates every source batch and falls back on budget clo
                     if (quantizer == .rabitq) try testing.expectEqual(@as(usize, 4), response.results.len);
                 }
                 try testing.expectEqual(@as(u64, @intCast(allowed)), source.recomputed);
+            }
+        }
+    }
+}
+
+test "leann: filtered source modes validate before pruning and score current copies" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 256, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = quantizer, .store_upper = true }, fx.data);
+        defer index.deinit();
+        var upper = index.upper_vectors.keyIterator();
+        const upper_id = upper.next().?.*;
+        var lower_id: u32 = 0;
+        while (index.upper_vectors.contains(lower_id)) lower_id += 1;
+        const Source = struct {
+            id: u32,
+            vector: []const f32,
+            valid: bool,
+            retained: bool,
+            validations: usize = 0,
+            loads: usize = 0,
+            fn current(raw: *anyopaque, _: u32) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.retained or self.valid;
+            }
+            fn allows(raw: *const anyopaque, id: u32) !bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return id == self.id;
+            }
+            fn validate(raw: *anyopaque, id: u32) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try testing.expectEqual(self.id, id);
+                self.validations += 1;
+                return self.valid;
+            }
+            fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (ids, 0..) |id, i| {
+                    try testing.expectEqual(self.id, id);
+                    self.loads += 1;
+                    @memcpy(out[i * 16 ..][0..16], self.vector);
+                }
+            }
+        };
+        const query: [16]f32 = @splat(0);
+        const missing: [16]f32 = @splat(std.math.nan(f32));
+        for ([_]u32{ upper_id, lower_id }) |id| {
+            const original = fx.data[@as(usize, id) * 16 ..][0..16];
+            const original_distance = distance(index.config.metric, &query, original);
+            try testing.expect(original_distance > 0);
+            for (0..3) |route| { // graph, direct with bounds, direct without bounds
+                for (0..5) |scenario| { // valid, missing, changed, quantized, no validator
+                    var source = Source{ .id = id, .vector = switch (scenario) {
+                        0 => original,
+                        1 => &missing,
+                        else => &query,
+                    }, .valid = scenario == 0 or scenario == 3, .retained = id == upper_id };
+                    const options = SearchOptions{ .k = 1, .ef = 256, .verify_source = true, .score_quantized_source = scenario == 3 };
+                    var response = try index.searchFiltered(alloc, .{ .ctx = &source, .recompute_fn = Source.recompute, .bounds_current = Source.current, .validate_retained_fn = if (scenario == 4) null else Source.validate }, &query, options, .{ .ctx = &source, .allows = Source.allows, .eligible_count = 1, .direct_verify_bounds = route == 1, .distance_under = if (scenario >= 2) original_distance / 2 else null }, if (route == 0) null else &.{id});
+                    defer response.deinit(alloc);
+                    try testing.expectEqual(@as(usize, if (scenario == 1) 0 else 1), response.results.len);
+                    const reused = id == upper_id and scenario == 0;
+                    try testing.expectEqual(@as(usize, if (reused) 0 else 1), source.loads);
+                    try testing.expectEqual(@as(usize, if (id == upper_id and scenario != 3 and scenario != 4) 1 else 0), source.validations);
+                    if (scenario != 1) {
+                        try testing.expectEqual(id, response.results[0].id);
+                        try testing.expectApproxEqAbs(if (scenario == 0) original_distance else 0, response.results[0].distance, 0.0001);
+                    }
+                }
             }
         }
     }
