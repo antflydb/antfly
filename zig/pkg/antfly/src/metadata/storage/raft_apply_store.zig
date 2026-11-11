@@ -12864,6 +12864,7 @@ pub const RaftApplyStore = struct {
         const resource = (try view.lookup(.dataset, ns.id, target.table)) orelse return error.CatalogNotFound;
         var descriptor = try system_catalog.retained_datasets.parse(a, resource.source_json);
         defer descriptor.deinit();
+        if (descriptor.value.phase != .active and descriptor.value.phase != .closing and descriptor.value.phase != .closed) return error.RetainedSeriesNotReady;
         const plan = (try retained_owner_journal.getPlan(a, &txn, group, resource.id, descriptor.value.definition.generation)) orelse return error.RetainedSeriesNotReady;
         if (plan.phase != .active and plan.phase != .closing and plan.phase != .closed) return error.RetainedSeriesNotReady;
         const owners = try retained_owner_journal.readOwners(a, &txn, group, plan);
@@ -46364,6 +46365,9 @@ test "system catalog retained owner acknowledgements verify physical authority a
     try store.requireRetainedSourceDropAllowed(group, 7);
     const released_work = try store.relationReconciliationWork(group);
     try std.testing.expectEqualDeep(released_work.epoch, released_work.published_epoch);
+    var retiring_json: ?[]u8 = null;
+    defer if (retiring_json) |bytes| a.free(bytes);
+    var closed_revision: u64 = 0;
     {
         var txn = try store.store.beginReadTxn();
         defer txn.abort();
@@ -46375,7 +46379,16 @@ test "system catalog retained owner acknowledgements verify physical authority a
         try std.testing.expectEqual(retained.Phase.closed, published.value.phase);
         try std.testing.expect(published.value.source == null and released.source_release_receipt != null);
         try std.testing.expectEqualDeep(released.source_release_receipt, published.value.closed_receipt);
+        closed_revision = published.value.revision;
+        var retiring = published.value;
+        retiring.phase = .retiring;
+        retiring.revision += 1;
+        retiring_json = try std.json.Stringify.valueAlloc(a, retiring, .{});
     }
+    const closed_cut = try store.retainedDatasetReadCutJson(a, group, .{ .table = "stats" });
+    a.free(closed_cut);
+    try applySystemCatalogTestCommand(&store, 6, .{ .expected_revision = (try store.systemCatalogMeta(a, group)).revision, .mutation = .{ .action = .set_definition, .kind = .dataset, .name = "stats", .source_json = retiring_json.?, .expected_dataset_revision = closed_revision } });
+    try std.testing.expectError(error.RetainedSeriesNotReady, store.retainedDatasetReadCutJson(a, group, .{ .table = "stats" }));
     // An enrolled but superseded physical reporter is not current authority.
     reporter.reporter_incarnation += 1;
     try store.applyStandaloneCommand(group, .{ .register_store = reporter });

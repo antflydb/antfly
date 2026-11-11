@@ -145,7 +145,7 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
     try:
         print(data, flush=True)
         (data / "objects").mkdir()
-        start(
+        object_server = start(
             [
                 "minio",
                 "server",
@@ -257,7 +257,7 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         bad_definition["measures"] = [{"name": "n", "law": "count"}]
         broken_state = api("POST", broken_path, bad_definition)
         sql(
-            "CREATE TABLE sensors (id BIGINT NOT NULL, recorded_at TIMESTAMPTZ NOT NULL, site TEXT NOT NULL)"
+            "CREATE TABLE sensors (id BIGINT NOT NULL, recorded_at TIMESTAMPTZ, site TEXT NOT NULL)"
         )
         now = time.time_ns()
         interval = 60 * 10**9
@@ -273,6 +273,12 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         # More than one native backfill/cleanup page, committed before install.
         values = ",".join(f"({i}, '{timestamp}', 'north')" for i in range(3, 503))
         sql("INSERT INTO sensors (id, recorded_at, site) VALUES " + values)
+        for batch in range(9):
+            values = ",".join(
+                f"({1000 + i}, '{timestamp}', 'site-{i}')"
+                for i in range(batch * 500, (batch + 1) * 500)
+            )
+            sql("INSERT INTO sensors (id, recorded_at, site) VALUES " + values)
         path = "/databases/default/namespaces/public/datasets/sensor_counts"
         print(
             "create",
@@ -300,7 +306,11 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             lambda result: result["phase"] == "active",
             process=server,
         )
-        query = {"start_ns": str(first_bucket), "end_ns": str(first_bucket + interval)}
+        query = {
+            "start_ns": str(first_bucket),
+            "end_ns": str(first_bucket + interval),
+            "dimensions": ["north"],
+        }
         with pytest.raises(OSError, match="409"):
             api(
                 "POST",
@@ -336,6 +346,47 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         initial = api("POST", path + "/query", query)
         print("native", initial, flush=True)
         assert initial["rows"], initial
+        export_query = {
+            key: value for key, value in query.items() if key != "dimensions"
+        }
+
+        def read_all_pages():
+            after = None
+            collected = []
+            seen = set()
+            while True:
+                request = dict(export_query, max_rows=1000)
+                if after is not None:
+                    request["after"] = after
+                page = api("POST", path + "/query", request)
+                collected.extend(page["rows"])
+                after = page["next"]
+                if after is None:
+                    break
+                assert after not in seen
+                seen.add(after)
+            assert len(collected) == 4501
+            assert len({tuple(row["dimensions"]) for row in collected}) == 4501
+            return collected
+
+        read_all_pages()
+        selective = sql(
+            f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') WHERE site = 'site-4242'"
+        )
+        assert selective["rows"] == [["1"]]
+        limited = sql(
+            f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') LIMIT 1"
+        )
+        assert len(limited["rows"]) == 1
+        with pytest.raises(OSError, match="400.*22023"):
+            api(
+                "POST",
+                "/sql",
+                {
+                    "statement": "INSERT INTO sensors (id, recorded_at, site) VALUES (99999, NULL, 'invalid')"
+                },
+            )
+
         sql(
             f"INSERT INTO sensors (id, recorded_at, site) VALUES (2, '{timestamp}', 'north')"
         )
@@ -367,9 +418,10 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         print("detached archived query", archived, flush=True)
         assert archived["rows"] == updated["rows"], archived
         archived_sql = sql(
-            f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}')"
+            f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') WHERE site = 'north'"
         )
         assert archived_sql["rows"] == [["502"]], archived_sql
+        read_all_pages()
 
         # Parallel dashboard queries must retain independent pins without exposing
         # conditional-root conflicts, after native state and the source are gone.
@@ -380,7 +432,7 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                 "POST",
                 "/sql",
                 {
-                    "statement": f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}')"
+                    "statement": f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') WHERE site = 'north'"
                 },
             )["rows"]
 
@@ -388,6 +440,142 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             answers = list(executor.map(archived_query, range(24)))
         for index, answer in enumerate(answers):
             assert answer == (updated["rows"] if index % 2 else [["502"]])
+
+        object_paths = subprocess.check_output(
+            [
+                "aws",
+                "--endpoint-url",
+                endpoint,
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                "retained-fixture",
+            ],
+            env=env,
+            text=True,
+        )
+        assert json.loads(object_paths).get("Contents")
+        sql("CREATE TABLE abandoned (recorded_at TIMESTAMPTZ, site TEXT)")
+        sql(
+            f"INSERT INTO abandoned (recorded_at, site) VALUES ('{timestamp}', 'north'), ('{timestamp}', NULL)"
+        )
+        abandoned_path = (
+            "/databases/default/namespaces/public/datasets/abandoned_rollup"
+        )
+        abandoned_definition = dict(bad_definition, source={"table": "abandoned"})
+        api("POST", abandoned_path, abandoned_definition)
+        abandoned = wait_for(
+            lambda: api("GET", abandoned_path),
+            lambda row: row["phase"] == "active",
+            process=server,
+        )
+        expiring_path = (
+            "/databases/default/namespaces/public/datasets/abandoned_expired"
+        )
+        expiring_definition = dict(
+            abandoned_definition,
+            interval_ns="1000000000",
+            mutable_for_ns="0",
+            retention_ns="1000000000",
+        )
+        api("POST", expiring_path, expiring_definition)
+        expiring = wait_for(
+            lambda: api("GET", expiring_path),
+            lambda row: row["phase"] == "active",
+            process=server,
+        )
+        with pytest.raises(OSError, match="410.*RetainedSeriesHistoryExpired"):
+            api(
+                "POST",
+                expiring_path + "/query",
+                {"start_ns": str(first_bucket), "end_ns": str(first_bucket + 10**9)},
+            )
+        api(
+            "POST",
+            expiring_path + "/close",
+            {"expected_revision": expiring["revision"], "discard": True},
+        )
+        wait_for(
+            lambda: api("GET", expiring_path),
+            lambda row: row["source_released"],
+            45,
+            server,
+        )
+        stop(object_server)
+        closing = api(
+            "POST",
+            abandoned_path + "/close",
+            {"expected_revision": abandoned["revision"]},
+        )
+        assert closing["phase"] == "closing"
+        abandoned = api(
+            "POST",
+            abandoned_path + "/close",
+            {"expected_revision": closing["revision"], "discard": True},
+        )
+        assert abandoned["phase"] == "retiring"
+        wait_for(
+            lambda: api("GET", abandoned_path),
+            lambda row: row["source_released"],
+            45,
+            server,
+        )
+        sql("DROP TABLE abandoned")
+        current = api("GET", path)
+        discarded = api(
+            "POST",
+            path + "/close",
+            {"expected_revision": current["revision"], "discard": True},
+        )
+        assert discarded["phase"] == "retiring"
+        assert discarded["source_released"]
+        with pytest.raises(OSError, match="409"):
+            api("POST", path + "/query", query)
+        object_server = start(
+            [
+                "minio",
+                "server",
+                "--address",
+                f"127.0.0.1:{object_port}",
+                "--console-address",
+                f"127.0.0.1:{console_port}",
+                str(data / "objects"),
+            ],
+            "minio-restarted.log",
+        )
+        wait_for(
+            lambda: (
+                urllib.request.urlopen(
+                    endpoint + "/minio/health/ready", timeout=2
+                ).status
+            ),
+            lambda value: value == 200,
+            15,
+        )
+
+        def remaining_summary_objects():
+            listing = json.loads(
+                subprocess.check_output(
+                    [
+                        "aws",
+                        "--endpoint-url",
+                        endpoint,
+                        "s3api",
+                        "list-objects-v2",
+                        "--bucket",
+                        "retained-fixture",
+                    ],
+                    env=env,
+                    text=True,
+                )
+            )
+            return [
+                row["Key"]
+                for row in listing.get("Contents", [])
+                if "/datasets/" in row["Key"] and f"/{current['id']}/" in row["Key"]
+            ]
+
+        wait_for(remaining_summary_objects, lambda keys: not keys, 60, server)
 
     finally:
         for process in reversed(processes):

@@ -16,16 +16,21 @@ class CloseRetainedDatasetBody:
     """
     Attributes:
         expected_revision (int):
+        discard (bool | Unset): Permanently discard the summary, fence publication, and asynchronously collect native
+            and archived state. Mutually exclusive with cancel_activation. Default: False.
         cancel_activation (bool | Unset): Explicitly cancel an activating summary and discard partial state. Rejected
             for an active summary; omit or set false to close and archive an active summary. Default: False.
     """
 
     expected_revision: int
+    discard: bool | Unset = False
     cancel_activation: bool | Unset = False
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         expected_revision = self.expected_revision
+
+        discard = self.discard
 
         cancel_activation = self.cancel_activation
 
@@ -36,6 +41,8 @@ class CloseRetainedDatasetBody:
                 "expected_revision": expected_revision,
             }
         )
+        if discard is not UNSET:
+            field_dict["discard"] = discard
         if cancel_activation is not UNSET:
             field_dict["cancel_activation"] = cancel_activation
 
@@ -46,10 +53,13 @@ class CloseRetainedDatasetBody:
         d = dict(src_dict)
         expected_revision = d.pop("expected_revision")
 
+        discard = d.pop("discard", UNSET)
+
         cancel_activation = d.pop("cancel_activation", UNSET)
 
         close_retained_dataset_body = cls(
             expected_revision=expected_revision,
+            discard=discard,
             cancel_activation=cancel_activation,
         )
 

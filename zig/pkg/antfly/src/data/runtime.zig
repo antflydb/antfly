@@ -5537,6 +5537,26 @@ fn storeRootRegistrationRefreshDue(confirmed: bool, active: bool, urgent: bool, 
     return elapsed_ms >= 60_000 or (urgent and elapsed_ms >= 5_000);
 }
 
+pub const StandaloneRetainedOwner = struct {
+    node_id: u64,
+    store_id: u64,
+    metadata: *anyopaque,
+    maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!u64,
+    validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const VTable = struct {
+        maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!u64,
+        validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
+    };
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    fn maintainArchive(self: @This(), context: antfly.public_api.operation.RequestContext) !u64 {
+        return BoundaryAbi.call("maintain_archive", self.boundary_dispatch, self.maintain_archive, .{ self.metadata, context });
+    }
+    fn validateRoot(self: @This(), a: std.mem.Allocator, identity: @import("../metadata/store_root_enrollment.zig").Identity, context: antfly.public_api.operation.RequestContext) !void {
+        return BoundaryAbi.call("validate_root", self.boundary_dispatch, self.validate_root, .{ self.metadata, a, identity, context });
+    }
+};
+
 pub const DataServer = struct {
     const StoreReportWorkState = enum(u8) { idle, capturing, ready };
     const StoreReportCollection = struct {
@@ -5570,6 +5590,8 @@ pub const DataServer = struct {
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     retained_maintenance_running: std.atomic.Value(bool) = .init(false),
+    retained_archive_running: std.atomic.Value(bool) = .init(false),
+    retained_archive_next_ns: std.atomic.Value(u64) = .init(0),
     retained_maintenance_next_ns: std.atomic.Value(u64) = .init(0),
     retained_resource_next_ns: u64 = 0,
     retained_owner_next_ns: u64 = 0,
@@ -5603,13 +5625,7 @@ pub const DataServer = struct {
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
-    standalone_retained_owner: ?struct {
-        node_id: u64,
-        store_id: u64,
-        metadata: *anyopaque,
-        maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!void,
-        validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
-    } = null,
+    standalone_retained_owner: ?StandaloneRetainedOwner = null,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
     store_root_registration_active: std.atomic.Value(bool) = .init(false),
@@ -6711,6 +6727,28 @@ pub const DataServer = struct {
     // Dispatch only: metadata and native proposals must never block the Raft
     // driver which advances them. Each job visits bounded indexed work and
     // only the current source-group leader performs reconciliation.
+    fn runRetainedArchiveMaintenanceRound(self: *DataServer) !void {
+        if (self.standalone_retained_owner == null or self.background_jobs_shutdown.load(.acquire)) return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.backgroundMonotonicNs() < self.retained_archive_next_ns.load(.acquire)) return;
+        if (self.retained_archive_running.swap(true, .acq_rel)) return;
+        errdefer self.retained_archive_running.store(false, .release);
+        try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = self, .run = runRetainedArchiveMaintenanceJob, .deinit = deinitRetainedArchiveMaintenanceJob });
+    }
+    fn deinitRetainedArchiveMaintenanceJob(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.retained_archive_running.store(false, .release);
+    }
+    fn runRetainedArchiveMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.retained_archive_next_ns.store(self.backgroundMonotonicNs() +| std.time.ns_per_s, .release);
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        const owner = self.standalone_retained_owner orelse return;
+        const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        const next = try owner.maintainArchive(context);
+        self.retained_archive_next_ns.store(@max(next, self.backgroundMonotonicNs() +| 10 * std.time.ns_per_ms), .release);
+    }
+
     fn runRetainedMaintenanceRound(self: *DataServer) !void {
         if (self.standalone_retained_owner == null and (self.data_raft == null or !self.store_root_registration_active.load(.acquire))) return;
         const runtime = self.backend_runtime orelse return;
@@ -6744,15 +6782,6 @@ pub const DataServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
-        defer if (self.standalone_retained_owner) |local| {
-            var archive_context = context;
-            archive_context.deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
-            local.maintain_archive(local.metadata, archive_context) catch |err| {
-                if (err != error.Canceled and !@import("../serverless/datasets/configured_archive.zig").ExpiryMaintenance.retryable(err))
-                    std.log.warn("standalone retained archive maintenance deferred err={s}", .{@errorName(err)});
-            };
-        };
-
         // Schedule the two indexed lanes independently. Idle resources must
         // not delay active backfill; alternating eligible lanes preserves
         // fairness when both have work.
@@ -9836,6 +9865,9 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runRetainedArchiveMaintenanceRound() catch |err| {
+            std.log.warn("retained archive dispatch deferred err={s}", .{@errorName(err)});
+        };
         self.runRetainedMaintenanceRound() catch |err| {
             std.log.warn("retained dataset dispatch deferred err={s}", .{@errorName(err)});
         };
@@ -12277,15 +12309,16 @@ pub const DataServer = struct {
         const snapshot = try self.loadRetainedReadOwner(a, table_name, request.scope, context);
         const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
         const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
-        var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = platform_time.realtimeNs() }, context);
+        var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = platform_time.realtimeNs(), .dimensions_json = request.dimensions_json, .after = request.after }, context);
         defer reader.deinit();
         var rows: std.ArrayList(local.storage_retained_series.Bucket) = .empty;
         var encoded_bytes: usize = 0;
         var position: ?local.storage_retained_series.Cursor = null;
         var root: []const u8 = "";
+        var next_key: ?local.retained_dataset_types.RowKey = null;
         while (true) {
-            const raw = try reader.nextJson(a, @min(128, request.limit), context);
-            if (raw.len > 6 * 1024 * 1024 - encoded_bytes) return error.DatasetPageBudgetExceeded;
+            const raw = try reader.nextJson(a, @min(128, request.limit - @as(u32, @intCast(rows.items.len))), context);
+            if (raw.len > @import("../api/retained_dataset_read.zig").max_result_bytes - encoded_bytes) return error.DatasetPageBudgetExceeded;
             encoded_bytes += raw.len;
             const page = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, raw, .{});
             if (position) |prior| {
@@ -12297,10 +12330,14 @@ pub const DataServer = struct {
             if (page.page.rows.len > request.limit - rows.items.len) return error.DatasetPageBudgetExceeded;
             try rows.appendSlice(a, page.page.rows);
             if (page.page.after == null) break;
-            if (rows.items.len == request.limit) return error.DatasetPageBudgetExceeded;
+            if (rows.items.len == request.limit) {
+                if (!request.allow_more) return error.DatasetPageBudgetExceeded;
+                next_key = local.storage_retained_series_archive.key(rows.items[rows.items.len - 1]);
+                break;
+            }
         }
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items, .root_incarnation = root, .cursor = position orelse return error.RetainedSeriesNotReady }, .{});
+        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items, .root_incarnation = root, .cursor = position orelse return error.RetainedSeriesNotReady, .next = next_key }, .{});
     }
 
     fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
@@ -12346,7 +12383,7 @@ pub const DataServer = struct {
         const local_root: ?signing.State = if (term == null) local: {
             const owner = self.standalone_retained_owner orelse return error.GroupLeaderUnavailable;
             const root = try signing.load(a, io, self.write_source.replica_root_dir);
-            try owner.validate_root(owner.metadata, a, .{
+            try owner.validateRoot(a, .{
                 .metadata_incarnation = lineage.metadata_incarnation,
                 .node_id = owner.node_id,
                 .store_id = owner.store_id,

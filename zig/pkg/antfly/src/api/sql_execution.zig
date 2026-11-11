@@ -1153,7 +1153,7 @@ pub const Adapter = struct {
             errdefer statement.close(statement.ptr);
             const wrapper = try alloc.create(SingleStatementCursor);
             wrapper.* = .{ .alloc = alloc, .statement = statement };
-            return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
+            return if (table.retained != null) wrapper.asCursor() else .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
         }
         if (table.external_base_source != null) return try self.openLakeScan(alloc, table, request);
         if (self.range_reads != null) {
@@ -2532,7 +2532,7 @@ pub const Adapter = struct {
                 const rows = try self.materializeRetainedRows(a, request.table, request.request, binding.*, &budget);
                 const reader = try a.create(RetainedCursor);
                 reader.* = .{ .rows = rows };
-                cursor.* = .{ .ptr = reader, .next = RetainedCursor.next, .close = StatementRead.borrowedClose, .estimated_rows = rows.len };
+                cursor.* = .{ .ptr = reader, .next = RetainedCursor.next, .close = StatementRead.borrowedClose, .estimated_rows = rows.len, .order_satisfied = request.request.order.len == 0 };
             } else {
                 try ordinary.append(a, request);
                 try positions.append(a, index);
@@ -2560,7 +2560,36 @@ pub const Adapter = struct {
         if (snapshot.resource.id != table.id or definition.generation != binding.generation or !std.mem.eql(u8, &definition.id, &binding.dataset) or
             !std.mem.eql(u8, &try definition.fingerprint(a), &binding.fingerprint)) return error.CatalogGenerationChanged;
         const summary = definition.summary orelse return error.UnsupportedSqlExecution;
-        var result = try read.readResolved(self.server, a, snapshot, definition, .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end) }, self.context);
+        var dimension_filter: ?[]const u8 = null;
+        if (summary.dimensions.len != 0) point: {
+            const values = try a.alloc(std.json.Value, summary.dimensions.len);
+            for (summary.dimensions, values) |name, *value| {
+                const term = for (scan_request.conditions) |condition| {
+                    if (std.mem.eql(u8, name, condition.column) and (condition.op == .eq or condition.op == .is_null)) break condition;
+                } else break :point;
+                value.* = if (term.op == .is_null) .null else term.datum().value;
+            }
+            // Equality hints may use a SQL-coercible operand that is not a
+            // stored dimension encoding. Decline that optimization and keep
+            // SQL's original comparison rather than adding a new type error.
+            dimension_filter = read.canonicalDimensions(a, definition, values) catch |err| switch (err) {
+                error.InvalidDatasetCoverage => null,
+                else => return err,
+            };
+        }
+        const window = if (scan_request.order.len == 0 and scan_request.conditions.len == 0 and scan_request.primary_key == null) scan_request.ordered_window else null;
+        const prefix = if (window) |maximum| maximum > 0 and maximum <= read.max_input_rows else false;
+        var request: read.Request = .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end), .max_rows = if (prefix) @intCast(window.?) else read.max_input_rows, .dimensions_json = dimension_filter, .page = prefix };
+        var result = try read.readResolved(self.server, a, snapshot, definition, request, self.context);
+        // A bounded archive coverage page can end before the requested number
+        // of rows. Fall back to the complete admitted cut instead of silently
+        // treating that partial page as exhaustion.
+        if (prefix and result.next != null and result.rows.len < request.max_rows) {
+            result.deinit();
+            request.page = false;
+            request.max_rows = read.max_input_rows;
+            result = try read.readResolved(self.server, a, snapshot, definition, request, self.context);
+        }
         defer result.deinit();
         var rows: std.ArrayList(catalog.Row) = .empty;
         row_loop: for (result.rows) |row| {

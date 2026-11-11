@@ -27,6 +27,8 @@ pub const Query = struct {
     end_ns: i128,
     admitted_ns: i128,
     archive: ?ArchiveStart = null,
+    dimensions_json: ?[]const u8 = null,
+    after: ?@import("../retained_dataset_types.zig").RowKey = null,
 };
 pub const Request = union(enum) {
     status,

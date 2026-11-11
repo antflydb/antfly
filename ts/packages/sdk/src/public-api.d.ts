@@ -3053,7 +3053,7 @@ export interface paths {
         put?: never;
         /**
          * Close and archive a retained summary
-         * @description Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must be true to cancel activation and discard partial summary state. The source dependency is released only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
+         * @description Begins asynchronous archive closure of an active summary. Set discard to permanently abandon any phase, including a closure blocked by archive unavailability. Discard releases the source only after verified native revocation and cleanup; archive collection resumes independently when storage returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation is retained for activating summaries only. Neither discard nor cancellation preserves summary history.
          */
         post: operations["closeRetainedDataset"];
         delete?: never;
@@ -3149,7 +3149,7 @@ export interface paths {
         put?: never;
         /**
          * Query retained summary buckets
-         * @description Reads a bounded, half-open range aligned to the summary's bucket width and origin. Requires read permission on the qualified dataset.
+         * @description Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same range and dimensions until null. Each page captures fresh authority; active data may change between pages. Rows are ordered by bucket time and a stable dimension hash. Requires read permission on the qualified dataset.
          */
         post: operations["queryRetainedDataset"];
         delete?: never;
@@ -7469,6 +7469,8 @@ export interface components {
             revision: number;
             /** @enum {string} */
             phase: "activating" | "active" | "closing" | "closed" | "retiring";
+            /** @description True after verified native revocation or archive handoff releases the source dependency. Retiring remains a durable discard tombstone while archive collection proceeds independently. */
+            source_released: boolean;
             /** @enum {string} */
             initial_history: "certified" | "retained_source_rows";
             dimensions: string[];
@@ -38842,6 +38844,11 @@ export interface operations {
                     /** Format: uint64 */
                     expected_revision: number;
                     /**
+                     * @description Permanently discard the summary, fence publication, and asynchronously collect native and archived state. Mutually exclusive with cancel_activation.
+                     * @default false
+                     */
+                    discard?: boolean;
+                    /**
                      * @description Explicitly cancel an activating summary and discard partial state. Rejected for an active summary; omit or set false to close and archive an active summary.
                      * @default false
                      */
@@ -38850,7 +38857,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Summary is closing or activation is being cancelled. */
+            /** @description Summary is closing, being discarded, or activation is being cancelled. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -39100,6 +39107,10 @@ export interface operations {
                     end_ns: string;
                     /** @default 4096 */
                     max_rows?: number;
+                    /** @description Opaque exclusive continuation key from next. Reuse the same range and dimension filter. */
+                    after?: string;
+                    /** @description Optional exact tuple in the definition's dimension order. Values are normalized using the frozen column types; null is supported. */
+                    dimensions?: unknown[];
                 };
             };
         };
@@ -39111,6 +39122,8 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
+                        /** @description Exclusive continuation key; null when complete. An empty page may still have a next key. */
+                        next: string | null;
                         /** @enum {string} */
                         initial_history: "certified" | "retained_source_rows";
                         dimensions: string[];

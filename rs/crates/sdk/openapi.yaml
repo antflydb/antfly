@@ -9263,10 +9263,12 @@ paths:
           maxLength: 128
     post:
       summary: Close and archive a retained summary
-      description: Begins asynchronous closure of an active summary. For an activating summary, cancel_activation
-        must be true to cancel activation and discard partial summary state. The source dependency is
-        released only after verified archive handoff or, for cancellation, verified owner revocation and
-        cleanup.
+      description: Begins asynchronous archive closure of an active summary. Set discard to permanently
+        abandon any phase, including a closure blocked by archive unavailability. Discard releases the
+        source only after verified native revocation and cleanup; archive collection resumes independently
+        when storage returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation
+        is retained for activating summaries only. Neither discard nor cancellation preserves summary
+        history.
       tags:
         - query_operations
       operationId: closeRetainedDataset
@@ -9284,6 +9286,11 @@ paths:
                   format: uint64
                   minimum: 1
                   maximum: 9007199254740991
+                discard:
+                  type: boolean
+                  default: false
+                  description: Permanently discard the summary, fence publication, and asynchronously
+                    collect native and archived state. Mutually exclusive with cancel_activation.
                 cancel_activation:
                   type: boolean
                   default: false
@@ -9291,7 +9298,7 @@ paths:
                     for an active summary; omit or set false to close and archive an active summary.
       responses:
         '202':
-          description: Summary is closing or activation is being cancelled.
+          description: Summary is closing, being discarded, or activation is being cancelled.
           content:
             application/json:
               schema:
@@ -9510,8 +9517,10 @@ paths:
           maxLength: 128
     post:
       summary: Query retained summary buckets
-      description: Reads a bounded, half-open range aligned to the summary's bucket width and origin.
-        Requires read permission on the qualified dataset.
+      description: Reads a half-open range aligned to the summary's bucket width and origin. Follow next
+        using the same range and dimensions until null. Each page captures fresh authority; active data
+        may change between pages. Rows are ordered by bucket time and a stable dimension hash. Requires
+        read permission on the qualified dataset.
       tags:
         - query_operations
       operationId: queryRetainedDataset
@@ -9537,6 +9546,18 @@ paths:
                   minimum: 1
                   maximum: 4096
                   default: 4096
+                after:
+                  type: string
+                  minLength: 96
+                  maxLength: 96
+                  pattern: ^[0-9a-f]{96}$
+                  description: Opaque exclusive continuation key from next. Reuse the same range and dimension
+                    filter.
+                dimensions:
+                  type: array
+                  description: Optional exact tuple in the definition's dimension order. Values are normalized
+                    using the frozen column types; null is supported.
+                  items: {}
       responses:
         '200':
           description: Summary buckets with dimensions and measures in the listed order. Count values
@@ -9550,7 +9571,13 @@ paths:
                   - dimensions
                   - measures
                   - rows
+                  - next
                 properties:
+                  next:
+                    type: string
+                    nullable: true
+                    description: Exclusive continuation key; null when complete. An empty page may still
+                      have a next key.
                   initial_history:
                     type: string
                     enum:
@@ -25012,6 +25039,7 @@ components:
         - name
         - revision
         - phase
+        - source_released
         - initial_history
         - dimensions
         - measures
@@ -25037,6 +25065,10 @@ components:
             - closing
             - closed
             - retiring
+        source_released:
+          type: boolean
+          description: True after verified native revocation or archive handoff releases the source dependency.
+            Retiring remains a durable discard tombstone while archive collection proceeds independently.
         initial_history:
           type: string
           enum:

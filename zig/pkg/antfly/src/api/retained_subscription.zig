@@ -188,6 +188,16 @@ fn replayKey(raw: []const u8) !dataset.RowKey {
     return key;
 }
 
+fn admitArchiveClock(server: anytype, a: A, snapshot: read.Snapshot, definition: dataset.Definition, archive: ?*const archive_api.Opened, proposed: i128, ctx: operation.RequestContext) !i128 {
+    const opened = archive orelse return proposed;
+    var clock = proposed;
+    for (snapshot.owners) |owner| if (owner.independent_receipt != null) {
+        clock = @max(clock, (try cutFor(owner)).admitted_ns);
+    };
+    const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
+    return opened.store(io, &ctx).admitRetentionClock(try specFor(a, definition, snapshot.owners[0]), clock);
+}
+
 pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []const u8, principal: registry.Digest, target: Target, input: Create, ctx: operation.RequestContext) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -198,7 +208,9 @@ pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     defer descriptor.deinit();
     const definition = descriptor.value.definition;
     const summary = definition.summary orelse return error.InvalidDatasetDefinition;
-    const now = platform.realtimeNs();
+    var archive = try openedArchive(server, a, snapshot, descriptor.value);
+    defer if (archive) |*opened| opened.deinit();
+    const now = try admitArchiveClock(server, a, snapshot, definition, if (archive) |*opened| opened else null, platform.realtimeNs(), ctx);
     const window = if (input.window_ns) |text| std.math.cast(u64, try parseBound(text)) orelse return error.InvalidDatasetCoverage else null;
     const bounds: Bounds = if (window) |width| range: {
         if (input.start_ns != null or input.end_ns != null) return error.InvalidDatasetCoverage;
@@ -206,8 +218,6 @@ pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     } else .{ .start = try parseBound(input.start_ns orelse return error.InvalidDatasetCoverage), .end = try parseBound(input.end_ns orelse return error.InvalidDatasetCoverage) };
     if (bounds.start >= bounds.end) return error.InvalidDatasetCoverage;
     const state: State = .{ .resource = snapshot.resource.id, .plan = snapshot.plan.id, .definition = snapshot.plan.definition, .window_ns = window, .bounds = bounds, .clock_ns = now, .parts = try a.alloc(Part, snapshot.owners.len) };
-    var archive = try openedArchive(server, a, snapshot, descriptor.value);
-    defer if (archive) |*opened| opened.deinit();
     var budget: usize = registry.max_state_bytes;
     for (state.parts, snapshot.owners) |*part, owner| part.* = try capture(server, a, snapshot, definition, owner, bounds, if (archive) |*opened| opened else null, ctx, &budget);
     var rows = try aggregate(a, snapshot, state, ctx);
@@ -242,14 +252,14 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     defer descriptor.deinit();
     const definition = descriptor.value.definition;
     const summary = definition.summary orelse return error.InvalidDatasetDefinition;
-    const now = @max(platform.realtimeNs(), original.clock_ns);
+    var archive = try openedArchive(server, a, snapshot, descriptor.value);
+    defer if (archive) |*opened| opened.deinit();
+    const now = try admitArchiveClock(server, a, snapshot, definition, if (archive) |*opened| opened else null, @max(platform.realtimeNs(), original.clock_ns), ctx);
     const bounds = if (original.window_ns) |width| try movingBounds(try specFor(a, definition, snapshot.owners[0]), width, now) else original.bounds;
     var next = original;
     next.parts = try a.alloc(Part, original.parts.len);
     next.bounds = bounds;
     next.clock_ns = now;
-    var archive = try openedArchive(server, a, snapshot, descriptor.value);
-    defer if (archive) |*opened| opened.deinit();
     var budget: usize = registry.max_state_bytes;
     for (snapshot.owners, original.parts, next.parts) |owner, old, *part| {
         if (old.group != owner.group or old.owner_revision != owner.revision or (old.cursor == null) != (owner.independent_receipt != null)) return error.RetainedSeriesResetRequired;
@@ -297,6 +307,8 @@ fn advancePart(server: anytype, a: A, snapshot: read.Snapshot, definition: datas
         const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
         const manifest = (try opened.store(io, &ctx).getClosedExport(spec, try cutFor(owner))) orelse return error.RetainedSeriesResetRequired;
         if (!std.mem.eql(u8, &try manifest.receipt(), &receipt)) return error.RetainedSeriesResetRequired;
+        const clock = try opened.store(io, &ctx).admitRetentionClock(spec, @max(now, manifest.cut.admitted_ns));
+        floor = @max(floor, try spec.bucket(try std.math.sub(i128, clock, spec.retention_ns)));
         if (manifest.expired_before_ns) |expired| floor = @max(floor, expired);
     };
     const visible: Bounds = .{ .start = floor, .end = current.end };
@@ -370,4 +382,77 @@ test "retained subscription replay preserves entering buckets until their read p
     try std.testing.expectEqual(@as(u64, 2), try applyFrames(a, &rows, &.{fence}, bounds, 1, replay));
     try std.testing.expectEqual(@as(i64, 4), rows.get(key).?.rows);
     try std.testing.expectError(error.RetainedSeriesResetRequired, applyFrames(a, &rows, &.{}, bounds, 0, replay));
+}
+
+test "retained subscription archived polling observes durable retention after clock rollback" {
+    const objects = @import("objectstore");
+    const catalog_api = @import("../serverless/datasets/catalog.zig");
+    const export_page = @import("../serverless/datasets/closure_export.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objects.memory.MemoryClient.init(std.testing.allocator);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("meta");
+    const namespace = std.fmt.bytesToHex(@as(dataset.Id, @splat(1)), .lower);
+    const Clock = struct {
+        now: u64 = 1000,
+        fn unix(ptr: *const anyopaque) u64 {
+            return @as(*const @This(), @ptrCast(@alignCast(ptr))).now;
+        }
+    };
+    var clock: Clock = .{};
+    const store: catalog_api.Catalog = .{ .context = .{ .alloc = a, .client = client, .bucket = "meta", .prefix = "catalog", .namespace = &namespace, .io = std.testing.io }, .dataset = @splat(1), .owner = @splat(1), .clock = .{ .ptr = &clock, .unix_fn = Clock.unix } };
+    var hash: dataset.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &hash, .{});
+    const def: dataset.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = hash, .schema_json = "{}", .authorization = @splat(3), .retention_ns = 1000, .local_residence_ns = 0, .summary = .{ .source = @splat(9), .timestamp = "ts", .interval_ns = 60, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } };
+    try store.create(def);
+    const spec = try @import("retained_owner_binding.zig").specification(a, def, @splat(5), 1);
+    const cut: closure.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    const loc: catalog_api.Location = .{ .id = @splat(6), .storage_identity = @splat(16), .client = client, .bucket = "meta", .prefix = "catalog", .access = .queryable };
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    const rows = [_]series.Bucket{ .{ .start_ns = 0, .dimensions = "[]", .rows = 1, .metrics = &metrics }, .{ .start_ns = 120, .dimensions = "[]", .rows = 1, .metrics = &metrics } };
+    const page = (try export_page.encode(a, def, spec, cut, dataset.rowKey(0, @splat(0)), &rows, false, loc)).?;
+    try export_page.publish(store, spec, cut, page, loc);
+    const manifest = try store.sealClosedExport(spec, cut, (try page.segment.span()).end);
+    const receipt = try manifest.receipt();
+    _ = try store.admitRetentionClock(spec, 1100);
+    clock.now = 1050;
+    const Resolver = struct {
+        value: catalog_api.Location,
+        pub fn location(self: @This(), _: dataset.Id) !catalog_api.Location {
+            return self.value;
+        }
+    };
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, archive_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "180" }, .{}, cut, receipt, Resolver{ .value = loc }));
+    var opened: archive_api.Opened = undefined;
+    opened.alloc = a;
+    opened.prefix = "catalog";
+    opened.namespace = namespace;
+    opened.dataset = @splat(1);
+    opened.writer = @splat(1);
+    opened.location_id = loc.id;
+    opened.storage.opened.client = client;
+    opened.storage.opened.bucket = try a.dupe(u8, "meta");
+    opened.storage.opened.prefix = try a.dupe(u8, "catalog");
+    opened.storage.identity = loc.storage_identity;
+    const Server = struct {
+        pub fn sharedApiIo(_: *@This()) ?std.Io {
+            return std.testing.io;
+        }
+        pub fn readRetainedOwnerRows(_: *@This(), _: A, _: []const u8, _: u64, _: read.NativeQuery, _: operation.RequestContext) ![]u8 {
+            return error.UnexpectedStorageRead;
+        }
+        pub fn pollRetainedOwnerReplay(_: *@This(), _: A, _: []const u8, _: u64, _: read.NativeReplay, _: operation.RequestContext) ![]u8 {
+            return error.UnexpectedStorageRead;
+        }
+    };
+    var server: Server = .{};
+    const owner: owners.Owner = .{ .plan = @splat(7), .group = 11, .partition = @splat(5), .incarnation = 1, .mode = .closed, .native_receipt = @splat(4), .cut = .{ .closure = cut.closure, .sequence = 20, .complete_from_ns = "0", .admitted_ns = "1000" }, .independent_receipt = receipt };
+    var budget: usize = registry.max_state_bytes;
+    const bounds: Bounds = .{ .start = 0, .end = 180 };
+    const next = try advancePart(&server, a, undefined, def, owner, .{ .group = 11, .owner_revision = 1, .rows = &rows }, bounds, bounds, 1050, &opened, .{}, &budget);
+
+    try std.testing.expectEqual(@as(usize, 1), next.rows.len);
 }

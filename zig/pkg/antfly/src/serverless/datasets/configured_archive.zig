@@ -68,9 +68,12 @@ pub const ExpiryMaintenance = struct {
     after: u64 = 0,
     next_ns: u64 = 0,
     cursors: std.AutoHashMapUnmanaged(u64, catalog.ExpiryCursor) = .empty,
+    discard_cursors: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
+    cycle_progress: bool = false,
 
     pub fn deinit(self: *ExpiryMaintenance, alloc: std.mem.Allocator) void {
         self.cursors.deinit(alloc);
+        self.discard_cursors.deinit(alloc);
     }
 
     pub fn run(
@@ -84,36 +87,93 @@ pub const ExpiryMaintenance = struct {
         now: u64,
         context: *const operation.RequestContext,
     ) !void {
-        if (now < self.next_ns or config.storage.artifacts.connection == null) return;
-        self.next_ns = now +| 2 * std.time.ns_per_s;
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const bytes = try store_.retainedArchiveWorkJson(a, group, self.after);
-        const resource = (try std.json.parseFromSliceLeaky(?local.system_catalog_domain.Resource, a, bytes, .{})) orelse {
-            self.next_ns = now +| 15 * std.time.ns_per_s;
+        if (now < self.next_ns) return;
+        if (config.storage.artifacts.connection == null) {
+            self.next_ns = now +| std.time.ns_per_s;
             return;
+        }
+        const Worker = struct {
+            maintenance: *ExpiryMaintenance,
+            alloc: std.mem.Allocator,
+            source: @TypeOf(store_),
+            group: u64,
+            config: *const local.common_config.Config,
+            secrets: ?*local.common_secrets.FileStore,
+            io: std.Io,
+            context: *const operation.RequestContext,
+            fn next(self_: @This(), a: std.mem.Allocator, after: u64) !?local.system_catalog_domain.Resource {
+                const bytes = try self_.source.retainedArchiveWorkJson(a, self_.group, after);
+                return std.json.parseFromSliceLeaky(?local.system_catalog_domain.Resource, a, bytes, .{});
+            }
+            fn visit(self_: @This(), a: std.mem.Allocator, resource: local.system_catalog_domain.Resource) !bool {
+                return self_.maintenance.process(a, self_.alloc, resource, self_.config, self_.secrets, self_.io, self_.context);
+            }
         };
-        self.after = resource.id;
+        return self.drain(alloc, now, context, Worker{ .maintenance = self, .alloc = alloc, .source = store_, .group = group, .config = config, .secrets = secrets, .io = io, .context = context });
+    }
+
+    fn drain(self: *ExpiryMaintenance, alloc: std.mem.Allocator, now: u64, context: *const operation.RequestContext, worker: anytype) !void {
+        self.next_ns = now +| 10 * std.time.ns_per_ms;
+        const until = @import("antfly_platform").time.monotonicNs() +| 100 * std.time.ns_per_ms;
+        for (0..32) |_| {
+            if (@import("antfly_platform").time.monotonicNs() >= until) break;
+            try context.ensureActive();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const resource = (try worker.next(a, self.after)) orelse {
+                self.next_ns = now +| std.time.ns_per_s;
+                self.cycle_progress = false;
+                return;
+            };
+            if (resource.id <= self.after) {
+                if (!self.cycle_progress) {
+                    self.after = 0;
+                    self.next_ns = now +| std.time.ns_per_s;
+                    return;
+                }
+                self.cycle_progress = false;
+            }
+            self.after = resource.id;
+            const progress = worker.visit(a, resource) catch |err| {
+                if (err == error.Canceled or err == error.Timeout) return err;
+                if (!retryable(err)) std.log.warn("retained archive work deferred resource={d} err={s}", .{ resource.id, @errorName(err) });
+                continue;
+            };
+            self.cycle_progress = self.cycle_progress or progress;
+        }
+    }
+
+    fn process(self: *ExpiryMaintenance, a: std.mem.Allocator, alloc: std.mem.Allocator, resource: local.system_catalog_domain.Resource, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, io: std.Io, context: *const operation.RequestContext) !bool {
         var descriptor = try local.system_catalog_retained_datasets.parse(a, resource.source_json);
         defer descriptor.deinit();
         var archive = try Opened.init(a, config, secrets, descriptor.value, false);
         defer archive.deinit();
         const archive_catalog = archive.store(io, context);
+        if (descriptor.value.phase == .retiring) {
+            try archive_catalog.beginDiscard(descriptor.value.definition);
+            const after = self.discard_cursors.get(resource.id);
+            const work = (try archive_catalog.nextDiscard(after)) orelse {
+                _ = self.discard_cursors.remove(resource.id);
+                return false;
+            };
+            if (self.discard_cursors.count() >= 4096) self.discard_cursors.clearRetainingCapacity();
+            try self.discard_cursors.put(alloc, resource.id, work);
+            return archive_catalog.discardOne(work, archive.location());
+        }
         const after = self.cursors.get(resource.id);
         const work = (try archive_catalog.nextExpiry(after)) orelse {
             _ = self.cursors.remove(resource.id);
-            return;
+            return false;
         };
         if (self.cursors.count() >= 4096) self.cursors.clearRetainingCapacity();
         try self.cursors.put(alloc, resource.id, work.cursor);
-        try context.ensureActive();
-        try archive_catalog.collectExpired(work.segment, archive.location());
+        return archive_catalog.collectExpired(work.segment, archive.location());
     }
 
     pub fn retryable(err: anyerror) bool {
         return switch (err) {
-            error.DatasetDependencyPending, error.DatasetRetentionPending, error.DatasetReadersActive, error.DatasetCompactionOrder, error.DatasetLocationUnavailable => true,
+            error.DatasetDependencyPending, error.DatasetRetentionPending, error.DatasetReadersActive, error.DatasetCompactionOrder, error.DatasetLocationUnavailable, error.PreconditionFailed => true,
             else => false,
         };
     }
@@ -124,4 +184,37 @@ pub fn locationIdentity(storage_identity: [32]u8) [32]u8 {
     hash.update("antfly/retained-archive-location/v1");
     hash.update(&storage_identity);
     return hash.finalResult();
+}
+
+test "retained owner native controls archive scheduler drains fair batches and resumes after idle wrap" {
+    const Worker = struct {
+        visits: [2]usize = .{ 0, 0 },
+        busy: bool = true,
+        held: bool = false,
+        fn next(_: *@This(), _: std.mem.Allocator, after: u64) !?local.system_catalog_domain.Resource {
+            return .{ .id = if (after == 1) 2 else 1, .kind = .dataset, .name = "summary" };
+        }
+        fn visit(self: *@This(), _: std.mem.Allocator, resource: local.system_catalog_domain.Resource) !bool {
+            self.visits[@intCast(resource.id - 1)] += 1;
+            if (self.held and resource.id == 1) return error.DatasetReadersActive;
+            return self.busy;
+        }
+    };
+    var maintenance: ExpiryMaintenance = .{};
+    defer maintenance.deinit(std.testing.allocator);
+    var worker: Worker = .{};
+    const context: operation.RequestContext = .{};
+    try maintenance.drain(std.testing.allocator, 1000, &context, &worker);
+    try std.testing.expectEqual(@as(usize, 16), worker.visits[0]);
+    try std.testing.expectEqual(@as(usize, 16), worker.visits[1]);
+    try std.testing.expectEqual(@as(u64, 1000 + 10 * std.time.ns_per_ms), maintenance.next_ns);
+    worker.busy = false;
+    try maintenance.drain(std.testing.allocator, 2000, &context, &worker);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.after);
+    try std.testing.expectEqual(@as(u64, 2000 + std.time.ns_per_s), maintenance.next_ns);
+    worker.busy = true;
+    worker.held = true;
+    const previous = worker.visits[1];
+    try maintenance.drain(std.testing.allocator, maintenance.next_ns, &context, &worker);
+    try std.testing.expect(worker.visits[1] > previous + 1);
 }

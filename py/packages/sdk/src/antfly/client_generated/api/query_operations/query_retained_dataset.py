@@ -100,8 +100,10 @@ def sync_detailed(
 ) -> Response[Any | QueryRetainedDatasetResponse200]:
     """Query retained summary buckets
 
-     Reads a bounded, half-open range aligned to the summary's bucket width and origin. Requires read
-    permission on the qualified dataset.
+     Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
+    range and dimensions until null. Each page captures fresh authority; active data may change between
+    pages. Rows are ordered by bucket time and a stable dimension hash. Requires read permission on the
+    qualified dataset.
 
     Args:
         database_name (str):
@@ -141,8 +143,10 @@ def sync(
 ) -> Any | QueryRetainedDatasetResponse200 | None:
     """Query retained summary buckets
 
-     Reads a bounded, half-open range aligned to the summary's bucket width and origin. Requires read
-    permission on the qualified dataset.
+     Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
+    range and dimensions until null. Each page captures fresh authority; active data may change between
+    pages. Rows are ordered by bucket time and a stable dimension hash. Requires read permission on the
+    qualified dataset.
 
     Args:
         database_name (str):
@@ -177,8 +181,10 @@ async def asyncio_detailed(
 ) -> Response[Any | QueryRetainedDatasetResponse200]:
     """Query retained summary buckets
 
-     Reads a bounded, half-open range aligned to the summary's bucket width and origin. Requires read
-    permission on the qualified dataset.
+     Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
+    range and dimensions until null. Each page captures fresh authority; active data may change between
+    pages. Rows are ordered by bucket time and a stable dimension hash. Requires read permission on the
+    qualified dataset.
 
     Args:
         database_name (str):
@@ -216,8 +222,10 @@ async def asyncio(
 ) -> Any | QueryRetainedDatasetResponse200 | None:
     """Query retained summary buckets
 
-     Reads a bounded, half-open range aligned to the summary's bucket width and origin. Requires read
-    permission on the qualified dataset.
+     Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
+    range and dimensions until null. Each page captures fresh authority; active data may change between
+    pages. Rows are ordered by bucket time and a stable dimension hash. Requires read permission on the
+    qualified dataset.
 
     Args:
         database_name (str):

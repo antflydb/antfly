@@ -1932,7 +1932,7 @@ fn graphBoolean(alloc: Allocator, root: *const Node, source: *const Node, progra
 /// transparent. Apply, materialization and set operators retain their boundaries.
 pub fn attachGraphConditions(alloc: Allocator, root: *const Node, program: scalar.Program, scans: []catalog.StatementScan) !void {
     const has_graph = for (scans) |scan| {
-        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+        if ((scan.table.graph != null or scan.table.retained != null) and !scan.request.graph_source_ordinals) break true;
     } else false;
     if (!has_graph) return;
     try attachGraphConditionsAt(alloc, root, root, program, scans);
@@ -1941,7 +1941,7 @@ fn attachGraphConditionsAt(alloc: Allocator, root: *const Node, node: *const Nod
     switch (node.operation) {
         .scan => |scan| {
             const source = &scans[scan.index];
-            if (source.table.graph == null or source.request.graph_source_ordinals) return;
+            if ((source.table.graph == null and source.table.retained == null) or source.request.graph_source_ordinals) return;
             var conditions: std.ArrayList(catalog.Scan.GraphCondition) = .empty;
             try conditions.appendSlice(alloc, source.request.graph_conditions);
             var predicates: std.ArrayList(catalog.Scan.GraphPredicate) = .empty;

@@ -882,7 +882,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(body);
         const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
-        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation, .max_response_bytes = 32 * 1024 * 1024 });
         defer response.deinit(self.alloc);
         switch (response.status) {
             200 => {},
@@ -897,7 +897,7 @@ pub const ApiHttpClient = struct {
             },
             else => return error.RetainedSeriesNotReady,
         }
-        if (response.body.len > 6 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
+        if (response.body.len > 32 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
         try context.ensureActive();
         return self.alloc.dupe(u8, response.body);
     }

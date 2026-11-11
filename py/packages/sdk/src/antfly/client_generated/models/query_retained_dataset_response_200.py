@@ -20,12 +20,14 @@ T = TypeVar("T", bound="QueryRetainedDatasetResponse200")
 class QueryRetainedDatasetResponse200:
     """
     Attributes:
+        next_ (None | str): Exclusive continuation key; null when complete. An empty page may still have a next key.
         initial_history (QueryRetainedDatasetResponse200InitialHistory):
         dimensions (list[str]):
         measures (list[QueryRetainedDatasetResponse200MeasuresItem]):
         rows (list[QueryRetainedDatasetResponse200RowsItem]):
     """
 
+    next_: None | str
     initial_history: QueryRetainedDatasetResponse200InitialHistory
     dimensions: list[str]
     measures: list[QueryRetainedDatasetResponse200MeasuresItem]
@@ -33,6 +35,9 @@ class QueryRetainedDatasetResponse200:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        next_: None | str
+        next_ = self.next_
+
         initial_history = self.initial_history.value
 
         dimensions = self.dimensions
@@ -51,6 +56,7 @@ class QueryRetainedDatasetResponse200:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "next": next_,
                 "initial_history": initial_history,
                 "dimensions": dimensions,
                 "measures": measures,
@@ -68,6 +74,14 @@ class QueryRetainedDatasetResponse200:
         from ..models.query_retained_dataset_response_200_rows_item import QueryRetainedDatasetResponse200RowsItem
 
         d = dict(src_dict)
+
+        def _parse_next_(data: object) -> None | str:
+            if data is None:
+                return data
+            return cast(None | str, data)
+
+        next_ = _parse_next_(d.pop("next"))
+
         initial_history = QueryRetainedDatasetResponse200InitialHistory(d.pop("initial_history"))
 
         dimensions = cast(list[str], d.pop("dimensions"))
@@ -87,6 +101,7 @@ class QueryRetainedDatasetResponse200:
             rows.append(rows_item)
 
         query_retained_dataset_response_200 = cls(
+            next_=next_,
             initial_history=initial_history,
             dimensions=dimensions,
             measures=measures,

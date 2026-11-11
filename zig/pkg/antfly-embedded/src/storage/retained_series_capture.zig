@@ -651,7 +651,7 @@ fn normalizeValueWithPresence(a: A, binding: Binding, value: std.json.Value, pre
     }
     return .{ .timestamp_ns = ns, .dimensions = try std.json.Stringify.valueAlloc(a, dimensions, .{}), .values = inputs };
 }
-fn normalizeDimension(a: A, declared: DimensionType, cell: std.json.Value) !std.json.Value {
+pub fn normalizeDimension(a: A, declared: DimensionType, cell: std.json.Value) !std.json.Value {
     if (cell == .null) return .null;
     return switch (declared) {
         .integer => if (cell == .integer) cell else if (cell == .number_string) .{ .integer = std.fmt.parseInt(i64, cell.number_string, 10) catch return error.InvalidRetainedSeriesRow } else error.InvalidRetainedSeriesRow,

@@ -59,6 +59,22 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 }
                 scan.request.graph_filters = try filters.toOwnedSlice(a);
                 scan.request.graph_predicates = &.{};
+                // Null tests are unary scalar hints and arrive as boolean
+                // comparisons. Retained readers use the same exact conjunct
+                // contract as equality seeks; disjunctions remain residual.
+                if (scan.table.retained != null) {
+                    var conditions: std.ArrayList(catalog.Condition) = .empty;
+                    try conditions.appendSlice(a, scan.request.conditions);
+                    for (scan.request.graph_filters) |filter| if (filter == .comparison) {
+                        const condition = filter.comparison;
+                        if (condition.op != .is_null and condition.op != .is_not_null) continue;
+                        const duplicate = for (conditions.items) |existing| {
+                            if (existing.op == condition.op and std.mem.eql(u8, existing.column, condition.column)) break true;
+                        } else false;
+                        if (!duplicate) try conditions.append(a, condition);
+                    };
+                    scan.request.conditions = try conditions.toOwnedSlice(a);
+                }
             }
             if (scan.request.search) |original| {
                 const search = try a.create(catalog.Scan.Search);
@@ -126,7 +142,7 @@ test "graph condition deduplication preserves exact operand domains and NULL sem
 pub fn outerGraphScans(a: Allocator, relation: *const binding.Bound, predicate: ?scalar.Program) ![]const catalog.StatementScan {
     const program = predicate orelse return relation.scans;
     const has_graph = for (relation.scans) |scan| {
-        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+        if ((scan.table.graph != null or scan.table.retained != null) and !scan.request.graph_source_ordinals) break true;
     } else false;
     if (!has_graph) return relation.scans;
     const scans = try a.dupe(catalog.StatementScan, relation.scans);
@@ -3640,6 +3656,31 @@ fn Source(comptime Context: type) type {
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
             var scans = try bindSearchScans(search_arena.allocator(), try outerGraphScans(search_arena.allocator(), relation, context.binding.scalars.predicate), context.parameters);
+            // A finite unordered prefix is safe only across identity lineage,
+            // without residual predicates, observers, ordering or fallible outputs.
+            // Reuse the exact-prefix certificate; row_goal remains advisory.
+            if (context.statement_capture == null and context.binding.aggregate == null and context.binding.window == null and
+                !relation.statement.count_all and !relation.statement.scalar_cardinality_limit and relation.statement.limit != null and
+                relation.statement.order_by.len == 0 and relation.statement.predicate == null and context.binding.scalars.predicate == null)
+            license_retained: {
+                if (!try context.hasRowLimit(relation.statement.limit)) break :license_retained;
+                const index = binding.rowPreservingScan(relation.root) orelse break :license_retained;
+                if (scans[index].table.retained == null) break :license_retained;
+                for (context.binding.scalars.projections) |program| if (program) |value| {
+                    if (value.instructions.len != 1 or value.root != 0) break :license_retained;
+                    switch (value.instructions[0].operation) {
+                        .column, .literal => {},
+                        else => break :license_retained,
+                    }
+                };
+                const request = scans[index].request;
+                if (request.primary_key != null or request.after != null or request.conditions.len != 0 or request.order.len != 0) break :license_retained;
+                const maximum = (try context.count(relation.statement.offset, 0)) +| (try context.count(relation.statement.limit, 0));
+                if (maximum == 0 or maximum > context.limits.scan_rows) break :license_retained;
+                const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
+                changed[index].request.ordered_window = maximum;
+                scans = changed;
+            }
             // A transparent graph scan preserves its physical cursor's order.
             // Negotiate before capturing the statement cut; never reopen a
             // captured cursor or propagate order through joins/derived errors.
@@ -4983,4 +5024,62 @@ test "distributed SQL sampled remote children replay before batch and scalar pul
         }
         try std.testing.expectEqual(total, index);
     };
+}
+
+test "SQL retained source finite prefixes require a complete consumer proof" {
+    const Fixture = struct {
+        window: ?u64 = null,
+        conditions: usize = 0,
+        position: usize = 0,
+        examined: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn retained(_: *anyopaque, a: Allocator, definition: @import("ast.zig").RetainedTable) !catalog.Table {
+            const spec = try a.create(catalog.Table.RetainedBinding);
+            spec.* = .{ .definition = definition, .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1 };
+            return .{ .id = 1, .physical_name = "summary", .schema_version = 1, .retained = spec, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.window = request.ordered_window;
+            self.conditions = request.conditions.len;
+            return .{ .ptr = self, .next = next, .close = close, .order_satisfied = request.order.len == 0 };
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const maximum = self.window orelse 1000;
+            const end = @min(maximum, self.position + limit);
+            const rows = try a.alloc(catalog.Row, end - self.position);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{"n"});
+            for (rows, self.position..) |*row, index| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(index) })});
+            self.examined += rows.len;
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < maximum) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_]struct { sql: []const u8, window: ?u64, conditions: usize = 0 }{
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') LIMIT 1", .window = 1 },
+        .{ .sql = "SELECT d.n FROM (SELECT n FROM retained_summary(public.stats, '0', '60')) d LIMIT 1", .window = 1 },
+        .{ .sql = "SELECT d.n FROM (SELECT n FROM retained_summary(public.stats, '0', '60') WHERE n > 5) d LIMIT 1", .window = null, .conditions = 1 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') LIMIT 2 OFFSET 3", .window = 5 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') LIMIT NULL OFFSET 3", .window = null },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') WHERE n > 5 LIMIT 1", .window = null, .conditions = 1 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') WHERE n IS NULL LIMIT 1", .window = null, .conditions = 1 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') ORDER BY n DESC LIMIT 1", .window = null },
+        .{ .sql = "SELECT COUNT(*) FROM retained_summary(public.stats, '0', '60') LIMIT 1", .window = null },
+        .{ .sql = "SELECT 10 / (n + 1) FROM retained_summary(public.stats, '0', '60') LIMIT 1", .window = null },
+    }) |case| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{ .result_rows = 2000 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.window, fixture.window);
+        try std.testing.expectEqual(case.conditions, fixture.conditions);
+        if (case.window) |maximum| try std.testing.expectEqual(maximum, fixture.examined);
+    }
 }

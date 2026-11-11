@@ -834,6 +834,9 @@ pub const Engine = struct {
     /// definition; partial buckets cannot be presented as exact raw aggregates.
     /// Pagination must retain this immutable transaction (or restart a snapshot).
     pub fn scan(self: Engine, a: A, txn: anytype, start_ns: i128, end_ns: i128, admitted_ns: i128, after: ?[]const u8, limit: usize) !Page {
+        return self.scanWhere(a, txn, start_ns, end_ns, admitted_ns, after, limit, null, null);
+    }
+    pub fn scanWhere(self: Engine, a: A, txn: anytype, start_ns: i128, end_ns: i128, admitted_ns: i128, after: ?[]const u8, limit: usize, dimensions_json: ?[]const u8, first_after: ?@import("../retained_dataset_types.zig").RowKey) !Page {
         if (limit == 0 or limit > max_changes or start_ns >= end_ns or try self.spec.bucket(start_ns) != start_ns or try self.spec.bucket(end_ns) != end_ns) return error.RetainedSeriesResolutionMismatch;
         const cut = try self.snapshotCursor(txn);
         const state = try self.load(a, txn);
@@ -842,7 +845,13 @@ pub const Engine = struct {
         const p = try self.key(a, "bucket:");
         const biased = @as(u128, @bitCast(start_ns)) ^ (@as(u128, 1) << 127);
         const lower = try std.fmt.allocPrint(a, "{s}{x:0>32}:", .{ p, biased });
-        return self.scanKeyRange(a, txn, p, lower, start_ns, end_ns, after, limit, cut);
+        var resume_after = after;
+        if (resume_after == null) if (first_after) |resume_key| {
+            const ts = try @import("../retained_dataset_types.zig").rowKeyTimestamp(resume_key);
+            if (ts < start_ns or ts >= end_ns) return error.RetainedSeriesResolutionMismatch;
+            resume_after = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ p, resume_key[0..32], resume_key[32..] });
+        };
+        return self.scanKeyRangeWhere(a, txn, p, lower, start_ns, end_ns, resume_after, limit, cut, dimensions_json);
     }
 
     /// A closed owner exports through the last physical bucket, including
@@ -867,6 +876,9 @@ pub const Engine = struct {
     }
 
     fn scanKeyRange(self: Engine, a: A, txn: anytype, p: []const u8, lower: []const u8, start_ns: i128, end_ns: ?i128, after: ?[]const u8, limit: usize, cut: Cursor) !Page {
+        return self.scanKeyRangeWhere(a, txn, p, lower, start_ns, end_ns, after, limit, cut, null);
+    }
+    fn scanKeyRangeWhere(self: Engine, a: A, txn: anytype, p: []const u8, lower: []const u8, start_ns: i128, end_ns: ?i128, after: ?[]const u8, limit: usize, cut: Cursor, dimensions_json: ?[]const u8) !Page {
         var seek = lower;
         if (after) |previous| {
             if (!std.mem.startsWith(u8, previous, p) or previous.len != p.len + 32 + 1 + 64 or std.mem.order(u8, previous, lower) == .lt) return error.RetainedSeriesResetRequired;
@@ -878,9 +890,35 @@ pub const Engine = struct {
         var cur = try txn.openCursor();
         defer cur.close();
         var entry = try cur.seekAtOrAfter(seek);
+        var visited: usize = 0;
         while (entry) |e| {
+            if (visited == 128 * 1024) return error.RetainedSeriesBatchTooLarge;
+            visited += 1;
             if (!std.mem.startsWith(u8, e.key, p)) break;
+            // Exact tuple reads seek by the canonical dimension hash and jump
+            // to the next nonempty time bucket, independently of cardinality.
+            if (dimensions_json) |dimensions| {
+                if (dimensions.len > 4096 or e.key.len != p.len + 97) return error.RetainedSeriesCorrupt;
+                const biased = std.fmt.parseInt(u128, e.key[p.len..][0..32], 16) catch return error.RetainedSeriesCorrupt;
+                const timestamp: i128 = @bitCast(biased ^ (@as(u128, 1) << 127));
+                if (end_ns) |end| if (timestamp >= end) break;
+                const target = try self.bucketKey(a, .{ .timestamp_ns = timestamp, .dimensions = dimensions, .values = &.{} });
+                switch (std.mem.order(u8, e.key, target)) {
+                    .lt => {
+                        entry = try cur.seekAtOrAfter(target);
+                        continue;
+                    },
+                    .gt => {
+                        const next_time = try std.math.add(i128, timestamp, self.spec.interval_ns);
+                        const next_bias = @as(u128, @bitCast(next_time)) ^ (@as(u128, 1) << 127);
+                        entry = try cur.seekAtOrAfter(try std.fmt.allocPrint(a, "{s}{x:0>32}:", .{ p, next_bias }));
+                        continue;
+                    },
+                    .eq => {},
+                }
+            }
             const b = try self.decodeBucket(a, e.key, e.value);
+            if (dimensions_json) |dimensions| if (!std.mem.eql(u8, dimensions, b.dimensions)) return error.RetainedSeriesCorrupt;
             if (end_ns) |end| {
                 if (b.start_ns >= end) break;
             }

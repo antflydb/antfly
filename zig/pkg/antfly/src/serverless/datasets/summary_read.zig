@@ -26,12 +26,44 @@ const closure = @import("closure_manifest.zig");
 pub const Result = struct {
     arena: std.heap.ArenaAllocator,
     rows: []const series.Bucket,
+    next: ?t.RowKey = null,
     pub fn deinit(self: *Result) void {
         self.arena.deinit();
         self.* = undefined;
     }
 };
-pub const Limits = struct { segments: usize = 32, rows: usize = 65536, bytes: usize = 64 * 1024 * 1024, read_clock_ns: i128 = 0 };
+pub const Limits = struct { segments: usize = 32, rows: usize = 65536, bytes: usize = 64 * 1024 * 1024, read_clock_ns: i128 = 0, after: ?t.RowKey = null, dimensions_json: ?[]const u8 = null, page: bool = false };
+
+pub fn successor(key: t.RowKey) !t.RowKey {
+    var result = key;
+    var i = result.len;
+    const digits = "0123456789abcdef";
+    while (i > 0) {
+        i -= 1;
+        const value = std.mem.indexOfScalar(u8, digits, result[i]) orelse return error.InvalidDatasetCoverage;
+        if (value < 15) {
+            result[i] = digits[value + 1];
+            return result;
+        }
+        result[i] = '0';
+    }
+    return error.InvalidDatasetCoverage;
+}
+pub fn predecessor(key: t.RowKey) !t.RowKey {
+    var result = key;
+    var i = result.len;
+    const digits = "0123456789abcdef";
+    while (i > 0) {
+        i -= 1;
+        const value = std.mem.indexOfScalar(u8, digits, result[i]) orelse return error.InvalidDatasetCoverage;
+        if (value > 0) {
+            result[i] = digits[value - 1];
+            return result;
+        }
+        result[i] = 'f';
+    }
+    return error.InvalidDatasetCoverage;
+}
 
 /// `resolve` is a host capability with resolve.location(id) returning Location.
 /// The caller authorizes the independent dataset resource before invoking this.
@@ -61,7 +93,7 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
     for (summary.measures, spec.laws, 0..) |measure, law, i| {
         if (measure.law != law or (law == .count and (measure.field != null) != spec.countsNonNull(i))) return error.RetainedSeriesDefinitionMismatch;
     }
-    if (limits.segments == 0 or limits.segments > catalog.max_page or limits.rows == 0 or limits.rows > codec.max_rows or limits.bytes == 0 or limits.bytes > 256 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
+    if (limits.segments == 0 or limits.segments > catalog.max_page or limits.rows == 0 or limits.rows > 128 * 1024 or limits.bytes == 0 or limits.bytes > 256 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
     if (try spec.bucket(try range.start()) != try range.start() or try spec.bucket(try range.end()) != try range.end()) return error.RetainedSeriesResolutionMismatch;
     const now = store.clock.unix();
     if (now == 0) return error.DatasetLeaseExpired;
@@ -84,15 +116,29 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         if (start >= tail) return .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{} };
         if (try range.end() > tail) scan_range.end_ns = try std.fmt.bufPrint(&tail_buffer, "{d}", .{tail});
     }
-    var plan = try store.planCoveringRange(spec.generation, spec.source_partition, spec.source_incarnation, scan_range, limits.segments);
+    var requested = try t.KeySpan.fromRange(scan_range);
+    if (limits.after) |after| {
+        const next = try successor(after);
+        if (std.mem.order(u8, &next, &requested.start) == .gt) requested.start = next;
+    }
+    // A point dimension tuple in one bucket maps directly to one coverage
+    // extent, even when the bucket spans thousands of immutable files.
+    if (limits.dimensions_json) |dimensions| if ((std.math.add(i128, try range.start(), spec.interval_ns) catch return error.InvalidDatasetCoverage) == try range.end()) {
+        const key = codec.key(.{ .start_ns = try range.start(), .dimensions = dimensions, .rows = 1, .metrics = &.{} });
+        if (std.mem.order(u8, &key, &requested.start) == .lt) return .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{} };
+        requested.start = key;
+        requested.end = try successor(key);
+    };
+    if (std.mem.order(u8, &requested.start, &requested.end) != .lt) return .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{} };
+    var plan = try store.planCoveringKeys(spec.generation, spec.source_partition, spec.source_incarnation, requested, limits.segments, limits.page);
     defer plan.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();
     const temp = arena.allocator();
     var rows = std.ArrayList(series.Bucket).empty;
     var total_bytes: usize = 0;
-    const requested = try t.KeySpan.fromRange(range);
-    for (plan.segments) |segment| {
+    var next_key: ?t.RowKey = if (plan.next) |end| try predecessor(end) else null;
+    segment_loop: for (plan.segments) |segment| {
         if ((segment.state_encoding != 1 and segment.state_encoding != codec.encoding) or !segment.finalized or !std.mem.eql(u8, &segment.schema, &definition.schema)) return error.InvalidDatasetSegment;
         if (segment.byte_len > limits.bytes - total_bytes) return error.DatasetPageBudgetExceeded;
         total_bytes += @intCast(segment.byte_len);
@@ -118,12 +164,17 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         for (decoded.rows) |row| {
             const key = codec.key(row);
             if (std.mem.order(u8, &key, &requested.start) == .lt or std.mem.order(u8, &key, &requested.end) != .lt) continue;
-            if (rows.items.len == limits.rows) return error.DatasetPageBudgetExceeded;
+            if (limits.dimensions_json) |dimensions| if (!std.mem.eql(u8, dimensions, row.dimensions)) continue;
+            if (rows.items.len == limits.rows) {
+                if (!limits.page) return error.DatasetPageBudgetExceeded;
+                next_key = codec.key(rows.items[rows.items.len - 1]);
+                break :segment_loop;
+            }
             var owned = row;
             owned.dimensions = try temp.dupe(u8, row.dimensions);
             try rows.append(temp, owned);
         }
     }
     if (try spec.expired(try range.start(), read_clock)) return error.RetainedSeriesHistoryExpired;
-    return .{ .arena = arena, .rows = rows.items };
+    return .{ .arena = arena, .rows = rows.items, .next = next_key };
 }

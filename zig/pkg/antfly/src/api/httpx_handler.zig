@@ -3015,11 +3015,14 @@ pub const AntflyApiHandler = struct {
         if (action == .get) return retainedDatasetInfo(ctx, 200, name, descriptor.value);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset revision required");
         if (body.len > 4096) return textResponse(ctx, 413, "close request too large");
-        const request = std.json.parseFromSliceLeaky(struct { expected_revision: u64, cancel_activation: bool = false }, a, body, .{}) catch return textResponse(ctx, 400, "invalid dataset revision");
-        if (descriptor.value.revision != request.expected_revision or descriptor.value.phase != (if (request.cancel_activation) @as(retained.Phase, .activating) else .active)) return textResponse(ctx, 409, "dataset phase or revision changed");
+        const request = std.json.parseFromSliceLeaky(struct { expected_revision: u64, cancel_activation: bool = false, discard: bool = false }, a, body, .{}) catch return textResponse(ctx, 400, "invalid dataset revision");
+        if (request.discard and request.cancel_activation) return textResponse(ctx, 400, "choose discard or cancel_activation");
+        if (descriptor.value.revision != request.expected_revision) return textResponse(ctx, 409, "dataset phase or revision changed");
+        if (request.discard and descriptor.value.phase == .retiring) return retainedDatasetInfo(ctx, 202, name, descriptor.value);
+        if (!request.discard and descriptor.value.phase != (if (request.cancel_activation) @as(retained.Phase, .activating) else .active)) return textResponse(ctx, 409, "dataset phase or revision changed");
         var next = descriptor.value;
         // Cancelling activation must revoke installed capture before releasing the source.
-        next.phase = if (request.cancel_activation) .retiring else .closing;
+        next.phase = if (request.cancel_activation or request.discard) .retiring else .closing;
         next.revision += 1;
         const json = try std.json.Stringify.valueAlloc(a, next, .{});
         const applied = source.systemCatalog(a, context, .{ .mutate = .{ .mutation = .{ .action = .set_definition, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json, .expected_dataset_revision = request.expected_revision } } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
@@ -3032,7 +3035,7 @@ pub const AntflyApiHandler = struct {
         const id = std.fmt.bytesToHex(descriptor.definition.id, .lower);
         const retention = try std.fmt.allocPrint(ctx.allocator, "{d}", .{descriptor.definition.retention_ns});
         const interval = try std.fmt.allocPrint(ctx.allocator, "{d}", .{summary.interval_ns});
-        return ctx.status(code).json(.{ .id = &id, .name = name, .revision = descriptor.revision, .phase = descriptor.phase, .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .retention_ns = retention, .interval_ns = interval, .origin_ns = summary.origin_ns });
+        return ctx.status(code).json(.{ .id = &id, .name = name, .revision = descriptor.revision, .phase = descriptor.phase, .source_released = descriptor.source == null, .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .retention_ns = retention, .interval_ns = interval, .origin_ns = summary.origin_ns });
     }
 
     pub fn queryRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
@@ -3047,8 +3050,8 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(logical);
         if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset range required");
-        if (body.len > 4096) return textResponse(ctx, 413, "dataset request too large");
-        const request = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid dataset range");
+        if (body.len > 32768) return textResponse(ctx, 413, "dataset request too large");
+        const request = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").QueryRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid dataset range");
         const result = @import("retained_dataset_read.zig").queryJson(self.api_server, ctx.allocator, .{ .database = route.database, .namespace = route.namespace, .table = name }, request, operationContext(ctx, identity)) catch |err| return switch (err) {
             error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
             error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
@@ -3072,7 +3075,7 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "retained owner read required");
-        if (body.len > 4096) return textResponse(ctx, 413, "retained owner read too large");
+        if (body.len > 32768) return textResponse(ctx, 413, "retained owner read too large");
         const query = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").NativeQuery, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid retained owner read");
         const port = self.api_server.cfg.retained_owner_read orelse return textResponse(ctx, 503, "retained owner unavailable");
         const bytes = port.readRows(ctx.allocator, params.table_name, params.group_id, query, operationContext(ctx, null)) catch |err| return switch (err) {

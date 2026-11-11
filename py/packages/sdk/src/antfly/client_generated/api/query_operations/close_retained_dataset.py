@@ -84,9 +84,11 @@ def sync_detailed(
 ) -> Response[Any | RetainedDatasetInfo]:
     """Close and archive a retained summary
 
-     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
-    be true to cancel activation and discard partial summary state. The source dependency is released
-    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
+     Begins asynchronous archive closure of an active summary. Set discard to permanently abandon any
+    phase, including a closure blocked by archive unavailability. Discard releases the source only after
+    verified native revocation and cleanup; archive collection resumes independently when storage
+    returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation is retained for
+    activating summaries only. Neither discard nor cancellation preserves summary history.
 
     Args:
         database_name (str):
@@ -126,9 +128,11 @@ def sync(
 ) -> Any | RetainedDatasetInfo | None:
     """Close and archive a retained summary
 
-     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
-    be true to cancel activation and discard partial summary state. The source dependency is released
-    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
+     Begins asynchronous archive closure of an active summary. Set discard to permanently abandon any
+    phase, including a closure blocked by archive unavailability. Discard releases the source only after
+    verified native revocation and cleanup; archive collection resumes independently when storage
+    returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation is retained for
+    activating summaries only. Neither discard nor cancellation preserves summary history.
 
     Args:
         database_name (str):
@@ -163,9 +167,11 @@ async def asyncio_detailed(
 ) -> Response[Any | RetainedDatasetInfo]:
     """Close and archive a retained summary
 
-     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
-    be true to cancel activation and discard partial summary state. The source dependency is released
-    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
+     Begins asynchronous archive closure of an active summary. Set discard to permanently abandon any
+    phase, including a closure blocked by archive unavailability. Discard releases the source only after
+    verified native revocation and cleanup; archive collection resumes independently when storage
+    returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation is retained for
+    activating summaries only. Neither discard nor cancellation preserves summary history.
 
     Args:
         database_name (str):
@@ -203,9 +209,11 @@ async def asyncio(
 ) -> Any | RetainedDatasetInfo | None:
     """Close and archive a retained summary
 
-     Begins asynchronous closure of an active summary. For an activating summary, cancel_activation must
-    be true to cancel activation and discard partial summary state. The source dependency is released
-    only after verified archive handoff or, for cancellation, verified owner revocation and cleanup.
+     Begins asynchronous archive closure of an active summary. Set discard to permanently abandon any
+    phase, including a closure blocked by archive unavailability. Discard releases the source only after
+    verified native revocation and cleanup; archive collection resumes independently when storage
+    returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation is retained for
+    activating summaries only. Neither discard nor cancellation preserves summary history.
 
     Args:
         database_name (str):

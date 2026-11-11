@@ -548,6 +548,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const retained_sql_diagnostic_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/sql/errors.zig"), .target = target, .optimize = optimize });
     const retained_sql_diagnostic_tests = b.addTest(.{ .root_module = retained_sql_diagnostic_mod, .filters = &.{"SQL retained source"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     retained_public_step.dependOn(&b.addRunArtifact(retained_sql_diagnostic_tests).step);
+    const retained_sql_prefix_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_sql_prefix_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, retained_sql_prefix_mod, true, true);
+    const retained_sql_prefix_tests = b.addTest(.{ .root_module = retained_sql_prefix_mod, .filters = &.{"SQL retained source finite prefixes"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    retained_public_step.dependOn(&b.addRunArtifact(retained_sql_prefix_tests).step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);

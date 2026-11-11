@@ -567,6 +567,15 @@ test "retained dataset large buckets split into disjoint key spans and compact w
     try std.testing.expectEqual(@as(usize, 2), plan.segments.len);
     try std.testing.expectEqual(left.id, plan.segments[0].id);
     try std.testing.expectEqual(right.id, plan.segments[1].id);
+    var partial = try store.planCoveringKeys(1, left.source.partition, 1, try t.KeySpan.fromRange(left.coverage), 1, true);
+    defer partial.deinit();
+    try std.testing.expectEqual(@as(usize, 1), partial.segments.len);
+    try std.testing.expectEqual(split, partial.next.?);
+    var rest = try store.planCoveringKeys(1, left.source.partition, 1, .{ .start = split, .end = t.rowKey(60, @splat(0)) }, 1, true);
+    defer rest.deinit();
+    try std.testing.expectEqual(right.id, rest.segments[0].id);
+    try std.testing.expectEqual(@as(?t.RowKey, null), rest.next);
+
     var overlap = segment();
     overlap.id = @splat(12);
     try std.testing.expectError(error.DatasetCoverageOverlap, store.publish(overlap, hot, "states"));
@@ -655,6 +664,15 @@ test "retained dataset archived summary serving checks exact state and filters c
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(i128, 60), result.rows[0].start_ns);
     try std.testing.expectEqual(metrics[0].count, (try result.rows[0].metrics[0].finalize(.count)).integer);
+    var first_page = try api.summary_read.read(a, store, def, spec, .{ .start_ns = "0", .end_ns = "180" }, .{ .rows = 1, .page = true }, resolver);
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first_page.rows.len);
+    try std.testing.expectEqual(codec.key(rows[0]), first_page.next.?);
+    var next_page = try api.summary_read.read(a, store, def, spec, .{ .start_ns = "0", .end_ns = "180" }, .{ .rows = 2, .page = true, .after = first_page.next }, resolver);
+    defer next_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), next_page.rows.len);
+    try std.testing.expectEqual(@as(?t.RowKey, null), next_page.next);
+
     try std.testing.expectError(error.DatasetPageBudgetExceeded, api.summary_read.read(a, store, def, spec, range, .{ .bytes = 1 }, resolver));
     clock.now = 1100;
     try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.read(a, store, def, spec, .{ .start_ns = "0", .end_ns = "60" }, .{}, resolver));
@@ -783,9 +801,9 @@ test "retained dataset closed export publishes disjoint retry-safe pages within 
     clock.now = prior_clock;
     try std.testing.expectError(error.RetainedSeriesHistoryExpired, api.summary_read.readClosed(a, reopened, def, spec, .{ .start_ns = "1200", .end_ns = "1260" }, .{}, cut, receipt, resolve));
     clock.now = @as(u64, @intCast(def.retention_ns)) + 1260;
-    try reopened.collectExpired(first.segment.id, cold);
+    _ = try reopened.collectExpired(first.segment.id, cold);
     try std.testing.expectEqualDeep(second.segment.id, (try reopened.nextExpiry(null)).?.segment);
-    try reopened.collectExpired(second.segment.id, cold);
+    _ = try reopened.collectExpired(second.segment.id, cold);
     try std.testing.expect((try reopened.nextExpiry(null)) == null);
     var wrong_cut = cut;
     wrong_cut.sequence += 1;
@@ -884,4 +902,93 @@ test "retained dataset rejected archive receipts cannot advance durable retentio
     };
     try std.testing.expectError(error.InvalidDatasetCoverage, api.summary_read.read(a, store, def, spec, value.coverage, .{}, Resolve{ .hot = hot }));
     try std.testing.expect(!try spec.expired(0, try store.admitRetentionClock(spec, 1000)));
+}
+
+test "retained dataset tied expiry pages compact in one bounded sweep" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const shared = @import("antfly_local_sources");
+    const series = shared.storage_retained_series;
+    const codec = shared.storage_retained_series_archive;
+    const export_page = @import("closure_export.zig");
+    const spec: series.Spec = .{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    const cut: export_page.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    const count = 16;
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    var rows: [count]series.Bucket = undefined;
+    var dimensions: [count][]u8 = undefined;
+    for (&rows, &dimensions, 0..) |*row, *dim, i| {
+        dim.* = try std.fmt.allocPrint(a, "[{d}]", .{i});
+        row.* = .{ .start_ns = 0, .dimensions = dim.*, .rows = 1, .metrics = &metrics };
+    }
+    defer for (dimensions) |dim| a.free(dim);
+    std.mem.sort(series.Bucket, &rows, {}, struct {
+        fn less(_: void, l: series.Bucket, r: series.Bucket) bool {
+            return std.mem.order(u8, &codec.key(l), &codec.key(r)) == .lt;
+        }
+    }.less);
+    var frontier = t.rowKey(0, @splat(0));
+    for (0..count) |i| {
+        const page = (try export_page.encode(a, def, spec, cut, frontier, rows[i .. i + 1], i + 1 < count, cold)).?;
+        defer export_page.deinit(a, page);
+        try export_page.publish(store, spec, cut, page, cold);
+        frontier = (try page.segment.span()).end;
+    }
+    _ = try store.sealClosedExport(spec, cut, frontier);
+    clock.now = def.retention_ns + 1000;
+    var attempts: usize = 0;
+    var passes: usize = 0;
+    var removed: usize = 0;
+    while (removed < count and passes < count + 1) {
+        passes += 1;
+        var cursor: ?api.catalog.ExpiryCursor = null;
+        while (try store.nextExpiry(cursor)) |work| {
+            cursor = work.cursor;
+            attempts += 1;
+            _ = store.collectExpired(work.segment, cold) catch |err| switch (err) {
+                error.DatasetCompactionOrder => continue,
+                else => return err,
+            };
+            removed += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), passes);
+    try std.testing.expectEqual(@as(usize, count), attempts);
+    try std.testing.expectEqual(@as(usize, count), removed);
+}
+
+test "retained dataset discard fences publication and drains pins and dependencies before physical cleanup" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    const def = definition(.summary);
+    try store.create(def);
+    try store.publish(segment(), hot, "states");
+    const pin = try store.acquire(segment().id);
+    const hold: api.catalog.Dependency = .{ .id = @splat(8), .consumer = @splat(9), .consumer_generation = 1 };
+    try store.hold(segment().id, hold);
+    try store.beginDiscard(def);
+    try store.beginDiscard(def);
+    try std.testing.expectError(error.DatasetSegmentRetired, store.acquire(segment().id));
+    try std.testing.expectError(error.DatasetSegmentRetired, store.publish(segment(), hot, "states"));
+    try std.testing.expectError(error.DatasetSegmentRetired, store.hold(segment().id, hold));
+    try std.testing.expectError(error.DatasetDependencyPending, store.discardOne(segment().id, hot));
+    try store.releaseHold(segment().id, hold);
+    try std.testing.expectError(error.DatasetReadersActive, store.discardOne(segment().id, hot));
+    try store.release(pin);
+    try std.testing.expectEqual(segment().id, (try store.nextDiscard(null)).?);
+    try std.testing.expect(try store.discardOne(segment().id, hot));
+    try std.testing.expectEqual(@as(?t.Id, null), try store.nextDiscard(null));
+    const reopened = catalog(&memory, &clock);
+    try std.testing.expectEqual(@as(?t.Id, null), try reopened.nextDiscard(null));
+    try std.testing.expectError(error.DatasetSegmentRetired, reopened.publish(segment(), hot, "states"));
 }

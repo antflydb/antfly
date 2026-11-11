@@ -4670,7 +4670,7 @@ pub fn storageOwnerRetainedQueryJson(owner: ?*anyopaque, request: *const kernel_
 pub fn storageOwnerRetainedReadOpen(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out_session: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_session.* = null;
     if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
-    if (request.request_json.len > 4096) return .invalid_argument;
+    if (request.request_json.len > 32768) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     const reader = antfly.capi_dependencies.storage_retained_series_reader;

@@ -786,3 +786,34 @@ test "retained series close admission drains old votes without accepting new con
     const page = try e.scan(arena.allocator(), &store, 0, 10, 4, null, 10);
     try std.testing.expectEqual(@as(i64, 1), page.rows[0].rows);
 }
+
+test "retained series exact dimensions seek across cardinality and resume by public row key" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const values = [_]?f64{ null, 1, 1, 1, 1 };
+    for (0..200) |i| {
+        const dimension = try std.fmt.allocPrint(a, "[{d}]", .{i});
+        defer a.free(dimension);
+        const key = try std.fmt.allocPrint(a, "row{d}", .{i});
+        defer a.free(key);
+        try e.apply(&store, i + 1, 1, .mutation, &.{.{ .key = key, .after = .{ .timestamp_ns = 1, .dimensions = dimension, .values = &values } }});
+    }
+    try e.apply(&store, 201, 11, .mutation, &.{.{ .key = "second", .after = .{ .timestamp_ns = 11, .dimensions = "[42]", .values = &values } }});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    store.ordered_seeks = 0;
+    const first = try e.scanWhere(arena.allocator(), &store, 0, 20, 11, null, 1, "[42]", null);
+    try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+    try std.testing.expectEqualStrings("[42]", first.rows[0].dimensions);
+    try std.testing.expect(first.after != null);
+    const key = @import("retained_series_archive.zig").key(first.rows[0]);
+    const second = try e.scanWhere(arena.allocator(), &store, 0, 20, 11, null, 1, "[42]", key);
+    try std.testing.expectEqual(@as(usize, 1), second.rows.len);
+    try std.testing.expectEqual(@as(i128, 10), second.rows[0].start_ns);
+    try std.testing.expectEqual(@as(?[]const u8, null), second.after);
+    const absent = try e.scanWhere(arena.allocator(), &store, 0, 20, 11, null, 1, "[999]", null);
+    try std.testing.expectEqual(@as(usize, 0), absent.rows.len);
+    try std.testing.expect(store.ordered_seeks < 20);
+}

@@ -54006,6 +54006,8 @@ pub const RetainedDatasetInfo = struct {
     name: []const u8,
     revision: u64,
     phase: []const u8,
+    /// True after verified native revocation or archive handoff releases the source dependency. Retiring remains a durable discard tombstone while archive collection proceeds independently.
+    source_released: bool,
     initial_history: []const u8,
     dimensions: []const []const u8,
     measures: []const RetainedDatasetMeasure,

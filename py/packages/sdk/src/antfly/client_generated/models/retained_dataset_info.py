@@ -24,6 +24,8 @@ class RetainedDatasetInfo:
         name (str):
         revision (int):
         phase (RetainedDatasetInfoPhase):
+        source_released (bool): True after verified native revocation or archive handoff releases the source dependency.
+            Retiring remains a durable discard tombstone while archive collection proceeds independently.
         initial_history (RetainedDatasetInfoInitialHistory):
         dimensions (list[str]):
         measures (list[RetainedDatasetMeasure]):
@@ -36,6 +38,7 @@ class RetainedDatasetInfo:
     name: str
     revision: int
     phase: RetainedDatasetInfoPhase
+    source_released: bool
     initial_history: RetainedDatasetInfoInitialHistory
     dimensions: list[str]
     measures: list[RetainedDatasetMeasure]
@@ -52,6 +55,8 @@ class RetainedDatasetInfo:
         revision = self.revision
 
         phase = self.phase.value
+
+        source_released = self.source_released
 
         initial_history = self.initial_history.value
 
@@ -76,6 +81,7 @@ class RetainedDatasetInfo:
                 "name": name,
                 "revision": revision,
                 "phase": phase,
+                "source_released": source_released,
                 "initial_history": initial_history,
                 "dimensions": dimensions,
                 "measures": measures,
@@ -100,6 +106,8 @@ class RetainedDatasetInfo:
 
         phase = RetainedDatasetInfoPhase(d.pop("phase"))
 
+        source_released = d.pop("source_released")
+
         initial_history = RetainedDatasetInfoInitialHistory(d.pop("initial_history"))
 
         dimensions = cast(list[str], d.pop("dimensions"))
@@ -122,6 +130,7 @@ class RetainedDatasetInfo:
             name=name,
             revision=revision,
             phase=phase,
+            source_released=source_released,
             initial_history=initial_history,
             dimensions=dimensions,
             measures=measures,

@@ -49,7 +49,7 @@ fn retainedArchived(a: std.mem.Allocator, resource: domain.Resource) !bool {
     if (identity.source_table_id != 0) return false;
     var descriptor = try retained.parse(a, resource.source_json);
     defer descriptor.deinit();
-    return descriptor.value.phase == .closed and descriptor.value.definition.kind == .summary;
+    return (descriptor.value.phase == .closed or descriptor.value.phase == .retiring) and descriptor.value.definition.kind == .summary;
 }
 fn retainedPending(a: std.mem.Allocator, resource: domain.Resource) !bool {
     const identity = resource.retained orelse return false;

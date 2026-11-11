@@ -62,6 +62,7 @@ fn expiryKey(segment: t.Segment, retention_ns: u64) !?ExpiryCursor {
 pub const RangePlan = struct {
     arena: std.heap.ArenaAllocator,
     segments: []const t.Segment,
+    next: ?t.RowKey = null,
     pub fn deinit(self: *RangePlan) void {
         self.arena.deinit();
         self.* = undefined;
@@ -206,6 +207,7 @@ pub const Catalog = struct {
         try next.validate();
         var session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         const current = try self.definition(session.value);
         defer current.deinit();
         const generation = std.math.add(u64, expected_generation, 1) catch return error.DatasetDefinitionConflict;
@@ -279,6 +281,7 @@ pub const Catalog = struct {
         defer self.context.alloc.free(key);
         const session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         try self.checkClosedSpec(session.value, spec);
         const current = (try self.closedProgress(session.value, key, initial)) orelse initial;
         const sealed = try current.seal(empty_tail);
@@ -293,6 +296,7 @@ pub const Catalog = struct {
     fn publishImpl(self: Catalog, value: t.Segment, location: Location, bytes: []const u8, closed_page: ?ClosedPage) !void {
         var session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         const def = try self.definition(session.value);
         defer def.deinit();
         try value.validate(def.value);
@@ -384,6 +388,7 @@ pub const Catalog = struct {
         if (t.zero(dependency.id) or t.zero(dependency.consumer) or dependency.consumer_generation == 0 or dependency.consumer_generation > t.max_public_counter) return error.InvalidDatasetDependency;
         var session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         const current = try self.segment(session.value, id);
         defer current.deinit();
         if (current.value.retiring) return error.DatasetSegmentRetired;
@@ -417,6 +422,7 @@ pub const Catalog = struct {
     pub fn migrate(self: Catalog, id: t.Id, expected_revision: u64, source: Location, destination: Location) !void {
         var session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         const current = try self.segment(session.value, id);
         defer current.deinit();
         var next = current.value;
@@ -456,17 +462,21 @@ pub const Catalog = struct {
     /// segment before exposing any result. Empty history requires an explicit
     /// empty-state segment; absence is never silently converted into zero.
     pub fn planRange(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, range: t.Range, limit: usize) !RangePlan {
-        return self.planExtent(generation, partition, incarnation, try t.KeySpan.fromRange(range), limit, false);
+        return self.planExtent(generation, partition, incarnation, try t.KeySpan.fromRange(range), limit, false, false);
     }
 
     /// Select complete immutable segments covering a requested range. Consumers
     /// must filter decoded row keys to the requested extent. This preserves
     /// exact aggregate states without requiring queries to align with files.
     pub fn planCoveringRange(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, range: t.Range, limit: usize) !RangePlan {
-        return self.planExtent(generation, partition, incarnation, try t.KeySpan.fromRange(range), limit, true);
+        return self.planExtent(generation, partition, incarnation, try t.KeySpan.fromRange(range), limit, true, false);
     }
 
-    fn planExtent(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, extent_requested: t.KeySpan, limit: usize, covering: bool) !RangePlan {
+    pub fn planCoveringKeys(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, span: t.KeySpan, limit: usize, partial: bool) !RangePlan {
+        return self.planExtent(generation, partition, incarnation, span, limit, true, partial);
+    }
+
+    fn planExtent(self: Catalog, generation: u64, partition: t.Id, incarnation: u64, extent_requested: t.KeySpan, limit: usize, covering: bool, partial: bool) !RangePlan {
         try extent_requested.validate();
         if (limit == 0 or limit > max_page or generation == 0 or incarnation == 0 or t.zero(partition)) return error.DatasetPageBudgetExceeded;
         var arena = std.heap.ArenaAllocator.init(self.context.alloc);
@@ -495,7 +505,8 @@ pub const Catalog = struct {
             covered = extent.end;
             if (std.mem.order(u8, &covered, &end) != .lt) break;
         }
-        if (std.mem.order(u8, &covered, &end) == .lt) return if (selected.items.len == limit) error.DatasetPageBudgetExceeded else error.DatasetCoverageUnavailable;
+        const incomplete = std.mem.order(u8, &covered, &end) == .lt;
+        if (incomplete and (!partial or selected.items.len != limit)) return if (selected.items.len == limit) error.DatasetPageBudgetExceeded else error.DatasetCoverageUnavailable;
         const definition_key = try std.fmt.allocPrint(temp, "definitions/{d}", .{generation});
         const def = (try catalog.get(session.value, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
         try def.value.validate();
@@ -512,7 +523,7 @@ pub const Catalog = struct {
             if (part.retiring or try part.expired(def.value, now)) return error.DatasetCoverageUnavailable;
             if (part.access == .restore_required) return error.DatasetRestoreRequired;
         }
-        return .{ .arena = arena, .segments = entries };
+        return .{ .arena = arena, .segments = entries, .next = if (incomplete) covered else null };
     }
 
     /// Register protection before returning an authoritative location. The root
@@ -526,6 +537,127 @@ pub const Catalog = struct {
         self.context.io.random(&random);
         const delay_ms = @min(@as(u64, 1) << @intCast(@min(attempt, 6)), 64) + random[0] % 17;
         try std.Io.sleep(self.context.io, .fromMilliseconds(@intCast(delay_ms)), .awake);
+    }
+
+    const Discard = struct { definition: t.Id, complete: bool = false };
+
+    fn requireLive(self: Catalog, session: Header) !void {
+        if (try self.get(session, Discard, "discard")) |state| {
+            state.deinit();
+            return error.DatasetSegmentRetired;
+        }
+    }
+
+    /// A permanent namespace fence rejects stale publishers before collection.
+    /// Native source release does not depend on reaching the archive; this
+    /// operation resumes whenever that archive becomes available again.
+    pub fn beginDiscard(self: Catalog, expected: t.Definition) !void {
+        self.create(expected) catch |err| switch (err) {
+            error.DatasetAlreadyExists => {},
+            else => return err,
+        };
+        const fingerprint = try expected.fingerprint(self.context.alloc);
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const session = try self.open(true);
+            defer session.deinit();
+            const definition_value = try self.definition(session.value);
+            defer definition_value.deinit();
+            if (!std.mem.eql(u8, &fingerprint, &try definition_value.value.fingerprint(self.context.alloc))) return error.InvalidDatasetBinding;
+            if (try self.get(session.value, Discard, "discard")) |state| {
+                defer state.deinit();
+                if (!std.mem.eql(u8, &state.value.definition, &fingerprint)) return error.InvalidDatasetBinding;
+                return;
+            }
+            const bytes = try std.json.Stringify.valueAlloc(self.context.alloc, Discard{ .definition = fingerprint }, .{});
+            defer self.context.alloc.free(bytes);
+            self.commit(session.value, &.{.{ .kind = .put, .key = "discard", .value = bytes }}) catch |err| switch (err) {
+                error.PreconditionFailed => {
+                    try self.retryConflict(attempt);
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
+    /// Return a bounded fair seek; callers advance past held segments and wrap.
+    pub fn nextDiscard(self: Catalog, after: ?t.Id) !?t.Id {
+        const session = try self.open(false);
+        defer session.deinit();
+        const state = (try self.get(session.value, Discard, "discard")) orelse return error.DatasetRetentionPending;
+        defer state.deinit();
+        if (state.value.complete) return null;
+        const key = if (after) |id| try segmentKey(self.context.alloc, id) else try self.context.alloc.dupe(u8, "");
+        defer self.context.alloc.free(key);
+        const page = try self.list(session.value, "segments/", key, 1);
+        defer page.deinit();
+        if (page.value.results[0].len != 0) {
+            const value = try std.json.parseFromSlice(t.Segment, self.context.alloc, page.value.results[0][0].value, .{});
+            defer value.deinit();
+            return value.value.id;
+        }
+        if (after != null) return null;
+        var complete = state.value;
+        complete.complete = true;
+        const bytes = try std.json.Stringify.valueAlloc(self.context.alloc, complete, .{});
+        defer self.context.alloc.free(bytes);
+        try self.commit(session.value, &.{.{ .kind = .put, .key = "discard", .value = bytes }});
+        return null;
+    }
+
+    pub fn discardOne(self: Catalog, id: t.Id, location: Location) !bool {
+        {
+            const session = try self.open(true);
+            defer session.deinit();
+            const state = (try self.get(session.value, Discard, "discard")) orelse return error.DatasetRetentionPending;
+            defer state.deinit();
+            const current = try self.segment(session.value, id);
+            defer current.deinit();
+            var value = current.value;
+            if (!std.mem.eql(u8, &value.location, &location.id) or value.previous_local != null or (value.archive != null and !std.mem.eql(u8, &value.archive.?, &location.id))) return error.DatasetLocationUnavailable;
+            const prefix = try std.fmt.allocPrint(self.context.alloc, "dependencies/{s}/", .{std.fmt.bytesToHex(id, .lower)});
+            defer self.context.alloc.free(prefix);
+            const dependencies = try self.list(session.value, prefix, "", 1);
+            defer dependencies.deinit();
+            if (dependencies.value.results[0].len != 0) return error.DatasetDependencyPending;
+            try self.requireNoReaders(session.value, id, null);
+            if (!value.retiring) {
+                value.retiring = true;
+                try self.putSegment(session.value, value);
+            }
+        }
+        try self.collect(id, location);
+        const session = try self.open(true);
+        defer session.deinit();
+        const current = try self.segment(session.value, id);
+        defer current.deinit();
+        const value = current.value;
+        if (!value.location_collected or (value.archive != null and !value.archive_collected)) return error.DatasetRetentionPending;
+        try self.requireNoReaders(session.value, id, null);
+        const sk = try segmentKey(self.context.alloc, id);
+        defer self.context.alloc.free(sk);
+        const ck = try coverageKey(self.context.alloc, value);
+        defer self.context.alloc.free(ck);
+        const dk = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{value.definition_generation});
+        defer self.context.alloc.free(dk);
+        const def = (try self.get(session.value, t.Definition, dk)) orelse return error.InvalidDatasetDefinition;
+        defer def.deinit();
+        const expiry = try expiryKey(value, def.value.retention_ns);
+        var commands = std.ArrayList(coordinator.Command).empty;
+        defer commands.deinit(self.context.alloc);
+        try commands.appendSlice(self.context.alloc, &.{ .{ .kind = .delete, .key = sk }, .{ .kind = .delete, .key = ck } });
+        if (expiry) |*key| try commands.append(self.context.alloc, .{ .kind = .delete, .key = key });
+        const prefix = try pinPrefix(self.context.alloc, id);
+        defer self.context.alloc.free(prefix);
+        const pins = try self.list(session.value, prefix, "", 65);
+        defer pins.deinit();
+        if (pins.value.results[0].len > 64) return error.DatasetReaderBudgetExceeded;
+        for (pins.value.results[0]) |row| try commands.append(self.context.alloc, .{ .kind = .delete, .key = row.key });
+        // The permanent discard fence replaces per-prefix retirement floors.
+        try self.commit(session.value, commands.items);
+        return true;
     }
 
     pub fn acquire(self: Catalog, id: t.Id) !Lease {
@@ -574,6 +706,7 @@ pub const Catalog = struct {
     fn acquireOnce(self: Catalog, id: t.Id) !Lease {
         var session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         const current = try self.segment(session.value, id);
         defer current.deinit();
         const value = current.value;
@@ -727,9 +860,9 @@ pub const Catalog = struct {
         return .{ .cursor = row.key[0..@sizeOf(ExpiryCursor)].*, .segment = id };
     }
 
-    pub fn collectExpired(self: Catalog, id: t.Id, location: Location) !void {
+    pub fn collectExpired(self: Catalog, id: t.Id, location: Location) !bool {
         const segment_value = self.getSegment(id) catch |err| switch (err) {
-            error.DatasetSegmentNotFound => return,
+            error.DatasetSegmentNotFound => return false,
             else => return err,
         };
         defer segment_value.deinit();
@@ -737,7 +870,36 @@ pub const Catalog = struct {
         if (!std.mem.eql(u8, &value.location, &location.id) or value.previous_local != null or (value.archive != null and !std.mem.eql(u8, &value.archive.?, &location.id))) return error.DatasetLocationUnavailable;
         try self.retire(id, value.placement_revision);
         try self.collect(id, location);
-        try self.compact(id);
+        const compacted = try self.compactCollectedPrefix(value, 32);
+        return !value.retiring or !value.location_collected or (value.archive != null and !value.archive_collected) or compacted != 0;
+    }
+
+    /// Collection order is independent of coverage order. Once a missing
+    /// prefix is collected, drain its already-collected successors in order,
+    /// instead of retrying a random-ID expiry permutation quadratically.
+    fn compactCollectedPrefix(self: Catalog, value: t.Segment, limit: usize) !usize {
+        const prefix = try coveragePrefix(self.context.alloc, value.definition_generation, value.source.partition, value.source.incarnation);
+        defer self.context.alloc.free(prefix);
+        const until = self.clock.authority() +| 100 * std.time.ns_per_ms;
+        var count: usize = 0;
+        while (count < limit and self.clock.authority() < until) : (count += 1) {
+            if (self.context.cancellation) |token| try token.check();
+            const session = try self.open(false);
+            defer session.deinit();
+            const page = try self.list(session.value, prefix, "", 1);
+            defer page.deinit();
+            if (page.value.results[0].len == 0) break;
+            const coverage = try std.json.parseFromSlice(Coverage, self.context.alloc, page.value.results[0][0].value, .{});
+            defer coverage.deinit();
+            const first = try self.segment(session.value, coverage.value.segment);
+            defer first.deinit();
+            if (!first.value.retiring or !first.value.location_collected or first.value.previous_local != null or (first.value.archive != null and !first.value.archive_collected)) break;
+            self.compact(first.value.id) catch |err| switch (err) {
+                error.DatasetReadersActive, error.DatasetCompactionOrder, error.DatasetRetentionPending, error.PreconditionFailed => break,
+                else => return err,
+            };
+        }
+        return count;
     }
 
     pub fn retire(self: Catalog, id: t.Id, expected_revision: u64) !void {
@@ -901,6 +1063,7 @@ pub const Catalog = struct {
     pub fn restore(self: Catalog, id: t.Id, expected_revision: u64, source: Location, destination: Location) !void {
         var session = try self.open(true);
         defer session.deinit();
+        try self.requireLive(session.value);
         const current = try self.segment(session.value, id);
         defer current.deinit();
         var next = current.value;
