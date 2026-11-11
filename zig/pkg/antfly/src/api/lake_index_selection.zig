@@ -48,15 +48,18 @@ pub fn selectCached(a: A, table: sql.Table, source: *local.serverless_query_lake
     return selectCachedWithLease(a, table, source, store, context, policy, cache, null);
 }
 pub fn selectCachedWithLease(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle) !?Selected {
+    return selectCachedWithLeasePipelined(a, table, source, store, context, policy, cache, reader, null);
+}
+pub fn selectCachedWithLeasePipelined(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle, pending: ?*@import("lake_publication_opening.zig").Pending) !?Selected {
     try context.ensureActive();
-    return selectVerified(a, table, source, store, context, cache, reader) catch |err| {
+    return selectVerified(a, table, source, store, context, cache, reader, pending) catch |err| {
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         if (policy == .required) return err;
         return null;
     };
 }
-fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle) !Selected {
+fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle, pending: ?*@import("lake_publication_opening.zig").Pending) !Selected {
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     var state = try catalog.parse(a, definitions.catalog_json);
     errdefer state.deinit();
@@ -73,7 +76,11 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
     const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.cache_identity, .context = context } else null;
-    if (cached) |read| try @import("lake_publication_opening.zig").warm(store, published, read, normalized);
+    if (cached) |read| {
+        if (pending) |pipeline| {
+            try pipeline.start(store, published, read, normalized);
+        } else try @import("lake_publication_opening.zig").warm(store, published, read, normalized);
+    }
     var inventory_lease: ?@import("lake_index_decoded_metadata.zig").Owned(InventoryMetadata) = null;
     errdefer if (inventory_lease) |owned| owned.release();
     var owned_inventory: ?InventoryMetadata = null;

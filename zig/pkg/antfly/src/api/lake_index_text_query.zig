@@ -535,7 +535,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
         defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .publication, publication_started);
-        break :blk (try @import("lake_index_selection.zig").selectCachedWithLease(ca, sql_table, &source, store, context, .required, &server.lake_read_cache, lease)) orelse return error.ExternalLakeIndexUnavailable;
+        break :blk (try @import("lake_index_selection.zig").selectCachedWithLeasePipelined(ca, sql_table, &source, store, context, .required, &server.lake_read_cache, lease, &prepared.opening_pending)) orelse return error.ExternalLakeIndexUnavailable;
     };
     defer if (!transferred) selected.deinit();
 
@@ -564,7 +564,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
 /// consumers keep their strict live-catalog qualification in readiness.names.
 pub fn prepareReadiness(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext) !*Prepared {
     var is_lake = false;
-    return (try prepare(a, server, table, .{}, request, null, &is_lake, true)) orelse error.ExternalLakeIndexUnavailable;
+    return (try prepare(a, server, table, .{}, request, null, &is_lake, true, null)) orelse error.ExternalLakeIndexUnavailable;
 }
 fn buildsVector(req: types.SearchRequest) bool {
     return req.dense != null or req.sparse != null or req.dense_queries.len != 0 or req.sparse_queries.len != 0;
