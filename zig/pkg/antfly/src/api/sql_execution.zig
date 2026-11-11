@@ -2531,6 +2531,9 @@ pub const Adapter = struct {
 
     fn captureRetainedStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !?catalog.StatementRead {
         if (self.range_reads != null or self.active_transaction != null or self.dynamic_snapshot != null or self.read_requirements.after_write != null) return error.UnsupportedSqlExecution;
+        // Raw staged-write overlays have no maintained-state counterpart.
+        // Certification covers committed snapshots, never an unstaged rollup.
+        if (self.staged) |staged| if (staged.tables.len != 0) return error.UnsupportedSqlExecution;
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
         const owner = try alloc.create(RetainedStatement);
         owner.* = .{ .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc) };
@@ -5232,6 +5235,16 @@ test "SQL retained source responses preserve definitive failures without overrid
         defer a.free(unknown);
         try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(item.status, unknown).err);
     }
+}
+
+test "SQL retained source capture rejects staged raw writes before opening snapshots" {
+    var tables = [_]@import("transactions.zig").TableCommitRequest{.{ .table_name = @constCast("events"), .batch = .{} }};
+    var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{ .tables = &tables };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = undefined, .identity = &identity, .context = .{}, .staged = &staged };
+    // No server or snapshot access is safe here: the committed rollup cannot
+    // represent the raw overlay, regardless of which source the query scans.
+    try std.testing.expectError(error.UnsupportedSqlExecution, adapter.captureRetainedStatement(std.testing.allocator, &.{}));
 }
 
 test "SQL retained source range uses a separate read-only table function binding" {
