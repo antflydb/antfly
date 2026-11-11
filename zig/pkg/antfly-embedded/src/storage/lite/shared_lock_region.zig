@@ -411,6 +411,79 @@ fn releaseProcessFd(io: Io, entry: *FdEntry) void {
     }
 }
 
+/// Test-only counters for the writer word's own futex traffic (the
+/// `writer_ticket_head`/`writer_release_epoch` wait/wake calls in
+/// `acquireWriter`/`acquireWriterFairBounded`/`releaseWriter`/
+/// `advanceHeadPastAbandoned`, not the reader table's separate
+/// `reader_slot_released` futex) -- what "a reported lock-syscall count
+/// per contended handoff" (§8.8) needs a number for. `void` outside tests
+/// so these never cost anything in a real build; each forked test process
+/// gets its own copy (counters are per-process state, like everything
+/// else these calls touch), so a cross-process test simply reads them
+/// back after its own loop with no shared-memory bookkeeping of its own.
+pub const WriterFutexSnapshot = struct { wait: u64, wake: u64 };
+
+const WriterFutexCounters = struct {
+    wait: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    wake: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+
+    fn countWait(self: *WriterFutexCounters) void {
+        if (builtin.is_test) _ = self.wait.fetchAdd(1, .monotonic);
+    }
+    fn countWake(self: *WriterFutexCounters) void {
+        if (builtin.is_test) _ = self.wake.fetchAdd(1, .monotonic);
+    }
+    fn reset(self: *WriterFutexCounters) void {
+        if (builtin.is_test) {
+            self.wait.store(0, .monotonic);
+            self.wake.store(0, .monotonic);
+        }
+    }
+    fn snapshot(self: *const WriterFutexCounters) WriterFutexSnapshot {
+        if (!builtin.is_test) return .{ .wait = 0, .wake = 0 };
+        return .{ .wait = self.wait.load(.monotonic), .wake = self.wake.load(.monotonic) };
+    }
+};
+var writer_futex_counters: WriterFutexCounters = .{};
+
+/// Test-only reset, called once per measuring process (after `fork`, not
+/// before -- see the handoff-report test's own doc comment) so a loop's
+/// own counts aren't polluted by whatever setup ran before it.
+pub fn testResetWriterFutexCounters() void {
+    writer_futex_counters.reset();
+}
+
+/// Test-only snapshot of `writer_futex_counters`; `{0, 0}` outside tests.
+pub fn testWriterFutexCounters() WriterFutexSnapshot {
+    return writer_futex_counters.snapshot();
+}
+
+/// `antfly_platform.sync.rawFutexWaitShared`, counted. Every writer-word
+/// wait call in `acquireWriter`/`advanceHeadPastAbandoned`'s peers goes
+/// through this (not the raw platform call directly) so the counters
+/// above see every one of them.
+fn countedRawFutexWaitShared(ptr: *const u32, expect: u32, timeout_ms: ?u32) void {
+    writer_futex_counters.countWait();
+    antfly_platform.sync.rawFutexWaitShared(ptr, expect, timeout_ms);
+}
+
+/// `antfly_platform.sync.futexWaitSharedBounded`, counted -- the bounded
+/// peer `countedRawFutexWaitShared` above has for `acquireWriterFairBounded`.
+fn countedFutexWaitSharedBounded(io: Io, ptr: *const u32, expect: u32, deadline: Io.Timestamp) Io.Cancelable!void {
+    writer_futex_counters.countWait();
+    return antfly_platform.sync.futexWaitSharedBounded(io, ptr, expect, deadline);
+}
+
+/// Counted wake for the writer word only (`writer_ticket_head`/
+/// `writer_release_epoch`), wrapping this file's own `futexWakeShared`
+/// alias further below rather than the raw platform call, so the reader
+/// table's own `reader_slot_released` wakes (a separate mechanism, not
+/// part of this handoff) are deliberately not counted here.
+fn countedWriterFutexWakeShared(ptr: *const u32) void {
+    writer_futex_counters.countWake();
+    futexWakeShared(ptr);
+}
+
 pub const Region = struct {
     mapping: []align(std.heap.page_size_min) u8,
     /// This handle's own reference into `fd_registry` -- this process's
@@ -834,14 +907,14 @@ pub const Region = struct {
         var backoff_ms: u32 = ring_full_backoff_initial_ms;
         const my_ticket: u32 = while (true) {
             if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
-            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
+            countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
             backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
         };
         self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
-            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_ticket_head.raw, head, dead_ticket_check_step_ms);
+            countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, head, dead_ticket_check_step_ms);
             const head2 = hdr.writer_ticket_head.load(.acquire);
             if (head2 == my_ticket) break;
             if (head2 == head) self.tryHelpDeadTicketAt(head2);
@@ -863,7 +936,7 @@ pub const Region = struct {
             // itself (see this function's own doc comment, and
             // `writer_release_epoch`'s own, for why).
             const epoch = hdr.writer_release_epoch.load(.acquire);
-            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_release_epoch.raw, epoch, null);
+            countedRawFutexWaitShared(&hdr.writer_release_epoch.raw, epoch, null);
         }
     }
 
@@ -959,7 +1032,7 @@ pub const Region = struct {
         const my_ticket: u32 = while (true) {
             if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
             if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
-            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
+            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
         };
         self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
@@ -969,7 +1042,7 @@ pub const Region = struct {
                 self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
                 return error.Timeout;
             }
-            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
+            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
             const head2 = hdr.writer_ticket_head.load(.acquire);
             if (head2 == head) self.tryHelpDeadTicketAt(head2);
         }
@@ -986,7 +1059,7 @@ pub const Region = struct {
                 return error.Timeout;
             }
             const epoch = hdr.writer_release_epoch.load(.acquire);
-            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
+            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
         }
     }
 
@@ -1067,7 +1140,7 @@ pub const Region = struct {
         while (self.ticketResolvedWithoutOwning(head)) {
             head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
         }
-        futexWakeShared(&hdr.writer_ticket_head.raw);
+        countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
     }
 
     /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
@@ -1093,7 +1166,7 @@ pub const Region = struct {
         hdr.writer_holder.store(0, .release);
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
             _ = hdr.writer_release_epoch.fetchAdd(1, .release);
-            futexWakeShared(&hdr.writer_release_epoch.raw);
+            countedWriterFutexWakeShared(&hdr.writer_release_epoch.raw);
         }
     }
 
@@ -1134,7 +1207,7 @@ pub const Region = struct {
         const hdr = self.header();
         hdr.writer_holder.store(0, .release);
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
-            futexWakeShared(&hdr.writer_ticket_head.raw);
+            countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
         }
     }
 
@@ -1597,6 +1670,141 @@ test "shared lock region: N-process contention grants in strict ticket order" {
         try std.testing.expectEqual(got, report[0]);
         try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 2000));
     }
+}
+
+// §8.8's own CPU gate calls out a number `lite-write-amplification-cpu`
+// cannot report by itself: not "zero per warm write" (that harness's own
+// job, and already zero -- see `write_amplification_cpu_bench_test.zig`),
+// but the real syscall price of a *contended* handoff, the case the region
+// design exists to make cheap and bounded instead of a 1 s fairness
+// quantum or a ticket-file `pread` poll. Two real OS processes (the same
+// `std.c.fork` pattern as the two tests above, and for the same reason:
+// the child uses no `Io` at all) repeatedly trade the writer word in a
+// tight loop with no artificial pacing -- the FIFO ticket protocol itself
+// (`acquireWriter`'s own doc comment: a new arrival may only take the
+// ticketless fast path when nobody is already queued) forces them to
+// alternate through the real ticket/futex path rather than one side
+// starving the other, so a tight loop is already a genuinely contended
+// workload, not a race that happens to usually avoid contention.
+//
+// Counters reset in each child right after `fork`, not in the parent
+// before it: `writer_futex_counters` is ordinary process memory, so each
+// child's copy already starts at whatever the parent had already done
+// against this same `region` value (its own `tryAcquireWriter` priming
+// below, same as the two tests above); resetting post-fork is what makes
+// each child's own report cover only its own loop.
+test "shared lock region: contended handoff reports lock syscalls and latency" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-handoff-report.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const handoffs_per_child = 40;
+    const HandoffReport = extern struct {
+        completed: u64,
+        futex_wait: u64,
+        futex_wake: u64,
+        latency_ns_total: u64,
+    };
+
+    var report_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&report_fds));
+
+    const n_children = 2;
+    var child_pids: [n_children]std.c.pid_t = undefined;
+    var ci: u8 = 0;
+    while (ci < n_children) : (ci += 1) {
+        const child_pid = std.c.fork();
+        if (child_pid == 0) {
+            _ = std.posix.system.close(report_fds[0]);
+            testResetWriterFutexCounters();
+            const my_pid: u32 = @bitCast(std.c.getpid());
+            var latency_ns_total: u64 = 0;
+            var h: u32 = 0;
+            while (h < handoffs_per_child) : (h += 1) {
+                var start_ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &start_ts);
+                region.acquireWriter(my_pid);
+                var end_ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &end_ts);
+                const start_ns = @as(i64, start_ts.sec) * std.time.ns_per_s + start_ts.nsec;
+                const end_ns = @as(i64, end_ts.sec) * std.time.ns_per_s + end_ts.nsec;
+                latency_ns_total += @intCast(end_ns - start_ns);
+                // Hold briefly, like real commit work (raw `nanosleep`,
+                // not `io.sleep`: no `Io` in a forked child, same reason
+                // as the two-process test above) -- without this, both
+                // children's own loop bodies are fast enough that they
+                // simply never overlap, and the "contended" handoff this
+                // test exists to measure never actually happens.
+                var hold: std.c.timespec = .{ .sec = 0, .nsec = 300_000 };
+                _ = std.c.nanosleep(&hold, null);
+                region.releaseWriter();
+            }
+            const counters = testWriterFutexCounters();
+            const report: HandoffReport = .{
+                .completed = handoffs_per_child,
+                .futex_wait = counters.wait,
+                .futex_wake = counters.wake,
+                .latency_ns_total = latency_ns_total,
+            };
+            _ = std.c.write(report_fds[1], @ptrCast(&report), @sizeOf(HandoffReport));
+            std.c._exit(0);
+        }
+        child_pids[ci] = child_pid;
+    }
+    _ = std.posix.system.close(report_fds[1]);
+    defer _ = std.posix.system.close(report_fds[0]);
+
+    var total_completed: u64 = 0;
+    var total_wait: u64 = 0;
+    var total_wake: u64 = 0;
+    var total_latency_ns: u64 = 0;
+    var got: u8 = 0;
+    while (got < n_children) : (got += 1) {
+        var report: HandoffReport = undefined;
+        // Generous (5s): two children doing 40 uncontended-sized handoffs
+        // each is normally well under a second even on a loaded host; this
+        // bound exists only to fail fast, not to constrain the real cost
+        // being measured (that is `latency_ns_total` below).
+        try readBounded(report_fds[0], std.mem.asBytes(&report), 5000);
+        try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 5000));
+        total_completed += report.completed;
+        total_wait += report.futex_wait;
+        total_wake += report.futex_wake;
+        total_latency_ns += report.latency_ns_total;
+    }
+
+    try std.testing.expect(total_completed > 0);
+    const wait_per_handoff = @as(f64, @floatFromInt(total_wait)) / @as(f64, @floatFromInt(total_completed));
+    const wake_per_handoff = @as(f64, @floatFromInt(total_wake)) / @as(f64, @floatFromInt(total_completed));
+    const latency_us_per_handoff = @as(f64, @floatFromInt(total_latency_ns)) / @as(f64, @floatFromInt(total_completed)) / 1000.0;
+    // §8.8's own report: the writer word takes no `fcntl` lock at all on
+    // this path (liveness is only ever probed for a *dead* holder, never
+    // on the happy path a plain handoff takes) and no `flock` either (the
+    // sidecar flock is a separate, still-authoritative mechanism this
+    // migration step does not touch) -- both genuinely zero, not merely
+    // unmeasured, so printed as constants rather than counted.
+    std.debug.print(
+        "shared lock region contended handoff report: handoffs={d} futex_wait/handoff={d:.2} futex_wake/handoff={d:.2} fcntl/handoff=0 flock/handoff=0 latency_us/handoff={d:.1}\n",
+        .{ total_completed, wait_per_handoff, wake_per_handoff, latency_us_per_handoff },
+    );
+
+    // A correct implementation's own handoff is a small, bounded number of
+    // futex calls, not a retry storm, and the latency this design exists
+    // to bound: about one commit's own hold time, not a fairness quantum
+    // or a lost wakeup (mirrors the two-process test above's 200ms bound,
+    // loosened here for a loaded host running many handoffs back to back).
+    try std.testing.expect(wait_per_handoff < 10);
+    try std.testing.expect(wake_per_handoff < 10);
+    try std.testing.expect(latency_us_per_handoff < 500_000);
 }
 
 test "shared lock region opens, initializes, and round-trips the writer lock uncontended" {
