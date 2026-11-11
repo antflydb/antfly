@@ -3135,10 +3135,15 @@ const RuntimeStore = struct {
 
     pub fn beginAuthorityProbe(self: *RuntimeStore) !AuthorityProbe {
         const store = self.store;
-        var file = try native.NativeFile.openWithIo(store.allocator, store.file.runtime(), store.file.path, .{
-            .read_only = true,
-            .wait_for_reader_lock = true,
-        });
+        const io = store.file.runtime();
+        if (!store.generation_lock.tryLockShared(io)) return error.WouldBlock;
+        defer store.generation_lock.unlockShared(io);
+        var file = try native.NativeFile.openWithIo(store.allocator, io, store.file.path, .{ .read_only = true });
+        errdefer file.close();
+        // An independently restored path can reuse a replay generation. Its
+        // checkpoint cannot certify visibility for the retained namespace.
+        if ((try file.file.stat(io)).inode != (try store.file.file.stat(io)).inode)
+            return error.EnrichmentSourceChanged;
         file.page_cache_policy = .metadata_only;
         return .{ .file = file, .prefix = self.prefix, .arena = .init(store.allocator) };
     }

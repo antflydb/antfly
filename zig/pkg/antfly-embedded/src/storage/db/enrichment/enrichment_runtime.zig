@@ -297,7 +297,7 @@ const RuntimePublicationStore = struct {
     retry_fence: ?GeneratedWriteFence = null,
     lease: ?GeneratedStoreLease = null,
     fn initRetryWrite(runtime: *EnrichmentRuntime) !@This() {
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var captured = try init(runtime);
         captured.retry_fence = fence;
         return captured;
@@ -2815,7 +2815,7 @@ const ScopedReplay = struct {
     hint_failed: bool = false,
 
     fn load(runtime: *EnrichmentRuntime) !@This() {
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         const epoch = if (fence) |value| value.epoch else 0;
         const generation = runtime.replayCut().generation;
         var pending = runtime.pending_scoped_retries;
@@ -6571,7 +6571,7 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
         for (writes) |write| try lease.guard_key(lease.ptr, write.key);
         for (deletes) |key| try lease.guard_key(lease.ptr, key);
     }
-    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
     var txn = try live.beginWrite();
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
@@ -7451,7 +7451,8 @@ const UnsupportedEnrichmentRuntime = struct {
     ) !void {
         if (sequence == 0) return;
         const before = self.replayCut();
-        const validated = try self.replayCutForVisibility(sequence);
+        const visibility_guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        const validated = if (before.applied >= sequence) try refreshVisibilityCut(self, before, visibility_guard) else before;
         const wait_after_sequence = if (validated.generation == before.generation) before.applied else 0;
         // A completed or terminal prefix wins a racing transport
         // cancellation. This mirrors the threaded runtime and prevents a
@@ -7462,8 +7463,7 @@ const UnsupportedEnrichmentRuntime = struct {
                 return RuntimeError.EnrichmentWorkerFailed;
             return;
         }
-        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
-        self.catchUpUntilGuarded(sequence, guard) catch |err| {
+        self.catchUpUntilGuarded(sequence, visibility_guard) catch |err| {
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
                 terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
@@ -7506,9 +7506,8 @@ const UnsupportedEnrichmentRuntime = struct {
         const config_hash = try enrichmentCatalogConfigHash(self.alloc, self.index_manager);
         const generation = self.replay_generation;
         try validateReplayPassGeneration(self, generation);
-        const previous_generation = self.active_replay_generation;
-        self.active_replay_generation = generation;
-        defer self.active_replay_generation = previous_generation;
+        const previous_generation = swapReplayWriteGeneration(self, generation);
+        defer _ = swapReplayWriteGeneration(self, previous_generation);
         var replay_cursor_assets = try loadReplayCursorForPass(self, self.applied_sequence, .assets, config_hash, generation);
         defer if (replay_cursor_assets) |*cursor| cursor.deinit(self.alloc);
         var replay_cursor_dense = try loadReplayCursorForPass(self, self.applied_sequence, .dense, config_hash, generation);
@@ -7580,7 +7579,7 @@ const UnsupportedEnrichmentRuntime = struct {
     pub fn replayCutForVisibility(self: *@This(), sequence: u64) !ReplayCut {
         const cut = self.replayCut();
         if (cut.applied < sequence) return cut;
-        return refreshVisibilityCut(self, cut);
+        return refreshVisibilityCut(self, cut, null);
     }
 
     pub fn appliedSequence(self: *@This()) u64 {
@@ -8148,7 +8147,7 @@ const PlatformEnrichmentRuntime = struct {
             if (self.applied_sequence >= sequence) {
                 const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
                 self.mutex.unlock(io);
-                const validated = try refreshVisibilityCut(self, cut);
+                const validated = try refreshVisibilityCut(self, cut, .{ .cancellation = cancellation, .deadline_ns = effective_deadline_ns, .clock = self.deadline_clock });
                 if (validated.applied < sequence) continue;
                 self.mutex.lockUncancelable(io);
                 const failure_envelope = terminalFailureEnvelopeSnapshot(self);
@@ -8226,7 +8225,10 @@ const PlatformEnrichmentRuntime = struct {
                     const retrying = self.retrying;
                     self.mutex.unlock(io);
                     if (cut.applied >= sequence) {
-                        const validated = try refreshVisibilityCut(self, cut);
+                        const validated = refreshVisibilityCut(self, cut, null) catch |probe_err| switch (probe_err) {
+                            error.EnrichmentRetryInProgress => return RuntimeError.EnrichmentWaitCanceled,
+                            else => return probe_err,
+                        };
                         if (validated.applied >= sequence) {
                             self.mutex.lockUncancelable(io);
                             const envelope = terminalFailureEnvelopeSnapshot(self);
@@ -8329,7 +8331,7 @@ const PlatformEnrichmentRuntime = struct {
             const retry_due = retrying and (new_work or self.clock.nowRealtimeMs() >= next_retry_at_ms);
             switch (foregroundCatchUpDecision(applied, sequence, runtime_target, failed, retrying, retry_due)) {
                 .complete => if (!recovery_pending) {
-                    if ((try self.replayCutForVisibility(sequence)).applied >= sequence) return;
+                    if ((try refreshVisibilityCut(self, self.replayCut(), guard)).applied >= sequence) return;
                     continue;
                 },
                 .worker_failed => if (!recovery_pending) return RuntimeError.EnrichmentWorkerFailed,
@@ -8397,7 +8399,7 @@ const PlatformEnrichmentRuntime = struct {
     pub fn replayCutForVisibility(self: *@This(), sequence: u64) !ReplayCut {
         const cut = self.replayCut();
         if (cut.applied < sequence) return cut;
-        return refreshVisibilityCut(self, cut);
+        return refreshVisibilityCut(self, cut, null);
     }
 
     pub fn appliedSequence(self: *@This()) u64 {
@@ -10069,9 +10071,8 @@ fn runForegroundCatchUpPassGuarded(
     defer runtime.active_provider_guard = previous_provider_guard;
 
     const generation = runtime.replayCut().generation;
-    const previous_generation = runtime.active_replay_generation;
-    runtime.active_replay_generation = generation;
-    defer runtime.active_replay_generation = previous_generation;
+    const previous_generation = swapReplayWriteGeneration(runtime, generation);
+    defer _ = swapReplayWriteGeneration(runtime, previous_generation);
     runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation) catch |err| {
         // Request cancellation and the visibility deadline are waiter
         // outcomes, not provider or pipeline failures. Never persist them into
@@ -11891,7 +11892,7 @@ const SharedPdfWindowScheduler = struct {
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
         const stage_id = try std.fmt.allocPrint(runtime.alloc, "replay-{d}:epoch-{d}:sequence-{d}:source-{x}", .{
-            runtime.active_replay_generation orelse runtime.replay_generation, if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
+            replayWriteGeneration(runtime) orelse runtime.replayCut().generation, if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
         defer runtime.alloc.free(stage_id);
         const total = switch (window) {
@@ -11933,7 +11934,7 @@ const SharedPdfWindowScheduler = struct {
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
         const stage_id = try std.fmt.allocPrint(runtime.alloc, "replay-{d}:epoch-{d}:sequence-{d}:source-{x}", .{
-            runtime.active_replay_generation orelse runtime.replay_generation, if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
+            replayWriteGeneration(runtime) orelse runtime.replayCut().generation, if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
         defer runtime.alloc.free(stage_id);
         const total = switch (window) {
@@ -17942,7 +17943,7 @@ const IndexDocumentCheckpoint = struct {
     fn init(runtime: *EnrichmentRuntime, item: *AssetProducerBatchItem) !@This() {
         const authority = if (item.producer_context) |*token| try token.command(&.{}) else null;
         const authority_json = if (authority) |command| try std.json.Stringify.valueAlloc(item.producer_context.?.arena.allocator(), command, .{}) else null;
-        return .{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime), .item = item, .catalog_generation = runtime.index_manager.writePlanGeneration(), .binding = .{
+        return .{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime)), .item = item, .catalog_generation = runtime.index_manager.writePlanGeneration(), .binding = .{
             .document = item.request.doc_key,
             .producer = requestArtifactName(item.request),
             .source_key = item.request.doc_key,
@@ -18034,7 +18035,7 @@ fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichmen
     defer arena.deinit();
     const a = arena.allocator();
     const id = try document_checkpoints.scope(a, request.doc_key, requestArtifactName(request));
-    var context = IndexDocumentCheckpoint{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime), .for_gc = true };
+    var context = IndexDocumentCheckpoint{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime)), .for_gc = true };
     const key = try document_checkpoints.rootKey(a, id);
     const observed = (try context.backend().get(&context, a, key)) orelse return;
     const root = try std.json.parseFromSliceLeaky(document_checkpoints.Root, a, observed, .{});
@@ -18049,6 +18050,7 @@ fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichmen
 fn maintainIndexDocumentCheckpoints(runtime: *EnrichmentRuntime) !void {
     if (!runtime.document_checkpoint_gc_mutex.tryLock()) return;
     defer runtime.document_checkpoint_gc_mutex.unlock();
+    const generation = runtime.replayCut().generation;
     // Discovery is a bounded read even before acquiring the enrichment lease.
     // This wakes retired spools after restart when the replay watermark is idle.
     const probe = probe: {
@@ -18075,7 +18077,7 @@ fn maintainIndexDocumentCheckpoints(runtime: *EnrichmentRuntime) !void {
         runtime.mutex.unlock(io);
         if (!acquired) return;
     }
-    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, generation);
     runtime.document_checkpoint_gc_pending.store(false, .release);
     var context = IndexDocumentCheckpoint{ .runtime = runtime, .fence = fence, .for_gc = true };
     var arena = std.heap.ArenaAllocator.init(runtime.alloc);
@@ -25686,7 +25688,7 @@ fn storePutPrivateBatch(runtime: ?*EnrichmentRuntime, store: *backend_erased.Sto
         for (writes) |write| try lease.guard_key(lease.ptr, write.key);
         for (deletes) |key| try lease.guard_key(lease.ptr, key);
     }
-    const fence = if (runtime) |owner| try requiredRuntimeStoreWriteFence(owner) else null;
+    const fence = if (runtime) |owner| try requiredRuntimeStoreWriteFence(owner, replayWriteGeneration(owner)) else null;
     var batch = try live_store.beginBatch();
     errdefer batch.abort();
     if (runtime) |owner| try validateRuntimeStoreWriteFenceTxn(owner, &batch, fence);
@@ -27187,7 +27189,7 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
     var read_open = true;
     defer if (read_open) read.abort();
     if (try ordered_publication.authority(&read) == null) return false;
-    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
     try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
     // Graph relations are derived from accepted asset output, not from a
     // provider's uncommitted response or a legacy source-hash cache.
@@ -29269,7 +29271,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         if (try ordered_publication.authority(&read) == null) return .materialize;
         try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
         if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
@@ -29542,7 +29544,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 return false;
             }
             try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
-            const fence = try requiredRuntimeStoreWriteFence(runtime);
+            const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
             try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
             var plan = try runtime.index_manager.acquireWritePlanSnapshot();
             defer plan.release();
@@ -29712,7 +29714,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
             var publication_store = try RuntimePublicationStore.init(runtime);
             defer publication_store.deinit();
-            const fence = try requiredRuntimeStoreWriteFence(runtime);
+            const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
             var write = try publication_store.store(runtime).beginWrite();
             var open = true;
             defer if (open) write.abort();
@@ -30471,7 +30473,7 @@ fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_t
 
 fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
     {
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
         defer read.abort();
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
@@ -30512,7 +30514,7 @@ fn producerInputAccepted(runtime: *EnrichmentRuntime, token: *const producer_inp
 
 fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_input.Token, key: []const u8, payload: ?[]const u8) !void {
     {
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
         defer read.abort();
         // Lease time is ingress-only authority. It is intentionally absent
@@ -30598,7 +30600,7 @@ fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEm
         defer publication_store.deinit();
         var txn = try publication_store.store(runtime).beginWrite();
         errdefer txn.abort();
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
         return storeGuardedEmbeddingsTxn(runtime, &txn, writes, accepted);
     }
@@ -31864,7 +31866,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
 fn submitChunkGenerationCommand(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, command: *ordered_publication.Command) !void {
     try heartbeatEnrichmentLease(runtime);
     {
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
         defer read.abort();
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
@@ -32405,7 +32407,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     const stage_generation_id = try std.fmt.allocPrint(
         metadata_alloc,
         "replay-{d}:epoch-{d}:sequence-{d}:source-{x}",
-        .{ runtime.active_replay_generation orelse runtime.replay_generation, fence_epoch, request.sequence, generation_hash },
+        .{ replayWriteGeneration(runtime) orelse runtime.replayCut().generation, fence_epoch, request.sequence, generation_hash },
     );
     defer metadata_alloc.free(stage_generation_id);
 
@@ -36619,12 +36621,38 @@ fn publishAppliedProgressWithRetry(runtime: *EnrichmentRuntime, sequence: u64, s
     }
 }
 
-fn refreshVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut) !ReplayCut {
+fn refreshVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut, guard: ?ForegroundCatchUpGuard) !ReplayCut {
     // Unbound runtime fixtures can exercise wait state without a store.
     if (runtime.backend_runtime == null) return cut;
+    while (true) {
+        return probeVisibilityCut(runtime, cut) catch |err| switch (err) {
+            error.WouldBlock, error.WriterLocked, error.FileBusy => {
+                const budget = guard orelse return RuntimeError.EnrichmentRetryInProgress;
+                try budget.check();
+                // Unbounded maintenance turns yield admission to the next
+                // turn. Only a request with a deadline waits here.
+                const deadline = budget.deadline_ns orelse return RuntimeError.EnrichmentRetryInProgress;
+                if (deadline -| budget.clock.nowRealtimeNs() < std.time.ns_per_ms) return RuntimeError.EnrichmentWaitTimeout;
+                budget.clock.sleepMs(1);
+                try budget.check();
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn probeVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut) !ReplayCut {
     const checkpoint = try enrichment_state.loadAuthoritativeCheckpoint(runtime.alloc, runtime.store, scope_name);
-    if (checkpoint.generation == cut.generation) return cut;
-    const publication_io = lockAppliedPublication(runtime);
+    if (checkpoint.generation == cut.generation) {
+        if (checkpoint.applied_sequence < cut.applied) return error.EnrichmentSourceChanged;
+        return cut;
+    }
+    const publication_io = if (comptime builtin.os.tag == .freestanding) null else blk: {
+        const io = (runtime.io_impl orelse break :blk null).io();
+        if (!runtime.applied_publication_mutex.tryLock()) return error.WouldBlock;
+        break :blk io;
+    };
     defer unlockAppliedPublication(runtime, publication_io);
     const observed = try enrichment_state.loadAuthoritativeRuntimeObservation(runtime.alloc, runtime.store, scope_name);
     const io = lockRuntime(runtime);
@@ -36637,7 +36665,10 @@ fn refreshVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut) !ReplayCut 
 }
 
 fn validateReplayPassGeneration(runtime: *EnrichmentRuntime, generation: u64) !void {
-    const refreshed = try refreshVisibilityCut(runtime, .{ .applied = 0, .generation = generation });
+    const refreshed = refreshVisibilityCut(runtime, .{ .applied = 0, .generation = generation }, null) catch |err| switch (err) {
+        error.EnrichmentRetryInProgress => return error.EnrichmentSourceChanged,
+        else => return err,
+    };
     if (refreshed.generation != generation) return error.EnrichmentSourceChanged;
 }
 
@@ -37269,7 +37300,7 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
-    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
     var batch = try live_store.*.beginBatch();
     var committed = false;
     defer if (!committed) batch.abort();
@@ -37615,6 +37646,23 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
         const rewound = try enrichment_state.rewindAppliedProgress(alloc, writer_store, scope_name, 1, 5, 0);
         try std.testing.expectEqual(@as(u64, 5), try enrichment_state.loadAppliedSequence(alloc, reader_store, scope_name));
         try std.testing.expectEqual(rewound, try enrichment_state.loadAuthoritativeRuntimeObservation(alloc, reader_store, scope_name));
+
+        const replacement_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authority-replacement.aflite", .{tmp.sub_path});
+        defer alloc.free(replacement_path);
+        {
+            var replacement = try Lite.createWithOptions(alloc, replacement_path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+            defer replacement.close();
+            var replacement_store = try replacement.runtimeStore(alloc);
+            defer replacement_store.deinit();
+            try enrichment_state.saveProjectionCheckpoint(replacement_store, scope_name, .{ .generation = rewound.generation });
+        }
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), replacement_path, std.Io.Dir.cwd(), lite_path, std.testing.io);
+        {
+            const exclusive = try std.Io.Dir.cwd().openFile(std.testing.io, lite_path, .{ .lock = .exclusive, .lock_nonblocking = true });
+            defer exclusive.close(std.testing.io);
+            try std.testing.expectError(error.WouldBlock, enrichment_state.loadAuthoritativeCheckpoint(alloc, reader_store, scope_name));
+        }
+        try std.testing.expectError(error.EnrichmentSourceChanged, enrichment_state.loadAuthoritativeCheckpoint(alloc, reader_store, scope_name));
     }
 }
 
@@ -37813,10 +37861,8 @@ fn appendGeneratedBatchWithRetry(
     artifact_delete_keys: []const []const u8,
     source_guards: []const GeneratedSourceGuard,
 ) !GeneratedRecordCommit {
-    const fence = if (runtime.active_replay_generation != null)
-        try requiredRuntimeStoreWriteFence(runtime)
-    else
-        currentGeneratedWriteFence(runtime);
+    const generation = replayWriteGeneration(runtime);
+    const fence = if (generation != null) try requiredRuntimeStoreWriteFence(runtime, generation) else currentGeneratedWriteFence(runtime);
     if (runtime.generated_publication) |publication| {
         return publication.commit(publication.ptr, batch, artifact_promotions, artifact_delete_keys, source_guards, fence);
     }
@@ -38073,15 +38119,29 @@ fn currentGeneratedWriteFence(runtime: *EnrichmentRuntime) ?GeneratedWriteFence 
     };
 }
 
-fn requiredRuntimeStoreWriteFence(runtime: *EnrichmentRuntime) !?GeneratedWriteFence {
+fn replayWriteGeneration(runtime: *EnrichmentRuntime) ?u64 {
+    const io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, io);
+    return runtime.active_replay_generation;
+}
+
+fn swapReplayWriteGeneration(runtime: *EnrichmentRuntime, generation: ?u64) ?u64 {
+    const io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, io);
+    const previous = runtime.active_replay_generation;
+    runtime.active_replay_generation = generation;
+    return previous;
+}
+
+fn requiredRuntimeStoreWriteFence(runtime: *EnrichmentRuntime, generation: ?u64) !?GeneratedWriteFence {
     var fence = currentGeneratedWriteFence(runtime);
     if (comptime builtin.os.tag != .freestanding) {
         if (runtime.lease_fencing_enabled and runtime.ownership.lease_owned and fence == null)
             return error.EnrichmentLeaseFenceLost;
     }
-    if (runtime.active_replay_generation) |generation| {
+    if (generation) |captured| {
         var proof = fence orelse GeneratedWriteFence{};
-        proof.replay_generation = generation;
+        proof.replay_generation = captured;
         fence = proof;
     }
     return fence;
@@ -38355,7 +38415,7 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
     if (publication_store.lease) |lease| try lease.guard_key(lease.ptr, key);
-    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
     var txn = try live_store.*.beginWrite();
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
@@ -38455,7 +38515,7 @@ fn storePutBatchGuarded(runtime: *EnrichmentRuntime, writes: []const KVPair, del
         for (writes) |write| try lease.guard_key(lease.ptr, write.key);
         for (deletes) |key| try lease.guard_key(lease.ptr, key);
     }
-    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
     var batch = try live_store.*.beginBatch();
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
