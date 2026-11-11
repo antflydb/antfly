@@ -24,7 +24,10 @@ const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Storage = local.storage_lsm_backend.Storage;
 pub const chunk_bytes = 256 * 1024;
-pub const max_chunks = 65536;
+// Chunk references live in paged trees. This bounds ordinals without imposing
+// the old 16 GiB generation ceiling or allocating a corpus-sized reference list.
+pub const max_chunks = std.math.maxInt(u32);
+pub const max_inline_chunks = 65536;
 pub const max_root_bytes = 16 * 1024 * 1024;
 const native_directory = @import("lake_index_native_directory.zig");
 /// Attempt-local proof of the descriptor a native producer actually opened.
@@ -58,7 +61,7 @@ pub const File = struct {
             try root.validate();
             if (self.chunks.len != 0 or root.records != expected) return error.InvalidNativeLakeFiles;
         } else {
-            if (self.chunks.len != expected) return error.InvalidNativeLakeFiles;
+            if (self.chunks.len != expected or self.chunks.len > max_inline_chunks) return error.InvalidNativeLakeFiles;
             for (self.chunks, 0..) |ref, ordinal| {
                 if (ref.byte_len != @min(chunk_bytes, self.bytes - @as(u64, @intCast(ordinal)) * chunk_bytes)) return error.InvalidNativeLakeFiles;
                 try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
@@ -230,8 +233,9 @@ pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.
     const budget = OutputBudget.from(output_budget);
     if (!validPath(path)) return error.InvalidNativeLakeFiles;
     try stores.chargeReadBudget(budget.generation, bytes.len);
-    const chunks = try out.alloc(artifacts.ChunkRef, std.math.divCeil(usize, bytes.len, chunk_bytes) catch return error.InvalidNativeLakeFiles);
-    if (chunks.len > max_chunks) return error.NativeLakeFilesTooLarge;
+    const count = std.math.divCeil(usize, bytes.len, chunk_bytes) catch return error.InvalidNativeLakeFiles;
+    if (count > max_inline_chunks) return error.NativeLakeFilesTooLarge;
+    const chunks = try out.alloc(artifacts.ChunkRef, count);
     var begin: usize = 0;
     while (begin < chunks.len) {
         const end = @min(chunks.len, begin + stores.ArtifactStore.max_upload_batch);
@@ -409,7 +413,7 @@ pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, path
         const size = try source.fileSize(physical);
         const n = std.math.cast(usize, size / chunk_bytes + @intFromBool(size % chunk_bytes != 0)) orelse return error.NativeLakeFilesTooLarge;
         total = std.math.add(usize, total, n) catch return error.NativeLakeFilesTooLarge;
-        if (total > max_chunks) return error.NativeLakeFilesTooLarge;
+        if (total > max_inline_chunks) return error.NativeLakeFilesTooLarge;
         try stores.chargeReadBudget(budget.generation, size);
         const chunks = try out.alloc(artifacts.ChunkRef, n);
         var begin: usize = 0;

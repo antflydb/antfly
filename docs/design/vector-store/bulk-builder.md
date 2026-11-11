@@ -28,41 +28,69 @@ implementation. Both algorithms use the same reservoir selection and routing
 machinery. The existing default build strategy applies when the option is
 omitted.
 
+Quantization settings remain part of the generation recipe. Build, archived
+mutation, and serving reopen all reconstruct `quantization_bits` and
+`quantization_refine`. Multi-bit quantization enables the required deterministic
+rotation; exact reranking continues to use original coordinates.
+
 The input allowance counts vector bytes and 128 identity bytes per member. It
-defaults to 512 MiB. Generation output has twice that allowance. Set the input
-allowance explicitly for a larger corpus. The shared native builder allocator
+defaults to 512 MiB. Generation output has twice that allowance. Identity tracking uses the same
+input allowance. Configured allowances also apply to subsequent updates. Set
+the input allowance explicitly for a larger corpus. The shared native builder allocator
 admits at most 256 MiB of live allocations across the index and exact-vector
 store. Native mappings, allocator overhead, and resident file pages contribute
 separately to process RSS.
 
 ## Construction
 
-1. Scan the immutable source with its existing cancellation, identity, enrichment,
-   and file-state tracking. Commit original vectors to the exact-vector LSM and
-   append transformed vectors and identities to a private checksummed sequential spool.
-2. Train each external partition on a uniform reservoir of up to 32 rows per
-   router center, with an 8 MiB vector-sample allowance. Each router has at most
-   16 centers.
-3. Route every partition row once to its nearest center. A partition that assigns
+1. Decode authored Parquet `LIST<FLOAT>` and `LIST<DOUBLE>` columns into borrowed
+   float32 vectors. Repetition and definition levels preserve rows across page
+   boundaries and distinguish null lists from empty lists. The reader retains
+   one physical page and a bounded output cohort. Shared producer replay keeps
+   vector values in packed float32 form. SQL and stored-source consumers
+   materialize JSON arrays when their requested result requires them.
+2. Scan the immutable source with its existing cancellation, identity, enrichment,
+   and file-state tracking. Sort bounded 16 MiB batches of original vectors and
+   publish immutable runs directly through the existing native table-file codec.
+   The shared checkpoint and exact-vector readers consume these runs. Append
+   transformed vectors and identities to a private checksummed sequential spool.
+3. Collect the root reservoir during source ingestion and child reservoirs while
+   writing partition files. Persist each reservoir with row IDs and checksums.
+   Train external routers from these small files, removing the extra corpus scan
+   previously needed for sampling. Each router has at most 16 centers. Each
+   reservoir holds at most 512 rows and 8 MiB of vector coordinates. Routing
+   owns at most 16 reservoirs, releasing them before recursive descent.
+4. Route every partition row once to its nearest center. A partition that assigns
    over three quarters of its rows to one child is routed again with fixed
    capacities. This bounds recursive progress for identical vectors and skewed
-   inputs.
-4. Finish small partitions in memory under an 8 MiB admission estimate covering
+   inputs. The progress threshold always requires at least one row to leave the
+   largest child, including two-row and three-row forced-spill partitions.
+5. Finish small partitions in memory under an 8 MiB admission estimate covering
    vectors, identities, and per-row construction scratch. Their learned hierarchy
    uses confidence-ordered capacity assignment. Final leaves respect the index's
    leaf capacity, which defaults to 100.
-5. Encode leaf payloads directly from their transformed matrices. Build weighted
+6. Encode leaf payloads directly from their transformed matrices. Build weighted
    parent centroids, covering radii, split ranges, and reverse mappings through
    the existing HBC write methods. Rotate storage transactions around an 8 MiB
-   staged-byte budget between complete writes. Flush the private projection
-   before native handoff.
-6. Stream the native generation into an atomic staging sink. Topology,
+   staged-byte budget between complete writes. Fresh private projection batches
+   use immutable bulk ingestion. Flush the private projection before native
+   handoff. Construction failures discard the entire private candidate.
+7. Stream the native generation into an atomic staging sink. Topology,
    centroid blocks, quantized scan blocks, and ordered vector-directory blocks
    share the established native codecs. Bootstrap point-read transactions end
-   after each node. The centroid writer retains one bounded block.
-7. Validate and install the staged receipt, publish durable `CURRENT`, and mark
+   after each node. Initial publication, synchronous checkpoints, and background
+   full consolidation share bounded streaming publication. Centroid writers
+   retain one block, including when flattening an existing large generation.
+8. Validate and install the staged receipt, publish durable `CURRENT`, and mark
    native authority. Publish the posting checkpoint and exact-vector checkpoint
    together through the existing lake artifact and generation-directory path.
+   Paged chunk directories admit more than 65,536 chunks. Inline chunk arrays
+   retain their separate allocation bound. Generation admission consequently
+   scales beyond the former 16 GiB aggregate limit. Large source files page their
+   identity-chunk references through the same authenticated ordered tree. The
+   tracker buffers at most 32 references per active file. Native vector and
+   sparse metadata version 5 adds this directory, while readers retain version
+   4 compatibility. Deletion and garbage collection traverse the paged references.
 
 External partition scratch is proportional to one corpus plus the partition
 currently being split. Terminal construction memory and the depth-first parent
@@ -107,3 +135,49 @@ Parquet normalization, exact-vector LSM construction, remote reads, and artifact
 upload are separate stages. The lake integration regression exercises the
 Parquet-to-published-artifact path across multiple files and reopens its native
 vector index.
+
+## Storage and I/O decisions
+
+Immutable exact-vector runs reuse the existing native source format, checksums,
+publication manifests, batched reads, and mutation overlays. This removes the
+source WAL and mutable-table phase for fresh offline builds. The authoritative
+posting generation uses the existing topology, centroid, scan, and reverse-map
+containers. Its final publication installs one complete durable generation.
+
+Collecting reservoirs during partition writes changes external partition work
+from a sampling read, routing read, and partition write to a routing read and
+partition write, plus small reservoir files. The sampling-only corpus pass is
+eliminated. Uniform replacement uses an independent deterministic random stream
+per output. Balanced rerouting rebuilds reservoirs for the final membership.
+Legacy callers supplying a spool without a reservoir retain the sampling scan.
+
+The larger source-backed and ordinal-partition designs are specified in
+[bulk source storage](bulk-source-storage.md). Their source-version, deletion,
+read-locality, and recovery requirements apply together.
+
+## Complete Parquet operation benchmark
+
+The existing native execution runtime probe accepts a raw Cohere-style Parquet
+file with `id` and `emb` columns. It streams that file into the filesystem
+object-store fixture before starting the operation timer. It measures source identity
+construction, typed decoding, exact-vector runs, clustering, artifact upload,
+and publication through the native operation. It then reopens the published
+artifacts and executes a vector query.
+
+```sh
+cd zig
+ANTFLY_LAKE_BULK_PARQUET_FILE=/absolute/path/to/train.parquet \
+ANTFLY_LAKE_BULK_DIMS=768 \
+ANTFLY_LAKE_BULK_ALGORITHM=lloyd \
+ANTFLY_LAKE_BULK_INPUT_BYTES=4294967296 \
+zig build lake-execution-runtime-probe -Doptimize=ReleaseFast
+```
+
+To use an existing object-store source, set `ANTFLY_LAKE_BULK_PARQUET` to its
+URI instead. A filesystem URI identifies a native framed object store, whose
+objects are installed through `Client.putFile`, rather than a plain directory.
+
+The operation probe preserves the authored vector coordinates and uses squared
+L2. Its query checks serving and exact-vector reopening. Recall measurement
+continues to use held-out queries and matching ground truth in the quality
+benchmark.

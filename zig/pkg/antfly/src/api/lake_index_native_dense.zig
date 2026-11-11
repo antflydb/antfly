@@ -25,10 +25,35 @@ const rebuild = @import("../serverless/build/lake_rebuild.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
-pub const metadata_version: u16 = 4;
+pub const metadata_version: u16 = 5;
 pub fn supportsMetadata(version: u16) bool {
-    return version == metadata_version;
+    return version == 4 or version == metadata_version;
 }
+/// Reconstruct codec options on every build and reopen; rotation is required by
+/// multi-bit quantization and must agree with the persisted projection.
+pub fn applyQuantization(config: *local.storage_hbc_adapter.HBCConfig, value: std.json.Value) !void {
+    if (value != .object) return error.InvalidIndexConfig;
+    if (value.object.get("quantization_bits")) |bits| {
+        if (bits != .integer or bits.integer < 1 or bits.integer > 8) return error.InvalidIndexConfig;
+        config.quantization_bits = @intCast(bits.integer);
+    }
+    if (value.object.get("quantization_refine")) |refine| {
+        if (refine != .string) return error.InvalidIndexConfig;
+        config.quantization_refine = std.meta.stringToEnum(@TypeOf(config.quantization_refine), refine.string) orelse return error.InvalidIndexConfig;
+    }
+    if (value.object.get("use_random_ortho_trans")) |rotation| {
+        if (rotation != .bool) return error.InvalidIndexConfig;
+        config.use_random_ortho_trans = rotation.bool;
+    }
+    config.use_random_ortho_trans = config.use_random_ortho_trans or config.quantization_bits > 1;
+}
+
+pub fn applyQuantizationJson(a: A, config: *local.storage_hbc_adapter.HBCConfig, json: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    try applyQuantization(config, parsed.value);
+}
+
 pub const Root = struct {
     version: u16 = metadata_version,
     binding: local.serverless_segment_source_binding.Binding,
@@ -77,6 +102,40 @@ fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage) local.storage
         .bulk_ingest_flush_threshold_bytes_multiplier = 1,
     };
 }
+
+/// Fresh snapshots publish sorted immutable source runs directly. The run
+/// codec, checkpoints, point readers and later mutation overlay stay shared.
+const FreshVectors = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: std.ArrayList(local.storage_lsm_backend.TableEntry) = .empty,
+    bytes: usize = 0,
+    fn init(a: A) FreshVectors {
+        return .{ .arena = .init(a) };
+    }
+    fn deinit(self: *FreshVectors) void {
+        self.arena.deinit();
+    }
+    fn append(self: *FreshVectors, namespace: []const u8, key: []const u8, value: []const u8) !void {
+        const a = self.arena.allocator();
+        try self.entries.append(a, .{ .namespace_name = namespace, .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
+        self.bytes += key.len + value.len + @sizeOf(local.storage_lsm_backend.TableEntry);
+    }
+    fn less(_: void, lhs: local.storage_lsm_backend.TableEntry, rhs: local.storage_lsm_backend.TableEntry) bool {
+        const order = std.mem.order(u8, lhs.namespace_name.?, rhs.namespace_name.?);
+        return if (order == .eq) std.mem.order(u8, lhs.key, rhs.key) == .lt else order == .lt;
+    }
+    fn flush(self: *FreshVectors, backend: *local.storage_lsm_backend.Backend) !void {
+        if (self.entries.items.len == 0) return;
+        std.mem.sort(local.storage_lsm_backend.TableEntry, self.entries.items, {}, less);
+        for (self.entries.items[1..], self.entries.items[0 .. self.entries.items.len - 1]) |entry, previous| {
+            if (std.mem.eql(u8, entry.namespace_name.?, previous.namespace_name.?) and std.mem.eql(u8, entry.key, previous.key)) return error.NativeLakeVectorIdentityCollision;
+        }
+        try backend.ingestSortedTableEntries(self.entries.items);
+        _ = self.arena.reset(.free_all);
+        self.entries = .empty;
+        self.bytes = 0;
+    }
+};
 
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
@@ -158,6 +217,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const hbc = local.storage_hbc_adapter;
         var options: hbc.HBCConfig = .{ .dims = dims };
         options.metric = std.meta.stringToEnum(@TypeOf(options.metric), metric) orelse return error.InvalidIndexConfig;
+        try applyQuantization(&options, normalized);
         var build_cancellation: BuildCancellation = .{ .token = cancellation, .provider = provider };
         var build_options: ?hbc.HBCIndex.SpoolBuildOptions = null;
         if (@import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build")) |algorithm| {
@@ -166,10 +226,15 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (selected == .emeans and options.metric != .l2_squared) return error.EmeansRequiresL2;
             if (seed == null) build_options = .{ .algorithm = selected, .check = BuildCancellation.check, .context = &build_cancellation };
         }
+        const configured_bulk = @import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build") != null;
         var bulk_input_limit: u64 = 512 * 1024 * 1024;
         if (@import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build_max_input_bytes")) |limit| {
             if (limit != .integer or limit.integer <= 0) return error.InvalidIndexConfig;
             bulk_input_limit = @intCast(limit.integer);
+        }
+        if (configured_bulk) {
+            tracker.output_bytes = bulk_input_limit;
+            tracker.directory_bytes = bulk_input_limit;
         }
         if (build_options != null) {
             // Construction consumes each source vector once per partition.
@@ -183,6 +248,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const vector_path = try std.fmt.allocPrint(ca, "{s}/vectors", .{path});
         var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, vectorStoreOptions(candidate_storage));
         defer vectors.close();
+        var fresh_vectors = FreshVectors.init(budget.allocator());
+        defer fresh_vectors.deinit();
+        var source_session = build_options != null;
+        if (source_session) try vectors.beginBulkIngestSession();
+        defer if (source_session) vectors.abortBulkIngestSession();
         var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, options, .{ .storage = candidate_storage });
         defer index.close();
         index.setIo(io);
@@ -211,6 +281,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var spool_buffer: [64 * 1024]u8 = undefined;
         var spool_output = if (build_options != null) try spool.create(&spool_buffer) else null;
         defer if (spool_output) |*output| output.abort(spool);
+        if (spool_output) |*output| try output.enableSample(budget.allocator(), 16 * 32, build_options.?.sample_bytes, index.rng.intN(std.math.maxInt(usize)));
         const transformed: []f32 = if (build_options != null) try budget.allocator().alloc(f32, dims) else &.{};
         defer if (build_options != null) budget.allocator().free(transformed);
         const incremental_session = seed == null and build_options == null;
@@ -220,7 +291,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var identities: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer identities.deinit(budget.allocator());
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan, .tracker = &tracker };
+            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan, .tracker = &tracker, .budget = if (configured_bulk) bulk_input_limit else 256 * 1024 * 1024 };
             defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
@@ -261,7 +332,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
-        var input_remaining: u64 = if (build_options != null) bulk_input_limit else 512 * 1024 * 1024;
+        var input_remaining: u64 = bulk_input_limit;
         const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
@@ -294,15 +365,28 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     try writes.append(pa, .{ .vector_id = id, .vector = vector, .metadata = key });
                 }
             }
-            var transaction = try vectors.beginBatchWithOptions(.{ .mode = if (seed == null) .bulk_ingest else .default });
-            errdefer transaction.abort();
-            for (writes.items) |write| {
-                const encoded_vector = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(pa, write.vector);
-                try transaction.put(.{ .name = "exact_vectors" }, write.metadata, encoded_vector);
+            if (build_options != null) {
+                for (writes.items) |write| {
+                    const encoded = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(pa, write.vector);
+                    try fresh_vectors.append("exact_vectors", write.metadata, encoded);
+                    if (fresh_vectors.bytes >= 16 * 1024 * 1024) try fresh_vectors.flush(&vectors);
+                }
+                var records = unit_records.iterator();
+                while (records.next()) |record| {
+                    try fresh_vectors.append("lake_units", record.key_ptr.*, record.value_ptr.*);
+                    if (fresh_vectors.bytes >= 16 * 1024 * 1024) try fresh_vectors.flush(&vectors);
+                }
+            } else {
+                var transaction = try vectors.beginBatchWithOptions(.{ .mode = if (seed == null) .bulk_ingest else .default });
+                errdefer transaction.abort();
+                for (writes.items) |write| {
+                    const encoded_vector = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(pa, write.vector);
+                    try transaction.put(.{ .name = "exact_vectors" }, write.metadata, encoded_vector);
+                }
+                var records = unit_records.iterator();
+                while (records.next()) |record| try transaction.put(.{ .name = "lake_units" }, record.key_ptr.*, record.value_ptr.*);
+                try transaction.commit();
             }
-            var records = unit_records.iterator();
-            while (records.next()) |record| try transaction.put(.{ .name = "lake_units" }, record.key_ptr.*, record.value_ptr.*);
-            try transaction.commit();
             if (spool_output) |*output| {
                 for (writes.items) |write| {
                     const vector = index.transformVector(write.vector, transformed);
@@ -318,9 +402,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (spool_output) |*output| {
             const root = try output.finish(io);
             spool_output = null;
-            // Release the source mutable table before admitting routing and
-            // leaf-construction work under the same allocator.
-            try vectors.flushBufferedWritesWithOptions(.{ .compact = false });
+            try fresh_vectors.flush(&vectors);
+            try vectors.finishBulkIngestSessionWithOptions(.{ .compact = false });
+            source_session = false;
             index.bulkBuildSpool(&spool, root, build_options.?) catch |err| switch (err) {
                 error.DuplicateVectorId => return error.NativeLakeVectorIdentityCollision,
                 else => return err,
@@ -341,7 +425,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = flatten, .make_authoritative = true, .check = BuildCancellation.check, .context = &build_cancellation });
         var checkpoint = (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot;
         defer checkpoint.deinit();
-        var output_remaining: u64 = if (build_options != null) try std.math.mul(u64, bulk_input_limit, 2) else 1024 * 1024 * 1024;
+        var output_remaining: u64 = if (configured_bulk) try std.math.mul(u64, bulk_input_limit, 2) else 1024 * 1024 * 1024;
         const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
         var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
         defer navigation.deinit();
@@ -548,6 +632,48 @@ test "external lake execution offline dense source flushes by bytes within its a
         try backend.flushBufferedWritesWithOptions(.{ .compact = false });
         var checkpoint = try backend.pinNativeCheckpoint();
         defer checkpoint.deinit();
+        try std.testing.expect(@as(u64, count) * dims * 4 > budget.limit);
+        try std.testing.expect(budget.peak <= budget.limit);
+    }
+    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null));
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    for ([_]usize{ 0, count / 2, count - 1 }) |row| {
+        var key: [32]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, encoded, try read.get(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row})));
+    }
+}
+
+test "external lake execution immutable exact vectors bypass WAL within source quota" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("offline-immutable-vectors");
+    defer directory.cleanup();
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024 };
+    const path = try std.fmt.allocPrint(a, "{s}/vectors", .{directory.path()});
+    defer a.free(path);
+    const dims = 768;
+    const count = 32768;
+    const vector: [dims]f32 = @splat(1.25);
+    const encoded = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, &vector);
+    defer a.free(encoded);
+    {
+        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null));
+        defer backend.close();
+        try backend.beginBulkIngestSession();
+        var fresh = FreshVectors.init(budget.allocator());
+        defer fresh.deinit();
+        for (0..count) |row| {
+            var key: [32]u8 = undefined;
+            try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
+            if (fresh.bytes >= 16 * 1024 * 1024) try fresh.flush(&backend);
+        }
+        try fresh.flush(&backend);
+        try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expect(stats.sorted_ingest_runs > 0);
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_append_bytes);
+        try std.testing.expectEqual(@as(u64, 0), stats.flush_input_entries);
         try std.testing.expect(@as(u64, count) * dims * 4 > budget.limit);
         try std.testing.expect(budget.peak <= budget.limit);
     }

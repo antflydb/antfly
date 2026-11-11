@@ -464,9 +464,10 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_sparse.zig"), ref);
                     if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
-                    for (root.file_states) |file| for (file.docs) |document_ref| {
-                        _ = try self.mark(document_ref);
-                    };
+                    for (root.file_states) |file| {
+                        if (file.docs_root) |directory| try self.markGenerationPage(a, root.generation.domain, directory, true);
+                        for (file.docs) |document_ref| _ = try self.mark(document_ref);
+                    }
                     try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
@@ -475,9 +476,10 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_dense.zig"), ref);
                     if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
-                    for (root.file_states) |file| for (file.docs) |document_ref| {
-                        _ = try self.mark(document_ref);
-                    };
+                    for (root.file_states) |file| {
+                        if (file.docs_root) |directory| try self.markGenerationPage(a, root.generation.domain, directory, true);
+                        for (file.docs) |document_ref| _ = try self.mark(document_ref);
+                    }
                     try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
@@ -550,6 +552,7 @@ pub const Collector = struct {
                     var arena = std.heap.ArenaAllocator.init(w.a);
                     defer arena.deinit();
                     const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(arena.allocator(), key, value, w.domain);
+                    if (file.docs_root) |document_root| try w.collector.markGenerationPage(w.a, w.domain, document_root, true);
                     for (file.docs) |ref| _ = try w.collector.mark(ref);
                     return;
                 }

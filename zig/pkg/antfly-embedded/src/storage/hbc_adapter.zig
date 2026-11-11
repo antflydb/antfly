@@ -5014,6 +5014,8 @@ const ExperimentalPostingCheckpointBuild = struct {
                 self.projection_source,
                 &self.staging_store,
                 self.segment_generation,
+                null,
+                null,
             ),
             .delta, .compact_deltas => try self.buildAndStageDelta(build_alloc),
         };
@@ -11205,223 +11207,6 @@ pub const HBCIndex = struct {
         try appendRowCheckpointValue(writer, sink, posting_id, .quantized_checkpoint, sequence, normalized);
     }
 
-    /// Rewrites a checkpoint from the already complete immutable query
-    /// generation. This avoids opening a new LSM snapshot and scanning all
-    /// derived namespaces every time the sidecar WAL is flattened.
-    fn appendExperimentalPostingCheckpointFromGeneration(
-        alloc: Allocator,
-        writer: *vectorindex_posting_segment.Writer,
-        generation: *ExperimentalPostingReadGeneration,
-        metadata: IndexMetadata,
-        covered_source_sequence: u64,
-        foreground_manager: ?*resource_manager_mod.ResourceManager,
-        force_progress: ?*const std.atomic.Value(bool),
-        projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
-        reconstructed_values: *std.ArrayListUnmanaged([]u8),
-    ) !?u64 {
-        const root = experimentalPostingRootState(generation) orelse return null;
-        const base_directory = root.vector_directory orelse return null;
-
-        var latest: ExperimentalPostingLatestValues = .empty;
-        defer latest.deinit(alloc);
-        try collectExperimentalPostingCompactionValues(alloc, generation, &latest, reconstructed_values);
-
-        var row_chunks = std.AutoHashMapUnmanaged(u64, void).empty;
-        defer row_chunks.deinit(alloc);
-        if (try generation.value(0, .row_chunk)) |cursor|
-            try writer.appendValueAt(0, .row_chunk, covered_source_sequence, cursor);
-
-        var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
-        try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
-
-        const metric: vec.DistanceMetric = switch (metadata.metric) {
-            @backingInt(vec.DistanceMetric.l2_squared) => .l2_squared,
-            @backingInt(vec.DistanceMetric.inner_product) => .inner_product,
-            @backingInt(vec.DistanceMetric.cosine) => .cosine,
-            else => return error.DistanceMetricMismatch,
-        };
-        var centroid_directory = try vectorindex_centroid_directory.Writer.init(
-            alloc,
-            metadata.dims,
-            metadata.metric,
-            1024,
-        );
-        defer centroid_directory.deinit();
-        var quantized_directory = try vectorindex_quantized_directory.Writer.init(
-            alloc,
-            metadata.dims,
-            metadata.metric,
-        );
-        defer quantized_directory.deinit();
-        const centroid_scratch = try alloc.alloc(f32, metadata.dims);
-        defer alloc.free(centroid_scratch);
-        var projection_vector_ids = std.ArrayListUnmanaged(u64).empty;
-        defer projection_vector_ids.deinit(alloc);
-        var projection_metadata = std.ArrayListUnmanaged(?[]const u8).empty;
-        defer projection_metadata.deinit(alloc);
-        var projection_values = std.ArrayListUnmanaged(vectorindex_hbc_runtime.NativeProjectionBuildValue).empty;
-        defer projection_values.deinit(alloc);
-        var projection_payload = std.ArrayListUnmanaged(u8).empty;
-        defer projection_payload.deinit(alloc);
-
-        // Float32 generations need no optional float16 projection plane.
-        // Treat an unavailable lifecycle exactly like an unavailable loader;
-        // real I/O or corruption errors must still abort the checkpoint.
-        var effective_projection_source = projection_source;
-        var projection_build_started = false;
-        if (effective_projection_source) |source| {
-            if (source.begin) |begin| {
-                begin(source.ctx, covered_source_sequence) catch |err| switch (err) {
-                    error.Unsupported => effective_projection_source = null,
-                    else => return err,
-                };
-                projection_build_started = effective_projection_source != null;
-            }
-        }
-        defer if (projection_build_started) {
-            const source = effective_projection_source.?;
-            if (source.end) |end| end(source.ctx);
-        };
-
-        var posting_count: u64 = 0;
-        var node_id: u64 = 1;
-        while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
-            if (node_id % 256 == 0) {
-                yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
-            }
-            const packed_node = (try experimentalPostingCheckpointValue(alloc, reconstructed_values, &latest, root, node_id, .base)) orelse continue;
-            try writer.appendValueBorrowedAt(node_id, .base, covered_source_sequence, packed_node);
-            posting_count += 1;
-            const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
-            const leaf_projections = if (decoded_node.header.is_leaf)
-                try loadExperimentalLeafProjectionPlane(
-                    alloc,
-                    generation,
-                    decoded_node.ids_bytes,
-                    metadata.dims,
-                    covered_source_sequence,
-                    effective_projection_source,
-                    &projection_vector_ids,
-                    &projection_metadata,
-                    &projection_values,
-                    &projection_payload,
-                )
-            else
-                &.{};
-            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len > 0) {
-                if (decoded_node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
-                @memcpy(std.mem.sliceAsBytes(centroid_scratch), decoded_node.centroid_bytes);
-                const measure: f32 = switch (metric) {
-                    .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
-                    .cosine => vec.norm(centroid_scratch),
-                    .inner_product => 0,
-                };
-                try centroid_directory.append(node_id, decoded_node.covering_radius, centroid_scratch, measure);
-            }
-            if (try experimentalPostingCheckpointValue(alloc, reconstructed_values, &latest, root, node_id, .node_range)) |range| {
-                try writer.appendValueBorrowedAt(node_id, .node_range, covered_source_sequence, range);
-            }
-            if (try experimentalPostingCheckpointValue(alloc, reconstructed_values, &latest, root, node_id, .posting_state)) |posting_state| {
-                try writer.appendValueBorrowedAt(node_id, .posting_state, covered_source_sequence, posting_state);
-            }
-            var quantized_directory_entry_written = false;
-            if (try experimentalPostingCheckpointValue(alloc, reconstructed_values, &latest, root, node_id, .quantized_checkpoint)) |quantized| {
-                if (posting_rows.isManifest(quantized)) {
-                    try appendRowCheckpoint(alloc, writer, null, generation, node_id, covered_source_sequence, quantized, &row_chunks, null, null);
-                    const cost = try resolvedExperimentalPostingLeafScan(generation, node_id, metadata.dims, metadata.use_quantization);
-                    quantized_directory.admission_stats.observeLeaf(cost.vector_count, cost.bytes);
-                    quantized_directory_entry_written = true;
-                } else if (node_id == metadata.root_node) {
-                    try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
-                } else {
-                    var decoded_quantized = proto.RaBitQuantizedVectorSet.decode(alloc, quantized) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return error.Corrupted,
-                    };
-                    defer decoded_quantized.deinit(alloc);
-                    try appendExperimentalLeafDirectory(
-                        alloc,
-                        foreground_manager,
-                        effective_projection_source,
-                        &quantized_directory,
-                        null,
-                        node_id,
-                        &decoded_quantized,
-                        if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
-                        leaf_projections,
-                    );
-                    quantized_directory_entry_written = true;
-                }
-            } else if (node_id != metadata.root_node) {
-                if (try generation.quantizedViewIfUnmodified(node_id)) |view| {
-                    var canonical = try view.canonical(alloc);
-                    defer canonical.deinit(alloc);
-                    const borrowed_quantized = canonical.value;
-                    try appendExperimentalLeafDirectory(
-                        alloc,
-                        foreground_manager,
-                        effective_projection_source,
-                        &quantized_directory,
-                        null,
-                        node_id,
-                        &borrowed_quantized,
-                        if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
-                        leaf_projections,
-                    );
-                    quantized_directory_entry_written = true;
-                }
-            }
-            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len != 0 and !quantized_directory_entry_written) {
-                quantized_directory.observeFallbackLeaf(decoded_node.ids_bytes.len / @sizeOf(u64));
-            }
-        }
-
-        const encoded_centroid_directory = try centroid_directory.build();
-        try writer.appendValueOwnedAt(0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
-        const encoded_quantized_directory = try quantized_directory.build();
-        try writer.appendValueOwnedAt(0, .quantized_directory, covered_source_sequence, encoded_quantized_directory);
-
-        var vector_overrides = std.ArrayListUnmanaged(ExperimentalVectorOverride).empty;
-        defer vector_overrides.deinit(alloc);
-        try vector_overrides.ensureTotalCapacity(alloc, latest.count());
-        var latest_it = latest.iterator();
-        while (latest_it.next()) |entry| {
-            const record_kind = experimentalPostingValueKeyKind(entry.key_ptr.*) catch continue;
-            const directory_kind: vectorindex_hbc_vector_directory.Kind = switch (record_kind) {
-                .vector_leaf => .leaf,
-                .vector_metadata => .metadata,
-                else => continue,
-            };
-            vector_overrides.appendAssumeCapacity(.{
-                .kind = directory_kind,
-                .id = experimentalPostingValueKeyId(entry.key_ptr.*),
-                .value = entry.value_ptr.*,
-            });
-        }
-        std.mem.sort(ExperimentalVectorOverride, vector_overrides.items, {}, ExperimentalVectorOverride.lessThan);
-
-        var directory_writer = try vectorindex_hbc_vector_directory.Writer.init(alloc);
-        defer directory_writer.deinit();
-        var rows = ExperimentalVectorRowIterator.init(base_directory, vector_overrides.items);
-        var directory_items: usize = 0;
-        while (try rows.next()) |row| {
-            directory_items += 1;
-            if (directory_items % 256 == 0) {
-                yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
-            }
-            try directory_writer.appendRow(row.id, row.leaf, row.metadata);
-        }
-        const vector_directory = try directory_writer.build();
-        try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
-        return posting_count;
-    }
-
-    /// Production full checkpoints stream both the outer segment and its
-    /// corpus-sized quantized directory into one atomic generation file. The
-    /// immutable source generation is traversed twice: once for ordinary HBC
-    /// families and centroid routing, then once for the contiguous candidate
-    /// plane. That bounded extra metadata traversal avoids retaining either a
-    /// complete nested directory or a second outer-segment copy in heap.
     fn stageExperimentalPostingCheckpointFromGeneration(
         alloc: Allocator,
         generation: *ExperimentalPostingReadGeneration,
@@ -11432,6 +11217,8 @@ pub const HBCIndex = struct {
         projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
         posting_store: *posting_segment_store_mod.Store,
         segment_generation: u64,
+        check: ?*const fn (*anyopaque) anyerror!void,
+        context: ?*anyopaque,
     ) !StagedExperimentalPostingCheckpoint {
         const stage_started_ns = nowNs();
         const root = experimentalPostingRootState(generation) orelse return error.MissingPostingCheckpoint;
@@ -11498,21 +11285,12 @@ pub const HBCIndex = struct {
             @backingInt(vec.DistanceMetric.cosine) => .cosine,
             else => return error.DistanceMetricMismatch,
         };
-        var centroid_directory = try vectorindex_centroid_directory.Writer.init(
-            alloc,
-            metadata.dims,
-            metadata.metric,
-            1024,
-        );
-        defer centroid_directory.deinit();
-        const centroid_scratch = try alloc.alloc(f32, metadata.dims);
-        defer alloc.free(centroid_scratch);
-
         var posting_count: u64 = 0;
         var node_id: u64 = 1;
         while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
             if (node_id % 256 == 0) {
                 base_reclaimer.reclaimObserved();
+                if (check) |active| try active(context.?);
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
             var packed_node_value = (try experimentalPostingStreamingCheckpointValue(
@@ -11528,17 +11306,6 @@ pub const HBCIndex = struct {
             try writer.appendValueAt(sink, node_id, .base, covered_source_sequence, packed_node);
             base_reclaimer.observe(packed_node);
             posting_count += 1;
-            const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
-            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len > 0) {
-                if (decoded_node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
-                @memcpy(std.mem.sliceAsBytes(centroid_scratch), decoded_node.centroid_bytes);
-                const measure: f32 = switch (metric) {
-                    .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
-                    .cosine => vec.norm(centroid_scratch),
-                    .inner_product => 0,
-                };
-                try centroid_directory.append(node_id, decoded_node.covering_radius, centroid_scratch, measure);
-            }
             if (try experimentalPostingStreamingCheckpointValue(
                 alloc,
                 &latest,
@@ -11593,9 +11360,35 @@ pub const HBCIndex = struct {
 
         {
             if (row_leaves.count() != 0) std.log.info("dense posting row checkpoint generation={} sequence={} leaves={} retained_chunks={}", .{ segment_generation, covered_source_sequence, row_leaves.count(), row_chunks.count() });
-            const encoded_centroid_directory = try centroid_directory.build();
-            defer alloc.free(encoded_centroid_directory);
-            try writer.appendValueAt(sink, 0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
+            try writer.alignForValue(sink, .centroid_directory);
+            const block_rows = std.math.clamp((1024 * 1024) / (@as(usize, metadata.dims) * 4 + 16), 1, 1024);
+            var centroids = try vectorindex_centroid_directory.StreamingWriter.init(alloc, sink, metadata.dims, metadata.metric, block_rows);
+            defer centroids.deinit();
+            const centroid = try alloc.alloc(f32, metadata.dims);
+            defer alloc.free(centroid);
+            node_id = 1;
+            while (node_id <= metadata.node_count) : (node_id += 1) {
+                if (node_id % 256 == 0) {
+                    base_reclaimer.reclaimObserved();
+                    if (check) |active| try active(context.?);
+                    yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
+                }
+                var resolved = (try experimentalPostingStreamingCheckpointValue(alloc, &latest, &deferred_patches, root, node_id, .base)) orelse continue;
+                defer resolved.deinit(alloc);
+                const node = try vectorindex_hbc.decodePackedNodeValue(resolved.bytes);
+                if (!node.header.is_leaf or node.ids_bytes.len == 0) continue;
+                if (node.centroid_bytes.len != centroid.len * 4) return error.Corrupted;
+                @memcpy(std.mem.sliceAsBytes(centroid), node.centroid_bytes);
+                const measure = switch (metric) {
+                    .l2_squared => vec.dot(centroid, centroid),
+                    .cosine => vec.norm(centroid),
+                    .inner_product => 0,
+                };
+                try centroids.append(sink, node_id, node.covering_radius, centroid, measure);
+                base_reclaimer.observe(resolved.bytes);
+            }
+            const finish = try centroids.finish(sink);
+            try writer.appendWrittenValueAt(sink, 0, .centroid_directory, covered_source_sequence, finish.offset, finish.len, finish.checksum);
         }
 
         // The nested directory begins on the same 64-byte boundary required by
@@ -11645,6 +11438,7 @@ pub const HBCIndex = struct {
         while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
             if (node_id % 256 == 0) {
                 base_reclaimer.reclaimObserved();
+                if (check) |active| try active(context.?);
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
             if (node_id == metadata.root_node) continue;
@@ -11839,6 +11633,7 @@ pub const HBCIndex = struct {
             directory_items += 1;
             if (directory_items % 256 == 0) {
                 base_reclaimer.reclaimObserved();
+                if (check) |active| try active(context.?);
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
             try directory_writer.appendRow(sink, row.id, row.leaf, row.metadata);
@@ -11889,47 +11684,6 @@ pub const HBCIndex = struct {
         };
     }
 
-    fn buildExperimentalPostingCheckpointFromGeneration(
-        alloc: Allocator,
-        generation: *ExperimentalPostingReadGeneration,
-        metadata: IndexMetadata,
-        covered_source_sequence: u64,
-        foreground_manager: ?*resource_manager_mod.ResourceManager,
-        force_progress: ?*const std.atomic.Value(bool),
-        projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
-    ) !ExperimentalPostingCheckpointBuildResult {
-        var writer = vectorindex_posting_segment.Writer.init(alloc);
-        defer writer.deinit();
-        var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (reconstructed_values.items) |value| alloc.free(value);
-            reconstructed_values.deinit(alloc);
-        }
-        const posting_count = (try appendExperimentalPostingCheckpointFromGeneration(
-            alloc,
-            &writer,
-            generation,
-            metadata,
-            covered_source_sequence,
-            foreground_manager,
-            force_progress,
-            projection_source,
-            &reconstructed_values,
-        )) orelse return error.MissingPostingCheckpoint;
-        const segment_bytes = try writer.build();
-        return .{
-            .segment_bytes = segment_bytes,
-            .segment_len = @intCast(segment_bytes.len),
-            .posting_count = posting_count,
-        };
-    }
-
-    /// Encodes values changed since the immutable root. Large packed-node and
-    /// quantized values use AFPD replacement patches when smaller than the
-    /// complete value; the patch is relative to the preceding CURRENT chain,
-    /// not to a WAL that will be rotated away. Small families stay as direct
-    /// replacements and exact per-kind tombstones distinguish deletion from
-    /// absence.
     fn buildExperimentalPostingDeltaFromGeneration(
         alloc: Allocator,
         generation: *ExperimentalPostingReadGeneration,
@@ -12517,66 +12271,39 @@ pub const HBCIndex = struct {
         if (source_generation == null) {
             return self.publishInitialPostingCheckpoint(&posting_store, generation, covered_source_sequence, check, context);
         }
-        var writer = vectorindex_posting_segment.Writer.init(self.alloc);
-        defer writer.deinit();
-        var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (reconstructed_values.items) |value| self.alloc.free(value);
-            reconstructed_values.deinit(self.alloc);
-        }
-        var posting_count: u64 = 0;
-
-        const flattened_generation = if (source_generation) |read_generation|
-            if (try appendExperimentalPostingCheckpointFromGeneration(
-                self.alloc,
-                &writer,
-                read_generation,
-                self.metadata,
-                covered_source_sequence,
-                self.resource_manager,
+        const native_root = experimentalPostingRootState(source_generation.?) orelse return self.publishInitialPostingCheckpoint(&posting_store, generation, covered_source_sequence, check, context);
+        if (native_root.vector_directory == null) return self.publishInitialPostingCheckpoint(&posting_store, generation, covered_source_sequence, check, context);
+        if (check) |active| try active(context.?);
+        const staged = try stageExperimentalPostingCheckpointFromGeneration(
+            self.alloc,
+            source_generation.?,
+            self.metadata,
+            covered_source_sequence,
+            self.resource_manager,
+            null,
+            if (self.external_vector_ctx != null and self.external_vector_projection_build_loader != null)
+                .{
+                    .ctx = self.external_vector_ctx.?,
+                    .loader = self.external_vector_projection_build_loader.?,
+                    .begin = self.external_vector_projection_build_begin,
+                    .end = self.external_vector_projection_build_end,
+                    .required = self.external_vector_projection_build_required,
+                    .retain_projection_plane = self.external_vector_projection_build_retain,
+                    .subgroup_count = if (self.resource_manager) |manager| manager.dense_subgroup_count else 0,
+                }
+            else
                 null,
-                if (self.external_vector_ctx != null and self.external_vector_projection_build_loader != null)
-                    .{
-                        .ctx = self.external_vector_ctx.?,
-                        .loader = self.external_vector_projection_build_loader.?,
-                        .begin = self.external_vector_projection_build_begin,
-                        .end = self.external_vector_projection_build_end,
-                        .required = self.external_vector_projection_build_required,
-                        .retain_projection_plane = self.external_vector_projection_build_retain,
-                        .subgroup_count = if (self.resource_manager) |manager| manager.dense_subgroup_count else 0,
-                    }
-                else
-                    null,
-                &reconstructed_values,
-            )) |count| blk: {
-                posting_count = count;
-                break :blk true;
-            } else false
-        else
-            false;
-
-        if (!flattened_generation) {
-            return self.publishInitialPostingCheckpoint(&posting_store, generation, covered_source_sequence, check, context);
-        }
-        const segment_bytes = try writer.build();
-        defer self.alloc.free(segment_bytes);
-        var prepared = try posting_store.prepareCheckpoint(generation, covered_source_sequence, segment_bytes);
+            &posting_store,
+            generation,
+            check,
+            context,
+        );
+        if (check) |active| try active(context.?);
+        var prepared = try posting_store.prepareStagedCheckpoint(generation, covered_source_sequence, staged.staged);
         defer prepared.deinit();
         try self.installPreparedExperimentalPostingCheckpoint(&posting_store, &prepared);
-        std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} source={s}", .{
-            generation,
-            covered_source_sequence,
-            segment_bytes.len,
-            if (flattened_generation) "immutable_generation" else "authoritative_lsm",
-        });
         self.experimental_posting_overlay_collapsed_wal_bytes = posting_store.wal_committed_bytes;
-        return .{
-            .generation = generation,
-            .covered_source_sequence = covered_source_sequence,
-            .posting_count = posting_count,
-            .segment_bytes = @intCast(segment_bytes.len),
-            .flattened_generation = flattened_generation,
-        };
+        return .{ .generation = generation, .covered_source_sequence = covered_source_sequence, .posting_count = staged.result.posting_count, .segment_bytes = staged.staged.bytes, .flattened_generation = true };
     }
 
     /// Appends full committed snapshots for selected postings to the sidecar
@@ -13837,6 +13564,14 @@ pub const HBCIndex = struct {
         errdefer txn.abort();
         try self.markExperimentalPostingWalAuthoritative(&txn);
         return txn;
+    }
+
+    /// Private offline snapshots can publish sorted immutable projection runs.
+    /// Their entire candidate is discarded if any construction phase fails.
+    pub fn beginOfflineBulkBatch(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
+        if (!self.crossBatchPublicationActive() or self.nativeHbcAuthoritative() or self.metadata.active_count != 0) return error.IndexNotEmpty;
+        self.bulk_publication_may_have_mutated = true;
+        return self.store.beginBatchWithOptions(.{ .mode = .bulk_ingest });
     }
 
     pub fn beginRuntimeBatchTxn(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
@@ -36271,5 +36006,34 @@ test "spooled bulk failures close sessions and remove private partitions" {
         try std.testing.expectEqual(@as(u64, 0), index.bulk_commit_rotation.budget);
         var iterator = dir.iterate();
         try std.testing.expect((try iterator.next(io)) == null);
+    }
+}
+
+test "spooled bulk identical tiny forced-spill partitions always shrink" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]usize{ 2, 3 }) |count| {
+        var tp: TestPath = .{};
+        const path = tp.initDisk();
+        defer tp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, std.mem.span(path));
+        const dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(path), .{ .iterate = true });
+        defer dir.close(io);
+        var index = try HBCIndex.open(a, path, .{ .dims = 2, .leaf_size = 1, .branching_factor = 2, .use_quantization = false });
+        defer index.close();
+        index.setIo(io);
+        var spool: HBCIndex.BulkSpool = .{ .dir = dir, .io = io, .dims = 2 };
+        var buffer: [4096]u8 = undefined;
+        var output = try spool.create(&buffer);
+        var open = true;
+        defer if (open) output.abort(spool);
+        try output.enableSample(a, 512, 4096, 42);
+        for (0..count) |row| try output.append(row + 1, "key", &.{ 1, 1 });
+        const partition = try output.finish(io);
+        open = false;
+        try index.bulkBuildSpool(&spool, partition, .{ .terminal_bytes = 0 });
+        try std.testing.expectEqual(@as(u64, @intCast(count)), index.stats().active_count);
+        try std.testing.expect((try index.verifyTreeLinks()).consistent());
+        try std.testing.expectEqual(@as(usize, 1), index.getWriteProfile().bulk_build_leaf_max_members);
     }
 }

@@ -35,8 +35,12 @@ pub fn vectors(a: A, batch: rows.ColumnBatch, columns: []const []const u8, specs
             if (spec.kind != current.kind or spec.scale != current.scale) return error.UnsupportedExternalLakeIndex;
             spec.precision = @max(spec.precision, current.precision);
         } else spec.* = current;
-        if (kind == .vector_f32 or kind == .encoded) return error.UnsupportedExternalLakeIndex;
-        if (vector.values == .decimal128) {
+        if (kind == .encoded) return error.UnsupportedExternalLakeIndex;
+        if (vector.values == .vector_f32) {
+            const values = try a.alloc([]const u8, batch.rowCount());
+            for (values, vector.values.vector_f32, 0..) |*value, coordinates_, row| value.* = if (vector.nulls.isNull(row)) "" else try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, coordinates_);
+            vector.values = .{ .bytes = values };
+        } else if (vector.values == .decimal128) {
             const values = try a.alloc([]const u8, batch.rowCount());
             for (values, 0..) |*value, row| {
                 const bytes = try a.alloc(u8, 16);

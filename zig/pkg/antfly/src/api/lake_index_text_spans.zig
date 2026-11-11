@@ -253,7 +253,7 @@ pub const View = struct {
     }
 };
 fn sourceEqual(l: Source, r: Source) bool {
-    if (l.file_rows != r.file_rows or !std.mem.eql(u8, l.file.id, r.file.id) or !std.mem.eql(u8, &l.file.digest, &r.file.digest) or !std.meta.eql(l.file.key_digest, r.file.key_digest) or !std.meta.eql(l.file.aggregate_digest, r.file.aggregate_digest) or l.file.count != r.file.count or l.file.key_width != r.file.key_width or l.file.docs.len != r.file.docs.len or !refEqual(l.physical, r.physical)) return false;
+    if (l.file_rows != r.file_rows or !std.mem.eql(u8, l.file.id, r.file.id) or !std.mem.eql(u8, &l.file.digest, &r.file.digest) or !std.meta.eql(l.file.key_digest, r.file.key_digest) or !std.meta.eql(l.file.aggregate_digest, r.file.aggregate_digest) or l.file.count != r.file.count or l.file.key_width != r.file.key_width or !std.meta.eql(l.file.docs_root, r.file.docs_root) or l.file.docs.len != r.file.docs.len or !refEqual(l.physical, r.physical)) return false;
     for (l.file.docs, r.file.docs) |x, y| if (!refEqual(x, y)) return false;
     return true;
 }

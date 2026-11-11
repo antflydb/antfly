@@ -209,7 +209,11 @@ pub const ColumnValues = union(ColumnKind) {
             .decimal128 => |v| .{ .string = try v.text(a, row) },
             .encoded => |v| try v.at(row),
             .json => |v| try std.json.parseFromSliceLeaky(std.json.Value, a, v[row], .{ .parse_numbers = false }),
-            .vector_f32 => return error.RowSourceColumnKindMismatch,
+            .vector_f32 => |vectors| value: {
+                const items = try a.alloc(std.json.Value, vectors[row].len);
+                for (items, vectors[row]) |*item, coordinate| item.* = .{ .float = coordinate };
+                break :value .{ .array = std.array_list.Managed(std.json.Value).fromOwnedSlice(a, items) };
+            },
         };
     }
 };

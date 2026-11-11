@@ -21,6 +21,7 @@ const publication = @import("lake_index_publication.zig");
 const catalog = local.metadata_lake_index_catalog;
 const A = std.mem.Allocator;
 comptime {
+    _ = @import("lake_index_native_state.zig");
     if (!@hasDecl(@import("lake_execution_options"), "external_test_provider")) @import("lake_execution_native_provider.zig").exportOperations();
 }
 
@@ -50,6 +51,14 @@ fn expectCandidate(a: A, expected: catalog.Publication, expected_declarations: [
 }
 
 test "external lake execution operation owns clients checkpoints cancellation and fenced results" {
+    try testNativeExecution(false);
+}
+
+test "external lake execution builds native typed Parquet vector lists across pages" {
+    try testNativeExecution(true);
+}
+
+fn testNativeExecution(typed_vectors: bool) !void {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("lake-execution-native");
     defer directory.cleanup();
@@ -77,10 +86,11 @@ test "external lake execution operation owns clients checkpoints cancellation an
         });
         defer a.free(data);
         var name: [32]u8 = undefined;
-        var put = try client.putObject("antfly", try std.fmt.bufPrint(&name, "part-{d}.parquet", .{file}), data, .{});
+        const typed_data = if (file == 0) @embedFile("testdata/lake_vectors_0.parquet") else @embedFile("testdata/lake_vectors_1.parquet");
+        var put = try client.putObject("antfly", try std.fmt.bufPrint(&name, "part-{d}.parquet", .{file}), if (typed_vectors) typed_data else data, .{});
         put.deinit(a);
     }
-    const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\",\"row_identity\":{{\"key_columns\":[\"body\"]}}}},\"relational_indexes\":[{{\"name\":\"body_idx\",\"keys\":[{{\"column\":\"body\"}}],\"include_columns\":[\"dense\"]}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}},\"dense\":{{\"type\":\"string\"}},\"sparse\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
+    const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\",\"row_identity\":{{\"key_columns\":[\"body\"]}}}},\"relational_indexes\":[{{\"name\":\"body_idx\",\"keys\":[{{\"column\":\"body\"}}],\"include_columns\":[\"dense\"]}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}},\"dense\":{s},\"sparse\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{ directory.path(), if (typed_vectors) "{\"type\":\"array\",\"items\":{\"type\":\"number\"}}" else "{\"type\":\"string\"}" });
     defer a.free(schema);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
     defer binding.deinit(a);
@@ -88,7 +98,7 @@ test "external lake execution operation owns clients checkpoints cancellation an
     defer source.deinit();
     var store = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
     defer store.deinit();
-    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\"},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema, .indexes_json = if (typed_vectors) "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\",\"quantization_bits\":4,\"quantization_refine\":\"all\"},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" else "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\"},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };
     const pending_bytes = try publication.beginWithLocator(a, std.testing.io, table, &source, store.identity, .{}, 100, 1000, store.locator);
     defer a.free(pending_bytes);
     var pending = table;
@@ -190,7 +200,10 @@ test "external lake execution operation owns clients checkpoints cancellation an
         var vectors = try local.storage_lsm_backend.Backend.open(a, "/published-bulk/vectors", .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
         defer vectors.close();
         var loader: native.VectorLoader = .{ .backend = &vectors, .dims = 2 };
-        var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/published-bulk", .{ .dims = 2 }, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
+        var hbc_config: local.storage_hbc_adapter.HBCConfig = .{ .dims = 2 };
+        try native.applyQuantizationJson(a, &hbc_config, root.config_json);
+        try std.testing.expectEqual(@as(u8, if (typed_vectors) 4 else 1), hbc_config.quantization_bits);
+        var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/published-bulk", hbc_config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
         defer index.close();
         index.setIo(std.testing.io);
         index.setExternalVectorLoader(&loader, native.VectorLoader.load);
@@ -329,4 +342,29 @@ test "external lake execution source fixtures ignore product execution selection
     const options = @import("lake_execution_options");
     try std.testing.expect(!options.shared_lake_execution);
     try std.testing.expect(!options.provide_lake_execution);
+}
+
+test "external lake execution native directories admit paged generations above sixteen GiB" {
+    const files = @import("lake_index_native_files.zig");
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const ref: tree.Ref = .{ .digest = @splat(1), .bytes = 128, .height = 2, .records = 131072 };
+    const file: files.File = .{ .path = "posting-segments/segment-1.afps", .bytes = @as(u64, files.chunk_bytes) * ref.records, .chunk_root = ref };
+    try file.validate(@splat(1));
+    const root: files.Root = .{ .version = 2, .domain = @splat(1), .directory = .{ .digest = @splat(1), .bytes = 128, .height = 0, .records = 1 }, .file_count = 1, .chunk_count = ref.records };
+    try root.validate();
+}
+
+test "external lake execution dense quantization reconstructs defaults and rejects invalid recipes" {
+    const dense = @import("lake_index_native_dense.zig");
+    var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = 768 };
+    try dense.applyQuantizationJson(std.testing.allocator, &config, "{}");
+    try std.testing.expectEqual(@as(u8, 1), config.quantization_bits);
+    try std.testing.expect(!config.use_random_ortho_trans);
+    try dense.applyQuantizationJson(std.testing.allocator, &config, "{\"quantization_bits\":4,\"quantization_refine\":\"all\"}");
+    try std.testing.expectEqual(@as(u8, 4), config.quantization_bits);
+    try std.testing.expect(config.use_random_ortho_trans);
+    try std.testing.expectEqual(.all, config.quantization_refine);
+    for ([_][]const u8{ "{\"quantization_bits\":0}", "{\"quantization_bits\":9}", "{\"quantization_bits\":true}", "{\"quantization_refine\":\"invalid\"}", "{\"use_random_ortho_trans\":1}" }) |json| {
+        try std.testing.expectError(error.InvalidIndexConfig, dense.applyQuantizationJson(std.testing.allocator, &config, json));
+    }
 }

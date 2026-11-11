@@ -61,6 +61,8 @@ fn writeFile(a: A, client: *local.storage_object_storage.ObjectStorage, ordinal:
 
 pub fn run(io: std.Io) !void {
     comptime std.debug.assert(!@import("builtin").is_test);
+    if (std.c.getenv("ANTFLY_LAKE_BULK_PARQUET")) |uri| return runParquet(io, std.mem.span(uri));
+    if (std.c.getenv("ANTFLY_LAKE_BULK_PARQUET_FILE") != null) return runParquet(io, "");
     const provider_mode = @extern(*const fn () callconv(.c) u8, .{ .name = "antfly_lake_probe_builtin_is_test" });
     const provider_is_test = provider_mode() != 0;
     try std.testing.expect(!provider_is_test);
@@ -193,4 +195,98 @@ pub fn run(io: std.Io) !void {
             }
         }
     }
+}
+
+/// Exercises the real native operation against an immutable, authored Parquet
+/// vector column, including identity construction and artifact publication.
+fn runParquet(io: std.Io, uri: []const u8) !void {
+    const a = std.heap.smp_allocator;
+    const dims = try count("ANTFLY_LAKE_BULK_DIMS", 768, 65536);
+    const allowance = try count("ANTFLY_LAKE_BULK_INPUT_BYTES", 4 * 1024 * 1024 * 1024, std.math.maxInt(usize) / 2);
+    const algorithm = if (std.c.getenv("ANTFLY_LAKE_BULK_ALGORITHM")) |raw| std.mem.span(raw) else "lloyd";
+    if (!std.mem.eql(u8, algorithm, "lloyd") and !std.mem.eql(u8, algorithm, "emeans")) return error.InvalidProbeWorkload;
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/parquet-bulk-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+    defer a.free(relative);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, relative);
+    defer cwd.deleteTree(io, relative) catch {};
+    var dir = try cwd.openDir(io, relative, .{});
+    defer dir.close(io);
+    var absolute: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try dir.realPath(io, &absolute);
+    const path = absolute[0..path_len];
+    // Prepare a local raw file through the same streaming object codec used by
+    // the filesystem adapter. Fixture upload is outside the operation timer.
+    const source_uri = if (std.c.getenv("ANTFLY_LAKE_BULK_PARQUET_FILE")) |raw| prepare: {
+        const input = try std.fmt.allocPrint(a, "{s}/input", .{path});
+        defer a.free(input);
+        var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, input);
+        defer fs.deinit();
+        var client = fs.client();
+        var uploaded = try client.putFileWithIo(io, "antfly", "train.parquet", std.mem.span(raw), .{});
+        uploaded.deinit(a);
+        break :prepare try std.fmt.allocPrint(a, "file://{s}", .{input});
+    } else try a.dupe(u8, uri);
+    defer a.free(source_uri);
+    const schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"parquet-bulk","format":"parquet","uri":"{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"emb":{{"type":"array","items":{{"type":"number"}}}}}},"additionalProperties":false}}}}}}}}
+    , .{source_uri});
+    defer a.free(schema);
+    const indexes = try std.fmt.allocPrint(a,
+        \\{{"emb":{{"type":"embeddings","external":true,"dimension":{d},"distance_metric":"l2_squared","lake_bulk_build":"{s}","lake_bulk_build_max_input_bytes":{d}}}}}
+    , .{ dims, algorithm, allowance });
+    defer a.free(indexes);
+    var state: support.State = .{ .allocator = a, .io = io, .table = .{ .table_id = 17, .name = "parquet-bulk", .schema_json = schema, .indexes_json = indexes } };
+    defer state.deinit();
+    var store = try Store.openNative(a, null, null, false, .standalone, path);
+    defer store.deinit();
+    const context: local.serverless_query_lake_read_context.Context = .{ .io = io };
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.openWithContext(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{}, context);
+    defer source.deinit();
+    const pending = try publication.beginWithLocator(a, io, state.table, &source, store.identity, context, 100, 1000, store.locator);
+    defer a.free(pending);
+    try state.set(pending);
+    var cause: ?anyerror = null;
+    const started = @import("antfly_platform").time.monotonicNs();
+    const result = try @import("lake_execution_native_client.zig").build(a, io, state.table, .{}, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{}, .{}, &cause);
+    defer a.free(result);
+    const elapsed = @import("antfly_platform").time.monotonicNs() - started;
+    var ready = try catalog.parse(a, result);
+    defer ready.deinit();
+    const ref = ready.value.published.?.directory.?;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const document = try @import("lake_index_directory.zig").loadDocument(arena.allocator(), store.artifactStore(), .{ .kind = .external_base_source, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, null);
+    const declaration = for (document.declarations) |declaration| {
+        if (declaration.artifact.kind == .vector_segment) break declaration;
+    } else return error.InvalidProbeWorkload;
+    const dense = @import("lake_index_native_dense.zig");
+    const root = try dense.loadRoot(arena.allocator(), store.artifactStore(), declaration.artifact, .none, null);
+    const files = @import("lake_index_native_files.zig");
+    var reader: files.Reader = .{ .root = root.generation, .prefix = "/parquet-bulk", .store = store.artifactStore(), .context = context, .scratch = a };
+    defer reader.deinit();
+    var vectors = try local.storage_lsm_backend.Backend.open(a, "/parquet-bulk/vectors", .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
+    defer vectors.close();
+    var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = @intCast(dims), .max_cached_nodes = 256, .max_cached_vectors = 0, .max_cached_metadata = 0 };
+    try dense.applyQuantizationJson(a, &config, root.config_json);
+    config.metric = std.meta.stringToEnum(@TypeOf(config.metric), root.metric) orelse return error.InvalidProbeWorkload;
+    var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/parquet-bulk", config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
+    defer index.close();
+    index.setIo(io);
+    var loader: dense.VectorLoader = .{ .backend = &vectors, .dims = @intCast(dims), .context = context };
+    index.setExternalVectorLoader(&loader, dense.VectorLoader.load);
+    index.setExternalVectorScratchLoader(&loader, dense.VectorLoader.loadInto);
+    index.setExternalVectorBatchScratchLoader(&loader, dense.VectorLoader.loadMany);
+    try index.activateExperimentalPostingReads(0);
+    const query = try a.alloc(f32, dims);
+    defer a.free(query);
+    @memset(query, 1);
+    var hits = try index.search(query, 10);
+    defer hits.deinit();
+    if (hits.getHits().len == 0) return error.InvalidProbeWorkload;
+    std.debug.print("PARQUET_BULK algorithm={s} vectors={} dims={} total_ns={} reopened_hits={} checkpoints={}\n", .{ algorithm, index.stats().active_count, dims, elapsed, hits.getHits().len, state.checkpoints });
 }

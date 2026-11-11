@@ -3315,14 +3315,16 @@ fn decodeCompressedExactAlloc(
         },
         .gzip => blk: {
             var in: std.Io.Reader = .fixed(compressed);
-            var window: [std.compress.flate.max_window_len]u8 = undefined;
-            var decompress: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+            const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+            defer alloc.free(window);
+            var decompress: std.compress.flate.Decompress = .init(&in, .gzip, window);
             break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
         .zstd => blk: {
             var in: std.Io.Reader = .fixed(compressed);
-            var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-            var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
+            const window = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+            defer alloc.free(window);
+            var decompress: std.compress.zstd.Decompress = .init(&in, window, .{});
             break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
     };

@@ -118,6 +118,7 @@ fn spooledBuild(idx: *hbc.HBCIndex, source: Source, path: []const u8, options: h
     var output = try spool.create(&buffer);
     var output_open = true;
     defer if (output_open) output.abort(spool);
+    try output.enableSample(a, 16 * 32, options.sample_bytes, idx.rng.intN(std.math.maxInt(usize)));
     var read_buffer: [64 * 1024]u8 = undefined;
     var reader = source.file.?.reader(io, &read_buffer);
     const vector = try a.alloc(f32, source.dims);

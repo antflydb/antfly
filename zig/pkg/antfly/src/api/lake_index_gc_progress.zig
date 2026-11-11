@@ -212,6 +212,7 @@ pub const Progress = struct {
                         }
                         if (visitor.native_files) {
                             const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(visitor.a, key, bytes, visitor.progress.value.domain);
+                            if (file.docs_root) |root| try visitor.progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false, .native_chunks = true } });
                             for (file.docs) |ref| try visitor.progress.enqueue(.{ .chunk = ref });
                             return;
                         }

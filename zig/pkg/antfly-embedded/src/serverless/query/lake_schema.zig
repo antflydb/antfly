@@ -33,6 +33,7 @@ pub const Column = struct {
     /// physical floats cannot silently become exact NUMERIC values.
     pub fn accepts(self: Column, actual: []const u8) bool {
         if (std.mem.eql(u8, self.kind, "numeric")) return std.mem.eql(u8, actual, "integer") or std.mem.eql(u8, actual, "string");
+        if (std.mem.eql(u8, self.kind, "json") and std.mem.eql(u8, actual, "array")) return true;
         return std.mem.eql(u8, actual, self.kind);
     }
 };
@@ -56,6 +57,7 @@ pub fn readFooter(a: A, reader: parquet.ObjectRangeReader, file: external.FileEn
     return metadata.parseFooterMetadataAlloc(a, bytes, file.byte_len);
 }
 pub fn parquetKind(column: metadata.SchemaColumn) ![]const u8 {
+    if (std.mem.startsWith(u8, column.logical_type, "vector_f32:")) return "array";
     if (column.nested) return error.UnsupportedExternalLakeSchemaType;
     if (std.mem.eql(u8, column.logical_type, "decimal")) {
         @import("lake_decimal.zig").validate(column.decimal_precision, column.decimal_scale) catch return error.UnsupportedExternalLakeSchemaType;

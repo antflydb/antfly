@@ -10463,6 +10463,7 @@ fn putMissingDeferredVecLeafMappings(self: anytype, txn: anytype, mappings: []co
 /// session, where intermediate commits are not published and an interrupted
 /// build leaves the bulk-publish marker that forces a rebuild on reopen.
 pub const BulkCommitRotation = struct {
+    fresh_snapshot: bool = false,
     budget: u64 = 0,
     /// Builder's own estimate of bytes staged since the last commit.
     staged: u64 = 0,
@@ -10473,6 +10474,13 @@ pub const BulkCommitRotation = struct {
     ratio: f64 = 1,
     commits: u64 = 0,
 };
+
+fn beginBulkBuildBatch(self: anytype) @TypeOf(self.beginRuntimeBatchTxn()) {
+    if (comptime @hasDecl(childType(@TypeOf(self)), "beginOfflineBulkBatch")) {
+        if (self.bulk_commit_rotation.fresh_snapshot) return self.beginOfflineBulkBatch();
+    }
+    return self.beginRuntimeBatchTxn();
+}
 
 /// Notes `bytes` staged into `txn` by the bulk builder and, at or over the
 /// budget, commits it and continues in a fresh runtime batch. Callers invoke
@@ -10500,7 +10508,7 @@ fn bulkNoteStaged(self: anytype, txn: anytype, bytes: u64) !void {
     rotation.commits += 1;
     rotation.staged = 0;
     rotation.next_check = rotation.budget / 2;
-    txn.* = self.beginRuntimeBatchTxn() catch |err| {
+    txn.* = beginBulkBuildBatch(self) catch |err| {
         txn.* = store.NamespaceBatch.inert(self.alloc);
         return err;
     };
@@ -10698,10 +10706,13 @@ pub fn bulkBuildSpool(self: anytype, spool: *bulk_spool.Spool, root: bulk_spool.
     try self.beginBulkIngestSession();
     var session_open = true;
     errdefer if (session_open) self.abortBulkIngestSession();
-    self.bulk_commit_rotation = .{ .budget = options.commit_bytes };
-    defer self.bulk_commit_rotation.budget = 0;
+    self.bulk_commit_rotation = .{ .budget = options.commit_bytes, .fresh_snapshot = true };
+    defer {
+        self.bulk_commit_rotation.budget = 0;
+        self.bulk_commit_rotation.fresh_snapshot = false;
+    }
     {
-        var batch = try self.beginRuntimeBatchTxn();
+        var batch = try beginBulkBuildBatch(self);
         errdefer batch.abort();
         errdefer abortVectorCacheMutationsIfSupported(self);
         try self.bindTxnLike(&batch);
@@ -10826,7 +10837,14 @@ fn partitionBulkSpool(
     const vector = try a.alloc(f32, dims);
     const key = try a.alloc(u8, spool_max_key);
     const read_buffer = try a.alloc(u8, spool_buffer_bytes);
-    {
+    if (partition.sample_count >= sample_count) {
+        var reader = try spool.openSample(partition, read_buffer);
+        defer reader.file.close(spool.io);
+        for (points, 0..) |*point, row| {
+            const value = sample[row * dims ..][0..dims];
+            point.* = .{ .stable_id = try bulk_spool.readSample(&reader.interface, value), .vector = value, .weight = 1 };
+        }
+    } else {
         var reader = try spool.open(partition, read_buffer);
         defer reader.file.close(spool.io);
         for (0..partition.count) |i| {
@@ -10894,6 +10912,7 @@ fn routeBulkSpool(
         leaf_cursor += quota;
         outputs[branch] = try spool.create(try a.alloc(u8, spool_buffer_bytes));
         opened += 1;
+        try outputs[branch].enableSample(self.alloc, spool_max_branches * 32, options.sample_bytes, self.rng.intN(std.math.maxInt(usize)));
     }
 
     var reader = try spool.open(partition, read_buffer);
@@ -10922,7 +10941,7 @@ fn routeBulkSpool(
 
     if (!balanced) {
         const max_count = for (partitions) |child| {
-            if (child.count > partition.count - partition.count / 4) break child.count;
+            if (child.count > partition.count - @max(1, partition.count / 4)) break child.count;
         } else 0;
         if (max_count != 0) {
             for (partitions) |child| spool.remove(child);
