@@ -70,7 +70,7 @@ FROM --platform=$TARGETPLATFORM alpine:3.21
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
-LABEL org.opencontainers.image.licenses=Elastic-2.0
+LABEL org.opencontainers.image.licenses=Apache-2.0
 
 RUN apk add --no-cache ca-certificates && \
     addgroup -S -g 10001 antfly && adduser -S -u 10001 -G antfly -h /home/antfly antfly && \
@@ -79,6 +79,7 @@ RUN apk add --no-cache ca-certificates && \
 WORKDIR /
 COPY --from=builder /out/bin/antfly /antfly
 COPY --from=builder /out/share/antfly /usr/share/antfly
+COPY --from=builder /out/share/licenses/antfly /usr/share/licenses/antfly
 COPY --from=wasmtime /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
 
 ENV ANTFLY_WASMTIME_LIB=/usr/local/lib/libwasmtime.so
