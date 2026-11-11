@@ -16,6 +16,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -123,7 +124,7 @@ class PreviousReaderBuildTests(unittest.TestCase):
                 self.assertEqual(kwargs["env"]["TZ"], "UTC0")
                 self.assertEqual(
                     kwargs["env"]["ZIG_GLOBAL_CACHE_DIR"],
-                    str(baseline / "zig/.zig-global-cache"),
+                    str(baseline / "zig/.zig-cache/global"),
                 )
                 extension = (
                     ".dylib" if previous_reader.sys.platform == "darwin" else ".so"
@@ -137,6 +138,9 @@ class PreviousReaderBuildTests(unittest.TestCase):
             patch.object(
                 previous_reader, "__file__", str(root / "scripts/ci/prepare.py")
             ),
+            patch.object(
+                previous_reader, "prepare_previous_reader_dependencies"
+            ) as dependencies,
             patch.object(previous_reader.subprocess, "run", side_effect=run),
             patch.object(
                 previous_reader.subprocess,
@@ -146,6 +150,12 @@ class PreviousReaderBuildTests(unittest.TestCase):
             patch("builtins.print"),
         ):
             previous_reader.main()
+        dependencies.assert_called_once()
+        self.assertEqual(dependencies.call_args.args[:2], (root, baseline))
+        self.assertEqual(
+            dependencies.call_args.args[2]["ZIG_LOCAL_CACHE_DIR"],
+            str(baseline / "zig/.zig-cache"),
+        )
         self.assertEqual(
             builds,
             [
@@ -162,6 +172,25 @@ class PreviousReaderBuildTests(unittest.TestCase):
                 ]
             ],
         )
+
+    def test_previous_reader_seeds_verified_sources_offline_into_its_own_cache(self):
+        root = self.previous / "repo"
+        source = root / "zig/.zig-cache/global"
+        baseline = root / ".worktrees/reader-baseline"
+        env = {"ZIG_GLOBAL_CACHE_DIR": str(baseline / "zig/.zig-cache/global")}
+        with (
+            patch.dict(os.environ, {"CI": "true", "ZIG_GLOBAL_CACHE_DIR": str(source)}),
+            patch.object(previous_reader.subprocess, "run") as run,
+        ):
+            previous_reader.prepare_previous_reader_dependencies(root, baseline, env)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--seed") + 1], str(source / "p"))
+        self.assertEqual(
+            command[command.index("--cache") + 1], env["ZIG_GLOBAL_CACHE_DIR"]
+        )
+        self.assertEqual(command[command.index("--root") + 1], str(baseline / "zig"))
+        self.assertIn("--offline", command)
+        self.assertNotEqual(source, Path(env["ZIG_GLOBAL_CACHE_DIR"]))
 
     def test_main_rejects_wrong_revision_before_repair_or_build(self):
         root = self.previous / "repo"

@@ -333,7 +333,8 @@ try {
     const runners = [spawnWorker("migrate"), spawnWorker("migrate")];
     const outcomes = await Promise.all(runners.map((runner) => runner.message));
     await Promise.all(runners.map((runner) => runner.exited));
-    for (const outcome of outcomes) assert.equal(outcome.error, null);
+    assert.deepEqual(outcomes.map((outcome) => outcome.error), [null, null],
+      `Concurrent migration outcomes: ${JSON.stringify(outcomes)}`);
     assert.equal(
       outcomes.reduce((total, outcome) => total + outcome.applied, 0),
       1,

@@ -14179,6 +14179,38 @@ pub const IndexManager = struct {
         if (previous) |*old| old.deinit(self.alloc);
     }
 
+    /// Discovery compares source routing and revision clocks, never executes a
+    /// resolver. Keep its per-window allocation independent of static aliases,
+    /// curation receipts and provider configuration. Include private/staged
+    /// definitions exactly as listResolvers does; they still own replay debt.
+    pub fn listResolverBackfillDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        try result.ensureTotalCapacityPrecise(alloc, self.resolvers.items.len);
+        for (self.resolvers.items) |cfg| {
+            result.appendAssumeCapacity(try ResolverConfig.clone(alloc, .{
+                .name = cfg.name,
+                .table = cfg.table,
+                .key_template = cfg.key_template,
+                .source_artifact = cfg.source_artifact,
+                .source_artifact_kind = cfg.source_artifact_kind,
+                .resolution_artifact = cfg.resolution_artifact,
+                .labels = cfg.labels,
+                .retired = cfg.retired,
+                .replacement_index = cfg.replacement_index,
+                .config_generation = cfg.config_generation,
+                .merge_generation = cfg.merge_generation,
+                .resolution_generation = cfg.resolution_generation,
+            }));
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
     pub fn listResolvers(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
         return self.cloneResolverSelection(alloc, true);
     }
@@ -51558,7 +51590,7 @@ test "inline resolver replacement public listing filters before cloning and unwi
     staged.name = "__antfly_replacement/new/1/concepts";
     staged.replacement_index = "new";
     staged.replacement_resolver = "concepts";
-    try manager.resolvers.append(a, try ResolverConfig.clone(a, staged));
+    manager.resolvers.appendAssumeCapacity(try ResolverConfig.clone(a, staged));
     const Check = struct {
         fn run(alloc: Allocator, target: *IndexManager) !void {
             const configs = try target.listPublicResolvers(alloc);
@@ -53369,4 +53401,68 @@ test "privacy text projection retains primary identity and removes private recei
     try std.testing.expect(std.mem.indexOf(u8, projected.stored_data, "private") == null);
     try std.testing.expect(projected.doc_ordinal == null and !projected.schema_less_fast_projection);
     try std.testing.expect(root.object.contains("_privacy"));
+}
+
+test "resolver backfill descriptors retain staged routing and revisions within policy independent memory" {
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const aliases = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    defer a.free(aliases);
+    var initialized: usize = 0;
+    defer for (aliases[0..initialized]) |alias| {
+        a.free(alias.key);
+        a.free(alias.target);
+    };
+    for (aliases, 0..) |*alias, i| {
+        const key = try std.fmt.allocPrint(a, "entity/source-{d}", .{i});
+        errdefer a.free(key);
+        alias.* = .{ .key = key, .target = try std.fmt.allocPrint(a, "entity/target-{d}", .{i}) };
+        initialized += 1;
+    }
+    const cfg: ResolverConfig = .{
+        .name = "people",
+        .table = "entities",
+        .key_template = "entity/{{_key}}",
+        .source_artifact = "mentions",
+        .source_artifact_kind = .chunk,
+        .resolution_artifact = "resolved",
+        .labels = &.{"PERSON"},
+        .aliases = aliases,
+        .config_generation = 3,
+        .merge_generation = 5,
+        .resolution_generation = 7,
+    };
+    try manager.resolvers.ensureTotalCapacityPrecise(a, 2);
+    manager.resolvers.appendAssumeCapacity(try ResolverConfig.clone(a, cfg));
+    var staged = cfg;
+    staged.name = "__antfly_replacement/people";
+    staged.replacement_index = "next_graph";
+    try manager.resolvers.append(a, try ResolverConfig.clone(a, staged));
+    // Two full policy clones cannot fit here; routing/revision descriptors do.
+    var bytes: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    const selected = try manager.listResolverBackfillDescriptors(bounded.allocator());
+    defer {
+        for (selected) |*entry| entry.deinit(bounded.allocator());
+        bounded.allocator().free(selected);
+    }
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    for (selected) |entry| {
+        try std.testing.expectEqualStrings("mentions", entry.source_artifact);
+        try std.testing.expectEqual(.chunk, entry.source_artifact_kind);
+        try std.testing.expectEqualStrings("resolved", entry.resolution_artifact);
+        try std.testing.expectEqual(@as(u64, 7), entry.effectiveGeneration());
+        try std.testing.expect(entry.resolvesLabel("PERSON"));
+        try std.testing.expect(!entry.resolvesLabel("ORG"));
+        try std.testing.expectEqual(@as(usize, 0), entry.aliases.len);
+    }
+    try std.testing.expect(!selected[0].sharesRoutingDomain(selected[1]));
+    try std.testing.expectEqualStrings("next_graph", selected[1].replacement_index);
 }

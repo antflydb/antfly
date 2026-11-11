@@ -2663,11 +2663,22 @@ class InferenceEmbeddingServer:
         with self._transient_embedding_lock:
             return self._transient_embedding_requests
 
+    @property
+    def embedding_delay_blocked(self) -> bool:
+        """The explicit gate still owns an admitted corpus request."""
+        return (
+            self.response_delay_s is None
+            and self._delay_enabled.is_set()
+            and self._embedding_request_active.is_set()
+            and not self._delay_released.is_set()
+        )
+
     def release_delay(self) -> None:
         self._delay_enabled.clear()
         self._delay_released.set()
 
     def stop(self) -> None:
+        self.release_delay()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)

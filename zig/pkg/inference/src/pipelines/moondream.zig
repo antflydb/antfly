@@ -47,7 +47,10 @@ pub const stop_text = "<END>";
 /// single-file safetensors checkpoint. Loads no weights.
 pub fn probeModelDir(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
     if (!build_options.enable_native) return false;
-    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    var artifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
     defer artifacts.deinit();
     for ([_][]const u8{ "tokenizer.json", weights_file }) |name| {
         const path = (try artifacts.resolve(name)) orelse return false;
