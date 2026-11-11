@@ -27,6 +27,28 @@ function fixture() {
 }
 
 describe("persistent migration ownership", () => {
+  it("waits with reads while another runner owns the claim, then arbitrates atomically", async () => {
+    vi.useFakeTimers();
+    try {
+      const { store, db } = fixture();
+      const owner = persistentMigrationLock(store);
+      const contender = persistentMigrationLock(store);
+      await owner.acquire(db);
+      const waiting = contender.acquire(db);
+      await vi.advanceTimersByTimeAsync(500);
+      // One owner INSERT and one definitively rejected contender INSERT.
+      // Repeated waiting must not compete with the owner's DDL for a writer.
+      expect(store.insert).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(store.read).mock.calls.length).toBeGreaterThan(3);
+      await owner.release(db);
+      await vi.advanceTimersByTimeAsync(200);
+      await waiting;
+      expect(store.insert).toHaveBeenCalledTimes(3);
+      await contender.release(db);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("excludes another runner and only releases confirmed ownership", async () => {
     const { store, db, claim } = fixture();
     const first = persistentMigrationLock(store, { waitTimeoutMs: 0 });

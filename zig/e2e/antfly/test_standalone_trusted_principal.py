@@ -171,7 +171,8 @@ def _exercise_lake_writer(call, secret, tmp_path, admin):
             break
         assert (
             status == 503
-            and json.loads(visible)["code"] == "index_rebuilding"
+            and json.loads(visible)["code"]
+            in {"index_rebuilding", "storage_read_temporarily_unavailable"}
             and time.monotonic() < deadline
         ), visible
         time.sleep(0.1)

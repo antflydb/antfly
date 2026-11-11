@@ -46,6 +46,7 @@ const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").A
 const LmdbBackend = @import("../../../build_support/embedded/storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    inference_enable_cuda: bool,
     apple_bridge: ?std.Build.LazyPath = null,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
@@ -5726,8 +5727,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     device_budget_host_root.addImport("antfly_inference_engine", test_imports.runtime.inference_engine);
     device_budget_host_root.addImport("inference_server", test_imports.runtime.inference_server);
     device_budget_host_root.link_libc = true;
-    const device_budget_host_tests = b.addTest(.{ .root_module = device_budget_host_root, .max_rss = 24 * 1024 * 1024 * 1024 });
+    const device_budget_host_tests = b.addTest(.{
+        .name = "inference-device-budget-host-tests",
+        .root_module = device_budget_host_root,
+        // This fixture owns two engine-host tests, not every test reachable
+        // through the production inference module. CPU builds compile only
+        // their capability skips; retain the existing CUDA compiler claim.
+        .filters = &.{"CUDA production engine"},
+        .max_rss = if (options.inference_enable_cuda) 24 * 1024 * 1024 * 1024 else 1536 * 1024 * 1024,
+    });
     const run_device_budget_host_tests = b.addRunArtifact(device_budget_host_tests);
+    if (!options.inference_enable_cuda) run_device_budget_host_tests.step.max_rss = 256 * 1024 * 1024;
     b.step("inference-device-budget-host-test", "Verify CUDA device ownership through the production engine host").dependOn(&run_device_budget_host_tests.step);
     inference_host_test_step.dependOn(&run_device_budget_host_tests.step);
     lib_standalone_runtime_test_step.dependOn(&run_device_budget_host_tests.step);

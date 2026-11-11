@@ -1,22 +1,21 @@
 {
-  "format_version": 1,
   "cases": [
     {
       "id": "mixed_tasks",
       "kind": "extract",
       "schema": {
-        "entities": [
-          "person",
-          "organization"
-        ],
         "classifications": [
           {
-            "task": "sentiment",
             "labels": [
               "positive",
               "negative"
-            ]
+            ],
+            "task": "sentiment"
           }
+        ],
+        "entities": [
+          "person",
+          "organization"
         ],
         "relations": [
           "works_for"
@@ -31,8 +30,8 @@
       "kind": "extract",
       "schema": {
         "entities": {
-          "person": "A named person",
-          "location": "A named place"
+          "location": "A named place",
+          "person": "A named person"
         }
       },
       "texts": [
@@ -47,24 +46,24 @@
           "product"
         ],
         "entity_attributes": {
-          "sentiment": {
-            "labels": [
-              "positive",
-              "negative",
-              "neutral"
-            ],
-            "applies_to": [
-              "product"
-            ],
-            "qualify_labels": true
-          },
           "condition": {
             "labels": [
               "working",
               "broken"
             ],
             "multi_label": true,
-            "threshold": 0.5,
+            "qualify_labels": true,
+            "threshold": 0.5
+          },
+          "sentiment": {
+            "applies_to": [
+              "product"
+            ],
+            "labels": [
+              "positive",
+              "negative",
+              "neutral"
+            ],
             "qualify_labels": true
           }
         }
@@ -81,12 +80,12 @@
           "employment": {
             "fields": [
               {
-                "name": "person",
-                "dtype": "str"
+                "dtype": "str",
+                "name": "person"
               },
               {
-                "name": "organization",
-                "dtype": "list"
+                "dtype": "list",
+                "name": "organization"
               }
             ]
           }
@@ -102,21 +101,21 @@
       "schema": {
         "structures": {
           "employment": {
-            "mode": "natural",
             "anchor": "person",
-            "occurrence_policy": "latent_all",
             "fields": [
               {
-                "name": "person",
+                "cardinality": "required_one",
                 "dtype": "str",
-                "cardinality": "required_one"
+                "name": "person"
               },
               {
-                "name": "organization",
                 "dtype": "str",
-                "exclusive": true
+                "exclusive": true,
+                "name": "organization"
               }
-            ]
+            ],
+            "mode": "natural",
+            "occurrence_policy": "latent_all"
           }
         }
       },
@@ -130,17 +129,17 @@
       "schema": {
         "structures": {
           "employment": {
-            "mode": "latent",
             "fields": [
               {
-                "name": "person",
-                "dtype": "str"
+                "dtype": "str",
+                "name": "person"
               },
               {
-                "name": "organization",
-                "dtype": "str"
+                "dtype": "str",
+                "name": "organization"
               }
-            ]
+            ],
+            "mode": "latent"
           }
         }
       },
@@ -154,17 +153,17 @@
       "schema": {
         "structures": {
           "employment": {
-            "mode": "anchorless",
             "fields": [
               {
-                "name": "person",
-                "dtype": "str"
+                "dtype": "str",
+                "name": "person"
               },
               {
-                "name": "organization",
-                "dtype": "str"
+                "dtype": "str",
+                "name": "organization"
               }
-            ]
+            ],
+            "mode": "anchorless"
           }
         }
       },
@@ -180,16 +179,16 @@
           "review": {
             "fields": [
               {
-                "name": "product",
-                "dtype": "str"
+                "dtype": "str",
+                "name": "product"
               },
               {
-                "name": "sentiment",
-                "dtype": "str",
                 "choices": [
                   "positive",
                   "negative"
-                ]
+                ],
+                "dtype": "str",
+                "name": "sentiment"
               }
             ]
           }
@@ -203,40 +202,40 @@
       "id": "constrained_classification",
       "kind": "classification",
       "schema": {
-        "version": 3,
+        "constraints": [
+          {
+            "cond": {
+              "label": "delete",
+              "task": "intent",
+              "type": "LabelRef"
+            },
+            "then": {
+              "label": "delete",
+              "task": "effects",
+              "type": "LabelRef"
+            },
+            "type": "Implies"
+          }
+        ],
         "tasks": {
-          "intent": {
-            "labels": [
-              "read",
-              "delete"
-            ],
-            "min_labels": 1,
-            "max_labels": 1
-          },
           "effects": {
             "labels": [
               "read_only",
               "delete"
             ],
-            "min_labels": 1,
-            "max_labels": 1
+            "max_labels": 1,
+            "min_labels": 1
+          },
+          "intent": {
+            "labels": [
+              "read",
+              "delete"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
           }
         },
-        "constraints": [
-          {
-            "type": "Implies",
-            "cond": {
-              "type": "LabelRef",
-              "task": "intent",
-              "label": "delete"
-            },
-            "then": {
-              "type": "LabelRef",
-              "task": "effects",
-              "label": "delete"
-            }
-          }
-        ]
+        "version": 3
       },
       "texts": [
         "Delete the temporary file."
@@ -255,10 +254,10 @@
             "head": [
               "person"
             ],
+            "max_per_head": 1,
             "tail": [
               "organization"
-            ],
-            "max_per_head": 1
+            ]
           }
         }
       },
@@ -266,5 +265,6 @@
         "John works at Apple. Alice works at Google."
       ]
     }
-  ]
+  ],
+  "format_version": 1
 }
