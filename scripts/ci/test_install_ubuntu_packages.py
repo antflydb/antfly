@@ -15,6 +15,8 @@
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -24,7 +26,7 @@ SCRIPT = Path(__file__).with_name("install_ubuntu_packages.sh")
 
 
 class InstallUbuntuPackagesTests(unittest.TestCase):
-    def run_install(self, failures, install_status=0, sources=None):
+    def run_install(self, failures, install_status=0, sources=None, command=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_env = {}
@@ -58,7 +60,10 @@ else:
                 path.write_text(body)
                 path.chmod(0o755)
             result = subprocess.run(
-                ["bash", str(SCRIPT), "pkg-config", "build-essential"],
+                ["bash", "-c", command]
+                if command is not None
+                else ["bash", str(SCRIPT), "pkg-config", "build-essential"],
+                cwd=SCRIPT.parents[2],
                 env={
                     **os.environ,
                     "PATH": f"{root}:{os.environ['PATH']}",
@@ -75,6 +80,40 @@ else:
                 else []
             )
             return result.returncode, calls
+
+    def test_zig_workflow_has_no_unverified_package_setup(self):
+        workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text()
+        self.assertNotRegex(workflow, r"\bapt-get\b")
+        self.assertLess(
+            workflow.index(
+                "bash scripts/ci/install_ubuntu_packages.sh bzip2 xz-utils time"
+            ),
+            workflow.index("uses: mlugg/setup-zig@"),
+        )
+        # Run the actual package arguments from every migrated setup variant
+        # through the installer. A transient refresh failure must finish a
+        # verified refresh before installing the exact original package set.
+        commands = set(
+            re.findall(
+                r"(?:run: |^ +)(bash scripts/ci/install_ubuntu_packages\.sh [^\n]+)",
+                workflow,
+                re.MULTILINE,
+            )
+        )
+        self.assertTrue(commands)
+        for command in sorted(commands):
+            with self.subTest(packages=command):
+                packages = shlex.split(command)[2:]
+                status, calls = self.run_install(1, sources="present", command=command)
+                self.assertEqual(status, 0)
+                self.assertEqual([call[-1] for call in calls[:2]], ["update", "update"])
+                self.assertEqual(
+                    calls[2][-(len(packages) + 2) :], ["install", "-y", *packages]
+                )
+                status, calls = self.run_install(5, sources="present", command=command)
+                self.assertEqual(status, 100)
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(all(call[-1] == "update" for call in calls))
 
     def test_success_installs_once_after_verified_refresh(self):
         status, calls = self.run_install(0)
