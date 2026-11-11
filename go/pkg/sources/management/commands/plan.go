@@ -168,7 +168,7 @@ func planManifest(ctx context.Context, api API, m Manifest, opts PlanOptions) (P
 		if !create {
 			item.Revision = sourceRevision(current)
 			item.Action = PlanUnchanged
-			if management.SourceRevision(desired) != management.SourceRevision(current) {
+			if management.SourceRevision(manifestDeclaration(desired)) != management.SourceRevision(manifestDeclaration(current)) {
 				item.Action = PlanUpdate
 				item.Changes, err = manifestChanges(current, desired)
 				if err != nil {
@@ -249,6 +249,11 @@ func validateDesired(source management.Source, c management.Capabilities) error 
 }
 
 func manifestDeclaration(source management.Source) management.Source {
+	// Nil and empty reader lists both mean no explicit readers. Normalize only
+	// manifest comparison, leaving the server's revision authoritative.
+	if source.Permissions.Readers == nil {
+		source.Permissions.Readers = []string{}
+	}
 	source.State = ""
 	source.SearchStatus = nil
 	source.KnowledgeStatus = nil

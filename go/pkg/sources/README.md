@@ -886,7 +886,9 @@ revision is authoritative (do not recompute it client-side).
 
 Optional empty stream/artifact arrays have the same revision as omitted arrays,
 matching their HTTP representation. Clearing either collection converges after
-one write.
+one write. Public policies with an omitted or empty `readers` list also compare
+as equivalent during manifest planning; the server's opaque revision remains
+authoritative for conditional writes.
 
 Runtimes may expose read-only `reconciliation_status` (`pending`, `failed` or
 `ready`) when desired state is committed before configuration side effects.

@@ -716,3 +716,26 @@ func TestApplyRetriesUnfinishedReconciliation(t *testing.T) {
 		})
 	}
 }
+
+func TestPublicManifestWithoutReadersConverges(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		readers []string
+	}{{"hosted empty list", []string{}}, {"omitted list", nil}} {
+		t.Run(test.name, func(t *testing.T) {
+			current := manifestCurrent("public-docs")
+			current.Permissions = management.Permissions{Public: true, Readers: test.readers}
+			entry := manifestEntry("public-docs")
+			entry.Permissions = &management.Permissions{Public: true}
+			api := newManifestAPI(t, current)
+			results, err := ApplyManifest(t.Context(), Env{API: api, Out: io.Discard}, manifestFile(entry), PlanOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireApplyOutcomes(t, results, []string{"public-docs"}, []string{"unchanged"})
+			if len(api.writes) != 0 {
+				t.Fatal("equivalent public policy must not write or reconcile")
+			}
+		})
+	}
+}
