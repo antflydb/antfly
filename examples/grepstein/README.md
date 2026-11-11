@@ -293,7 +293,7 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 
 ```sh
 ./grepstein enrich --url "$ANTFLY_URL" --stage semantic \
-  --embedder-config vertex-embedder.example.json
+  --embedder-config antfly-embedder.example.json
 ./grepstein wait --url "$ANTFLY_URL" --index embeddings
 ./grepstein enrich --url "$ANTFLY_URL" --stage graph
 ./grepstein graph --state ./grepstein-corpus --url "$ANTFLY_URL"
@@ -301,7 +301,8 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 ./grepstein wait --url "$ANTFLY_URL" --index autograph_relations
 ```
 
-The showcase Vertex profile selects **`gemini-embedding-2`**, project
+The alternative `--embedder-config vertex-embedder.example.json` profile selects
+**`gemini-embedding-2`**, project
 `antfly-showcases`, location `global`, and 3072 dimensions. The index, generated
 embedding artifacts, and query embedder share the same dimensions/provider.
 The stable Google model ID is not `gemini-embedding-002`. The native adapter uses
@@ -386,7 +387,7 @@ are retired. Existing projection tables/buckets are not automatically deleted.
 Build both binaries from the same checkout, then run the real PDF-to-grep path:
 
 ```sh
-(cd zig && zig build antfly grep -j2 -Doptimize=ReleaseSafe)
+(cd zig && zig build antfly grep -j2 -Doptimize=Debug)
 (cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
   ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
   ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
