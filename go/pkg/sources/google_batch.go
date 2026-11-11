@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"strconv"
+	"strings"
 )
 
 const GCSAccessBatchLimit = 100
@@ -53,8 +54,9 @@ func (c *GoogleConnector) CheckGCSAccessBatch(ctx context.Context, r Request, it
 			return nil, err
 		}
 		part, err := writer.CreatePart(textproto.MIMEHeader{
-			"Content-Type": {"application/http"},
-			"Content-Id":   {"<" + strconv.Itoa(i) + ">"},
+			"Content-Type":              {"application/http"},
+			"Content-Transfer-Encoding": {"binary"},
+			"Content-Id":                {"<" + strconv.Itoa(i) + ">"},
 		})
 		if err != nil {
 			return nil, err
@@ -83,11 +85,11 @@ func (c *GoogleConnector) CheckGCSAccessBatch(ctx context.Context, r Request, it
 	if resp.StatusCode != http.StatusOK {
 		return nil, googleResponseError(resp)
 	}
-	kind, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil || kind != "multipart/mixed" || params["boundary"] == "" {
-		return nil, fmt.Errorf("invalid GCS metadata batch response")
+	boundary, err := gcsBatchBoundary(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, err
 	}
-	reader := multipart.NewReader(io.LimitReader(resp.Body, 4<<20), params["boundary"])
+	reader := multipart.NewReader(io.LimitReader(resp.Body, 4<<20), boundary)
 	results := make([]error, len(items))
 	for i, item := range items {
 		part, err := reader.NextPart()
@@ -124,4 +126,18 @@ func checkGCSAccessReply(reply *http.Response, item Item) error {
 		return &RevisionChangedError{Expected: item.Revision, Actual: object.Generation}
 	}
 	return nil
+}
+
+func gcsBatchBoundary(contentType string) (string, error) {
+	kind, params, err := mime.ParseMediaType(contentType)
+	if err == nil && kind == "multipart/mixed" && params["boundary"] != "" {
+		return params["boundary"], nil
+	}
+	// GCS documents responses with unquoted "=" characters in the boundary.
+	if raw, ok := strings.CutPrefix(contentType, "multipart/mixed; boundary="); ok && !strings.ContainsAny(raw, " \t;") {
+		if err := multipart.NewWriter(io.Discard).SetBoundary(raw); err == nil {
+			return raw, nil
+		}
+	}
+	return "", fmt.Errorf("invalid GCS metadata batch response")
 }
