@@ -96,13 +96,97 @@ func TestArchiveRejectsNonZIPWithMatchingChecksum(t *testing.T) {
 	}
 }
 
-func TestArchiveOnlySmallDatasets(t *testing.T) {
-	for _, id := range []string{"doj-08", "doj-09", "doj-10", "doj-11", "court-2024", "doj-00"} {
+func TestArchiveRejectsUnknownDatasets(t *testing.T) {
+	for _, id := range []string{"court-2024", "doj-00", "doj-13"} {
 		if archiveItem(id) != "" {
 			t.Fatalf("allowed deferred dataset %s", id)
 		}
 		if err := fetchArchiveCmd([]string{"--dataset", id}); err == nil {
 			t.Fatalf("fetch accepted %s", id)
+		}
+	}
+}
+
+func TestArchiveResumeAndRangeValidation(t *testing.T) {
+	var data bytes.Buffer
+	writer := zip.NewWriter(&data)
+	member, err := writer.Create("DATA/EFTA00000001.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := member.Write(createMinimalPDF()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wire := data.Bytes()
+	for _, mode := range []string{"range", "restart", "invalid-range"} {
+		t.Run(mode, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if requests == 1 {
+					w.Header().Set("Content-Length", fmt.Sprint(len(wire)))
+					w.Write(wire[:len(wire)/2])
+					return
+				}
+				offset := len(wire) / 2
+				if r.Header.Get("Range") != fmt.Sprintf("bytes=%d-", offset) {
+					t.Errorf("missing resume range: %s", r.Header.Get("Range"))
+				}
+				if mode == "restart" {
+					w.Write(wire)
+					return
+				}
+				start := offset
+				if mode == "invalid-range" {
+					start++
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(wire)-1, len(wire)))
+				w.WriteHeader(http.StatusPartialContent)
+				w.Write(wire[offset:])
+			}))
+			defer server.Close()
+			receipt := archiveReceipt{URL: server.URL, File: archiveFile{SHA1: fmt.Sprintf("%x", sha1.Sum(wire)), MD5: fmt.Sprintf("%x", md5.Sum(wire))}}
+			destination := filepath.Join(t.TempDir(), "release.zip")
+			if err := downloadArchive(server.Client(), destination, &receipt, int64(len(wire))); err == nil {
+				t.Fatal("partial archive published")
+			}
+			err := downloadArchive(server.Client(), destination, &receipt, int64(len(wire)))
+			if mode == "invalid-range" {
+				if err == nil {
+					t.Fatal("invalid range accepted")
+				}
+				if _, e := os.Stat(destination); !os.IsNotExist(e) {
+					t.Fatal("invalid range became source")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(destination)
+			if err != nil || !bytes.Equal(got, wire) {
+				t.Fatal("resume corrupted archive", err)
+			}
+			if requests != 2 {
+				t.Fatal("unexpected requests", requests)
+			}
+		})
+	}
+}
+
+func TestLargeArchiveMappingsAreExplicit(t *testing.T) {
+	for _, id := range []string{"doj-08", "doj-09", "doj-10", "doj-11"} {
+		if archiveItem(id) == "" {
+			t.Fatal("missing raw archive", id)
+		}
+	}
+	// Extending raw acquisition must not make prepare-small index large releases.
+	for _, d := range smallDatasets() {
+		if d.ID >= "doj-08" && d.ID <= "doj-11" && d.Stage != "deferred" {
+			t.Fatal("large release enabled for v1 indexing")
 		}
 	}
 }

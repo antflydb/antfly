@@ -5,7 +5,8 @@ Grepstein is the GCS-backed Antfly Cloud public-records showcase tracked in
 Antfly's native `document_extraction` artifacts. It has no DocsAF dependency.
 
 V1 indexes PDFs from DOJ datasets **1–7 and 12**. Indexing datasets **8–11 is
-deferred**, and the v1 downloader refuses them. Raw preservation is independent:
+deferred** in the default v1 workflow. Explicit large-archive acquisition and
+raw preservation are independent:
 `stage-originals` accepts PDFs, images, audio, video, and ancillary files from any
 explicitly supplied release directory or ZIP, including larger releases. The
 court collection can be supplied as an existing
@@ -115,10 +116,23 @@ Explicit local copies without acquisition receipts have no asserted official
 provenance. The catalog cannot be used as an Antfly load manifest.
 
 Uploads use ADC and the create-only publisher identity, with resumable GCS
-uploads, an 8 MiB upload buffer, and CRC32C validation before finalization.
+uploads and CRC32C validation before finalization. Each in-flight upload uses
+a 256 KiB-aligned buffer sized to its object, capped at 8 MiB; tiny objects use
+256 KiB rather than allocating the large-object buffer. Upload concurrency defaults to 8 (`--concurrency 1–16`), while
+catalog order and hashes remain deterministic. Completions refill any available
+worker slot; a slow early object does not stall later uploads. A temporary
+disk-backed ordinal index restores source order at publication, with a fixed
+16-byte slot per object and a metadata log; it retains no corpus-sized reorder
+map in memory. Active spool files are bounded
+by concurrency times the maximum object size; failed workers cancel siblings
+and remove their owned spools before returning.
+Create-only collisions during either streaming or finalization are resolved
+by size/checksum verification of the winning object. Cleanup cancels only the
+upload, preserving the verification context; permission and source I/O failures
+remain errors. No collision recovery overwrites an object.
 SHA-addressed objects are reused only after size/checksum verification; staged
-PDF originals use the same keys as subsequent PDF publication. ZIP members spool
-one at a time; scratch state must be outside input directories. Defaults cap
+PDF originals use the same keys as subsequent PDF publication. ZIP members are read/hashed one at a time and uploads run through the bounded
+worker window; scratch state must be outside input directories. Defaults cap
 total uncompressed inputs at 10 GiB, each original at 8 GiB, and a batch at two
 million files. Raise byte limits only for a reviewed batch and adequate worker
 scratch space. Split larger inventories into separate states.
@@ -132,8 +146,10 @@ them to the managed instance or existing source jobs.
 
 For releases 8–11, run bulk acquisition and staging on a separately approved
 Google Cloud worker rather than routing hundreds of GB through a laptop. The
-v1 downloader does not acquire those releases and this command does not provision
-that worker. Candidate archive metadata must be reviewed before transfer; some
+default acquisition selection remains the small releases. Explicit
+`fetch-archive --dataset all-large` supports selected large archive snapshots;
+it does not provision a worker or establish official completeness. Candidate
+archive metadata must be reviewed before transfer; some
 dataset 9 mirrors explicitly declare themselves incomplete. Record that as the
 **mirror's reported status**, separately from our **unverified dataset coverage**.
 It does not establish that every available copy of dataset 9 is incomplete.
@@ -363,6 +379,14 @@ antfly-grep --table-config ./grepstein-corpus/grep.json 'pattern'
 antfly-grep --table-config ./grepstein-corpus/grep.json --artifact chunks 'pattern'
 ```
 
+Qualification checks both extraction-unit and chunk index readiness, then
+streams the sealed manifest through at most four concurrent
+workers by default. Set `qualify --concurrency 1` for a constrained instance or
+choose another limit from 1–32. Each worker still verifies the current source
+and raw native completion evidence; an error cancels sibling requests and the
+receipt remains incomplete. Receipts include the configured concurrency and
+elapsed seconds. This does not alter extraction/model concurrency.
+
 The default `extracted` stream reads `document_units_v1` through
 `document_units_text`. Each native extraction unit is a matching boundary; a
 regex never spans pages or transcript units. The optional `chunks` stream uses
@@ -471,3 +495,120 @@ proxy routing/authentication problem. A Cloudflare `403` with error `1010` is a
 separate transport rejection. Diagnostic clients should identify themselves with
 a descriptive application `User-Agent`, such as `antfly-cloud/grepstein-diagnostics`.
 Do not treat either response as evidence that OCR failed or that the GPU is busy.
+
+## Measuring a private sample
+
+The bounded runners use an owned loopback server and never change Cloud tables.
+Use the released runtime and the exact model revisions from the example:
+
+```sh
+python3 benchmark_inference.py --antfly /absolute/path/antfly \
+  --models-dir /absolute/path/models --output ./timings/inference \
+  --stages ocr embed extract --ocr-concurrency 2 --budget-seconds 180
+python3 benchmark_corpus.py --antfly /absolute/path/antfly \
+  --pdf-dir /absolute/path/verified-sample --output ./timings/native
+```
+
+Inference timings distinguish cold/warm model use, disable prompt caching, use
+distinct embedding/extraction inputs, validate completed work, and record GPU
+contention. Extraction samples require real entity spans with exact input offsets,
+evidenced relation endpoints and the expected John → worked for → Apple
+relationship. A nonempty JSON container alone does not qualify extraction.
+A failed or truncated page has no completed-page throughput. The
+native runner reports extraction time and incomplete units with OCR disabled;
+it does not call an incomplete artifact a successful OCR result. Both runners
+stop their own processes on exit and accept explicit sample/time/byte limits.
+The [Spark measurement](benchmarks/spark-rc14-2026-11-11.md) records the measured
+scope and the limits of corpus extrapolation.
+
+Managed source syncs still replace a complete physical generation when inventory
+content changes. The [native generation-cloning design](../../docs/design/source-generation-cloning.md)
+specifies the separate engine work needed to retain unchanged derived artifacts
+without full replacement writes. The qualification and load improvements here do
+not implement that engine feature.
+
+
+## Grow the qualified table without repeating sample OCR
+
+Keep the sample's table, state directory, sealed publication, document IDs,
+immutable GCS generations, page-window size, reader and index configuration.
+Raw staging never calls Antfly. Do not recreate the sample table or replace a
+managed source generation to perform this append.
+
+Prepare/publish each new batch into a separate state, then use the same table
+and the same reader/inference/semantic/graph/source-connection flags as the
+sample load. First inspect a read-only plan:
+
+```sh
+./grepstein load --state ./release-08 --url "$ANTFLY_URL" --table grepstein_corpus \
+  --append-only --accepted-state ./sample --plan-only
+# Repeat the same command without --plan-only to submit only absent documents.
+```
+
+The command streams the complete manifest through four bounded lookup workers
+before any writes, saving `append-plan.json` with new/reused counts and the
+manifest/table/configuration binding. Matching existing primary documents are
+reused without any write; a changed existing ID aborts the preflight. Uploader
+`indexed_at` alone is ignored during comparison. All source fields, permissions,
+and metadata remain significant. Numbers are decoded losslessly, including
+nanosecond timestamps larger than the exact-integer range of a float64. Newly absent IDs use an OCC transaction with
+version-zero predicates, so another writer cannot turn the append into an
+accidental update. A conflict or unknown commit outcome stops the command. Run
+it again with the same state: observed identical primaries are reused, including
+writes that committed before a response/checkpoint was lost. `load.json` is bound
+to append mode, preventing an accidental resume through ordinary upserts.
+
+Repeat `--accepted-state` for every completed prior batch in this table. These
+sealed catalogs detect identical immutable sources under different IDs across
+releases/mirrors. Such aliases currently stop with the canonical ID; they are
+not silently re-OCR'd, discarded, or granted new permissions. Reconcile them
+before publishing the append, retaining every source association in the raw
+originals catalogs. This is not automatic native artifact cloning. Source
+revisions, policy changes, producer changes, or repartitioning existing PDFs
+require an explicit update/migration rather than append mode. Coordinate table
+DDL/producer changes with the load; append does not hold an administrative lock.
+
+The native smoke covers digital PDFs and a PDF that actually invokes a loopback
+Reader fixture: load/qualify the sample, plan/append a second sealed catalog,
+resume, and query with `antfly-grep`. It asserts the sample's native extraction
+generation is unchanged, no extra sample Reader calls occur, and only the new
+PDF is fetched. It tests native OCR orchestration rather than model accuracy.
+
+## Preserve the large archive snapshots
+
+The [2026-11-11 candidate inventory](benchmarks/large-corpus-acquisition-2026-11-11.json)
+records four archive revisions: 229,696,444,373 compressed bytes and
+240,591,394,010 uncompressed bytes. Bounded ZIP-directory reads list 1,376,437
+PDFs, 1,491 videos, and 118 audio files plus metadata/attachments. These are
+metadata observations, not completed downloads or official coverage proofs.
+Dataset 9's selected mirror reports itself incomplete. Independent native-media
+collections and missing official files remain separate reconciliation work.
+
+`stage_large.py` defaults to metadata-only inventory. Run it on the dedicated
+staging worker with the built `grepstein` CLI, never on the application VM:
+
+```sh
+python3 stage_large.py --grepstein /usr/local/bin/grepstein \
+  --state /srv/grepstein/large
+# After reviewing the resulting acquisition-plan.json, use its stable digest.
+python3 stage_large.py --grepstein /usr/local/bin/grepstein \
+  --state /srv/grepstein/large --execute \
+  --expected-plan-sha256 750e308470b7046616906dce2c011accdc19422d8964e82ff2d79a1ade5e2f4a
+```
+
+The driver serializes orchestration in each state, pins the original in-memory
+metadata plan before content transfer, and rejects changed source identities
+afterward. It holds the CLI acquisition lock while inspecting receipts and
+staging, so a standalone acquisition cannot replace cached revisions midway.
+Every completed acquisition receipt must match the pinned source identity.
+Changed metadata requires a fresh inventory. After a crashed process, verify
+that no acquisition/staging process is running before removing an abandoned
+`archives/.lock` directory; the workflow file lock releases automatically. Defaults bound compressed and total uncompressed
+inputs to 270 GB each, with an 8 GiB maximum member. Each release/revision seals
+its own raw GCS catalog. Downloads retain revision-bound partial files and resume
+only exact HTTP ranges, falling back to a full replacement download when a
+server ignores Range. Full size, SHA-1, MD5 and ZIP structure must validate before
+an archive becomes a usable source. Staging then verifies acquisition receipts,
+hashes every member, reuses verified GCS objects, and records object generations.
+No table keys, inference credentials, OCR, transcription or index creation are
+part of this command. Keep the current sample load running independently.
