@@ -1753,8 +1753,10 @@ const document_external_value_flag: u8 = 1 << 1;
 const document_namespace_link_flag: u8 = 1 << 2;
 const document_content_digest_flag: u8 = 1 << 3;
 
-fn documentHeaderSize(key: []const u8) usize {
-    return if (std.mem.indexOf(u8, key, "\x00\x00__metadata__:") != null) 60 else 28;
+fn documentHeaderSize(indexed: bool, key: []const u8) usize {
+    // The digest flag belongs to indexed v7. Legacy v3 must remain readable
+    // by its original readers; fingerprints can hash those values on demand.
+    return if (indexed and std.mem.indexOf(u8, key, "\x00\x00__metadata__:") != null) 60 else 28;
 }
 const namespace_directory_key = "\x00antfly.document_namespaces.v1";
 pub const secret_catalog_prefix = "\x00antfly.secrets.v1/";
@@ -3385,13 +3387,14 @@ const PageAllocator = struct {
     // roots; writeRecord copies bytes before the next encoding can overwrite it.
     fn writeDocument(self: *PageAllocator, entry: DocumentEntry) !u64 {
         var encoded_entry = entry;
-        if (!entry.is_delete and documentHeaderSize(entry.key) == 60 and
+        if (!entry.is_delete and documentHeaderSize(self.file.header.indexed_reclamation, entry.key) == 60 and
             (entry.external_value_root_page == 0 or entry.value.len != 0))
         {
             var digest: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(entry.value, &digest, .{});
             encoded_entry.content_digest = digest;
         }
+        if (!self.file.header.indexed_reclamation) encoded_entry.content_digest = null;
         self.encoded_record.clearRetainingCapacity();
         try encodeDocumentEntry(self.file.allocator, &self.encoded_record, encoded_entry);
         return self.writeRecord(.document, self.encoded_record.items);
@@ -9705,7 +9708,7 @@ pub const NativeFile = struct {
     fn copyVacuumValue(self: *NativeFile, file: std.Io.File, next_page: *u64, entry: CatalogEntry, tree: bool, cancel: ?*const maintenance.CancelToken, tracking: ?*PageAllocator) !VacuumValue {
         const len = if (entry.external_value_root_page == 0) entry.value.len else entry.external_value_len;
         if (entry.external_value_root_page == 0) return .{ .inline_value = entry.value, .len = len };
-        const header_len: usize = if (tree) 16 else documentHeaderSize(entry.key);
+        const header_len: usize = if (tree) 16 else documentHeaderSize(self.header.indexed_reclamation or self.vacuum_target_indexed, entry.key);
         if (header_len + entry.key.len + len <= self.maxPagePayloadBytes()) {
             // Re-inlining an external value allocates at most one page.
             const value = try self.catalogEntryValueAlloc(self.allocator, entry);
@@ -9802,7 +9805,7 @@ pub const NativeFile = struct {
                 .value = value.inline_value,
                 .external_value_root_page = value.root,
                 .external_value_len = value.len,
-                .content_digest = if (documentHeaderSize(record.key) == 60) try self.documentFingerprintAtCheckpoint(self.activeCheckpoint(), record.key) else null,
+                .content_digest = if (documentHeaderSize(writer.header.indexed_reclamation, record.key) == 60) try self.documentFingerprintAtCheckpoint(self.activeCheckpoint(), record.key) else null,
             });
             try document_index.add(record.key, document_root_page.*);
             if (namespace_directory.getPtr(namespace)) |head| {
@@ -10254,7 +10257,7 @@ pub const NativeFile = struct {
 
     fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
         if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-        const fixed_len = documentHeaderSize(mutation.key) + mutation.key.len;
+        const fixed_len = documentHeaderSize(self.header.indexed_reclamation, mutation.key) + mutation.key.len;
         if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
         if (mutation.external_value_root_page != 0) {
             if (self.transaction_header == null or mutation.is_delete or mutation.value.len != 0 or mutation.external_value_len == 0 or mutation.external_value_len > std.math.maxInt(u32) or mutation.external_value_root_page >= self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
@@ -10268,7 +10271,7 @@ pub const NativeFile = struct {
     }
 
     fn documentEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
-        const fixed_len = documentHeaderSize(key) + key.len;
+        const fixed_len = documentHeaderSize(self.header.indexed_reclamation, key) + key.len;
         return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
     }
 
@@ -11338,7 +11341,7 @@ pub const NativeFile = struct {
                 if (source == .catalog and source.catalog == .metadata and std.mem.startsWith(u8, record.key, artifact_lease_key_prefix)) continue;
                 const len = if (record.external_value_root_page == 0) record.value.len else record.external_value_len;
                 const is_catalog = cursor.kind == .catalog;
-                const header_len: usize = if (is_catalog) 16 else documentHeaderSize(record.key);
+                const header_len: usize = if (is_catalog) 16 else documentHeaderSize(indexed, record.key);
                 live_bytes +|= record.key.len + len;
                 const category = switch (source) {
                     .catalog => |root| if (root == .metadata) &accounting.metadata_catalog else &accounting.index_catalog,
@@ -21872,4 +21875,50 @@ test "lite logical generations vacuum images establish independent identities" {
     defer reopened.close();
     try std.testing.expectEqualDeep(second_ids, reopened.activeCheckpoint().logical);
     try std.testing.expect((try reopened.check()).valid);
+}
+
+test "lite document content digests preserve legacy wire compatibility" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const key = "table\x00\x00__metadata__:record";
+    for ([_]bool{ false, true }) |indexed| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "document-digest.aflite");
+        defer a.free(path);
+        var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = indexed, .no_sync = true });
+        defer file.close();
+        // Exercise both inline and external metadata. Legacy readers must
+        // never encounter the v7 flag, but both formats retain equal hashes.
+        for ([_]usize{ 32, 8192 }) |len| {
+            const value = try a.alloc(u8, len);
+            defer a.free(value);
+            @memset(value, 'v');
+            try file.putDocument(key, value);
+            const checkpoint = file.activeCheckpoint();
+            const page = (try file.lookupDocumentIndexPage(checkpoint, key)).?;
+            var reader = NativeFile.ValuePageReader{};
+            defer reader.deinit(&file);
+            const payload = try reader.readPayload(&file, checkpoint, page, 1, .document);
+            try std.testing.expectEqual(indexed, payload[8] & document_content_digest_flag != 0);
+            var expected: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(value, &expected, .{});
+            try std.testing.expectEqual(expected, (try file.documentFingerprintAtCheckpoint(checkpoint, key)).?);
+        }
+        // Rewriting an external record must preserve the same format policy,
+        // including the digest copied into indexed vacuum images.
+        var image = try file.prepareVacuum(null);
+        defer image.deinit();
+        const compact = &image.prepared;
+        const checkpoint = compact.activeCheckpoint();
+        const page = (try compact.lookupDocumentIndexPage(checkpoint, key)).?;
+        var reader = NativeFile.ValuePageReader{};
+        defer reader.deinit(compact);
+        const payload = try reader.readPayload(compact, checkpoint, page, 1, .document);
+        try std.testing.expectEqual(indexed, payload[8] & document_content_digest_flag != 0);
+        try std.testing.expectEqual(
+            (try file.documentFingerprintAtCheckpoint(file.activeCheckpoint(), key)).?,
+            (try compact.documentFingerprintAtCheckpoint(checkpoint, key)).?,
+        );
+    }
 }
