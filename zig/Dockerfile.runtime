@@ -70,7 +70,7 @@ FROM --platform=$TARGETPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cb
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
-LABEL org.opencontainers.image.licenses=Elastic-2.0
+LABEL org.opencontainers.image.licenses=Apache-2.0
 
 ARG TARGETARCH
 
@@ -85,6 +85,7 @@ RUN apt-get update && \
 WORKDIR /
 COPY antfly /antfly
 COPY share/antfly /usr/share/antfly
+COPY share/licenses/antfly /usr/share/licenses/antfly
 COPY --from=runtime-libraries /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
 COPY --from=runtime-libraries /opt/cublas/lib/ /usr/local/lib/
 COPY --from=runtime-libraries /opt/cublas/LICENSE* /usr/share/doc/antfly/cublas/
