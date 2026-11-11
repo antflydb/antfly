@@ -625,7 +625,7 @@ and retains the existing PDF/OCR recipe and artifact names. Use
 MIME types before applying file limits, and saves the profile for resume,
 publication, loading and grep configuration. A resume cannot change it.
 Raw `stage-originals` remains independent and preserves every media type.
-The native transcription profile selects WAV, MP3, MP4/M4A, Ogg/Opus, AAC,
+The native transcription profile selects WAV, MP3, M4A (MP4 audio), Ogg/Opus, AAC,
 AIFF, CAF and FLAC. AMR originals are preserved by raw staging but are excluded
 from this profile because the native decoder does not support them.
 
@@ -772,3 +772,32 @@ borrowing the already fetched recording. The JSON fallback encodes directly into
 one exactly sized request body. Invocation memory planning follows the selected
 transport; local callback compatibility accounts for its inline data URI. Missing
 audio MIME is inferred from the native format detector without decoding samples.
+
+Direct-URL transcription also reserves the downloader’s temporary body buffers,
+including compressed input and output-buffer growth. Body capacities are capped
+at `max_download_bytes`; the conservative collection bound is three times that
+limit. A separate 8 MiB transport quota covers TLS buffers, trust roots and HTTP
+metadata. `DownloadContext.transport_memory_limit_bytes` configures that quota
+for library callers across HTTP, S3, GCS and pinned-range reads; exhaustion reports
+`DownloadTransportMemoryExceeded`. Detached bodies retain the caller allocator,
+while object-store credentials and connection state stay within the transport
+quota.
+
+Download and encoding peaks are separate phases, so admission uses their maximum
+without increasing the transcription response limit. Pre-acquired GCS recordings
+retain their actual-size borrowed-source plan. OpenAI multipart uploads borrow
+the recording directly with a randomized, collision-checked delimiter; Antfly,
+Vertex and Cloudflare JSON uploads encode into one exact-sized body, avoiding
+multiple recording-sized buffers.
+
+Native Vertex transcriptions borrow the process provider runtime's Google
+credential manager (or retain a manager for the lifetime of a standalone asset
+runtime). Token exchanges, TLS state and cached tokens use that runtime's
+allocator, rather than a document's invocation allocator. Only the request's
+Authorization value is copied into the invocation. OAuth completes before the
+recognition JSON is built; tokens are reused until refresh is required.
+
+HTTP trust loading and peer-certificate parsing use a scoped Zig 0.17
+certificate compatibility copy with checked DER lengths. Malformed or truncated
+CA certificates return a parse error and release partial allocations. Trust and
+hostname verification remain enabled.
