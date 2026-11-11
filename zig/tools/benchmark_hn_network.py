@@ -116,13 +116,18 @@ def main(argv=None):
         }
         for key, value in env.items():
             patch.setenv(key, value)
-        patch.setattr(
-            test,
-            "network_phase",
-            lambda name: service.configure(
+
+        def network_phase(name):
+            if name in ("cold_startup", "publication_setup"):
+                # These hooks run while the engine is stopped. Finish canceled
+                # responses before swapping policies; never drain after startup
+                # or between cold startup and its immediately following query.
+                service.wait_idle()
+            service.configure(
                 setup_policy if name == "publication_setup" else policy, name
-            ),
-        )
+            )
+
+        patch.setattr(test, "network_phase", network_phase)
         try:
             test.test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 patch,
