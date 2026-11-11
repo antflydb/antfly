@@ -19,6 +19,10 @@ func (f *fakeAPI) PutSourceIfMatch(context.Context, management.Source, string) (
 	return management.Source{}, errors.New("not implemented")
 }
 
+func (f *fakeAPI) PutSourceIfAbsent(context.Context, management.Source) (management.Source, error) {
+	return management.Source{}, errors.New("not implemented")
+}
+
 func TestClassifySourceRevisionMismatchThroughClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		management.WriteError(w, management.Failure(http.StatusPreconditionFailed, "source_revision_mismatch"))

@@ -169,7 +169,10 @@ func TestStartRunInvalidKeyMakesNoCalls(t *testing.T) {
 		t.Run(key, func(t *testing.T) {
 			api := &runFakeAPI{fakeAPI: &fakeAPI{t: t}}
 			_, err := StartRun(context.Background(), Env{API: api, Out: io.Discard}, "src-1", RunOptions{IdempotencyKey: key})
-			assertCode(t, err, CodeInvalid)
+			failure := assertCode(t, err, CodeInvalid)
+			if failure.IdempotencyKey != "" {
+				t.Errorf("validation error carries submission key %q", failure.IdempotencyKey)
+			}
 			if len(api.calls) != 0 {
 				t.Fatalf("invalid key made calls: %#v", api.calls)
 			}
@@ -191,22 +194,50 @@ func TestStartRunCapabilityGate(t *testing.T) {
 	}
 }
 
-func TestStartRunDoesNotRetry(t *testing.T) {
-	api := &runFakeAPI{fakeAPI: &fakeAPI{t: t,
-		capabilities: func() (management.Capabilities, error) {
-			return management.Capabilities{PerSourceRuns: true}, nil
-		},
-		getSource: func(id string) (management.Source, error) { return management.Source{Id: id}, nil },
-	}}
-	attempts := 0
-	api.startRun = func(string, string, management.RunInput) (management.Run, error) {
-		attempts++
-		return management.Run{}, &management.TransportError{}
-	}
-	_, err := StartRun(context.Background(), Env{API: api, Out: io.Discard}, "src-1", RunOptions{IdempotencyKey: "retry-me"})
-	assertCode(t, err, CodeTransport)
-	if attempts != 1 {
-		t.Fatalf("POST attempts = %d, want 1", attempts)
+func TestStartRunSubmissionFailureReturnsIdempotencyKey(t *testing.T) {
+	for _, suppliedKey := range []string{"", "retry-me"} {
+		t.Run("key="+suppliedKey, func(t *testing.T) {
+			api := &runFakeAPI{fakeAPI: &fakeAPI{t: t,
+				capabilities: func() (management.Capabilities, error) {
+					return management.Capabilities{PerSourceRuns: true}, nil
+				},
+				getSource: func(id string) (management.Source, error) { return management.Source{Id: id}, nil },
+			}}
+			original := &management.TransportError{}
+			attempts := 0
+			var submittedKey string
+			api.startRun = func(id, key string, in management.RunInput) (management.Run, error) {
+				attempts++
+				submittedKey = key
+				return management.Run{}, original
+			}
+			receipt, err := StartRun(context.Background(), Env{API: api, Out: io.Discard}, "src-1", RunOptions{IdempotencyKey: suppliedKey})
+			failure := assertCode(t, err, CodeTransport)
+			if _, ok := err.(*Error); !ok {
+				t.Errorf("submission error = %T, want *Error", err)
+			}
+			if attempts != 1 {
+				t.Errorf("POST attempts = %d, want 1", attempts)
+			}
+			if suppliedKey == "" {
+				if !regexp.MustCompile(`^cli-[0-9a-f]{32}$`).MatchString(submittedKey) {
+					t.Errorf("generated key = %q", submittedKey)
+				}
+			} else if submittedKey != suppliedKey {
+				t.Errorf("submitted key = %q, want %q", submittedKey, suppliedKey)
+			}
+			if receipt.IdempotencyKey != submittedKey || failure.IdempotencyKey != receipt.IdempotencyKey {
+				t.Errorf("submitted key=%q receipt=%#v error key=%q", submittedKey, receipt, failure.IdempotencyKey)
+			}
+			suffix := " (idempotency key " + submittedKey + "; retry with this key to avoid a duplicate submission)"
+			if !strings.HasSuffix(failure.Message, suffix) || !strings.Contains(err.Error(), submittedKey) {
+				t.Errorf("submission error = %q, want suffix %q", err.Error(), suffix)
+			}
+			var transport *management.TransportError
+			if !errors.As(err, &transport) || transport != original {
+				t.Errorf("submission error lost original transport error: %v", err)
+			}
+		})
 	}
 }
 

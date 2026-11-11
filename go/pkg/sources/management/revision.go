@@ -55,11 +55,14 @@ func SourceRevision(s Source) string {
 	return "r1-" + hex.EncodeToString(sum[:])
 }
 
-// PreconditionBackend optionally supports atomic declaration compare-and-set.
-// Implementations must compare SourceRevision(current) with revision under the
+// PreconditionBackend optionally supports atomic declaration updates and creates.
+// PutSourceIfMatch must compare SourceRevision(current) with revision under the
 // same lock that guards the write. A mismatch returns
 // Failure(412, "source_revision_mismatch"); a missing source returns
-// Failure(404, "source_not_found"). Conditional PUT never creates a source.
+// Failure(404, "source_not_found"). PutSourceIfMatch never creates a source.
+// PutSourceIfAbsent atomically creates only if source.Id does not exist;
+// an existing source returns Failure(412, "source_already_exists").
 type PreconditionBackend interface {
 	PutSourceIfMatch(ctx context.Context, source Source, revision string) (Source, error)
+	PutSourceIfAbsent(ctx context.Context, source Source) (Source, error)
 }

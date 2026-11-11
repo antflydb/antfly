@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -133,6 +134,9 @@ func TestPurgeRequiresExplicitConfirmation(t *testing.T) {
 	if failure.Message != want {
 		t.Fatalf("message = %q, want %q", failure.Message, want)
 	}
+	if failure.IdempotencyKey != "" {
+		t.Errorf("unconfirmed purge error carries submission key %q", failure.IdempotencyKey)
+	}
 }
 
 func TestPurgeInvalidKeyMakesNoCalls(t *testing.T) {
@@ -143,7 +147,10 @@ func TestPurgeInvalidKeyMakesNoCalls(t *testing.T) {
 			if len(api.calls) != 0 {
 				t.Fatalf("invalid key made API calls: %#v", api.calls)
 			}
-			assertCode(t, err, CodeInvalid)
+			failure := assertCode(t, err, CodeInvalid)
+			if failure.IdempotencyKey != "" {
+				t.Errorf("validation error carries submission key %q", failure.IdempotencyKey)
+			}
 		})
 	}
 }
@@ -277,40 +284,61 @@ func assertPurgeCallOrder(t *testing.T, calls []apiCall) {
 }
 
 func TestPurgeStartFailurePreservesIntent(t *testing.T) {
-	api := &retireFakeAPI{runFakeAPI: &runFakeAPI{fakeAPI: &fakeAPI{t: t,
-		capabilities: func() (management.Capabilities, error) {
-			return management.Capabilities{PurgeSources: true, PerSourceRuns: true}, nil
-		},
-		getSource: func(id string) (management.Source, error) {
-			return management.Source{Id: id, Name: "Docs"}, nil
-		},
-	}}}
-	api.removeSource = func(id string, purge bool) (management.Mutation, error) {
-		if id != "src-1" || !purge {
-			t.Fatalf("RemoveSource(%q, %t), want src-1, true", id, purge)
-		}
-		return management.Mutation{SourceId: id, State: "purge_pending"}, nil
-	}
-	api.startRun = func(id, key string, in management.RunInput) (management.Run, error) {
-		if id != "src-1" || key != "retry-purge" || in != (management.RunInput{Operation: management.RunInputOperationPurge}) {
-			t.Fatalf("purge submission = %q, %q, %#v", id, key, in)
-		}
-		return management.Run{}, &management.HTTPError{Status: http.StatusServiceUnavailable}
-	}
-	var out bytes.Buffer
-	_, err := Purge(context.Background(), Env{API: api, Out: &out}, "src-1", PurgeOptions{Confirm: true, IdempotencyKey: "retry-purge"})
-	failure := assertCode(t, err, CodeFailed)
-	message := strings.ToLower(failure.Message)
-	for _, text := range []string{"src-1", "purge intent", "recorded", "same command"} {
-		if !strings.Contains(message, text) {
-			t.Errorf("failure message missing %q: %q", text, failure.Message)
-		}
-	}
-	if !strings.Contains(message, "retry") && !strings.Contains(message, "retried") {
-		t.Errorf("failure message does not explain retry: %q", failure.Message)
-	}
-	assertPurgeCallOrder(t, api.calls)
-	if out.Len() != 0 {
-		t.Fatalf("failed purge printed success: %q", out.String())
+	for _, suppliedKey := range []string{"", "retry-purge"} {
+		t.Run("key="+suppliedKey, func(t *testing.T) {
+			api := &retireFakeAPI{runFakeAPI: &runFakeAPI{fakeAPI: &fakeAPI{t: t,
+				capabilities: func() (management.Capabilities, error) {
+					return management.Capabilities{PurgeSources: true, PerSourceRuns: true}, nil
+				},
+				getSource: func(id string) (management.Source, error) {
+					return management.Source{Id: id, Name: "Docs"}, nil
+				},
+			}}}
+			mutation := management.Mutation{SourceId: "src-1", State: "purge_pending"}
+			api.removeSource = func(id string, purge bool) (management.Mutation, error) {
+				if id != "src-1" || !purge {
+					t.Fatalf("RemoveSource(%q, %t), want src-1, true", id, purge)
+				}
+				return mutation, nil
+			}
+			original := &management.HTTPError{Status: http.StatusServiceUnavailable}
+			var submittedKey string
+			api.startRun = func(id, key string, in management.RunInput) (management.Run, error) {
+				if id != "src-1" || in != (management.RunInput{Operation: management.RunInputOperationPurge}) {
+					t.Fatalf("purge submission = %q, %q, %#v", id, key, in)
+				}
+				submittedKey = key
+				return management.Run{}, original
+			}
+			var out bytes.Buffer
+			receipt, err := Purge(context.Background(), Env{API: api, Out: &out}, "src-1", PurgeOptions{Confirm: true, IdempotencyKey: suppliedKey})
+			failure := assertCode(t, err, CodeFailed)
+			if _, ok := err.(*Error); !ok {
+				t.Errorf("submission error = %T, want *Error", err)
+			}
+			if suppliedKey == "" {
+				if !regexp.MustCompile(`^cli-[0-9a-f]{32}$`).MatchString(submittedKey) {
+					t.Errorf("generated key = %q", submittedKey)
+				}
+			} else if submittedKey != suppliedKey {
+				t.Errorf("submitted key = %q, want %q", submittedKey, suppliedKey)
+			}
+			if receipt.Mutation != mutation || receipt.IdempotencyKey != submittedKey || failure.IdempotencyKey != receipt.IdempotencyKey {
+				t.Errorf("submitted key=%q receipt=%#v error key=%q", submittedKey, receipt, failure.IdempotencyKey)
+			}
+			prefix := "purge intent is recorded for src-1; purge can be retried with the same command: "
+			suffix := " (idempotency key " + submittedKey + "; retry with this key to avoid a duplicate submission)"
+			if !strings.HasPrefix(failure.Message, prefix) || !strings.HasSuffix(failure.Message, suffix) || !strings.Contains(err.Error(), submittedKey) {
+				t.Errorf("submission error = %q, want intent prefix %q and key suffix %q", err.Error(), prefix, suffix)
+			}
+			var httpError *management.HTTPError
+			if !errors.As(err, &httpError) || httpError != original {
+				t.Errorf("submission error lost original HTTP error: %v", err)
+			}
+			assertPurgeCallOrder(t, api.calls)
+			if out.Len() != 0 {
+				t.Fatalf("failed purge printed success: %q", out.String())
+			}
+		})
 	}
 }

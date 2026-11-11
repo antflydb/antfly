@@ -121,6 +121,10 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	err = c.call(ctx, "GET", "/sources/"+url.PathEscape(id), "", nil, &out)
 	return
 }
+
+func (c *Client) PutSourceIfAbsent(ctx context.Context, source Source) (Source, error) {
+	return Source{}, errors.New("not implemented")
+}
 func (c *Client) PutSource(ctx context.Context, source Source) (Source, error) {
 	return c.putSource(ctx, source, "")
 }

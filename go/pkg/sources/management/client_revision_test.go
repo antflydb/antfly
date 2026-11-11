@@ -16,11 +16,7 @@ import (
 )
 
 func TestClientSourceRevisionPUT(t *testing.T) {
-	for _, conditional := range []bool{false, true} {
-		name := "unconditional"
-		if conditional {
-			name = "If-Match"
-		}
+	for _, name := range []string{"unconditional", "If-Match", "If-None-Match"} {
 		t.Run(name, func(t *testing.T) {
 			revision := "r1-" + strings.Repeat("a", 64)
 			input := revisionTestSource()
@@ -36,11 +32,18 @@ func TestClientSourceRevisionPUT(t *testing.T) {
 					t.Errorf("request = %s %s, want PUT /mount/sources/source", r.Method, r.URL.Path)
 				}
 				wantTag := ""
-				if conditional {
+				if name == "If-Match" {
 					wantTag = `"` + revision + `"`
 				}
 				if got := r.Header.Get("If-Match"); got != wantTag {
 					t.Errorf("If-Match = %q, want %q", got, wantTag)
+				}
+				wantNoneMatch := ""
+				if name == "If-None-Match" {
+					wantNoneMatch = "*"
+				}
+				if got := r.Header.Values("If-None-Match"); (wantNoneMatch == "" && len(got) != 0) || (wantNoneMatch != "" && !reflect.DeepEqual(got, []string{wantNoneMatch})) {
+					t.Errorf("If-None-Match = %q, want %q", got, wantNoneMatch)
 				}
 				var body map[string]json.RawMessage
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -62,9 +65,12 @@ func TestClientSourceRevisionPUT(t *testing.T) {
 				t.Fatal(err)
 			}
 			var got Source
-			if conditional {
+			switch name {
+			case "If-Match":
 				got, err = client.PutSourceIfMatch(context.Background(), input, revision)
-			} else {
+			case "If-None-Match":
+				got, err = client.PutSourceIfAbsent(context.Background(), input)
+			default:
 				got, err = client.PutSource(context.Background(), input)
 			}
 			if err != nil {

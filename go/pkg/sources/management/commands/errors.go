@@ -43,11 +43,12 @@ const (
 
 // Error provides a stable machine code, exit status, and safe human message.
 type Error struct {
-	Code       string
-	HTTPStatus int
-	ServerCode string
-	Message    string
-	err        error
+	Code           string
+	HTTPStatus     int
+	ServerCode     string
+	Message        string
+	IdempotencyKey string
+	err            error
 }
 
 func (e *Error) Error() string {

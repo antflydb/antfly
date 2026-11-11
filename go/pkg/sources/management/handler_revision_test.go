@@ -37,6 +37,7 @@ func (b *revisionHandlerBackend) PutSource(_ context.Context, source Source) (So
 type revisionConditionalBackend struct {
 	*revisionHandlerBackend
 	conditionalCalls int
+	absentCalls      int
 	revision         string
 	err              error
 }
@@ -47,6 +48,12 @@ func (b *revisionConditionalBackend) PutSourceIfMatch(_ context.Context, source 
 	b.conditionalCalls++
 	b.received = source
 	b.revision = revision
+	return b.source, b.err
+}
+
+func (b *revisionConditionalBackend) PutSourceIfAbsent(_ context.Context, source Source) (Source, error) {
+	b.absentCalls++
+	b.received = source
 	return b.source, b.err
 }
 
@@ -199,6 +206,98 @@ func TestHandlerSourceRevisionInvalidPreconditions(t *testing.T) {
 				assertRevisionHTTPError(t, response, http.StatusBadRequest, "invalid_precondition")
 				if base.putCalls != 0 || cas.conditionalCalls != 0 {
 					t.Errorf("invalid precondition reached backend (conditional=%t): PutSource=%d PutSourceIfMatch=%d", conditional, base.putCalls, cas.conditionalCalls)
+				}
+			}
+		})
+	}
+}
+
+func TestHandlerSourceIfAbsent(t *testing.T) {
+	for _, tag := range []string{"*", "  *  "} {
+		t.Run(tag, func(t *testing.T) {
+			input := revisionTestSource()
+			input.Revision = "forged"
+			stored := revisionTestSource()
+			stored.Name, stored.Revision = "Backend normalized name", "stale"
+			backend := &revisionConditionalBackend{revisionHandlerBackend: &revisionHandlerBackend{source: stored}}
+			request := revisionPutRequest(t, input, "")
+			request.Header.Set("If-None-Match", tag)
+			response := httptest.NewRecorder()
+			Handler(backend).ServeHTTP(response, request)
+			if backend.absentCalls != 1 || backend.putCalls != 0 || backend.conditionalCalls != 0 {
+				t.Errorf("absent/unconditional/match calls = %d/%d/%d, want 1/0/0", backend.absentCalls, backend.putCalls, backend.conditionalCalls)
+			}
+			if backend.received.Id != input.Id || backend.received.Revision != "" {
+				t.Errorf("backend received = %#v, want source declaration without revision", backend.received)
+			}
+			assertRevisionResponse(t, response, stored)
+		})
+	}
+}
+
+func TestHandlerSourceIfAbsentConflict(t *testing.T) {
+	backend := &revisionConditionalBackend{
+		revisionHandlerBackend: &revisionHandlerBackend{source: revisionTestSource()},
+		err:                    Failure(http.StatusPreconditionFailed, "source_already_exists"),
+	}
+	request := revisionPutRequest(t, revisionTestSource(), "")
+	request.Header.Set("If-None-Match", "*")
+	response := httptest.NewRecorder()
+	Handler(backend).ServeHTTP(response, request)
+	assertRevisionHTTPError(t, response, http.StatusPreconditionFailed, "source_already_exists")
+	if backend.absentCalls != 1 || backend.putCalls != 0 || backend.conditionalCalls != 0 {
+		t.Errorf("absent/unconditional/match calls = %d/%d/%d, want 1/0/0", backend.absentCalls, backend.putCalls, backend.conditionalCalls)
+	}
+}
+
+func TestHandlerSourceIfAbsentUnsupported(t *testing.T) {
+	backend := &revisionHandlerBackend{source: revisionTestSource()}
+	request := revisionPutRequest(t, revisionTestSource(), "")
+	request.Header.Set("If-None-Match", "*")
+	response := httptest.NewRecorder()
+	Handler(backend).ServeHTTP(response, request)
+	assertRevisionHTTPError(t, response, http.StatusNotImplemented, "revision_preconditions_unsupported")
+	if backend.putCalls != 0 {
+		t.Errorf("unsupported precondition called PutSource %d times", backend.putCalls)
+	}
+}
+
+func TestHandlerSourceIfAbsentInvalidPreconditions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values []string
+		match  []string
+	}{
+		{name: "empty", values: []string{""}},
+		{name: "whitespace", values: []string{"  "}},
+		{name: "bare revision", values: []string{"x"}},
+		{name: "quoted revision", values: []string{`"x"`}},
+		{name: "weak revision", values: []string{`W/"x"`}},
+		{name: "quoted star", values: []string{`"*"`}},
+		{name: "comma separated", values: []string{"*, *"}},
+		{name: "multiple values", values: []string{"*", "*"}},
+		{name: "second empty value", values: []string{"*", ""}},
+		{name: "both headers", values: []string{"*"}, match: []string{`"x"`}},
+		{name: "empty match header", values: []string{"*"}, match: []string{""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, conditional := range []bool{false, true} {
+				base := &revisionHandlerBackend{source: revisionTestSource()}
+				cas := &revisionConditionalBackend{revisionHandlerBackend: base}
+				var backend Backend = base
+				if conditional {
+					backend = cas
+				}
+				request := revisionPutRequest(t, revisionTestSource(), "")
+				request.Header["If-None-Match"] = tc.values
+				if tc.match != nil {
+					request.Header["If-Match"] = tc.match
+				}
+				response := httptest.NewRecorder()
+				Handler(backend).ServeHTTP(response, request)
+				assertRevisionHTTPError(t, response, http.StatusBadRequest, "invalid_precondition")
+				if base.putCalls != 0 || cas.conditionalCalls != 0 || cas.absentCalls != 0 {
+					t.Errorf("invalid precondition reached backend (conditional=%t): PutSource=%d IfMatch=%d IfAbsent=%d", conditional, base.putCalls, cas.conditionalCalls, cas.absentCalls)
 				}
 			}
 		})

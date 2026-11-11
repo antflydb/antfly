@@ -20,6 +20,7 @@ import (
 type manifestWrite struct {
 	source      management.Source
 	conditional bool
+	absent      bool
 	revision    string
 }
 
@@ -32,7 +33,7 @@ type manifestAPI struct {
 	gets        map[string]int
 	writes      []manifestWrite
 	removes     int
-	beforeGet   func(string, int)
+	beforeWrite func(string)
 	putFailures map[string]error
 	// revisionFor models a server whose revision encoding the client cannot recompute.
 	revisionFor func(management.Source) string
@@ -52,7 +53,7 @@ func newManifestAPI(t *testing.T, sources ...management.Source) *manifestAPI {
 	f := &manifestAPI{
 		fakeAPI: &fakeAPI{t: t},
 		caps: management.Capabilities{Runtime: "standalone", Version: 1,
-			ConfigureSources: true, SearchVersions: []int{1, 2}},
+			ConfigureSources: true, RevisionPreconditions: true, SearchVersions: []int{1, 2}},
 		sources: make(map[string]management.Source), gets: make(map[string]int),
 		putFailures: make(map[string]error),
 	}
@@ -81,9 +82,6 @@ func (f *manifestAPI) Capabilities(context.Context) (management.Capabilities, er
 
 func (f *manifestAPI) GetSource(_ context.Context, id string) (management.Source, error) {
 	f.gets[id]++
-	if f.beforeGet != nil {
-		f.beforeGet(id, f.gets[id])
-	}
 	s, ok := f.sources[id]
 	if !ok {
 		return management.Source{}, management.Failure(http.StatusNotFound, "source_not_found")
@@ -94,11 +92,28 @@ func (f *manifestAPI) GetSource(_ context.Context, id string) (management.Source
 }
 
 func (f *manifestAPI) PutSource(_ context.Context, s management.Source) (management.Source, error) {
+	if f.beforeWrite != nil {
+		f.beforeWrite(s.Id)
+	}
 	f.writes = append(f.writes, manifestWrite{source: f.copySource(s)})
 	return f.store(s)
 }
 
+func (f *manifestAPI) PutSourceIfAbsent(_ context.Context, s management.Source) (management.Source, error) {
+	if f.beforeWrite != nil {
+		f.beforeWrite(s.Id)
+	}
+	f.writes = append(f.writes, manifestWrite{source: f.copySource(s), absent: true})
+	if _, exists := f.sources[s.Id]; exists {
+		return management.Source{}, management.Failure(http.StatusPreconditionFailed, "source_already_exists")
+	}
+	return f.store(s)
+}
+
 func (f *manifestAPI) PutSourceIfMatch(_ context.Context, s management.Source, revision string) (management.Source, error) {
+	if f.beforeWrite != nil {
+		f.beforeWrite(s.Id)
+	}
 	f.writes = append(f.writes, manifestWrite{source: f.copySource(s), conditional: true, revision: revision})
 	current, ok := f.sources[s.Id]
 	if !ok {
@@ -415,6 +430,12 @@ func TestApplyManifestIdempotentAndLeavesAbsentSources(t *testing.T) {
 	if len(api.writes) != 2 || api.sources["existing"].Name != "Updated name" || api.sources["new"].Name != "new" {
 		t.Fatalf("first apply writes=%#v sources=%#v", api.writes, api.sources)
 	}
+	if !api.writes[0].absent || api.writes[0].conditional || api.writes[1].absent || !api.writes[1].conditional || api.writes[1].revision != management.SourceRevision(manifestCurrent("existing")) {
+		t.Errorf("create/update did not use planned preconditions: %#v", api.writes)
+	}
+	if api.gets["new"] != 1 || api.gets["existing"] != 1 {
+		t.Errorf("apply re-read sources after planning: gets=%#v", api.gets)
+	}
 	for _, result := range results {
 		if result.Revision != management.SourceRevision(api.sources[result.SourceID]) || result.Revision == "" {
 			t.Errorf("successful write revision = %#v", result)
@@ -455,22 +476,20 @@ func TestApplyManifestRevisionPreconditions(t *testing.T) {
 	}
 }
 
-func TestApplyManifestFallbackDetectsInterveningEdit(t *testing.T) {
+func TestApplyManifestUpdateRace(t *testing.T) {
 	api := newManifestAPI(t, manifestCurrent("docs"))
-	api.beforeGet = func(id string, count int) {
-		if id == "docs" && count == 2 {
-			s := api.sources[id]
-			s.Name = "Concurrent edit"
-			api.sources[id] = s
-		}
+	concurrent := manifestCurrent("docs")
+	concurrent.Name = "Concurrent edit"
+	api.beforeWrite = func(id string) {
+		api.sources[id] = api.copySource(concurrent)
 	}
 	entry := manifestEntry("docs")
 	entry.Name = "Our edit"
 	results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifestFile(entry), PlanOptions{})
 	failure := assertCode(t, err, CodeConflict)
 	requireApplyOutcomes(t, results, []string{"docs"}, []string{"conflict"})
-	if failure.ExitCode() != 5 || failure.Message != "1 source(s) changed since plan; review with plan and rerun apply" || len(api.writes) != 0 || api.sources["docs"].Name != "Concurrent edit" {
-		t.Fatalf("error=%#v writes=%#v stored=%#v", failure, api.writes, api.sources["docs"])
+	if failure.ExitCode() != 5 || len(api.writes) != 1 || !api.writes[0].conditional || api.writes[0].revision != management.SourceRevision(manifestCurrent("docs")) || api.gets["docs"] != 1 || !reflect.DeepEqual(api.sources["docs"], concurrent) {
+		t.Fatalf("error=%#v writes=%#v gets=%#v stored=%#v", failure, api.writes, api.gets, api.sources["docs"])
 	}
 }
 
@@ -520,18 +539,64 @@ func TestApplyManifestPartialFailureAndRerunConverges(t *testing.T) {
 
 func TestApplyManifestCreateRace(t *testing.T) {
 	api := newManifestAPI(t)
-	api.beforeGet = func(id string, count int) {
-		if id == "docs" && count == 2 {
-			s := manifestCurrent(id)
-			s.Name = "Racing creator"
-			api.sources[id] = s
-		}
+	concurrent := manifestCurrent("docs")
+	concurrent.Name = "Racing creator"
+	api.beforeWrite = func(id string) {
+		api.sources[id] = api.copySource(concurrent)
 	}
 	results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifestFile(manifestEntry("docs")), PlanOptions{})
 	failure := assertCode(t, err, CodeConflict)
 	requireApplyOutcomes(t, results, []string{"docs"}, []string{"conflict"})
-	if failure.ExitCode() != 5 || len(api.writes) != 0 || api.sources["docs"].Name != "Racing creator" {
-		t.Fatalf("create race error=%#v writes=%#v sources=%#v", failure, api.writes, api.sources)
+	if failure.ExitCode() != 5 || len(api.writes) != 1 || !api.writes[0].absent || api.gets["docs"] != 1 || !reflect.DeepEqual(api.sources["docs"], concurrent) {
+		t.Fatalf("create race error=%#v writes=%#v gets=%#v sources=%#v", failure, api.writes, api.gets, api.sources)
+	}
+}
+
+func TestApplyManifestRequiresRevisionPreconditions(t *testing.T) {
+	for _, action := range []PlanAction{PlanCreate, PlanUpdate} {
+		t.Run(string(action), func(t *testing.T) {
+			api := newManifestAPI(t, manifestCurrent("same"), manifestCurrent("existing"))
+			api.caps.RevisionPreconditions = false
+			entry := manifestEntry("new")
+			if action == PlanUpdate {
+				entry = manifestEntry("existing")
+				entry.Name = "Updated"
+			}
+			var out bytes.Buffer
+			results, err := ApplyManifest(context.Background(), Env{API: api, Out: &out}, manifestFile(manifestEntry("same"), entry), PlanOptions{})
+			failure := assertCode(t, err, CodeUnsupported)
+			if failure.ExitCode() != 6 || !strings.Contains(failure.Message, "revision_preconditions") || !strings.Contains(failure.Message, api.caps.Runtime) {
+				t.Errorf("unsupported error = %#v (exit %d)", failure, failure.ExitCode())
+			}
+			if results != nil || len(api.writes) != 0 || api.removes != 0 || out.Len() != 0 {
+				t.Errorf("unsupported apply returned results=%#v writes=%#v removes=%d output=%q", results, api.writes, api.removes, out.String())
+			}
+		})
+	}
+}
+
+func TestApplyManifestUnchangedWithoutRevisionPreconditions(t *testing.T) {
+	current := manifestCurrent("docs")
+	api := newManifestAPI(t, current)
+	api.caps.RevisionPreconditions = false
+	results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifestFile(manifestEntry("docs")), PlanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireApplyOutcomes(t, results, []string{"docs"}, []string{"unchanged"})
+	if len(api.writes) != 0 || api.removes != 0 || api.gets["docs"] != 1 || !reflect.DeepEqual(api.sources["docs"], current) {
+		t.Fatalf("unchanged apply mutated or re-read source: writes=%#v gets=%#v sources=%#v", api.writes, api.gets, api.sources)
+	}
+}
+
+func TestPlanManifestWithoutRevisionPreconditions(t *testing.T) {
+	api := newManifestAPI(t, manifestCurrent("existing"))
+	api.caps.RevisionPreconditions = false
+	entry := manifestEntry("existing")
+	entry.Name = "Updated"
+	plan := planWithoutWrites(t, api, manifestFile(manifestEntry("new"), entry), PlanOptions{})
+	if plan.Items[0].Action != PlanCreate || plan.Items[1].Action != PlanUpdate {
+		t.Fatalf("read-only plan = %#v, want create and update", plan.Items)
 	}
 }
 
@@ -597,21 +662,16 @@ func TestApplyManifestOutput(t *testing.T) {
 // The server's revision is authoritative: its config encoding (for example
 // JSON numbers) may differ from what the client would recompute.
 func TestApplyManifestUsesServerRevision(t *testing.T) {
-	for _, preconditions := range []bool{true, false} {
-		t.Run(fmt.Sprintf("preconditions=%t", preconditions), func(t *testing.T) {
-			api := newManifestAPI(t, manifestCurrent("docs"))
-			api.caps.RevisionPreconditions = preconditions
-			api.revisionFor = func(s management.Source) string { return "server-" + management.SourceRevision(s) }
-			entry := manifestEntry("docs")
-			entry.Name = "Updated"
-			results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifestFile(entry), PlanOptions{})
-			if err != nil {
-				t.Fatalf("apply: %v (results %#v)", err, results)
-			}
-			requireApplyOutcomes(t, results, []string{"docs"}, []string{"updated"})
-			if preconditions && api.writes[0].revision != api.revision(manifestCurrent("docs")) {
-				t.Fatalf("precondition revision = %q", api.writes[0].revision)
-			}
-		})
+	api := newManifestAPI(t, manifestCurrent("docs"))
+	api.revisionFor = func(s management.Source) string { return "server-" + management.SourceRevision(s) }
+	entry := manifestEntry("docs")
+	entry.Name = "Updated"
+	results, err := ApplyManifest(context.Background(), Env{API: api, Out: io.Discard}, manifestFile(entry), PlanOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v (results %#v)", err, results)
+	}
+	requireApplyOutcomes(t, results, []string{"docs"}, []string{"updated"})
+	if len(api.writes) != 1 || !api.writes[0].conditional || api.writes[0].revision != api.revision(manifestCurrent("docs")) {
+		t.Fatalf("precondition writes = %#v", api.writes)
 	}
 }
