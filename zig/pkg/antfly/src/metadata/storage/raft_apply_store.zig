@@ -5819,7 +5819,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "15";
+const derived_catalog_index_version = "16";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -11454,7 +11454,9 @@ pub const RaftApplyStore = struct {
             try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected, command.compare_and_replace_table.replacement);
         };
         _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
-        try self.applyTransitionCommandTxn(&txn, group_id, command);
+        if (command == .acknowledge_retained_owner and command.acknowledge_retained_owner.metadata_version == 0) {
+            try self.retainedOwnerReceiptTxn(&txn, group_id, command.acknowledge_retained_owner, true, true);
+        } else try self.applyTransitionCommandTxn(&txn, group_id, command);
         try advanceStandaloneRevision(&txn);
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
         try self.checkHotStandby();
@@ -11660,6 +11662,17 @@ pub const RaftApplyStore = struct {
         if (relation_writer) {
             try self.publishCapturedRelationsTxn(&txn, group_id, &relation_journal);
             try relation_journal.accept();
+        }
+        // Root enrollment is catalog authority, independent of relation
+        // names. Write it after releasing the relation capture while keeping
+        // the binding, enrollment and standalone revision in one transaction.
+        if (update.native_owner_signing_identity) |identity| {
+            const binding = update.native_owner orelse return error.InvalidStandaloneNativeOwner;
+            if (identity.node_id != binding.node_id or identity.store_id != binding.store_id or
+                identity.root_incarnation != binding.root_incarnation or
+                !std.mem.eql(u8, &identity.metadata_incarnation, &binding.metadata_incarnation))
+                return error.StoreRootEnrollmentChanged;
+            try self.persistStoreRootEnrollmentTxn(&txn, group_id, identity);
         }
         try advanceStandaloneRevision(&txn);
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
@@ -12869,6 +12882,17 @@ pub const RaftApplyStore = struct {
         return reply;
     }
 
+    pub fn retainedArchiveWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        return std.json.Stringify.valueAlloc(alloc, try view.nextRetainedArchive(after), .{});
+    }
+
     pub fn retainedDatasetPendingJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group);
         defer txn.abort();
@@ -13813,6 +13837,12 @@ pub const RaftApplyStore = struct {
         defer metadata_table_manager.freeStore(self.alloc, current);
         if (current.node_id != identity.node_id or current.replica_root_incarnation != identity.root_incarnation or
             !std.mem.eql(u8, &current.replica_root_public_key, &identity.public_key)) return error.StoreRootEnrollmentChanged;
+        try self.persistStoreRootEnrollmentTxn(txn, group_id, identity);
+    }
+
+    fn persistStoreRootEnrollmentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, identity: store_root_enrollment.Identity) !void {
+        try identity.validate();
+        var key_buf: [256]u8 = undefined;
         const enrollment_key = try store_root_enrollment.key(&key_buf, group_id, identity.store_id, identity.root_incarnation);
         if (try stagingGet(txn, enrollment_key)) |prior| {
             var old = try std.json.parseFromSlice(store_root_enrollment.Identity, self.alloc, prior, .{});
@@ -15199,7 +15229,7 @@ pub const RaftApplyStore = struct {
     pub fn validateRetainedOwnerReceipt(self: *RaftApplyStore, group: u64, receipt: retained_owner_receipt.Receipt) !void {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        try self.retainedOwnerReceiptTxn(&txn, group, receipt, false);
+        try self.retainedOwnerReceiptTxn(&txn, group, receipt, false, false);
     }
     /// Every registered owner has committed physical reclamation. Closing
     /// additionally requires verified independent coverage for all owners.
@@ -15264,25 +15294,35 @@ pub const RaftApplyStore = struct {
     }
 
     fn acknowledgeRetainedOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, receipt: retained_owner_receipt.Receipt) !void {
-        return self.retainedOwnerReceiptTxn(txn, group, receipt, true);
+        return self.retainedOwnerReceiptTxn(txn, group, receipt, true, false);
     }
-    fn retainedOwnerReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, receipt: retained_owner_receipt.Receipt, persist: bool) !void {
+    fn retainedOwnerReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, receipt: retained_owner_receipt.Receipt, persist: bool, standalone: bool) !void {
         try receipt.verify();
         try self.requireStoreRootEnrollmentTxn(txn, group, receipt.identity);
-        const current = (try self.loadStoreHeaderTxn(txn, group, receipt.identity.store_id)) orelse return error.RetainedOwnerPlanChanged;
-        defer metadata_table_manager.freeStore(self.alloc, current);
-        if (!current.live or current.node_id != receipt.identity.node_id or current.reporter_incarnation != receipt.reporter_incarnation or
-            current.replica_root_incarnation != receipt.identity.root_incarnation or
-            !std.mem.eql(u8, &current.replica_root_public_key, &receipt.identity.public_key)) return error.RetainedOwnerPlanChanged;
         var key: [192]u8 = undefined;
         const cluster_bytes = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&key, group))) orelse return error.RetainedOwnerPlanChanged;
         if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(cluster_bytes)).incarnation, &receipt.identity.metadata_incarnation)) return error.RetainedOwnerPlanChanged;
-        const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&key, group, receipt.group, receipt.identity.node_id))) orelse return error.RetainedOwnerPlanChanged;
-        defer raft_reconciler.freeIntentOwned(self.alloc, placement);
-        if (placement.store_id != receipt.identity.store_id or placement.record.group_id != receipt.group or
-            placement.record.local_node_id != receipt.identity.node_id or placement.record.replica_id != receipt.replica_id or
-            placement.record.metadata_version != receipt.metadata_version or placement.serving_state != .serving or
-            std.mem.indexOfScalar(u64, placement.peer_node_ids, receipt.identity.node_id) == null) return error.RetainedOwnerPlanChanged;
+        if (standalone) {
+            const bytes = (try stagingGet(txn, try standalone_native_owner.key(&key, group))) orelse return error.RetainedOwnerPlanChanged;
+            const binding = try standalone_native_owner.decode(bytes);
+            if (binding.node_id != receipt.identity.node_id or binding.store_id != receipt.identity.store_id or
+                binding.root_incarnation != receipt.identity.root_incarnation or
+                !std.mem.eql(u8, &binding.metadata_incarnation, &receipt.identity.metadata_incarnation) or
+                receipt.metadata_version != 0 or receipt.replica_id != receipt.group or receipt.reporter_incarnation != 1)
+                return error.RetainedOwnerPlanChanged;
+        } else {
+            const current = (try self.loadStoreHeaderTxn(txn, group, receipt.identity.store_id)) orelse return error.RetainedOwnerPlanChanged;
+            defer metadata_table_manager.freeStore(self.alloc, current);
+            if (!current.live or current.node_id != receipt.identity.node_id or current.reporter_incarnation != receipt.reporter_incarnation or
+                current.replica_root_incarnation != receipt.identity.root_incarnation or
+                !std.mem.eql(u8, &current.replica_root_public_key, &receipt.identity.public_key)) return error.RetainedOwnerPlanChanged;
+            const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&key, group, receipt.group, receipt.identity.node_id))) orelse return error.RetainedOwnerPlanChanged;
+            defer raft_reconciler.freeIntentOwned(self.alloc, placement);
+            if (placement.store_id != receipt.identity.store_id or placement.record.group_id != receipt.group or
+                placement.record.local_node_id != receipt.identity.node_id or placement.record.replica_id != receipt.replica_id or
+                placement.record.metadata_version != receipt.metadata_version or placement.serving_state != .serving or
+                std.mem.indexOfScalar(u64, placement.peer_node_ids, receipt.identity.node_id) == null) return error.RetainedOwnerPlanChanged;
+        }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -46200,7 +46240,29 @@ test "system catalog retained owner acknowledgements verify physical authority a
     second.group = 12;
     second.partition = Partition.forGroup(12);
     second.replica_id = 12;
+    second.reporter_incarnation = 1;
+    second.metadata_version = 0;
     second = try second.sign(seed);
+    try std.testing.expectError(error.RetainedOwnerPlanChanged, store.applyStandaloneCommand(group, .{ .acknowledge_retained_owner = second }));
+    var local_identity = identity;
+    local_identity.root_incarnation += 1;
+    second.identity = local_identity;
+    second = try second.sign(seed);
+    const local_binding: standalone_native_owner.Binding = .{
+        .metadata_incarnation = local_identity.metadata_incarnation,
+        .node_id = local_identity.node_id,
+        .store_id = local_identity.store_id,
+        .root_incarnation = local_identity.root_incarnation,
+    };
+    _ = try adoptLiveRelationWriterForTest(&store, a, group);
+    try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_owner = local_binding, .native_owner_signing_identity = local_identity });
+    // A signature produced by another key cannot adopt the same root.
+    const foreign_seed: [32]u8 = @splat(43);
+    const foreign_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(foreign_seed);
+    var foreign = second;
+    foreign.identity.public_key = foreign_pair.public_key.toBytes();
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, store.applyStandaloneCommand(group, .{ .acknowledge_retained_owner = try foreign.sign(foreign_seed) }));
+    try std.testing.expectError(error.RetainedOwnerPlanChanged, store.validateRetainedOwnerReceipt(group, second));
     // Both receipts name owner revision one. Neither carries the shared plan
     // revision, so accepting one cannot make the other spuriously stale.
     for ([_]retained_owner_receipt.Receipt{ first, second, first }) |receipt| {
@@ -46242,6 +46304,8 @@ test "system catalog retained owner acknowledgements verify physical authority a
         try std.testing.expectEqual(retained.Phase.active, published.value.phase);
         try std.testing.expectEqual(@as(u64, 2), published.value.revision);
     }
+    const activated_work = try store.relationReconciliationWork(group);
+    try std.testing.expectEqualDeep(activated_work.epoch, activated_work.published_epoch);
     const pending = try store.retainedDatasetPendingJson(a, group, 0);
     defer a.free(pending);
     try std.testing.expectEqualStrings("null", pending);
@@ -46298,6 +46362,8 @@ test "system catalog retained owner acknowledgements verify physical authority a
     defer a.free(release_entries);
     try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 5, .entries_bytes = release_entries });
     try store.requireRetainedSourceDropAllowed(group, 7);
+    const released_work = try store.relationReconciliationWork(group);
+    try std.testing.expectEqualDeep(released_work.epoch, released_work.published_epoch);
     {
         var txn = try store.store.beginReadTxn();
         defer txn.abort();

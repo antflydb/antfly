@@ -145,4 +145,6 @@ test "retained owner native controls discovery" {
     _ = @import("api/retained_owner_control.zig");
     _ = @import("api/retained_owner_binding.zig");
     _ = httpx_handler;
+    _ = @import("api/retained_dataset_read.zig");
+    _ = @import("api/retained_subscription.zig");
 }

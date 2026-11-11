@@ -588,6 +588,9 @@ pub const RaftApplyStore = struct {
     pub fn retainedDatasetReadCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, target: @import("antfly_local_sources").system_catalog_domain.Target) ![]u8 {
         return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_read_cut = target });
     }
+    pub fn retainedArchiveWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_archive_work = after });
+    }
     pub fn retainedDatasetPendingJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_pending = after });
     }

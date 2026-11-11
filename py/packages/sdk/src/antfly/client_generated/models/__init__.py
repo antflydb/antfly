@@ -100,6 +100,7 @@ from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .brave_search_config_provider import BraveSearchConfigProvider
 from .calendar_interval import CalendarInterval
+from .cancel_retained_subscription_body import CancelRetainedSubscriptionBody
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
 from .catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
@@ -243,6 +244,7 @@ from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_retained_dataset_body import CreateRetainedDatasetBody
 from .create_retained_dataset_body_source import CreateRetainedDatasetBodySource
+from .create_retained_subscription_body import CreateRetainedSubscriptionBody
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_table_storage_migration_body import CreateTableStorageMigrationBody
@@ -2063,6 +2065,7 @@ from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
+from .poll_retained_subscription_body import PollRetainedSubscriptionBody
 from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
@@ -2408,6 +2411,11 @@ from .retained_dataset_info_initial_history import RetainedDatasetInfoInitialHis
 from .retained_dataset_info_phase import RetainedDatasetInfoPhase
 from .retained_dataset_measure import RetainedDatasetMeasure
 from .retained_dataset_measure_law import RetainedDatasetMeasureLaw
+from .retained_subscription_frame import RetainedSubscriptionFrame
+from .retained_subscription_frame_events_item import RetainedSubscriptionFrameEventsItem
+from .retained_subscription_frame_events_item_type import RetainedSubscriptionFrameEventsItemType
+from .retained_subscription_frame_initial_history import RetainedSubscriptionFrameInitialHistory
+from .retained_subscription_frame_kind import RetainedSubscriptionFrameKind
 from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -2809,6 +2817,7 @@ __all__ = (
     "BraveSearchConfigFreshness",
     "BraveSearchConfigProvider",
     "CalendarInterval",
+    "CancelRetainedSubscriptionBody",
     "Capability",
     "CardinalityMode",
     "CatalogMutationVisibilityPending",
@@ -2974,6 +2983,7 @@ __all__ = (
     "CreateRelationalIndexRequestType",
     "CreateRetainedDatasetBody",
     "CreateRetainedDatasetBodySource",
+    "CreateRetainedSubscriptionBody",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateTablespaceRequest",
@@ -4550,6 +4560,7 @@ __all__ = (
     "Permission",
     "PermissionType",
     "PhraseQuery",
+    "PollRetainedSubscriptionBody",
     "PredicateDecisionQuestion",
     "PredicateDecisionQuestionType",
     "PrefixQuery",
@@ -4893,6 +4904,11 @@ __all__ = (
     "RetainedDatasetInfoPhase",
     "RetainedDatasetMeasure",
     "RetainedDatasetMeasureLaw",
+    "RetainedSubscriptionFrame",
+    "RetainedSubscriptionFrameEventsItem",
+    "RetainedSubscriptionFrameEventsItemType",
+    "RetainedSubscriptionFrameInitialHistory",
+    "RetainedSubscriptionFrameKind",
     "RetrievalAgentRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",

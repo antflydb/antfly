@@ -32,7 +32,7 @@ pub const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, graph } = .table,
+    kind: enum { table, graph, dataset } = .table,
     graph_pattern_hash: u64 = 0,
     database: []const u8,
     namespace: []const u8,
@@ -44,7 +44,7 @@ pub const Binding = struct {
 
     pub fn from(table: catalog.Table) !Binding {
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-        return .{ .kind = if (table.graph != null) .graph else .table, .graph_pattern_hash = if (table.graph) |graph| std.hash.Wyhash.hash(0x67726170685f7371, graph.definition.query.source) else 0, .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision };
+        return .{ .kind = if (table.graph != null) .graph else if (table.retained != null) .dataset else .table, .graph_pattern_hash = if (table.graph) |graph| std.hash.Wyhash.hash(0x67726170685f7371, graph.definition.query.source) else 0, .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision };
     }
 
     pub fn verify(bindings: []const Binding, table: catalog.Table) !void {

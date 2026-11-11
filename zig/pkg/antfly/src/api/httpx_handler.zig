@@ -1649,6 +1649,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
         try server.post(table_prefix ++ routes.retained_owner_control_suffix, httpx.Handler.bind(self, internalGroupRetainedOwnerControl));
         try server.post(table_prefix ++ routes.retained_owner_read_suffix, httpx.Handler.bind(self, internalGroupRetainedOwnerRead));
+        try server.post(table_prefix ++ routes.retained_owner_replay_suffix, httpx.Handler.bind(self, internalGroupRetainedOwnerReplay));
         try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
@@ -2890,6 +2891,66 @@ pub const AntflyApiHandler = struct {
         return ctx.json(receipt);
     }
 
+    pub fn createRetainedSubscription(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        return self.retainedSubscription(ctx, .open);
+    }
+    pub fn pollRetainedSubscription(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        return self.retainedSubscription(ctx, .poll);
+    }
+    pub fn cancelRetainedSubscription(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
+        return self.retainedSubscription(ctx, .cancel);
+    }
+
+    fn retainedSubscription(self: *AntflyApiHandler, ctx: *httpx.Context, action: enum { open, poll, cancel }) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*admitted| admitted.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const route = (try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path))) orelse return textResponse(ctx, 400, "invalid dataset target");
+        defer route.deinit(ctx.allocator);
+        if (route.kind != .dataset) return textResponse(ctx, 400, "invalid dataset target");
+        const target: system_catalog.Target = .{ .database = route.database, .namespace = route.namespace, .table = route.name orelse return textResponse(ctx, 400, "dataset name required") };
+        const a = ctx.allocator;
+        const logical = try target.resourceNameAlloc(a);
+        defer a.free(logical);
+        if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
+        const subscription = @import("retained_subscription.zig");
+        const registry = @import("retained_subscription_registry.zig");
+        const server = self.api_server;
+        const io = server.sharedApiIo() orelse return textResponse(ctx, 503, "subscription service unavailable");
+        const secret = try server.researchStateKey(io);
+        const principal = try subscription.authorityHash(a, if (identity) |admitted| admitted.credential_principal else "anonymous", target);
+        var context = try operationContext(ctx, identity).platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "subscription request required");
+        if (body.len > 4096) return textResponse(ctx, 413, "subscription request too large");
+        const result = switch (action) {
+            .open => subscription.open(server, a, &server.retained_subscriptions, &secret, principal, target, std.json.parseFromSliceLeaky(subscription.Create, a, body, .{}) catch return textResponse(ctx, 400, "invalid subscription range"), context),
+            .poll, .cancel => response: {
+                const request = std.json.parseFromSliceLeaky(subscription.Poll, a, body, .{}) catch return textResponse(ctx, 400, "invalid subscription cursor");
+                if (action == .poll) break :response subscription.poll(server, a, &server.retained_subscriptions, &secret, principal, target, request, context);
+                const position = registry.verify(&secret, request.cursor) catch return textResponse(ctx, 400, "invalid subscription cursor");
+                server.retained_subscriptions.cancel(server.alloc, position, principal) catch return textResponse(ctx, 403, "forbidden");
+                return ctx.status(204).text("");
+            },
+        };
+        const bytes = result catch |err| return switch (err) {
+            error.RetainedSeriesResetRequired, error.RetainedOwnerPlanChanged => ctx.status(409).json(.{ .code = "reset_required", .reset_required = true }),
+            error.InvalidRetainedSubscriptionToken, error.InvalidDatasetCoverage, error.RetainedSeriesResolutionMismatch => textResponse(ctx, 400, @errorName(err)),
+            error.DatasetPageBudgetExceeded, error.DatasetReaderBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
+            error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
+            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.CatalogNotFound => textResponse(ctx, 404, "dataset not found"),
+            else => textResponse(ctx, 503, "subscription replay unavailable"),
+        };
+        defer a.free(bytes);
+        if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
+        _ = ctx.status(if (action == .open) 201 else 200);
+        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("cache-control", "no-store");
+        _ = ctx.response.body(bytes);
+        return ctx.response.build();
+    }
+
     pub fn createRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {
         return self.retainedDatasetControl(ctx, .create);
     }
@@ -2911,7 +2972,6 @@ pub const AntflyApiHandler = struct {
         const logical = try system_catalog_routes.resourceNameAlloc(ctx.allocator, route);
         defer ctx.allocator.free(logical);
         if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, if (action == .get) .read else .admin)) return textResponse(ctx, 403, "forbidden");
-        if (action != .get and self.api_server.cfg.deployment_mode == .standalone) return textResponse(ctx, 503, "retained dataset maintenance unavailable");
         const a = ctx.allocator;
         const local = @import("antfly_local_sources");
         const retained = local.system_catalog_retained_datasets;
@@ -3018,6 +3078,30 @@ pub const AntflyApiHandler = struct {
             error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
             error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
             error.RetainedSeriesCoverageMissing, error.RetainedOwnerPlanChanged, error.RetainedSeriesSourceRevoked, error.RetainedSeriesResolutionMismatch => textResponse(ctx, 409, @errorName(err)),
+            error.InvalidRetainedOwnerPlan, error.InvalidDatasetCoverage => textResponse(ctx, 400, @errorName(err)),
+            else => textResponse(ctx, 503, "retained owner unavailable"),
+        };
+        defer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(bytes);
+        return ctx.response.build();
+    }
+
+    fn internalGroupRetainedOwnerReplay(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "retained owner replay required");
+        if (body.len > 4096) return textResponse(ctx, 413, "retained owner replay too large");
+        const query = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").NativeReplay, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid retained owner replay");
+        const port = self.api_server.cfg.retained_owner_read orelse return textResponse(ctx, 503, "retained owner unavailable");
+        const bytes = port.poll(ctx.allocator, params.table_name, params.group_id, query, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
+            error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
+            error.RetainedSeriesResetRequired, error.RetainedSeriesCoverageMissing, error.RetainedOwnerPlanChanged, error.RetainedSeriesSourceRevoked, error.RetainedSeriesResolutionMismatch => textResponse(ctx, 409, @errorName(err)),
             error.InvalidRetainedOwnerPlan, error.InvalidDatasetCoverage => textResponse(ctx, 400, @errorName(err)),
             else => textResponse(ctx, 503, "retained owner unavailable"),
         };

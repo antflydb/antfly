@@ -183,12 +183,14 @@ pub const Cte = struct {
 pub const Search = struct { request: Value, limit: ?Value = null };
 /// Native graph relation, sharing source-spanned graph IR with standalone
 /// Cypher. SQL output aliases retain SQL identifier folding and scope.
+pub const RetainedTable = struct { name: Name, start: Value, end: Value };
 pub const GraphTable = struct { name: Name, query: @import("cypher").ast.Query, parameters: []const []const u8 };
 pub const Relation = union(enum) {
     table: struct {
         name: Name,
         search: ?*const Search = null,
         graph: ?*const GraphTable = null,
+        retained: ?*const RetainedTable = null,
         alias: ?[]const u8 = null,
         mutation_target: bool = false,
         mutation_document: bool = false,

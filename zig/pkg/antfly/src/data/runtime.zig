@@ -5602,6 +5602,13 @@ pub const DataServer = struct {
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
+    standalone_retained_owner: ?struct {
+        node_id: u64,
+        store_id: u64,
+        metadata: *anyopaque,
+        maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!void,
+        validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
+    } = null,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
     store_root_registration_active: std.atomic.Value(bool) = .init(false),
@@ -6704,7 +6711,7 @@ pub const DataServer = struct {
     // driver which advances them. Each job visits bounded indexed work and
     // only the current source-group leader performs reconciliation.
     fn runRetainedMaintenanceRound(self: *DataServer) !void {
-        if (self.data_raft == null or !self.store_root_registration_active.load(.acquire)) return;
+        if (self.standalone_retained_owner == null and (self.data_raft == null or !self.store_root_registration_active.load(.acquire))) return;
         const runtime = self.backend_runtime orelse return;
         if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
         const now = self.backgroundMonotonicNs();
@@ -6721,7 +6728,7 @@ pub const DataServer = struct {
     fn retainedMaintenanceLeader(self: *DataServer, group: u64) bool {
         lockAtomic(&self.data_raft_mutex);
         defer self.data_raft_mutex.unlock();
-        const raft = self.data_raft orelse return false;
+        const raft = self.data_raft orelse return self.standalone_retained_owner != null;
         return raft.host.http_host.host.isLocalLeader(group);
     }
     fn runRetainedMaintenanceJob(ptr: *anyopaque) !void {
@@ -6736,6 +6743,15 @@ pub const DataServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        defer if (self.standalone_retained_owner) |local| {
+            var archive_context = context;
+            archive_context.deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+            local.maintain_archive(local.metadata, archive_context) catch |err| {
+                if (err != error.Canceled and !@import("../serverless/datasets/configured_archive.zig").ExpiryMaintenance.retryable(err))
+                    std.log.warn("standalone retained archive maintenance deferred err={s}", .{@errorName(err)});
+            };
+        };
+
         // Schedule the two indexed lanes independently. Idle resources must
         // not delay active backfill; alternating eligible lanes preserves
         // fairness when both have work.
@@ -7223,7 +7239,7 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
         api_server_cfg.retained_owner_control = .{ .ptr = self, .execute_fn = executeRetainedOwnerControl };
-        api_server_cfg.retained_owner_read = .{ .ptr = self, .read_fn = queryRetainedOwnerRows };
+        api_server_cfg.retained_owner_read = .{ .ptr = self, .read_fn = queryRetainedOwnerRows, .poll_fn = pollRetainedOwner };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -12193,6 +12209,31 @@ pub const DataServer = struct {
         return receipt;
     }
 
+    fn loadRetainedReadOwner(self: *DataServer, a: std.mem.Allocator, table_name: []const u8, scope: @import("../metadata/retained_dataset_owners.zig").ArchiveScope, context: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Snapshot {
+        const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .owner = scope } });
+        if (bytes.len > 4 * 1024 * 1024) return error.CatalogCommandTooLarge;
+        const snapshot = try std.json.parseFromSliceLeaky(antfly.public_api.retained_owner_control.Snapshot, a, bytes, .{});
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        if ((snapshot.plan.phase != .active and snapshot.plan.phase != .closing) or (snapshot.owner.mode != .ready and snapshot.owner.mode != .closed) or
+            snapshot.owner.independent_receipt != null or !std.mem.eql(u8, source.name, table_name)) return error.RetainedOwnerPlanChanged;
+        return snapshot;
+    }
+
+    fn pollRetainedOwner(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeReplay, input: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        var context = try input.platformDeadline();
+        context.setting_admin = true;
+        try context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const snapshot = try self.loadRetainedReadOwner(arena.allocator(), table_name, request.scope, context);
+        const local = @import("antfly_local_sources");
+        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        return owner.queryRetainedSeriesJson(alloc, group, table_name, .{ .poll = .{ .fence = fence, .root_incarnation = try std.fmt.parseInt(u128, request.root_incarnation, 10), .cursor = request.cursor, .limit = request.limit } }, context);
+    }
+
     fn queryRetainedOwnerRows(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeQuery, input: antfly.public_api.operation.RequestContext) ![]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try request.validate(group);
@@ -12203,30 +12244,33 @@ pub const DataServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const local = @import("antfly_local_sources");
-        const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .owner = request.scope } });
-        if (bytes.len > 4 * 1024 * 1024) return error.CatalogCommandTooLarge;
-        const snapshot = try std.json.parseFromSliceLeaky(antfly.public_api.retained_owner_control.Snapshot, a, bytes, .{});
-        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
-        if ((snapshot.plan.phase != .active and snapshot.plan.phase != .closing) or (snapshot.owner.mode != .ready and snapshot.owner.mode != .closed) or
-            snapshot.owner.independent_receipt != null or !std.mem.eql(u8, source.name, table_name)) return error.RetainedOwnerPlanChanged;
+        const snapshot = try self.loadRetainedReadOwner(a, table_name, request.scope, context);
         const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
         const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = platform_time.realtimeNs() }, context);
         defer reader.deinit();
         var rows: std.ArrayList(local.storage_retained_series.Bucket) = .empty;
         var encoded_bytes: usize = 0;
+        var position: ?local.storage_retained_series.Cursor = null;
+        var root: []const u8 = "";
         while (true) {
             const raw = try reader.nextJson(a, @min(128, request.limit), context);
             if (raw.len > 6 * 1024 * 1024 - encoded_bytes) return error.DatasetPageBudgetExceeded;
             encoded_bytes += raw.len;
             const page = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, raw, .{});
+            if (position) |prior| {
+                if (!std.meta.eql(prior, page.page.cursor) or !std.mem.eql(u8, root, page.root_incarnation)) return error.RetainedSeriesResetRequired;
+            } else {
+                position = page.page.cursor;
+                root = page.root_incarnation;
+            }
             if (page.page.rows.len > request.limit - rows.items.len) return error.DatasetPageBudgetExceeded;
             try rows.appendSlice(a, page.page.rows);
             if (page.page.after == null) break;
             if (rows.items.len == request.limit) return error.DatasetPageBudgetExceeded;
         }
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items }, .{});
+        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items, .root_incarnation = root, .cursor = position orelse return error.RetainedSeriesNotReady }, .{});
     }
 
     fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
@@ -12242,12 +12286,14 @@ pub const DataServer = struct {
         const term = blk: {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            const raft = self.data_raft orelse break :blk @as(?u64, null);
             if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
             const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
-            break :blk status.hard.current_term;
+            break :blk @as(?u64, status.hard.current_term);
         };
-        try self.waitDataReadSafeWithCancellation(group_id, "retained-owner-control", 5_000, context.cancellation);
+        if (term != null) {
+            try self.waitDataReadSafeWithCancellation(group_id, "retained-owner-control", 5_000, context.cancellation);
+        } else if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -12261,6 +12307,20 @@ pub const DataServer = struct {
         const descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
         const lineage = descriptor.value.source orelse return error.RetainedOwnerPlanChanged;
         if (!std.mem.eql(u8, source.name, table_name) or source.table_id != snapshot.plan.source_table) return error.RetainedOwnerPlanChanged;
+        const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+        const io = (try self.ensureBackendRuntime()).apiIo() orelse return error.BackendRuntimeUnavailable;
+        const local_root: ?signing.State = if (term == null) local: {
+            const owner = self.standalone_retained_owner orelse return error.GroupLeaderUnavailable;
+            const root = try signing.load(a, io, self.write_source.replica_root_dir);
+            try owner.validate_root(owner.metadata, a, .{
+                .metadata_incarnation = lineage.metadata_incarnation,
+                .node_id = owner.node_id,
+                .store_id = owner.store_id,
+                .root_incarnation = root.root_incarnation,
+                .public_key = root.public_key,
+            }, context);
+            break :local root;
+        } else null;
         const fence: controls.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
         const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         var revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
@@ -12317,13 +12377,14 @@ pub const DataServer = struct {
         }
         if (command) |native| {
             try context.ensureActive();
-            try self.proposeRaftBatchGroup(a, group_id, table_name, .{ .retained_series = native, .timestamp_ns = platform_time.realtimeNs() }, .{
+            const batch: antfly.db.types.BatchRequest = .{ .retained_series = native, .timestamp_ns = platform_time.realtimeNs() };
+            if (term) |leader_term| try self.proposeRaftBatchGroup(a, group_id, table_name, batch, .{
                 .discovery = .cached,
-                .required_local_term = term,
+                .required_local_term = leader_term,
                 .allow_remote_forward = false,
                 .admission_deadline_ns = context.deadline_ns,
                 .visibility_cancellation = context.cancellation,
-            });
+            }) else try owners.applyRetainedSeriesNative(a, group_id, table_name, batch, context);
             revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
         }
         if (revocation.revoked and !revocation.reclaimed) return error.RetainedSeriesNotReady;
@@ -12347,22 +12408,26 @@ pub const DataServer = struct {
             }
             native_root = try std.fmt.parseInt(u128, status.root_incarnation, 10);
         } else if (request.action != .revoke and request.action != .observe) return error.RetainedSeriesSourceRevoked;
-        const registration = self.store_registration orelse return error.StoreRegistrationUnavailable;
-        const runtime = try self.ensureBackendRuntime();
-        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(a, io, self.write_source.replica_root_dir);
-        var point = blk: {
-            lockAtomic(&self.data_raft_mutex);
-            defer self.data_raft_mutex.unlock();
-            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
-            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
-            const current = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
-            if (current.hard.current_term != term) return error.GroupLeaderUnavailable;
-            break :blk (try raft.host.http_host.host.readReplicaCatalogRecord(a, group_id)) orelse return error.ReplicaCatalogUnavailable;
+        const root = local_root orelse try signing.load(a, io, self.write_source.replica_root_dir);
+        const authority = blk: {
+            const Authority = struct { node: u64, store: u64, reporter: u64, replica: u64, version: u64 };
+            if (term) |leader_term| {
+                const registration = self.store_registration orelse return error.StoreRegistrationUnavailable;
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+                if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+                const current = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+                if (current.hard.current_term != leader_term) return error.GroupLeaderUnavailable;
+                var point = (try raft.host.http_host.host.readReplicaCatalogRecord(a, group_id)) orelse return error.ReplicaCatalogUnavailable;
+                defer point.deinit(a);
+                const record = point.record orelse return error.ReplicaCatalogUnavailable;
+                if (record.local_node_id != registration.node_id or record.group_id != group_id) return error.RetainedOwnerPlanChanged;
+                break :blk Authority{ .node = registration.node_id, .store = registration.store_id, .reporter = self.reporter_incarnation, .replica = record.replica_id, .version = record.metadata_version };
+            }
+            const local = self.standalone_retained_owner orelse return error.GroupLeaderUnavailable;
+            break :blk Authority{ .node = local.node_id, .store = local.store_id, .reporter = 1, .replica = group_id, .version = 0 };
         };
-        defer point.deinit(a);
-        const record = point.record orelse return error.ReplicaCatalogUnavailable;
-        if (record.local_node_id != registration.node_id or record.group_id != group_id) return error.RetainedOwnerPlanChanged;
         const receipt = try (antfly.public_api.retained_owner_control.Response{
             .resource = request.resource,
             .generation = request.generation,
@@ -12376,10 +12441,10 @@ pub const DataServer = struct {
             .mode = mode,
             .cut = cut,
             .native_root = native_root,
-            .identity = .{ .metadata_incarnation = lineage.metadata_incarnation, .node_id = registration.node_id, .store_id = registration.store_id, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
-            .reporter_incarnation = self.reporter_incarnation,
-            .replica_id = record.replica_id,
-            .metadata_version = record.metadata_version,
+            .identity = .{ .metadata_incarnation = lineage.metadata_incarnation, .node_id = authority.node, .store_id = authority.store, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
+            .reporter_incarnation = authority.reporter,
+            .replica_id = authority.replica,
+            .metadata_version = authority.version,
         }).sign(root.seed);
         try context.ensureActive();
         return receipt;

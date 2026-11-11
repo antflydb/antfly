@@ -41,14 +41,31 @@ pub const NativeQuery = struct {
         try (dataset.Range{ .start_ns = self.start_ns, .end_ns = self.end_ns }).validate();
     }
 };
-pub const NativeReply = struct { rows: []const series.Bucket };
+pub const NativeReply = struct { rows: []const series.Bucket, root_incarnation: []const u8, cursor: series.Cursor };
+pub const NativeReplay = struct {
+    scope: owner_model.ArchiveScope,
+    root_incarnation: []const u8,
+    cursor: series.Cursor,
+    limit: u16 = 8,
+    pub fn validate(self: NativeReplay, group: u64) !void {
+        try (owner_model.Read{ .owner = self.scope }).validate();
+        if (self.scope.group != group or self.root_incarnation.len == 0 or self.root_incarnation.len > 40 or self.limit == 0 or self.limit > 32) return error.InvalidRetainedOwnerPlan;
+        if ((std.fmt.parseInt(u128, self.root_incarnation, 10) catch return error.InvalidRetainedOwnerPlan) == 0) return error.InvalidRetainedOwnerPlan;
+    }
+};
 pub const NativePort = struct {
     ptr: *anyopaque,
     read_fn: *const fn (*anyopaque, A, []const u8, u64, NativeQuery, operation.RequestContext) anyerror![]u8,
+    poll_fn: *const fn (*anyopaque, A, []const u8, u64, NativeReplay, operation.RequestContext) anyerror![]u8,
     pub fn readRows(self: NativePort, a: A, table: []const u8, group: u64, request: NativeQuery, context: operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate(group);
         return self.read_fn(self.ptr, a, table, group, request, context);
+    }
+    pub fn poll(self: NativePort, a: A, table: []const u8, group: u64, request: NativeReplay, context: operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate(group);
+        return self.poll_fn(self.ptr, a, table, group, request, context);
     }
 };
 pub const Snapshot = struct {
@@ -152,21 +169,26 @@ pub fn read(a: A, snapshot: Snapshot, input: Request, context: operation.Request
     return .{ .arena = arena, .rows = rows.items, .history = summary.initial_history };
 }
 
-/// Serve one already-authorized qualified dataset range. Raw table authority
-/// stays private and is resolved solely from the dataset's metadata cut.
-pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Target, input: Request, request_context: operation.RequestContext) ![]u8 {
-    var context = request_context;
+/// Capture authority after the caller has authorized the qualified dataset.
+pub fn fetchReadCut(server: anytype, a: A, target: local.system_catalog_domain.Target, input: operation.RequestContext) !Snapshot {
+    var context = input;
     context.setting_admin = true;
+    const bytes = try server.source.systemCatalog(a, context, .{ .retained_dataset_read_cut = target });
+    defer a.free(bytes);
+    if (bytes.len > 8 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
+    return std.json.parseFromSliceLeaky(Snapshot, a, bytes, .{ .allocate = .alloc_always });
+}
+
+pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
+    var context = try request_context.platformDeadline();
+    const now = @import("antfly_platform").time.monotonicNs();
+    context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| 30 * std.time.ns_per_s);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const bytes = try server.source.systemCatalog(scratch, context, .{ .retained_dataset_read_cut = target });
-    if (bytes.len > 8 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
-    const snapshot = try std.json.parseFromSliceLeaky(Snapshot, scratch, bytes, .{});
     var descriptor = try local.system_catalog_retained_datasets.parse(scratch, snapshot.resource.source_json);
     defer descriptor.deinit();
-    const definition = descriptor.value.definition;
-    const summary = definition.summary orelse return error.InvalidDatasetDefinition;
+    if (!std.mem.eql(u8, &try descriptor.value.definition.fingerprint(scratch), &try definition.fingerprint(scratch))) return error.RetainedOwnerPlanChanged;
     const Archive = @import("../serverless/datasets/configured_archive.zig").Opened;
     var archive: ?Archive = null;
     defer if (archive) |*opened| opened.deinit();
@@ -211,7 +233,19 @@ pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Targ
         }
     };
     if (input.max_rows == 0 or input.max_rows > 4096) return error.DatasetPageBudgetExceeded;
-    var result = try read(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = @intCast(input.max_rows) });
+    return read(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = @intCast(input.max_rows) });
+}
+
+pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Target, input: Request, context: operation.RequestContext) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const snapshot = try fetchReadCut(server, scratch, target, context);
+    var descriptor = try local.system_catalog_retained_datasets.parse(scratch, snapshot.resource.source_json);
+    defer descriptor.deinit();
+    const definition = descriptor.value.definition;
+    const summary = definition.summary orelse return error.InvalidDatasetDefinition;
+    var result = try readResolved(server, a, snapshot, definition, input, context);
     defer result.deinit();
     const Row = struct { bucket_start_ns: []const u8, dimensions: []const std.json.Value, values: []const std.json.Value };
     const output = try scratch.alloc(Row, result.rows.len);
@@ -227,4 +261,58 @@ pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Targ
         out.* = .{ .bucket_start_ns = try std.fmt.allocPrint(scratch, "{d}", .{row.start_ns}), .dimensions = dimensions, .values = values };
     }
     return std.json.Stringify.valueAlloc(a, .{ .initial_history = result.history, .dimensions = summary.dimensions, .measures = summary.measures, .rows = output }, .{});
+}
+
+test "retained owner native controls merge archived and native average states without fallback" {
+    const a = std.testing.allocator;
+    const cluster = "11111111111111111111111111111111".*;
+    const lineage = try local.system_catalog_retained_datasets.Source.fromTable(a, .{ .table_id = @as(u64, 7), .name = "raw", .schema_json = "" }, cluster);
+    var schema: dataset.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const definition: dataset.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(2), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = lineage.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "avg_v", .law = .avg, .field = "v" }} } };
+    const descriptor: local.system_catalog_retained_datasets.Descriptor = .{ .definition = definition, .source = lineage, .phase = .closing, .catalog_location = @splat(3), .catalog_storage_identity = @splat(4) };
+    const json = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(json);
+    var membership: topology.RangeMembershipAccumulator = .{};
+    try membership.add(11);
+    try membership.add(12);
+    var plan: owner_model.Plan = .{ .id = @splat(0), .resource = 8, .dataset = definition.id, .generation = 1, .definition = try definition.fingerprint(a), .source = lineage.identity(), .source_table = 7, .topology_generation = 1, .membership = membership.finish(7).digest, .phase = .closing, .registration_after = 12, .registration_complete = true, .registered = 2, .registration_membership = membership, .ready = 2, .stopped = 1, .independent = 1 };
+    plan.id = plan.identity();
+    const snapshot: Snapshot = .{ .resource = .{ .id = 8, .kind = .dataset, .name = "stats", .source_json = json, .retained = descriptor.identity() }, .plan = plan, .owners = &.{
+        .{ .plan = plan.id, .group = 11, .partition = @splat(5), .incarnation = 1, .revision = 2, .mode = .ready, .native_receipt = @splat(7) },
+        .{ .plan = plan.id, .group = 12, .partition = @splat(6), .incarnation = 1, .revision = 4, .mode = .closed, .native_receipt = @splat(8), .independent_receipt = @splat(9), .cut = .{ .closure = @splat(10), .sequence = 1, .complete_from_ns = "0", .admitted_ns = "100" } },
+    } };
+    const Reader = struct {
+        archive_available: bool = true,
+        native_calls: usize = 0,
+        archived_calls: usize = 0,
+        pub fn readPartition(self: *@This(), alloc: A, owner: owner_model.Owner, authority: Authority, _: dataset.Range, _: operation.RequestContext) !@import("../serverless/datasets/summary_read.zig").Result {
+            if (owner.group == 12) {
+                try std.testing.expectEqual(Authority.archive, authority);
+                self.archived_calls += 1;
+                if (!self.archive_available) return error.DatasetLocationUnavailable;
+            } else {
+                try std.testing.expectEqual(Authority.native, authority);
+                self.native_calls += 1;
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const scratch = arena.allocator();
+            const rows = try scratch.alloc(series.Bucket, 1);
+            const metric = try scratch.alloc(series.Metric, 1);
+            metric[0] = if (owner.group == 11) .{ .count = 1, .sum = 10 } else .{ .count = 3, .sum = 3 };
+            rows[0] = .{ .start_ns = 0, .dimensions = "[]", .rows = metric[0].count, .metrics = metric };
+            return .{ .arena = arena, .rows = rows };
+        }
+    };
+    var reader: Reader = .{};
+    const range: Request = .{ .start_ns = "0", .end_ns = "10" };
+    var result = try read(a, snapshot, range, .{}, &reader);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(?f64, 3.25), result.rows[0].metrics[0].value(.avg));
+    reader.archive_available = false;
+    try std.testing.expectError(error.DatasetLocationUnavailable, read(a, snapshot, range, .{}, &reader));
+    try std.testing.expectEqual(@as(usize, 2), reader.native_calls);
+    try std.testing.expectEqual(@as(usize, 2), reader.archived_calls);
 }

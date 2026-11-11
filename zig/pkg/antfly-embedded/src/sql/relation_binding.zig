@@ -1392,7 +1392,7 @@ const Builder = struct {
                     }
                     break :blk try self.node(columns, .{ .prepared_rows = names });
                 }
-                if (reference.graph == null and reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
+                if (reference.graph == null and reference.retained == null and reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
@@ -1427,13 +1427,18 @@ const Builder = struct {
                 // Two GRAPH_TABLE references to one graph can have different
                 // patterns and projections. Cache the complete descriptor,
                 // rather than accidentally reusing the first relation shape.
+                if (reference.retained != null and (reference.mutation_target or reference.mutation_document or reference.mutation_presence)) return error.UnsupportedSqlExecution;
                 const identity = if (reference.graph) |graph|
                     try std.fmt.allocPrint(self.alloc, "graph:{s}", .{try std.json.Stringify.valueAlloc(self.alloc, graph.*, .{})})
+                else if (reference.retained) |retained|
+                    try std.fmt.allocPrint(self.alloc, "retained:{s}", .{try std.json.Stringify.valueAlloc(self.alloc, retained.*, .{})})
                 else
                     try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
                 if (!entry.found_existing) entry.value_ptr.* = if (reference.graph) |graph|
                     try (self.backend.vtable.resolve_graph orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.alloc, graph.*)
+                else if (reference.retained) |retained|
+                    try (self.backend.vtable.resolve_retained orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.alloc, retained.*)
                 else
                     try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
                 var table = entry.value_ptr.*;
@@ -1441,6 +1446,13 @@ const Builder = struct {
                     const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
                     if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
                     try self.graph_parameter_slots.append(self.alloc, index - 1);
+                };
+                if (reference.retained) |retained| for ([_]ast.Value{ retained.start, retained.end }) |bound| {
+                    if (bound != .parameter) continue;
+                    const slot = bound.parameter - 1;
+                    if (slot >= self.parameters.len) return error.InvalidSqlParameters;
+                    if (self.parameters[slot]) |kind| if (kind != .string) return error.ConflictingSqlParameterTypes;
+                    self.parameters[slot] = .string;
                 };
                 if (reference.search) |search| {
                     if (!self.backend.supports_search_relations) return error.UnsupportedSqlExecution;

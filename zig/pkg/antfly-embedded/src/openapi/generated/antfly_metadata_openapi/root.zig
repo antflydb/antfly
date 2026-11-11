@@ -278,6 +278,7 @@ pub const RestoreJobList = types.RestoreJobList;
 pub const RestoreRequest = types.RestoreRequest;
 pub const RetainedDatasetInfo = types.RetainedDatasetInfo;
 pub const RetainedDatasetMeasure = types.RetainedDatasetMeasure;
+pub const RetainedSubscriptionFrame = types.RetainedSubscriptionFrame;
 pub const RetrievalAgentRequest = types.RetrievalAgentRequest;
 pub const RetrievalAgentResult = types.RetrievalAgentResult;
 pub const RetrievalAgentSteps = types.RetrievalAgentSteps;

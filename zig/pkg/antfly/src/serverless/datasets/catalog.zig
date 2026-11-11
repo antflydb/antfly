@@ -46,6 +46,19 @@ const Coverage = struct {
         try t.writeFields(self, .{}, writer);
     }
 };
+const expiry_prefix = "archive_expiry/";
+pub const ExpiryCursor = [expiry_prefix.len + 32 + 1 + 64]u8;
+pub const Expiry = struct { cursor: ExpiryCursor, segment: t.Id };
+
+fn expiryKey(segment: t.Segment, retention_ns: u64) !?ExpiryCursor {
+    const expires = std.math.add(i128, try segment.coverage.end(), retention_ns) catch return null;
+    const biased = @as(u128, @bitCast(expires)) ^ (@as(u128, 1) << 127);
+    var key: ExpiryCursor = undefined;
+    const rendered = try std.fmt.bufPrint(&key, "{s}{x:0>32}/{s}", .{ expiry_prefix, biased, std.fmt.bytesToHex(segment.id, .lower) });
+    if (rendered.len != key.len) return error.InvalidDatasetCoverage;
+    return key;
+}
+
 pub const RangePlan = struct {
     arena: std.heap.ArenaAllocator,
     segments: []const t.Segment,
@@ -352,8 +365,19 @@ pub const Catalog = struct {
         defer self.context.alloc.free(encoded);
         if (encoded.len > 32768) return error.DatasetSegmentBudgetExceeded;
         try self.writeVerified(value, location, bytes);
-        const extra: ?coordinator.Command = if (progress_key) |progress| .{ .kind = .put, .key = progress, .value = progress_bytes.? } else null;
-        try self.putSegmentWithLocation(session.value, value, location, extra);
+        var extra: [2]coordinator.Command = undefined;
+        var extra_len: usize = 0;
+        var expiry: ?ExpiryCursor = null;
+        if (progress_key) |progress| {
+            extra[0] = .{ .kind = .put, .key = progress, .value = progress_bytes.? };
+            extra_len = 1;
+            expiry = try expiryKey(value, def.value.retention_ns);
+            if (expiry) |*due_key| {
+                extra[1] = .{ .kind = .put, .key = due_key, .value = "1" };
+                extra_len = 2;
+            }
+        }
+        try self.putSegmentWithLocation(session.value, value, location, extra[0..extra_len]);
     }
 
     pub fn hold(self: Catalog, id: t.Id, dependency: Dependency) !void {
@@ -409,7 +433,7 @@ pub const Catalog = struct {
         next.location = destination.id;
         next.access = destination.access;
         next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
-        try self.putSegmentWithLocation(session.value, next, destination, null);
+        try self.putSegmentWithLocation(session.value, next, destination, &.{});
     }
 
     fn list(self: Catalog, session: Header, prefix: []const u8, after: []const u8, limit: usize) !std.json.Parsed(Read) {
@@ -616,6 +640,39 @@ pub const Catalog = struct {
     /// Expiration is independent of local residence. Finalized historical state
     /// may be retired only after the caller has checked downstream dependencies.
     /// Retirement rejects new readers before any object deletion is attempted.
+    /// Ordered expiry seek. The caller advances the cursor when a pin or
+    /// dependency defers one extent, so unrelated history can still retire.
+    pub fn nextExpiry(self: Catalog, after: ?ExpiryCursor) !?Expiry {
+        const now = self.clock.unix();
+        if (now == 0) return error.DatasetLeaseExpired;
+        const session = try self.open(false);
+        defer session.deinit();
+        const page = try self.list(session.value, expiry_prefix, if (after) |*key| key else "", 1);
+        defer page.deinit();
+        if (page.value.results[0].len == 0) return null;
+        const row = page.value.results[0][0];
+        if (row.key.len != @sizeOf(ExpiryCursor) or row.key[expiry_prefix.len + 32] != '/' or !std.mem.eql(u8, row.value, "1")) return error.InvalidDatasetCoverage;
+        const biased = std.fmt.parseInt(u128, row.key[expiry_prefix.len..][0..32], 16) catch return error.InvalidDatasetCoverage;
+        const expires: i128 = @bitCast(biased ^ (@as(u128, 1) << 127));
+        if (expires > now) return null;
+        var id: t.Id = undefined;
+        _ = std.fmt.hexToBytes(&id, row.key[expiry_prefix.len + 33 ..]) catch return error.InvalidDatasetCoverage;
+        return .{ .cursor = row.key[0..@sizeOf(ExpiryCursor)].*, .segment = id };
+    }
+
+    pub fn collectExpired(self: Catalog, id: t.Id, location: Location) !void {
+        const segment_value = self.getSegment(id) catch |err| switch (err) {
+            error.DatasetSegmentNotFound => return,
+            else => return err,
+        };
+        defer segment_value.deinit();
+        const value = segment_value.value;
+        if (!std.mem.eql(u8, &value.location, &location.id) or value.previous_local != null or (value.archive != null and !std.mem.eql(u8, &value.archive.?, &location.id))) return error.DatasetLocationUnavailable;
+        try self.retire(id, value.placement_revision);
+        try self.collect(id, location);
+        try self.compact(id);
+    }
+
     pub fn retire(self: Catalog, id: t.Id, expected_revision: u64) !void {
         var session = try self.open(true);
         defer session.deinit();
@@ -723,10 +780,16 @@ pub const Catalog = struct {
         defer self.context.alloc.free(floor);
         try commands.appendSlice(self.context.alloc, &.{ .{ .kind = .delete, .key = segment_key }, .{ .kind = .delete, .key = coverage_key }, .{ .kind = .put, .key = floor_key, .value = floor } });
         for (pins.value.results[0]) |row| try commands.append(self.context.alloc, .{ .kind = .delete, .key = row.key });
+        const definition_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{value.definition_generation});
+        defer self.context.alloc.free(definition_key);
+        const definition_value = (try self.get(session.value, t.Definition, definition_key)) orelse return error.InvalidDatasetDefinition;
+        defer definition_value.deinit();
+        const expiry = try expiryKey(value, definition_value.value.retention_ns);
+        if (expiry) |*key| try commands.append(self.context.alloc, .{ .kind = .delete, .key = key });
         try self.commit(session.value, commands.items);
     }
 
-    fn putSegmentWithLocation(self: Catalog, session: Header, value: t.Segment, location: Location, extra: ?coordinator.Command) !void {
+    fn putSegmentWithLocation(self: Catalog, session: Header, value: t.Segment, location: Location, extra: []const coordinator.Command) !void {
         const bound = try self.checkLocation(session, location, true);
         const key = try segmentKey(self.context.alloc, value.id);
         defer self.context.alloc.free(key);
@@ -740,8 +803,13 @@ pub const Catalog = struct {
         defer self.context.alloc.free(coverage_key);
         const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns, .key_span = value.key_span }, .{});
         defer self.context.alloc.free(coverage);
-        const commands = [_]coordinator.Command{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = coverage_key, .value = coverage }, extra orelse undefined };
-        try self.commit(session, commands[if (bound) @as(usize, 1) else 0..if (extra != null) @as(usize, 4) else 3]);
+        if (extra.len > 2) return error.DatasetPageBudgetExceeded;
+        var commands: [5]coordinator.Command = undefined;
+        commands[0] = .{ .kind = .put, .key = binding_key, .value = binding };
+        commands[1] = .{ .kind = .put, .key = key, .value = raw };
+        commands[2] = .{ .kind = .put, .key = coverage_key, .value = coverage };
+        @memcpy(commands[3..][0..extra.len], extra);
+        try self.commit(session, commands[if (bound) @as(usize, 1) else 0 .. 3 + extra.len]);
     }
 
     fn putSegment(self: Catalog, session: Header, value: t.Segment) !void {
@@ -782,7 +850,7 @@ pub const Catalog = struct {
         next.location = destination.id;
         next.access = .local;
         next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
-        try self.putSegmentWithLocation(session.value, next, destination, null);
+        try self.putSegmentWithLocation(session.value, next, destination, &.{});
     }
 
     fn objectKey(self: Catalog, alloc: A, value: t.Segment, location: Location) ![]u8 {

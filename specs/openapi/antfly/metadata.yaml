@@ -1254,6 +1254,34 @@ components:
       schema:
         type: string
   schemas:
+    RetainedSubscriptionFrame:
+      type: object
+      required: [kind, cursor, events]
+      properties:
+        kind: {type: string, enum: [snapshot, changes]}
+        cursor: {type: string, maxLength: 128}
+        initial_history: {type: string, enum: [certified, retained_source_rows]}
+        dimensions:
+          type: array
+          items: {type: string}
+        measures:
+          type: array
+          items: {$ref: '#/components/schemas/RetainedDatasetMeasure'}
+        events:
+          type: array
+          items:
+            type: object
+            required: [type, key]
+            properties:
+              type: {type: string, enum: [upsert, remove]}
+              key: {type: string}
+              bucket_start_ns: {type: string}
+              dimensions:
+                type: array
+                items: {}
+              values:
+                type: array
+                items: {}
     RetainedDatasetMeasure:
       type: object
       required: [name, law]
@@ -18841,6 +18869,127 @@ paths:
         '403': {description: Dataset administration permission required.}
         '404': {description: Dataset not found.}
         '409': {description: The summary phase or revision changed.}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+      - name: datasetName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+    post:
+      summary: Open a retained summary subscription
+      tags: [query_operations]
+      operationId: createRetainedSubscription
+      description: Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires dataset read permission.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                start_ns: {type: string, description: Inclusive signed decimal nanoseconds.}
+                end_ns: {type: string, description: Exclusive signed decimal nanoseconds.}
+                window_ns: {type: string, description: "Sliding window width in decimal nanoseconds, aligned to the dataset interval."}
+      responses:
+        '201':
+          description: Snapshot or committed delta frame and its next cursor.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RetainedSubscriptionFrame'}
+        '400': {description: Invalid cursor or range.}
+        '403': {description: Dataset read permission or cursor authority is missing.}
+        '409': {description: Replay or serving state was lost. Open a fresh snapshot.}
+        '413': {description: Subscription exceeds its result or state budget.}
+        '503': {description: Subscription owner is temporarily unavailable.}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+      - name: datasetName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+    post:
+      summary: Replay retained summary changes
+      tags: [query_operations]
+      operationId: pollRetainedSubscription
+      description: Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame. Use a new snapshot when replay is unavailable or the serving session expires.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cursor]
+              additionalProperties: false
+              properties:
+                cursor: {type: string, maxLength: 128}
+      responses:
+        '200':
+          description: Snapshot or committed delta frame and its next cursor.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RetainedSubscriptionFrame'}
+        '400': {description: Invalid cursor or range.}
+        '403': {description: Dataset read permission or cursor authority is missing.}
+        '409': {description: Replay or serving state was lost. Open a fresh snapshot.}
+        '413': {description: Subscription exceeds its result or state budget.}
+        '503': {description: Subscription owner is temporarily unavailable.}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+      - name: datasetName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+    post:
+      summary: Cancel a retained summary subscription
+      tags: [query_operations]
+      operationId: cancelRetainedSubscription
+      description: Releases serving state for the authenticated cursor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cursor]
+              additionalProperties: false
+              properties:
+                cursor: {type: string, maxLength: 128}
+      responses:
+        '204':
+          description: Subscription canceled.
+        '400': {description: Invalid cursor or range.}
+        '403': {description: Dataset read permission or cursor authority is missing.}
+        '409': {description: Replay or serving state was lost. Open a fresh snapshot.}
+        '413': {description: Subscription exceeds its result or state budget.}
+        '503': {description: Subscription owner is temporarily unavailable.}
 
   /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query:
     parameters:

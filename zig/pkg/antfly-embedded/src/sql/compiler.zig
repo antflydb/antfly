@@ -1255,6 +1255,20 @@ const Parser = struct {
         }
         if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
+        if (name_value.database == null and name_value.namespace == null and std.mem.eql(u8, name_value.table, "retained_summary") and self.take(.lparen)) {
+            const dataset_name = try self.tableReferenceName();
+            try self.expect(.comma);
+            const start = try self.value();
+            try self.expect(.comma);
+            const end = try self.value();
+            try self.expect(.rparen);
+            for ([_]ast.Value{ start, end }) |boundary| {
+                if (boundary != .string and boundary != .integer and boundary != .parameter) return self.fail(error.InvalidSqlSyntax, "retained_summary requires nanosecond bounds or positional parameters");
+            }
+            const retained = try self.alloc.create(ast.RetainedTable);
+            retained.* = .{ .name = dataset_name, .start = start, .end = end };
+            return self.relationNode(.{ .table = .{ .name = dataset_name, .retained = retained, .alias = (try self.sourceAlias()) orelse dataset_name.table } });
+        }
         if (name_value.database == null and name_value.namespace == null and std.mem.eql(u8, name_value.table, "graph_table") and self.take(.lparen)) {
             const graph_name = try self.tableReferenceName();
             try self.expectKeyword(.match);

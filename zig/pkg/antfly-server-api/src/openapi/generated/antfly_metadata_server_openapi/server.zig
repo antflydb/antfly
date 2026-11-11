@@ -199,6 +199,42 @@ pub fn parseQueryRetainedDatasetBody(allocator: std.mem.Allocator, body: []const
     return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Open a retained summary subscription
+pub const CreateRetainedSubscriptionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for createRetainedSubscription.
+pub fn parseCreateRetainedSubscriptionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Cancel a retained summary subscription
+pub const CancelRetainedSubscriptionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for cancelRetainedSubscription.
+pub fn parseCancelRetainedSubscriptionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Replay retained summary changes
+pub const PollRetainedSubscriptionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for pollRetainedSubscription.
+pub fn parsePollRetainedSubscriptionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Rename catalog resource
 pub const RenameNamespacePathParams = struct {
     database_name: []const u8,
@@ -2196,6 +2232,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}", .operation_id = "createRetainedDataset", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/close", .operation_id = "closeRetainedDataset", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query", .operation_id = "queryRetainedDataset", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions", .operation_id = "createRetainedSubscription", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel", .operation_id = "cancelRetainedSubscription", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll", .operation_id = "pollRetainedSubscription", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/rename", .operation_id = "renameNamespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables", .operation_id = "listNamespaceTables", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "getNamespaceTable", .request_body = .none, .streaming_response = false },
@@ -2439,6 +2478,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createRetainedDataset")) @compileError("ServerRouter: Impl missing required method 'createRetainedDataset'");
         if (!@hasDecl(Impl, "closeRetainedDataset")) @compileError("ServerRouter: Impl missing required method 'closeRetainedDataset'");
         if (!@hasDecl(Impl, "queryRetainedDataset")) @compileError("ServerRouter: Impl missing required method 'queryRetainedDataset'");
+        if (!@hasDecl(Impl, "createRetainedSubscription")) @compileError("ServerRouter: Impl missing required method 'createRetainedSubscription'");
+        if (!@hasDecl(Impl, "cancelRetainedSubscription")) @compileError("ServerRouter: Impl missing required method 'cancelRetainedSubscription'");
+        if (!@hasDecl(Impl, "pollRetainedSubscription")) @compileError("ServerRouter: Impl missing required method 'pollRetainedSubscription'");
         if (!@hasDecl(Impl, "renameNamespace")) @compileError("ServerRouter: Impl missing required method 'renameNamespace'");
         if (!@hasDecl(Impl, "listNamespaceTables")) @compileError("ServerRouter: Impl missing required method 'listNamespaceTables'");
         if (!@hasDecl(Impl, "getNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTable'");
@@ -2680,6 +2722,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/datasets/:datasetName", httpx.Handler.bind(self.impl, createRetainedDataset));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/datasets/:datasetName/close", httpx.Handler.bind(self.impl, closeRetainedDataset));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/datasets/:datasetName/query", httpx.Handler.bind(self.impl, queryRetainedDataset));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/datasets/:datasetName/subscriptions", httpx.Handler.bind(self.impl, createRetainedSubscription));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/datasets/:datasetName/subscriptions/cancel", httpx.Handler.bind(self.impl, cancelRetainedSubscription));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/datasets/:datasetName/subscriptions/poll", httpx.Handler.bind(self.impl, pollRetainedSubscription));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/rename", httpx.Handler.bind(self.impl, renameNamespace));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables", httpx.Handler.bind(self.impl, listNamespaceTables));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", httpx.Handler.bind(self.impl, getNamespaceTable));
@@ -3094,6 +3139,33 @@ pub fn ServerRouter(comptime Impl: type) type {
             const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
             const dataset_name = ctx.param("datasetName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: datasetName" });
             return impl.queryRetainedDataset(ctx, database_name, namespace_name, dataset_name);
+        }
+
+        /// Open a retained summary subscription
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions
+        fn createRetainedSubscription(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const dataset_name = ctx.param("datasetName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: datasetName" });
+            return impl.createRetainedSubscription(ctx, database_name, namespace_name, dataset_name);
+        }
+
+        /// Cancel a retained summary subscription
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel
+        fn cancelRetainedSubscription(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const dataset_name = ctx.param("datasetName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: datasetName" });
+            return impl.cancelRetainedSubscription(ctx, database_name, namespace_name, dataset_name);
+        }
+
+        /// Replay retained summary changes
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll
+        fn pollRetainedSubscription(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const dataset_name = ctx.param("datasetName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: datasetName" });
+            return impl.pollRetainedSubscription(ctx, database_name, namespace_name, dataset_name);
         }
 
         /// Rename catalog resource
@@ -4825,6 +4897,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
 //   fn closeRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
 //   fn queryRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn createRetainedSubscription(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn cancelRetainedSubscription(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn pollRetainedSubscription(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
 //   fn renameNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn listNamespaceTables(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !httpx.Response
 //   fn getNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response

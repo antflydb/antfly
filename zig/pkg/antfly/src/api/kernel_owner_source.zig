@@ -3781,6 +3781,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
     }
 
+    pub fn applyRetainedSeriesNative(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !void {
+        try context.ensureActive();
+        if (req.retained_series == null) return error.InvalidBatchRequest;
+        const native_context = try platformDeadlineContext(context);
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = context.cancellation });
+        defer lease.deinit();
+        const encoded = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().batchJson(table_name, encoded);
+        defer response.deinit();
+    }
+
     pub fn applyFkGenerationNative(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,

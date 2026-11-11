@@ -147,6 +147,7 @@ pub const MetadataServer = struct {
     owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
+    retained_archive: @import("../serverless/datasets/configured_archive.zig").ExpiryMaintenance = .{},
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -479,6 +480,7 @@ pub const MetadataServer = struct {
 
     pub fn deinitWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopRestoreSupervisor();
+        self.retained_archive.deinit(self.alloc);
         if (self.transition_ops_registration) |*registration| registration.deinit();
         self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
@@ -599,6 +601,10 @@ pub const MetadataServer = struct {
                             if (!metadata_authority.isRetryableError(err))
                                 std.log.warn("metadata session maintenance schedule deferred err={s}", .{@errorName(err)});
                         };
+                        self.maintainRetainedArchive(io) catch |err| {
+                            if (!@import("../serverless/datasets/configured_archive.zig").ExpiryMaintenance.retryable(err) and !metadata_authority.isRetryableError(err))
+                                std.log.warn("retained archive maintenance deferred err={s}", .{@errorName(err)});
+                        };
                         if (mux.public_api.pollRestoreJobsOnce()) |_| {
                             last_unexpected_error = null;
                         } else |err| {
@@ -629,6 +635,16 @@ pub const MetadataServer = struct {
                 error.Canceled => return,
             };
         }
+    }
+
+    fn maintainRetainedArchive(self: *MetadataServer, io: std.Io) !void {
+        const config = self.svc.retained_archive_config orelse return;
+        const now = @import("antfly_platform").time.monotonicNs();
+        if (now < self.retained_archive.next_ns or config.storage.artifacts.connection == null) return;
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = now +| 2 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.restore_supervisor_stop) };
+        try self.svc.ensureLinearizableReadWithContext(context);
+        const store = self.svc.projectedStore() orelse return;
+        try self.retained_archive.run(self.alloc, store, self.svc.metadata_group_id, config, self.svc.secret_store, io, now, &context);
     }
 
     fn restoreSupervisorDeinit(_: *anyopaque) void {}

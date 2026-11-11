@@ -41,6 +41,16 @@ fn retainedWorkPrefix(a: std.mem.Allocator, group: u64, native: bool) ![]u8 {
 fn retainedPendingPrefix(a: std.mem.Allocator, group: u64) ![]u8 {
     return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:retained_pending_work:", .{group});
 }
+fn retainedArchivePrefix(a: std.mem.Allocator, group: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:retained_archive_work:", .{group});
+}
+fn retainedArchived(a: std.mem.Allocator, resource: domain.Resource) !bool {
+    const identity = resource.retained orelse return false;
+    if (identity.source_table_id != 0) return false;
+    var descriptor = try retained.parse(a, resource.source_json);
+    defer descriptor.deinit();
+    return descriptor.value.phase == .closed and descriptor.value.definition.kind == .summary;
+}
 fn retainedPending(a: std.mem.Allocator, resource: domain.Resource) !bool {
     const identity = resource.retained orelse return false;
     if (identity.source_table_id == 0) return false;
@@ -749,7 +759,13 @@ pub const View = struct {
         return resource;
     }
     pub fn nextRetainedPending(self: View, after: u64) !?domain.Resource {
-        const prefix = try retainedPendingPrefix(self.alloc, self.group_id);
+        return self.nextRetainedIndexed(after, false);
+    }
+    pub fn nextRetainedArchive(self: View, after: u64) !?domain.Resource {
+        return self.nextRetainedIndexed(after, true);
+    }
+    fn nextRetainedIndexed(self: View, after: u64, archived: bool) !?domain.Resource {
+        const prefix = if (archived) try retainedArchivePrefix(self.alloc, self.group_id) else try retainedPendingPrefix(self.alloc, self.group_id);
         const seek = if (after == std.math.maxInt(u64)) prefix else try indexedIdKey(self.alloc, prefix, after + 1);
         var cursor = try self.txn.openCursor();
         defer cursor.close();
@@ -761,7 +777,7 @@ pub const View = struct {
         const id = std.mem.readInt(u64, entry.value[0..8], .little);
         if (id == 0 or id != std.mem.readInt(u64, entry.key[prefix.len..][0..8], .big)) return error.InvalidCatalogRecord;
         const resource = (try self.byId(.dataset, id)) orelse return error.InvalidCatalogRecord;
-        if (!try retainedPending(self.alloc, resource)) return error.InvalidCatalogRecord;
+        if (!(if (archived) try retainedArchived(self.alloc, resource) else try retainedPending(self.alloc, resource))) return error.InvalidCatalogRecord;
         return resource;
     }
     pub fn bindingForStorage(self: View, name: []const u8) !?domain.Resource {
@@ -883,6 +899,14 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
                 if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
             }
         }
+        if (try retainedArchived(alloc, resource)) {
+            const prefix = try retainedArchivePrefix(alloc, group_id);
+            defer alloc.free(prefix);
+            const key = try indexedIdKey(alloc, prefix, resource.id);
+            defer alloc.free(key);
+            const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
+            if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+        }
         if (try retainedPending(alloc, resource)) {
             const prefix = try retainedPendingPrefix(alloc, group_id);
             defer alloc.free(prefix);
@@ -944,6 +968,13 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
             defer alloc.free(work_key);
             try txn.put(work_key, &id);
         }
+        if (try retainedArchived(alloc, r)) {
+            const archive_prefix = try retainedArchivePrefix(alloc, group_id);
+            defer alloc.free(archive_prefix);
+            const archive_key = try indexedIdKey(alloc, archive_prefix, r.id);
+            defer alloc.free(archive_key);
+            try txn.put(archive_key, &id);
+        }
         if (try retainedPending(alloc, r)) {
             const pending_prefix = try retainedPendingPrefix(alloc, group_id);
             defer alloc.free(pending_prefix);
@@ -994,6 +1025,11 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
             defer alloc.free(work_key);
             try txn.delete(work_key);
         }
+        const archive_prefix = try retainedArchivePrefix(alloc, group_id);
+        defer alloc.free(archive_prefix);
+        const archive_key = try indexedIdKey(alloc, archive_prefix, r.id);
+        defer alloc.free(archive_key);
+        try txn.delete(archive_key);
         const pending_prefix = try retainedPendingPrefix(alloc, group_id);
         defer alloc.free(pending_prefix);
         const pending_key = try indexedIdKey(alloc, pending_prefix, r.id);

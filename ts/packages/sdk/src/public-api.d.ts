@@ -3059,6 +3059,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a retained summary subscription
+         * @description Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires dataset read permission.
+         */
+        post: operations["createRetainedSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replay retained summary changes
+         * @description Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame. Use a new snapshot when replay is unavailable or the serving session expires.
+         */
+        post: operations["pollRetainedSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a retained summary subscription
+         * @description Releases serving state for the authenticated cursor.
+         */
+        post: operations["cancelRetainedSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query": {
         parameters: {
             query?: never;
@@ -7363,6 +7435,23 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        RetainedSubscriptionFrame: {
+            /** @enum {string} */
+            kind: "snapshot" | "changes";
+            cursor: string;
+            /** @enum {string} */
+            initial_history?: "certified" | "retained_source_rows";
+            dimensions?: string[];
+            measures?: components["schemas"]["RetainedDatasetMeasure"][];
+            events: {
+                /** @enum {string} */
+                type: "upsert" | "remove";
+                key: string;
+                bucket_start_ns?: string;
+                dimensions?: unknown[];
+                values?: unknown[];
+            }[];
+        };
         RetainedDatasetMeasure: {
             name: string;
             /** @enum {string} */
@@ -38773,6 +38862,204 @@ export interface operations {
             };
             /** @description The summary phase or revision changed. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createRetainedSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Inclusive signed decimal nanoseconds. */
+                    start_ns?: string;
+                    /** @description Exclusive signed decimal nanoseconds. */
+                    end_ns?: string;
+                    /** @description Sliding window width in decimal nanoseconds, aligned to the dataset interval. */
+                    window_ns?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Snapshot or committed delta frame and its next cursor. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedSubscriptionFrame"];
+                };
+            };
+            /** @description Invalid cursor or range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission or cursor authority is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Replay or serving state was lost. Open a fresh snapshot. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription exceeds its result or state budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription owner is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    pollRetainedSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    cursor: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Snapshot or committed delta frame and its next cursor. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedSubscriptionFrame"];
+                };
+            };
+            /** @description Invalid cursor or range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission or cursor authority is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Replay or serving state was lost. Open a fresh snapshot. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription exceeds its result or state budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription owner is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    cancelRetainedSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    cursor: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Subscription canceled. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid cursor or range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission or cursor authority is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Replay or serving state was lost. Open a fresh snapshot. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription exceeds its result or state budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription owner is temporarily unavailable. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -4104,6 +4104,7 @@ pub const ApiHttpServer = struct {
     document_cursor: usize = 0,
     document_schedule_mutex: std.atomic.Mutex = .unlocked,
     research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    retained_subscriptions: @import("retained_subscription_registry.zig").Registry = .{},
     research_state_key: [32]u8 = undefined,
     research_state_key_ready: std.atomic.Value(bool) = .init(false),
     research_state_key_mutex: std.atomic.Mutex = .unlocked,
@@ -4980,6 +4981,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.retained_subscriptions.deinit(self.alloc);
         self.object_tables.deinit(self.owner_alloc);
         if (self.pgwire_listener) |listener| {
             listener.deinit();
@@ -5541,6 +5543,7 @@ pub const ApiHttpServer = struct {
         try self.maybeRenewOwnedSessionLeases();
     }
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        self.retained_subscriptions.expire(self.alloc, @import("antfly_platform").time.monotonicNs());
         if (self.cfg.session_maintenance_local_only) return self.runLocalSessionMaintenanceOnce();
         // Policy phase decisions and owner receipts each use the shared HA
         // metadata/owner outbox. Run this coordinator on a writable HA primary
@@ -20993,6 +20996,24 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn pollRetainedOwnerReplay(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("retained_dataset_read.zig").NativeReplay, context: api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate(group);
+        if (self.cfg.deployment_mode == .standalone)
+            return (self.cfg.retained_owner_read orelse return error.RetainedSeriesNotReady).poll(alloc, table_name, group, request, context);
+        var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), self.cfg.session_router orelse fallback.router(), group, .prefer_leader)) orelse return error.RetainedSeriesNotReady;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => (self.cfg.retained_owner_read orelse return error.RetainedSeriesNotReady).poll(alloc, table_name, group, request, context),
+            .remote => |remote| remote: {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                break :remote client.fetchRetainedOwnerReplay(remote.base_uri, group, table_name, request, context);
+            },
+        };
+    }
+
     pub fn executeRetainedOwnerControl(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("retained_owner_control.zig").Request, context: api_operation.RequestContext) !@import("retained_owner_control.zig").Response {
         try context.ensureActive();
         try request.validate(group_id);
@@ -29072,7 +29093,8 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         const resolver_route = if (route.kind == .table) @import("resolvers.zig").matchSuffix(route.suffix) else null;
         const resolver_read = if (resolver_route) |r| @import("resolvers.zig").readOnly(r.op) else false;
         const resolver_write = if (resolver_route) |r| r.op != .namespace else false;
-        const permission: usermgr.PermissionType = if (isReadMethod(method) or ((route.kind == .graph or route.kind == .dataset) and std.mem.eql(u8, route.suffix, "query")) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
+        const subscription_read = route.kind == .dataset and (std.mem.eql(u8, route.suffix, "subscriptions") or std.mem.eql(u8, route.suffix, "subscriptions/poll") or std.mem.eql(u8, route.suffix, "subscriptions/cancel"));
+        const permission: usermgr.PermissionType = if (isReadMethod(method) or subscription_read or ((route.kind == .graph or route.kind == .dataset) and std.mem.eql(u8, route.suffix, "query")) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -30974,6 +30996,7 @@ fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.Resource
         .user => .user,
         .inference => .inference,
         .graph => .graph,
+        .dataset => .dataset,
         .@"*" => .@"*",
     };
 }
@@ -30996,6 +31019,7 @@ fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceTy
         .user => .user,
         .inference => .inference,
         .graph => .graph,
+        .dataset => .dataset,
         .@"*" => .@"*",
     };
 }

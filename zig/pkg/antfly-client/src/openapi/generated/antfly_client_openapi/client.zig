@@ -2162,6 +2162,57 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Open a retained summary subscription
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions
+    pub fn createRetainedSubscription(self: *@This(), database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8, body: std.json.Value) !ApiResponse(types.RetainedSubscriptionFrame) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_dataset_name = try httpx.PercentEncoding.encode(self.allocator, dataset_name);
+        defer self.allocator.free(encoded_dataset_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/datasets/{s}/subscriptions", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_dataset_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RetainedSubscriptionFrame).fromResponse(self.allocator, &resp);
+    }
+
+    /// Cancel a retained summary subscription
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel
+    pub fn cancelRetainedSubscription(self: *@This(), database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8, body: std.json.Value) !ApiResponse(std.json.Value) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_dataset_name = try httpx.PercentEncoding.encode(self.allocator, dataset_name);
+        defer self.allocator.free(encoded_dataset_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/datasets/{s}/subscriptions/cancel", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_dataset_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Replay retained summary changes
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll
+    pub fn pollRetainedSubscription(self: *@This(), database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8, body: std.json.Value) !ApiResponse(types.RetainedSubscriptionFrame) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_dataset_name = try httpx.PercentEncoding.encode(self.allocator, dataset_name);
+        defer self.allocator.free(encoded_dataset_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/datasets/{s}/subscriptions/poll", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_dataset_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RetainedSubscriptionFrame).fromResponse(self.allocator, &resp);
+    }
+
     /// Rename catalog resource
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/rename
     pub fn renameNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8, body: types.RenameCatalogResourceRequest) !ApiResponse(std.json.Value) {

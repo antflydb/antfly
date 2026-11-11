@@ -2190,6 +2190,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.retainedDatasetReadCutJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .retained_archive_work => |input| {
+                    const value = handle.store.retainedArchiveWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .retained_dataset_pending => |input| {
                     const value = handle.store.retainedDatasetPendingJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

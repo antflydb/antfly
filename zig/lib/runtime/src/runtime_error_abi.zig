@@ -1103,6 +1103,24 @@ pub const Detail = enum(c_int) {
     invalid_external_source_snapshot,
     external_source_snapshot_too_large,
     storage_owner_admission_pending,
+    // Retained dataset catalog admission and owner-read outcomes.
+    retained_dataset_source_in_use,
+    retained_dataset_source_not_ready,
+    retained_dataset_retirement_pending,
+    retained_dataset_resource_changed,
+    retained_dataset_generation_transition_required,
+    invalid_retained_dataset_resource,
+    invalid_retained_owner_plan,
+    retained_owner_plan_changed,
+    retained_series_not_ready,
+    dataset_dependency_pending,
+    dataset_page_budget_exceeded,
+    invalid_dataset_coverage,
+    retained_series_resolution_mismatch,
+    retained_series_coverage_missing,
+    retained_series_history_expired,
+    retained_series_snapshot_expired,
+    retained_series_reset_required,
 };
 
 pub const Status = extern struct {
@@ -2120,6 +2138,23 @@ pub fn statusFromError(err: anyerror) Status {
         // identity (the enrichment retry-budget exemption) can tell them
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
+        error.RetainedDatasetSourceInUse => status(.conflict, .retained_dataset_source_in_use),
+        error.RetainedDatasetSourceNotReady => status(.retryable, .retained_dataset_source_not_ready),
+        error.RetainedDatasetRetirementPending => status(.conflict, .retained_dataset_retirement_pending),
+        error.RetainedDatasetResourceChanged => status(.conflict, .retained_dataset_resource_changed),
+        error.RetainedDatasetGenerationTransitionRequired => status(.conflict, .retained_dataset_generation_transition_required),
+        error.InvalidRetainedDatasetResource => status(.invalid_argument, .invalid_retained_dataset_resource),
+        error.InvalidRetainedOwnerPlan => status(.invalid_argument, .invalid_retained_owner_plan),
+        error.RetainedOwnerPlanChanged => status(.conflict, .retained_owner_plan_changed),
+        error.RetainedSeriesNotReady => status(.retryable, .retained_series_not_ready),
+        error.DatasetDependencyPending => status(.retryable, .dataset_dependency_pending),
+        error.DatasetPageBudgetExceeded => status(.invalid_argument, .dataset_page_budget_exceeded),
+        error.InvalidDatasetCoverage => status(.invalid_argument, .invalid_dataset_coverage),
+        error.RetainedSeriesResolutionMismatch => status(.invalid_argument, .retained_series_resolution_mismatch),
+        error.RetainedSeriesCoverageMissing => status(.conflict, .retained_series_coverage_missing),
+        error.RetainedSeriesHistoryExpired => status(.conflict, .retained_series_history_expired),
+        error.RetainedSeriesSnapshotExpired => status(.conflict, .retained_series_snapshot_expired),
+        error.RetainedSeriesResetRequired => status(.conflict, .retained_series_reset_required),
         error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
@@ -3100,6 +3135,23 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
         .embed_admission_refused => "EmbedAdmissionRefused",
+        .retained_dataset_source_in_use => "RetainedDatasetSourceInUse",
+        .retained_dataset_source_not_ready => "RetainedDatasetSourceNotReady",
+        .retained_dataset_retirement_pending => "RetainedDatasetRetirementPending",
+        .retained_dataset_resource_changed => "RetainedDatasetResourceChanged",
+        .retained_dataset_generation_transition_required => "RetainedDatasetGenerationTransitionRequired",
+        .invalid_retained_dataset_resource => "InvalidRetainedDatasetResource",
+        .invalid_retained_owner_plan => "InvalidRetainedOwnerPlan",
+        .retained_owner_plan_changed => "RetainedOwnerPlanChanged",
+        .retained_series_not_ready => "RetainedSeriesNotReady",
+        .dataset_dependency_pending => "DatasetDependencyPending",
+        .dataset_page_budget_exceeded => "DatasetPageBudgetExceeded",
+        .invalid_dataset_coverage => "InvalidDatasetCoverage",
+        .retained_series_resolution_mismatch => "RetainedSeriesResolutionMismatch",
+        .retained_series_coverage_missing => "RetainedSeriesCoverageMissing",
+        .retained_series_history_expired => "RetainedSeriesHistoryExpired",
+        .retained_series_snapshot_expired => "RetainedSeriesSnapshotExpired",
+        .retained_series_reset_required => "RetainedSeriesResetRequired",
         .read_output_truncated => "ReadOutputTruncated",
         .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
         .document_extraction_model_required => "DocumentExtractionModelRequired",
@@ -3340,6 +3392,31 @@ test "system catalog errors retain their stable runtime boundary classification"
     try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
     const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "retained dataset errors preserve the catalog and read outcomes across runtime callbacks" {
+    const errors = [_]anyerror{
+        error.RetainedDatasetSourceInUse,
+        error.RetainedDatasetSourceNotReady,
+        error.RetainedDatasetRetirementPending,
+        error.RetainedDatasetResourceChanged,
+        error.RetainedDatasetGenerationTransitionRequired,
+        error.InvalidRetainedDatasetResource,
+        error.InvalidRetainedOwnerPlan,
+        error.RetainedOwnerPlanChanged,
+        error.RetainedSeriesNotReady,
+        error.DatasetDependencyPending,
+        error.DatasetPageBudgetExceeded,
+        error.InvalidDatasetCoverage,
+        error.RetainedSeriesResolutionMismatch,
+        error.RetainedSeriesCoverageMissing,
+        error.RetainedSeriesHistoryExpired,
+        error.RetainedSeriesSnapshotExpired,
+        error.RetainedSeriesResetRequired,
+    };
+    for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    try std.testing.expectEqual(@backingInt(Code.conflict), statusFromError(error.RetainedDatasetSourceInUse).code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.RetainedSeriesNotReady).code);
 }
 
 test "ambiguous backup outcome survives runtime transport without rollback authorization" {

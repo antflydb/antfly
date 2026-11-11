@@ -65,7 +65,11 @@ pub fn descriptor(a: A, io: std.Io, input: Create, source: Source, storage_ident
         .local_residence_ns = retention,
         .summary = .{ .source = source.lineage.identity(), .timestamp = input.timestamp, .dimensions = input.dimensions, .interval_ns = interval, .origin_ns = try std.fmt.allocPrint(a, "{d}", .{origin}), .mutable_for_ns = mutable, .measures = input.measures, .initial_history = .retained_source_rows },
     };
+    try requireNumericSources(a, input.measures, source.schema_json);
+    for (input.dimensions) |name| if (reservedColumn(name)) return error.InvalidDatasetDefinition;
+    for (input.measures) |measure| if (reservedColumn(measure.name)) return error.InvalidDatasetDefinition;
     const binding = try @import("retained_owner_binding.zig").compile(a, definition, source.schema_json, @splat(1), 1);
+    _ = try binding.spec.bucket(@import("antfly_platform").time.realtimeNs());
     // Freeze the output schema independently of the raw table schema.
     const Dimension = struct { name: []const u8, type: local.storage_retained_series_capture.DimensionType };
     const dimensions = try a.alloc(Dimension, input.dimensions.len);
@@ -82,4 +86,31 @@ fn duration(value: []const u8) !u64 {
     if (value.len == 0 or value.len > 20) return error.InvalidDatasetDefinition;
     for (value) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidDatasetDefinition;
     return std.fmt.parseInt(u64, value, 10) catch error.InvalidDatasetDefinition;
+}
+
+fn reservedColumn(name: []const u8) bool {
+    return std.mem.eql(u8, name, "bucket_start") or std.mem.eql(u8, name, "_id");
+}
+
+fn requireNumericSources(a: A, measures: []const dataset.Measure, schema_json: []const u8) !void {
+    const typed = for (measures) |measure| {
+        if (measure.law != .count) break true;
+    } else false;
+    if (!typed) return;
+    const schema_api = local.schema_mod;
+    var schema = schema_api.parseValidatedTableSchema(a, schema_json) catch return error.InvalidDatasetDefinition;
+    defer schema.deinit(a);
+    if (schema.document_schemas.len == 0) return error.InvalidDatasetDefinition;
+    for (measures) |measure| {
+        if (measure.law == .count) continue;
+        const field = measure.field orelse return error.InvalidDatasetDefinition;
+        for (schema.document_schemas) |document| {
+            const property = for (document.properties) |candidate| {
+                if (std.mem.eql(u8, candidate.name, field)) break candidate;
+            } else return error.InvalidDatasetDefinition;
+            // The native numeric state consumes binary64. Reject exact
+            // integer/NUMERIC measures until their own state codec exists.
+            if (schema_api.runtimeRelationalColumnType(property) != .number) return error.InvalidDatasetDefinition;
+        }
+    }
 }

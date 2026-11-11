@@ -861,12 +861,20 @@ pub const ApiHttpClient = struct {
     }
 
     pub fn fetchRetainedOwnerRows(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, request: @import("retained_dataset_read.zig").NativeQuery, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        return self.fetchRetainedOwnerReadBytes(base_uri, group, table_name, routes.Routes.retained_owner_read_suffix, request, input);
+    }
+
+    pub fn fetchRetainedOwnerReplay(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, request: @import("retained_dataset_read.zig").NativeReplay, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        return self.fetchRetainedOwnerReadBytes(base_uri, group, table_name, routes.Routes.retained_owner_replay_suffix, request, input);
+    }
+
+    fn fetchRetainedOwnerReadBytes(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, suffix: []const u8, request: anytype, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         const context = try input.platformDeadline();
         try context.ensureActive();
         try request.validate(group);
         const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_name);
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, encoded_name, routes.Routes.retained_owner_read_suffix });
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, encoded_name, suffix });
         defer self.alloc.free(path);
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
@@ -884,6 +892,7 @@ pub const ApiHttpClient = struct {
             409 => {
                 if (std.mem.eql(u8, response.body, "RetainedSeriesCoverageMissing")) return error.RetainedSeriesCoverageMissing;
                 if (std.mem.eql(u8, response.body, "RetainedSeriesResolutionMismatch")) return error.RetainedSeriesResolutionMismatch;
+                if (std.mem.eql(u8, response.body, "RetainedSeriesResetRequired")) return error.RetainedSeriesResetRequired;
                 return error.RetainedOwnerPlanChanged;
             },
             else => return error.RetainedSeriesNotReady,

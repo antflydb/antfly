@@ -54040,6 +54040,56 @@ pub const RetainedDatasetMeasure = struct {
     }
 };
 
+pub const RetainedSubscriptionFrame = struct {
+    kind: []const u8,
+    cursor: []const u8,
+    initial_history: ?[]const u8 = null,
+    dimensions: ?[]const []const u8 = null,
+    measures: ?[]const RetainedDatasetMeasure = null,
+    events: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "cursor", "cursor", false },
+        .{ "initial_history", "initial_history", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "measures", "measures", true },
+        .{ "events", "events", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("cursor");
+        try jw.write(self.cursor);
+        if (self.initial_history) |value| {
+            try jw.objectField("initial_history");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.measures) |value| {
+            try jw.objectField("measures");
+            try jw.write(value);
+        }
+        try jw.objectField("events");
+        try jw.write(self.events);
+        try jw.endObject();
+    }
+};
+
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     context_management: ?AgentContextManagement = null,

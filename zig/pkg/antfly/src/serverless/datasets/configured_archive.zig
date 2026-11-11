@@ -62,6 +62,63 @@ pub const Opened = struct {
     }
 };
 
+/// The metadata authority drives a bounded indexed expiry sweep. The resume
+/// positions are scheduling hints; durable archive state governs collection.
+pub const ExpiryMaintenance = struct {
+    after: u64 = 0,
+    next_ns: u64 = 0,
+    cursors: std.AutoHashMapUnmanaged(u64, catalog.ExpiryCursor) = .empty,
+
+    pub fn deinit(self: *ExpiryMaintenance, alloc: std.mem.Allocator) void {
+        self.cursors.deinit(alloc);
+    }
+
+    pub fn run(
+        self: *ExpiryMaintenance,
+        alloc: std.mem.Allocator,
+        store_: anytype,
+        group: u64,
+        config: *const local.common_config.Config,
+        secrets: ?*local.common_secrets.FileStore,
+        io: std.Io,
+        now: u64,
+        context: *const operation.RequestContext,
+    ) !void {
+        if (now < self.next_ns or config.storage.artifacts.connection == null) return;
+        self.next_ns = now +| 2 * std.time.ns_per_s;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const bytes = try store_.retainedArchiveWorkJson(a, group, self.after);
+        const resource = (try std.json.parseFromSliceLeaky(?local.system_catalog_domain.Resource, a, bytes, .{})) orelse {
+            self.next_ns = now +| 15 * std.time.ns_per_s;
+            return;
+        };
+        self.after = resource.id;
+        var descriptor = try local.system_catalog_retained_datasets.parse(a, resource.source_json);
+        defer descriptor.deinit();
+        var archive = try Opened.init(a, config, secrets, descriptor.value, false);
+        defer archive.deinit();
+        const archive_catalog = archive.store(io, context);
+        const after = self.cursors.get(resource.id);
+        const work = (try archive_catalog.nextExpiry(after)) orelse {
+            _ = self.cursors.remove(resource.id);
+            return;
+        };
+        if (self.cursors.count() >= 4096) self.cursors.clearRetainingCapacity();
+        try self.cursors.put(alloc, resource.id, work.cursor);
+        try context.ensureActive();
+        try archive_catalog.collectExpired(work.segment, archive.location());
+    }
+
+    pub fn retryable(err: anyerror) bool {
+        return switch (err) {
+            error.DatasetDependencyPending, error.DatasetRetentionPending, error.DatasetReadersActive, error.DatasetCompactionOrder, error.DatasetLocationUnavailable => true,
+            else => false,
+        };
+    }
+};
+
 pub fn locationIdentity(storage_identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly/retained-archive-location/v1");

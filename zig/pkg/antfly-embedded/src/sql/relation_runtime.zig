@@ -1323,7 +1323,10 @@ fn Engine(comptime Context: type) type {
                     .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
                     .join => |join| {
                         if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
-                            if (engine.context.backend.distributed_join) |remote| {
+                            const has_retained = for (engine.context.binding.relation.?.scans) |scan| {
+                                if (scan.table.retained != null) break true;
+                            } else false;
+                            if (if (has_retained) null else engine.context.backend.distributed_join) |remote| {
                                 self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters, engine.context.backend.distributed_context);
                                 if (self.remote_join != null) return self;
                             }

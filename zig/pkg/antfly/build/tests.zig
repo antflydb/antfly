@@ -541,7 +541,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const retained_public_filters = &.{ "retained owner native controls", "retained source write diagnostics", "SQL retained source", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
+    const retained_public_filters = &.{ "retained subscription", "retained owner native controls", "retained source write diagnostics", "SQL retained source", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
     const retained_public_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = retained_public_filters, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const retained_public_step = b.step("retained-series-public-test", "Verify source write constraints and retry semantics across HTTP, SQL and participant transport");
     retained_public_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, retained_public_tests, retained_public_filters).step);
