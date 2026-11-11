@@ -1041,6 +1041,24 @@ test "leann store: buffer, build, search, filters, delete, persist" {
         for (res2.items.items) |item| try testing.expect(item.vector_id >= 3 and item.vector_id <= 5);
     }
 
+    {
+        var filtered = try store.search(alloc, .{
+            .query = data[250 * dims ..][0..dims],
+            .k = 3,
+            .filter_prefix = "doc-25",
+            .exclude_ids = &.{250},
+            .load_metadata = true,
+        });
+        defer filtered.deinit();
+        const hits = filtered.getHits();
+        try testing.expectEqual(@as(usize, 3), hits.len);
+        for (hits) |hit| {
+            try testing.expect(hit.vector_id != 250);
+            try testing.expect(std.mem.startsWith(u8, hit.metadata.?, "doc-25"));
+        }
+        try testing.expect(hits[0].distance <= hits[1].distance and hits[1].distance <= hits[2].distance);
+    }
+
     // Upsert and delete are idempotent.
     try store.apply(&[_]TestItem{.{ .vector_id = 250, .vector = data[250 * dims ..][0..dims], .metadata = "doc-250" }}, &.{});
     try store.apply(&[_]TestItem{}, &.{ 251, 251, 9999 });
