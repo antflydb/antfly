@@ -30,8 +30,12 @@ import time
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-build", action="store_true")
+    parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
+    binary = (args.binary or root / "zig/zig-out/bin/antfly").resolve()
+    if args.binary and not args.no_build:
+        parser.error("--binary requires --no-build to use the supplied installation")
     if not args.no_build:
         build_flags = shlex.split(os.environ.get("ZIG_BUILD_FLAGS", ""))
         subprocess.run(
@@ -65,6 +69,8 @@ def main():
             check=True,
         )
         subprocess.run(["make", "-C", "zig", "build"], cwd=root, check=True)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        parser.error(f"native executable is missing or not executable: {binary}")
     with tempfile.TemporaryDirectory(prefix=".source-native-ci-", dir=root) as name:
         state = Path(name)
 
@@ -99,7 +105,7 @@ def main():
         with (state / "server.log").open("w+") as log:
             server = subprocess.Popen(
                 [
-                    str(root / "zig/zig-out/bin/antfly"),
+                    str(binary),
                     "standalone",
                     "--config",
                     str(config),

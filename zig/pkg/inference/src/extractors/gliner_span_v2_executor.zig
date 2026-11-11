@@ -1867,7 +1867,7 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     const markers: [42]usize = undefined;
     var groups = [_]processor.Group{std.mem.zeroes(processor.Group)};
     groups[0].child_markers = markers[0..2];
-    var samples: [1]processor.Sample = undefined;
+    var samples = [_]processor.Sample{std.mem.zeroes(processor.Sample)};
     samples[0].input_ids = &ids;
     samples[0].words = words[0..8];
     samples[0].groups = &groups;

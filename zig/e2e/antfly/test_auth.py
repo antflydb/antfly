@@ -1339,11 +1339,30 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             }
             for task in tasks
         ]
-        call(
-            "POST",
-            space + "/evaluations/run/verdicts",
-            {"expected_revision": revision(), "verdicts": verdicts, "model": judge},
-        )
+        # External-evaluation maintenance can advance the space while the
+        # caller assembles a verdict. Refresh a rejected space CAS while keeping
+        # the task's pinned case revisions and fingerprints.
+        for attempt in range(4):
+            try:
+                call(
+                    "POST",
+                    space + "/evaluations/run/verdicts",
+                    {
+                        "expected_revision": revision(),
+                        "verdicts": verdicts,
+                        "model": judge,
+                    },
+                )
+                break
+            except requests.HTTPError as error:
+                response = error.response
+                if (
+                    response is None
+                    or response.status_code != 409
+                    or response.json().get("code") != "MemoryRevisionConflict"
+                    or attempt == 3
+                ):
+                    raise
         assert call("GET", space + "/evaluations/run")["identity"]["accuracy"] == 1
         assert len(call("GET", space + "/evaluations/run/results")["items"]) == 3
         claims = [

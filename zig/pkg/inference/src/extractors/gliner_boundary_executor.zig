@@ -1723,6 +1723,12 @@ test "GPU boundary classification windows fit backend-specific reference reserva
     try std.testing.expect(reserved > metal_reserved);
     var tight = options;
     tight.device.max_encoder_device_bytes = reserved - 1;
+    // Window fitting can repartition the document to honor a smaller budget.
+    // Check the resulting reservation, then reject a budget no window can fit.
+    const fitted = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight);
+    try std.testing.expect(fitted > 0);
+    try std.testing.expect(fitted <= tight.device.max_encoder_device_bytes);
+    tight.device.max_encoder_device_bytes = 1;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
 }
 

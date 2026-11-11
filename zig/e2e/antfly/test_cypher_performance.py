@@ -1397,6 +1397,8 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 server.url,
                 "--pgport",
                 str(server.pgwire_port),
+                "--psql",
+                _psql_binary(),
             ]
             if policy:
                 command.append("--policy")
@@ -3455,6 +3457,7 @@ def test_authenticated_cypher_immutable_metadata_and_visited_comparison_work(
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_certified_point_domains_across_owners(monkeypatch):
     monkeypatch.setenv(
         "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-point-cohort-authority-secret-v1"
@@ -3486,6 +3489,7 @@ def test_authenticated_cypher_certified_point_domains_across_owners(monkeypatch)
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypatch):
     import threading
 

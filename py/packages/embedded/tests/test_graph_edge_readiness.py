@@ -18,9 +18,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -1004,6 +1006,16 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
     plain = tmp_path / "previous-plain.aflite"
     identity = tmp_path / "previous-identity.aflite"
     pending = tmp_path / "previous-pending.aflite"
+    # Current creation uses v7, while this pinned writer creates v4. Both
+    # support v3. Use a real empty v3 file so all cases reach catalog fencing,
+    # rather than failing at an intentionally incompatible physical header.
+    fixture = Path(__file__).resolve().parents[4] / "scripts/testdata/lite_previous_reader/empty-v3.aflite"
+    assert (
+        hashlib.sha256(fixture.read_bytes()).hexdigest()
+        == "d0a509a1ddf87feaf017032b1f9762bc89fd67c6568760a6f867bd23baf95d48"
+    )
+    for path in (plain, identity, pending):
+        shutil.copyfile(fixture, path)
     with _open_graph_test(plain, options) as db:
         db.create_table("plain_named", {})
         db.create_table("dropped_named", {})
@@ -1017,11 +1029,13 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         config = _resolver_graph("knowledge", "concepts")
         config["resolvers"][0]["promote"] = True
         db.add_index(config)
-        # Durable Lite resolver projection work requires reader epoch 15.
-        assert db.capabilities()["minimum_reader_version"] == 15
+        # Durable resolver projection needs at least epoch 15; subsequent
+        # resolver features may raise that floor. The historical reader must
+        # still reject the database, checked below against its real library.
+        assert db.capabilities()["minimum_reader_version"] >= 15
     # Hosted maintenance leaves the shadow pending deterministically. The old
     # writer must fail open before it can truncate the retained journal.
-    with antfly_embedded.create_hosted(pending) as db:
+    with antfly_embedded.open_hosted(pending) as db:
         graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
         db.add_index(graph)
         db.batch_json({"inserts": {"source": {"links": ["before"]}}})
@@ -1029,16 +1043,25 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         db.add_index(dict(graph, name="new", replaces="old"))
         assert db.pending_work_stats()["replacements"]
         assert db.capabilities()["minimum_reader_version"] == 2
+    for path in (plain, identity, pending):
+        with path.open("rb") as file:
+            assert file.read(8) == b"AFLITE\x03P", "catalog fencing requires a compatible physical format"
     script = r"""
 import ctypes, sys
 lib = ctypes.CDLL(sys.argv[1])
 lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
 lib.antfly_lite_open.restype = ctypes.c_int
 lib.antfly_db_close.argtypes = [ctypes.c_void_p]
-for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], False)]:
+lib.antfly_last_error_detail.restype = ctypes.c_char_p
+for path, expected in [(sys.argv[2], None), (sys.argv[3], b"UnknownField"), (sys.argv[4], b"UnexpectedToken")]:
     handle = ctypes.c_void_p()
     code = lib.antfly_lite_open(path.encode(), ctypes.byref(handle))
-    assert (code == 0) == accepted, (path, code)
+    detail = lib.antfly_last_error_detail()
+    assert (code == 0) == (expected is None), (path, code, detail)
+    if expected is not None:
+        # Reject the new resolver fields / versioned catalog envelope before
+        # loading artifacts, rather than failing on physical file encoding.
+        assert detail == expected, (path, code, detail)
     if handle.value:
         lib.antfly_db_close(handle)
 """
@@ -1046,22 +1069,36 @@ for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], 
         [sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60
     )
 
-    # A previously opened Lite writer must also reject mutation after the
-    # registration commit, when its connection refreshes the catalog.
-    live = tmp_path / "previous-live-writer.aflite"
+
+def test_previous_reader_live_directory_writer_blocks_generation_transition(tmp_path):
+    previous = os.environ.get("ANTFLY_LITE_PREVIOUS_LIBRARY")
+    if not previous:
+        if os.environ.get("ANTFLY_LITE_REQUIRE_PREVIOUS_READER") == "1":
+            pytest.fail("ANTFLY_LITE_PREVIOUS_LIBRARY is required")
+        pytest.skip("set ANTFLY_LITE_PREVIOUS_LIBRARY to the pinned pre-PR reader")
+    # A live historical directory writer owns its generation. Current code
+    # must reject the transition until that owner closes, before it can expose
+    # a new catalog feature to the old writer.
+    # That writer unconditionally upgrades writable Lite v3 files to v4,
+    # which current Lite cannot open. Directory storage avoids that separate
+    # physical-format boundary; the preceding test checks actual Lite opens.
+    live = tmp_path / "previous-live-writer"
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
     # Seed with the historical writer too: current full-text artifacts use a
     # newer section format. This case tests fencing a writer already open when
     # a new catalog feature is published, not opening newer index bytes.
     writer_script = r"""
-import ctypes, json, sys
+import ctypes, json, struct, sys
 class Slice(ctypes.Structure):
     _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 class Buffer(ctypes.Structure):
     _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 lib = ctypes.CDLL(sys.argv[1])
-lib.antfly_lite_create_hosted.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
-lib.antfly_lite_create_hosted.restype = ctypes.c_int
+lib.antfly_open_options_size.restype = ctypes.c_uint32
+lib.antfly_open_options_init.argtypes = [ctypes.c_void_p]
+lib.antfly_open_options_init.restype = ctypes.c_int
+lib.antfly_db_open_with_options.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_db_open_with_options.restype = ctypes.c_int
 lib.antfly_db_batch_json.argtypes = [ctypes.c_void_p, Slice, ctypes.POINTER(Buffer)]
 lib.antfly_buffer_free.argtypes = [ctypes.POINTER(Buffer)]
 lib.antfly_db_batch_json.restype = ctypes.c_int
@@ -1071,7 +1108,12 @@ lib.antfly_db_run_until_idle.argtypes = [ctypes.c_void_p]
 lib.antfly_db_run_until_idle.restype = ctypes.c_int
 lib.antfly_db_close.argtypes = [ctypes.c_void_p]
 handle = ctypes.c_void_p()
-assert lib.antfly_lite_create_hosted(sys.argv[2].encode(), ctypes.byref(handle)) == 0
+options = ctypes.create_string_buffer(lib.antfly_open_options_size())
+assert lib.antfly_open_options_init(options) == 0
+# Stable ABI prefix: abi_size, storage_kind, open_mode, profile. Keep the
+# historical library's own ABI size and initialize every other field there.
+struct.pack_into("=I", options, 12, 1)  # hosted; default storage is directory
+assert lib.antfly_db_open_with_options(sys.argv[2].encode(), options, ctypes.byref(handle)) == 0
 def invoke(name, payload):
     data = json.dumps(payload).encode()
     buffer = ctypes.create_string_buffer(data)
@@ -1095,7 +1137,7 @@ try:
     code = lib.antfly_db_batch_json(handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(request)), ctypes.byref(output))
 finally:
     if output.ptr: lib.antfly_buffer_free(ctypes.byref(output))
-assert code != 0, "old writer admitted mutation across the replacement fence"
+assert code == 0, "rejected transition must leave the old generation writable"
 lib.antfly_db_close(handle)
 """
     writer = subprocess.Popen(
@@ -1116,10 +1158,32 @@ lib.antfly_db_close(handle)
                 writer.kill()
             _, stderr = writer.communicate(timeout=30)
             pytest.fail(f"previous reader failed to initialize: exit={writer.returncode}, stdout={line!r}\n{stderr}")
-        with antfly_embedded.open_hosted(live) as db:
+        options = antfly_embedded.OpenOptions(
+            storage=antfly_embedded.Storage.DIRECTORY, profile=antfly_embedded.Profile.HOSTED
+        )
+        with pytest.raises(antfly_embedded.BusyError, match="GenerationTransitionActive"):
+            antfly_embedded.open_with_options(live, options)
+        _, stderr = writer.communicate("write\n", timeout=30)
+        assert writer.returncode == 0, stderr
+        with antfly_embedded.open_with_options(live, options) as db:
             db.add_index(dict(graph, name="new", replaces="old"))
-            _, stderr = writer.communicate("write\n", timeout=30)
-            assert writer.returncode == 0, stderr
+            assert db.capabilities()["minimum_reader_version"] == 2
+        # Once ownership transfers, the old catalog decoder must reject
+        # the pending feature even though physical directory storage is
+        # unchanged. Reuse the historical ABI, not the current reader.
+        reject_script = r"""
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_db_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_db_open.restype = ctypes.c_int
+lib.antfly_last_error_detail.restype = ctypes.c_char_p
+handle = ctypes.c_void_p()
+code = lib.antfly_db_open(sys.argv[2].encode(), ctypes.byref(handle))
+assert code != 0, "old reader admitted the pending replacement"
+assert lib.antfly_last_error_detail() == b"UnexpectedToken", lib.antfly_last_error_detail()
+"""
+        subprocess.run([sys.executable, "-c", reject_script, previous, str(live)], check=True, timeout=30)
+        with antfly_embedded.open_with_options(live, options) as db:
             db.batch_json({"inserts": {"source": {"links": ["latest"]}}})
             db.run_until_idle()
             edges = db.edges("new", "source", "R", antfly_embedded.GraphDirection.OUT)

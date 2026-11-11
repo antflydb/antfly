@@ -302,6 +302,9 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             // larger peak plus 10%, rounded up to 128 MiB. Qualified local
             // SDK profiles retain their independent claims below.
             .{ .name = test_owner_names.capi_contract, .mib = 20_096 },
+            // Complete native Debug unit gate on SDK 27.0 reached
+            // 19,627,360,256 bytes; apply the same 10% / 128 MiB rule.
+            .{ .name = "api-docid-tests", .mib = 21_888 },
             .{ .name = "data-runtime-tests", .mib = 15_616 },
             .{ .name = "data-runtime-implementation-tests", .mib = 19_584 },
         };
@@ -314,7 +317,6 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             .{ .name = "metadata-unit-lane-a-tests", .gib = 22 },
             .{ .name = "metadata-unit-lane-b-tests", .gib = 22 },
             .{ .name = "public-api-parity", .gib = 22 },
-            .{ .name = "api-docid-tests", .gib = 18 },
             .{ .name = "api-auth-tests", .gib = 17 },
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
             .{ .name = "raft-unit-tests", .gib = 17 },
@@ -766,6 +768,7 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
         .{ .name = test_owner_names.root_unit, .peak = 17_932_107_776 },
         .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
         .{ .name = test_owner_names.capi_contract, .peak = 19_145_900_032 },
+        .{ .name = "api-docid-tests", .peak = 20_845_002_752 },
         .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
         .{ .name = "data-runtime-implementation-tests", .peak = 18_559_696_896 },
     }) |sample| {
@@ -779,6 +782,8 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
         try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, macos, linux, .debug, 7 * gib));
     }
     const budget = 36 * gib * 4 / 5;
+    try std.testing.expect(testCompileMaxRss("api-docid-tests", macos, macos, .debug, 0) + 7 * gib <= budget);
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
     try std.testing.expect(testCompileMaxRss("root-unit-tests", macos, macos, .debug, 0) + 10 * gib <= budget);
     try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 9 * gib <= budget);
     // These newly measured consumers must serialize on a 36 GiB host.

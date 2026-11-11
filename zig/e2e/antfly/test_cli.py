@@ -96,7 +96,9 @@ class TinyImageServer:
 
 @pytest.fixture(scope="module")
 def cli_inference_servers():
-    embedder = InferenceEmbeddingServer(response_delay_s=30.0)
+    # Explicit release proves control-plane independence without comparing
+    # wall time to scheduler speed on a shared CI node.
+    embedder = InferenceEmbeddingServer(response_delay_s=None)
     generator = InferenceGeneratorServer()
     reranker = InferenceRerankerServer()
     yield {
@@ -366,7 +368,6 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         assert embedder_server.wait_for_embedding_request(10.0)
 
-        full_text_started = time.monotonic()
         full_text_query = cli(
             "query",
             "--table",
@@ -377,9 +378,8 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "title,body",
             "--limit",
             "2",
-            timeout_s=5.0,
         )
-        assert time.monotonic() - full_text_started < 3.0, (
+        assert embedder_server.embedding_delay_blocked, (
             "a ready full-text read queued behind generated-index backfill"
         )
         full_text_hits = parse_json(full_text_query.stdout)["responses"][0]["hits"][
@@ -512,7 +512,6 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             ),
         )
         assert embedder_server.wait_for_embedding_request(10.0)
-        image_create_started = time.monotonic()
         cli(
             "index",
             "create",
@@ -534,9 +533,8 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                     "api_url": embedder_url,
                 }
             ),
-            timeout_s=8.0,
         )
-        assert time.monotonic() - image_create_started < 5.0, (
+        assert embedder_server.embedding_delay_blocked, (
             "second-index activation queued behind provider execution"
         )
 
@@ -969,7 +967,6 @@ def test_cli_index_wait_survives_retry_exhaustion_and_restart(
         # Hold a later healthy request open so the CLI observes and waits
         # through the exact degraded-but-progressing boundary.
         embedder_server.arm_delay()
-        insert_started = time.monotonic()
         cli(
             "insert",
             "--table",
@@ -985,10 +982,10 @@ def test_cli_index_wait_survives_retry_exhaustion_and_restart(
                 }
             ),
         )
-        assert time.monotonic() - insert_started < 5.0, (
+        assert embedder_server.wait_for_embedding_request(10.0)
+        assert embedder_server.embedding_delay_blocked, (
             "the default point-mutation barrier inherited provider latency"
         )
-        assert embedder_server.wait_for_embedding_request(10.0)
 
         def isolated_failure_is_pending() -> dict | None:
             status = parse_json(

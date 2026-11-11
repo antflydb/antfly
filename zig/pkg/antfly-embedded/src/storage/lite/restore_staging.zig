@@ -2086,13 +2086,16 @@ test "lite restore staging inspector bounds memory independently of archive leng
     });
     for (0..128) |_| try backup_codec.writeBlockTo(&writer.interface, .document_batch, payload);
     try writer.end();
-    const memory = try a.alloc(u8, 2 * 1024 * 1024);
-    defer a.free(memory);
-    var bounded = std.heap.FixedBufferAllocator.init(memory);
+    // Streaming inspection releases blocks and aligned parse metadata in
+    // independent lifetimes. FixedBufferAllocator cannot reclaim alignment
+    // gaps on free; cap live heap bytes rather than cumulative bump offsets.
+    var bounded: @import("test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 2 * 1024 * 1024 };
     var counter: InspectionCounter = .{};
     const report = try portable_backup.inspectPortableFileBlocks(bounded.allocator(), io, file, .{}, &counter, InspectionCounter.visit);
     try std.testing.expect(report.size_bytes > 32 * 1024 * 1024);
     try std.testing.expectEqual(@as(u64, 128), counter.documents);
+    try std.testing.expect(bounded.peak <= bounded.limit);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
 }
 
 test "lite restore staging inspector rejects a source changed by its visitor" {

@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18591")
     parser.add_argument("--pgport", type=int, default=18592)
-    parser.add_argument("--psql", default="/opt/homebrew/opt/postgresql@18/bin/psql")
+    parser.add_argument("--psql", default=os.environ.get("PSQL", "psql"))
     parser.add_argument("--policy", action="store_true")
     args = parser.parse_args()
     user, password = os.environ["ANTFLY_CYPHER_TEST_AUTH"].split(":", 1)

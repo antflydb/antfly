@@ -61,7 +61,8 @@ check_memory() {
 }
 
 check_sources() {
-  python3 "$repo_root/scripts/ci/check_source_native.py"
+  # Native source integration consumes the shared E2E executable in
+  # source-sdk-native. Keep this lane limited to portable Go checks.
   section "Checking portable source ingestion"
   (
     cd "$repo_root/go/pkg/sources"
