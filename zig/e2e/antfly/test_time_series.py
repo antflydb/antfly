@@ -526,8 +526,9 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     )
     count = 100_001
     for first in range(0, count, 1000):
-        # Bulk full-index visibility can include checkpoint warming. Allow a
-        # longer setup transport timeout without relaxing the query's budget.
+        # Only the final prefix is queried. Fence it once after admitting all
+        # source batches so this scale fixture also exercises coalesced replay.
+        # The final full-index write covers every preceding sequence.
         api.batch_write_with_timeout(
             name,
             timeout_s=120,
@@ -540,7 +541,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
                 }
                 for i in range(first, min(first + 1000, count))
             },
-            sync_level="full_index",
+            sync_level="full_index" if first + 1000 >= count else "write",
         )
     payload = api.post("/query", dict(fixture["query"], table=name))
     result = payload.get("responses", [payload])[0]

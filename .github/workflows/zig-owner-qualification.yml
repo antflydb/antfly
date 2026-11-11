@@ -160,7 +160,7 @@ jobs:
     name: Native owner equivalence / Linux x86_64
     needs: [admission, changes]
     if: needs.changes.outputs.owners == 'true'
-    runs-on: arc-antfly-heavy-runtime
+    runs-on: arc-antfly-heavy
     permissions:
       contents: read
       checks: read
@@ -174,6 +174,16 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
+      - name: Place compiler caches on the build runner volume
+        run: |
+          set -euo pipefail
+          test -d /mnt/cache
+          cache_root=/mnt/cache/operation-owners
+          mkdir -p "$cache_root/zig-cache" "$cache_root/zig-out"
+          # Keep every tool's worktree-relative cache/output path intact.
+          # The runtime-only runner's 10 GiB writable layer cannot hold these.
+          ln -s "$cache_root/zig-cache" zig/.zig-cache
+          ln -s "$cache_root/zig-out" zig/zig-out
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Prepare native build tools
@@ -258,7 +268,7 @@ jobs:
     name: Native media cache matrix / Linux x86_64
     needs: [admission, changes]
     if: needs.changes.outputs.owners == 'true' && (github.event_name == 'schedule' || inputs.cache_matrices)
-    runs-on: arc-antfly-heavy-runtime
+    runs-on: arc-antfly-heavy
     permissions:
       contents: read
       checks: read
@@ -272,6 +282,16 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
+      - name: Place compiler caches on the build runner volume
+        run: |
+          set -euo pipefail
+          test -d /mnt/cache
+          cache_root=/mnt/cache/operation-owners
+          mkdir -p "$cache_root/zig-cache" "$cache_root/zig-out"
+          # Keep every tool's worktree-relative cache/output path intact.
+          # The runtime-only runner's 10 GiB writable layer cannot hold these.
+          ln -s "$cache_root/zig-cache" zig/.zig-cache
+          ln -s "$cache_root/zig-out" zig/zig-out
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Prepare native build tools
@@ -318,7 +338,7 @@ jobs:
     name: Production archive ownership / native Linux x86_64
     # Reuse the established 24 GiB pod/20 GiB compiler profile. Hosted Linux
     # cannot admit the existing 20 GiB storage reservation; never override it.
-    runs-on: arc-antfly-heavy-runtime
+    runs-on: arc-antfly-heavy
     permissions:
       contents: read
       checks: read
@@ -332,6 +352,16 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
+      - name: Place compiler caches on the build runner volume
+        run: |
+          set -euo pipefail
+          test -d /mnt/cache
+          cache_root=/mnt/cache/operation-owners
+          mkdir -p "$cache_root/zig-cache" "$cache_root/zig-out"
+          # Keep every tool's worktree-relative cache/output path intact.
+          # The runtime-only runner's 10 GiB writable layer cannot hold these.
+          ln -s "$cache_root/zig-cache" zig/.zig-cache
+          ln -s "$cache_root/zig-out" zig/zig-out
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Prepare native build tools
