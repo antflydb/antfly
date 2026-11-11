@@ -1577,6 +1577,12 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "doc:a",
         "document_units_v1",
     ));
+    // Document extraction reprocessing is accepted at sync_level `.write` and
+    // completes on the generated replay worker so accepting it never blocks
+    // on remote OCR/provider latency; the config-fenced reprocess intent is
+    // durable immediately, but the manifest's bumped generation is only
+    // visible once replay has caught up to `.full_index`.
+    try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
     var reprocessed_manifest = (try read_source.source().documentArtifactManifest(
         alloc,
         "articles",

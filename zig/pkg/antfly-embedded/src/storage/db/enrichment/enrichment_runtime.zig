@@ -16609,7 +16609,11 @@ fn processAsset(
 
     if (producer_cfg.type == .copy) {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text);
-        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, source_text)) {
+        // Same reasoning as the generic producer's receipt below: key the
+        // reuse receipt on the declared source (`source_text`), not the
+        // whole primary document (`raw`), so an edit to an unrelated field
+        // doesn't invalidate it.
+        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, source_text, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             // The artifact exists and is current: produced coverage, so an
@@ -16621,7 +16625,7 @@ fn processAsset(
         const receipt_key = try local.key(runtime.alloc, key);
         defer runtime.alloc.free(receipt_key);
         const producer_recipe = local.requestRecipe(request);
-        const receipt = local.encode(producer_recipe, raw, source_text);
+        const receipt = local.encode(producer_recipe, source_text, source_text);
         try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
@@ -16681,7 +16685,15 @@ fn processAsset(
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
-            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+            // Same reasoning as the `.copy` branch above: key the reuse
+            // receipt on the declared source (`source_text`), which
+            // `shouldSkipAssetProducer` just proved unchanged, not the
+            // whole primary document (`raw`) -- otherwise an edit to an
+            // unrelated field silently defeats the skip this check exists
+            // to provide (`storePutBatchGuarded`'s separate fencing digest,
+            // a few lines below in the write path, still keys on `raw` to
+            // guard against a genuinely concurrent primary change).
+            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, source_text, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
                 try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
                 // Private outputs also require their destination-owned witness.
@@ -18313,7 +18325,20 @@ fn applyAssetProducerBatchOutput(
     const receipt_key = try local.key(runtime.alloc, item.artifact_key);
     defer runtime.alloc.free(receipt_key);
     const producer_recipe = local.requestRecipe(item.request);
-    const receipt = local.encode(producer_recipe, item.raw_doc, validated);
+    // This receipt's "parent" proves the output was produced from exactly
+    // this input, for `reusableLocalAsset`'s skip-the-provider check
+    // (`requireLocalAssetSource` reads it back). That input is the
+    // producer's own declared source (`item.source_text`, already what
+    // `shouldSkipAssetProducer`'s state-value check keys its skip decision
+    // on), not the whole primary document (`item.raw_doc`, which also
+    // carries fields the producer never saw, e.g. doc_key's own metadata
+    // consumed by nothing it depends on) -- the matching privacy witness a
+    // few lines above already makes exactly this choice for its own
+    // non-private-consumer case. Keying this receipt on `item.raw_doc`
+    // instead invalidated it on every unrelated field edit, silently
+    // defeating the skip (the duplicate work `shouldSkipAssetProducer`
+    // already proved is unnecessary) on every such edit.
+    const receipt = local.encode(producer_recipe, item.source_text, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
     try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
 
@@ -42017,9 +42042,29 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .doc_key = "blocked",
         .source_field = "body",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-        .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
+        // Must match byte-for-byte what `enrichmentFromPublic` serializes
+        // for the registered entry below via `std.json.Stringify.valueAlloc`
+        // with default options: `emit_null_optional_fields` defaults to
+        // `true`, so `EnrichmentExecutionConfig`'s unset `max_document_pages`
+        // is emitted as an explicit `null`, not omitted.
+        .execution_json = "{\"batch_items\":8,\"batch_bytes\":1,\"max_document_pages\":null}",
         .sequence = 7,
     };
+    // `applyAssetProducerBatchOutput`'s write fences every non-token asset
+    // write (`storePutBatchGuarded` -> `validateLocalSourceFence`) against
+    // a registered catalog entry whose recipe (producer_json/source_field/
+    // execution_json/...) matches this request's own fields exactly, and
+    // against a stored source document matching `item.raw_doc`'s digest
+    // (pre-existing fencing, unrelated to any change in this task -- this
+    // bare `IndexManager`/`mem_backend` fixture just never satisfied it).
+    // `Harness.item` always sets the same raw_doc regardless of doc_key, so
+    // one write covers every doc_key used below.
+    for ([_][]const u8{ "healthy-a", "healthy-b", "bounded-a", "bounded-b", "healthy-serial" }) |doc_key| {
+        const source_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+        defer alloc.free(source_key);
+        try storePutBatch(&runtime, &.{.{ .key = source_key, .value = "{\"body\":\"large retained document\"}" }}, &.{});
+    }
+    try manager.addEnrichment(&erased_store, .{ .name = "generated", .kind = .asset, .field = "body", .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
     // There is deliberately no document in the store. Planning must retain
     // the request, not read/materialize it or invoke the provider.
     try processAssetOrDefer(&runtime, request, &queued, &prepared_sources, &window);
@@ -42045,11 +42090,14 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     try std.testing.expectEqual(requestFailureFingerprint(request), batch.retry_fingerprint);
     // Two individually admissible items must flush at the byte boundary even
     // though the item-count limit allows eight. Account for raw/state bytes,
-    // not just the much smaller text sent to the provider.
+    // not just the much smaller text sent to the provider. The recipe fence
+    // hashes execution_json too, so the registered entry must track this
+    // batch-size override to keep matching these requests' own fields.
+    _ = try manager.upsertEnrichment(&erased_store, .{ .name = "generated", .kind = .asset, .field = "body", .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 128 } });
     for ([_][]const u8{ "bounded-a", "bounded-b" }, 0..) |source, i| {
         var next = request;
         next.doc_key = source;
-        next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128}";
+        next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128,\"max_document_pages\":null}";
         const item = try Harness.item(alloc, next, source);
         try std.testing.expect(assetProducerRetainedBytes(item) < 128);
         try std.testing.expect(assetProducerRetainedBytes(item) * 2 > 128);
@@ -42063,7 +42111,10 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     try std.testing.expectEqual(@as(u64, 4), harness.publications);
 
     // Serial compatibility must not let a retryable first item starve an
-    // independent sibling in the same bounded batch either.
+    // independent sibling in the same bounded batch either. `healthy_request`
+    // below reuses `request` unmodified, so the registered recipe must
+    // track back to its original execution_json.
+    _ = try manager.upsertEnrichment(&erased_store, .{ .name = "generated", .kind = .asset, .field = "body", .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
     const blocked = try Harness.item(alloc, request, "blocked");
     defer freeAssetProducerBatchItem(alloc, blocked);
     var healthy_request = request;
@@ -44014,12 +44065,27 @@ test "model aware media vector labels rebuild from stored vectors without media 
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    // `IndexDocumentCheckpoint.mutate` fences every non-token asset write
+    // against the doc's own stored source record (see its `else` branch:
+    // no `producer_context` token here, so it reads `documentSourceStoreKeyAlloc`
+    // and compares against `item.raw_doc`'s digest). `processVectorLabels`
+    // below is called with `raw_doc = "{}"`, so the stored source must be
+    // exactly "{}" too, or the very first write returns EnrichmentSourceChanged
+    // before ever reaching the labels logic this test means to exercise.
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    // producer_json must match the registered "labels" enrichment's
+    // recipe exactly (validateLocalSourceFence hashes producer_json as
+    // part of the producer_recipe fence) -- the short form here used to
+    // omit the registered entry's "config" object entirely, which this
+    // fencing check (pre-existing, unrelated to any change in this task)
+    // now rejects as EnrichmentSourceChanged.
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
     {
         const result = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
@@ -45121,7 +45187,17 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    catalog.binding.effect_protocol = 15;
+    // Unlike sibling tests in this file that copy this same activation
+    // sequence to pin an *old* catalog baseline (effect_protocol = 15),
+    // this test's own "vectors" index is exactly a chunk-generated dense
+    // vector config (artifact_inventory.zig's onlineGeneratedChunkVectorConfig),
+    // which naturally computes to the current max, 18 -- the floor
+    // processOrderedChunkVectorWithAllocator's own execution_revision !=
+    // null and effect_protocol < 18 check requires before it will even
+    // reach the chunk-embedding-target compatibility error this test
+    // expects (error.IncompatibleChunkEmbeddingTarget). Pinning 15 here
+    // instead hits the earlier, unrelated error.OnlineMergeArtifactTailsUnsupported.
+    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -45364,6 +45440,16 @@ test "model aware media retained named text permits a changed embedding generati
     var runtime: EnrichmentRuntime = undefined;
     runtime.alloc = std.testing.allocator;
     runtime.dense_result_cache = null;
+    // `undefined` leaves every unassigned field poisoned with Zig's debug-mode
+    // 0xaa fill. `assetProviderRequestContext` (reached from
+    // `processOrderedChunkVectorWithAllocator` below, through the asset
+    // producer's media fallback) dereferences `deadline_clock` -- a Clock
+    // *value* (ctx + two function pointers), never assigned here -- which
+    // calls through the poisoned `now_realtime_ns_fn` pointer and crashes
+    // with "Bus error at address 0xaaaaaaaaaaaaaaaa". Not a use-after-free:
+    // this field was simply never given a real value by this fixture.
+    runtime.deadline_clock = platform_clock.Clock.real();
+    runtime.active_provider_guard = .{};
     const text_payload = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .body = "exact rendered page text", ._chunk = metadata }, .{});
     defer std.testing.allocator.free(text_payload);
     try std.testing.expect((try storedModelChunkVector(&runtime, std.testing.allocator, provider, request, text_payload)) == null);
