@@ -931,6 +931,9 @@ never deletes a source that is absent from the file —
 retire sources explicitly with archive or purge.
 
 Omitted names preserve existing display names; a new source defaults to its key.
+An omitted or empty identity namespace preserves the server-assigned namespace.
+Both `identity: {}` and `identity: {"namespace": ""}` leave that identity intact
+and converge without repeated writes.
 Planning validates every effective search, processing and knowledge declaration
 before any write, using the same pure validators as the runtime adapters.
 Provider access, authorization and native index admission are checked by the

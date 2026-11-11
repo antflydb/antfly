@@ -229,7 +229,9 @@ func manifestDesired(ctx context.Context, current management.Source, entry Manif
 	if entry.Processing != nil {
 		desired.Processing = entry.Processing
 	}
-	if entry.Identity != nil {
+	// An empty namespace asks the runtime to assign or preserve the identity.
+	// Retain an existing assignment so the manifest converges after creation.
+	if entry.Identity != nil && entry.Identity.Namespace != "" {
 		desired.Identity = *entry.Identity
 	}
 	if entry.Knowledge != nil {
