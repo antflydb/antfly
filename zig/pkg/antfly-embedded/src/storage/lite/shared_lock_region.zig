@@ -42,6 +42,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const antfly_platform = @import("antfly_platform");
 
 const magic: [8]u8 = "AFLLOCK1".*;
 const format_version: u32 = 1;
@@ -107,6 +108,18 @@ const Header = extern struct {
     /// so `claimReaderSlotWait` can block on exhaustion instead of
     /// spin-polling, the same shape as the writer ticket's own futex word.
     reader_slot_released: std.atomic.Value(u32),
+    /// Bumped (and the matching futex woken) unconditionally on every
+    /// `releaseWriter`. `acquireWriter`'s own doc comment explains why
+    /// its phase 2 needs to wait on a word `releaseWriter` itself
+    /// mutates (not `head`, which it never touches). `writer_holder`
+    /// itself cannot serve as that word: a futex word must be exactly 32
+    /// bits, and `writer_holder` is 64 (`pid` packed with a 32-bit
+    /// liveness slot). A plain monotonic counter sidesteps the size
+    /// mismatch entirely and is simpler to reason about than any 32-bit
+    /// slice of `writer_holder` would be -- the same shape as
+    /// `reader_slot_released`, already proven correct for exactly this
+    /// "wait for the next release, not a specific value" pattern.
+    writer_release_epoch: std.atomic.Value(u32),
     /// Sized so the named fields above sum to exactly `header_bytes` (64)
     /// with no implicit trailing struct padding: `std.mem.asBytes`
     /// includes any such padding, and Zig's struct-literal initialization
@@ -115,7 +128,7 @@ const Header = extern struct {
     /// rejecting its own freshly-written, uncorrupted bytes as corrupt on
     /// every reopen. `== header_bytes` below (not `<=`) keeps that
     /// invariant enforced at compile time for any future field addition.
-    _reserved: [8]u8 = @splat(0),
+    _reserved: [4]u8 = @splat(0),
 };
 
 comptime {
@@ -258,25 +271,21 @@ pub const RegionError = error{ RegionUnavailable, RegionCorrupt, LivenessSlotsEx
 /// free (claiming its own liveness slot) or is specifically testing
 /// whether a *recorded* holder is still alive (`probeDead`), never
 /// waiting to become one.
-fn fcntlTryLock(fd: std.posix.fd_t, offset: i64, lock_type: i16) bool {
-    var fl: std.c.Flock = .{ .start = offset, .len = 1, .pid = 0, .type = lock_type, .whence = std.c.SEEK.SET };
-    return std.c.fcntl(fd, std.c.F.SETLK, &fl) != -1;
-}
+const fcntlTryLock = antfly_platform.sync.fcntlTryLock;
+const fcntlUnlock = antfly_platform.sync.fcntlUnlock;
 
-fn fcntlUnlock(fd: std.posix.fd_t, offset: i64) void {
-    var fl: std.c.Flock = .{ .start = offset, .len = 1, .pid = 0, .type = std.c.F.UNLCK, .whence = std.c.SEEK.SET };
-    _ = std.c.fcntl(fd, std.c.F.SETLK, &fl);
-}
-
-/// Blocking `fcntl` byte-range lock, retried across `EINTR`. Used only
+/// Bounded, cancelable alternative to a raw blocking `fcntl` lock (never
+/// `F_SETLKW`, which has no deadline or cancellation of its own -- see
+/// `antfly_platform.sync.fcntlLockBounded`'s own doc comment). Used only
 /// for the one-time create/validate section's own exclusive lock (see
 /// `setup_lock_offset`) -- everywhere else in this module takes the
-/// nonblocking `fcntlTryLock` instead.
-fn fcntlLockBlocking(fd: std.posix.fd_t, offset: i64, lock_type: i16) void {
-    var fl: std.c.Flock = .{ .start = offset, .len = 1, .pid = 0, .type = lock_type, .whence = std.c.SEEK.SET };
-    while (std.c.fcntl(fd, std.c.F.SETLKW, &fl) == -1) {
-        if (std.c._errno().* != @backingInt(std.c.E.INTR)) return;
-    }
+/// nonblocking `fcntlTryLock` instead. Generous (30s) but still bounded:
+/// genuine multi-process contention on this one-time section should
+/// never come close, and the alternative (an unbounded wait) is exactly
+/// what this whole design exists to avoid everywhere else.
+fn fcntlLockBlocking(io: Io, fd: std.posix.fd_t, offset: i64, lock_type: i16) !void {
+    const deadline = Io.Clock.now(.awake, io).addDuration(.fromSeconds(30));
+    return antfly_platform.sync.fcntlLockBounded(io, fd, offset, lock_type, deadline);
 }
 
 /// A fixed byte offset, far beyond any real region's actual size, used
@@ -585,7 +594,7 @@ pub const Region = struct {
         // process's own `openSized` call on this same region. Released
         // explicitly below, alongside `setup_file`'s own close -- not
         // deferred to function exit, same reasoning.
-        fcntlLockBlocking(raw_fd, setup_lock_offset, std.c.F.WRLCK);
+        try fcntlLockBlocking(io, raw_fd, setup_lock_offset, std.c.F.WRLCK);
         errdefer fcntlUnlock(raw_fd, setup_lock_offset);
 
         const size = (try setup_file.stat(io)).size;
@@ -622,6 +631,7 @@ pub const Region = struct {
                 .writer_ticket_tail = .init(0),
                 .writer_ticket_head = .init(0),
                 .reader_slot_released = .init(0),
+                .writer_release_epoch = .init(0),
             };
             fresh.header_checksum = headerChecksum(&fresh);
             try setup_file.writePositionalAll(io, std.mem.asBytes(&fresh), 0);
@@ -744,19 +754,40 @@ pub const Region = struct {
     /// until the writer word is acquired for `pid`. The uncontended case
     /// never reaches the futex syscall at all.
     ///
-    /// `head` means "this ticket may try the CAS now", not "this ticket
-    /// has it" -- the holder of ticket N may still be the *ticketless*
-    /// fast-path holder above (acquired with no ticket at all), so `head`
-    /// only ever advances here, in the waiter that actually wins its CAS,
-    /// never in `releaseWriter`. An earlier version advanced it in
-    /// `releaseWriter` instead; a ticketless holder's release then had no
-    /// ticket of its own to retire, so it either skipped the wake entirely
-    /// (an off-by-one on a post-increment comparison) or walked `head`
-    /// past where the *next* ticket would ever match it -- a release could
-    /// land with nothing waiting at all and still advance `head`, after
-    /// which no future ticket's `head == my_ticket` check could ever
-    /// become true again. Both were real: the second produced the lost
-    /// cross-process wakeup a two-process contention test hung on.
+    /// Two phases, deliberately waiting on a *different* word in each,
+    /// because a futex's atomic "check the word, block only if it still
+    /// equals `expect`" guarantee only protects against a lost wakeup
+    /// when the word being checked is the *same* word the other side
+    /// actually mutates before waking. The two things this function
+    /// waits for -- "it is my turn" and "the current holder has
+    /// released" -- are backed by two different words, so one futex
+    /// word cannot stand in for both without a race:
+    ///
+    /// **Phase 1** waits on `head` until `head == my_ticket`. `head`
+    /// itself transitions exactly when this should re-check (advanced
+    /// only by the ticket that just won, immediately below, in the same
+    /// breath as its own wake), so the atomic guarantee fully applies:
+    /// no interleaving of another waiter's check-then-wait with this
+    /// phase's own `head` mutation can land `head` motionless while a
+    /// waiter is still parked expecting it to move.
+    ///
+    /// **Phase 2** starts once `head == my_ticket`, but the writer word
+    /// may still be held (the previous winner's own commit may still be
+    /// running) -- it is *not* released by `head` moving, only by
+    /// `releaseWriter`'s own store to `writer_holder`. An earlier version
+    /// kept waiting on `head` through this phase too, on the reasoning
+    /// that `releaseWriter` always wakes `head`'s waiters when anyone is
+    /// queued. That reasoning missed that `head` itself never changes
+    /// during a release, so the futex's atomic guarantee does not cover
+    /// this phase at all: if a failed CAS here and this phase's own
+    /// `futexWaitShared` call happened to straddle the releaser's own
+    /// `store` + wake, the wake could fire while nothing was yet
+    /// listening, and the subsequent wait's own atomic check would see
+    /// `head` *unchanged* and block anyway -- a real, reproducible lost
+    /// wakeup under a four-process contention test, not merely
+    /// theoretical. Phase 2 now waits on `writer_holder` itself instead,
+    /// the word `releaseWriter` actually mutates, so the same atomic
+    /// guarantee phase 1 already relies on now covers this phase too.
     pub fn acquireWriter(self: *Region, pid: u32) void {
         const hdr = self.header();
         // FIFO: only take the fast, ticketless path with nobody already
@@ -766,37 +797,42 @@ pub const Region = struct {
         const my_ticket: u32 = @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
-            if (head == my_ticket and self.tryAcquireWriter(pid)) {
-                // Won this turn. Advance head so ticket `my_ticket + 1`
-                // (if any) may try, and wake whoever is parked for it --
-                // including a spurious wake of a later ticket still
-                // waiting on the old head value, which simply re-checks
-                // and re-parks (see the module doc comment).
+            if (head == my_ticket) break;
+            futexWaitShared(&hdr.writer_ticket_head.raw, head);
+        }
+        while (true) {
+            if (self.tryAcquireWriter(pid)) {
+                // Won. Advance head so ticket `my_ticket + 1` (if any)
+                // leaves phase 1 and enters its own phase 2, and wake
+                // whoever is parked for that -- including a spurious
+                // wake of a later ticket still waiting on the old head
+                // value, which simply re-checks and re-parks.
                 _ = hdr.writer_ticket_head.fetchAdd(1, .release);
                 futexWakeShared(&hdr.writer_ticket_head.raw);
                 return;
             }
-            // Either not our turn yet, or it was but the word was not
-            // free (the holder -- possibly the ticketless fast-path
-            // holder, with no ticket of its own -- has not released yet).
-            // `releaseWriter` wakes this exact word whenever anyone is
-            // queued, so waiting on the *current*, unchanged `head` value
-            // is correct: nothing else is responsible for moving `head`
-            // in that case.
-            futexWaitShared(&hdr.writer_ticket_head.raw, head);
+            // Still held by the previous winner. Wait on
+            // `writer_release_epoch`, not `head` and not `writer_holder`
+            // itself (see this function's own doc comment, and
+            // `writer_release_epoch`'s own, for why).
+            const epoch = hdr.writer_release_epoch.load(.acquire);
+            futexWaitShared(&hdr.writer_release_epoch.raw, epoch);
         }
     }
 
     /// Releases a writer hold taken by `acquireWriter`/`tryAcquireWriter`.
-    /// Never touches `head` itself (see `acquireWriter`'s doc comment for
-    /// why) -- only wakes, and only when someone is actually queued
-    /// (`head != tail`), so the fully uncontended release stays a single
-    /// store with no syscall.
+    /// Never touches `head` itself (`acquireWriter`'s own doc comment
+    /// explains why `head` only ever advances in the waiter that wins
+    /// its own turn) -- bumps and wakes `writer_release_epoch` instead,
+    /// the word `acquireWriter`'s phase 2 actually waits on, and only
+    /// when someone is actually queued (`head != tail`), so the fully
+    /// uncontended release stays a single store with no syscall.
     pub fn releaseWriter(self: *Region) void {
         const hdr = self.header();
         hdr.writer_holder.store(0, .release);
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
-            futexWakeShared(&hdr.writer_ticket_head.raw);
+            _ = hdr.writer_release_epoch.fetchAdd(1, .release);
+            futexWakeShared(&hdr.writer_release_epoch.raw);
         }
     }
 
@@ -904,22 +940,20 @@ pub const Region = struct {
     /// growth.
     pub fn claimReaderSlotWait(self: *Region, pid: u32, deadline_ms: i64) ReaderError!u32 {
         const hdr = self.header();
-        var waited_ms: i64 = 0;
+        const deadline = Io.Clock.now(.awake, self.io).addDuration(.fromMilliseconds(deadline_ms));
         while (true) {
             if (self.claimReaderSlot(pid)) |slot| return slot else |_| {}
-            if (waited_ms >= deadline_ms) return ReaderError.ReadersExhausted;
+            if (Io.Clock.now(.awake, self.io).compare(.gte, deadline)) return ReaderError.ReadersExhausted;
             const before = hdr.reader_slot_released.load(.acquire);
             // Re-check after reading `before`, not before: a release that
             // landed between the failed claim above and this load would
             // otherwise be missed by the wait below (the same
             // lost-wakeup shape `acquireWriter`'s own doc comment warns
-            // about), since `futexWaitShared` only blocks while the word
-            // still equals `before`.
+            // about) -- `futexWaitSharedBounded` guards against it by
+            // checking the word against `before` itself before ever
+            // deciding to block.
             if (self.claimReaderSlot(pid)) |slot| return slot else |_| {}
-            const remaining_ms = deadline_ms - waited_ms;
-            const step_ms: i32 = @intCast(@min(remaining_ms, 50));
-            futexWaitSharedTimed(&hdr.reader_slot_released.raw, before, step_ms);
-            waited_ms += step_ms;
+            antfly_platform.sync.futexWaitSharedBounded(self.io, &hdr.reader_slot_released.raw, before, deadline) catch {};
         }
     }
 
@@ -990,76 +1024,21 @@ pub const Region = struct {
     }
 };
 
-/// Shared (cross-process) futex wait/wake. Neither `std.Io`'s own
-/// `futexWait*`/`futexWake` (always the OS's *private*, same-process-only
-/// variant on every backend checked -- `Io.Threaded` passes
-/// `.private = true` on Linux and the non-`_SHARED` op on macOS) nor
-/// `antfly_platform.sync`'s `BroadcastCondition` (built on exactly that
-/// private primitive, for same-process predicate loops) can wake a waiter
-/// in a different process. These wrap the same underlying OS calls with
-/// the shared variant instead, so a release in one process reliably wakes
-/// a waiter parked in another.
+/// Shared (cross-process) futex wait/wake, now hosted in
+/// `antfly_platform.sync` (not inline here) so the rest of the §8.9
+/// sweep -- the fallback path (§8.6), and anything else that eventually
+/// needs a shared futex -- has one place to reuse instead of its own
+/// copy of this platform switch. `futexWaitShared` is this file's own
+/// name for `antfly_platform.sync.rawFutexWaitShared` with no timeout:
+/// the writer/ticket wait never needs one (a correct implementation
+/// hands off in about one commit, not on a deadline) or an `Io` to
+/// consult (the two-process contention test's own doc comment explains
+/// why a forked child can't safely use one here).
 fn futexWaitShared(ptr: *const u32, expect: u32) void {
-    switch (builtin.os.tag) {
-        .linux => {
-            const linux = std.os.linux;
-            const rc = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = false }, expect, null);
-            switch (linux.errno(rc)) {
-                .SUCCESS, .INTR, .AGAIN => {},
-                else => {},
-            }
-        },
-        .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit => {
-            const c = std.c;
-            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT_SHARED, .NO_ERRNO = true };
-            _ = c.__ulock_wait(flags, @ptrCast(@constCast(ptr)), expect, 0);
-        },
-        else => @compileError("shared futex not implemented for this target; see §8.6 fallback"),
-    }
+    antfly_platform.sync.rawFutexWaitShared(ptr, expect, null);
 }
 
-/// `futexWaitShared`, bounded by `timeout_ms` instead of parking forever.
-/// `claimReaderSlotWait` is this file's only caller: the writer/ticket
-/// wait above never needs a timeout (a correct implementation hands off
-/// in about one commit, not on a deadline), but `max_readers`'s own doc
-/// comment makes exhaustion a real, caller-visible outcome a reader must
-/// be able to give up on.
-fn futexWaitSharedTimed(ptr: *const u32, expect: u32, timeout_ms: i32) void {
-    switch (builtin.os.tag) {
-        .linux => {
-            const linux = std.os.linux;
-            const ts: linux.timespec = .{
-                .sec = @intCast(@divTrunc(timeout_ms, 1000)),
-                .nsec = @intCast(@mod(timeout_ms, 1000) * std.time.ns_per_ms),
-            };
-            const rc = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = false }, expect, &ts);
-            _ = linux.errno(rc);
-        },
-        .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit => {
-            const c = std.c;
-            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT_SHARED, .NO_ERRNO = true };
-            const timeout_us: u32 = @intCast(@as(i64, timeout_ms) * 1000);
-            _ = c.__ulock_wait(flags, @ptrCast(@constCast(ptr)), expect, timeout_us);
-        },
-        else => @compileError("shared futex not implemented for this target; see §8.6 fallback"),
-    }
-}
-
-fn futexWakeShared(ptr: *const u32) void {
-    switch (builtin.os.tag) {
-        .linux => {
-            const linux = std.os.linux;
-            const rc = linux.futex_4arg(ptr, .{ .cmd = .WAKE, .private = false }, std.math.maxInt(u32), null);
-            _ = linux.errno(rc);
-        },
-        .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit => {
-            const c = std.c;
-            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT_SHARED, .WAKE_ALL = true, .NO_ERRNO = true };
-            _ = c.__ulock_wake(flags, @ptrCast(@constCast(ptr)), 0);
-        },
-        else => @compileError("shared futex not implemented for this target; see §8.6 fallback"),
-    }
-}
+const futexWakeShared = antfly_platform.sync.futexWakeShared;
 
 /// Reads exactly `buf.len` bytes from `fd`, but never blocks past
 /// `timeout_ms`: every cross-process test in this file waits on something a
