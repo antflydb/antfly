@@ -42,6 +42,7 @@ const (
 )
 
 // Error provides a stable machine code, exit status, and safe human message.
+// Submission failures include the idempotency key needed for a safe retry.
 type Error struct {
 	Code           string
 	HTTPStatus     int
@@ -135,6 +136,19 @@ func Classify(err error) error {
 		return &Error{Code: CodeTimeout, Message: "source-management request timed out", err: err}
 	}
 	return err
+}
+
+func submissionError(err error, key string) *Error {
+	classified := Classify(err)
+	failure := Error{Code: CodeFailed, Message: classified.Error()}
+	var existing *Error
+	if errors.As(classified, &existing) {
+		failure = *existing
+	}
+	failure.Message = failure.Error() + " (idempotency key " + key + "; retry with this key to avoid a duplicate submission)"
+	failure.IdempotencyKey = key
+	failure.err = classified
+	return &failure
 }
 
 // Unsupported describes a capability unavailable in the hosting runtime.

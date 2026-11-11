@@ -122,11 +122,12 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	return
 }
 
+// PutSourceIfAbsent creates a declaration only if its source ID is absent.
 func (c *Client) PutSourceIfAbsent(ctx context.Context, source Source) (Source, error) {
-	return Source{}, errors.New("not implemented")
+	return c.putSource(ctx, source, http.Header{"If-None-Match": {"*"}})
 }
 func (c *Client) PutSource(ctx context.Context, source Source) (Source, error) {
-	return c.putSource(ctx, source, "")
+	return c.putSource(ctx, source, nil)
 }
 
 // PutSourceIfMatch requires a matching declaration revision for a PUT.
@@ -134,17 +135,13 @@ func (c *Client) PutSourceIfMatch(ctx context.Context, source Source, revision s
 	if revision == "" {
 		return Source{}, Failure(400, "invalid_precondition")
 	}
-	return c.putSource(ctx, source, revision)
+	return c.putSource(ctx, source, http.Header{"If-Match": {`"` + revision + `"`}})
 }
 
-func (c *Client) putSource(ctx context.Context, source Source, revision string) (out Source, err error) {
+func (c *Client) putSource(ctx context.Context, source Source, headers http.Header) (out Source, err error) {
 	source.Revision = ""
 	source.KnowledgeStatus = nil
 	source.SearchStatus = nil // GET observations are never submitted as desired state.
-	var headers http.Header
-	if revision != "" {
-		headers = http.Header{"If-Match": {`"` + revision + `"`}}
-	}
 	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out, headers)
 	return
 }

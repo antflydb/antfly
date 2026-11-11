@@ -263,18 +263,32 @@ func hasManifestCode(err error, code string) bool {
 	return errors.As(Classify(err), &failure) && failure.Code == code
 }
 
-// ApplyManifest plans silently, then applies each changed source without deleting.
+// ApplyManifest plans silently, then applies changes with atomic preconditions.
+// Changed sources require revision_preconditions; unchanged plans need no writes.
 func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) ([]ApplyResult, error) {
 	plan, c, err := planManifest(ctx, env.API, m, opts)
 	if err != nil {
 		return nil, err
+	}
+	if !c.RevisionPreconditions {
+		for _, item := range plan.Items {
+			if item.Action == PlanCreate || item.Action == PlanUpdate {
+				return nil, Unsupported(c.Runtime, "revision_preconditions")
+			}
+		}
 	}
 	results := make([]ApplyResult, 0, len(plan.Items))
 	counts := make(map[string]int)
 	for _, item := range plan.Items {
 		result := ApplyResult{Key: item.Key, SourceID: item.SourceID, Action: item.Action, Outcome: "unchanged"}
 		if item.Action != PlanUnchanged {
-			source, err := applyManifestItem(ctx, env.API, item, c.RevisionPreconditions)
+			var source management.Source
+			var err error
+			if item.Action == PlanCreate {
+				source, err = env.API.PutSourceIfAbsent(ctx, item.Desired)
+			} else {
+				source, err = env.API.PutSourceIfMatch(ctx, item.Desired, item.Revision)
+			}
 			switch {
 			case hasManifestCode(err, CodeConflict):
 				result.Outcome, result.Error = "conflict", Classify(err).Error()
@@ -315,27 +329,4 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 		return results, &Error{Code: CodeFailed, Message: fmt.Sprintf("%d of %d sources failed to apply; rerunning apply is safe", failed, len(results))}
 	}
 	return results, Classify(outputErr)
-}
-
-func applyManifestItem(ctx context.Context, api API, item PlanItem, preconditions bool) (management.Source, error) {
-	if item.Action == PlanUpdate && preconditions {
-		return api.PutSourceIfMatch(ctx, item.Desired, item.Revision)
-	}
-	current, err := api.GetSource(ctx, item.SourceID)
-	if item.Action == PlanCreate {
-		if err == nil {
-			return management.Source{}, &Error{Code: CodeConflict, Message: "source appeared since plan"}
-		}
-		if !hasManifestCode(err, CodeNotFound) {
-			return management.Source{}, Classify(err)
-		}
-	} else {
-		if err != nil {
-			return management.Source{}, Classify(err)
-		}
-		if sourceRevision(current) != item.Revision {
-			return management.Source{}, &Error{Code: CodeConflict, Message: "source changed since plan"}
-		}
-	}
-	return api.PutSource(ctx, item.Desired)
 }

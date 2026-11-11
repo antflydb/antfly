@@ -46,7 +46,7 @@ type WaitOptions struct {
 	MaxInterval time.Duration // Zero defaults to 15 seconds.
 }
 
-// StartRun submits once; callers can reuse the receipt's key to retry safely.
+// StartRun submits once; the receipt and any submission error carry the retry key.
 func StartRun(ctx context.Context, env Env, ref string, opts RunOptions) (RunReceipt, error) {
 	if opts.IdempotencyKey != "" && !sourceID(opts.IdempotencyKey) {
 		return RunReceipt{}, &Error{Code: CodeInvalid, Message: "idempotency key must match [A-Za-z0-9_-]{1,128}"}
@@ -67,7 +67,7 @@ func StartRun(ctx context.Context, env Env, ref string, opts RunOptions) (RunRec
 	run, err := env.API.StartRun(ctx, source.Id, key, management.RunInput{Restart: opts.Restart})
 	receipt := RunReceipt{Run: run, IdempotencyKey: key}
 	if err != nil {
-		return receipt, Classify(err)
+		return receipt, submissionError(err, key)
 	}
 	if env.JSON {
 		return receipt, Classify(env.writeJSON(receipt))

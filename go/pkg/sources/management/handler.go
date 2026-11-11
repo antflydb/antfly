@@ -126,6 +126,38 @@ func sourcePrecondition(values []string) (string, error) {
 	return revision, nil
 }
 
+// putSourceConditionally applies at most one of If-Match (revision) or
+// If-None-Match: * (create-only). Malformed preconditions are rejected before
+// the backend's precondition support is checked.
+func putSourceConditionally(ctx context.Context, b Backend, source Source, h http.Header) (Source, error) {
+	ifMatch, ifNoneMatch := h.Values("If-Match"), h.Values("If-None-Match")
+	switch {
+	case ifMatch != nil && ifNoneMatch != nil:
+		return Source{}, Failure(400, "invalid_precondition")
+	case ifMatch == nil && ifNoneMatch == nil:
+		return b.PutSource(ctx, source)
+	}
+	var revision string
+	if ifNoneMatch != nil {
+		if len(ifNoneMatch) != 1 || strings.TrimSpace(ifNoneMatch[0]) != "*" {
+			return Source{}, Failure(400, "invalid_precondition")
+		}
+	} else {
+		var err error
+		if revision, err = sourcePrecondition(ifMatch); err != nil {
+			return Source{}, err
+		}
+	}
+	backend, ok := b.(PreconditionBackend)
+	if !ok {
+		return Source{}, Failure(501, "revision_preconditions_unsupported")
+	}
+	if ifNoneMatch != nil {
+		return backend.PutSourceIfAbsent(ctx, source)
+	}
+	return backend.PutSourceIfMatch(ctx, source, revision)
+}
+
 // Handler expects a base-relative path. The caller mounts and authenticates it.
 // Route validation and JSON/error semantics are shared by both hosting runtimes.
 func Handler(b Backend) http.Handler {
@@ -171,22 +203,7 @@ func Handler(b Backend) http.Handler {
 						break
 					}
 					source.Revision = ""
-					values := r.Header.Values("If-Match")
-					if values == nil {
-						result, err = b.PutSource(r.Context(), source)
-						break
-					}
-					revision, e := sourcePrecondition(values)
-					if e != nil {
-						err = e
-						break
-					}
-					backend, ok := b.(PreconditionBackend)
-					if !ok {
-						err = Failure(501, "revision_preconditions_unsupported")
-						break
-					}
-					result, err = backend.PutSourceIfMatch(r.Context(), source, revision)
+					result, err = putSourceConditionally(r.Context(), b, source, r.Header)
 				case http.MethodDelete:
 					purge := r.URL.Query().Get("purge")
 					if purge != "" && purge != "true" && purge != "false" {

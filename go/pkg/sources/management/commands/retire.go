@@ -17,7 +17,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/antflydb/antfly/go/pkg/sources/management"
@@ -55,7 +54,7 @@ type PurgeReceipt struct {
 }
 
 // Purge records a purge intent and submits deletion of source-owned records.
-// If submission fails, the recorded intent remains available for retry.
+// If submission fails, the intent remains recorded and the error carries the retry key.
 func Purge(ctx context.Context, env Env, ref string, opts PurgeOptions) (PurgeReceipt, error) {
 	if !opts.Confirm {
 		return PurgeReceipt{}, &Error{Code: CodeInvalid, Message: "purge permanently deletes this source's indexed records; confirm explicitly to continue"}
@@ -83,15 +82,9 @@ func Purge(ctx context.Context, env Env, ref string, opts PurgeOptions) (PurgeRe
 	}
 	receipt.Run, err = env.API.StartRun(ctx, source.Id, key, management.RunInput{Operation: management.RunInputOperationPurge})
 	if err != nil {
-		err = Classify(err)
-		failure := Error{Code: CodeFailed}
-		var classified *Error
-		if errors.As(err, &classified) {
-			failure = *classified
-		}
-		failure.Message = fmt.Sprintf("purge intent is recorded for %s; purge can be retried with the same command: %v", source.Id, err)
-		failure.err = err
-		return receipt, &failure
+		failure := submissionError(err, key)
+		failure.Message = fmt.Sprintf("purge intent is recorded for %s; purge can be retried with the same command: %s", source.Id, failure.Message)
+		return receipt, failure
 	}
 	if env.JSON {
 		return receipt, Classify(env.writeJSON(receipt))
