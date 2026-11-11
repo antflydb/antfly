@@ -421,6 +421,15 @@ pub const PreparedSearch = struct {
     /// Consumes candidate storage. Only request-owned bytes and the source
     /// callbacks are used after graph preparation.
     pub fn score(self: *PreparedSearch, alloc: Allocator, source: EmbeddingSource, query: []const f32, input_opts: SearchOptions) !SearchResponse {
+        // Match Index.search's argument contract before allocation or callbacks.
+        // Invalid dimensions leave the plan available for a corrected call.
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (input_opts.k == 0 or self.candidates.len == 0) {
+            var stats = self.stats;
+            stats.matches.complete = input_opts.k != 0;
+            self.deinit(alloc);
+            return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        }
         var opts = input_opts;
         if (opts.ef == 0) opts.ef = if (self.has_bounds) 512 else 64;
         const q = try alloc.dupe(f32, query);
@@ -5146,4 +5155,33 @@ test "leann: exact buffer scoring is independent of the graph shortlist" {
     try std.testing.expectEqual(@as(u32, 129), result.results[1].id);
     try std.testing.expectEqual(@as(usize, 130), source.scored);
     try std.testing.expect(source.largest_batch <= 7);
+}
+
+test "leann: prepared scoring validates dimensions and consumes zero-k and empty plans without source work" {
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        fn recompute(_: *anyopaque, _: []const u32, _: []f32) !void {
+            return error.UnexpectedSourceWork;
+        }
+    };
+    var context: u8 = 0;
+    const source = EmbeddingSource{ .ctx = &context, .recompute_fn = Source.recompute };
+    var plan = PreparedSearch{ .candidates = try alloc.alloc(PreparedCandidate, 2), .metric = .l2_squared, .dims = 2, .has_bounds = true };
+    defer plan.deinit(alloc);
+    plan.candidates[0] = .{ .id = 0, .lower = 0, .est = 0 };
+    plan.candidates[1] = .{ .id = 1, .lower = 0, .est = 0, .exact = true };
+    for ([_][]const f32{ &.{}, &.{0}, &.{ 0, 0, 0 } }) |query| {
+        try testing.expectError(error.DimensionMismatch, plan.score(std.testing.failing_allocator, source, query, .{ .k = 1 }));
+        try testing.expectError(error.DimensionMismatch, plan.score(std.testing.failing_allocator, source, query, .{ .k = 0 }));
+        try testing.expectEqual(@as(usize, 2), plan.candidates.len);
+    }
+    var zero = try plan.score(alloc, source, &.{ 0, 0 }, .{ .k = 0 });
+    defer zero.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), zero.results.len);
+    try testing.expectEqual(@as(usize, 0), plan.candidates.len);
+    try testing.expectEqual(@as(u32, 0), zero.stats.recomputed);
+    var empty = try plan.score(std.testing.failing_allocator, source, &.{ 0, 0 }, .{ .k = 3 });
+    defer empty.deinit(std.testing.failing_allocator);
+    try testing.expectEqual(@as(usize, 0), empty.results.len);
+    try testing.expect(empty.stats.matches.complete);
 }

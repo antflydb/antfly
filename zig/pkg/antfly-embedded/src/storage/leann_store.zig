@@ -731,9 +731,15 @@ pub const LeannStore = struct {
                     captured.results.addResultWithOwnedMetadata(row.vector_id, result.distance, 0, if (req.load_metadata) try result_alloc.dupe(u8, row.metadata) else null);
                 }
                 captured.results.candidate_coverage = profile.matches.candidateCoverage(captured.results.getHits().len);
+            } else {
+                // No graph or dirty buffer remains: capture scored every
+                // eligible exact-buffer row, including distance predicates.
+                const profile = leann.SearchStats{ .matches = .{ .verified = captured.pending_matches, .complete = req.k != 0 } };
+                if (search_stats) |output| output.* = profile;
+                captured.results.candidate_coverage = profile.matches.candidateCoverage(captured.results.getHits().len);
             }
-            if (search_types.requiresExhaustiveCoverage(req) or captured.results.items.items.len >= req.k or
-                want >= captured.live or !filter.distanceActive() or captured.truncated)
+            if (search_types.requiresExhaustiveCoverage(req) or captured.results.candidate_coverage == .exhausted or
+                captured.results.items.items.len >= req.k or want >= captured.live or !filter.distanceActive() or captured.truncated)
             {
                 var results = captured.results;
                 captured.results = search_results.SearchResults.init(result_alloc, 0);
@@ -914,7 +920,7 @@ pub const LeannStore = struct {
             captured.rows.appendAssumeCapacity(row.*);
         }
         buffered.clearRetainingCapacity();
-        captured.direct = captured.direct or captured.plan.?.candidates.len == captured.live;
+        captured.direct = captured.direct or index == null or captured.plan.?.candidates.len == captured.live;
         std.mem.sortUnstable(CapturedRow, captured.rows.items, {}, CapturedRow.less);
         // All pointers into the graph and stack predicates end at preparation.
         captured.options.filter = null;

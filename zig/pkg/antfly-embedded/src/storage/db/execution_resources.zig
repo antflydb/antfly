@@ -181,6 +181,30 @@ pub const QueryRecoveryFactory = struct {
     ptr: *anyopaque,
     create: *const fn (*anyopaque, @import("antfly_inference_execution_context").RequestContext) anyerror!enrichment_runtime_mod.Config,
     release: *const fn (*anyopaque) void,
+
+    /// A failed cold setup must not turn an operational outage into a
+    /// permanently unusable read handle. Keep background repair's shared
+    /// provider policy, with construction/transport errors specific to setup.
+    pub fn isRetryableFailure(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory,
+            error.ConcurrencyUnavailable,
+            error.Canceled,
+            error.Cancelled,
+            error.EmbeddingProbeUnavailable,
+            error.RemoteCapabilityDiscoveryTransient,
+            error.ConnectionRefused,
+            error.NetworkUnreachable,
+            error.HostLacksNetworkAddresses,
+            error.TemporaryNameServerFailure,
+            error.NameServerFailure,
+            error.UnexpectedReadFailure,
+            error.SendFailed,
+            error.RecvFailed,
+            => true,
+            else => types.repair_failure.isTransient(err),
+        };
+    }
 };
 
 pub const AsyncContext = struct {

@@ -54709,3 +54709,101 @@ test "leann pinned source loader batches sorted artifact keys and restores candi
     try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &found);
     try std.testing.expectEqualSlices(f32, &.{ 1, 11, 2, 12, 3, 13 }, &out);
 }
+
+test "leann exact buffer publishes coverage for local replicated and mixed dirty rows" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    for ([_]bool{ false, true }) |replicated| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(dir);
+        const Primary = struct {
+            vectors: [96][2]f32 = undefined,
+            reads: usize = 0,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.reads += 1;
+                return a.dupe(f32, &self.vectors[@intCast(id)]);
+            }
+        };
+        var primary = Primary{};
+        var store = try leann_store_mod.LeannStore.open(alloc, std.testing.io, dir, .{ .dims = 2, .metric = .l2_squared, .transient = true, .replicated = replicated });
+        defer store.deinit();
+        store.setLoader(.{ .ctx = &primary, .load = Primary.load });
+        var stats: @import("antfly_vectorindex").leann.SearchStats = .{};
+        {
+            var empty = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10 }, &stats);
+            defer empty.deinit();
+            try std.testing.expectEqual(.exhausted, empty.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 0), stats.matches.verified);
+        }
+        const Item = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+        var keys: [96][8]u8 = undefined;
+        var items: [96]Item = undefined;
+        for (&items, &primary.vectors, 0..) |*item, *vector, id| {
+            vector.* = .{ @floatFromInt(id), 0 };
+            item.* = .{ .vector_id = id, .vector = vector, .metadata = try std.fmt.bufPrint(&keys[id], "key{d:0>3}", .{id}) };
+        }
+        try store.apply(&items, &.{});
+        if (replicated) {
+            var raft: u64 = 1;
+            while (try store.planRecord(alloc)) |value| {
+                var planned = value;
+                defer planned.deinit(alloc);
+                _ = try store.applyRecord(planned.record, raft, null);
+                raft += 1;
+            }
+            try std.testing.expect(store.replicated.?.replica.index == null);
+        } else try std.testing.expect(store.index == null);
+        primary.reads = 0;
+        {
+            var selective = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10, .distance_under = 2 }, &stats);
+            defer selective.deinit();
+            try std.testing.expectEqual(@as(usize, 2), selective.items.items.len);
+            try std.testing.expectEqual(.exhausted, selective.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 2), stats.matches.verified);
+        }
+        {
+            var top = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 3 }, &stats);
+            defer top.deinit();
+            try std.testing.expectEqual(.more, top.candidate_coverage);
+            try std.testing.expectEqual(@as(usize, 96), stats.matches.verified);
+        }
+        {
+            var full = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 128, .search_effort = 1 }, &stats);
+            defer full.deinit();
+            try std.testing.expectEqual(.exhausted, full.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 96), full.items.items.len);
+        }
+        {
+            var rejected = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10, .filter_prefix = "absent" }, &stats);
+            defer rejected.deinit();
+            try std.testing.expectEqual(.exhausted, rejected.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 0), stats.matches.verified);
+        }
+        {
+            var zero = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 0 }, &stats);
+            defer zero.deinit();
+            try std.testing.expectEqual(.unknown, zero.candidate_coverage);
+            try std.testing.expect(!stats.matches.complete);
+        }
+        try std.testing.expectEqual(@as(usize, 0), primary.reads);
+        if (replicated) {
+            primary.vectors[95] = .{ 0.5, 0 };
+            try store.replicated.?.noteWrites(items[95..], &.{});
+            var mixed = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10, .distance_under = 2 }, &stats);
+            defer mixed.deinit();
+            try std.testing.expectEqual(@as(usize, 3), mixed.items.items.len);
+            try std.testing.expectEqual(.exhausted, mixed.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 3), stats.matches.verified);
+            try std.testing.expectEqual(@as(usize, 1), primary.reads);
+        }
+    }
+}

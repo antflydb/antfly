@@ -735,6 +735,8 @@ keep their short query fence. Candidate metadata and scoring scratch count again
 set budget. Full-effort plans retain the live candidate list and score vectors
 in bounded batches. Exact-buffer rows are scored independently of the graph
 shortlist, including dirty replicated rows before the first graph build.
+Buffer-only searches publish their exact match count and exhaustion proof,
+including when clean and dirty replicated rows are scored together.
 Pinned source reads open short-lived read scopes: sorted artifact batches use
 the backend bulk lookup, and source values and external payloads belong to
 the scoring batch allocator. The pinned transaction retains the generation,
@@ -747,6 +749,8 @@ Provider service lifetimes use reference counting; legacy custom callbacks can b
 still matches under the live catalog apply fence. Custom providers that support changing catalogs can implement
 `clone_for_indexes_fn`. Lazy setup observes the initiating request's deadline
 and cancellation before returning, including during uncached-handle cleanup.
+Operational setup failures retain the lazy recipe behind a short retry backoff;
+only permanent configuration failures retire it.
 
 Int8 media quantization is irreversible. A full-vector consumer added after
 quantization reports `ArtifactRepairRequired` rather than treating a dequantized

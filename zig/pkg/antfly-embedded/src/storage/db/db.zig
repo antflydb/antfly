@@ -27685,14 +27685,11 @@ pub const DB = struct {
             context.query_recovery_condition.broadcast(io);
         }
         var config = created catch |err| {
-            switch (err) {
-                error.OutOfMemory, error.ConcurrencyUnavailable, error.Timeout, error.Canceled, error.Cancelled => {
-                    context.query_recovery_retry_at = monotonicTimeNs() +| query_recovery_retry_ns;
-                },
-                else => {
-                    factory.release(factory.ptr);
-                    context.query_recovery_factory = null;
-                },
+            if (QueryRecoveryFactory.isRetryableFailure(err)) {
+                context.query_recovery_retry_at = monotonicTimeNs() +| query_recovery_retry_ns;
+            } else {
+                factory.release(factory.ptr);
+                context.query_recovery_factory = null;
             }
             try control.check();
             if (err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
@@ -152631,4 +152628,79 @@ test "retained legacy provider catalog validation fences concurrent index deleti
     if (reader.err) |err| return err;
     if (deleter.err) |err| return err;
     try std.testing.expect(deleter.removed);
+}
+
+test "leann lazy recovery retries operational setup failures and releases permanent failures once" {
+    var fixture = @import("../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    var directory = try TestDirectory.init("leann-setup-retry");
+    defer directory.cleanup();
+    const path = directory.path();
+    defer cleanupTempDir(path.ptr);
+    {
+        var writer = try DB.open(alloc, path, .{ .ttl_cleanup = .{ .enabled = false } });
+        writer.close();
+    }
+    var db = try DB.open(alloc, path, .{ .open_mode = .query_readonly, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const Factory = struct {
+        failures: []const anyerror,
+        provider: embedder_mod.DeterministicDenseEmbedder = .{},
+        attempts: usize = 0,
+        releases: usize = 0,
+        fn create(raw: *anyopaque, _: @import("antfly_inference_execution_context").RequestContext) !enrichment_runtime_mod.Config {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const attempt = self.attempts;
+            self.attempts += 1;
+            if (attempt < self.failures.len) return self.failures[attempt];
+            return .{ .dense_embedder = self.provider.interface() };
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+        fn port(self: *@This()) DB.QueryRecoveryFactory {
+            return .{ .ptr = self, .create = create, .release = release };
+        }
+    };
+    const operational = [_]anyerror{
+        error.OutOfMemory,                        error.ConcurrencyUnavailable, error.EmbeddingProbeUnavailable,
+        error.RemoteCapabilityDiscoveryTransient, error.ConnectionRefused,      error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,                 error.NetworkUnreachable,     error.HostLacksNetworkAddresses,
+        error.TemporaryNameServerFailure,         error.NameServerFailure,      error.UnexpectedReadFailure,
+        error.SendFailed,                         error.RecvFailed,             error.QueueFull,
+        error.EmbedAdmissionRefused,              error.EmbedTransientFailure,  error.ProviderRateLimited,
+    };
+    var retryable = Factory{ .failures = &operational };
+    try db.attachLazyQueryRecovery(retryable.port());
+    for (operational, 0..) |_, index| {
+        db.async_context.query_recovery_retry_at = 0;
+        try std.testing.expectError(error.ReembedSetupRetry, DB.queryRecoveryRuntime(db.async_context, null));
+        try std.testing.expectEqual(index + 1, retryable.attempts);
+        try std.testing.expectEqual(@as(usize, 0), retryable.releases);
+        try std.testing.expect(db.async_context.query_recovery_factory != null);
+        // Pin the clock-independent backoff assertion even on a slow test host.
+        try std.testing.expect(db.async_context.query_recovery_retry_at != 0);
+        db.async_context.query_recovery_retry_at = std.math.maxInt(u64);
+        // Backoff suppresses repeated construction without destroying its recipe.
+        try std.testing.expectError(error.ReembedSetupRetry, DB.queryRecoveryRuntime(db.async_context, null));
+        try std.testing.expectEqual(index + 1, retryable.attempts);
+    }
+    db.async_context.query_recovery_retry_at = 0;
+    const recovered = try DB.queryRecoveryRuntime(db.async_context, null);
+    try std.testing.expect(recovered.config.dense_embedder != null);
+    try std.testing.expectEqual(@as(usize, operational.len + 1), retryable.attempts);
+    try std.testing.expectEqual(@as(usize, 1), retryable.releases);
+    try std.testing.expectEqual(recovered, try DB.queryRecoveryRuntime(db.async_context, null));
+    for ([_]anyerror{ error.InvalidManagedEmbeddingIndex, error.RemoteCapabilityDiscoveryRejected, error.InvalidEmbeddingArtifactProducer }) |permanent| {
+        var rejected = Factory{ .failures = &.{permanent} };
+        try db.attachLazyQueryRecovery(rejected.port());
+        try std.testing.expectError(error.ReembedUnavailable, DB.queryRecoveryRuntime(db.async_context, null));
+        try std.testing.expectEqual(@as(usize, 1), rejected.releases);
+        try std.testing.expect(db.async_context.query_recovery_factory == null);
+        try std.testing.expectError(error.ReembedUnavailable, DB.queryRecoveryRuntime(db.async_context, null));
+        try std.testing.expectEqual(@as(usize, 1), rejected.attempts);
+        try std.testing.expectEqual(@as(usize, 1), rejected.releases);
+    }
 }
