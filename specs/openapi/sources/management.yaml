@@ -113,7 +113,23 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "full",
+                "declaration"
+              ],
+              "default": "full"
+            },
+            "description": "declaration requests configuration, revision and reconciliation state without native readiness observations. Older runtimes may return full observations."
+          }
+        ]
       },
       "put": {
         "operationId": "putSource",
@@ -148,7 +164,33 @@
               }
             }
           }
-        }
+        },
+        "description": "Replaces the source declaration. Runtimes that advertise revision_preconditions honor two standard HTTP preconditions, evaluated atomically with the write: If-Match (update only when the current declaration revision matches; never creates) and If-None-Match: * (create only when no source with this ID exists). A failed precondition returns 412.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "description": "Quoted declaration revision from a prior GET (strong tag only).",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "description": "Use * to create the source only if it does not already exist.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "*"
+              ]
+            }
+          }
+        ]
       },
       "delete": {
         "operationId": "removeSource",
@@ -588,6 +630,10 @@
           "knowledge_audience": {
             "type": "string",
             "description": "Runtime deployment boundary, absent when knowledge is disabled."
+          },
+          "revision_preconditions": {
+            "type": "boolean",
+            "description": "PUT /sources/{source_id} honors If-Match declaration revisions and If-None-Match: * create-only writes."
           }
         }
       },
@@ -700,6 +746,17 @@
           },
           "knowledge_status": {
             "$ref": "#/components/schemas/KnowledgeStatus",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": false
+          },
+          "revision": {
+            "type": "string",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Opaque declaration revision returned by GET and PUT. Covers declared fields only; run state and search status do not change it. Ignored when submitted."
+          },
+          "reconciliation_status": {
+            "$ref": "#/components/schemas/ReconciliationStatus",
             "readOnly": true,
             "x-go-type-skip-optional-pointer": false
           }
@@ -1627,6 +1684,23 @@
           "graph",
           "start"
         ]
+      },
+      "ReconciliationStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "failed",
+              "ready"
+            ]
+          }
+        }
       }
     }
   }

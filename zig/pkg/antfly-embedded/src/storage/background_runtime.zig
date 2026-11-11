@@ -992,6 +992,8 @@ const OwnerRegistry = struct {
 };
 
 pub const BackendRuntime = struct {
+    /// Owned handles share executor lifetime with retained query generations.
+    handle_references: std.atomic.Value(usize) = .init(1),
     /// Borrowed until every physical owner and retained reader has closed.
     query_cut_repository: ?@import("db/native_query_cut_repository.zig").Port = null,
     alloc: Allocator,
@@ -1913,7 +1915,16 @@ pub const BackendRuntimeHandle = struct {
         }
     }
 
+    pub fn retain(self: BackendRuntimeHandle) BackendRuntimeHandle {
+        _ = self.runtime.handle_references.fetchAdd(1, .monotonic);
+        return self;
+    }
+
     pub fn deinit(self: *BackendRuntimeHandle) void {
+        if (self.runtime.handle_references.fetchSub(1, .acq_rel) != 1) {
+            self.* = undefined;
+            return;
+        }
         self.runtime.deinit();
         self.alloc.destroy(self.runtime);
         if (self.owned_filesystem_io) |io_impl| deinitIoLane(self.alloc, io_impl);
@@ -1928,6 +1939,17 @@ pub const BackendRuntimeHandle = struct {
         return self.runtime;
     }
 };
+
+test "retained runtime handle keeps its owned filesystem executor alive" {
+    if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var original = try BackendRuntimeHandle.initManualWithOwnedFilesystemIo(alloc);
+    var retained = original.retain();
+    defer retained.deinit();
+    original.deinit();
+    const io = retained.ptr().filesystemIo() orelse return error.TestUnexpectedResult;
+    try std.Io.Dir.cwd().access(io, ".", .{});
+}
 
 const InlineDurableJobLane = struct {
     fn lane(owners: *OwnerRegistry) DurableJobLane {

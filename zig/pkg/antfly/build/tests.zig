@@ -2864,12 +2864,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
-    const leann_replication_runtime_tests = b.addTest(.{
-        .root_module = data_implementation_module,
-        .filters = &.{"leann replication round"},
+    const leann_regression_tests = b.addTest(.{
+        .name = "leann-regression-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "leann", "reembed", "chunked dense", "synchronous chunk", "synchronously builds chunk", "generated memo reuses only", "public table query handler preserves retryable", "preserves public query availability" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("leann-replication-runtime-test", "Run LEANN leader replication routing and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, leann_replication_runtime_tests).step);
+    b.step("leann-regression-test", "Run LEANN storage, provenance, split and recovery regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, leann_regression_tests).step);
+
+    const leann_replication_runtime_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{ "leann replication round", "leann dense artifact format admission", "raft proposal preserves isolated catalog admission", "raft proposal preserves guarded graph cleanup", "raft cleanup protocol preflight", "graph endpoint cleanup routing worker requires" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const leann_replication_consumer_tests = @import("linked_tests.zig").add(b, .{
+        .name = "leann-replication-consumer-tests",
+        .root_module = data_consumer_module,
+        .filters = leann_replication_runtime_tests.filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("leann-replication-runtime-test", "Run LEANN leader replication routing and protocol regressions")
+        .dependOn(&@import("linked_tests.zig").runPair(b, leann_replication_consumer_tests, leann_replication_runtime_tests).step);
 
     const data_runtime_vopr_tests = b.addTest(.{
         .root_module = data_implementation_module,

@@ -44,7 +44,16 @@ pub const Flags = packed struct(u8) {
     /// dimension count and a digest of the dropped vector; readers that need
     /// the vector get `error.VectorElided` and must re-embed the source.
     vector_elided: bool = false,
-    _reserved: u3 = 0,
+    /// Dense embedding the producer computed from text alone (a field, a
+    /// text-only template, or a plain text chunk), so re-embedding the source
+    /// reproduces it. LEANN `vector_storage: auto` drops only these. Unset on
+    /// media-derived, authored, imported and older vectors, which stay stored.
+    /// Requires the all-replica dense-artifact protocol barrier.
+    text_input: bool = false,
+    /// Elided stub that keeps an int8 copy of the vector (LEANN
+    /// `media_vectors: int8`), read back instead of re-embedding.
+    int8_payload: bool = false,
+    _reserved: u1 = 0,
 };
 
 pub const Header = struct {
@@ -94,16 +103,22 @@ test "embedding reprocess generations preserve legacy hashes and isolate complet
 }
 
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, false, vector);
+}
+
+/// A produced embedding, marked `text_input` when the producer embedded text
+/// alone (see `Flags.text_input`).
+pub fn encodeProducedDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, text_input: bool, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, text_input, vector);
 }
 
 /// Only explicit user-vector ingress may set this origin. In particular, an
 /// absent source hash in old or imported output does not establish authorship.
 pub fn encodeAuthoredDenseEmbeddingAlloc(alloc: Allocator, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, false, vector);
 }
 
-fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, vector: []const f32) ![]u8 {
+fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, text_input: bool, vector: []const f32) ![]u8 {
     const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32);
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -112,7 +127,7 @@ fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, auth
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .dense_embedding,
-        .flags = .{ .has_source_hash = source_hash != null, .authored = authored },
+        .flags = .{ .has_source_hash = source_hash != null, .authored = authored, .text_input = text_input },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
@@ -155,8 +170,140 @@ pub fn encodeElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, dims: u
 /// keeping the stub's header (source hash and origin).
 pub fn encodeRestoredDenseEmbeddingAlloc(alloc: Allocator, stub_header: Header, vector: []const f32) ![]u8 {
     if (stub_header.kind != .dense_embedding) return error.InvalidArtifactKind;
-    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, if (stub_header.flags.has_source_hash) stub_header.source_hash else null, stub_header.flags.authored, vector);
+    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, if (stub_header.flags.has_source_hash) stub_header.source_hash else null, stub_header.flags.authored, stub_header.flags.text_input, vector);
     return out;
+}
+
+test "int8 elided stub keeps a close copy and still reads as a stub" {
+    const alloc = std.testing.allocator;
+    const vector = [_]f32{ 0.5, -1.25, 3.0, 0.0, -2.0 };
+    const full = try encodeDenseEmbeddingAlloc(alloc, 7, &vector);
+    defer alloc.free(full);
+    const stub = try encodeInt8ElidedDenseEmbeddingAlloc(alloc, try decodeHeader(full), &vector, 99);
+    defer alloc.free(stub);
+    try std.testing.expect(stub.len < full.len);
+    const elided = (try elidedDenseEmbedding(stub)).?;
+    try std.testing.expectEqual(@as(u32, 5), elided.dims);
+    try std.testing.expectEqual(@as(u64, 99), elided.vector_digest);
+    try std.testing.expectError(error.VectorElided, decodeDenseEmbeddingAlloc(alloc, stub));
+    const copy = (try int8ElidedDenseEmbeddingAlloc(alloc, stub)).?;
+    defer alloc.free(copy);
+    for (vector, copy) |x, y| try std.testing.expect(@abs(x - y) <= 3.0 / 127.0);
+    // A plain stub has no copy.
+    const plain = try encodeElidedDenseEmbeddingAlloc(alloc, try decodeHeader(full), 5, 99);
+    defer alloc.free(plain);
+    try std.testing.expect((try int8ElidedDenseEmbeddingAlloc(alloc, plain)) == null);
+    // Restoring drops the stub flags.
+    const restored = try encodeRestoredDenseEmbeddingAlloc(alloc, try decodeHeader(stub), &vector);
+    defer alloc.free(restored);
+    const restored_header = try decodeHeader(restored);
+    try std.testing.expect(!restored_header.flags.vector_elided and !restored_header.flags.int8_payload);
+}
+
+test "int8 stub handles subnormal components and full decode rejects stubs before allocation" {
+    const alloc = std.testing.allocator;
+    const tiny: f32 = @bitCast(@as(u32, 1));
+    const vector = [_]f32{ tiny, 0, -tiny };
+    const full = try encodeDenseEmbeddingAlloc(alloc, 7, &vector);
+    defer alloc.free(full);
+    const stub = try encodeInt8ElidedDenseEmbeddingAlloc(alloc, try decodeHeader(full), &vector, 99);
+    defer alloc.free(stub);
+    try std.testing.expectError(error.VectorElided, decodeDenseEmbeddingAlloc(std.testing.failing_allocator, stub));
+    const decoded = (try int8ElidedDenseEmbeddingAlloc(alloc, stub)).?;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(f32, &vector, decoded);
+    @memset(stub[header_len + elided_payload_len ..][0..4], 0);
+    try std.testing.expectError(error.InvalidArtifactPayload, int8ElidedDenseEmbeddingAlloc(alloc, stub));
+}
+
+test "dense embedding text input flag survives stubbing and restore" {
+    const alloc = std.testing.allocator;
+    const vector = [_]f32{ 1, 2, 3 };
+    const produced = try encodeProducedDenseEmbeddingAlloc(alloc, 7, true, &vector);
+    defer alloc.free(produced);
+    const header = try decodeHeader(produced);
+    try std.testing.expect(header.flags.text_input);
+    const stub = try encodeElidedDenseEmbeddingAlloc(alloc, header, 3, 99);
+    defer alloc.free(stub);
+    try std.testing.expect((try decodeHeader(stub)).flags.text_input);
+    const restored = try encodeRestoredDenseEmbeddingAlloc(alloc, try decodeHeader(stub), &vector);
+    defer alloc.free(restored);
+    const restored_header = try decodeHeader(restored);
+    try std.testing.expect(restored_header.flags.text_input and !restored_header.flags.vector_elided);
+    // Media-derived and plain encodes leave it unset.
+    const plain = try encodeDenseEmbeddingAlloc(alloc, 7, &vector);
+    defer alloc.free(plain);
+    try std.testing.expect(!(try decodeHeader(plain)).flags.text_input);
+}
+
+/// Like `encodeElidedDenseEmbeddingAlloc`, but keeps a symmetric int8 copy
+/// of `vector` (one scale, one byte per dimension: about a quarter of the
+/// float32 size), which readers dequantize instead of re-embedding.
+pub fn encodeInt8ElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, vector: []const f32, vector_digest: u64) ![]u8 {
+    if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
+    const payload_len = elided_payload_len + @sizeOf(f32) + vector.len;
+    const out = try alloc.alloc(u8, header_len + payload_len);
+    errdefer alloc.free(out);
+    var flags = header.flags;
+    flags.vector_elided = true;
+    flags.int8_payload = true;
+    writeHeader(out[0..header_len], .{
+        .version = codec_version,
+        .kind = .dense_embedding,
+        .flags = flags,
+        .source_hash = header.source_hash,
+        .payload_len = @intCast(payload_len),
+    });
+    var max_abs: f32 = 0;
+    for (vector) |x| {
+        if (!std.math.isFinite(x)) return error.InvalidArtifactPayload;
+        max_abs = @max(max_abs, @abs(x));
+    }
+    // A subnormal maximum can round down to zero when divided by 127.
+    var scale: f32 = if (max_abs > 0) @max(max_abs / 127.0, std.math.floatTrueMin(f32)) else 1.0;
+    // At the other end, rounding the scale up can overflow dequantization.
+    if (!std.math.isFinite(scale * 127.0)) scale = std.math.nextAfter(f32, scale, 0);
+    var pos: usize = header_len;
+    std.mem.writeInt(u32, out[pos..][0..4], @intCast(vector.len), .little);
+    pos += 4;
+    std.mem.writeInt(u64, out[pos..][0..8], vector_digest, .little);
+    pos += 8;
+    std.mem.writeInt(u32, out[pos..][0..4], @bitCast(scale), .little);
+    pos += 4;
+    for (vector, out[pos..][0..vector.len]) |x, *b| {
+        const q: i8 = @intFromFloat(std.math.clamp(@round(x / scale), -127, 127));
+        b.* = @bitCast(q);
+    }
+    return out;
+}
+
+/// The dequantized int8 copy an elided stub keeps, or null for a plain stub
+/// or a stored vector.
+pub fn int8ElidedDenseEmbeddingAlloc(alloc: Allocator, data: []const u8) !?[]f32 {
+    const header = try decodeHeader(data);
+    if (header.kind != .dense_embedding or !header.flags.vector_elided or !header.flags.int8_payload) return null;
+    const payload = try int8StubPayload(data[header_len..]);
+    const out = try alloc.alloc(f32, payload.codes.len);
+    for (out, payload.codes) |*o, b| o.* = @as(f32, @floatFromInt(@as(i8, @bitCast(b)))) * payload.scale;
+    return out;
+}
+
+fn int8StubPayload(payload: []const u8) !struct { codes: []const u8, scale: f32 } {
+    const prefix = elided_payload_len + @sizeOf(f32);
+    if (payload.len < prefix) return error.InvalidArtifactPayload;
+    const dims: usize = std.mem.readInt(u32, payload[0..4], .little);
+    const codes = payload[prefix..];
+    if (codes.len != dims) return error.InvalidArtifactPayload;
+    const scale: f32 = @bitCast(std.mem.readInt(u32, payload[elided_payload_len..][0..4], .little));
+    if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidArtifactPayload;
+    // Most scales prove every code finite without scanning the payload.
+    if (!std.math.isFinite(scale * 128.0)) {
+        for (codes) |code| {
+            const value = @as(f32, @floatFromInt(@as(i8, @bitCast(code)))) * scale;
+            if (!std.math.isFinite(value)) return error.InvalidArtifactPayload;
+        }
+    }
+    return .{ .codes = codes, .scale = scale };
 }
 
 pub const ElidedDenseEmbedding = struct { dims: u32, vector_digest: u64 };
@@ -167,7 +314,9 @@ pub fn elidedDenseEmbedding(data: []const u8) !?ElidedDenseEmbedding {
     const header = try decodeHeader(data);
     if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
     if (!header.flags.vector_elided) return null;
-    if (header.payload_len != elided_payload_len) return error.InvalidArtifactPayload;
+    if (header.flags.int8_payload) {
+        _ = try int8StubPayload(data[header_len..]);
+    } else if (header.payload_len != elided_payload_len) return error.InvalidArtifactPayload;
     const payload = data[header_len..][0..elided_payload_len];
     return .{
         .dims = std.mem.readInt(u32, payload[0..4], .little),
@@ -176,7 +325,8 @@ pub fn elidedDenseEmbedding(data: []const u8) !?ElidedDenseEmbedding {
 }
 
 pub fn decodeDenseEmbeddingAlloc(alloc: Allocator, data: []const u8) ![]f32 {
-    const dims = try decodeDenseEmbeddingDims(data);
+    const payload = try denseEmbeddingPayload(data);
+    const dims = std.mem.readInt(u32, payload[0..4], .little);
     const vector = try alloc.alloc(f32, dims);
     errdefer alloc.free(vector);
     _ = try decodeDenseEmbeddingInto(data, vector);
@@ -613,6 +763,7 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
     if (flags.authored and (flags.has_source_hash or source_hash != 0 or
         flags.has_graph_generation or flags.portable_unbound_graph_generation or
         (kind != .dense_embedding and kind != .sparse_embedding))) return error.InvalidArtifactHeader;
+    if (flags.text_input and (flags.authored or kind != .dense_embedding)) return error.InvalidArtifactHeader;
 
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);

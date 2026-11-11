@@ -543,6 +543,8 @@ pub const ProviderRuntime = struct {
 };
 
 pub const InitOptions = struct {
+    /// Used only while constructing the provider. Never retained by entries.
+    setup_context: ?RequestContext = null,
     antfly_provider: ?AntflyProvider = null,
     /// Runtime-owned cache shared by distributed task adapters. Managed
     /// embedders borrow it; standalone callers retain an owned fallback.
@@ -1166,6 +1168,8 @@ fn attachManagedBedrockCredentialCaches(
 }
 
 pub const ManagedEmbedder = struct {
+    retained_options: InitOptions = .{},
+    retained_options_arena: ?std.heap.ArenaAllocator = null,
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
     /// Standalone owners without an injected runtime executor share one
@@ -1220,6 +1224,24 @@ pub const ManagedEmbedder = struct {
         };
 
         var options = supplied_options;
+        const SetupCancellation = struct {
+            original: ?CancellationToken,
+            request: ?CancellationToken,
+            fn cancelled(raw: *const anyopaque) bool {
+                const value: *const @This() = @ptrCast(@alignCast(raw));
+                if (value.original) |token| if (token.isCancelled()) return true;
+                return if (value.request) |token| token.isCancelled() else false;
+            }
+        };
+        const setup_cancel = SetupCancellation{
+            .original = supplied_options.cancellation,
+            .request = if (options.setup_context) |control| control.cancellation else null,
+        };
+        if (options.setup_context) |control| {
+            try control.check();
+            if (control.deadline_ns) |deadline| options.deadline_ns = @min(deadline, options.deadline_ns orelse deadline);
+            options.cancellation = .{ .ptr = &setup_cancel, .is_cancelled_fn = SetupCancellation.cancelled };
+        }
         const owned_http_io = try bindOwnedHttpIoIfNeeded(alloc, &options);
         errdefer deinitOwnedHttpIo(alloc, owned_http_io);
 
@@ -1231,6 +1253,7 @@ pub const ManagedEmbedder = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
+            if (options.setup_context) |control| try control.check();
             if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
             var managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options, sparse_kind) orelse continue;
             entries.append(alloc, managed) catch |err| {
@@ -1245,7 +1268,10 @@ pub const ManagedEmbedder = struct {
         try collectEmbeddingVectorSpaces(root, &vector_spaces, alloc);
         try validateManagedEmbeddingLookupNames(alloc, entries.items, &vector_spaces);
 
-        for (entries.items) |*entry| try attachProviderQuota(entry, options);
+        for (entries.items) |*entry| {
+            if (options.setup_context) |control| try control.check();
+            try attachProviderQuota(entry, options);
+        }
 
         const owned_google_credentials = try attachManagedGoogleCredentialManager(
             alloc,
@@ -1280,7 +1306,26 @@ pub const ManagedEmbedder = struct {
         if (owned_http_client) |client| for (owned_entries) |*entry| {
             if (entry.antfly_provider == null) entry.shared_http_client = client;
         };
+        if (options.setup_context) |control| try control.check();
+        for (owned_entries) |*entry| {
+            entry.deadline_ns = supplied_options.deadline_ns;
+            entry.cancellation = supplied_options.cancellation;
+        }
+        var options_arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer options_arena.deinit();
+        var retained_options = supplied_options;
+        retained_options.io = options.io;
+        retained_options.bounded_http_request = options.bounded_http_request;
+        retained_options.setup_context = null;
+        retained_options.deadline_ns = null;
+        retained_options.cancellation = null;
+        retained_options.progress = null;
+        retained_options.source_table = try options_arena.allocator().dupe(u8, supplied_options.source_table);
+        if (supplied_options.inference_api_url) |value| retained_options.inference_api_url = try options_arena.allocator().dupe(u8, value);
+        if (supplied_options.inference_api_key) |value| retained_options.inference_api_key = try options_arena.allocator().dupe(u8, value);
         return .{
+            .retained_options = retained_options,
+            .retained_options_arena = options_arena,
             .alloc = alloc,
             .entries = owned_entries,
             .owned_http_io = owned_http_io,
@@ -1290,6 +1335,7 @@ pub const ManagedEmbedder = struct {
     }
 
     pub fn deinit(self: *ManagedEmbedder) void {
+        if (self.retained_options_arena) |*arena| arena.deinit();
         for (self.entries) |*entry| entry.deinit(self.alloc);
         self.alloc.free(self.entries);
         deinitManagedEmbeddingHttpClient(self.alloc, self.owned_http_client);
@@ -1341,9 +1387,17 @@ pub const ManagedEmbedder = struct {
         return false;
     }
 
+    fn cloneDenseForIndexes(raw: *anyopaque, alloc: std.mem.Allocator, indexes: []const u8, control: RequestContext) !db_embedder.DenseEmbedder {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(raw));
+        var options = self.retained_options;
+        options.setup_context = control;
+        return (try createDenseEmbedderWithOptions(alloc, indexes, options)) orelse error.ReembedUnavailable;
+    }
+
     pub fn denseInterface(self: *ManagedEmbedder) db_embedder.DenseEmbedder {
         return .{
             .ptr = self,
+            .clone_for_indexes_fn = cloneDenseForIndexes,
             .dense_embed_fn = embedDense,
             .computation_key_fn = documentComputationKey,
             .dense_embed_batch_fn = embedDenseBatch,
@@ -1424,8 +1478,10 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         options: InitOptions,
     ) !?db_embedder.DenseEmbedder {
+        if (options.setup_context) |control| try control.check();
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
         defer parsed.deinit();
+        if (options.setup_context) |control| try control.check();
         return try createDenseEmbedderFromIndexValueWithOptions(alloc, parsed.value, options);
     }
 
@@ -2143,6 +2199,7 @@ pub const ManagedEmbedder = struct {
         const caps = lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
         if (entry.antfly_provider == null and entry.provider == .antfly and entry.model_identity.len == 0 and dims != 0 and caps.numeric_responses_v1)
             return @min(requested, try httpx.numeric_response.maxRows(dims));
+        if (openAiCompatiblePacedBatchLimit(entry)) |limit| return @min(requested, limit);
         return requested;
     }
 
@@ -3207,11 +3264,17 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
-    // Transient vector storage re-embeds candidates from the document's own
-    // field or template, so it needs the index's embedder and one vector per
-    // document: no external vectors, chunking, or artifacts from other
-    // enrichments.
-    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and chunker_json == null and embedder_json != null);
+    // Dropping stored vectors relies on re-embedding candidates from the
+    // document's own field or template (re-chunked the way the producer
+    // chunks it), so it needs the index's embedder: no external vectors or
+    // artifacts from other enrichments. `auto` keeps media-derived vectors
+    // itself; `transient` drops everything, so its chunker must be text-only.
+    const owns_input = !external and !artifact_backed and embedder_json != null;
+    const text_only_chunks = if (root.get("chunker")) |chunker| textOnlyChunker(chunker) else true;
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, .{
+        .auto = owns_input,
+        .transient = owns_input and text_only_chunks,
+    });
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3278,6 +3341,26 @@ fn denseAlgorithmIsLeann(root: std.json.ObjectMap) !bool {
     return leann;
 }
 
+/// Whether a chunker's vectors can be reproduced from chunk text alone:
+/// fixed text chunking, with no audio windows, media policy, model outputs
+/// or chunk embedding targets (those embed media parts or carry vectors the
+/// re-embedder cannot recompute).
+fn textOnlyChunker(chunker: std.json.Value) bool {
+    if (chunker != .object) return false;
+    for ([_][]const u8{ "audio", "policy", "outputs", "embedding" }) |key| {
+        if (chunker.object.get(key)) |value| if (value != .null) return false;
+    }
+    if (chunker.object.get("model")) |model| {
+        if (model != .string) return false;
+        const fixed = [_][]const u8{ "fixed", "fixed_bert", "fixed_bpe", "fixed-bert-tokenizer" };
+        for (fixed) |name| {
+            if (std.mem.eql(u8, model.string, name)) return true;
+        }
+        return false;
+    }
+    return true;
+}
+
 /// Mirrors `leann.Config.default_rabitq_bits` (this module does not depend on
 /// the vector index library).
 const leann_default_rabitq_bits: i64 = 4;
@@ -3288,12 +3371,17 @@ const leann_default_rabitq_bits: i64 = 4;
 /// dense index's top-level `quantization_bits`, shared with HBC; HBC's
 /// `quantization_refine` does not apply, since LEANN's error bounds already
 /// decide which candidates get exact distances.
-fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, can_reembed: bool) !void {
+/// Which `vector_storage` modes an index's input allows besides `persistent`.
+const LeannStorageAllowed = struct { auto: bool, transient: bool };
+
+fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, allowed: LeannStorageAllowed) !void {
     var max_degree: i64 = 30;
     var quantizer: []const u8 = "rabitq";
     var search_ef: i64 = 0;
     var bound_scale: f64 = 1.0;
     var batch_size: i64 = 0;
+    var reembed_budget_ms: i64 = 0;
+    var media_vectors: []const u8 = "full";
     var quantization_bits: i64 = 0;
     var vector_storage: ?[]const u8 = null;
     if (root.get("leann")) |leann| {
@@ -3319,9 +3407,15 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
                 if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
             } else if (std.mem.eql(u8, key, "batch_size")) {
                 batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else if (std.mem.eql(u8, key, "reembed_budget_ms")) {
+                reembed_budget_ms = try jsonIntegerInRange(value, 0, 600_000);
+            } else if (std.mem.eql(u8, key, "media_vectors")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "full") and !std.mem.eql(u8, value.string, "int8")) return error.InvalidCreateTableRequest;
+                media_vectors = value.string;
             } else if (std.mem.eql(u8, key, "vector_storage")) {
                 if (value != .string) return error.InvalidCreateTableRequest;
-                if (!std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "auto") and !std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
                 vector_storage = value.string;
             } else return error.InvalidCreateTableRequest;
         }
@@ -3332,17 +3426,22 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     const rabitq = std.mem.eql(u8, quantizer, "rabitq");
     if (!rabitq and quantization_bits > 1) return error.InvalidCreateTableRequest;
     if (quantization_bits == 0) quantization_bits = if (rabitq) leann_default_rabitq_bits else 1;
-    // Transient storage rebuilds graphs from RaBitQ codes, so PQ keeps
-    // vectors. It is the default wherever re-embedding is possible.
-    const transient_allowed = can_reembed and rabitq;
+    // Dropping vectors rebuilds graphs from RaBitQ codes, so PQ keeps them.
+    // `auto` is the default wherever the index owns its input: it drops the
+    // vectors re-embedding can reproduce from text and keeps the rest.
+    const auto_allowed = allowed.auto and rabitq;
+    const transient_allowed = allowed.transient and rabitq;
     if (vector_storage) |requested| {
         if (std.mem.eql(u8, requested, "transient") and !transient_allowed) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, requested, "auto") and !auto_allowed) return error.InvalidCreateTableRequest;
     }
-    const resolved_storage = vector_storage orelse if (transient_allowed) "transient" else "persistent";
+    const resolved_storage = vector_storage orelse if (auto_allowed) "auto" else "persistent";
+    // int8 copies replace vectors only where vectors are dropped at all.
+    if (std.mem.eql(u8, media_vectors, "int8") and std.mem.eql(u8, resolved_storage, "persistent")) return error.InvalidCreateTableRequest;
     const json = try std.fmt.allocPrint(
         alloc,
-        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
-        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size },
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d},\"reembed_budget_ms\":{d},\"media_vectors\":\"{s}\"}}",
+        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size, reembed_budget_ms, media_vectors },
     );
     defer alloc.free(json);
     try out.appendSlice(alloc, json);
@@ -3369,22 +3468,55 @@ test "managed embedder translates leann algorithm into dense config" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"vector_storage\":\"persistent\"") != null);
 
     for ([_][2][]const u8{
-        // An embedder-backed field index defaults to transient storage.
+        // An embedder-backed field index defaults to auto storage.
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
             ,
-            "\"vector_storage\":\"transient\"",
+            "\"vector_storage\":\"auto\"",
         },
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
             ,
             "\"vector_storage\":\"persistent\"",
         },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"reembed_budget_ms":250}}
+            ,
+            "\"reembed_budget_ms\":250",
+        },
+        .{
+            \\{"template":"{{remoteMedia url=image_url}}","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"media_vectors":"int8"}}
+            ,
+            "\"media_vectors\":\"int8\"",
+        },
         // PQ graphs rebuild from vectors, so they keep them.
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq"}}
             ,
             "\"vector_storage\":\"persistent\"",
+        },
+        // Text chunks are re-chunked and re-embedded like whole documents.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":64}},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"auto\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":64}},"algorithm":"leann","leann":{"vector_storage":"transient"}}
+            ,
+            "\"vector_storage\":\"transient\"",
+        },
+        // Audio windows and media templates default to auto too: auto keeps
+        // the media-derived vectors it cannot re-embed.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","audio":{"window_duration_ms":30000}},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"auto\"",
+        },
+        .{
+            \\{"template":"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"auto\"",
         },
     }) |case| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
@@ -3434,9 +3566,19 @@ test "managed embedder translates leann algorithm into dense config" {
         ,
         \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"}}
         ,
+        // External vectors cannot be re-embedded at all.
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"auto"}}
+        ,
+        // int8 copies need dropped vectors to replace.
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent","media_vectors":"int8"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"auto"}}
+        ,
         \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"transient"}}
         ,
         \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"sometimes"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","audio":{"window_duration_ms":30000}},"algorithm":"leann","leann":{"vector_storage":"transient"}}
         ,
     }) |bad| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});
@@ -7851,6 +7993,16 @@ fn embedBatchWithBedrockRequest(
     return try adoptDenseBatchResult(alloc, &result);
 }
 
+/// Keep the planned callback within a single paced provider request.
+fn openAiCompatiblePacedBatchLimit(entry: *const ManagedEmbeddingEntry) ?usize {
+    const burst = @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
+    return switch (entry.provider) {
+        .cloudflare => if (entry.requests_per_minute > 0) @min(100, burst) else 100,
+        .openai, .openrouter, .ollama => if (entry.requests_per_minute > 0) burst else null,
+        else => null,
+    };
+}
+
 fn embedBatchWithOpenAiCompatiblePacedChunks(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -7858,7 +8010,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    const chunk_size = if (entry.provider == .cloudflare) @min(@as(usize, 100), if (entry.requests_per_minute > 0) @max(@as(usize, 1), @as(usize, entry.burst)) else 100) else @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
+    const chunk_size = openAiCompatiblePacedBatchLimit(entry) orelse unreachable;
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
         for (out.items) |vector| alloc.free(vector);
@@ -12317,6 +12469,18 @@ test "managed embedder text batch limits follow provider model and format contra
         try caps.validate();
         try std.testing.expectEqual(case.maximum, caps.batch.max_items);
     }
+}
+
+test "managed embedder planned text dispatch respects paced provider request size" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://example.invalid/v1","requests_per_minute":60,"burst":2}}}
+    ;
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc, json);
+    defer managed.deinit();
+    const dense = managed.denseInterface();
+    const generation = try dense.captureTextGeneration(alloc, "semantic");
+    try std.testing.expectEqual(@as(usize, 2), try dense.withTextGeneration(generation).partBatchLimit("semantic", 3, 10));
 }
 
 test "managed embedder Ollama text batches preserve full HTTP arrays and result order" {

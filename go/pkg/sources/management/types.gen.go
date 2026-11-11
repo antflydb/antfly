@@ -180,6 +180,27 @@ func (e ProcessingPresetMetric) Valid() bool {
 	}
 }
 
+// Defines values for ReconciliationStatusState.
+const (
+	ReconciliationStatusStateFailed  ReconciliationStatusState = "failed"
+	ReconciliationStatusStatePending ReconciliationStatusState = "pending"
+	ReconciliationStatusStateReady   ReconciliationStatusState = "ready"
+)
+
+// Valid indicates whether the value is a known member of the ReconciliationStatusState enum.
+func (e ReconciliationStatusState) Valid() bool {
+	switch e {
+	case ReconciliationStatusStateFailed:
+		return true
+	case ReconciliationStatusStatePending:
+		return true
+	case ReconciliationStatusStateReady:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RepresentationStatusState.
 const (
 	RepresentationStatusStateBuilding    RepresentationStatusState = "building"
@@ -447,6 +468,39 @@ func (e VectorSpaceQueryModality) Valid() bool {
 	}
 }
 
+// Defines values for GetSourceParamsView.
+const (
+	Declaration GetSourceParamsView = "declaration"
+	Full        GetSourceParamsView = "full"
+)
+
+// Valid indicates whether the value is a known member of the GetSourceParamsView enum.
+func (e GetSourceParamsView) Valid() bool {
+	switch e {
+	case Declaration:
+		return true
+	case Full:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PutSourceParamsIfNoneMatch.
+const (
+	Asterisk PutSourceParamsIfNoneMatch = "*"
+)
+
+// Valid indicates whether the value is a known member of the PutSourceParamsIfNoneMatch enum.
+func (e PutSourceParamsIfNoneMatch) Valid() bool {
+	switch e {
+	case Asterisk:
+		return true
+	default:
+		return false
+	}
+}
+
 // ArtifactBinding defines model for ArtifactBinding.
 type ArtifactBinding struct {
 	Artifact      string `json:"artifact"`
@@ -466,17 +520,20 @@ type Capabilities struct {
 	ConfigureSources  bool   `json:"configure_sources,omitempty,omitzero"`
 
 	// KnowledgeAudience Runtime deployment boundary, absent when knowledge is disabled.
-	KnowledgeAudience string              `json:"knowledge_audience,omitempty,omitzero"`
-	KnowledgeVersions []int               `json:"knowledge_versions,omitempty,omitzero"`
-	MediaProxy        bool                `json:"media_proxy,omitempty,omitzero"`
-	PerSourceRuns     bool                `json:"per_source_runs"`
-	ProcessingJobs    bool                `json:"processing_jobs,omitempty,omitzero"`
-	ProcessingPresets bool                `json:"processing_presets,omitempty,omitzero"`
-	PurgeSources      bool                `json:"purge_sources,omitempty,omitzero"`
-	Runtime           string              `json:"runtime"`
-	SearchVersions    []int               `json:"search_versions,omitempty,omitzero"`
-	SerializedRuns    bool                `json:"serialized_runs,omitempty,omitzero"`
-	Version           CapabilitiesVersion `json:"version"`
+	KnowledgeAudience string `json:"knowledge_audience,omitempty,omitzero"`
+	KnowledgeVersions []int  `json:"knowledge_versions,omitempty,omitzero"`
+	MediaProxy        bool   `json:"media_proxy,omitempty,omitzero"`
+	PerSourceRuns     bool   `json:"per_source_runs"`
+	ProcessingJobs    bool   `json:"processing_jobs,omitempty,omitzero"`
+	ProcessingPresets bool   `json:"processing_presets,omitempty,omitzero"`
+	PurgeSources      bool   `json:"purge_sources,omitempty,omitzero"`
+
+	// RevisionPreconditions PUT /sources/{source_id} honors If-Match declaration revisions and If-None-Match: * create-only writes.
+	RevisionPreconditions bool                `json:"revision_preconditions,omitempty,omitzero"`
+	Runtime               string              `json:"runtime"`
+	SearchVersions        []int               `json:"search_versions,omitempty,omitzero"`
+	SerializedRuns        bool                `json:"serialized_runs,omitempty,omitzero"`
+	Version               CapabilitiesVersion `json:"version"`
 }
 
 // CapabilitiesVersion defines model for Capabilities.Version.
@@ -642,6 +699,14 @@ type ProcessingPreview struct {
 	Stream     SearchStream          `json:"stream"`
 }
 
+// ReconciliationStatus defines model for ReconciliationStatus.
+type ReconciliationStatus struct {
+	State ReconciliationStatusState `json:"state"`
+}
+
+// ReconciliationStatusState defines model for ReconciliationStatus.State.
+type ReconciliationStatusState string
+
 // RepresentationStatus defines model for RepresentationStatus.
 type RepresentationStatus struct {
 	Name   string                    `json:"name"`
@@ -761,10 +826,14 @@ type Source struct {
 	Processing           *ProcessingDeclaration `json:"processing,omitempty"`
 
 	// Publication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
-	Publication SourcePublication `json:"publication"`
+	Publication          SourcePublication     `json:"publication"`
+	ReconciliationStatus *ReconciliationStatus `json:"reconciliation_status,omitempty"`
 
 	// Rekeys Set only on a PUT response. True when the call makes the next sync re-key this source's existing rows. A new source, or one that already has a namespace, never re-keys.
-	Rekeys       bool          `json:"rekeys,omitempty,omitzero"`
+	Rekeys bool `json:"rekeys,omitempty,omitzero"`
+
+	// Revision Opaque declaration revision returned by GET and PUT. Covers declared fields only; run state and search status do not change it. Ignored when submitted.
+	Revision     string        `json:"revision,omitempty,omitzero"`
 	SearchStatus *SearchStatus `json:"search_status,omitempty"`
 
 	// SearchVersion Omitted/1 uses legacy text bindings. Version 2 enables SearchStream retrieval and artifact declarations.
@@ -828,6 +897,27 @@ type ListSourcesParams struct {
 type RemoveSourceParams struct {
 	Purge bool `form:"purge,omitempty" json:"purge,omitempty,omitzero"`
 }
+
+// GetSourceParams defines parameters for GetSource.
+type GetSourceParams struct {
+	// View declaration requests configuration, revision and reconciliation state without native readiness observations. Older runtimes may return full observations.
+	View GetSourceParamsView `form:"view,omitempty" json:"view,omitempty,omitzero"`
+}
+
+// GetSourceParamsView defines parameters for GetSource.
+type GetSourceParamsView string
+
+// PutSourceParams defines parameters for PutSource.
+type PutSourceParams struct {
+	// IfMatch Quoted declaration revision from a prior GET (strong tag only).
+	IfMatch string `json:"If-Match,omitempty,omitzero"`
+
+	// IfNoneMatch Use * to create the source only if it does not already exist.
+	IfNoneMatch PutSourceParamsIfNoneMatch `json:"If-None-Match,omitempty,omitzero"`
+}
+
+// PutSourceParamsIfNoneMatch defines parameters for PutSource.
+type PutSourceParamsIfNoneMatch string
 
 // ListSourceRunsParams defines parameters for ListSourceRuns.
 type ListSourceRunsParams struct {

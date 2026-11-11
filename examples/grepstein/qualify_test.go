@@ -28,7 +28,7 @@ import (
 )
 
 func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T) {
-	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest", "incomplete", "retryable_incomplete", "unknown_completion", "invalid_completion"} {
+	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest", "incomplete", "retryable_incomplete", "unknown_completion", "invalid_completion", "units_index_pending"} {
 		t.Run(problem, func(t *testing.T) {
 			state := t.TempDir()
 			hash := strings.Repeat("a", 64)
@@ -46,6 +46,10 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case strings.Contains(r.URL.Path, "/indexes/"):
+					if problem == "units_index_pending" && strings.HasSuffix(r.URL.Path, "/"+corpusUnitsIndex) {
+						fmt.Fprint(w, `{"status":{"readiness":{"complete":false,"queryable":false}}}`)
+						return
+					}
 					fmt.Fprint(w, `{"status":{"readiness":{"complete":true,"queryable":true}},"shard_status":{"one":{"readiness":{"complete":true,"queryable":true}}}}`)
 				case strings.Contains(r.URL.Path, "/artifacts/"):
 					artifact := map[string]any{"source_url": source, "generation": 1, "unit_count": 2, "ocr_attempted_count": 2, "ocr_failed_count": 0, "route_type": "pdf", "merge_status": "converged"}
