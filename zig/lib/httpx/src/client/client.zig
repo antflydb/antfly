@@ -1019,6 +1019,18 @@ pub const Client = struct {
         return self.config.max_response_size;
     }
 
+    /// Heap bytes needed by the buffered HTTP/1 body collector, excluding
+    /// response headers, connection state and caller-owned request buffers.
+    /// Both encoded and decoded bodies obey max_body_bytes. During decompression
+    /// the encoded buffer survives an output growth: encoded + old output + new
+    /// output. Derive capacities from the collector's actual ArrayList policy,
+    /// including alloc/copy/free fallback when the allocator cannot remap.
+    pub fn bufferedResponseBodyPeakBytes(max_body_bytes: usize) error{Overflow}!usize {
+        if (max_body_bytes == 0) return 0;
+        const capacity = std.ArrayListUnmanaged(u8).growCapacity(max_body_bytes);
+        return std.math.mul(usize, capacity, 3);
+    }
+
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
         self.shutdown();
@@ -7030,4 +7042,10 @@ test "admitted transport H2 pre-send expiry retains the cached connection and tr
         try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
         try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
     }
+}
+
+test "buffered response peak rejects unrepresentable admission bounds" {
+    try std.testing.expectEqual(@as(usize, 0), try Client.bufferedResponseBodyPeakBytes(0));
+    try std.testing.expectError(error.Overflow, Client.bufferedResponseBodyPeakBytes(std.math.maxInt(usize)));
+    try std.testing.expectError(error.Overflow, Client.bufferedResponseBodyPeakBytes(std.math.maxInt(usize) / 2));
 }

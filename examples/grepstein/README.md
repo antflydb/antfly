@@ -625,7 +625,7 @@ and retains the existing PDF/OCR recipe and artifact names. Use
 MIME types before applying file limits, and saves the profile for resume,
 publication, loading and grep configuration. A resume cannot change it.
 Raw `stage-originals` remains independent and preserves every media type.
-The native transcription profile selects WAV, MP3, MP4/M4A, Ogg/Opus, AAC,
+The native transcription profile selects WAV, MP3, M4A (MP4 audio), Ogg/Opus, AAC,
 AIFF, CAF and FLAC. AMR originals are preserved by raw staging but are excluded
 from this profile because the native decoder does not support them.
 
@@ -772,3 +772,9 @@ borrowing the already fetched recording. The JSON fallback encodes directly into
 one exactly sized request body. Invocation memory planning follows the selected
 transport; local callback compatibility accounts for its inline data URI. Missing
 audio MIME is inferred from the native format detector without decoding samples.
+
+Direct-URL transcription also reserves the downloader’s temporary body buffers,
+including compressed input and output-buffer growth. Download and encoding peaks
+are separate phases, so admission uses their maximum. This reservation follows
+`max_download_bytes`; it does not enlarge the transcription response limit.
+Pre-acquired GCS recordings retain their actual-size borrowed-source plan.

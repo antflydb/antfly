@@ -200,6 +200,14 @@ pub fn effectiveMaxDownloadBytes(max_download_bytes: ?usize) usize {
     return configured orelse default_max_download_bytes;
 }
 
+/// Download collection can temporarily retain capacity beyond the final
+/// recording length, including encoded bytes while inflating compressed HTTP.
+/// Keep this contract at the adapter boundary so callers do not duplicate the
+/// downloader's allocation policy. Borrowed recordings need none of this space.
+pub fn audioDownloadMemoryPeakBytes(max_download_bytes: ?usize) error{Overflow}!usize {
+    return httpx.Client.bufferedResponseBodyPeakBytes(effectiveMaxDownloadBytes(max_download_bytes));
+}
+
 fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
     return .{ .max_download_size_bytes = effectiveMaxDownloadBytes(max_download_bytes) };
 }

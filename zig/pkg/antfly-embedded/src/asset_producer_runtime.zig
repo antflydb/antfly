@@ -1161,7 +1161,10 @@ pub const Runtime = struct {
                     // Bound its downloaded source plus transport workspace here.
                     if (!has_media and !inline_source) {
                         const source_peak = try selected_transport.peakResidentSize(transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes), 0);
-                        caller_workspace_bytes = try std.math.mul(usize, source_peak, requests.len);
+                        const download_peak = try transcribing.audioDownloadMemoryPeakBytes(cfg.max_download_bytes);
+                        // Download growth/decompression ends before encoding.
+                        // Charge the larger phase, not two simultaneous peaks.
+                        caller_workspace_bytes = try std.math.mul(usize, @max(source_peak, download_peak), requests.len);
                     }
                     break :blk selected_transport;
                 }
@@ -10131,6 +10134,57 @@ test "transcriber negotiated source transport fits the planned allocator indepen
         const output = try runtime.transcribe(budget.allocator(), request);
         defer budget.allocator().free(output);
         try std.testing.expectEqualStrings("hello", output);
+        // The source URL plan must also fund the real downloader, not just
+        // the later provider request. Loopback access is enabled only in this
+        // test's explicit downloader policy, never in production STT policy.
+        const gzip_recording = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x01\x00\x00\x00\x80\x90\xfe\xaf\xee\x08\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x6a\xeb\x8e\x97\xd7\x00\x00\x01\x00";
+        const deflate_recording = "\x78\x9c\xed\xc1\x01\x01\x00\x00\x00\x80\x90\xfe\xaf\xee\x08\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x6a\x00\x0f\x00\x01";
+        const chunked_recording = try std.fmt.allocPrint(a, "{x}\r\n{s}\r\n0\r\n\r\n", .{ recording.len, recording });
+        defer a.free(chunked_recording);
+        var originals = try httpx.TestServer.start(a, io, &.{
+            .{ .path = "/plain.wav", .respond = .{ .body = recording, .content_type = "audio/wav" } },
+            .{ .path = "/chunked.wav", .respond = .{ .body = chunked_recording, .chunked = true, .content_type = "audio/wav" } },
+            .{ .path = "/gzip.wav", .respond = .{ .body = gzip_recording, .content_type = "audio/wav", .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} } },
+            .{ .path = "/deflate.wav", .respond = .{ .body = deflate_recording, .content_type = "audio/wav", .headers = &.{.{ .name = "Content-Encoding", .value = "deflate" }} } },
+        });
+        defer originals.deinit();
+        var downloading = std.Io.Group.init;
+        var download_error: ?anyerror = null;
+        try downloading.concurrent(io, Serve.run, .{ &originals, &download_error });
+        defer downloading.cancel(io);
+        const direct_config = try std.fmt.allocPrint(a, "{{\"provider\":\"antfly\",\"model\":\"speech\",\"max_download_bytes\":65536,\"api_url\":\"{s}/ai/v1\"}}", .{server.baseUrl()});
+        defer a.free(direct_config);
+        var direct = request;
+        direct.config_json = direct_config;
+        direct.source_text = "https://audio.example/recording.wav";
+        direct.media = &.{};
+        const direct_plan = try runtime.producer().invocationMemoryForRequests(a, &.{direct});
+        const download_peak = try transcribing.audioDownloadMemoryPeakBytes(recording.len);
+        const encoded_peak = try direct_plan.attachment_transport.peakResidentSize(recording.len, 0);
+        // Opaque URL and borrowed-source planning share the same small control
+        // overhead; a phase max must not silently become a sum of both peaks.
+        try std.testing.expect(direct_plan.allocator_limit_bytes >= @max(download_peak, encoded_peak));
+        try std.testing.expect(direct_plan.allocator_limit_bytes < download_peak + encoded_peak);
+        for ([_][]const u8{ "/plain.wav", "/chunked.wav", "/gzip.wav", "/deflate.wav" }) |path| {
+            const source = try std.fmt.allocPrint(a, "{s}{s}", .{ originals.baseUrl(), path });
+            defer a.free(source);
+            var direct_budget = inference_work.BoundedInvocationAllocator.init(a, direct_plan.allocator_limit_bytes);
+            {
+                const scraping = @import("antfly_scraping");
+                var downloaded = try scraping.downloadContentAllocWithContext(direct_budget.allocator(), .{ .io = io }, source, &.{ .block_private_ips = false, .max_download_size_bytes = recording.len }, null);
+                defer downloaded.deinit(direct_budget.allocator());
+                try std.testing.expectEqualSlices(u8, recording, downloaded.data);
+                var acquired = direct;
+                acquired.media = &.{.{ .bytes = downloaded.data, .mime_type = downloaded.content_type }};
+                const transcript = try runtime.transcribe(direct_budget.allocator(), acquired);
+                defer direct_budget.allocator().free(transcript);
+                try std.testing.expectEqualStrings("hello", transcript);
+            }
+            try std.testing.expect(!direct_budget.limit_exceeded);
+            try std.testing.expectEqual(@as(usize, 0), direct_budget.live_bytes);
+        }
+        downloading.cancel(io);
+        if (download_error) |err| return err;
         serving.cancel(io);
         if (server_error) |err| return err;
     }
