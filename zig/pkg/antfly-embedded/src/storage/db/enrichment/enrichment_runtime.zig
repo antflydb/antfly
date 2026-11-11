@@ -40075,6 +40075,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
                     .doc_key = doc_key,
                     .source_field = "body",
                     .content_type = "text/plain",
+                    .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
                 },
                 .producer_type = .generator,
                 .config_json = try a.dupe(u8, "{\"provider\":\"test\"}"),
@@ -40118,6 +40119,14 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
         .config = .{ .asset_producer = producer },
         .ownership = undefined,
     };
+
+    try index_manager.addEnrichment(&store, .{ .name = "asset", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+    // Publication validates both the admitted recipe and its primary revision.
+    for ([_][]const u8{ "doc:1", "doc:2", "doc:3", "doc:4", "doc:5", "doc:6" }) |key| {
+        const primary = try documentSourceStoreKeyAlloc(&runtime, key);
+        defer alloc.free(primary);
+        try storePutWithRetry(&runtime, primary, "{}");
+    }
 
     var items = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
     defer {
@@ -42009,14 +42018,21 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .doc_key = "blocked",
         .source_field = "body",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-        .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
+        .execution_json = "{\"batch_items\":8,\"batch_bytes\":1,\"max_document_pages\":null}",
         .sequence = 7,
     };
+    try manager.addEnrichment(&store, .{ .name = request.artifact_name, .kind = .asset, .field = request.source_field, .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
     // There is deliberately no document in the store. Planning must retain
     // the request, not read/materialize it or invoke the provider.
     try processAssetOrDefer(&runtime, request, &queued, &prepared_sources, &window);
     try std.testing.expectEqual(@as(usize, 1), queued.items.len);
     try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    // Once executing, the fixture must retain the primary revisions it captured.
+    for ([_][]const u8{ "blocked", "healthy-a", "healthy-b", "bounded-a", "bounded-b", "healthy-serial" }) |key| {
+        const primary = try documentSourceStoreKeyAlloc(&runtime, key);
+        defer alloc.free(primary);
+        try storePutWithRetry(&runtime, primary, "{\"body\":\"large retained document\"}");
+    }
     var batch = PreparedAssetBatch{};
     defer batch.deinit(alloc);
     var scope = FailureScope{};
@@ -42041,7 +42057,8 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     for ([_][]const u8{ "bounded-a", "bounded-b" }, 0..) |source, i| {
         var next = request;
         next.doc_key = source;
-        next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128}";
+        next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128,\"max_document_pages\":null}";
+        _ = try manager.upsertEnrichment(&store, .{ .name = next.artifact_name, .kind = .asset, .field = next.source_field, .producer_json = next.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 128 } });
         const item = try Harness.item(alloc, next, source);
         try std.testing.expect(assetProducerRetainedBytes(item) < 128);
         try std.testing.expect(assetProducerRetainedBytes(item) * 2 > 128);
@@ -42056,6 +42073,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
 
     // Serial compatibility must not let a retryable first item starve an
     // independent sibling in the same bounded batch either.
+    _ = try manager.upsertEnrichment(&store, .{ .name = request.artifact_name, .kind = .asset, .field = request.source_field, .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
     const blocked = try Harness.item(alloc, request, "blocked");
     defer freeAssetProducerBatchItem(alloc, blocked);
     var healthy_request = request;
@@ -44011,7 +44029,10 @@ test "model aware media vector labels rebuild from stored vectors without media 
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(primary);
+    try storePutWithRetry(&runtime, primary, "{}");
+    var request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
     {
         const result = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
@@ -44029,6 +44050,8 @@ test "model aware media vector labels rebuild from stored vectors without media 
     fake.generation = 2;
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    request.producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}}";
+    _ = try index_manager.upsertEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = request.producer_json });
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
     const retained = (try storeGetOptionalAllocWithRetry(&runtime, vector_key)).?;
     defer alloc.free(retained);
@@ -45113,7 +45136,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    catalog.binding.effect_protocol = 15;
+    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -45353,9 +45376,21 @@ test "model aware media retained named text permits a changed embedding generati
     harness.generation = 0x11;
     try std.testing.expect(!try retainedTextVectorCurrent(std.testing.allocator, provider, request, "exact retained text", &reference));
     harness.generation = 0x22;
-    var runtime: EnrichmentRuntime = undefined;
-    runtime.alloc = std.testing.allocator;
-    runtime.dense_result_cache = null;
+    var runtime: EnrichmentRuntime = .{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
     const text_payload = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .body = "exact rendered page text", ._chunk = metadata }, .{});
     defer std.testing.allocator.free(text_payload);
     try std.testing.expect((try storedModelChunkVector(&runtime, std.testing.allocator, provider, request, text_payload)) == null);
@@ -45490,7 +45525,8 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    catalog.binding.effect_protocol = 15;
+    // Execution-bound model outputs require the v18 publication fence.
+    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -45716,13 +45752,25 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
-    var window = GeneratedReplayWindow{ .alloc = alloc };
-    defer window.deinit();
+    const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(primary);
+    try storePutWithRetry(&runtime, primary, "{}");
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
     for (0..2) |_| for (0..32) |i| {
         const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
         defer alloc.free(config);
-        try processVectorLabels(&runtime, request, config, null, "{}", output_key, &window);
+        const producer = try std.fmt.allocPrint(alloc, "{{\"type\":\"vector_labels\",\"config\":{s}}}", .{config});
+        defer alloc.free(producer);
+        // Each vocabulary is a real admitted producer recipe, not a stale
+        // request bypassing the current catalog publication fence.
+        _ = try index_manager.upsertEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = producer });
+        var admitted_request = request;
+        admitted_request.producer_json = producer;
+        // A catalog mutation starts a fresh replay cut; the vocabulary cache
+        // belongs to the runtime and must survive all 64 independent windows.
+        var window = GeneratedReplayWindow{ .alloc = alloc };
+        defer window.deinit();
+        try processVectorLabels(&runtime, admitted_request, config, null, "{}", output_key, &window);
     };
     try std.testing.expectEqual(@as(usize, 32), fake.calls);
     std.debug.print("vocabulary prompts={d} retained={d} slots={d} budget={d}\n", .{ fake.calls, runtime.vector_label_cache.bytes, @import("vector_label_cache.zig").Cache.max_entries, @import("vector_label_cache.zig").Cache.max_bytes });
@@ -45761,7 +45809,7 @@ test "model aware media labels authenticate independently refreshed retained tex
     };
     try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
     try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
-    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" });
     const Fake = struct {
         calls: usize = 0,
         generation: u8 = 2,
@@ -45821,7 +45869,10 @@ test "model aware media labels authenticate independently refreshed retained tex
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(primary);
+    try storePutWithRetry(&runtime, primary, "{}");
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     const output = try storeGetAlloc(&runtime, output_key);

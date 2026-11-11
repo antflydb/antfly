@@ -359,6 +359,9 @@ jobs:
             scripts/ci/test_zig_e2e_shard.py scripts/ci/merge_e2e_durations.py scripts/ci/summarize_e2e_timings.py scripts/ci/antfly_e2e_durations.json \
             scripts/ci/toolchain-policy.json \
             ':(glob)go/pkg/embedded/**' \
+            ':(glob)go/pkg/sources/**' \
+            ':(glob)examples/grepstein/**' \
+            scripts/ci/check_source_native.py \
             ':(glob)rs/crates/embedded*/**' \
             rs/Cargo.toml rs/Cargo.lock \
             ':(glob)py/packages/embedded/**' \
@@ -2055,6 +2058,44 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  source-sdk-native:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    name: source-sdk-native
+    needs: [admission, e2e-base-build, e2e-full-build]
+    runs-on: arc-antfly-standard-runtime
+    timeout-minutes: 20
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Download candidate E2E executable
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: antfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/source-sdk-artifact
+      - name: Install candidate E2E executable
+        run: tar -xzf "${RUNNER_TEMP}/source-sdk-artifact/"*.tar.gz -C zig
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Verify source SDK ingestion and durable recipe restart
+        run: python scripts/ci/check_source_native.py --no-build --binary zig/zig-out/bin/antfly
+
   better-auth:
     if: >-
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
@@ -2514,7 +2555,7 @@ jobs:
       inputs.pr_number != '' &&
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
-    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]
+    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -2528,6 +2569,7 @@ jobs:
           PLAN_RESULT: ${{ needs.e2e-base-plan.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
+          SOURCE_SDK_RESULT: ${{ needs.source-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
           BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
         run: |
@@ -2537,6 +2579,7 @@ jobs:
           test "$PLAN_RESULT" = "success"
           test "$LOW_FD_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
+          test "$SOURCE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
           test "$BETTER_AUTH_RESULT" = "success"
 
@@ -2998,7 +3041,7 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-base-plan, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-base-plan, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
@@ -3008,6 +3051,7 @@ jobs:
           PLAN_RESULT: ${{ needs.e2e-base-plan.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
+          SOURCE_SDK_RESULT: ${{ needs.source-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
           BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
           REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
@@ -3017,6 +3061,7 @@ jobs:
           test "$TEST_RESULT" = "success"
           test "$PLAN_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
+          test "$SOURCE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
           test "$BETTER_AUTH_RESULT" = "success"
           if [[ "$REQUIRE_LOW_FD" == "true" ]]; then

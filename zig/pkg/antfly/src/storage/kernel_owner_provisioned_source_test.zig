@@ -1577,6 +1577,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "doc:a",
         "document_units_v1",
     ));
+    // Reprocess acknowledges admission; inspect the newly published manifest
+    // only after its explicit enrichment visibility fence.
+    try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
     var reprocessed_manifest = (try read_source.source().documentArtifactManifest(
         alloc,
         "articles",

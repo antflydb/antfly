@@ -48,6 +48,11 @@ jobs:
       suite: sdks
 
   sdks:
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -85,8 +90,15 @@ jobs:
 
       - name: Prepare SDK build caches
         run: |
-          mkdir -p "$SDK_CI_WORK_DIR"/{tmp,cargo-phases,cargo-target,cargo-home,rustup,go-build,go-mod,gopath,uv-cache,python,pnpm-store,xdg}
+          set -euo pipefail
+          mkdir -p "$SDK_CI_WORK_DIR"/{tmp,cargo-phases,cargo-target,cargo-home,rustup,go-build,go-mod,gopath,uv-cache,python,pnpm-store,xdg,zig-cache,zig-out}
+          # Native policy tests and release fixtures compile Zig too. Preserve
+          # worktree-relative paths while keeping their output off the overlay.
+          ln -s "$SDK_CI_WORK_DIR/zig-cache" zig/.zig-cache
+          ln -s "$SDK_CI_WORK_DIR/zig-out" zig/zig-out
           {
+            echo "ZIG_LOCAL_CACHE_DIR=$GITHUB_WORKSPACE/zig/.zig-cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/zig/.zig-cache/global"
             echo "TMPDIR=$SDK_CI_WORK_DIR/tmp"
             echo "ANTFLY_CARGO_TARGET_PARENT=$SDK_CI_WORK_DIR/cargo-phases"
             echo "CARGO_TARGET_DIR=$SDK_CI_WORK_DIR/cargo-target"
@@ -209,6 +221,24 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      # Use immutable executing policy for the bucket-scoped reader action.
+      - name: Check out executing dependency policy
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.release == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.release == 'true'
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Set up Zig for formatting
         if: steps.scopes.outputs.format_zig == 'true' && steps.scopes.outputs.sdk != 'true' && steps.scopes.outputs.memory != 'true' && steps.scopes.outputs.sources != 'true' && steps.scopes.outputs.release != 'true'
