@@ -123,8 +123,19 @@ func checkGCSAccessReply(reply *http.Response, item Item) error {
 	var object struct {
 		Generation string `json:"generation"`
 	}
-	if err := json.NewDecoder(io.LimitReader(reply.Body, 4096)).Decode(&object); err != nil {
+	const maxProofBytes = 4096
+	body, err := io.ReadAll(io.LimitReader(reply.Body, maxProofBytes+1))
+	if err != nil {
 		return gcsBatchReadError(err)
+	}
+	if len(body) > maxProofBytes {
+		return fmt.Errorf("GCS metadata proof exceeds byte limit")
+	}
+	if err := reply.Body.Close(); err != nil {
+		return gcsBatchReadError(err)
+	}
+	if err := json.Unmarshal(body, &object); err != nil {
+		return fmt.Errorf("invalid GCS metadata proof: %w", err)
 	}
 	if object.Generation != item.Revision {
 		return &RevisionChangedError{Expected: item.Revision, Actual: object.Generation}
