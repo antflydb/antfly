@@ -449,6 +449,21 @@ pub const Region = struct {
         return @as(i64, header_bytes) + @as(i64, max_readers) * reader_slot_bytes + @as(i64, slot_index);
     }
 
+    /// Byte offset of ticket `ticket`'s abandonment flag, in a fixed ring
+    /// of `max_readers` bytes immediately after the liveness bytes.
+    /// `acquireWriterFairBounded`'s own doc comment explains what this
+    /// is for and why a ring, keyed by `ticket % max_readers`, is safe:
+    /// in short, a bounded (deadline-capable) FIFO acquire needs a way
+    /// for a ticket holder that gives up to signal that without
+    /// permanently wedging every ticket after it, and this codebase's
+    /// current callers never have more than `max_readers` of this
+    /// region's own tickets genuinely outstanding at once (every ticket-
+    /// taker already needed a liveness slot to open this region at all,
+    /// so `max_readers` already bounds concurrent callers more broadly).
+    fn ticketAbandonedOffset(max_readers: u32, ticket: u32) i64 {
+        return @as(i64, header_bytes) + @as(i64, max_readers) * (reader_slot_bytes + 1) + @as(i64, ticket % max_readers);
+    }
+
     /// `probeDead`, but for *this process's own* liveness slot index
     /// (`writer_holder`/a reader slot's `generation` can legitimately
     /// name this process's own slot -- it is this process's own writer
@@ -612,7 +627,7 @@ pub const Region = struct {
             try ensureNoLivePeer(raw_fd, &existing_raw, size);
         }
         if (need_init) {
-            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 1);
+            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 2);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -686,7 +701,7 @@ pub const Region = struct {
         if (claimed_max_readers == 0 or claimed_max_readers > max_sane_readers) {
             return RegionError.RegionCorrupt;
         }
-        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 1);
+        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 2);
         if (implied_bytes > actual_file_bytes) {
             // The claimed slot count doesn't even fit the file's actual
             // size -- the header is corrupt enough that this count can't
@@ -802,13 +817,14 @@ pub const Region = struct {
         }
         while (true) {
             if (self.tryAcquireWriter(pid)) {
-                // Won. Advance head so ticket `my_ticket + 1` (if any)
-                // leaves phase 1 and enters its own phase 2, and wake
-                // whoever is parked for that -- including a spurious
-                // wake of a later ticket still waiting on the old head
-                // value, which simply re-checks and re-parks.
-                _ = hdr.writer_ticket_head.fetchAdd(1, .release);
-                futexWakeShared(&hdr.writer_ticket_head.raw);
+                // Won. Advance head (and past any already-abandoned
+                // tickets right after it -- see `advanceHeadPastAbandoned`)
+                // so ticket `my_ticket + 1` (if any) leaves phase 1 and
+                // enters its own phase 2, and wake whoever is parked for
+                // that -- including a spurious wake of a later ticket
+                // still waiting on the old head value, which simply
+                // re-checks and re-parks.
+                self.advanceHeadPastAbandoned();
                 return;
             }
             // Still held by the previous winner. Wait on
@@ -818,6 +834,101 @@ pub const Region = struct {
             const epoch = hdr.writer_release_epoch.load(.acquire);
             futexWaitShared(&hdr.writer_release_epoch.raw, epoch);
         }
+    }
+
+    /// §8.2 "try" mode (the three-mode region acquisition API
+    /// `fairWriterLockWithIo`/`tryFairWriterLockWithIo`/
+    /// `waitPathLockWithIo` are migrating onto): nonblocking, and --
+    /// unlike `tryAcquireWriter`, this method's own private building
+    /// block -- never jumps the FIFO: fails immediately if anyone is
+    /// already queued, rather than racing them for the CAS. Takes no
+    /// ticket on failure, so there is nothing to abandon; a failed call
+    /// leaves no trace.
+    pub fn tryAcquireWriterFair(self: *Region, pid: u32) bool {
+        const hdr = self.header();
+        if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) return false;
+        return self.tryAcquireWriter(pid);
+    }
+
+    /// §8.2 "fair blocking (FIFO ticket)" mode, bounded by `deadline`
+    /// (construct with `Io.Clock.now(.awake, io).addDuration(...)`):
+    /// `acquireWriter`'s own two-phase protocol, but able to give up
+    /// and return `error.Timeout` instead of blocking forever -- what
+    /// `fairWriterLockWithIo`'s own `deadline_ns` parameter needs.
+    ///
+    /// Giving up partway through is not simply "stop waiting": once a
+    /// ticket is taken, `head` only ever advances in whoever is
+    /// currently responsible for ticket number `head` (the waiter who
+    /// wins it, or -- new here -- the waiter who gives up on it). If a
+    /// timed-out waiter just walked away, nothing would ever move `head`
+    /// past its abandoned ticket, permanently wedging every ticket taken
+    /// after it. The two phases handle this differently, matching which
+    /// of them currently "owns" `head`:
+    ///
+    /// - **Phase 1** (`head != my_ticket` yet) does not own `head` --
+    ///   some earlier ticket does -- so it cannot safely move it. It
+    ///   marks its own ring slot in `ticketAbandonedOffset` instead:
+    ///   whichever later winner's `advanceHeadPastAbandoned` eventually
+    ///   reaches this ticket number sees the flag and continues past it
+    ///   on this ticket's behalf, exactly as if it had also just won and
+    ///   immediately stepped aside.
+    /// - **Phase 2** (`head == my_ticket`) already owns `head` -- it is
+    ///   this ticket's turn, the writer word is just still held by the
+    ///   previous winner -- so it advances `head` itself via the same
+    ///   `advanceHeadPastAbandoned` a real win would use, a "pseudo-win"
+    ///   that passes the turn along without ever touching `writer_holder`.
+    ///
+    /// Needs `io` (unlike `acquireWriter`) specifically to check it and
+    /// the deadline; not safe to call from a freshly forked child, for
+    /// the same reason `acquireWriter`'s own doc comment gives.
+    pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp) error{ Timeout, Canceled }!void {
+        const hdr = self.header();
+        if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
+        const my_ticket: u32 = @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+        while (true) {
+            const head = hdr.writer_ticket_head.load(.acquire);
+            if (head == my_ticket) break;
+            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) {
+                self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
+                return error.Timeout;
+            }
+            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
+        }
+        while (true) {
+            if (self.tryAcquireWriter(pid)) {
+                self.advanceHeadPastAbandoned();
+                return;
+            }
+            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) {
+                // Our own turn, but we're giving it up: step aside
+                // ourselves, exactly like a real win's own advance, just
+                // without ever touching `writer_holder`.
+                self.advanceHeadPastAbandoned();
+                return error.Timeout;
+            }
+            const epoch = hdr.writer_release_epoch.load(.acquire);
+            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
+        }
+    }
+
+    /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
+    /// aside for it (`acquireWriterFairBounded`'s own phase-2 timeout),
+    /// advances `head` past it and keeps advancing past any immediately
+    /// following tickets already marked abandoned, clearing each flag as
+    /// it passes (the ring slot is reused once ticket numbers wrap back
+    /// around to it). See `acquireWriterFairBounded`'s own doc comment
+    /// for why this skip is necessary at all. Wakes once after advancing
+    /// past everything it can, not once per step.
+    fn advanceHeadPastAbandoned(self: *Region) void {
+        const hdr = self.header();
+        const flags = self.ticketAbandonedFlags();
+        while (true) {
+            const new_head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
+            const slot = &flags[new_head % hdr.max_readers];
+            if (slot.load(.acquire) == 0) break;
+            slot.store(0, .monotonic);
+        }
+        futexWakeShared(&hdr.writer_ticket_head.raw);
     }
 
     /// Releases a writer hold taken by `acquireWriter`/`tryAcquireWriter`.
@@ -885,6 +996,18 @@ pub const Region = struct {
     fn readerSlots(self: *const Region) []ReaderSlot {
         const max_readers = self.header().max_readers;
         const base: [*]ReaderSlot = @ptrCast(@alignCast(self.mapping.ptr + header_bytes));
+        return base[0..max_readers];
+    }
+
+    /// The abandonment-flag ring `ticketAbandonedOffset` indexes into,
+    /// immediately after the liveness bytes. Plain shared memory (no
+    /// `fcntl` lock involved, unlike the liveness bytes right before it):
+    /// `0` means "not abandoned", `1` means "the holder of this ring
+    /// slot's ticket gave up without ever winning; whoever reaches this
+    /// ticket number should treat it as already resolved and continue".
+    fn ticketAbandonedFlags(self: *const Region) []std.atomic.Value(u8) {
+        const max_readers = self.header().max_readers;
+        const base: [*]std.atomic.Value(u8) = @ptrCast(@alignCast(self.mapping.ptr + header_bytes + @as(usize, max_readers) * reader_slot_bytes + max_readers));
         return base[0..max_readers];
     }
 
@@ -1776,4 +1899,160 @@ test "shared lock region: a kill -9'd reader's pin is cleared by the frontier sc
     const own_pid: u32 = @bitCast(std.c.getpid());
     const reclaimed = try region.claimReaderSlot(own_pid);
     try std.testing.expectEqual(child_slot, reclaimed);
+}
+
+test "shared lock region: tryAcquireWriterFair succeeds uncontended and refuses when anyone is queued" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-try-fair.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const pid: u32 = 4242;
+    try std.testing.expect(region.tryAcquireWriterFair(pid));
+    // Already held: a second try correctly fails (not "nobody queued yet"
+    // -- the word itself is busy).
+    try std.testing.expect(!region.tryAcquireWriterFair(pid + 1));
+    region.releaseWriter();
+    try std.testing.expect(region.tryAcquireWriterFair(pid + 1));
+    region.releaseWriter();
+}
+
+test "shared lock region: acquireWriterFairBounded succeeds once free and times out when it can't" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-bounded-fair.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const pid: u32 = 4242;
+    // Uncontended: succeeds well within a generous deadline.
+    try region.acquireWriterFairBounded(io, pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    // Still held by `pid`'s own hold above (never released): a short
+    // deadline against a genuinely busy word must time out, bounded,
+    // not hang.
+    const short_deadline = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(100));
+    try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, pid + 1, short_deadline));
+    region.releaseWriter();
+    // Free again: a fresh bounded acquire succeeds, proving the timed-out
+    // attempt above didn't leave the region in a bad state.
+    try region.acquireWriterFairBounded(io, pid + 1, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    region.releaseWriter();
+}
+
+// Ports writer_queue.zig's own "rule 6: cancelling a queued waiter does
+// not let a later one pass an earlier live one" to the region's ticket
+// ring: an earlier, still-active ticket must not be skipped or harmed by
+// a later ticket's own timeout, and tickets taken after the abandoned one
+// must still make progress once it's skipped -- not wedge forever, which
+// is exactly what would happen if whoever eventually reaches the
+// abandoned ticket's position in `head` didn't know to continue past it.
+test "shared lock region: an abandoned ticket does not wedge an earlier or a later one" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-abandon.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    try std.testing.expect(region.tryAcquireWriterFair(own_pid)); // ticketless hold
+
+    var ready1_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready1_fds));
+    var done1_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&done1_fds));
+
+    // Child 1: takes ticket 0 (the first contender after the ticketless
+    // hold above), waits patiently (unbounded) -- the "earlier live
+    // ticket" rule 6 says must not be skipped.
+    const child1_pid = std.c.fork();
+    if (child1_pid == 0) {
+        _ = std.posix.system.close(ready1_fds[0]);
+        _ = std.posix.system.close(done1_fds[0]);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready1_fds[1], @ptrCast(&sig), 1);
+        region.acquireWriter(my_pid);
+        var report: [1]u8 = .{1};
+        _ = std.c.write(done1_fds[1], @ptrCast(&report), 1);
+        region.releaseWriter();
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready1_fds[1]);
+    defer _ = std.posix.system.close(ready1_fds[0]);
+    _ = std.posix.system.close(done1_fds[1]);
+    defer _ = std.posix.system.close(done1_fds[0]);
+    var sig1: [1]u8 = undefined;
+    try readBounded(ready1_fds[0], &sig1, 2000);
+
+    var ready2_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready2_fds));
+    var timedout2_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&timedout2_fds));
+
+    // Child 2: takes ticket 1 (forked only after child 1's own ticket is
+    // taken, so fork order is ticket order, same assumption the N-process
+    // test above makes), with a short deadline it cannot possibly make --
+    // this process still holds the writer word and won't release for a
+    // while yet. This is the ticket that abandons.
+    const child2_pid = std.c.fork();
+    if (child2_pid == 0) {
+        _ = std.posix.system.close(ready2_fds[0]);
+        _ = std.posix.system.close(timedout2_fds[0]);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready2_fds[1], @ptrCast(&sig), 1);
+        const deadline = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(100));
+        const result = region.acquireWriterFairBounded(io, my_pid, deadline);
+        var report: [1]u8 = .{if (result) |_| 0 else |_| 1};
+        _ = std.c.write(timedout2_fds[1], @ptrCast(&report), 1);
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready2_fds[1]);
+    defer _ = std.posix.system.close(ready2_fds[0]);
+    _ = std.posix.system.close(timedout2_fds[1]);
+    defer _ = std.posix.system.close(timedout2_fds[0]);
+    var sig2: [1]u8 = undefined;
+    try readBounded(ready2_fds[0], &sig2, 2000);
+
+    // Child 2 must have genuinely timed out (not raced into winning)
+    // before this process releases -- generous margin past its own
+    // 100ms deadline.
+    var timedout_report: [1]u8 = undefined;
+    try readBounded(timedout2_fds[0], &timedout_report, 2000);
+    try std.testing.expectEqual(@as(u8, 1), timedout_report[0]);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child2_pid, 2000));
+
+    // Now release: child 1 (ticket 0, still patiently waiting) must win,
+    // not be harmed by ticket 1's abandonment.
+    region.releaseWriter();
+    var done1_report: [1]u8 = undefined;
+    try readBounded(done1_fds[0], &done1_report, 2000);
+    try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+
+    // Child 1's own release just advanced head past ticket 1's abandoned
+    // flag. The region must be left in a sane, usable state -- not
+    // wedged -- for whoever comes next.
+    try region.acquireWriterFairBounded(io, own_pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    region.releaseWriter();
 }
