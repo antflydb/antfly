@@ -68,6 +68,10 @@ class RestAuthority(BaseHTTPRequestHandler):
     # when native queries, enrichment, and publication run concurrently.
     _state_lock = threading.RLock()
 
+    # Match provider keep-alive to avoid a new TCP connection for every read.
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+
     def log_message(self, *args):
         pass
 
@@ -77,7 +81,8 @@ class RestAuthority(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        if self.command != "HEAD":
+            self.wfile.write(payload)
 
     def result(self):
         return {
@@ -127,6 +132,8 @@ class RestAuthority(BaseHTTPRequestHandler):
 
     @atomic_authority_operation
     def do_PUT(self):
+        # Drain the body even when the precondition fails and the socket is reused.
+        data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if urlsplit(self.path).path.rstrip("/") == "/archive":
             self.send_response(200)
             self.send_header("Content-Length", "0")
@@ -138,7 +145,6 @@ class RestAuthority(BaseHTTPRequestHandler):
             and path.name.startswith("antfly-")
             and path.suffix == ".parquet"
         ):
-            self.rfile.read(int(self.headers["Content-Length"]))
             return self.respond(503, {})
         if self.headers.get("If-None-Match") == "*" and path.exists():
             return self.respond(412, {})
@@ -151,7 +157,6 @@ class RestAuthority(BaseHTTPRequestHandler):
             if actual != expected:
                 return self.respond(412, {})
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = self.rfile.read(int(self.headers["Content-Length"]))
         path.write_bytes(data)
         self.send_response(200)
         self.send_header("Content-Length", "0")
@@ -1684,16 +1689,28 @@ def test_native_catalog_file_commit_read_and_restart(
                 stop()
                 start()
                 deadline = time.monotonic() + 180
+                scheduler_samples = []
                 while True:
                     scheduled = call("POST", maintenance, {"action": "status"})
                     progress = scheduled.get("state")
+                    sample = json.dumps(progress, sort_keys=True)
+                    if not scheduler_samples or scheduler_samples[-1][1] != sample:
+                        scheduler_samples.append(
+                            (round(deadline - time.monotonic(), 2), sample)
+                        )
+                        scheduler_samples = scheduler_samples[-32:]
                     if progress and progress.get("last_result"):
                         assert not progress.get("last_error"), scheduled
-                        if json.loads(progress["last_result"])["complete"]:
+                        result = json.loads(progress["last_result"])
+                        if (result.get("collection") or {}).get("phase") == "waiting":
+                            assert progress["next_ms"] > 0, scheduled
+                        if result["complete"]:
                             break
-                    assert time.monotonic() < deadline, (
-                        tmp_path / "server.log"
-                    ).read_text()[-5000:]
+                    assert time.monotonic() < deadline, {
+                        "scheduled": scheduled,
+                        "samples": scheduler_samples,
+                        "server_log": (tmp_path / "server.log").read_text()[-5000:],
+                    }
                     time.sleep(0.2)
                 stop()
                 start()

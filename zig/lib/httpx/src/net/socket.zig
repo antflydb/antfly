@@ -570,7 +570,22 @@ pub const Socket = struct {
                 .sec = @intCast(ms / 1000),
                 .usec = @intCast((ms % 1000) * 1000),
             };
-            try setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv));
+            setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv)) catch |err| {
+                // Darwin rejects even a valid timeout with EINVAL once TCP is
+                // defunct after a peer reset. Preserve genuine option errors
+                // on connected sockets and invalid descriptor diagnostics.
+                if (comptime builtin.os.tag.isDarwin()) {
+                    if (err == error.InvalidSocketOption) {
+                        var peer: PosixAddress = undefined;
+                        var length: posix.socklen_t = @sizeOf(PosixAddress);
+                        switch (posix.errno(posix.system.getpeername(self.handle, &peer.any, &length))) {
+                            .INVAL, .NOTCONN => return error.ConnectionResetByPeer,
+                            else => {},
+                        }
+                    }
+                }
+                return err;
+            };
         }
     }
 

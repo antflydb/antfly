@@ -201,7 +201,13 @@ pub fn merge(a: A, left_bytes: []const u8, right_bytes: []const u8, layout: *con
         var l = try left.cells(work, index);
         const r = try right.cells(work, index);
         if (l[0].value.integer < 0 or r[0].value.integer < 0) return error.InvalidSqlSpill;
-        const count = std.math.add(i64, l[0].value.integer, r[0].value.integer) catch return error.SqlNumericOutOfRange;
+        // Extrema and Boolean states record presence, not bag cardinality.
+        // Normalize legacy counts before addition, matching the shared reducer
+        // and avoiding overflow for arbitrarily weighted imported partials.
+        const count = if (ops.Aggregate.presenceOnly(slot.spec.kind))
+            @as(i64, @intFromBool(l[0].value.integer != 0 or r[0].value.integer != 0))
+        else
+            std.math.add(i64, l[0].value.integer, r[0].value.integer) catch return error.SqlNumericOutOfRange;
         const fixed = slot.kind == .lanes and (slot.spec.kind == .count or (slot.spec.kind == .sum and slot.spec.input_type == .integer) or slot.spec.kind == .bool_and or slot.spec.kind == .bool_or);
         if (fixed) {
             if (r[0].value.integer != 0) switch (slot.spec.kind) {
@@ -213,8 +219,8 @@ pub fn merge(a: A, left_bytes: []const u8, right_bytes: []const u8, layout: *con
                     l[1] = Datum.json(.{ .integer = @bitCast(@as(u64, @truncate(bits))) });
                     l[2] = Datum.json(.{ .integer = @bitCast(@as(u64, @truncate(bits >> 64))) });
                 },
-                .bool_and => l[6] = Datum.json(.{ .bool = l[6].value.bool and r[6].value.bool }),
-                .bool_or => l[6] = Datum.json(.{ .bool = l[6].value.bool or r[6].value.bool }),
+                .bool_and => l[6] = Datum.json(.{ .bool = if (l[0].value.integer == 0) r[6].value.bool else l[6].value.bool and r[6].value.bool }),
+                .bool_or => l[6] = Datum.json(.{ .bool = if (l[0].value.integer == 0) r[6].value.bool else l[6].value.bool or r[6].value.bool }),
                 .count => {},
                 else => unreachable,
             };
@@ -401,6 +407,8 @@ test "external lake aggregate compact record kernels preserve typed transitions 
         .{ .spec = .{ .kind = .sum, .input_type = .integer }, .left = &.{.{}}, .right = &.{n} },
         .{ .spec = .{ .kind = .bool_and, .input_type = .boolean }, .left = &.{y}, .right = &.{no} },
         .{ .spec = .{ .kind = .bool_or, .input_type = .boolean }, .left = &.{}, .right = &.{y} },
+        .{ .spec = .{ .kind = .bool_and, .input_type = .boolean }, .left = &.{}, .right = &.{y} },
+        .{ .spec = .{ .kind = .bool_and, .input_type = .boolean }, .left = &.{y}, .right = &.{} },
         .{ .spec = .{ .kind = .min, .input_type = .integer }, .left = &.{.{}}, .right = &.{n} },
         .{ .spec = .{ .kind = .max, .input_type = .boolean }, .left = &.{no}, .right = &.{y} },
         .{ .spec = .{ .kind = .min, .input_type = .string }, .left = &.{Datum.json(.{ .string = "z" })}, .right = &.{Datum.json(.{ .string = "a" })} },
@@ -432,6 +440,39 @@ test "external lake aggregate compact record kernels preserve typed transitions 
         var fixed_growth = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), mergeFaultScenario, .{ l, r, &layout, expected });
     }
+}
+
+test "external lake compact presence kernels normalize legacy counts before overflow checks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const specs = [_]ops.AggregateSpec{
+        .{ .kind = .bool_and, .input_type = .boolean },
+        .{ .kind = .bool_or, .input_type = .boolean },
+        .{ .kind = .min, .input_type = .integer },
+        .{ .kind = .max, .input_type = .integer },
+    };
+    for (specs) |spec| for (0..4) |mask| {
+        var left = try ops.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer left.deinit();
+        var right = try ops.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer right.deinit();
+        if (mask & 1 != 0) try left.update(Datum.json(if (spec.input_type == .boolean) .{ .bool = true } else .{ .integer = 7 }));
+        if (mask & 2 != 0) try right.update(Datum.json(if (spec.input_type == .boolean) .{ .bool = false } else .{ .integer = 3 }));
+        const recipe: Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "v", .type = spec.input_type.?, .nullable = true } }} };
+        const layout = try Layout.init(out, recipe);
+        const l = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{left}, .ordinal = 0 }, layout);
+        const r = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{right}, .ordinal = 0 }, layout);
+        if (left.count != 0) putWord(l, layout.header(), std.math.maxInt(i64));
+        if (right.count != 0) putWord(r, layout.header(), std.math.maxInt(i64));
+        // Empty imported Boolean lanes need not contain the identity value.
+        if (spec.kind == .bool_and and mask == 2) l[layout.header() + 8] = 0;
+        const actual = try merge(out, l, r, &layout);
+        try partial.merge(&left, right);
+        const expected = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{left}, .ordinal = 0 }, layout);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    };
 }
 
 test "external lake compact record kernels reject count and wide integer sum overflow" {

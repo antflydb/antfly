@@ -199,6 +199,11 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.server.deinit();
         return fail(err);
     };
+    // State is now at its final address. Begin optional disk recovery before
+    // admitting requests; never launch a worker against init's returned value.
+    state.server.prepareLakeCache() catch |err| {
+        std.log.warn("lake cache startup deferred: error.{s}", .{@errorName(err)});
+    };
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(@ptrCast(&state.server.incoming_graph_routes));
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;

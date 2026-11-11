@@ -124,6 +124,7 @@ pub const Reads = struct {
     }
     pub fn init(backend: stores.ArtifactStore) Reads {
         const vtable: stores.ArtifactStore.VTable = .{
+            .optional_read_view = optional_read_view,
             .object_store = if (backend.vtable.object_store != null) object_store else null,
             .retention_witness = if (backend.vtable.retention_witness != null) retention_witness else null,
             .retained_closure = if (backend.vtable.retained_closure != null) retained_closure else null,
@@ -159,6 +160,10 @@ pub const Reads = struct {
         handle.ptr = self;
         handle.vtable = &self.vtable;
         return handle;
+    }
+    fn optional_read_view(raw: *anyopaque) stores.ArtifactStore {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.optionalReadView();
     }
     fn object_store(raw: *anyopaque) *@import("../serverless/artifacts/object_store.zig").ObjectStore {
         const self: *Reads = @ptrCast(@alignCast(raw));
@@ -462,4 +467,43 @@ test "external lake artifact recovery preserves batch capability and partial fai
     vtable.put_scoped_many = null;
     var serial = Reads.init(.{ .allocator = std.testing.allocator, .ptr = undefined, .vtable = &vtable });
     try std.testing.expect(serial.store().vtable.put_scoped_many == null);
+}
+
+test "external lake optional opening reads preserve scope without promoting canonical loss to recovery" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("optional-canonical-recovery");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var reads = Reads.init(fs.artifactStore());
+    defer reads.close();
+    var required = reads.store();
+    required.upload_scope = try stores.UploadScope.forPublication(@splat(17), 1, std.testing.io);
+    required.namespace_identity = @splat(19);
+    required.point_read_blocks = true;
+    const hint = required.optionalReadView();
+    try std.testing.expectEqualDeep(required.upload_scope, hint.upload_scope);
+    try std.testing.expectEqualDeep(required.namespace_identity, hint.namespace_identity);
+    try std.testing.expect(hint.point_read_blocks);
+    const missing = try required.upload_scope.?.artifactId("0000000000000000000000000000000000000000000000000000000000000000");
+    try std.testing.expectError(error.FileNotFound, hint.vtable.get_alloc(hint.ptr, a, &missing));
+    try std.testing.expect(reads.cause() == null);
+    try std.testing.expectError(error.LakeIndexArtifactUnavailable, required.vtable.get_alloc(required.ptr, a, &missing));
+    try std.testing.expectEqual(error.FileNotFound, reads.cause().?);
+    // A provider/authorization wrapper which has not opted in remains in
+    // force. Hint reads may skip recovery classification, never permission.
+    const Protected = struct {
+        fn denied(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+            return error.Forbidden;
+        }
+    };
+    var backend = fs.artifactStore();
+    var vtable = backend.vtable.*;
+    vtable.get_alloc = Protected.denied;
+    backend.vtable = &vtable;
+    var protected_reads = Reads.init(backend);
+    defer protected_reads.close();
+    const protected_hint = protected_reads.store().optionalReadView();
+    try std.testing.expectError(error.Forbidden, protected_hint.vtable.get_alloc(protected_hint.ptr, a, &missing));
+    try std.testing.expect(protected_reads.cause() == null);
 }

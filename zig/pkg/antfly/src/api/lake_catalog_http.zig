@@ -74,6 +74,16 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
             else => return err,
         };
         server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
+        // Persist the accepted suffix's recent vector jobs before returning
+        // when they fit this request's bounded preparation window. A restart
+        // must not depend on a volatile publication wakeup to find these jobs.
+        // Durable WAL acceptance remains successful if enrichment is pending.
+        var recent_context = context;
+        recent_context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+        @import("lake_index_text_query.zig").reconcileRecent(a, server, table.*, recent_context) catch |err| {
+            @import("lake_owned_cut_jobs.zig").schedule(server, table.*);
+            std.log.warn("lake accepted vector preparation deferred err={s}", .{@errorName(err)});
+        };
         return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .read_receipt = @import("antfly_local_sources").sql_read_requirements.Receipt{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = lsn }, .wal_lsn = lsn, .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) };
     }
     if (request.action == .reconcile) {
