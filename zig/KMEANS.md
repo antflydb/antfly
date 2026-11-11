@@ -226,3 +226,112 @@ checks passed, all 100,000 members remained present, and no leaf exceeded 128.
 Fixed-budget recall and warm query time improved on this fixture, but absolute
 recall is low, these are not matched-recall measurements, and they reuse one
 synthetic seed. This result does not support enabling e-means splits by default.
+
+### Full-corpus Cohere Parquet benchmark
+
+The benchmark accepts the VectorDBBench Cohere `train.parquet`, `test.parquet`,
+and `neighbors.parquet` files. The preparation script decodes and L2-normalizes
+the embeddings in batches. Both CPU builders use squared L2 on those unit
+vectors and the same held-out cosine neighbor IDs.
+
+From `zig/`, with NumPy and PyArrow installed:
+
+```sh
+python3 tools/prepare_cohere_bulk_bench.py "$cohere_parquet_dir" .benchmark-results/cohere-prepared
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build bench-build-quality -Doptimize=ReleaseFast
+for algo in emeans kmeans; do
+  zig-out/bin/bench_build_quality \
+    .benchmark-results/cohere-prepared/train.f32 \
+    .benchmark-results/cohere-prepared/queries.f32 \
+    .benchmark-results/cohere-prepared/truth.u64 \
+    768 "$algo" full ".benchmark-results/cohere-prepared/index-$algo" 4096
+done
+```
+
+Use fresh output directories for the preparation and each index build. The
+`full` mode passes all prepared vectors to one clustering run, stages storage
+commits with a 64 MiB target, and publishes a native posting generation on
+local storage. The prepared float32 file supplies exact vectors. The benchmark
+reopens and activates the published generation, verifies tree links and row
+count, and measures recall@100 across a probe sweep.
+
+Timings cover Parquet decode, normalization and local vector-file writing
+(`prepare.json`), then fixture loading, HBC construction, leaf clustering
+within construction, and native posting publication (`full_build_phase`).
+The million-vector run uses a shared 4,096-vector leaf capacity to limit the
+CPU cost of flat, all-centroid assignment. The 3.072 GB vector matrix is
+held in memory during training. This is a local analogue of lake posting construction
+and excludes remote reads, object-store upload, and lake manifest publication.
+
+One measured build per optimizer on Cohere 1M, 768 dimensions, CPU, normalized
+L2, 4,096-vector leaves and 100 held-out queries:
+
+| Stage | Lloyd | e-means |
+| --- | ---: | ---: |
+| Shared Parquet decode, normalization, and float32 write | 17.42 s | 17.42 s |
+| Leaf clustering | 711.77 s | 468.49 s |
+| Other HBC construction | 99.40 s | 105.45 s |
+| Native posting publication | 1.63 s | 1.88 s |
+| Parquet preparation through reopened sidecar, summed phases | 831.47 s | 594.68 s |
+| Recall@100 at 64 probes | 95.59% | 95.77% |
+| Mean query time at 64 probes | 7.45 ms | 7.49 ms |
+
+E-means reduced measured construction and posting publication from 13m33s to
+9m36s. Both published generations reopened and verified all 1,000,000 rows.
+The full sweep and phase data are in
+[`emeans_cohere_1m.json`](bench/vectors/emeans_cohere_1m.json). The workstation
+was shared and memory pressure varied during these single runs. A build-cache
+eviction removed the completed e-means output and Lloyd's scratch directories.
+Lloyd continued with its original in-memory input after the empty scratch
+directories were recreated. The timing and validation logs survived.
+
+### Sampled e-means leaf training
+
+The optional `bulk_build_training_sample_size` setting selects a uniform
+reservoir across the prepared input rows. E-means fits the same number of
+centroids as a full-corpus build, using only the sample during training.
+A single exact assignment pass routes every vector to the trained centroids.
+The existing packer splits large groups into leaves within the configured
+capacity and recomputes their leaf centroids.
+
+To reproduce the sampled arm on the prepared Cohere 1M fixture, append the
+sample size after the leaf capacity:
+
+```sh
+zig-out/bin/bench_build_quality \
+  .benchmark-results/cohere-prepared/train.f32 \
+  .benchmark-results/cohere-prepared/queries.f32 \
+  .benchmark-results/cohere-prepared/truth.u64 \
+  768 emeans full .benchmark-results/cohere-prepared/index-sampled 4096 50000
+```
+
+The comparison uses 245 trained centroids for both arms and a leaf cap of
+4,096. The reservoir contains 50,000 rows, and the input remains the same
+normalized 3.072 GB vector matrix. The probe reports training time, full
+corpus routing time, leaf occupancy, and held-out recall and query timing.
+
+Measured on the same prepared Cohere input in two consecutive runs:
+
+| Metric | Full training | 50K sample |
+| --- | ---: | ---: |
+| Leaf training and final assignment | 189.28 s | 34.23 s |
+| HBC build through native sidecar reopen | 273.51 s | 87.59 s |
+| Local Parquet-to-reopen phase sum | 290.25 s | 104.39 s |
+| Final leaves | 342 | 367 |
+| Leaf members, min / mean / max | 1,220 / 2,924 / 4,091 | 800 / 2,725 / 4,095 |
+| Whole-process peak RSS | 3.22 GiB | 3.70 GiB |
+| Recall@100 at 64 probes | 95.77% | 95.16% |
+| First tested probe count at or above 95.5% recall | 64 | 72 |
+| Recall@100 and mean query time at that point | 95.77%, 9.59 ms | 95.53%, 6.27 ms |
+
+The sampled arm spent 8.11 seconds selecting and training on the sample and
+26.12 seconds routing the corpus and sorting its assignments. Both runs
+verified the reopened tree and all one million members. The local phase sum
+includes the same 16.27-second Parquet preparation in each column. The sample
+reduced the measured local build time by about 2.8x. Both arms held the full
+vector matrix, and sampled training did not reduce observed peak RSS. The
+probe sweep compares a recall threshold on one fixture. Its query timings are
+single-run observations from a shared workstation.
+
+See [`emeans_sampled_cohere_1m.json`](bench/vectors/emeans_sampled_cohere_1m.json)
+for the complete phases and recall/latency sweep.

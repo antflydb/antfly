@@ -6691,27 +6691,29 @@ test "kmeans bulk builders pack bounded leaves" {
     try std.testing.expect(mock.max_internal_children <= 2);
     try std.testing.expectEqual(@as(usize, inputs.len), built.member_count);
 
-    var experimental = MockIndex{
-        .alloc = std.testing.allocator,
-        .config = .{ .dims = 2, .leaf_size = 2, .branching_factor = 2, .metric = .l2_squared, .kmeans_backend = .cpu, .use_quantization = false },
-        .rng = go_rand.GoPcg.init(42, 1024),
-    };
-    defer experimental.deinit();
-    var e_built = try buildBulkClusteredFromInputs(&experimental, {}, &inputs, true);
-    defer e_built.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, inputs.len), e_built.member_count);
-    try std.testing.expect(experimental.max_leaf_members <= 2);
-    try std.testing.expect(experimental.max_internal_children <= 2);
-    var seen: [6]bool = @splat(false);
-    var nodes = experimental.nodes.valueIterator();
-    while (nodes.next()) |node| {
-        if (!node.is_leaf) continue;
-        for (node.members) |id| {
-            try std.testing.expect(!seen[id - 1]);
-            seen[id - 1] = true;
+    for ([_]usize{ 0, 3 }) |sample_size| {
+        var experimental = MockIndex{
+            .alloc = std.testing.allocator,
+            .config = .{ .dims = 2, .leaf_size = 2, .branching_factor = 2, .metric = .l2_squared, .kmeans_backend = .cpu, .use_quantization = false, .bulk_build_training_sample_size = sample_size },
+            .rng = go_rand.GoPcg.init(42, 1024),
+        };
+        defer experimental.deinit();
+        var e_built = try buildBulkClusteredFromInputs(&experimental, {}, &inputs, true);
+        defer e_built.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, inputs.len), e_built.member_count);
+        try std.testing.expect(experimental.max_leaf_members <= 2);
+        try std.testing.expect(experimental.max_internal_children <= 2);
+        var seen: [6]bool = @splat(false);
+        var nodes = experimental.nodes.valueIterator();
+        while (nodes.next()) |node| {
+            if (!node.is_leaf) continue;
+            for (node.members) |id| {
+                try std.testing.expect(!seen[id - 1]);
+                seen[id - 1] = true;
+            }
         }
+        for (seen) |present| try std.testing.expect(present);
     }
-    for (seen) |present| try std.testing.expect(present);
 
     var hierarchical = MockIndex{
         .alloc = std.testing.allocator,
@@ -10914,7 +10916,24 @@ fn buildBulkClusteredFromInputs(
     const entries = try self.alloc.alloc(kmeans.Entry, inputs.len);
     defer self.alloc.free(entries);
 
-    const stats = try kmeans.run(.{
+    const sample_size = self.config.bulk_build_training_sample_size;
+    if (sample_size != 0 and (!emeans or sample_size < cluster_count or sample_size > points.len)) {
+        return error.InvalidBulkTrainingSample;
+    }
+    const sampled = sample_size != 0 and sample_size < points.len;
+    const cluster_started = kmeans.monotonicNs();
+    const sample = if (sampled) try self.alloc.dupe(kmeans.Point, points[0..sample_size]) else null;
+    defer if (sample) |values| self.alloc.free(values);
+    if (sample) |values| {
+        // Reservoir sampling gives every row equal inclusion probability
+        // without assuming that Parquet row groups are shuffled.
+        for (sample_size..points.len) |i| {
+            const slot = self.rng.intN(i + 1);
+            if (slot < sample_size) values[slot] = points[i];
+        }
+    }
+    const training = sample orelse points;
+    const config: kmeans.RunConfig = .{
         .emeans = emeans,
         .allocator = self.alloc,
         .dims = dims,
@@ -10922,9 +10941,21 @@ fn buildBulkClusteredFromInputs(
         .max_iter = self.config.kmeans_max_iter,
         .backend = self.config.kmeans_backend,
         .update_strategy = self.config.kmeans_update_strategy,
-        .dense_vectors = dense_vectors,
-    }, points, self.rng.intN(inputs.len), centroids, next_centroids, assignments, distances, counts, entries);
+        .dense_vectors = if (sampled) null else dense_vectors,
+    };
+    const stats = try kmeans.run(config, training, self.rng.intN(training.len), centroids, next_centroids, assignments[0..training.len], distances[0..training.len], counts, entries[0..training.len]);
+    const trained = kmeans.monotonicNs();
     recordKmeansRunStats(self, stats);
+    if (sampled) {
+        recordKmeansRunStats(self, try kmeans.assignFixedCenters(config, points, centroids, assignments, distances, entries));
+    }
+    if (comptime @hasField(childType(@TypeOf(self)), "write_profile")) {
+        const finished = kmeans.monotonicNs();
+        self.write_profile.bulk_build_leaf_cluster_ns += finished -| cluster_started;
+        self.write_profile.bulk_build_leaf_training_rows = training.len;
+        self.write_profile.bulk_build_leaf_training_ns += trained -| cluster_started;
+        self.write_profile.bulk_build_leaf_route_ns += if (sampled) finished -| trained else 0;
+    }
 
     var current_count: usize = 0;
     var current = try self.alloc.alloc(BuiltBulkNode, inputs.len);
@@ -10954,6 +10985,15 @@ fn buildBulkClusteredFromInputs(
             current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
             self.alloc.free(group_inputs);
             current_count += 1;
+            if (comptime @hasField(childType(@TypeOf(self)), "write_profile")) {
+                const profile = &self.write_profile;
+                profile.bulk_build_leaf_min_members = if (profile.bulk_build_leaf_count == 0)
+                    group_size
+                else
+                    @min(profile.bulk_build_leaf_min_members, group_size);
+                profile.bulk_build_leaf_max_members = @max(profile.bulk_build_leaf_max_members, group_size);
+                profile.bulk_build_leaf_count += 1;
+            }
             entry_cursor += group_size;
         }
         self.alloc.free(leaf_groups);

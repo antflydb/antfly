@@ -225,6 +225,27 @@ fn initCentroids(
     }
 }
 
+/// Route unit-weight points to fixed centers and produce the sorted entries
+/// expected by the bulk leaf packer.
+pub fn assignFixedCenters(
+    config: RunConfig,
+    points: []const Point,
+    centers: []const f32,
+    assignments: []usize,
+    distances: []f32,
+    entries: []Entry,
+) !RunStats {
+    if (config.dims == 0 or centers.len == 0 or centers.len % config.dims != 0) return error.InvalidDimensions;
+    if (assignments.len != points.len or distances.len != points.len or entries.len != points.len) return error.InvalidDimensions;
+    const started = monotonicNs();
+    assign(config, points, centers, assignments, distances);
+    var stats: RunStats = .{};
+    try recordAssignmentStats(&stats, points.len, .{ .used_metal = false, .ns = elapsedNsSince(started) });
+    populateEntries(entries, assignments, distances);
+    sortEntries(points, entries);
+    return stats;
+}
+
 fn assign(
     config: RunConfig,
     points: []const Point,
@@ -354,7 +375,7 @@ fn elapsedNsSince(start_ns: u64) u64 {
     return monotonicNs() -| start_ns;
 }
 
-fn monotonicNs() u64 {
+pub fn monotonicNs() u64 {
     if (builtin.os.tag == .freestanding) {
         fallback_counter_ns +%= 1;
         return fallback_counter_ns;

@@ -115,6 +115,8 @@ pub const HBCConfig = struct {
     /// is roughly 1.3 standard deviations, so small values miss neighbors.
     quantization_refine_margin: f32 = 2,
     bulk_build_algo: BulkBuildAlgo = .hilbert_seeded,
+    /// Optional reservoir size for e-means bulk leaf training. Zero uses all rows.
+    bulk_build_training_sample_size: usize = 0,
     prefer_key_local_leaf_splits: bool = false,
     key_local_leaf_split_penalty: f32 = 1.10,
     max_cached_nodes: usize = 100_000,
