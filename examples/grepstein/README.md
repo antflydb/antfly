@@ -776,7 +776,9 @@ audio MIME is inferred from the native format detector without decoding samples.
 Direct-URL transcription also reserves the downloader’s temporary body buffers,
 including compressed input and output-buffer growth. Body capacities are capped
 at `max_download_bytes`. Gzip is decoded as bytes arrive, without retaining the
-encoded recording. Deflate retains a bounded replay buffer for its zlib/raw
+encoded recording. Every gzip member is decoded and its CRC32/size verified;
+the encoded and decoded ceilings apply to the whole member sequence. Wrapped
+deflate checks its Adler-32 checksum and retains a bounded replay buffer for its zlib/raw
 format fallback, so the general admission bound remains three times the limit.
 A separate 8 MiB transport quota covers TLS buffers, trust roots and HTTP
 metadata. `DownloadContext.transport_memory_limit_bytes` configures that quota

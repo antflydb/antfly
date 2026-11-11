@@ -3402,6 +3402,61 @@ pub const Client = struct {
         const vtable = IoReaderHelpers.makeVTable(readVec);
     };
 
+    const BoundedBodyListWriter = struct {
+        allocator: Allocator,
+        output: *std.ArrayListUnmanaged(u8),
+        limit: usize,
+        pub fn writeAll(self: @This(), bytes: []const u8) !void {
+            try appendBoundedBody(self.allocator, self.output, bytes, self.limit);
+        }
+    };
+
+    fn verifyContentFooter(hasher: *flate.Container.Hasher, metadata: flate.Container.Metadata) !void {
+        switch (hasher.*) {
+            .gzip => |*gzip| if (metadata.gzip.crc != gzip.crc.final() or metadata.gzip.count != gzip.count) return error.DecompressionFailed,
+            .zlib => |zlib| if (metadata.zlib.adler != zlib.adler) return error.DecompressionFailed,
+            .raw => {},
+        }
+    }
+
+    /// Decode every gzip member before reporting completion. Encoded-byte
+    /// accounting and HTTP framing belong to the bounded input adapter; this
+    /// helper owns the aggregate decoded ceiling and each member's integrity.
+    fn writeGzipMembers(input: *Io.Reader, writer: anytype, max_size: usize, progress_cb: ?WriterProgressCallback, progress_ctx: ?*anyopaque) !usize {
+        var total: usize = 0;
+        var members: usize = 0;
+        var window: [flate.max_window_len]u8 = undefined;
+        var output: [16 * 1024]u8 = undefined;
+        while (true) {
+            if (members != 0) {
+                // Common gzip producers pad with zeroes. Skip padding in
+                // buffered spans, while retaining the encoded input ceiling.
+                while (true) {
+                    const next = input.peekGreedy(1) catch |err| {
+                        if (err == error.EndOfStream) return total;
+                        return err;
+                    };
+                    if (next[0] != 0) break;
+                    input.toss(next.len - std.mem.trimStart(u8, next, "\x00").len);
+                }
+            }
+            var decoder = flate.Decompress.init(input, .gzip, &window);
+            var checksum = flate.Container.Hasher.init(.gzip);
+            while (true) {
+                const n = decoder.reader.readSliceShort(&output) catch return error.DecompressionFailed;
+                if (n == 0) break;
+                const next_total = try checkedResponseSize(total, n, max_size);
+                try writer.writeAll(output[0..n]);
+                checksum.update(output[0..n]);
+                total = next_total;
+                if (progress_cb) |cb| cb(.{ .bytes_written = @intCast(total), .total_bytes = null }, progress_ctx);
+            }
+            // std.flate exposes trailer values but does not verify them.
+            try verifyContentFooter(&checksum, decoder.container_metadata);
+            members += 1;
+        }
+    }
+
     fn appendBoundedBody(a: Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8, limit: usize) !void {
         const required = try checkedResponseSize(output.items.len, bytes.len, limit);
         if (required > output.capacity) try output.ensureTotalCapacityPrecise(a, @min(limit, std.ArrayListUnmanaged(u8).growCapacity(required)));
@@ -3419,6 +3474,7 @@ pub const Client = struct {
         var decompress_window: [flate.max_window_len]u8 = undefined;
         var decompressor = flate.Decompress.init(&encoded_reader, container, &decompress_window);
         var read_buf: [16 * 1024]u8 = undefined;
+        var checksum = flate.Container.Hasher.init(container);
 
         while (true) {
             const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
@@ -3428,7 +3484,9 @@ pub const Client = struct {
             if (n == 0) break;
             _ = try checkedResponseSize(output.items.len, n, max_size);
             try appendBoundedBody(allocator, output, read_buf[0..n], max_size);
+            checksum.update(read_buf[0..n]);
         }
+        try verifyContentFooter(&checksum, decompressor.container_metadata);
     }
 
     fn appendDeflateDecompressed(
@@ -3521,7 +3579,7 @@ pub const Client = struct {
             chunked_reader = ChunkedBodyReader.init(body_source, &chunked_buf);
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
-            if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
+            if (len > std.math.maxInt(usize) or len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -3552,32 +3610,13 @@ pub const Client = struct {
         if (content_coding == .gzip) {
             var encoded_buffer: [8192]u8 = undefined;
             var encoded = BoundedBodyReader.init(framed_reader, max_size, &encoded_buffer);
-            var window: [flate.max_window_len]u8 = undefined;
-            var decompressor = flate.Decompress.init(&encoded.reader_iface, .gzip, &window);
-            while (true) {
-                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
-                    try encoded.checkLimit();
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
-                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
-                    if (err == error.EndOfStream) break;
-                    return error.DecompressionFailed;
-                };
-                if (n == 0) break;
-                try appendBoundedBody(body_allocator, &result, read_buf[0..n], max_size);
-            }
-            // Gzip EOF is not HTTP EOF. Consume trailers/framing and enforce
-            // the encoded ceiling even when the decoder has finished early.
-            while (true) {
-                const n = readSomeOnce(&encoded.reader_iface, &read_buf) catch |err| {
-                    try encoded.checkLimit();
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
-                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
-                    if (err == error.EndOfStream) break;
-                    if (err == error.ReadFailed and close_delimited_body) break;
-                    return error.InvalidResponse;
-                };
-                if (n == 0) break;
-            }
+            const output = BoundedBodyListWriter{ .allocator = body_allocator, .output = &result, .limit = max_size };
+            _ = writeGzipMembers(&encoded.reader_iface, output, max_size, null, null) catch |err| {
+                try encoded.checkLimit();
+                if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                return err;
+            };
         } else if (content_coding == .deflate) {
             var compressed = std.ArrayListUnmanaged(u8).empty;
             defer compressed.deinit(body_allocator);
@@ -3676,7 +3715,7 @@ pub const Client = struct {
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
             if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
-            if (content_coding == null and len > max_response_size) return error.ResponseTooLarge;
+            if (len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -3705,11 +3744,23 @@ pub const Client = struct {
                     max_response_size,
                 );
             }
-        } else if (content_coding) |coding| {
+        } else if (content_coding == .gzip) {
+            var encoded_buffer: [8192]u8 = undefined;
+            var encoded = BoundedBodyReader.init(framed_reader, max_response_size, &encoded_buffer);
+            written_total = writeGzipMembers(&encoded.reader_iface, writer, max_response_size, progress_cb, progress_ctx) catch |err| {
+                try encoded.checkLimit();
+                if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                return err;
+            };
+        } else if (content_coding == .deflate) {
+            var bounded_buffer: [8192]u8 = undefined;
+            var bounded = BoundedBodyReader.init(framed_reader, max_response_size, &bounded_buffer);
             var encoded_prefix: [2]u8 = undefined;
             var encoded_prefix_len: usize = 0;
             while (encoded_prefix_len < encoded_prefix.len) {
-                const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
+                const n = readSomeOnce(&bounded.reader_iface, encoded_prefix[encoded_prefix_len..]) catch |err| {
+                    try bounded.checkLimit();
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
@@ -3723,16 +3774,17 @@ pub const Client = struct {
             var encoded_prefix_buffer: [8192]u8 = undefined;
             var encoded_reader = PrefixedReader.init(
                 encoded_prefix[0..encoded_prefix_len],
-                framed_reader,
+                &bounded.reader_iface,
                 &encoded_prefix_buffer,
             );
 
-            if (coding == .deflate and hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
+            if (hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
                 const body_allocator = self.config.http1_response_body_allocator orelse parser.allocator;
                 var encoded = std.ArrayListUnmanaged(u8).empty;
                 defer encoded.deinit(body_allocator);
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
+                        try bounded.checkLimit();
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
@@ -3759,19 +3811,16 @@ pub const Client = struct {
                     .total_bytes = null,
                 }, progress_ctx);
             } else {
-                const container: flate.Container = switch (coding) {
-                    .gzip => .gzip,
-                    .deflate => .raw,
-                };
                 var decompress_window: [flate.max_window_len]u8 = undefined;
                 var decompressor = flate.Decompress.init(
                     &encoded_reader.reader_iface,
-                    container,
+                    .raw,
                     &decompress_window,
                 );
 
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        try bounded.checkLimit();
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
@@ -3791,6 +3840,18 @@ pub const Client = struct {
                         .total_bytes = null,
                     }, progress_ctx);
                 }
+            }
+            // A raw decoder may finish before its HTTP body. Drain through
+            // the same counter, so padding cannot evade the encoded ceiling.
+            while (true) {
+                const n = readSomeOnce(&bounded.reader_iface, &read_buf) catch |err| {
+                    try bounded.checkLimit();
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                    if (err == error.EndOfStream) break;
+                    return err;
+                };
+                if (n == 0) break;
             }
         } else {
             while (true) {
@@ -7159,5 +7220,69 @@ test "buffered gzip streams within two body buffers and enforces encoded and dec
             try std.testing.expect(!body_quota.exceeded);
         }
         try std.testing.expectEqual(@as(usize, 0), body_quota.live);
+    }
+}
+
+test "compressed responses share complete members integrity and bounds across buffered and writer paths" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const TestServer = @import("../testing.zig").TestServer;
+    const hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00";
+    const multi = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05\x00\x00\x00";
+    const padded = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const empty = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const bad_crc = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf7\xf9\x81\xed\x06\x00\x00\x00";
+    const bad_size = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x07\x00\x00\x00";
+    const bad_second = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x42\x11\x77\x3a\x05\x00\x00\x00";
+    const truncated_second = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05";
+    const junk = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x67\x61\x72\x62\x61\x67\x65";
+    const decoded_over = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x0d\x00\x00\x00\xc2\xa0\xf7\x4f\x6d\x0f\x07\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xef\x06\x78\xf9\x28\xad\xdc\xff\x00\x00";
+    const encoded_over = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const zlib_valid = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00\x1a\x0b\x04\x5d";
+    const zlib_bad = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00\x1a\x0b\x04\x5c";
+    const raw_valid = "\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00";
+    const raw_over = "\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const cases = [_]struct { wire: []const u8, coding: []const u8 = "gzip", decoded: []const u8 = "", limit: usize = 256, expected: ?anyerror = null }{
+        .{ .wire = hello, .decoded = "hello " },
+        .{ .wire = multi, .decoded = "hello world" },
+        .{ .wire = padded, .decoded = "hello world" },
+        .{ .wire = empty },
+        .{ .wire = bad_crc, .expected = error.DecompressionFailed },
+        .{ .wire = bad_size, .expected = error.DecompressionFailed },
+        .{ .wire = bad_second, .expected = error.DecompressionFailed },
+        .{ .wire = truncated_second, .expected = error.DecompressionFailed },
+        .{ .wire = junk, .expected = error.DecompressionFailed },
+        .{ .wire = decoded_over, .limit = 1024, .expected = error.ResponseTooLarge },
+        .{ .wire = encoded_over, .limit = 64, .expected = error.ResponseTooLarge },
+        .{ .wire = zlib_valid, .coding = "deflate", .decoded = "hello world" },
+        .{ .wire = zlib_bad, .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = raw_valid, .coding = "deflate", .decoded = "hello world" },
+        .{ .wire = raw_over, .coding = "deflate", .limit = 64, .expected = error.ResponseTooLarge },
+    };
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]bool{ false, true }) |chunked| {
+            for (cases) |case| {
+                const wire = if (chunked) try std.fmt.allocPrint(a, "{x}\r\n{s}\r\n0\r\n\r\n", .{ case.wire.len, case.wire }) else try a.dupe(u8, case.wire);
+                defer a.free(wire);
+                var server = try TestServer.start(a, io, &.{.{ .path = "/", .respond = .{ .body = wire, .chunked = chunked, .headers = &.{.{ .name = "Content-Encoding", .value = case.coding }} } }});
+                defer server.deinit();
+                var serving = try io.concurrent(TestServer.handleOne, .{&server});
+                defer serving.cancel(io) catch {};
+                var client = Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                var output = std.ArrayListUnmanaged(u8).empty;
+                defer output.deinit(a);
+                const result = if (to_writer) client.getToWriter(server.baseUrl(), .{ .max_response_size = case.limit }, arrayListWriter(&output, a), null, null) else client.get(server.baseUrl(), .{ .max_response_size = case.limit });
+                if (result) |value| {
+                    var reply = value;
+                    defer reply.deinit();
+                    if (case.expected != null) return error.AcceptedInvalidCompressedResponse;
+                    try std.testing.expectEqualStrings(case.decoded, if (to_writer) output.items else reply.body orelse "");
+                } else |err| {
+                    if (case.expected) |expected| try std.testing.expectEqual(expected, err) else return err;
+                }
+                try std.testing.expect(output.items.len <= case.limit);
+            }
+        }
     }
 }
