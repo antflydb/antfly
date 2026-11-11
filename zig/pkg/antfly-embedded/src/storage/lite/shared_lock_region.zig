@@ -441,12 +441,22 @@ pub const Region = struct {
         return @ptrCast(@alignCast(self.mapping.ptr));
     }
 
+    /// Byte offset of ticket ring slot `ticket % max_readers`'s owner
+    /// word (packed `pid`/liveness-slot, `packHolder`'s own encoding),
+    /// immediately after the reader slot array -- 8-byte aligned for any
+    /// `max_readers` value, since the reader slot array's own size is
+    /// always a multiple of 8. See `ticketOwnerPids`'s own doc comment
+    /// for what this is for.
+    fn ticketOwnerOffset(max_readers: u32) usize {
+        return header_bytes + @as(usize, max_readers) * reader_slot_bytes;
+    }
+
     /// Byte offset of liveness slot `slot_index`'s dedicated byte,
-    /// immediately after the reader slot array (§8.1's "M*1 process
+    /// immediately after the ticket owner ring (§8.1's "M*1 process
     /// liveness bytes, one per slot"). Content is never read or written;
     /// the byte exists purely as an `fcntl` lock target.
     fn livenessByteOffset(max_readers: u32, slot_index: u32) i64 {
-        return @as(i64, header_bytes) + @as(i64, max_readers) * reader_slot_bytes + @as(i64, slot_index);
+        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 8 + @as(i64, slot_index);
     }
 
     /// Byte offset of ticket `ticket`'s abandonment flag, in a fixed ring
@@ -459,9 +469,11 @@ pub const Region = struct {
     /// current callers never have more than `max_readers` of this
     /// region's own tickets genuinely outstanding at once (every ticket-
     /// taker already needed a liveness slot to open this region at all,
-    /// so `max_readers` already bounds concurrent callers more broadly).
+    /// so `max_readers` already bounds concurrent callers more broadly;
+    /// `acquireWriter`/`acquireWriterFairBounded` also actively enforce
+    /// this bound -- see their own "ring full" backoff).
     fn ticketAbandonedOffset(max_readers: u32, ticket: u32) i64 {
-        return @as(i64, header_bytes) + @as(i64, max_readers) * (reader_slot_bytes + 1) + @as(i64, ticket % max_readers);
+        return @as(i64, livenessByteOffset(max_readers, 0)) + @as(i64, max_readers) + @as(i64, ticket % max_readers);
     }
 
     /// `probeDead`, but for *this process's own* liveness slot index
@@ -627,7 +639,7 @@ pub const Region = struct {
             try ensureNoLivePeer(raw_fd, &existing_raw, size);
         }
         if (need_init) {
-            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 2);
+            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 10);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -701,7 +713,7 @@ pub const Region = struct {
         if (claimed_max_readers == 0 or claimed_max_readers > max_sane_readers) {
             return RegionError.RegionCorrupt;
         }
-        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 2);
+        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 10);
         if (implied_bytes > actual_file_bytes) {
             // The claimed slot count doesn't even fit the file's actual
             // size -- the header is corrupt enough that this count can't
@@ -809,21 +821,34 @@ pub const Region = struct {
         // queued -- otherwise a new arrival could win the CAS ahead of an
         // earlier ticket already parked and waiting its turn.
         if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
-        const my_ticket: u32 = @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+        // `rawFutexWaitShared`, not an uncancelable wait with no Io: see
+        // this function's own module-level peers for why it takes none,
+        // and `tryHelpDeadTicketAt`'s own doc comment for why phase 1
+        // needs a *bounded* step at all now, not a true indefinite park.
+        var backoff_ms: u32 = ring_full_backoff_initial_ms;
+        const my_ticket: u32 = while (true) {
+            if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
+            backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
+        };
+        self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
-            futexWaitShared(&hdr.writer_ticket_head.raw, head);
+            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_ticket_head.raw, head, dead_ticket_check_step_ms);
+            const head2 = hdr.writer_ticket_head.load(.acquire);
+            if (head2 == my_ticket) break;
+            if (head2 == head) self.tryHelpDeadTicketAt(head2);
         }
         while (true) {
             if (self.tryAcquireWriter(pid)) {
-                // Won. Advance head (and past any already-abandoned
-                // tickets right after it -- see `advanceHeadPastAbandoned`)
-                // so ticket `my_ticket + 1` (if any) leaves phase 1 and
-                // enters its own phase 2, and wake whoever is parked for
-                // that -- including a spurious wake of a later ticket
-                // still waiting on the old head value, which simply
-                // re-checks and re-parks.
+                // Won. Advance head (and past any already-abandoned or
+                // dead-owned tickets right after it -- see
+                // `advanceHeadPastAbandoned`) so ticket `my_ticket + 1`
+                // (if any) leaves phase 1 and enters its own phase 2, and
+                // wake whoever is parked for that -- including a
+                // spurious wake of a later ticket still waiting on the
+                // old head value, which simply re-checks and re-parks.
                 self.advanceHeadPastAbandoned();
                 return;
             }
@@ -832,7 +857,7 @@ pub const Region = struct {
             // itself (see this function's own doc comment, and
             // `writer_release_epoch`'s own, for why).
             const epoch = hdr.writer_release_epoch.load(.acquire);
-            futexWaitShared(&hdr.writer_release_epoch.raw, epoch);
+            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_release_epoch.raw, epoch, null);
         }
     }
 
@@ -848,6 +873,47 @@ pub const Region = struct {
         const hdr = self.header();
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) return false;
         return self.tryAcquireWriter(pid);
+    }
+
+    /// `true` when there is a ticket queued (regardless of whether it
+    /// belongs to this process or a foreign one) -- §8.2's "fair
+    /// blocking (FIFO ticket)" mode's own query for the "is anyone
+    /// waiting at all" question `PathWriterLock.othersWaiting` needs. An
+    /// atomic load, same as `acquireWriter`'s own ticketless fast-path
+    /// check.
+    pub fn othersWaiting(self: *const Region) bool {
+        const hdr = self.header();
+        return hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)));
+    }
+
+    /// Like `othersWaiting`, but true only if at least one *currently
+    /// live* queued ticket belongs to a different process than
+    /// `own_pid` -- `PathWriterLock.othersWaitingAcrossProcesses`'s own
+    /// query, for a caller (`WriterLane`'s own `checkin`) that must not
+    /// treat its own same-process callers (reaching the queue through a
+    /// different path) as a hostile waiter to release for, the same
+    /// distinction `writer_queue.zig`'s own per-ticket pid byte made.
+    /// Scans every outstanding ticket (bounded by `max_readers`, same as
+    /// every other scan in this file), skipping ones already known
+    /// abandoned or dead -- a ticket that will never actually show up to
+    /// claim the lease should not count as "someone is waiting" either.
+    pub fn othersWaitingAcrossProcesses(self: *const Region, own_pid: u32) bool {
+        const hdr = self.header();
+        const head = hdr.writer_ticket_head.load(.monotonic);
+        const tail: u32 = @truncate(hdr.writer_ticket_tail.load(.monotonic));
+        if (head == tail) return false;
+        const owners = self.ticketOwnerPids();
+        const flags = self.ticketAbandonedFlags();
+        var t = head;
+        while (t != tail) : (t +%= 1) {
+            const idx = t % hdr.max_readers;
+            if (flags[idx].load(.acquire) != 0) continue;
+            const owner = owners[idx].load(.acquire);
+            if (holderPid(owner) == own_pid) continue;
+            if (self.isSlotDead(holderLivenessSlot(owner))) continue;
+            return true;
+        }
+        return false;
     }
 
     /// §8.2 "fair blocking (FIFO ticket)" mode, bounded by `deadline`
@@ -884,7 +950,12 @@ pub const Region = struct {
     pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp) error{ Timeout, Canceled }!void {
         const hdr = self.header();
         if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
-        const my_ticket: u32 = @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+        const my_ticket: u32 = while (true) {
+            if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
+            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
+        };
+        self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
@@ -893,6 +964,8 @@ pub const Region = struct {
                 return error.Timeout;
             }
             antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
+            const head2 = hdr.writer_ticket_head.load(.acquire);
+            if (head2 == head) self.tryHelpDeadTicketAt(head2);
         }
         while (true) {
             if (self.tryAcquireWriter(pid)) {
@@ -911,24 +984,95 @@ pub const Region = struct {
         }
     }
 
-    /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
-    /// aside for it (`acquireWriterFairBounded`'s own phase-2 timeout),
-    /// advances `head` past it and keeps advancing past any immediately
-    /// following tickets already marked abandoned, clearing each flag as
-    /// it passes (the ring slot is reused once ticket numbers wrap back
-    /// around to it). See `acquireWriterFairBounded`'s own doc comment
-    /// for why this skip is necessary at all. Wakes once after advancing
-    /// past everything it can, not once per step.
-    fn advanceHeadPastAbandoned(self: *Region) void {
+    /// Bound on how many of this region's own tickets may be
+    /// simultaneously outstanding (taken but not yet resolved), enforced
+    /// by `ringHasRoom` before `acquireWriter`/`acquireWriterFairBounded`
+    /// ever call `fetchAdd` on `writer_ticket_tail`: past this point,
+    /// `ticket % max_readers` would collide with an older, still-
+    /// unresolved ticket's own ring slots (owner, abandoned-flag). Tied
+    /// to `max_readers` rather than a separate constant because every
+    /// ticket-taker already needed a liveness slot to open this region
+    /// at all (§8.3), so this bound was already implied; enforcing it
+    /// explicitly, rather than only documenting it, is what turns "an
+    /// assumption this step's callers happen to satisfy" into something
+    /// that fails safe (backs off; never silently corrupts a ring slot)
+    /// if a future caller ever doesn't.
+    fn ringHasRoom(self: *const Region) bool {
         const hdr = self.header();
+        const outstanding = hdr.writer_ticket_tail.load(.monotonic) -% hdr.writer_ticket_head.load(.monotonic);
+        return outstanding < hdr.max_readers;
+    }
+
+    const ring_full_backoff_initial_ms: u32 = 5;
+    const ring_full_backoff_max_ms: u32 = 50;
+    /// How often a phase-1 waiter re-checks whether the ticket currently
+    /// at `head` is abandoned or dead-owned, when nothing has woken it
+    /// in the meantime. See `tryHelpDeadTicketAt`'s own doc comment.
+    const dead_ticket_check_step_ms: u32 = 50;
+
+    /// `true` (and clears the abandonment flag, if that is why) when
+    /// ticket `ticket` is already resolved one way or another -- either
+    /// explicitly abandoned, or its recorded owner is provably dead --
+    /// without this call itself needing to own or win it.
+    fn ticketResolvedWithoutOwning(self: *Region, ticket: u32) bool {
+        const hdr = self.header();
+        const idx = ticket % hdr.max_readers;
         const flags = self.ticketAbandonedFlags();
-        while (true) {
-            const new_head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
-            const slot = &flags[new_head % hdr.max_readers];
-            if (slot.load(.acquire) == 0) break;
-            slot.store(0, .monotonic);
+        if (flags[idx].load(.acquire) != 0) {
+            flags[idx].store(0, .monotonic);
+            return true;
+        }
+        const owner = self.ticketOwnerPids()[idx].load(.acquire);
+        return owner != 0 and self.isSlotDead(holderLivenessSlot(owner));
+    }
+
+    /// Called by a waiter stuck making no progress on `head` (any phase,
+    /// any ticket -- it only ever looks at `head`'s *current* value, not
+    /// its own ticket) to check whether `head`'s current occupant is a
+    /// ticket whose own recorded owner has died -- `kill -9` of a queued
+    /// waiter, in either of *its* phases, same as the abandonment case
+    /// `acquireWriterFairBounded`'s own doc comment covers, except this
+    /// one never got the chance to mark its own flag. Nobody else is
+    /// normally responsible for moving `head` past a ticket once it's
+    /// stuck there, so without this, a dead queued waiter would wedge
+    /// every ticket after it exactly as a leaked abandonment would.
+    ///
+    /// A `cmpxchg`, not an unconditional advance like
+    /// `advanceHeadPastAbandoned`'s own first step: more than one other
+    /// waiter can notice the same dead occupant on the same bounded
+    /// step, and only the one that wins should continue the skip-chain.
+    /// The others simply loop back to their own wait, see the new `head`
+    /// value, and proceed normally.
+    fn tryHelpDeadTicketAt(self: *Region, stuck_head: u32) void {
+        if (!self.ticketResolvedWithoutOwning(stuck_head)) return;
+        const hdr = self.header();
+        if (hdr.writer_ticket_head.cmpxchgStrong(stuck_head, stuck_head +% 1, .release, .monotonic) != null) return;
+        self.continueSkippingFrom(stuck_head +% 1);
+    }
+
+    /// After `head` has just become `current_head` -- because its own
+    /// rightful ticket just won or stepped aside, or because
+    /// `tryHelpDeadTicketAt` just won the right to advance past a dead
+    /// occupant -- keeps advancing past any immediately following
+    /// tickets that are themselves already resolved, then wakes once.
+    fn continueSkippingFrom(self: *Region, current_head: u32) void {
+        const hdr = self.header();
+        var head = current_head;
+        while (self.ticketResolvedWithoutOwning(head)) {
+            head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
         }
         futexWakeShared(&hdr.writer_ticket_head.raw);
+    }
+
+    /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
+    /// aside for it (`acquireWriterFairBounded`'s own phase-2 timeout),
+    /// advances `head` past it and delegates to `continueSkippingFrom`
+    /// for anything immediately following that is also already
+    /// resolved.
+    fn advanceHeadPastAbandoned(self: *Region) void {
+        const hdr = self.header();
+        const new_head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
+        self.continueSkippingFrom(new_head);
     }
 
     /// Releases a writer hold taken by `acquireWriter`/`tryAcquireWriter`.
@@ -1007,7 +1151,27 @@ pub const Region = struct {
     /// ticket number should treat it as already resolved and continue".
     fn ticketAbandonedFlags(self: *const Region) []std.atomic.Value(u8) {
         const max_readers = self.header().max_readers;
-        const base: [*]std.atomic.Value(u8) = @ptrCast(@alignCast(self.mapping.ptr + header_bytes + @as(usize, max_readers) * reader_slot_bytes + max_readers));
+        const base: [*]std.atomic.Value(u8) = @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(ticketAbandonedOffset(max_readers, 0)))));
+        return base[0..max_readers];
+    }
+
+    /// A ring of `max_readers` packed owner words (`packHolder`'s own
+    /// `(pid, liveness_slot)` encoding), one per `ticket % max_readers`,
+    /// written when a ticket is taken and read for two purposes:
+    ///
+    /// 1. `othersWaitingAcrossProcesses` -- telling a genuinely foreign
+    ///    waiter apart from this same process's own other caller (its
+    ///    own background maintenance worker, say) reaching the queue
+    ///    through a different path, the same distinction
+    ///    `writer_queue.zig`'s own per-ticket pid byte made.
+    /// 2. Dead-ticket-holder detection -- a waiter stuck making no
+    ///    progress on `head` probes this ring slot's liveness; see
+    ///    `tryHelpDeadTicketAt`'s own doc comment for the full case this
+    ///    closes (a `kill -9` of a queued waiter, in either phase, that
+    ///    never gets the chance to mark its own abandonment).
+    fn ticketOwnerPids(self: *const Region) []std.atomic.Value(u64) {
+        const max_readers = self.header().max_readers;
+        const base: [*]std.atomic.Value(u64) = @ptrCast(@alignCast(self.mapping.ptr + ticketOwnerOffset(max_readers)));
         return base[0..max_readers];
     }
 
@@ -2054,5 +2218,293 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
     // flag. The region must be left in a sane, usable state -- not
     // wedged -- for whoever comes next.
     try region.acquireWriterFairBounded(io, own_pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    region.releaseWriter();
+}
+
+// A kill -9 on an abandoning waiter (the test above) still gets to run
+// its own cleanup code -- it chooses to mark its own abandonment flag
+// before giving up. A kill -9 on a *queued* waiter gets no such chance:
+// the signal lands while it's blocked inside `acquireWriter` with no
+// opportunity to run anything at all. `writer_queue.zig`'s own "dead
+// waiters" rule existed for exactly this case; this ports it to the
+// region's ticket ring. The fix this test exercises is
+// `tryHelpDeadTicketAt`: a later waiter, stuck on `head` with no
+// progress for a full bounded step, probes `head`'s current occupant's
+// liveness slot itself and performs the skip -- no winner's own cleanup
+// pass is involved at all, since the dead ticket's holder never reaches
+// (and never will reach) the code that would normally do that.
+test "shared lock region: a dead queued waiter does not wedge a later one" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-dead-queued.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    try std.testing.expect(region.tryAcquireWriterFair(own_pid)); // ticketless hold; nobody queued yet.
+
+    // Child 0: takes ticket 0 -- the very first ticket, so it is
+    // immediately "at head" (its own phase 2), legitimately parked
+    // waiting for this process's own ticketless hold to free up. It is
+    // killed before it ever resolves -- no win, no voluntary abandon --
+    // so nothing *it* runs ever calls `continueSkippingFrom` on its own
+    // behalf. The only way forward is a later waiter's own bounded-step
+    // poll on `head`.
+    var ready0_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready0_fds));
+    const child0_pid = std.c.fork();
+    if (child0_pid == 0) {
+        _ = std.posix.system.close(ready0_fds[0]);
+        // See the kill-9'd-writer test's own comment: without this,
+        // ticket 0's recorded owner would carry the inherited
+        // `own_liveness_slot` number whose real lock the *parent* (not
+        // this child) still holds, so no later waiter's dead-check
+        // would ever see it as dead.
+        region.reclaimLivenessAfterFork() catch std.c._exit(1);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready0_fds[1], @ptrCast(&sig), 1);
+        region.acquireWriter(my_pid); // never returns: killed first.
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready0_fds[1]);
+    defer _ = std.posix.system.close(ready0_fds[0]);
+    var sig0: [1]u8 = undefined;
+    try readBounded(ready0_fds[0], &sig0, 2000);
+
+    // Wait until child 0 has genuinely taken ticket 0 (not merely
+    // signaled that it is about to try) before forking child 1 or
+    // killing it -- observed directly off the region's own shared
+    // header, visible to this process through the same mapping.
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) == 0) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 2000) return error.TestTimeout;
+        }
+    }
+
+    // Child 1: forked *while child 0 is still alive*, so that when it
+    // claims its own liveness slot below, child 0's own slot is still
+    // genuinely held and gets skipped -- it ends up with a distinct
+    // slot number of its own. Forking only after killing child 0 would
+    // let child 1's scan reclaim child 0's now-freed slot number for
+    // itself, aliasing the two and making `isSlotDead` see child 1's
+    // own, very much alive, hold on that same slot index instead of
+    // ever noticing child 0 is gone -- a `fcntl`-byte-range-reuse trap
+    // distinct from (but adjacent to) the ones this file's own module
+    // doc comment already lists. It takes ticket 1 -- genuinely behind
+    // (not yet at) head when it starts waiting, real "phase 1" the same
+    // way the coordinator's own wording means it.
+    var ready1_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready1_fds));
+    var done1_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&done1_fds));
+    const child1_pid = std.c.fork();
+    if (child1_pid == 0) {
+        _ = std.posix.system.close(ready1_fds[0]);
+        _ = std.posix.system.close(done1_fds[0]);
+        region.reclaimLivenessAfterFork() catch std.c._exit(1);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready1_fds[1], @ptrCast(&sig), 1);
+        region.acquireWriter(my_pid);
+        var report: [1]u8 = .{1};
+        _ = std.c.write(done1_fds[1], @ptrCast(&report), 1);
+        region.releaseWriter();
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready1_fds[1]);
+    defer _ = std.posix.system.close(ready1_fds[0]);
+    _ = std.posix.system.close(done1_fds[1]);
+    defer _ = std.posix.system.close(done1_fds[0]);
+    var sig1: [1]u8 = undefined;
+    try readBounded(ready1_fds[0], &sig1, 2000);
+
+    // Confirm ticket 1 is genuinely taken before killing child 0 or
+    // releasing, so the eventual win below cannot be a race that
+    // happened to work out some other way.
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) < 2) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 2000) return error.TestTimeout;
+        }
+    }
+
+    // The actual crash: a real SIGKILL, not a cooperative exit, and only
+    // now -- after child 1 already holds its own distinct liveness slot
+    // -- so child 0's freed slot cannot be reclaimed out from under this
+    // test's own assumptions.
+    _ = std.c.kill(child0_pid, std.c.SIG.KILL);
+    _ = try reapBounded(child0_pid, 2000);
+
+    // Give child 1 a real chance to have already run its own dead-ticket
+    // poll and skip past ticket 0 *before* this process ever releases --
+    // proving the skip itself doesn't depend on this release at all,
+    // only the final win does. Not load-bearing for correctness (the
+    // release below would eventually unstick things either way via the
+    // same poll), just makes the scenario this test means to exercise
+    // unambiguous.
+    try io.sleep(.fromMilliseconds(250), .awake);
+    try std.testing.expectEqual(@as(u32, 1), region.header().writer_ticket_head.load(.monotonic));
+
+    region.releaseWriter();
+    var done1_report: [1]u8 = undefined;
+    try readBounded(done1_fds[0], &done1_report, 2000);
+    try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+
+    // Left in a sane, usable state.
+    try std.testing.expect(region.tryAcquireWriterFair(own_pid));
+    region.releaseWriter();
+}
+
+// The owner-pid and abandoned-ticket rings are both sized by
+// `max_readers`, keyed by `ticket % max_readers` -- safe only as long as
+// no more than `max_readers` of this region's own tickets are ever
+// genuinely outstanding at once (otherwise two live tickets would alias
+// the same ring slot). `ringHasRoom` enforces that bound before either
+// `acquireWriter` or `acquireWriterFairBounded` ever takes a ticket at
+// all, rather than merely documenting it. This test fills a
+// deliberately tiny ring (`max_readers = 2`) to its exact limit and
+// confirms a bounded third arrival is refused (times out without ever
+// taking a ticket, rather than aliasing an existing one), and that
+// normal service resumes once room frees up.
+test "shared lock region: the ticket ring refuses to grow past max_readers outstanding" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-ring-full.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.openSized(a, io, db_path, 2);
+    defer region.close();
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    try std.testing.expect(region.tryAcquireWriterFair(own_pid)); // ticketless hold.
+
+    // `max_readers = 2` sizes the ticket ring tightly enough that two
+    // outstanding tickets alone already fill it -- deliberately, so
+    // this test can reach "exactly full" with only two child processes.
+    // Unlike the dead-queued-waiter test above, this one is purely
+    // about ring-capacity bookkeeping (`ringHasRoom`), not liveness or
+    // death detection, so neither child calls `reclaimLivenessAfterFork`
+    // -- they ride along on this process's own already-claimed slot
+    // (inherited, but never reclaimed independently) rather than each
+    // needing a distinct one of their own, which `max_readers = 2`
+    // alone (this process's own open already consumes one of the two)
+    // could not otherwise provide to two separate children at once.
+    //
+    // Child 0 takes ticket 0 (immediately at head, phase 2) and parks,
+    // blocked on this process's own hold.
+    var ready0_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready0_fds));
+    var done0_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&done0_fds));
+    const child0_pid = std.c.fork();
+    if (child0_pid == 0) {
+        _ = std.posix.system.close(ready0_fds[0]);
+        _ = std.posix.system.close(done0_fds[0]);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready0_fds[1], @ptrCast(&sig), 1);
+        region.acquireWriter(my_pid);
+        var report: [1]u8 = .{1};
+        _ = std.c.write(done0_fds[1], @ptrCast(&report), 1);
+        region.releaseWriter();
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready0_fds[1]);
+    defer _ = std.posix.system.close(ready0_fds[0]);
+    _ = std.posix.system.close(done0_fds[1]);
+    defer _ = std.posix.system.close(done0_fds[0]);
+    var sig0: [1]u8 = undefined;
+    try readBounded(ready0_fds[0], &sig0, 2000);
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) < 1) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 2000) return error.TestTimeout;
+        }
+    }
+
+    // Child 1 takes ticket 1 -- still behind head (phase 1) -- filling
+    // the ring to its exact `max_readers` limit.
+    var ready1_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready1_fds));
+    var done1_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&done1_fds));
+    const child1_pid = std.c.fork();
+    if (child1_pid == 0) {
+        _ = std.posix.system.close(ready1_fds[0]);
+        _ = std.posix.system.close(done1_fds[0]);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready1_fds[1], @ptrCast(&sig), 1);
+        region.acquireWriter(my_pid);
+        var report: [1]u8 = .{1};
+        _ = std.c.write(done1_fds[1], @ptrCast(&report), 1);
+        region.releaseWriter();
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready1_fds[1]);
+    defer _ = std.posix.system.close(ready1_fds[0]);
+    _ = std.posix.system.close(done1_fds[1]);
+    defer _ = std.posix.system.close(done1_fds[0]);
+    var sig1: [1]u8 = undefined;
+    try readBounded(ready1_fds[0], &sig1, 2000);
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) < 2) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 2000) return error.TestTimeout;
+        }
+    }
+
+    // Exactly full: 2 outstanding tickets against `max_readers = 2`.
+    try std.testing.expect(!region.ringHasRoom());
+
+    // A third arrival, bounded: must refuse to take a ticket at all
+    // (which would alias ticket 0's or ticket 1's own ring slot) and
+    // instead time out once the deadline passes, ring still exactly as
+    // full as it was.
+    const third_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(200));
+    try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, own_pid, third_deadline));
+    try std.testing.expectEqual(@as(u64, 2), region.header().writer_ticket_tail.load(.monotonic));
+
+    // Release: child 0 wins, advances head past its own ticket, frees
+    // one ring slot.
+    region.releaseWriter();
+    var done0_report: [1]u8 = undefined;
+    try readBounded(done0_fds[0], &done0_report, 2000);
+    try std.testing.expectEqual(@as(u8, 1), done0_report[0]);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child0_pid, 2000));
+    try std.testing.expect(region.ringHasRoom());
+
+    // Child 1 then wins its own turn in the normal way.
+    var done1_report: [1]u8 = undefined;
+    try readBounded(done1_fds[0], &done1_report, 2000);
+    try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+
+    // Left in a sane, usable state, ring fully drained.
+    try std.testing.expect(region.ringHasRoom());
+    try std.testing.expect(region.tryAcquireWriterFair(own_pid));
     region.releaseWriter();
 }
