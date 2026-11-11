@@ -39,6 +39,12 @@ from conftest import (
 )
 
 
+# The matched loopback runner installs this observer. Default qualification is
+# unchanged; phase changes never drain startup/background provider activity.
+def network_phase(name):
+    pass
+
+
 pytestmark = [
     pytest.mark.iceberg_integration,
     pytest.mark.fresh_antfly_process,
@@ -91,6 +97,23 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
     gcs_prefix = os.environ.get("ANTFLY_E2E_GCS_PREFIX")
     token_file = os.environ.get("ANTFLY_E2E_GCS_TOKEN_FILE")
     token = None
+    api_base = os.environ.get("ANTFLY_E2E_GCS_LOOPBACK_BASE")
+    if api_base:
+        from urllib.parse import urlsplit
+
+        endpoint = urlsplit(api_base)
+        assert (
+            endpoint.scheme == "http"
+            and endpoint.hostname == "127.0.0.1"
+            and endpoint.port
+        )
+        assert (
+            not endpoint.path
+            and not endpoint.query
+            and not endpoint.fragment
+            and not endpoint.username
+            and not endpoint.password
+        )
     is_gcs = provider.startswith("gcs")
     remote_source = provider == "gcs_remote"
     if is_gcs:
@@ -136,6 +159,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "capabilities": ["storage.primary"],
                 "external_io": {
                     "protocol": "gcs",
+                    **(
+                        {
+                            "endpoint": api_base + "/storage/v1",
+                            "upload_endpoint": api_base + "/upload/storage/v1",
+                        }
+                        if api_base
+                        else {}
+                    ),
                     "buckets": [gcs_bucket],
                     "prefix": gcs_prefix,
                     "credentials": {
@@ -156,6 +187,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 + ([] if publication_blocked else ["lake.write"]),
                 "external_io": {
                     "protocol": "gcs",
+                    **(
+                        {
+                            "endpoint": api_base + "/storage/v1",
+                            "upload_endpoint": api_base + "/upload/storage/v1",
+                        }
+                        if api_base
+                        else {}
+                    ),
                     "buckets": [gcs_bucket],
                     "prefix": gcs_prefix,
                     "credentials": {
@@ -254,7 +293,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
 
             def put_remote(name, body):
                 r = requests.post(
-                    f"https://storage.googleapis.com/upload/storage/v1/b/{gcs_bucket}/o",
+                    f"{api_base or 'https://storage.googleapis.com'}/upload/storage/v1/b/{gcs_bucket}/o",
                     params={
                         "uploadType": "media",
                         "name": f"{gcs_prefix}/source/archive/{name}",
@@ -982,8 +1021,10 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             cache_root = (server.root / "serving-cache").resolve()
             assert cache_root.parent == server.root.resolve()
             shutil.rmtree(cache_root, ignore_errors=True)
+            network_phase("cold_startup")
             cold_started = time.monotonic()
             server.resume()
+            network_phase("cold_query")
             response, usage = measure(
                 logical_process_reader(server.proc.pid),
                 lambda: requests.post(
@@ -999,6 +1040,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             )
             assert_highlights(response.json()["responses"][0], profile_term)
             record_property("cold_cache_query", json.dumps(usage))
+            network_phase("after_cold_query")
             record_property(
                 "cold_cache_startup_and_query_ms",
                 (time.monotonic() - cold_started) * 1000,

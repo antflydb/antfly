@@ -31,6 +31,84 @@ from lake_network_store import Network, NetworkStore
 
 
 class NetworkStoreTest(unittest.TestCase):
+    def test_resumable_upload_retains_atomic_generation_preconditions_and_cleanup(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            NetworkStore(Path(root) / "store") as service,
+        ):
+
+            def begin():
+                request = Request(
+                    service.url
+                    + "/upload/storage/v1/b/lake-benchmark/o?uploadType=resumable&name=object&ifGenerationMatch=0",
+                    data=b"{}",
+                    method="POST",
+                    headers={"X-Upload-Content-Length": "6"},
+                )
+                with urlopen(request) as response:
+                    return response.headers["Location"]
+
+            session = begin()
+            with self.assertRaises(HTTPError) as progress:
+                urlopen(
+                    Request(
+                        session,
+                        data=b"abc",
+                        method="PUT",
+                        headers={"Content-Range": "bytes 0-2/6"},
+                    )
+                )
+            self.assertEqual(progress.exception.code, 308)
+            with urlopen(
+                Request(
+                    session,
+                    data=b"def",
+                    method="PUT",
+                    headers={"Content-Range": "bytes 3-5/6"},
+                )
+            ) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(service.store.get("object")["size"], "6")
+            with self.assertRaises(HTTPError) as error:
+                urlopen(
+                    Request(
+                        begin(),
+                        data=b"abcdef",
+                        method="PUT",
+                        headers={"Content-Range": "bytes 0-5/6"},
+                    )
+                )
+            self.assertEqual(error.exception.code, 412)
+            session = begin()
+            with urlopen(Request(session, method="DELETE")) as response:
+                self.assertEqual(response.status, 204)
+            self.assertEqual(service.upload_bytes, 0)
+            self.assertEqual(service.uploads, {})
+
+    def test_connection_setup_cost_is_paid_once_on_a_reused_connection(self):
+        from http.client import HTTPConnection
+        from urllib.parse import urlsplit
+
+        with (
+            tempfile.TemporaryDirectory() as root,
+            NetworkStore(Path(root) / "store", Network(connection_ms=10)) as service,
+        ):
+            host = urlsplit(service.url)
+            connection = HTTPConnection(host.hostname, host.port, timeout=5)
+            try:
+                for _ in range(2):
+                    connection.request("GET", "/storage/v1/b/lake-benchmark")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                service.wait_idle()
+                summary = service.summary("setup")
+                self.assertEqual(summary["requests"], 2)
+                self.assertEqual(summary["connections"], 1)
+                self.assertGreaterEqual(summary["connection_setup_ns"], 10_000_000)
+            finally:
+                connection.close()
+
     def test_versions_conditional_writes_ranges_and_listing(self):
         with (
             tempfile.TemporaryDirectory() as root,

@@ -1445,3 +1445,34 @@ through the 32/64 MiB gates. Pipeline opening time is now attributed explicitly.
 Transport priority/deadline/cancellation and control-response bounds have focused
 regressions; new optimized latency and publication-readiness qualification are
 required before claiming improvement. No correctness or readiness limit is relaxed.
+
+
+### Matched loopback qualification
+
+`zig/tools/benchmark_hn_network.py` runs the same composed fixture as real GCS:
+the provided HN corpus, history/current overlay, highlights, retained restart
+cursors, concurrent changes and unchanged publication barrier. It uses explicit
+loopback GCS endpoints with bearer credentials, queries immediately after cold
+startup, and never waits for provider idleness before timing. Reports separate
+startup/query provider traffic, duplicate reads, request waves and connection
+reuse. Request latency, jitter, bandwidth, provider concurrency and a synthetic
+per-connection setup cost are explicit inputs. The latter models setup cost;
+the fixture still uses HTTP and does not implement real TLS or Google auth.
+
+```sh
+uv run --project zig/e2e/antfly --locked --extra lake --extra iceberg python -B \
+  zig/tools/benchmark_hn_network.py --binary zig/zig-out/bin/antfly \
+  --corpus-dir qualification-assets/composed-real-10k/archive --rows 10000 \
+  --latency-ms 100 --jitter-ms 30 --connection-ms 50 --bandwidth-mib 16 \
+  --concurrency 8 --output-dir .benchmark-results/lake/hn-matched-stored
+```
+
+Repeat with `--no-store-source` and a new output directory for Parquet hydration.
+This is a matched local performance/correctness gate; real-GCS qualification
+remains required. Current engine changes include bounded inline map navigation,
+artifact-client reuse, charged chunk hydration and exact-flight joining. The
+previous 738ff2c6d5 GCS samples were 1.819 s stored-source / 4.068 s Parquet; both
+full GCS cases passed and cleaned their prefixes (879/811 versions, zero
+remaining). That candidate's HN fixture failed its first pending dense query
+with `index_rebuilding` after immediate restart. New timings and HN validation
+are required; sub-second GCS cold latency is not established.

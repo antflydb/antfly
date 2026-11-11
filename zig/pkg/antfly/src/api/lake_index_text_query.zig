@@ -384,26 +384,26 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
             }
         };
     }
+    // One stable artifact client serves descriptor admission, the retained
+    // manifest and index reads. Dropping temporary clients between these steps
+    // discards their live connection pools on every cold/current preparation.
+    prepared.store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
+    const store = &prepared.store;
+    defer if (!transferred) store.deinit();
+    store.implementation.cloud_io = server.embedding_provider_runtime.io;
+    store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = prepared.retained_context };
     var manifest_ahead: ManifestAhead = .{};
     defer manifest_ahead.deinit(server.embedding_provider_runtime.io);
     if (prepared.native_cut) |cut| {
-        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
-        defer cut_store.deinit();
-        cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
-        cut_store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context };
-        var artifacts = cut_store.artifactStore();
-        if (cut.manifest) |ref| manifest_ahead.start(server, ref, cut_store.cache_identity, prepared.retained_context);
-        retained_pin = try retained_api.loadOwned(ra, &artifacts, cut_store.identity, table, cut, now_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context, .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context });
+        var artifacts = store.artifactStore();
+        if (cut.manifest) |ref| manifest_ahead.start(server, ref, store.cache_identity, prepared.retained_context);
+        retained_pin = try retained_api.loadOwned(ra, &artifacts, store.identity, table, cut, now_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = prepared.retained_context });
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     }
     if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
-        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
-        defer cut_store.deinit();
-        cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
-        cut_store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context };
-        var artifacts = cut_store.artifactStore();
-        retained_pin = try retained_api.loadWithGroups(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context);
+        var artifacts = store.artifactStore();
+        retained_pin = try retained_api.loadWithGroups(ra, &artifacts, store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context);
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     };
@@ -429,21 +429,13 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     options.authoritative_metadata = prepared.native_cut != null;
     options.native_reader_protected = if (prepared.native_owner) |owner| owner.enabled else false;
     if (prepared.native_cut) |cut| if (cut.manifest) |ref| {
-        var manifest_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
-        defer manifest_store.deinit();
-        manifest_store.implementation.cloud_io = server.embedding_provider_runtime.io;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = manifest_store.cache_identity, .context = context };
-        prepared.manifest_pin = try @import("lake_index_decoded_metadata.zig").acquire(Manifest, cached, manifest_store.artifactStore(), try Manifest.artifact(ref), retained_cancellation, Manifest.load);
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
+        prepared.manifest_pin = try @import("lake_index_decoded_metadata.zig").acquire(Manifest, cached, store.artifactStore(), try Manifest.artifact(ref), retained_cancellation, Manifest.load);
         options.retained_manifest = prepared.manifest_pin.?.value.bytes;
     };
     defer if (!transferred) if (prepared.manifest_pin) |pin| pin.release();
-    // Publication bindings retain &store.implementation: initialize the store
-    // at its final heap address before selecting/binding any publication.
-    // Owned queries reference already durable state. Enforce their no-upload
-    // contract through a read-only artifact store, including fresh requests.
-    prepared.store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
-    const store = &prepared.store;
-    defer if (!transferred) store.deinit();
+    // The stable client opened above remains read-only for owned cuts and
+    // resumed cursors; no retained upload is admitted by these reads.
     if (retained == null) try server.retainLakeQueryStore(a, store, table.table_id, request);
     store.implementation.cloud_io = server.embedding_provider_runtime.io;
     store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
@@ -877,6 +869,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     owner.cloud_generations = selected.publication().cloud_generations;
     if (has_vectors) if (owner.overlay) |pending_overlay| {
         const recent_prepared: @import("lake_recent_vectors.zig").Prepared = if (prepared.retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud, .runs = cut.recent_runs } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms, &server.lake_recent_vector_jobs) catch |err| {
+            // Recent jobs need their own recovery wakeup even when native
+            // serving-cut admission is disabled. A publication-only wakeup
+            // cannot rebuild a pending dense/sparse suffix after restart.
+            @import("lake_owned_cut_jobs.zig").schedule(server, current_table);
             server.notifyLakeCommit(table.name) catch {};
             return err;
         };

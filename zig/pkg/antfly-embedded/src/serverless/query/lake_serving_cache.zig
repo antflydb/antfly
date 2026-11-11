@@ -1275,6 +1275,13 @@ pub const Reader = struct {
         // Prefer an existing exact disk entry before widening. Upgrades and
         // range-only requests must retain their restart cache benefit.
         if (try self.lookupRangeLease(alloc, read, key)) |lease| return lease;
+        // Coalesced prefetch registers exact member flights before dispatch.
+        // Join that work before widening to a different physical window; a
+        // second key would bypass deduplication and reread the same bytes.
+        while (!self.cache.mutex.tryLock()) std.atomic.spinLoopHint();
+        const already_loading = self.cache.flights.contains(key);
+        self.cache.mutex.unlock();
+        if (already_loading) return readExactLease(raw, alloc, read);
         if (try self.readAheadLease(alloc, read)) |lease| return lease;
         return readExactLease(raw, alloc, read);
     }
@@ -2642,4 +2649,54 @@ test "external lake source read ahead provider failures fall back once per reque
         try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
         try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     }
+}
+
+test "external lake exact prefetch flights prevent duplicate widened source reads" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 1024 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    @memcpy(bytes[0..4], "data");
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var trace: @import("lake_read_context.zig").IoTrace = .{};
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(63), .context = .{ .io = io, .trace = &trace } };
+    const read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk };
+    const key = try reader.rangeKey(a, read);
+    defer a.free(key);
+    const claim = (try cache.begin(key)).?;
+    var claimed = true;
+    defer if (claimed) cache.finish(claim, io);
+    const Task = struct {
+        fn run(owner: *Reader, wanted: ranges.RangeRead) !void {
+            const lease = try owner.reader().readPlannedLease(std.testing.allocator, wanted);
+            defer lease.release();
+            try std.testing.expectEqualStrings("data", lease.bytes);
+        }
+    };
+    var task = try io.concurrent(Task.run, .{ &reader, read });
+    defer _ = task.cancel(io) catch {};
+    const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (true) {
+        while (!cache.mutex.tryLock()) std.atomic.spinLoopHint();
+        const joined = claim.flight.refs > 1;
+        cache.mutex.unlock();
+        if (joined) break;
+        try std.testing.expectEqual(@as(u64, 0), trace.snapshot().source_provider_reads);
+        try std.testing.expect(@import("antfly_platform").time.monotonicNs() < deadline);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try cache.store(key, "data");
+    cache.finish(claim, io);
+    claimed = false;
+    try task.await(io);
+    try std.testing.expectEqual(@as(u64, 0), trace.snapshot().source_provider_reads);
 }

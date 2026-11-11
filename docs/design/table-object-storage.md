@@ -717,3 +717,35 @@ client crosses the boundary. Temporary local admission/resource exhaustion stays
 pending in index readiness while the fenced coordinator backs off and resumes
 verified progress. Integrity, authorization and hard work-limit failures retain
 their terminal classification.
+
+
+Cold-serving continuation (reader protocol 101 / topology capability 88): a
+publication may inline at most 17 authenticated generation-map pages and 32 KiB
+of raw JSON. The producer follows the root and one child level, validates every
+page, and drops the optional copy if the catalog would lose its control
+headroom. Readers copy the pages into their stable binding and validate their
+checksums, namespace, exact version and root before use. These are copies of the
+existing rooted map, so no seed object creates a self-reference or new GC root.
+Larger maps retain bounded provider fallback; this is not an archive-sized
+manifest in the catalog. Legacy empty-field serialization remains unchanged.
+
+Preparation reuses its final-address artifact store for retained descriptor,
+manifest and index reads, preserving its connection pool across those phases.
+Explicit GCS endpoints apply to native artifacts with bearer credentials too;
+physical store identity and credential-scope checks remain mandatory.
+
+Winning-row Parquet hydration may stage the first four small unindexed projected
+chunks, at most 1 MiB each and within the cursor input allowance. Coalesced
+prefetch registers exact member flights; demand joins them before considering a
+wider read-ahead window. Decoders retain slices under one charged chunk owner,
+release the owner after decoding/error, and fall back to ordinary page-sized
+reads when optional staging cannot acquire input credit. Pruned/unprojected
+columns and larger chunks keep their original discovery path.
+
+After durable WAL acceptance, the API gives recent vector preparation a bounded
+five-second window before acknowledging. Pending enrichment does not revoke an
+accepted WAL record or claim searchable publication. Failures schedule separate,
+incarnation-fenced recovery; vector reads also schedule that recovery on a
+missing cut even when native serving-cut optimization is disabled. This makes
+completed manual-vector preparation durable before an immediate restart while
+preserving asynchronous recovery for slower enrichment.

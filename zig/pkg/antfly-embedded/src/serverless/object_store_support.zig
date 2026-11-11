@@ -151,6 +151,8 @@ pub const OpenedObjectStore = struct {
         query_requests: ?*@import("httpx").RequestLimit = null,
         speculative: bool = false,
         wait_for_speculative_io: bool = false,
+        gcs_endpoint: ?[]const u8 = null,
+        gcs_upload_endpoint: ?[]const u8 = null,
     };
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
@@ -264,6 +266,16 @@ pub const OpenedObjectStore = struct {
         else
             try object_storage.Gcs.jsonApiClientConfigFromEnvWithAuthoritiesAlloc(alloc, null, options.io, null);
         errdefer cfg.deinit(alloc);
+        if (options.gcs_endpoint) |endpoint| {
+            const owned = try alloc.dupe(u8, endpoint);
+            alloc.free(cfg.endpoint);
+            cfg.endpoint = owned;
+        }
+        if (options.gcs_upload_endpoint) |endpoint| {
+            const owned = try alloc.dupe(u8, endpoint);
+            alloc.free(cfg.upload_endpoint);
+            cfg.upload_endpoint = owned;
+        }
         if (options.io) |io| cfg.io = io;
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
         if (gcs.owned_httpx) |transport| {
@@ -502,4 +514,18 @@ test "external lake provider clients borrow the live runtime without private tra
     }
     // Both provider clients are gone; the borrowed runtime remains usable.
     try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+}
+
+test "external lake provider clients preserve explicit GCS endpoint and bearer configuration" {
+    var opened = try OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(std.testing.allocator, "bucket", "native", "local-test-only", .{
+        .ensure_bucket = false,
+        .io = std.testing.io,
+        .gcs_endpoint = "http://127.0.0.1:1/storage/v1",
+        .gcs_upload_endpoint = "http://127.0.0.1:1/upload/storage/v1",
+    });
+    defer opened.deinit();
+    const cfg = opened.gcs_client.?.cfg;
+    try std.testing.expectEqualStrings("http://127.0.0.1:1/storage/v1", cfg.endpoint);
+    try std.testing.expectEqualStrings("http://127.0.0.1:1/upload/storage/v1", cfg.upload_endpoint);
+    try std.testing.expectEqualStrings("local-test-only", cfg.auth.bearer_token);
 }

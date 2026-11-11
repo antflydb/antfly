@@ -119,7 +119,8 @@ const std = @import("std");
 /// Version 85 admits publication-scoped immutable opening bundles.
 /// Version 86 admits authenticated demand locators in opening bundles.
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
-pub const current_version: u16 = 87;
+/// Version 88 admits bounded inline map navigation in reader protocol 101.
+pub const current_version: u16 = 88;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
@@ -148,7 +149,7 @@ pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
-pub const lake_index_catalog_version: u16 = 87;
+pub const lake_index_catalog_version: u16 = 88;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.

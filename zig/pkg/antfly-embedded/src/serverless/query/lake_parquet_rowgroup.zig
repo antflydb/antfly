@@ -11544,3 +11544,44 @@ test "external lake opening disk inventory checkpoints accelerate clean restart 
     defer a.free(bytes);
     try std.testing.expectEqualStrings("data", bytes);
 }
+
+test "external lake selected hydration reuses complete small chunks without diagnostic read ahead" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var values: [4096]i64 = undefined;
+    for (&values, 0..) |*value, i| value.* = @intCast(i);
+    try appendPlainI64DataPage(&bytes, a, &values);
+    const split = bytes.items.len;
+    try appendPlainI64DataPage(&bytes, a, &values);
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("a"), .file_offset = 0, .compressed_len = split, .uncompressed_len = split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+        .{ .column_id = @constCast("b"), .file_offset = split, .compressed_len = bytes.items.len - split, .uncompressed_len = bytes.items.len - split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+    };
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = values.len, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = values.len, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(65), .context = .{} };
+    var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{ "a", "b" }, .{});
+    defer cursor.deinit();
+    cursor.shared_reader = &reader;
+    cursor.selected_hydration = true;
+    cursor.row_end = 2;
+    const batch = (try cursor.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), batch.rowCount());
+    try std.testing.expectEqual(@as(i64, 1), try batch.columns[0].integerAt(1));
+    try std.testing.expectEqual(@as(i64, 1), try batch.columns[1].integerAt(1));
+    // No tracing, async prefetch or generic one-MiB window is available. Each
+    // whole chunk must still satisfy both header discovery and page payload.
+    try std.testing.expectEqual(@as(u64, 2), cache.snapshot().provider_reads);
+}

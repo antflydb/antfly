@@ -48,11 +48,17 @@ class Network:
     seed: int = 0
     fault_every: int = 0
     fault: str = "none"  # none, throttle, reset, truncate
+    connection_ms: float = 0  # synthetic setup cost, once per TCP connection
 
     def validate(self):
         if any(
             not math.isfinite(v) or v < 0
-            for v in (self.latency_ms, self.jitter_ms, self.bandwidth_mib)
+            for v in (
+                self.latency_ms,
+                self.jitter_ms,
+                self.bandwidth_mib,
+                self.connection_ms,
+            )
         ):
             raise ValueError("Network values must be finite and nonnegative")
         if (
@@ -200,6 +206,10 @@ class NetworkStore:
         self.record_overflow = 0
         self.sequence = 0
         self.phase = "setup"
+        self.connection_sequence = 0
+        self.upload_sequence = 0
+        self.uploads = {}
+        self.upload_bytes = 0
         self.active = self.peak = self.waiting = 0
         self.next_byte_time = 0.0
         self.stop = threading.Event()
@@ -213,6 +223,16 @@ class NetworkStore:
                 super().setup()
                 self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.connection.settimeout(5)
+                with owner.lock:
+                    owner.connection_sequence += 1
+                    self.connection_id = owner.connection_sequence
+                    setup_ms = owner.network.connection_ms
+                started = time.monotonic_ns()
+                if setup_ms:
+                    owner.stop.wait(setup_ms / 1000)
+                self.connection_setup_ns = (
+                    time.monotonic_ns() - started if setup_ms else 0
+                )
 
             def log_message(self, *_):
                 pass
@@ -252,6 +272,8 @@ class NetworkStore:
                 started = time.monotonic_ns()
                 record = {
                     "sequence": sequence,
+                    "connection_id": self.connection_id,
+                    "connection_setup_ns": self.connection_setup_ns,
                     "phase": phase,
                     "method": self.command,
                     "arrived_ns": arrived,
@@ -262,6 +284,7 @@ class NetworkStore:
                     "object": None,
                     "range": self.headers.get("Range"),
                 }
+                self.connection_setup_ns = 0
                 source = None
                 try:
                     # Each request pays one synthetic RTT. Jitter is reproducible
@@ -278,6 +301,8 @@ class NetworkStore:
                         return
                     parsed = urlsplit(self.path)
                     query = parse_qs(parsed.query, keep_blank_values=True)
+                    if parsed.path.startswith("/__lake_upload/"):
+                        return self.resumable(record, parsed.path.rsplit("/", 1)[1])
                     match = re.fullmatch(
                         r"/(?:upload/)?storage/v1/b/([^/]+)(?:/o(?:/(.*))?)?",
                         parsed.path,
@@ -335,6 +360,40 @@ class NetworkStore:
                         return self.reply(record, 200, owner.store.listing(query))
                     if key is None and self.command in {"POST", "PUT"}:
                         key = query.get("name", [None])[0]
+                        if key is not None and query.get("uploadType") == ["resumable"]:
+                            length = int(self.headers.get("Content-Length", "0"))
+                            total = int(
+                                self.headers.get("X-Upload-Content-Length", "-1")
+                            )
+                            if (
+                                not 0 <= length <= 1024**2
+                                or not 0 <= total <= 64 * 1024**2
+                            ):
+                                self.close_connection = True
+                                return self.reply(record, 413, {})
+                            metadata = self.rfile.read(length)
+                            if len(metadata) != length:
+                                return self.reply(record, 400, {})
+                            json.loads(metadata or b"{}")
+                            with owner.lock:
+                                if len(owner.uploads) >= 16:
+                                    return self.reply(record, 429, {})
+                                owner.upload_sequence += 1
+                                session = str(owner.upload_sequence)
+                                owner.uploads[session] = {
+                                    "key": key,
+                                    "total": total,
+                                    "expected": query.get("ifGenerationMatch", [None])[
+                                        0
+                                    ],
+                                    "data": bytearray(),
+                                }
+                            return self.reply(
+                                record,
+                                200,
+                                b"",
+                                {"Location": owner.url + "/__lake_upload/" + session},
+                            )
                         if key is None or query.get("uploadType") != ["media"]:
                             return self.reply(
                                 record,
@@ -431,6 +490,54 @@ class NetworkStore:
                         else:
                             owner.record_overflow += 1
                     slots.release()
+
+            def resumable(self, record, session):
+                record["operation"] = "resumable_upload"
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 <= length <= 64 * 1024**2:
+                    self.close_connection = True
+                    return self.reply(record, 413, {})
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    return self.reply(record, 400, {})
+                with owner.lock:
+                    upload = owner.uploads.get(session)
+                    if upload is None:
+                        return self.reply(record, 404, {})
+                    if self.command == "DELETE":
+                        owner.upload_bytes -= len(upload["data"])
+                        del owner.uploads[session]
+                        return self.reply(record, 204, b"")
+                    if self.command != "PUT":
+                        return self.reply(record, 405, {})
+                    match = re.fullmatch(
+                        r"bytes ([0-9]+)-([0-9]+)/([0-9]+)",
+                        self.headers.get("Content-Range", ""),
+                    )
+                    if (
+                        not match
+                        or int(match[1]) != len(upload["data"])
+                        or int(match[2]) + 1 != int(match[1]) + length
+                        or int(match[3]) != upload["total"]
+                        or int(match[2]) >= upload["total"]
+                    ):
+                        return self.reply(record, 400, {})
+                    if length > 64 * 1024**2 - owner.upload_bytes:
+                        return self.reply(record, 413, {})
+                    upload["data"].extend(body)
+                    owner.upload_bytes += length
+                    if len(upload["data"]) < upload["total"]:
+                        return self.reply(
+                            record,
+                            308,
+                            b"",
+                            {"Range": "bytes=0-" + str(len(upload["data"]) - 1)},
+                        )
+                    data = bytes(upload["data"])
+                    owner.upload_bytes -= len(data)
+                    del owner.uploads[session]
+                item = owner.store.put(upload["key"], data, upload["expected"])
+                return self.reply(record, 200 if item else 412, item or {})
 
             def reply(
                 self, record, status, body, headers=None, *, length=None, truncate=False
@@ -554,6 +661,8 @@ class NetworkStore:
         )
         return {
             "requests": len(selected),
+            "connections": len({row["connection_id"] for row in selected}),
+            "connection_setup_ns": sum(row["connection_setup_ns"] for row in selected),
             "operation_counts": dict(operation_counts),
             "get_kind_counts": dict(kind_counts),
             "unique_get_objects": len(object_reads),

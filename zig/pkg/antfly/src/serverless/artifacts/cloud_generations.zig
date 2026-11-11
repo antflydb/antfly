@@ -213,6 +213,8 @@ pub const ByteCache = struct {
 };
 
 pub const Reader = struct {
+    opening_pages: []const local.metadata_lake_index_catalog.CloudNavigationPage = &.{},
+    opening_root: ?Ref = null,
     byte_cache: ?ByteCache = null,
     io: ?std.Io = null,
     client: objectstore.Client,
@@ -306,7 +308,31 @@ pub const Reader = struct {
             if (!std.mem.eql(u8, &root_scope.domain, &nested.domain)) return error.InvalidCloudGenerationMap;
         }
     }
+    pub fn bindOpeningPages(self: *Reader, pages: []const local.metadata_lake_index_catalog.CloudNavigationPage, token: Token) !void {
+        const root = self.root orelse return error.InvalidCloudGenerationMap;
+        const domain = (try api.uploadScopeFromArtifactId(root.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+        if (pages.len > 17) return error.InvalidCloudGenerationMap;
+        var remaining: usize = 32 * 1024;
+        for (pages, 0..) |page, i| {
+            try page.ref.validate();
+            const scope_ = (try api.uploadScopeFromArtifactId(page.ref.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+            if (!std.mem.eql(u8, &scope_.domain, &domain.domain) or page.body.len != page.ref.byte_len or page.body.len > remaining) return error.InvalidCloudGenerationMap;
+            for (pages[0..i]) |prior| if (std.mem.eql(u8, prior.ref.artifact_id, page.ref.artifact_id)) return error.InvalidCloudGenerationMap;
+            try api.validatePayloadSha256WithCancellation(page.body, page.ref.checksum, token);
+            remaining -= page.body.len;
+        }
+        self.opening_pages = pages;
+        self.opening_root = root;
+    }
+
     fn readBytes(self: *Reader, a: A, ref: Ref, token: Token) ![]u8 {
+        if (self.opening_root) |bound| if (self.root) |root| if (sameRef(bound, root)) {
+            for (self.opening_pages) |page| if (sameRef(page.ref, ref)) {
+                try token.check();
+                try api.validatePayloadSha256WithCancellation(page.body, ref.checksum, token);
+                return a.dupe(u8, page.body);
+            };
+        };
         const Load = struct {
             reader: *Reader,
             ref: Ref,
@@ -1628,4 +1654,95 @@ test "external lake metadata navigation verified bytes survive reader recreation
         if (pass == 1) try std.testing.expectEqual(reads, provider.gets);
         if (pass == 2) try std.testing.expect(provider.gets > reads);
     }
+}
+
+fn sameRef(left: Ref, right: Ref) bool {
+    return left.byte_len == right.byte_len and left.retention_until_ms == right.retention_until_ms and
+        std.mem.eql(u8, left.artifact_id, right.artifact_id) and std.mem.eql(u8, left.checksum, right.checksum) and std.mem.eql(u8, left.generation, right.generation);
+}
+pub fn freeOpeningPages(a: A, pages: []const local.metadata_lake_index_catalog.CloudNavigationPage) void {
+    for (pages) |page| {
+        freeRef(a, page.ref);
+        a.free(page.body);
+    }
+    if (pages.len != 0) a.free(pages);
+}
+/// A bounded copy of the authenticated map spine, carried in the publication.
+/// No extra object is created, so the map never depends on its own seed pack.
+pub fn collectOpeningPages(reader: *Reader, a: A, token: Token) ![]const local.metadata_lake_index_catalog.CloudNavigationPage {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var output: std.ArrayList(local.metadata_lake_index_catalog.CloudNavigationPage) = .empty;
+    defer output.deinit(a);
+    errdefer for (output.items) |page| {
+        freeRef(a, page.ref);
+        a.free(page.body);
+    };
+    var queue: [17]struct { ref: Ref, depth: u8 } = undefined;
+    queue[0] = .{ .ref = reader.root orelse return &.{}, .depth = 0 };
+    var count: usize = 1;
+    var position: usize = 0;
+    var remaining: usize = 32 * 1024;
+    while (position < count) : (position += 1) {
+        const entry = queue[position];
+        if (entry.ref.byte_len > remaining) continue;
+        const bytes = try reader.readBytes(sa, entry.ref, token);
+        const node = try std.json.parseFromSliceLeaky(Node, sa, bytes, .{ .allocate = .alloc_always });
+        try node.validate(entry.depth);
+        try reader.validateDomain(node, entry.ref);
+        const owned_ref = try cloneRef(a, entry.ref);
+        errdefer freeRef(a, owned_ref);
+        const body = try a.dupe(u8, bytes);
+        errdefer a.free(body);
+        try output.append(a, .{ .ref = owned_ref, .body = body });
+        remaining -= bytes.len;
+        if (entry.depth == 0) for (node.children) |child| {
+            if (count == queue.len) break;
+            queue[count] = .{ .ref = child.ref, .depth = 1 };
+            count += 1;
+        };
+    }
+    return output.toOwnedSlice(a);
+}
+
+test "external lake inline map navigation removes cold dependency reads and fences the exact root" {
+    const a = std.testing.allocator;
+    const Provider = @import("cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const scope: api.UploadScope = .{ .domain = @splat(61), .attempt = @splat(2) };
+    var writer: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope };
+    defer writer.deinit();
+    const id = try scope.artifactId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    try writer.capture(&id, 42, "payload-v1", .none);
+    const root = (try writer.finish(.none)).?;
+    defer freeRef(a, root);
+    var seed_reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root };
+    defer seed_reader.deinit();
+    const pages = try collectOpeningPages(&seed_reader, a, .none);
+    defer freeOpeningPages(a, pages);
+    try std.testing.expectEqual(@as(usize, 1), pages.len);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root };
+    defer reader.deinit();
+    try reader.bindOpeningPages(pages, .none);
+    const reads = provider.gets;
+    var selected = (try reader.lookup(arena.allocator(), &id, .none)).?;
+    defer selected.deinit(arena.allocator());
+    try std.testing.expectEqualStrings("payload-v1", selected.generation);
+    try std.testing.expectEqual(reads, provider.gets);
+    var damaged = [_]local.metadata_lake_index_catalog.CloudNavigationPage{pages[0]};
+    var bytes = try a.dupe(u8, damaged[0].body);
+    defer a.free(bytes);
+    bytes[0] ^= 1;
+    damaged[0].body = bytes;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, reader.bindOpeningPages(&damaged, .none));
+    const original = reader.root;
+    reader.root.?.generation = "different-root";
+    defer reader.root = original;
+    try std.testing.expectError(error.CloudGenerationMapUnavailable, reader.lookup(arena.allocator(), &id, .none));
 }
