@@ -205,7 +205,7 @@ pub fn effectiveMaxDownloadBytes(max_download_bytes: ?usize) usize {
 /// Keep this contract at the adapter boundary so callers do not duplicate the
 /// downloader's allocation policy. Borrowed recordings need none of this space.
 pub fn audioDownloadMemoryPeakBytes(max_download_bytes: ?usize) error{Overflow}!usize {
-    return httpx.Client.bufferedResponseBodyPeakBytes(effectiveMaxDownloadBytes(max_download_bytes));
+    return scraping.downloadMemoryPeakBytes(effectiveMaxDownloadBytes(max_download_bytes), scraping.default_download_transport_memory_bytes);
 }
 
 fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
@@ -944,30 +944,33 @@ const AntflyTranscriberState = struct {
 /// Keep one exact-sized JSON request body. Encoding into a separate base64
 /// string would retain two recording-sized buffers and violate the public
 /// boundary's base64-payload memory contract.
-fn antflyAudioReadBodyAlloc(a: Allocator, model: []const u8, options: inference_api.AudioReadOptions, bytes: []const u8, framed: bool) ![]u8 {
-    const json_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
-    const metadata = try std.json.Stringify.valueAlloc(a, .{ .model = model, .audio_options = options, .audio = "" }, json_options);
-    defer a.free(metadata);
-    const encoded_len = if (framed) "attachment:0".len else std.base64.standard.Encoder.calcSize(bytes.len);
-    const size = try std.math.add(usize, metadata.len, encoded_len);
+const Base64Audio = struct {
+    bytes: []const u8,
+    pub fn jsonStringify(value: @This(), jw: *std.json.Stringify) !void {
+        try jw.beginWriteRaw();
+        try jw.writer.writeByte('"');
+        try std.base64.standard.Encoder.encodeWriter(jw.writer, value.bytes);
+        try jw.writer.writeByte('"');
+        jw.endWriteRaw();
+    }
+};
+
+fn audioJsonBodyAlloc(a: Allocator, metadata: anytype, body_value: anytype, bytes: []const u8) ![]u8 {
+    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    const empty = try std.json.Stringify.valueAlloc(a, metadata, options);
+    defer a.free(empty);
+    const size = try std.math.add(usize, empty.len, std.base64.standard.Encoder.calcSize(bytes.len));
     const body = try a.alloc(u8, size);
     errdefer a.free(body);
     var output = std.Io.Writer.fixed(body);
-    const AudioValue = struct {
-        bytes: []const u8,
-        framed: bool,
-        pub fn jsonStringify(value: @This(), jw: *std.json.Stringify) !void {
-            if (value.framed) return jw.write("attachment:0");
-            try jw.beginWriteRaw();
-            try jw.writer.writeByte('"');
-            try std.base64.standard.Encoder.encodeWriter(jw.writer, value.bytes);
-            try jw.writer.writeByte('"');
-            jw.endWriteRaw();
-        }
-    };
-    try std.json.Stringify.value(.{ .model = model, .audio_options = options, .audio = AudioValue{ .bytes = bytes, .framed = framed } }, json_options, &output);
+    try std.json.Stringify.value(body_value, options, &output);
     std.debug.assert(output.end == body.len);
     return body;
+}
+
+fn antflyAudioReadBodyAlloc(a: Allocator, model: []const u8, options: inference_api.AudioReadOptions, bytes: []const u8, framed: bool) ![]u8 {
+    if (framed) return std.json.Stringify.valueAlloc(a, .{ .model = model, .audio_options = options, .audio = "attachment:0" }, .{ .emit_null_optional_fields = false });
+    return audioJsonBodyAlloc(a, .{ .model = model, .audio_options = options, .audio = "" }, .{ .model = model, .audio_options = options, .audio = Base64Audio{ .bytes = bytes } }, bytes);
 }
 
 /// Resolve MIME from shared native format detection when a caller has no MIME
@@ -1203,31 +1206,30 @@ const CloudflareTranscriberState = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
         const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const work = arena.allocator();
-        var content = try resolveAudioContentWithContext(work, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
-        defer content.deinit(work);
-        const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(content.bytes().len));
-        _ = std.base64.standard.Encoder.encode(encoded, content.bytes());
+        var content = try resolveAudioContentWithContext(a, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
+        defer content.deinit(a);
+        const bytes = content.bytes();
+        const language = req.language orelse self.cfg.language_code;
+        const wire = try audioJsonBodyAlloc(a, .{ .audio = "", .language = language }, .{ .audio = Base64Audio{ .bytes = bytes }, .language = language }, bytes);
+        defer a.free(wire);
         const cf = @import("antfly_cloudflare");
-        const wire = try std.json.Stringify.valueAlloc(work, cloudflare.wire.types.WhisperLargeV3TurboInput{
-            .audio = cf.string(encoded),
-            .language = req.language orelse self.cfg.language_code,
-        }, .{ .emit_null_optional_fields = false });
-        const payload = try std.json.parseFromSliceLeaky(std.json.Value, work, wire, .{ .parse_numbers = false });
-        const endpoint = try self.cfg.effectiveEndpointAlloc(work);
-        const value = try cf.invokeNative(self.http, work, .{
+        const endpoint = try self.cfg.effectiveEndpointAlloc(a);
+        defer if (endpoint) |value| a.free(value);
+        var response = try cf.postNativeEncoded(self.http, a, .{
             .account_id = self.cfg.account_id.?,
             .model = self.cfg.model.?,
             .api_key = self.cfg.bearer_token orelse self.cfg.api_key orelse return error.MissingCloudflareCredentials,
             .gateway_id = self.cfg.gateway_id,
             .url = endpoint,
-        }, payload, .{
+        }, wire, .{
             .max_response_bytes = self.cfg.max_response_bytes orelse httpx.types.default_max_body_size,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = self.options.cancellation,
         });
+        defer response.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try cf.decodeNative(arena.allocator(), response.body orelse return error.InvalidCloudflareResponse);
         return cloudflareTranscript(a, value, req.timestamps orelse self.cfg.timestamps orelse true);
     }
 };
@@ -1356,7 +1358,8 @@ const OpenAiTranscriberState = struct {
 
         const content_type = "application/octet-stream";
         const multipart = try buildOpenAiMultipartAlloc(alloc, self.model, req.language orelse self.language_code, audio_bytes, content_type);
-        defer alloc.free(multipart.body);
+        defer alloc.free(multipart.prefix);
+        const segments = [_][]const u8{ multipart.prefix, audio_bytes, multipart_suffix };
         defer alloc.free(multipart.content_type);
 
         const url = try std.fmt.allocPrint(alloc, "{s}/audio/transcriptions", .{self.base_url});
@@ -1368,7 +1371,7 @@ const OpenAiTranscriberState = struct {
         if (self.auth_header) |header| try headers.append(alloc, header);
 
         var resp = try self.http.post(url, .{
-            .body = multipart.body,
+            .borrowed_body_segments = &segments,
             .headers = headers.items,
             .max_response_size = self.max_response_bytes,
             .timeout_ms = try control.remainingTimeoutMs(),
@@ -1550,11 +1553,6 @@ const VertexTranscriberState = struct {
         defer content.deinit(alloc);
         const audio_bytes = content.bytes();
 
-        const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
-        const encoded = try alloc.alloc(u8, encoded_len);
-        defer alloc.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, audio_bytes);
-
         const language = req.language orelse self.language_code;
         const DiarizationConfig = struct {
             minSpeakerCount: u32 = 1,
@@ -1566,15 +1564,12 @@ const VertexTranscriberState = struct {
             diarizationConfig: ?DiarizationConfig = null,
         };
         const RecognitionConfig = struct {
-            explicitDecodingConfig: struct {} = .{},
+            autoDecodingConfig: struct {} = .{},
             model: []const u8,
             languageCodes: []const []const u8,
             features: RecognitionFeatures,
         };
-        const RequestBody = struct {
-            config: RecognitionConfig,
-            content: []const u8,
-        };
+
         const languages = [_][]const u8{language};
         // Word offsets are what segment timing is rebuilt from, so they are
         // requested whenever timestamps are wanted; speaker labels ride on
@@ -1583,18 +1578,16 @@ const VertexTranscriberState = struct {
         // the default.
         const want_timestamps = req.timestamps orelse self.timestamps orelse true;
         const want_diarization = req.diarization orelse self.diarization orelse false;
-        const body = try httpx.json.Json.stringifyRequest(alloc, RequestBody{
-            .config = .{
-                .model = self.model,
-                .languageCodes = &languages,
-                .features = .{
-                    .enableWordTimeOffsets = want_timestamps or want_diarization,
-                    .enableAutomaticPunctuation = self.enable_automatic_punctuation,
-                    .diarizationConfig = if (want_diarization) DiarizationConfig{} else null,
-                },
+        const recognition_config: RecognitionConfig = .{
+            .model = self.model,
+            .languageCodes = &languages,
+            .features = .{
+                .enableWordTimeOffsets = want_timestamps or want_diarization,
+                .enableAutomaticPunctuation = self.enable_automatic_punctuation,
+                .diarizationConfig = if (want_diarization) DiarizationConfig{} else null,
             },
-            .content = encoded,
-        });
+        };
+        const body = try audioJsonBodyAlloc(alloc, .{ .config = recognition_config, .content = "" }, .{ .config = recognition_config, .content = Base64Audio{ .bytes = audio_bytes } }, audio_bytes);
         defer alloc.free(body);
 
         const url = try std.fmt.allocPrint(
@@ -2016,9 +2009,11 @@ fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u
     return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
 }
 
+const multipart_boundary = "antfly-zig-audio-boundary";
+const multipart_suffix = "\r\n--" ++ multipart_boundary ++ "--\r\n";
 const MultipartBody = struct {
     content_type: []u8,
-    body: []u8,
+    prefix: []u8,
 };
 
 /// OpenAI's transcription models do not share one response format.
@@ -2040,20 +2035,19 @@ fn buildOpenAiMultipartAlloc(
     audio_bytes: []const u8,
     audio_content_type: []const u8,
 ) !MultipartBody {
-    const boundary = "antfly-zig-audio-boundary";
+    const boundary = multipart_boundary;
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(alloc);
 
     try appendMultipartField(&buf, alloc, boundary, "model", model);
     if (language) |lang| try appendMultipartField(&buf, alloc, boundary, "language", lang);
     try appendMultipartField(&buf, alloc, boundary, "response_format", openAiResponseFormat(model));
-    try appendMultipartFile(&buf, alloc, boundary, "file", "audio", audio_content_type, audio_bytes);
-    try buf.print(alloc, "--{s}--\r\n", .{boundary});
+    _ = audio_bytes; // Kept borrowed by the caller's request segments.
+    try buf.print(alloc, "--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, audio_content_type });
 
-    return .{
-        .content_type = try std.fmt.allocPrint(alloc, "multipart/form-data; boundary={s}", .{boundary}),
-        .body = try buf.toOwnedSlice(alloc),
-    };
+    const content_type = try std.fmt.allocPrint(alloc, "multipart/form-data; boundary={s}", .{boundary});
+    errdefer alloc.free(content_type);
+    return .{ .content_type = content_type, .prefix = try buf.toOwnedSlice(alloc) };
 }
 
 fn appendMultipartField(
@@ -2068,24 +2062,6 @@ fn appendMultipartField(
         "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n",
         .{ boundary, name, value },
     );
-}
-
-fn appendMultipartFile(
-    buf: *std.ArrayList(u8),
-    alloc: Allocator,
-    boundary: []const u8,
-    name: []const u8,
-    filename: []const u8,
-    content_type: []const u8,
-    content: []const u8,
-) !void {
-    try buf.print(
-        alloc,
-        "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n",
-        .{ boundary, name, filename, content_type },
-    );
-    try buf.appendSlice(alloc, content);
-    try buf.appendSlice(alloc, "\r\n");
 }
 
 /// Trusted document sources remain owned by their caller until recognition
@@ -2597,9 +2573,9 @@ test "openai response format follows the model's capability" {
 
     const multipart = try buildOpenAiMultipartAlloc(std.testing.allocator, "gpt-4o-transcribe", null, "fake", "audio/wav");
     defer std.testing.allocator.free(multipart.content_type);
-    defer std.testing.allocator.free(multipart.body);
-    try std.testing.expect(std.mem.indexOf(u8, multipart.body, "name=\"response_format\"\r\n\r\njson\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, multipart.body, "verbose_json") == null);
+    defer std.testing.allocator.free(multipart.prefix);
+    try std.testing.expect(std.mem.indexOf(u8, multipart.prefix, "name=\"response_format\"\r\n\r\njson\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multipart.prefix, "verbose_json") == null);
 }
 
 test "a json-only openai response still yields its transcript" {

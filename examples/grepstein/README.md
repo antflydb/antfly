@@ -774,7 +774,13 @@ transport; local callback compatibility accounts for its inline data URI. Missin
 audio MIME is inferred from the native format detector without decoding samples.
 
 Direct-URL transcription also reserves the downloader’s temporary body buffers,
-including compressed input and output-buffer growth. Download and encoding peaks
-are separate phases, so admission uses their maximum. This reservation follows
-`max_download_bytes`; it does not enlarge the transcription response limit.
-Pre-acquired GCS recordings retain their actual-size borrowed-source plan.
+including compressed input and output-buffer growth. Body capacities are capped
+at `max_download_bytes`; the conservative collection bound is three times that
+limit. A separate 8 MiB transport quota covers TLS buffers, trust roots and HTTP
+metadata. `DownloadContext.transport_memory_limit_bytes` configures that quota
+for library callers; exhaustion reports `DownloadTransportMemoryExceeded`.
+Download and encoding peaks are separate phases, so admission uses their maximum
+without increasing the transcription response limit. Pre-acquired GCS recordings
+retain their actual-size borrowed-source plan. OpenAI multipart uploads borrow
+the recording directly; Antfly, Vertex and Cloudflare JSON uploads encode into
+one exact-sized body, avoiding multiple recording-sized buffers.

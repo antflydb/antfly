@@ -2852,6 +2852,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         // failure. Same kind of deterministic size-based rejection as
         // InferenceBatchTooLarge/InferenceEncodedBytesExceeded above.
         error.InferenceInvocationMemoryExceeded,
+        error.DownloadTransportMemoryExceeded,
         // GLiNER boundary extraction's reviewed length qualification
         // (zig/pkg/inference/src/models/gliner_boundary_qualification.zig's
         // LengthContract, one named error per exceeded dimension) and its
@@ -4114,6 +4115,8 @@ test "Apple transcription duration rejection is terminal while native failures r
 }
 
 test "enrichment treats deterministic size-based inference rejections as terminal, not retryable" {
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.DownloadTransportMemoryExceeded));
+
     // InferenceInvocationMemoryExceeded is a pure function of request/response
     // byte size (asset_producer_runtime.zig's invocationMemoryForRequests):
     // retrying the same document reproduces the identical estimate and the

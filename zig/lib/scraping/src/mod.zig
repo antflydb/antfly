@@ -83,8 +83,17 @@ pub const HTTPHeader = struct {
 /// default) still applies. File I/O uses caller cancellation when this is null;
 /// a nonzero file deadline fails closed because std.Io files cannot enforce it.
 /// Zero disables that individual ceiling rather than the configured one.
+/// Hard quota for connection state, TLS buffers, trust roots and HTTP metadata.
+/// Bodies have a separate allocation domain and never consume this quota.
+pub const default_download_transport_memory_bytes: usize = 8 << 20;
+
+pub fn downloadMemoryPeakBytes(max_body_bytes: usize, transport_memory_limit_bytes: usize) error{Overflow}!usize {
+    return std.math.add(usize, transport_memory_limit_bytes, try httpx.Client.bufferedResponseBodyPeakBytes(max_body_bytes));
+}
+
 pub const DownloadContext = struct {
     io: std.Io,
+    transport_memory_limit_bytes: usize = default_download_transport_memory_bytes,
     timeout_ms: ?u64 = null,
     cancellation: ?CancellationToken = null,
 
@@ -553,7 +562,10 @@ fn downloadHttpOutcomeAlloc(
 ) !DownloadOutcome {
     try context.check();
     const ceiling = try DownloadCeiling.init(context, security);
-    var client = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security));
+    var transport = httpx.QuotaAllocator{ .backing = alloc, .limit = context.transport_memory_limit_bytes };
+    var client_config = httpClientConfig(security);
+    client_config.http1_response_body_allocator = alloc;
+    var client = httpx.Client.initWithConfig(transport.allocator(), context.io, client_config);
     defer client.deinit();
 
     var headers = std.ArrayListUnmanaged([2][]const u8).empty;
@@ -595,6 +607,7 @@ fn downloadHttpOutcomeAlloc(
         }) catch |err| switch (err) {
             error.AddressRejected => return error.PrivateIpBlocked,
             error.ResponseTooLarge => return error.StreamTooLong,
+            error.OutOfMemory => return if (transport.exceeded) error.DownloadTransportMemoryExceeded else err,
             else => return err,
         };
         defer response.deinit();
@@ -647,6 +660,7 @@ fn takeHttpResponseBodyAlloc(alloc: Allocator, response: *httpx.Response) ![]u8 
     if (!response.body_owned) return try alloc.dupe(u8, body);
     response.body = null;
     response.body_owned = false;
+    response.body_allocator = null;
     return @constCast(body);
 }
 
@@ -2556,4 +2570,11 @@ test "remote fetch retry hints retain delta seconds and validated HTTP dates" {
     try std.testing.expectEqual(@as(?u64, 0), retryAfterMs("Thu, 01 Jan 1970 00:00:02 GMT", 3000));
     try std.testing.expectEqual(@as(?u64, null), retryAfterMs("garbage", 0));
     try std.testing.expectEqual(@as(?u64, null), retryAfterMs(null, 0));
+}
+
+test "HTTP downloader exposes transport quota exhaustion without retaining allocations" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    try std.testing.expectError(error.DownloadTransportMemoryExceeded, downloadContentAllocWithContext(a, .{ .io = io_impl.io(), .transport_memory_limit_bytes = 1 }, "https://example.org/recording.wav", &.{ .max_download_size_bytes = 4096 }, null));
 }

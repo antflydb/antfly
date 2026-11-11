@@ -104,6 +104,9 @@ pub const ClientConfig = struct {
     /// ceiling but still bounded by max_response_size.
     max_error_response_size: ?usize = null,
     max_response_headers: usize = 256,
+    /// Optional separate allocation domain for HTTP/1 body collection,
+    /// including decompression fallback buffers. Must outlive returned bodies.
+    http1_response_body_allocator: ?Allocator = null,
     /// Default request lifetime for adapters whose provider interface does not
     /// expose per-call HTTP options. An explicit RequestOptions cancellation
     /// source takes precedence. The token is borrowed for the client's
@@ -1025,10 +1028,10 @@ pub const Client = struct {
     /// the encoded buffer survives an output growth: encoded + old output + new
     /// output. Derive capacities from the collector's actual ArrayList policy,
     /// including alloc/copy/free fallback when the allocator cannot remap.
+    /// Collector capacity is capped at the enforced body limit.
     pub fn bufferedResponseBodyPeakBytes(max_body_bytes: usize) error{Overflow}!usize {
         if (max_body_bytes == 0) return 0;
-        const capacity = std.ArrayListUnmanaged(u8).growCapacity(max_body_bytes);
-        return std.math.mul(usize, capacity, 3);
+        return std.math.mul(usize, max_body_bytes, 3);
     }
 
     /// Releases all allocated resources.
@@ -3359,6 +3362,12 @@ pub const Client = struct {
         return cmf & 0x0f == 8 and cmf >> 4 <= 7 and header % 31 == 0;
     }
 
+    fn appendBoundedBody(a: Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8, limit: usize) !void {
+        const required = try checkedResponseSize(output.items.len, bytes.len, limit);
+        if (required > output.capacity) try output.ensureTotalCapacityPrecise(a, @min(limit, std.ArrayListUnmanaged(u8).growCapacity(required)));
+        output.appendSliceAssumeCapacity(bytes);
+    }
+
     fn appendDecompressed(
         allocator: Allocator,
         encoded: []const u8,
@@ -3378,7 +3387,7 @@ pub const Client = struct {
             };
             if (n == 0) break;
             _ = try checkedResponseSize(output.items.len, n, max_size);
-            try output.appendSlice(allocator, read_buf[0..n]);
+            try appendBoundedBody(allocator, output, read_buf[0..n], max_size);
         }
     }
 
@@ -3483,8 +3492,9 @@ pub const Client = struct {
         const close_delimited_body = !parser.chunked and parser.content_length == null;
 
         // --- Read from the chain into a single output buffer ---
+        const body_allocator = self.config.http1_response_body_allocator orelse self.allocator;
         var result = std.ArrayListUnmanaged(u8).empty;
-        errdefer result.deinit(self.allocator);
+        errdefer result.deinit(body_allocator);
         const max_size = max_response_size;
 
         // Pre-allocate hint: use content_length if known (and not compressed).
@@ -3492,7 +3502,7 @@ pub const Client = struct {
             if (parser.content_length) |len| {
                 if (len > max_size) return error.ResponseTooLarge;
                 if (len <= std.math.maxInt(usize)) {
-                    try result.ensureTotalCapacity(self.allocator, @intCast(len));
+                    try result.ensureTotalCapacityPrecise(body_allocator, @intCast(len));
                 }
             }
         }
@@ -3501,7 +3511,7 @@ pub const Client = struct {
 
         if (content_coding) |coding| {
             var compressed = std.ArrayListUnmanaged(u8).empty;
-            defer compressed.deinit(self.allocator);
+            defer compressed.deinit(body_allocator);
 
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
@@ -3513,19 +3523,19 @@ pub const Client = struct {
                 };
                 if (n == 0) break;
                 _ = try checkedResponseSize(compressed.items.len, n, max_size);
-                try compressed.appendSlice(self.allocator, read_buf[0..n]);
+                try appendBoundedBody(body_allocator, &compressed, read_buf[0..n], max_size);
             }
 
             switch (coding) {
                 .gzip => try appendDecompressed(
-                    self.allocator,
+                    body_allocator,
                     compressed.items,
                     .gzip,
                     &result,
                     max_size,
                 ),
                 .deflate => try appendDeflateDecompressed(
-                    self.allocator,
+                    body_allocator,
                     compressed.items,
                     &result,
                     max_size,
@@ -3542,13 +3552,14 @@ pub const Client = struct {
                 };
                 if (n == 0) break;
                 _ = try checkedResponseSize(result.items.len, n, max_size);
-                try result.appendSlice(self.allocator, read_buf[0..n]);
+                try appendBoundedBody(body_allocator, &result, read_buf[0..n], max_size);
             }
         }
 
         if (result.items.len > 0) {
-            res.body = try result.toOwnedSlice(self.allocator);
+            res.body = try result.toOwnedSlice(body_allocator);
             res.body_owned = true;
+            res.body_allocator = body_allocator;
         }
 
         // Remove encoding/length headers when decompression was applied.
@@ -3662,8 +3673,9 @@ pub const Client = struct {
             );
 
             if (coding == .deflate and hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
+                const body_allocator = self.config.http1_response_body_allocator orelse parser.allocator;
                 var encoded = std.ArrayListUnmanaged(u8).empty;
-                defer encoded.deinit(parser.allocator);
+                defer encoded.deinit(body_allocator);
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
@@ -3674,13 +3686,13 @@ pub const Client = struct {
                     };
                     if (n == 0) break;
                     _ = try checkedResponseSize(encoded.items.len, n, max_response_size);
-                    try encoded.appendSlice(parser.allocator, read_buf[0..n]);
+                    try appendBoundedBody(body_allocator, &encoded, read_buf[0..n], max_response_size);
                 }
 
                 var decoded = std.ArrayListUnmanaged(u8).empty;
-                defer decoded.deinit(parser.allocator);
+                defer decoded.deinit(body_allocator);
                 try appendDeflateDecompressed(
-                    parser.allocator,
+                    body_allocator,
                     encoded.items,
                     &decoded,
                     max_response_size,
@@ -4787,53 +4799,52 @@ test "raw deflate fallback handles a valid zlib-looking prefix" {
 
 const test_tls_cert_pem =
     "-----BEGIN CERTIFICATE-----\n" ++
-    "MIIDCTCCAfGgAwIBAgIUGjCWCIDqTRw/vKwQVR5QhFvTtqswDQYJKoZIhvcNAQEL\n" ++
-    "BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDQwMTA1MzAzNFoXDTI2MDQw\n" ++
-    "MjA1MzAzNFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\n" ++
-    "AAOCAQ8AMIIBCgKCAQEAlcbhuVCGNinrY/u0i9CraIMPPbUUuidxw6oDcxU2dBmf\n" ++
-    "5dZgbMWIOM6ugs2bg0dVLld/epE3AKbK1O2wzmPtziyE+i+aUze1EddHgOm91bDc\n" ++
-    "jRE/Poy74X0Nh9kpqdG5JTgqrGU8HFWgVAZJ72cQTTHQrLG4V4cZUaklga2b3EWx\n" ++
-    "AtKuhn25aG3c5NO9gdZRJCs9YZ/q7WKX1xI0uwnJXrS54/e7uLgE2HnQZADXujCd\n" ++
-    "62fTUaa6NJBjqpYcrmsRT5RU0ZymJQB6megB8GiyAWAtvb0qP9LIyYDo0krW4Q6y\n" ++
-    "d4hKFktK6x2yMhsYb71085OiH5I1lvcPMimG3kEdQQIDAQABo1MwUTAdBgNVHQ4E\n" ++
-    "FgQU1ju/opd9LtCdJJgvwJIFyrUGCxwwHwYDVR0jBBgwFoAU1ju/opd9LtCdJJgv\n" ++
-    "wJIFyrUGCxwwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAeNEq\n" ++
-    "DCRtgQY3DXmIv4DBb6hef/5pULMwmb0Rsv5cQfExE0TLYT+m5jTPUbl34kyvFDew\n" ++
-    "IAL+6IQf1Wug8ohRPZPxtNFhf8LT+Z2DjfmX1+rMNRNKGeENbj7kDhOE0U7On+iH\n" ++
-    "mFtDm068CNlMtUO39BF8dYNFZLyTNPZagmoS+InUSVNwVKGop4TKeN1oHkiMBf9u\n" ++
-    "ZSLs84DHU59GbIgSJWBi5MihRgbpauZs/VhvfciLU9KlcwLY1XgbImFggSJdcyqm\n" ++
-    "7PlORVQMy2bnuImpzdGywVdMjH9ka7wuEuoXQOSAhMJvycfuY4jls7+abBrhlV/l\n" ++
-    "36+7YT0LzE5Z9pLwyA==\n" ++
+    "MIIC9TCCAd2gAwIBAgIJAKSB9mD1VeSqMA0GCSqGSIb3DQEBCwUAMBQxEjAQBgNV\n" ++
+    "BAMMCWxvY2FsaG9zdDAeFw0yNjExMTEyMTI2NTFaFw0zNjExMDgyMTI2NTFaMBQx\n" ++
+    "EjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC\n" ++
+    "ggEBALbFwwECV8+EOQKGKGDC1x5fuorRA2DlshtunwulnAPRVW2sRuhGB+JUOB6l\n" ++
+    "4+3mBFJpgZeXhDLoyLKIrS8yKBM09JQKlh097SafHHe1Cl39TfyFpVzHkbIFUK8G\n" ++
+    "5jLoLytUIwmDteXo4R8J2FMliR5JkpRzZ9T+VmnlQA1MeoUCvTNzS/fkWFg0YTSc\n" ++
+    "ey6y+XaZ83xYM4mu37qJ92TIiS1eW1hGlnIXBz1CdL33o3eGrn4G4DCi6HgRuSJN\n" ++
+    "ybcykWAgL+FXBjD7MiiA9ebjFwexBhRFtsx84d1+gPlwIbkt/fbgY4DEH7IAXPPS\n" ++
+    "FA4L0tO2Drn2KEAlsF7hZejSx9ECAwEAAaNKMEgwDwYDVR0TAQH/BAUwAwEB/zAO\n" ++
+    "BgNVHQ8BAf8EBAMCAqQwJQYDVR0RBB4wHIIJbG9jYWxob3N0ggkxMjcuMC4wLjGH\n" ++
+    "BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAEmUp6mqHEwWayCpGiqkhZ9CN0UPpS0T\n" ++
+    "0wRBSGxTQfK/79u8IJUoGfBh+lA5WdGE1o8HbriC/TGtXLePkoYbL2/IfGmX22A4\n" ++
+    "prbDlQBoBOSI/mGiUTXmH0quQIP/sBniDWvxUe+voqBHr7RCnxmPrKsBkDagT4G5\n" ++
+    "HJ8Nwb5qS16lqTnyemkyX40NbYQ9/uca5nmSSPNbh9Lq30Hb9uxbUZ05AWEZJjI8\n" ++
+    "phFd9gcCNwPmrdM/1sSviPZcF71tdG2BfUQg5zIpcuorlaeWd/q8bxlUoIOpQmiQ\n" ++
+    "V+Qo5Z8JqbXl551Q2CGoEhlt4WfzGpqIgCjplAdVy/Pse5Yf+3yZ6mk=\n" ++
     "-----END CERTIFICATE-----\n";
 
 const test_tls_key_pem =
     "-----BEGIN PRIVATE KEY-----\n" ++
-    "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCVxuG5UIY2Ketj\n" ++
-    "+7SL0Ktogw89tRS6J3HDqgNzFTZ0GZ/l1mBsxYg4zq6CzZuDR1UuV396kTcApsrU\n" ++
-    "7bDOY+3OLIT6L5pTN7UR10eA6b3VsNyNET8+jLvhfQ2H2Smp0bklOCqsZTwcVaBU\n" ++
-    "BknvZxBNMdCssbhXhxlRqSWBrZvcRbEC0q6Gfblobdzk072B1lEkKz1hn+rtYpfX\n" ++
-    "EjS7CcletLnj97u4uATYedBkANe6MJ3rZ9NRpro0kGOqlhyuaxFPlFTRnKYlAHqZ\n" ++
-    "6AHwaLIBYC29vSo/0sjJgOjSStbhDrJ3iEoWS0rrHbIyGxhvvXTzk6IfkjWW9w8y\n" ++
-    "KYbeQR1BAgMBAAECggEAQsS7uJBwnDG4yUQamt+FohwWzcPtPwU5fmfKjOGOelg4\n" ++
-    "A047gxHV5bkha5c79dx1WSjRX/Lfaa9xKVXipUc/6lLHXv6cle92DUOCkTHiGiJz\n" ++
-    "V4GyR3CWivFj+ETzgUxIdJKi12Jz1w/G3t5E1HAGANutsmaxjndf7prwaOxbWGic\n" ++
-    "RCPwL5T/UTen6KknrMWASJSJFVhrjszvsbz6lea/EF9OrmmKSu8/NaQH+fOF5xix\n" ++
-    "pdRVCzkiFq9ox1R59k30hjMx2VJRRN53ErauMxWzogJVB7vrCxgdw3qxAr35tKTv\n" ++
-    "YRQBeCRDu0nDw05DBo+fMGN8Fe0f3tke7XiKk0sgvwKBgQDL2UMX74KIMjlSFvBE\n" ++
-    "6kgO3AJGwItxHnyUcpkUTpYyxGmZ8ZUAw8SG1CBBgBz9161gytTlyQcw0M779xUe\n" ++
-    "RXDaclhk8x1PDjnrjlX1WltOPc6f/Qafk1XvzHP5UGI65E2rGXRIrpejF/eiecoM\n" ++
-    "SD8TV9FuzBq3R8Te8XbeaCYsLwKBgQC8GEZukAft6x/OAVh6UIIOgzHCbYaklau7\n" ++
-    "7bj9NVQKEJRGABRYA/73J579r/stl3cybrRm0IfmzJk2QcBp/AaKTJF0MyiyMfRq\n" ++
-    "7LqQLtlJQFDYzqH4KAhjCBiUu7OeZV0SF7ds2EesH1EF+tmOHK8SeFbTTIQriy38\n" ++
-    "BfD/jZHBjwKBgGNYH6WTmRbM+zhxa2j6kGGFgSp//bUEOYyTCN1nqzVUmW5n2MkF\n" ++
-    "n0piKNIjIH3pVVqdnwHZZcK5kJYlBUq6ZtRe84tHHBqCAWI1/NhUz7ii0IcR5d9x\n" ++
-    "C2mRR1fSf/zZdKyU/CHLzKS0MoAhQIGZ1/uSScPofoCh3mUUYmzjbu8LAoGAXv+z\n" ++
-    "suuz1YpHSfiMA1reFQ5V92jx8/ZUAlqSb/CbPWoaOTCZFcsO3y13s5FKP0Ccxy/6\n" ++
-    "lWMFAKCdUTXsRJsxgnAhlpqwFy/7znU51NCUldaR/q5+R6OQeNQB9jzG/10aoKSx\n" ++
-    "05t4t4opleeYMZpzIdT9pUKkDooA86Tcj3WlBCkCgYAOJKlKAjp2ZwHQ/ktkX1hK\n" ++
-    "tHbXZMXM40RjrujdimrIJxK87o73jp1s6cIuuHpNCVN15rI30Eb0WGy7ER2J2q2T\n" ++
-    "Bk1Pw3B3fAHZpbU7U8YgKW1KTNU7zpOwZjPCTBh2f4jhwwN0Zk4iltu8D2y2KvsC\n" ++
-    "xm8hZP/ZhT5VKqRD/ot8fw==\n" ++
+    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC2xcMBAlfPhDkC\n" ++
+    "hihgwtceX7qK0QNg5bIbbp8LpZwD0VVtrEboRgfiVDgepePt5gRSaYGXl4Qy6Miy\n" ++
+    "iK0vMigTNPSUCpYdPe0mnxx3tQpd/U38haVcx5GyBVCvBuYy6C8rVCMJg7Xl6OEf\n" ++
+    "CdhTJYkeSZKUc2fU/lZp5UANTHqFAr0zc0v35FhYNGE0nHsusvl2mfN8WDOJrt+6\n" ++
+    "ifdkyIktXltYRpZyFwc9QnS996N3hq5+BuAwouh4EbkiTcm3MpFgIC/hVwYw+zIo\n" ++
+    "gPXm4xcHsQYURbbMfOHdfoD5cCG5Lf324GOAxB+yAFzz0hQOC9LTtg659ihAJbBe\n" ++
+    "4WXo0sfRAgMBAAECggEBAKl7Goc+B/UKs96uTpTjN50XwZ/ljw90D0M2wc6IA/La\n" ++
+    "UzA+twW9oqPx2pQ42fGJAGr3IM9UFacriqda69S+2sBss3rvkiGNgfH1Su2J+BIN\n" ++
+    "yBooR52QBX8hRJ74c8+y08KG43J4Kt0FpHMmquz2+n4WVRDJLvgn3DOX/FwYleft\n" ++
+    "f+xoqta3DCFGtHZMF+tC+eGg+bsqzBMFMBAlda7jfF0t3ifXWzUusxd27/2wwhNb\n" ++
+    "3w/Z1mQ1j7QJ6SGYzN/NZ1Zwdb3YEycWaOsfJO37fTGpyIZIVBU8tQaj5lp4nLwW\n" ++
+    "UfV2A/oXsGHGagji6Sw70urIh/sycziJ0vCHW4Nj6dECgYEA30xjuj3gZELK9+uo\n" ++
+    "xSSQWzuox0MAH/FsLI/Ma1NeiZXVWIeTdvz4huF7Vdk3LXbQbZusLGEaywl9ky8z\n" ++
+    "Qy/zfoh4oQgxmmkg9xdT/BYAR/aZLBazxXgiP6px/kBFplwqQNNrBO/WJhdlkY3n\n" ++
+    "/kAwbTy6S2PX6Pal41+4VhFp55UCgYEA0YoHWGewuh87XGYYn+fKdjVnOBglpJ7Z\n" ++
+    "DJOdDnuBjLRx4fz4powKOa4Nf2IdG7Ti8lnfbyRVnqLlU8nN4F3T2wXTI9+yi5Fa\n" ++
+    "PtXHVvvsdpcaOgLBn3K0zC8tiGERv80sUnt0SPFWzmGgc+gciMSQbg8CY+2F9ljb\n" ++
+    "oczF4+OPoE0CgYEAgK79Ke9OyXjUj1t3v2T67BjNg0fRYpc2x9d27sL00EVQ1dwL\n" ++
+    "156hetmmwiqT6dd29jOoXUr4rdmiTJf+6tFPebQcEHEwZNQA82S2OahUMSSj0Qyk\n" ++
+    "PUCmPBp15xgTC3RBxWoRWp78wqbpGaC1+Yf0YH+GvLulSdQadZZMHQ2cAqECgYAI\n" ++
+    "424EVgGtI34FIV+SCOcRtJo4Su3t2b8jRW+4GY0ZRt4909lIV1BnufZgnOzXLAkk\n" ++
+    "dqN/t27aV9aag0j0Z4aBF/Io52hPe070s2TNT8psDWTTaSKFfPwmXSn1SwjRtgZX\n" ++
+    "SV1ZasNf5cxEnmf3dT8bLA/R5VV1abeHWYRbcl+5UQKBgFb7yLIfRKB20/pweq7K\n" ++
+    "AEdOYn36ga4pqau+KzCfrGSaDrmLeSsTv1HllbzMmFPvkii37jL5Atej9xgGCN6a\n" ++
+    "hUGD1Pe7h3tDx0LBYV5oGEuiVT9dR86tnDcGOvxpEFQ4yM1TZldx6yCOKxYLfKy3\n" ++
+    "JMeM5NYvCYUaVB1WBRw3p6jL\n" ++
     "-----END PRIVATE KEY-----\n";
 
 const python_tls_server_script =
@@ -4926,6 +4937,11 @@ const python_tls_chunked_compressed_server_script =
     "                )\n" ++
     "                tls_conn.sendall(format(len(payload), 'x').encode() + b'\\r\\n')\n" ++
     "                tls_conn.sendall(payload + b'\\r\\n0\\r\\n\\r\\n')\n" ++
+    "                try:\n" ++
+    "                    tls_conn.settimeout(2)\n" ++
+    "                    tls_conn.unwrap().close()\n" ++
+    "                except (ssl.SSLError, OSError):\n" ++
+    "                    pass\n" ++
     "                break\n" ++
     "        except ssl.SSLError:\n" ++
     "            continue\n" ++
@@ -5646,7 +5662,7 @@ test "writer H1 timeout evicts an interrupted pooled connection" {
     try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
 }
 
-test "HTTPS client round trip via local TLS server" {
+test "HTTPS verified round trip preserves separate bounded transport and body ownership" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -5685,9 +5701,19 @@ test "HTTPS client round trip via local TLS server" {
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
 
-    var client = Client.initWithConfig(allocator, io, .{
+    const ca_path = try tmp.dir.realPathFileAlloc(io, "cert.pem", allocator);
+    defer allocator.free(ca_path);
+    const Quota = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var overall = Quota{ .backing = allocator, .limit = (8 << 20) + try Client.bufferedResponseBodyPeakBytes(4096) };
+    defer std.debug.assert(overall.live == 0);
+    var quota = Quota{ .backing = overall.allocator(), .limit = 8 << 20 };
+    defer std.debug.assert(quota.live == 0);
+    var client = Client.initWithConfig(quota.allocator(), io, .{
+        .http1_response_body_allocator = overall.allocator(),
+        .max_response_size = 4096,
+        .tls_ca_file = ca_path,
         .keep_alive = false,
-        .verify_ssl = false,
+        .verify_ssl = true,
         .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
     });
@@ -5747,9 +5773,12 @@ fn expectChunkedCompressedResponse(mode: []const u8, to_writer: bool) !void {
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
 
+    const ca_path = try tmp.dir.realPathFileAlloc(io, "cert.pem", allocator);
+    defer allocator.free(ca_path);
     var client = Client.initWithConfig(allocator, io, .{
         .keep_alive = false,
-        .verify_ssl = false,
+        .verify_ssl = true,
+        .tls_ca_file = ca_path,
         .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
     });
@@ -5758,14 +5787,20 @@ fn expectChunkedCompressedResponse(mode: []const u8, to_writer: bool) !void {
     if (to_writer) {
         var out = std.ArrayListUnmanaged(u8).empty;
         defer out.deinit(allocator);
-        var resp = try client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null);
+        var resp = client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null) catch |err| {
+            std.debug.print("compressed HTTPS writer mode={s} error={s}\n", .{ mode, @errorName(err) });
+            return err;
+        };
         defer resp.deinit();
 
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);
         try std.testing.expect(resp.body == null);
         try std.testing.expectEqualStrings("{\"ok\":true}\n", out.items);
     } else {
-        var resp = try getWithRetry(&client, io, url, 50);
+        var resp = getWithRetry(&client, io, url, 50) catch |err| {
+            std.debug.print("compressed HTTPS mode={s} error={s}\n", .{ mode, @errorName(err) });
+            return err;
+        };
         defer resp.deinit();
 
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);

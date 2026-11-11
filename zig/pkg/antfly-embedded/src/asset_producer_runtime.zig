@@ -1138,6 +1138,8 @@ pub const Runtime = struct {
                     // The adapter owns its bounded downloaded recording; Swift
                     // borrows it while AVAudioFile streams decoded samples.
                     native_workspace_bytes = transcribing.apple_native.workspace_bytes + transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes);
+                    if (requests[0].media.len == 0 and !inference_work.hasDataUriScheme(requests[0].source_text))
+                        native_workspace_bytes = @max(native_workspace_bytes, try transcribing.audioDownloadMemoryPeakBytes(cfg.max_download_bytes));
                     break :blk .borrowed_binary;
                 }
                 if (!remote) {
@@ -1154,21 +1156,21 @@ pub const Runtime = struct {
                 const has_media = requests[0].media.len != 0;
                 for (requests[1..]) |request| if ((request.media.len != 0) != has_media)
                     return error.InferenceInvocationMemoryUnavailable;
-                if (cfg.provider == .antfly) {
-                    if (!remote) break :blk if (has_media or inline_source) .data_uri else .borrowed_binary;
-                    const selected_transport = remoteAttachmentTransport(try self.transcriberCapabilities(alloc, cfg), .base64_payload);
-                    // An opaque URL has no caller-owned recording to charge.
-                    // Bound its downloaded source plus transport workspace here.
-                    if (!has_media and !inline_source) {
-                        const source_peak = try selected_transport.peakResidentSize(transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes), 0);
-                        const download_peak = try transcribing.audioDownloadMemoryPeakBytes(cfg.max_download_bytes);
-                        // Download growth/decompression ends before encoding.
-                        // Charge the larger phase, not two simultaneous peaks.
-                        caller_workspace_bytes = try std.math.mul(usize, @max(source_peak, download_peak), requests.len);
-                    }
-                    break :blk selected_transport;
+                if (!remote) break :blk if (has_media or inline_source) .data_uri else .borrowed_binary;
+                const selected_transport: inference_work.AttachmentTransport = switch (cfg.provider) {
+                    .antfly => remoteAttachmentTransport(try self.transcriberCapabilities(alloc, cfg), .base64_payload),
+                    .openai => .segmented_framed_binary,
+                    .cloudflare, .vertex => .base64_payload,
+                    .apple => unreachable,
+                };
+                if (!has_media and !inline_source) {
+                    const source_peak = try selected_transport.peakResidentSize(transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes), 0);
+                    const download_peak = try transcribing.audioDownloadMemoryPeakBytes(cfg.max_download_bytes);
+                    // Connection state is quota-bounded; its body collection
+                    // finishes before provider encoding starts.
+                    caller_workspace_bytes = try std.math.mul(usize, @max(source_peak, download_peak), requests.len);
                 }
-                break :blk if (inline_source) .data_uri else .borrowed_binary;
+                break :blk selected_transport;
             },
         };
 
@@ -10093,13 +10095,25 @@ test "transcriber negotiated source transport fits the planned allocator indepen
                     try std.testing.expectEqualStrings("audio/wav", envelope.attachments[0].mime_type);
                     return;
                 };
+                if (r.header("Content-Type")) |mime| if (std.mem.startsWith(u8, mime, "multipart/form-data")) {
+                    try std.testing.expect(r.body.len > 65536);
+                    try std.testing.expect(std.mem.indexOf(u8, r.body, "name=\"file\"") != null);
+                    return;
+                };
                 var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.body, .{});
                 defer parsed.deinit();
-                try std.testing.expectEqual(@as(usize, 87384), parsed.value.object.get("audio").?.string.len);
+                try std.testing.expectEqual(@as(usize, 87384), (parsed.value.object.get("audio") orelse parsed.value.object.get("content").?).string.len);
+                if (parsed.value.object.get("config")) |config| {
+                    try std.testing.expect(config.object.get("autoDecodingConfig") != null);
+                    try std.testing.expect(config.object.get("explicitDecodingConfig") == null);
+                }
             }
         };
         var server = try httpx.TestServer.start(a, io, &.{
             .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = catalog } },
+            .{ .method = .POST, .path = "/cf", .assert_request = Check.request, .respond = .{ .body = "{\"success\":true,\"result\":{\"text\":\"hello\"}}" } },
+            .{ .method = .POST, .path = "/projects/fixture/locations/global/recognizers/_:recognize", .assert_request = Check.request, .respond = .{ .body = "{\"results\":[{\"alternatives\":[{\"transcript\":\"hello\"}]}]}" } },
+            .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = Check.request, .respond = .{ .body = "{\"text\":\"hello\",\"segments\":[]}" } },
             .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"speech\",\"usage\":null,\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"hello\",\"status\":\"complete\",\"audio\":{\"duration_ms\":1}}]}" } },
         });
         defer server.deinit();
@@ -10134,6 +10148,38 @@ test "transcriber negotiated source transport fits the planned allocator indepen
         const output = try runtime.transcribe(budget.allocator(), request);
         defer budget.allocator().free(output);
         try std.testing.expectEqualStrings("hello", output);
+        const openai_config = try std.fmt.allocPrint(a, "{{\"provider\":\"openai\",\"model\":\"whisper-1\",\"base_url\":\"{s}\",\"api_key\":\"fixture\"}}", .{server.baseUrl()});
+        defer a.free(openai_config);
+        var openai_request = request;
+        openai_request.config_json = openai_config;
+        const openai_plan = try runtime.producer().invocationMemoryForRequests(a, &.{openai_request});
+        try std.testing.expectEqual(inference_work.AttachmentTransport.segmented_framed_binary, openai_plan.attachment_transport);
+        try std.testing.expect(openai_plan.allocator_limit_bytes < recording.len);
+        var openai_budget = inference_work.BoundedInvocationAllocator.init(a, openai_plan.allocator_limit_bytes);
+        const openai_transcript = try runtime.transcribe(openai_budget.allocator(), openai_request);
+        try std.testing.expectEqualStrings("hello", openai_transcript);
+        openai_budget.allocator().free(openai_transcript);
+        try std.testing.expect(!openai_budget.limit_exceeded);
+        try std.testing.expectEqual(@as(usize, 0), openai_budget.live_bytes);
+        inline for ([_][]const u8{
+            "{{\"provider\":\"cloudflare\",\"account_id\":\"fixture\",\"model\":\"@cf/openai/whisper-large-v3-turbo\",\"base_url\":\"{s}/cf\",\"api_key\":\"fixture\"}}",
+            "{{\"provider\":\"vertex\",\"project_id\":\"fixture\",\"location\":\"global\",\"model\":\"long\",\"base_url\":\"{s}\",\"api_key\":\"fixture\"}}",
+        }) |template| {
+            const json_config = try std.fmt.allocPrint(a, template, .{server.baseUrl()});
+            defer a.free(json_config);
+            var json_request = request;
+            json_request.config_json = json_config;
+            const json_plan = try runtime.producer().invocationMemoryForRequests(a, &.{json_request});
+            try std.testing.expectEqual(inference_work.AttachmentTransport.base64_payload, json_plan.attachment_transport);
+            const json_peak = try json_plan.attachment_transport.peakResidentSize(recording.len, "audio/wav".len);
+            var json_budget = inference_work.BoundedInvocationAllocator.init(a, json_plan.allocator_limit_bytes + json_peak - recording.len);
+            const json_transcript = try runtime.transcribe(json_budget.allocator(), json_request);
+            try std.testing.expectEqualStrings("hello", json_transcript);
+            json_budget.allocator().free(json_transcript);
+            try std.testing.expect(!json_budget.limit_exceeded);
+            try std.testing.expectEqual(@as(usize, 0), json_budget.live_bytes);
+        }
+
         // The source URL plan must also fund the real downloader, not just
         // the later provider request. Loopback access is enabled only in this
         // test's explicit downloader policy, never in production STT policy.
