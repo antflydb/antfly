@@ -27,6 +27,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import time
 
 ZIG = Path(__file__).resolve().parents[1]
 FAMILIES = (
@@ -165,6 +166,38 @@ def authored_inputs():
     return {"sha256": digest.hexdigest(), "files": count}
 
 
+def run_logged(command, env, log, timeout):
+    started = time.monotonic()
+    with log.open("w") as stream:
+        with subprocess.Popen(
+            command,
+            cwd=ZIG,
+            env=env,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        ) as process:
+            try:
+                process.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                raise
+    if process.returncode:
+        raise RuntimeError(f"command exited {process.returncode}; inspect {log}")
+    return time.monotonic() - started
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
@@ -178,10 +211,23 @@ def main():
     parser.add_argument(
         "--optimize", choices=("debug", "fast", "safe"), default="debug"
     )
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="Probe execution timeout in seconds, excluding compilation",
+    )
+    parser.add_argument(
+        "--build-timeout",
+        type=int,
+        default=5400,
+        help="Cold compilation timeout in seconds",
+    )
     args = parser.parse_args()
     if not 1 <= args.rows <= 4096 or not 1 <= args.rounds <= 8:
         parser.error("rows must be 1..4096 and rounds 1..8")
+    if args.timeout <= 0 or args.build_timeout <= 0:
+        parser.error("timeouts must be positive")
     args.report = args.report.resolve()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     log = args.report.with_suffix(".log")
@@ -190,7 +236,7 @@ def main():
         "tools/run_bounded_zig_build.py",
         "--",
         "build",
-        "lake-execution-runtime-probe",
+        "lake-execution-runtime-probe-build",
         f"-Doptimize={args.optimize}",
         f"-Dstrip={str(args.optimize != 'debug').lower()}",
         "-Dcpu=baseline",
@@ -218,7 +264,8 @@ def main():
         "optimize": args.optimize,
         "passed": False,
         "host": platform.platform(),
-        "command": command,
+        "build_command": command,
+        "command": [str(ZIG / "zig-out/bin/lake-execution-runtime-probe")],
         "rows_per_file": args.rows,
         "rounds": args.rounds,
         "native_quota_layers": args.native_quota_layers,
@@ -243,29 +290,12 @@ def main():
                 ZIG / "lib/runtime/src/runtime_io_abi.zig",
             )
         }
-        with log.open("w") as stream:
-            with subprocess.Popen(
-                command,
-                cwd=ZIG,
-                env=env,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            ) as run:
-                try:
-                    run.wait(timeout=args.timeout)
-                except subprocess.TimeoutExpired:
-                    os.killpg(run.pid, signal.SIGTERM)
-                    try:
-                        run.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(run.pid, signal.SIGKILL)
-                        run.wait()
-                    raise
+        report["build_seconds"] = run_logged(
+            command, env, args.report.with_suffix(".build.log"), args.build_timeout
+        )
+        report["run_seconds"] = run_logged(report["command"], env, log, args.timeout)
         report["authored_inputs_after"] = authored_inputs()
-        report["returncode"] = run.returncode
-        if run.returncode:
-            raise RuntimeError("probe build/test failed; inspect " + str(log))
+        report["returncode"] = 0
         if report["authored_inputs_before"] != report["authored_inputs_after"]:
             raise ValueError(
                 "authored Zig inputs changed during measurement; rerun at a coherent checkpoint"
@@ -281,7 +311,8 @@ def main():
         if executable_headers[0]["optimize"] != args.optimize:
             raise ValueError("executable optimization mode mismatch")
         binary = Path(executable_headers[0]["path"]).resolve()
-        binary.relative_to((ZIG / ".zig-cache").resolve())
+        if binary != Path(report["command"][0]).resolve():
+            raise ValueError("probe provenance does not match the installed executable")
         binary_hash = hashlib.sha256()
         with binary.open("rb") as compiled:
             for block in iter(lambda: compiled.read(1024 * 1024), b""):

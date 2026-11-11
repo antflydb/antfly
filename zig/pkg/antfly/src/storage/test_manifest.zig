@@ -392,6 +392,7 @@ comptime {
     _ = @import("hot_standby/write_gate.zig");
     _ = @import("hot_standby/seed_materialization.zig");
     _ = @import("antfly_local_sources").storage_hbc_adapter;
+    _ = @import("antfly_local_sources").storage_leann_filter;
     _ = @import("antfly_local_sources").storage_leann_store;
     _ = @import("antfly_local_sources").storage_leann_replica;
     _ = @import("antfly_local_sources").storage_leann_replicated;

@@ -17,8 +17,45 @@
 """Reject skipped, partial and duplicate performance evidence."""
 
 import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
-from check_lake_execution_runtime import observations, PHASES, FAMILIES
+from check_lake_execution_runtime import observations, run_logged, PHASES, FAMILIES
+
+
+class ProbeProcessBudgets(unittest.TestCase):
+    def test_separate_phase_budgets_retain_phase_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build_log, run_log = root / "build.log", root / "run.log"
+            # A slow build must not spend the executable's execution budget.
+            run_logged(
+                [sys.executable, "-c", "import time; time.sleep(.1); print('built')"],
+                None,
+                build_log,
+                2,
+            )
+            run_logged([sys.executable, "-c", "print('ran')"], None, run_log, 2)
+            self.assertEqual(build_log.read_text().strip(), "built")
+            self.assertEqual(run_log.read_text().strip(), "ran")
+
+    def test_execution_timeout_stops_the_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "run.log"
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_logged(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; print('started', flush=True); time.sleep(30)",
+                    ],
+                    None,
+                    log,
+                    0.2,
+                )
+            self.assertIn("started", log.read_text())
 
 
 class Evidence(unittest.TestCase):
