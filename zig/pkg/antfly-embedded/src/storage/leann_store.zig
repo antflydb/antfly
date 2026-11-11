@@ -708,7 +708,7 @@ pub const LeannStore = struct {
         @memcpy(scratch, item.vector);
         if (self.opts.metric == .cosine) normalize(scratch);
         const dist = leann.distance(@fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))), q, scratch);
-        if (!filter.distanceAllowed(dist)) return;
+        if (!std.math.isFinite(dist) or !filter.distanceAllowed(dist)) return;
         out.addResultWithOwnedMetadata(item.vector_id, dist, 0, if (filter.request.load_metadata) try alloc.dupe(u8, item.metadata) else null);
     }
 

@@ -785,7 +785,7 @@ pub const Index = struct {
         defer work.deinit(alloc);
         if (direct_ids) |ids| {
             if (filter.direct_verify_bounds and self.rabitq != null) {
-                var approx = try Approx.init(alloc, self, q);
+                var approx = try Approx.initWithRadius(alloc, self, q, filter.distance_under != null);
                 defer approx.deinit();
                 var eligible: [128]u32 = undefined;
                 var offset: usize = 0;
@@ -801,7 +801,7 @@ pub const Index = struct {
                     const estimates = try approx.score(eligible[0..count]);
                     stats.approx_evaluated += @intCast(count);
                     for (eligible[0..count], estimates) |id, estimate| {
-                        try self.enqueueFiltered(alloc, &work, id, estimate, opts.bound_scale);
+                        try self.enqueueFiltered(alloc, &work, id, estimate, opts.bound_scale, filter.distance_under, approx.query_radius);
                     }
                     offset = end;
                 }
@@ -817,7 +817,7 @@ pub const Index = struct {
                 try self.verifyFiltered(alloc, source, q, upper_query, opts, filter, &work, &top, &stats);
             }
         } else {
-            var approx = try Approx.init(alloc, self, q);
+            var approx = try Approx.initWithRadius(alloc, self, q, filter.distance_under != null);
             defer approx.deinit();
             const start = try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
             var frontier: Heap(false) = .{};
@@ -830,7 +830,7 @@ pub const Index = struct {
             visited.set(start);
             stats.approx_evaluated += 1;
             try frontier.push(alloc, .{ .id = start, .dist = first.dist });
-            try self.offerFiltered(alloc, filter, &work, start, first, opts.bound_scale);
+            try self.offerFiltered(alloc, filter, &work, start, first, opts.bound_scale, approx.query_radius);
 
             const default_ef: u32 = if (self.rabitq != null) 512 else 64;
             var budget = @max(opts.k, if (opts.ef == 0) default_ef else opts.ef);
@@ -858,7 +858,7 @@ pub const Index = struct {
                     stats.approx_evaluated += @intCast(fresh.items.len);
                     for (fresh.items, estimates) |id, estimate| {
                         try frontier.push(alloc, .{ .id = id, .dist = estimate.dist });
-                        try self.offerFiltered(alloc, filter, &work, id, estimate, opts.bound_scale);
+                        try self.offerFiltered(alloc, filter, &work, id, estimate, opts.bound_scale, approx.query_radius);
                     }
                     stats.peak_frontier = @max(stats.peak_frontier, @as(u32, @intCast(frontier.len())));
                 }
@@ -908,13 +908,27 @@ pub const Index = struct {
         }
     };
 
-    fn offerFiltered(self: *const Index, alloc: Allocator, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32) !void {
+    fn offerFiltered(self: *const Index, alloc: Allocator, filter: ResultFilter, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, query_radius: ?ThresholdRadius) !void {
         if (self.isDeleted(id) or !try filter.allows(filter.ctx, id)) return;
-        try self.enqueueFiltered(alloc, work, id, estimate, bound_scale);
+        try self.enqueueFiltered(alloc, work, id, estimate, bound_scale, filter.distance_under, query_radius);
     }
 
-    fn enqueueFiltered(self: *const Index, alloc: Allocator, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32) !void {
-        const lower = if (self.upper_vectors.contains(id))
+    fn enqueueFiltered(self: *const Index, alloc: Allocator, work: *FilteredVerification, id: u32, estimate: Est, bound_scale: f32, distance_under: ?f32, query_radius: ?ThresholdRadius) !void {
+        const stored_upper = self.upper_vectors.contains(id);
+        if (distance_under) |threshold| {
+            if (stored_upper) {
+                if (estimate.dist >= threshold) return;
+            } else if (query_radius) |radius| {
+                const r = &self.rabitq.?;
+                const row_norm = if (r.ex) |codec| codec.rowResidualNorm(r.exRow(id)) else r.centroid_distances.items[id];
+                // Reverse triangle inequality in the rotated space. Leave
+                // slack for f32 norm and rotation rounding.
+                const slack = (radius.query_norm + row_norm + 2 * radius.centroid_norm) * 0.001;
+                const gap = @max(0, @abs(radius.query_norm - row_norm) - slack);
+                if (gap * gap >= threshold) return;
+            }
+        }
+        const lower = if (stored_upper)
             estimate.dist
         else if (self.rabitq != null)
             estimate.dist - @max(bound_scale, 0) * estimate.bound
@@ -2042,6 +2056,11 @@ const Est = struct { dist: f32, bound: f32 };
 /// Per-query approximate scorer over PQ codes (ADC table, bound 0) or RaBitQ
 /// codes (repo RaBitQ kernel, with error bounds). Not thread-safe; create one
 /// per query.
+const ThresholdRadius = struct {
+    query_norm: f32,
+    centroid_norm: f32,
+};
+
 const Approx = struct {
     alloc: Allocator,
     index: *const Index,
@@ -2054,6 +2073,7 @@ const Approx = struct {
     out: std.ArrayListUnmanaged(Est) = .empty,
     /// Query in the space of `Index.upper_vectors`, when the index has any.
     exact_q: []f32 = &.{},
+    query_radius: ?ThresholdRadius = null,
     /// Multi-bit RaBitQ only.
     ex_query: ?rqx.Codec.Query = null,
 
@@ -2062,6 +2082,10 @@ const Approx = struct {
     /// `q` must already be normalized for cosine and is in the original
     /// (unrotated) space.
     fn init(alloc: Allocator, index: *const Index, q: []const f32) !Approx {
+        return initWithRadius(alloc, index, q, false);
+    }
+
+    fn initWithRadius(alloc: Allocator, index: *const Index, q: []const f32, needs_radius: bool) !Approx {
         var self = Approx{ .alloc = alloc, .index = index };
         errdefer self.deinit();
         if (index.config.store_upper) self.exact_q = try index.toDecodeSpace(alloc, q);
@@ -2074,6 +2098,10 @@ const Approx = struct {
         const rotated = try alloc.alloc(f32, q.len);
         defer alloc.free(rotated);
         _ = r.rotation.transform(q, rotated);
+        if (needs_radius and index.config.metric == .l2_squared) self.query_radius = .{
+            .query_norm = @sqrt(l2Squared(rotated, r.centroid)),
+            .centroid_norm = @sqrt(dot(r.centroid, r.centroid)),
+        };
         if (r.ex) |ex| {
             self.ex_query = try ex.prepare(alloc, r.centroid, rotated);
             return self;
@@ -3259,6 +3287,33 @@ test "leann: filtered graph and direct scoring preserve upper vector distances" 
             try testing.expectApproxEqRel(distance(.l2_squared, query, vector), hit.distance, 0.0001);
         }
     }
+}
+
+test "leann: filtered verification avoids loads beyond the upper threshold" {
+    const alloc = testing.allocator;
+    const dims = 16;
+    var fixture = try Fixture.init(alloc, 128, 1, dims, 8, 315);
+    defer fixture.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = dims, .quantizer = .rabitq }, fixture.data);
+    defer index.deinit();
+    var source = SliceEmbeddingSource{ .vectors = fixture.data, .dims = dims };
+    const query: [dims]f32 = @splat(100);
+    const ids = [_]u32{ 3, 19, 23, 64 };
+    const filter = ResultFilter{
+        .ctx = &index,
+        .allows = struct {
+            fn allows(_: *const anyopaque, _: u32) !bool {
+                return true;
+            }
+        }.allows,
+        .direct_verify_bounds = true,
+        .distance_under = 1,
+    };
+    var response = try index.searchFiltered(alloc, source.source(), &query, .{ .k = 2 }, filter, &ids);
+    defer response.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), response.results.len);
+    try testing.expectEqual(@as(u32, ids.len), response.stats.approx_evaluated);
+    try testing.expectEqual(@as(u32, 0), response.stats.recomputed);
 }
 
 test "leann: filtered heap evicts the largest ID on equal distances" {

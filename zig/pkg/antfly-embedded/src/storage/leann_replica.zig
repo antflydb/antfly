@@ -751,6 +751,7 @@ pub const Replica = struct {
         }
         std.mem.sortUnstable(Hit, hits.items, {}, struct {
             fn lt(_: void, a: Hit, b: Hit) bool {
+                if (a.distance == b.distance) return std.mem.lessThan(u8, a.key, b.key);
                 return a.distance < b.distance;
             }
         }.lt);
@@ -768,6 +769,7 @@ pub const Replica = struct {
         @memcpy(scratch, self.buffer_vectors.items[slot]);
         if (metric == .cosine) normalize(scratch);
         const dist = leann.distance(metric, query, scratch);
+        if (!std.math.isFinite(dist)) return;
         if (filter) |f| if (!f.distanceAllowed(dist)) return;
         try hits.append(alloc, .{ .key = key, .distance = dist });
     }

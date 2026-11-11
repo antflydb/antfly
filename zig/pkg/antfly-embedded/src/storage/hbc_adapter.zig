@@ -5632,6 +5632,7 @@ pub const HBCIndex = struct {
         quantized_score_ns_per_candidate: u64 = 0,
         artifact_read_decode_ns_per_vector: u64 = 0,
         exact_distance_ns_per_vector: u64 = 0,
+        exact_native_lookup_ns_per_candidate: u64 = 0,
         rerank_cache_hit_permille: u64 = 0,
         rerank_cache_observations: u64 = 0,
         exact_observations: u64 = 0,
@@ -5650,6 +5651,7 @@ pub const HBCIndex = struct {
     pub const ExactRouteCostObservation = struct {
         candidates: u64,
         metadata_ns: u64,
+        native_lookup_ns: u64 = 0,
         artifact_read_decode_ns: u64,
         distance_ns: u64,
         artifact_cache_hits: u64,
@@ -18927,6 +18929,10 @@ pub const HBCIndex = struct {
         state.filter_scan_ns_per_candidate = routeRateEwma(
             state.filter_scan_ns_per_candidate,
             perUnit(observation.metadata_ns, observation.candidates),
+        );
+        state.exact_native_lookup_ns_per_candidate = routeRateEwma(
+            state.exact_native_lookup_ns_per_candidate,
+            perUnit(observation.native_lookup_ns, observation.candidates),
         );
         state.artifact_read_decode_ns_per_vector = routeRateEwma(
             state.artifact_read_decode_ns_per_vector,

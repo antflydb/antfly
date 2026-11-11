@@ -15447,6 +15447,7 @@ fn searchDenseInternal(
             entry.index.observeExactDenseRouteCost(.{
                 .candidates = exact.profile.candidate_count,
                 .metadata_ns = exact.profile.metadata_lookup_ns,
+                .native_lookup_ns = exact.profile.native_lookup_ns,
                 .artifact_read_decode_ns = exact.profile.artifact_read_ns +| exact.profile.artifact_decode_ns,
                 .distance_ns = exact.profile.distance_ns,
                 .artifact_cache_hits = exact.profile.artifact_cache_hits,
@@ -15953,8 +15954,12 @@ fn denseSearchRouteWithCosts(
         const resolved_cost = resolveDenseRouteCosts(cost, vector_dims, external_vector_storage);
         const filter_ns = resolved_cost.filter_scan_ns_per_candidate;
         const artifact_ns = resolved_cost.artifact_miss_read_decode_ns_per_vector;
+        const exact_lookup_ns = if (external_vector_storage)
+            artifact_ns
+        else
+            denseRouteCostOrPrior(cost.exact_native_lookup_ns_per_candidate, artifact_ns);
         const exact_work_ns = candidate_count *|
-            (filter_ns +| artifact_ns +| resolved_cost.exact_distance_ns_per_vector);
+            (filter_ns +| exact_lookup_ns +| resolved_cost.exact_distance_ns_per_vector);
         var hbc_work_ns = hbc_candidates *|
             (filter_ns +| resolved_cost.quantized_score_ns_per_candidate) +|
             rerank_candidates *| (artifact_ns +| resolved_cost.exact_distance_ns_per_vector);
@@ -16071,6 +16076,16 @@ test "dense search route reports exact native filter budget decisions" {
     try std.testing.expectEqual(@as(usize, 32 * 1024), selectiveExactCandidateWorkBudget(2));
     try std.testing.expectEqual(@as(usize, 16 * 1024), selectiveExactCandidateWorkBudget(1024));
     try std.testing.expectEqual(@as(usize, 1), selectiveExactCandidateWorkBudget(std.math.maxInt(usize)));
+}
+
+test "native exact lookup costs affect the exact route without pricing HBC rerank" {
+    var costs: hbc_mod.HBCIndex.DenseRouteCostSnapshot = .{};
+    const prior = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
+    costs.exact_native_lookup_ns_per_candidate = 100_000;
+    const measured = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
+    try std.testing.expect(prior.exact_native_filter);
+    try std.testing.expect(!measured.exact_native_filter);
+    try std.testing.expectEqual(prior.estimated_hbc_work_ns, measured.estimated_hbc_work_ns);
 }
 
 test "dense search route uses measured per-index costs pressure and hysteresis" {
@@ -16549,7 +16564,7 @@ fn exactScoreNativeDenseFilter(
 
     const candidate_metadata = try alloc.alloc(
         ?[]const u8,
-        if (req.filter_prefix.len > 0) unique_candidate_ids.len else 0,
+        if (req.filter_prefix.len > 0 or req.key_predicate != null) unique_candidate_ids.len else 0,
     );
     defer alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
@@ -16578,15 +16593,23 @@ fn exactScoreNativeDenseFilter(
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
         if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
-        if (req.filter_prefix.len > 0) {
+        if (candidate_metadata.len > 0) {
             const metadata = candidate_metadata[i] orelse continue;
             if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
+            if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, metadata)) continue;
         }
-        const vector = (if (vector_cursor) |*cursor|
+        const lookup_start = platform_time.monotonicNs();
+        exact_profile.raw_scalar_reads += 1;
+        const loaded_vector = if (vector_cursor) |*cursor|
             entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
         else
-            entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
-            error.NotFound => continue,
+            entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch);
+        exact_profile.native_lookup_ns += platform_time.monotonicNs() - lookup_start;
+        const vector = loaded_vector catch |err| switch (err) {
+            error.NotFound => {
+                exact_profile.missing_vectors += 1;
+                continue;
+            },
             else => return err,
         };
         if (vector.len != req.query.len) return error.DimensionMismatch;
@@ -16692,6 +16715,24 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
     try std.testing.expectEqual(@as(u64, 2), hits[1].vector_id);
+
+    var residual = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &.{ 0.0, 0.0 },
+        .k = 4,
+        .filter_ids = &.{ 4, 2, 3, 1 },
+        .key_predicate = .{
+            .ptr = &counter,
+            .allows = struct {
+                fn allows(_: *anyopaque, metadata: []const u8) !bool {
+                    return std.mem.eql(u8, metadata, "doc:keep:b");
+                }
+            }.allows,
+        },
+    });
+    defer residual.results.deinit();
+    try std.testing.expectEqual(@as(usize, 3), counter.count);
+    try std.testing.expectEqual(@as(usize, 1), residual.results.getHits().len);
+    try std.testing.expectEqual(@as(u64, 2), residual.results.getHits()[0].vector_id);
 }
 
 test "one percent filtered route preserves exact recall with candidate-linear IO" {

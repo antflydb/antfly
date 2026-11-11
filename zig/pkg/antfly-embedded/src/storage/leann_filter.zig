@@ -70,7 +70,14 @@ pub const Filter = struct {
         const width = @max(dims, 1);
         const exact_limit: usize = if (transient) 16 else 64;
         if (count <= @min(exact_limit, (64 * 1024) / width)) return .exact;
-        if (rabitq and count *| 8 <= live and count <= @min(1024, (1024 * 1024) / width)) return .bounds;
+        if (rabitq and count *| 8 <= live) {
+            // A walk must discover enough eligible nodes to fill its
+            // verification pool. Approximate its work from global density
+            // and allow for scoring neighbors of each expanded node.
+            const target = @min(count, self.request.k *| 12);
+            const graph_score_work = (live *| target *| 4) / count;
+            if (count <= graph_score_work) return .bounds;
+        }
         if (!transient and count *| 32 <= live and count <= @min(256, (256 * 1024) / width)) return .exact;
         return .graph;
     }
@@ -87,4 +94,15 @@ test "sparse allowlists use bounded direct work on either side of the exact cuto
         try std.testing.expectEqual(if (count <= 16) Filter.DirectMode.exact else .bounds, filter.directMode(768, 1_000_000, true, true));
         if (count == 65) try std.testing.expectEqual(Filter.DirectMode.graph, filter.directMode(768, 300, false, true));
     }
+}
+
+test "direct bounds work scales with graph size and requested results" {
+    const alloc = std.testing.allocator;
+    const ids = try alloc.alloc(u64, 1025);
+    defer alloc.free(ids);
+    for (ids, 0..) |*id, i| id.* = i;
+    var filter = try Filter.init(alloc, .{ .query = &.{}, .k = 10, .filter_ids = ids });
+    defer filter.deinit(alloc);
+    try std.testing.expectEqual(Filter.DirectMode.bounds, filter.directMode(768, 1_000_000, true, true));
+    try std.testing.expectEqual(Filter.DirectMode.graph, filter.directMode(768, 4096, true, true));
 }

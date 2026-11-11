@@ -33,6 +33,7 @@ pub const SearchOutcome = struct {
         request_vector_cache_entries: u64 = 0,
         raw_batch_reads: u64 = 0,
         raw_scalar_reads: u64 = 0,
+        native_lookup_ns: u64 = 0,
         missing_vectors: u64 = 0,
         candidate_prepare_ns: u64 = 0,
         metadata_lookup_ns: u64 = 0,

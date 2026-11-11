@@ -19523,6 +19523,7 @@ pub const IndexManager = struct {
                 for (unique_candidate_ids[candidate_start..candidate_end], candidate_metadata[candidate_start..candidate_end], fallback_doc_keys[candidate_start..candidate_end]) |vector_id, maybe_metadata, fallback_doc_key| {
                     const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
                     if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, doc_key)) continue;
                     batch_ids[batch_len] = vector_id;
                     batch_metadata[batch_len] = doc_key;
                     batch_distances[batch_len] = std.math.inf(f32);
@@ -19581,11 +19582,19 @@ pub const IndexManager = struct {
                     const resolved_doc_key = doc_key orelse continue;
                     if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
                 }
-                const distance_start_ns = platform_time.monotonicNs();
-                const vector = (if (vector_cursor) |*cursor|
+                if (req.key_predicate) |predicate| {
+                    const resolved_doc_key = doc_key orelse continue;
+                    if (!try predicate.allows(predicate.ptr, resolved_doc_key)) continue;
+                }
+                const lookup_start = platform_time.monotonicNs();
+                exact_profile.raw_scalar_reads += 1;
+                const loaded_vector = if (vector_cursor) |*cursor|
                     entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
                 else
-                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
+                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch);
+                const distance_start_ns = platform_time.monotonicNs();
+                exact_profile.native_lookup_ns += distance_start_ns - lookup_start;
+                const vector = loaded_vector catch |err| switch (err) {
                     error.NotFound => {
                         exact_profile.missing_vectors += 1;
                         continue;
@@ -19606,7 +19615,7 @@ pub const IndexManager = struct {
         if (exact_load_session) |session| {
             exact_profile.request_vector_cache_entries = session.vector_cache.count();
             exact_profile.raw_batch_reads = session.raw_batch_reads;
-            exact_profile.raw_scalar_reads = session.raw_scalar_reads;
+            exact_profile.raw_scalar_reads +|= session.raw_scalar_reads;
         }
         results.sort();
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
@@ -46662,6 +46671,26 @@ test "production external scorers use bounded cache-first artifact batches" {
         try std.testing.expectEqual(expected.vector_id, hit.vector_id);
         try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
     }
+
+    const Residual = struct {
+        key: []const u8,
+
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const context: *const @This() = @ptrCast(@alignCast(raw));
+            return std.mem.eql(u8, context.key, key);
+        }
+    };
+    var residual = Residual{ .key = doc_keys[far_query_idx] };
+    var filtered = try manager.exactScoreDenseEntryWithRequest(entry, .{
+        .query = vectors[far_query_idx * dims ..][0..dims],
+        .k = 10,
+        .filter_ids = candidate_ids,
+        .key_predicate = .{ .ptr = &residual, .allows = Residual.allows },
+    });
+    defer filtered.results.deinit();
+    try std.testing.expectEqual(@as(u64, 1), filtered.vectors_scored);
+    try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
+    try std.testing.expectEqual(candidate_ids[far_query_idx], filtered.results.getHits()[0].vector_id);
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {
