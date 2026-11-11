@@ -1135,7 +1135,11 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             import threading
 
             publication_blocked = False
-            server.restart()
+            server.pause()
+            # The matched simulator can select a construction policy while the
+            # engine is stopped. Never drain provider work after cold startup.
+            network_phase("publication_setup")
+            server.resume()
             _, pinned = call("POST", "/query", query)
             stop = threading.Event()
             first_read = threading.Event()

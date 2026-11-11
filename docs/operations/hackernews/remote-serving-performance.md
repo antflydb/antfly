@@ -1476,3 +1476,35 @@ full GCS cases passed and cleaned their prefixes (879/811 versions, zero
 remaining). That candidate's HN fixture failed its first pending dense query
 with `index_rebuilding` after immediate restart. New timings and HN validation
 are required; sub-second GCS cold latency is not established.
+
+
+### Candidate 340d977e8a qualification
+
+The optimized server/Lite build and focused native, SQL and linked ABI gates
+passed. The same 10,000-row GCS fixture passed both concurrent-write publication
+barriers. Empty-cache search measured 1.652 s with stored source and 2.005 s with
+Parquet hydration (previous samples: 1.819 / 4.068 s). Peak RSS was 254 / 284 MB.
+Parquet source reads fell from 27 to 19, and transferred bytes from 3.88 to
+3.33 MB; these are individual fixture samples, not latency distributions. Cleanup
+removed 900 / 836 versions and verified zero remaining in both task prefixes.
+
+The initial matched local runs applied the 100 ms model to index construction
+and timed out before cold measurement. The zero-latency control passed the full
+fixture. Enabling shaping before cold startup instead produced a 1.454 s cold
+stored-source sample, but the later all-shaped publication barrier timed out;
+that probe is incomplete and is not a passing qualification. The runner now
+reports construction and query policies separately: the default shapes measured
+reads, while initial construction and the final publication phase use loopback
+without synthetic delay. `--shape-setup` retains the all-phase stress case.
+Neither readiness deadlines nor correctness assertions are extended or skipped.
+The default cannot qualify publication performance under the shaped network;
+the real GCS barrier remains an independent requirement.
+
+The assembled HN case still fails the first manual dense-vector query after
+restart with `index_rebuilding`. Its accepted-write preparation exhausts the
+five-second window, and all vector recipes share each partition job, including
+the two managed chunk/enrichment recipes. Interrupted jobs release their claims,
+but manual-vector reads still wait for the whole recipe set. Recovery scheduling
+alone does not establish immediate manual-vector visibility. Recipe-scoped
+preparation and readiness need further implementation and validation; this is
+still a merge blocker.

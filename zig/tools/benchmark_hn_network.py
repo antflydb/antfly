@@ -23,7 +23,7 @@ and publication barrier. Startup is never drained before the cold query.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import importlib
 import json
@@ -46,6 +46,11 @@ def main(argv=None):
     parser.add_argument("--bandwidth-mib", type=float, default=16)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument(
+        "--shape-setup",
+        action="store_true",
+        help="Also shape initial construction and publication; default shapes measured reads only",
+    )
+    parser.add_argument(
         "--store-source", action=argparse.BooleanOptionalAction, default=True
     )
     args = parser.parse_args(argv)
@@ -58,6 +63,17 @@ def main(argv=None):
         connection_ms=args.connection_ms,
     )
     policy.validate()
+    setup_policy = (
+        policy
+        if args.shape_setup
+        else replace(
+            policy,
+            latency_ms=0,
+            jitter_ms=0,
+            connection_ms=0,
+            bandwidth_mib=0,
+        )
+    )
     assert args.binary.is_file() and args.corpus_dir.is_dir()
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -69,12 +85,14 @@ def main(argv=None):
     report = {
         "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
         "network": asdict(policy),
+        "setup_network": asdict(setup_policy),
+        "shape_setup": args.shape_setup,
         "properties": {},
         "complete": False,
         "qualification": "same GCS composed fixture; loopback HTTP transport",
     }
     with (
-        NetworkStore(out / "objects", policy, bucket="hn-loopback") as service,
+        NetworkStore(out / "objects", setup_policy, bucket="hn-loopback") as service,
         pytest.MonkeyPatch.context() as patch,
     ):
         token_file = out / "token"
@@ -99,7 +117,11 @@ def main(argv=None):
         for key, value in env.items():
             patch.setenv(key, value)
         patch.setattr(
-            test, "network_phase", lambda name: service.configure(policy, name)
+            test,
+            "network_phase",
+            lambda name: service.configure(
+                setup_policy if name == "publication_setup" else policy, name
+            ),
         )
         try:
             test.test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
@@ -116,7 +138,13 @@ def main(argv=None):
             report["complete"] = True
         finally:
             service.wait_idle()
-            for phase in ("setup", "cold_startup", "cold_query", "after_cold_query"):
+            for phase in (
+                "setup",
+                "cold_startup",
+                "cold_query",
+                "after_cold_query",
+                "publication_setup",
+            ):
                 report.setdefault("io", {})[phase] = service.summary(phase)
             # Preserve counters and hashes, not tokens or raw query/source data.
             (out / "report.json").write_text(json.dumps(report, indent=2))

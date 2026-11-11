@@ -749,3 +749,18 @@ incarnation-fenced recovery; vector reads also schedule that recovery on a
 missing cut even when native serving-cut optimization is disabled. This makes
 completed manual-vector preparation durable before an immediate restart while
 preserving asynchronous recovery for slower enrichment.
+
+
+Recent-vector recovery qualification found that partition-only jobs couple
+manual dense/sparse indexes to managed chunk/enrichment recipes. A bounded
+acceptance-side build and recovery wakeups alone cannot guarantee immediate
+manual-vector reads after restart: a job interrupted while enriching one recipe
+still leaves every recipe in that partition unavailable. The next implementation
+must persist progress under exact partition-content and recipe identities,
+prioritize already supplied vectors, and evaluate readiness for the indexes a
+query actually selects. Multi-index queries must still prove coverage for each
+selected recipe at the same WAL horizon. Retained cursors must retain all of
+those recipe-specific segment roots through expiry. Aggregate table status can
+report incomplete enrichment without suppressing unrelated ready indexes;
+background recovery must resume missing recipes without rebuilding completed
+ones or allowing an old worker to publish into a newer cut.
