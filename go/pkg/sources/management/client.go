@@ -137,6 +137,13 @@ func (c *Client) PutSource(ctx context.Context, source Source) (Source, error) {
 	return c.putSource(ctx, source, nil)
 }
 
+// GetSourceDeclaration requests configuration without native readiness probes.
+// Older servers may ignore the optional view and return full observations.
+func (c *Client) GetSourceDeclaration(ctx context.Context, id string) (out Source, err error) {
+	err = c.call(ctx, "GET", "/sources/"+url.PathEscape(id)+"?view=declaration", "", nil, &out)
+	return
+}
+
 // PutSourceIfMatch requires a matching declaration revision for a PUT.
 func (c *Client) PutSourceIfMatch(ctx context.Context, source Source, revision string) (Source, error) {
 	if revision == "" {

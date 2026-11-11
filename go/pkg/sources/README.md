@@ -1095,3 +1095,14 @@ and explicit exact-key selections are retained.
 Projected-page syncs checkpoint each verified publication batch. On resume,
 the sync rechecks the indexed rows and the pinned GCS generations and
 metagenerations before reusing them.
+
+
+Manifest comparison treats equivalent JSON numeric spellings exactly (including
+large integers and decimal exponents); it never converts them to float64 or
+changes the server's opaque revision. Plan and apply prefer
+`Client.GetSourceDeclaration`, using `GET /sources/{id}?view=declaration` to read
+configuration and reconciliation state without native readiness inspection.
+Runtimes implement the optional `management.DeclarationBackend`; older runtimes
+may return the full source view. Status commands continue to request readiness.
+Opaque connector config rejects `management.ReservedSourceConfigFields()` in both
+manifest preflight and the shared HTTP handler.

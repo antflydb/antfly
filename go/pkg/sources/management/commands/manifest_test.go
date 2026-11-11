@@ -76,7 +76,7 @@ func TestDecodeManifestInvalid(t *testing.T) {
 }
 
 func TestDecodeManifestReservedConfigKeys(t *testing.T) {
-	for _, key := range []string{"permissions", "permission_ttl_seconds", "publication", "streams", "search_version", "artifacts", "processing", "search_status", "knowledge"} {
+	for _, key := range []string{"permissions", "permission_ttl_seconds", "publication", "streams", "search_version", "artifacts", "processing", "search_status", "knowledge", "knowledge_status"} {
 		t.Run(key, func(t *testing.T) {
 			source := strings.Replace(minimalManifestSource, `"config":{}`, fmt.Sprintf(`"config":{%q:null}`, key), 1)
 			_, err := DecodeManifest(strings.NewReader(`{"version":1,"sources":[` + source + `]}`))

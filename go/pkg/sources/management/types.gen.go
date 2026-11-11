@@ -468,6 +468,24 @@ func (e VectorSpaceQueryModality) Valid() bool {
 	}
 }
 
+// Defines values for GetSourceParamsView.
+const (
+	Declaration GetSourceParamsView = "declaration"
+	Full        GetSourceParamsView = "full"
+)
+
+// Valid indicates whether the value is a known member of the GetSourceParamsView enum.
+func (e GetSourceParamsView) Valid() bool {
+	switch e {
+	case Declaration:
+		return true
+	case Full:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for PutSourceParamsIfNoneMatch.
 const (
 	Asterisk PutSourceParamsIfNoneMatch = "*"
@@ -879,6 +897,15 @@ type ListSourcesParams struct {
 type RemoveSourceParams struct {
 	Purge bool `form:"purge,omitempty" json:"purge,omitempty,omitzero"`
 }
+
+// GetSourceParams defines parameters for GetSource.
+type GetSourceParams struct {
+	// View declaration requests configuration, revision and reconciliation state without native readiness observations. Older runtimes may return full observations.
+	View GetSourceParamsView `form:"view,omitempty" json:"view,omitempty,omitzero"`
+}
+
+// GetSourceParamsView defines parameters for GetSource.
+type GetSourceParamsView string
 
 // PutSourceParams defines parameters for PutSource.
 type PutSourceParams struct {

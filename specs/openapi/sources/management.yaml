@@ -113,7 +113,23 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "full",
+                "declaration"
+              ],
+              "default": "full"
+            },
+            "description": "declaration requests configuration, revision and reconciliation state without native readiness observations. Older runtimes may return full observations."
+          }
+        ]
       },
       "put": {
         "operationId": "putSource",

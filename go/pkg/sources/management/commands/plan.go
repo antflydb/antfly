@@ -145,7 +145,12 @@ func planManifest(ctx context.Context, api API, m Manifest, opts PlanOptions) (P
 				return Plan{}, c, Classify(err)
 			}
 		}
-		current, err := api.GetSource(ctx, id)
+		var current management.Source
+		if declarations, ok := api.(management.DeclarationBackend); ok {
+			current, err = declarations.GetSourceDeclaration(ctx, id)
+		} else {
+			current, err = api.GetSource(ctx, id)
+		}
 		create := hasManifestCode(err, CodeNotFound)
 		if err != nil && !create {
 			return Plan{}, c, Classify(err)
@@ -168,12 +173,12 @@ func planManifest(ctx context.Context, api API, m Manifest, opts PlanOptions) (P
 		if !create {
 			item.Revision = sourceRevision(current)
 			item.Action = PlanUnchanged
-			if management.SourceRevision(manifestDeclaration(desired)) != management.SourceRevision(manifestDeclaration(current)) {
-				item.Action = PlanUpdate
-				item.Changes, err = manifestChanges(current, desired)
-				if err != nil {
-					return Plan{}, c, Classify(err)
-				}
+			changes, err := manifestChanges(current, desired)
+			if err != nil {
+				return Plan{}, c, Classify(err)
+			}
+			if len(changes) > 0 {
+				item.Action, item.Changes = PlanUpdate, changes
 			} else if current.ReconciliationStatus != nil && current.ReconciliationStatus.State != management.ReconciliationStatusStateReady {
 				item.Action = PlanReconcile
 			}
@@ -236,6 +241,11 @@ func manifestDesired(ctx context.Context, current management.Source, entry Manif
 // Validate the complete effective declaration before any source is written.
 // Provider access, native admission and authorization remain server checks.
 func validateDesired(source management.Source, c management.Capabilities) error {
+	for _, key := range management.ReservedSourceConfigFields() {
+		if _, exists := source.Config[key]; exists {
+			return fmt.Errorf("config must not contain reserved key %q", key)
+		}
+	}
 	if err := declarations.ValidateSearchBindings(source.SearchVersion, source.Streams, source.Artifacts); err != nil {
 		return fmt.Errorf("search bindings: %w", err)
 	}
@@ -265,7 +275,7 @@ func manifestDeclaration(source management.Source) management.Source {
 
 func manifestChanges(current, desired management.Source) ([]string, error) {
 	fields := func(source management.Source) (map[string]json.RawMessage, error) {
-		raw, err := json.Marshal(manifestDeclaration(source))
+		raw, err := manifestComparisonJSON(source)
 		if err != nil {
 			return nil, err
 		}

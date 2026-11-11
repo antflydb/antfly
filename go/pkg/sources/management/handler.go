@@ -192,7 +192,18 @@ func Handler(b Backend) http.Handler {
 			case len(parts) == 2:
 				switch r.Method {
 				case http.MethodGet:
-					result, err = b.GetSource(r.Context(), id)
+					switch view := r.URL.Query().Get("view"); view {
+					case "", "full":
+						result, err = b.GetSource(r.Context(), id)
+					case "declaration":
+						if declarations, ok := b.(DeclarationBackend); ok {
+							result, err = declarations.GetSourceDeclaration(r.Context(), id)
+						} else {
+							result, err = b.GetSource(r.Context(), id)
+						}
+					default:
+						err = Failure(400, "invalid_source_view")
+					}
 				case http.MethodPut:
 					var source Source
 					if err = Decode(w, r, &source); err != nil {
@@ -200,6 +211,15 @@ func Handler(b Backend) http.Handler {
 					}
 					if source.Id != id || source.Config == nil || !source.Publication.Valid() || source.Connection == "" || source.Table == "" {
 						err = Failure(400, "invalid_source")
+						break
+					}
+					for _, key := range ReservedSourceConfigFields() {
+						if _, exists := source.Config[key]; exists {
+							err = Failure(400, "reserved_source_config_field")
+							break
+						}
+					}
+					if err != nil {
 						break
 					}
 					source.Revision = ""

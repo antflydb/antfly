@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package management
 
@@ -299,6 +311,69 @@ func TestHandlerSourceIfAbsentInvalidPreconditions(t *testing.T) {
 				if base.putCalls != 0 || cas.conditionalCalls != 0 || cas.absentCalls != 0 {
 					t.Errorf("invalid precondition reached backend (conditional=%t): PutSource=%d IfMatch=%d IfAbsent=%d", conditional, base.putCalls, cas.conditionalCalls, cas.absentCalls)
 				}
+			}
+		})
+	}
+}
+
+type declarationHandlerBackend struct {
+	*revisionHandlerBackend
+	declarations int
+}
+
+func (b *declarationHandlerBackend) GetSourceDeclaration(context.Context, string) (Source, error) {
+	b.declarations++
+	return b.source, nil
+}
+func (b *declarationHandlerBackend) GetSource(context.Context, string) (Source, error) {
+	return Source{}, Failure(503, "native_observations_unavailable")
+}
+func TestDeclarationViewUsesFastBackendAndPreservesRevision(t *testing.T) {
+	backend := &declarationHandlerBackend{revisionHandlerBackend: &revisionHandlerBackend{source: revisionTestSource()}}
+	server := httptest.NewServer(Handler(backend))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := client.GetSourceDeclaration(t.Context(), "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Revision != SourceRevision(backend.source) || backend.declarations != 1 {
+		t.Fatalf("source=%#v, reads=%d", source, backend.declarations)
+	}
+	if _, err = client.GetSource(t.Context(), "source"); err == nil {
+		t.Fatal("full view did not use observation backend")
+	}
+	response := httptest.NewRecorder()
+	Handler(backend).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/sources/source?view=bogus", nil))
+	if response.Code != 400 {
+		t.Fatalf("invalid view status=%d", response.Code)
+	}
+	// Optional backends remain compatible with the additive view parameter.
+	old := &revisionHandlerBackend{source: revisionTestSource()}
+	response = httptest.NewRecorder()
+	Handler(old).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/sources/source?view=declaration", nil))
+	if response.Code != 200 {
+		t.Fatalf("old backend status=%d", response.Code)
+	}
+}
+
+func TestHandlerRejectsContractFieldsInOpaqueConfig(t *testing.T) {
+	for _, key := range ReservedSourceConfigFields() {
+		t.Run(key, func(t *testing.T) {
+			source := revisionTestSource()
+			source.Config[key] = nil
+			body, err := json.Marshal(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend := &revisionHandlerBackend{source: source}
+			response := httptest.NewRecorder()
+			Handler(backend).ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/sources/source", bytes.NewReader(body)))
+			if response.Code != 400 || backend.putCalls != 0 {
+				t.Fatalf("status=%d writes=%d", response.Code, backend.putCalls)
 			}
 		})
 	}

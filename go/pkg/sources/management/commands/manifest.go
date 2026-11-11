@@ -125,10 +125,7 @@ func validateManifestSource(s ManifestSource, seen map[string]bool) string {
 	case s.Config == nil:
 		return "config is required"
 	}
-	for _, key := range []string{
-		"permissions", "permission_ttl_seconds", "publication", "streams",
-		"search_version", "artifacts", "processing", "search_status", "knowledge",
-	} {
+	for _, key := range management.ReservedSourceConfigFields() {
 		if _, ok := s.Config[key]; ok {
 			return fmt.Sprintf("config must not contain reserved key %q", key)
 		}
