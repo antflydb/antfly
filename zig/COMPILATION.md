@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-11-02
+Last updated: 2026-11-10
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -1862,6 +1862,12 @@ The same qualification measured the API document identity/restore root at
 floor is 18 GiB with the same profile guards and headroom. The object now has
 the explicit name `api-docid-tests` for attribution and can be qualified via
 `zig build antfly-api-docid-test` without rebuilding unrelated unit roots.
+A subsequent full native Apple Silicon Debug unit gate on 2026-11-10 with
+Zig 0.17.0 / SDK 27.0 reached 19,627,360,256 bytes and exceeded that claim.
+The measured native Darwin Debug floor is now 20,608 MiB: this complete peak
+plus 10%, rounded up to 128 MiB. It still admits an 8 GiB compiler within
+the unchanged 28.8 GiB host-aware budget. Linux, cross-host and release
+profiles are unchanged; larger authored claims remain authoritative.
 The API auth and derived-coverage roots measured 13,895,155,712 and
 14,097,039,360 bytes. Both receive a 17 GiB native Darwin Debug floor under
 the same guards; they retain their existing focused targets and now use
