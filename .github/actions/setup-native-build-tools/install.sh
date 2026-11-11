@@ -22,5 +22,8 @@ for tool in cc c++ make nm pkg-config xz; do
 done
 if [[ "$missing" == false ]]; then exit 0; fi
 
-sudo apt-get update
-sudo apt-get install --no-install-recommends -y build-essential binutils pkg-config xz-utils
+# APT normally reports success after a partially failed index refresh. That
+# leaves a clean runner with no installation candidates after a DNS outage.
+# Reuse the signature/checksum-preserving, bounded refresh policy used by CI.
+exec /bin/bash "${BASH_SOURCE[0]%/*}/../../../scripts/ci/install_ubuntu_packages.sh" \
+  --no-install-recommends build-essential binutils pkg-config xz-utils

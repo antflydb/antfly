@@ -39,7 +39,9 @@ class PreviousReaderBuildTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.temp.cleanup)
-        self.previous = Path(self.temp.name)
+        # CI's worktree cache is a symlink to the build volume. The entry point
+        # canonicalizes __file__, so fixture expectations use that same root.
+        self.previous = Path(self.temp.name).resolve()
         self.build = self.previous / "zig/embedded.build.zig"
         self.build.parent.mkdir()
         # Exact file at e8666a5b758e1e588a6b2b74b260212e984b40a9.
@@ -112,6 +114,8 @@ class PreviousReaderBuildTests(unittest.TestCase):
         build = baseline / "zig/embedded.build.zig"
         build.parent.mkdir(parents=True)
         build.write_bytes(self.original)
+        checkout = self.previous / "linked-checkout"
+        checkout.symlink_to(root, target_is_directory=True)
         builds = []
 
         def run(args, **kwargs):
@@ -136,7 +140,7 @@ class PreviousReaderBuildTests(unittest.TestCase):
 
         with (
             patch.object(
-                previous_reader, "__file__", str(root / "scripts/ci/prepare.py")
+                previous_reader, "__file__", str(checkout / "scripts/ci/prepare.py")
             ),
             patch.object(
                 previous_reader, "prepare_previous_reader_dependencies"
