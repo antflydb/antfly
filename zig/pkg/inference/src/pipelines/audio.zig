@@ -31,6 +31,7 @@ pub const DecodeOptions = generic.DecodeOptions;
 pub const EncodedClip = generic.EncodedClip;
 pub const decodeWav = generic.decodeWav;
 pub const detectFormat = generic.detectFormat;
+pub const mimeForBytes = generic.mimeForBytes;
 pub const detectFormatFromMime = generic.detectFormatFromMime;
 pub const detectFormatFromFilename = generic.detectFormatFromFilename;
 pub const decode = generic.decode;

@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/sources"
@@ -32,25 +33,36 @@ const defaultTranscriberModel = "openai/whisper-small:safetensors@973afd24965f72
 // Profiles select native recipes and coverage policies. Acquisition remains
 // independent. Each profile gets a separate corpus state/table so installing a
 // new recipe cannot invalidate an accepted PDF table's producers or artifacts.
-type corpusProfile struct{ Name, Purpose, Route string }
+type unitEvidence uint8
+
+const (
+	pdfPageEvidence unitEvidence = iota
+	transcriptEvidence
+	groundedImageEvidence
+)
+
+type corpusProfile struct {
+	Name, Purpose, Route string
+	MIMEs                []string
+	Evidence             unitEvidence
+}
 
 func processingProfile(name string) (corpusProfile, error) {
 	switch name {
 	case "", "pdf":
-		return corpusProfile{"pdf", "extraction", "pdf"}, nil
+		return corpusProfile{Name: "pdf", Purpose: "extraction", Route: "pdf", MIMEs: []string{"application/pdf"}, Evidence: pdfPageEvidence}, nil
 	case "images":
-		return corpusProfile{"images", "caption", "image"}, nil
+		return corpusProfile{Name: "images", Purpose: "caption", Route: "image", MIMEs: []string{"image/png", "image/jpeg", "image/webp"}, Evidence: groundedImageEvidence}, nil
 	case "transcription":
-		return corpusProfile{"transcription", "transcription", "audio"}, nil
+		// Raw preservation accepts more formats than the native Whisper profile.
+		// Add processing formats only with decoder and temporal-evidence support.
+		return corpusProfile{Name: "transcription", Purpose: "transcription", Route: "audio", MIMEs: []string{"audio/wav", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/aac", "audio/aiff", "audio/x-caf", "audio/flac"}, Evidence: transcriptEvidence}, nil
 	default:
 		return corpusProfile{}, fmt.Errorf("unknown processing profile %q (available: pdf, transcription, images)", name)
 	}
 }
 func (p corpusProfile) accepts(mime string) bool {
-	if p.Name == "pdf" {
-		return mime == "application/pdf"
-	}
-	return (p.Name == "transcription" && strings.HasPrefix(mime, "audio/")) || (p.Name == "images" && strings.HasPrefix(mime, "image/"))
+	return slices.Contains(p.MIMEs, mime)
 }
 
 func nativeTranscriptionConfig(filename, inferenceURL, secretRef string) (map[string]any, error) {
@@ -95,6 +107,7 @@ func nativeTranscriptionConfig(filename, inferenceURL, secretRef string) (map[st
 	}
 	if transcriber["provider"] == "antfly" && secretRef != "" {
 		transcriber["api_key"] = secretRef
+		delete(transcriber, "bearer_token")
 	}
 	producer := sources.NativeTranscriptProducer(transcriber)
 	return producer["config"].(map[string]any), nil

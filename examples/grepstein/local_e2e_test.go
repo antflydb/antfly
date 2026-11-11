@@ -57,6 +57,9 @@ func TestLocalNativeGCSTranscription(t *testing.T) {
 	t.Run("antfly", func(t *testing.T) {
 		testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "transcription", HostedSTT: true})
 	})
+	t.Run("antfly-framed", func(t *testing.T) {
+		testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "transcription", HostedSTT: true, FramedSTT: true})
+	})
 }
 func TestLocalNativeGCSImages(t *testing.T) {
 	t.Run("png", func(t *testing.T) { testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "images"}) })
@@ -81,8 +84,8 @@ func nativeImageFixture(t *testing.T, variant uint8, asJPEG ...bool) []byte {
 }
 
 type nativeCorpusSmokeOptions struct {
-	Profile              string
-	OCR, HostedSTT, JPEG bool
+	Profile                         string
+	OCR, HostedSTT, JPEG, FramedSTT bool
 }
 
 func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions) {
@@ -234,7 +237,7 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 	}
 	transcriberConfig, inferenceSecret := "", ""
 	if speech {
-		transcriber := nativeAppendTranscriberFixture(t, &ocrCalls, hostedSTT)
+		transcriber := nativeAppendTranscriberFixture(t, &ocrCalls, hostedSTT, options.FramedSTT)
 		if hostedSTT {
 			inferenceURL = transcriber.URL
 			inferenceSecret = "antfly.e2e.stt.key"
@@ -514,15 +517,16 @@ func nativeTranscriptFixtureAudio() []byte {
 	binary.LittleEndian.PutUint32(data[40:], 32000)
 	return data
 }
-func nativeAppendTranscriberFixture(t *testing.T, calls *atomic.Int64, hosted bool) *httptest.Server {
+func nativeAppendTranscriberFixture(t *testing.T, calls *atomic.Int64, hosted bool, framed ...bool) *httptest.Server {
 	t.Helper()
+	useFramed := len(framed) > 0 && framed[0]
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer local-stt-e2e-token" {
 			http.Error(w, "invalid STT credential", 403)
 			return
 		}
 		if hosted && r.Method == "GET" && strings.Contains(r.URL.Path, "/models") {
-			caps := map[string]any{"version": 4, "task": "transcribe", "input_modalities": []string{"audio"}, "accepted_mime_types": []string{"audio/wav"}, "input_granularity": "item", "output": "transcription", "result_cardinality": "one_per_request", "prompt_policy": "explicit", "borrowed_attachments": false, "task_limits": map[string]any{"max_text_bytes_per_item": 65536, "max_input_tokens_per_item": 8192, "max_output_tokens_per_item": 8192, "max_candidates_per_request": nil, "max_schema_bytes": nil}, "batch": map[string]any{"mode": "serial_compatibility", "preferred_items": 1, "max_items": 1, "max_encoded_media_bytes": 67108864, "max_decoded_pixels": 0, "max_media_parts_per_item": 1, "per_item_failures": false}}
+			caps := map[string]any{"version": 4, "task": "transcribe", "input_modalities": []string{"audio"}, "accepted_mime_types": []string{"audio/wav"}, "input_granularity": "item", "output": "transcription", "result_cardinality": "one_per_request", "prompt_policy": "explicit", "borrowed_attachments": false, "framed_attachments": useFramed, "task_limits": map[string]any{"max_text_bytes_per_item": 65536, "max_input_tokens_per_item": 8192, "max_output_tokens_per_item": 8192, "max_candidates_per_request": nil, "max_schema_bytes": nil}, "batch": map[string]any{"mode": "serial_compatibility", "preferred_items": 1, "max_items": 1, "max_encoded_media_bytes": 67108864, "max_decoded_pixels": 0, "max_media_parts_per_item": 1, "per_item_failures": false}}
 			json.NewEncoder(w).Encode(map[string]any{"transcribers": map[string]any{defaultTranscriberModel: map[string]any{"inputs": []string{"audio"}, "inference_capabilities": caps}}})
 			return
 		}
@@ -538,6 +542,28 @@ func nativeAppendTranscriberFixture(t *testing.T, calls *atomic.Int64, hosted bo
 		if err != nil || (!hosted && !bytes.Contains(raw, []byte("whisper-1"))) || (hosted && !bytes.Contains(raw, []byte(defaultTranscriberModel))) {
 			http.Error(w, "invalid audio form", 400)
 			return
+		}
+		if hosted && useFramed {
+			if r.Header.Get("Content-Type") != "application/vnd.antfly.attachments.v1" || len(raw) < 40 || string(raw[:8]) != "AFATT001" {
+				t.Errorf("missing framed audio")
+				http.Error(w, "invalid audio frame", 400)
+				return
+			}
+			metadata := binary.LittleEndian.Uint64(raw[8:16])
+			mime := binary.LittleEndian.Uint32(raw[24:28])
+			data := binary.LittleEndian.Uint64(raw[32:40])
+			if binary.LittleEndian.Uint32(raw[16:20]) != 1 || metadata > 65536 || mime > 1024 || data > 4<<20 || uint64(len(raw)) != 40+metadata+uint64(mime)+data {
+				t.Errorf("invalid frame bounds")
+				http.Error(w, "invalid audio frame", 400)
+				return
+			}
+			start := 40 + int(metadata)
+			end := start + int(mime)
+			if string(raw[start:end]) != "audio/wav" || !bytes.HasPrefix(raw[end:], []byte("RIFF")) {
+				t.Errorf("lost source MIME or bytes")
+				http.Error(w, "invalid audio frame", 400)
+				return
+			}
 		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
