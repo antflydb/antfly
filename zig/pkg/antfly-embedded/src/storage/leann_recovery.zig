@@ -25,10 +25,33 @@ pub const Session = struct {
     elapsed_ns: u64 = 0,
     state: ?*anyopaque = null,
     release: ?*const fn (*anyopaque) void = null,
+    reclaim: ?*const fn (*anyopaque) bool = null,
+
+    /// Query-wide allocations may reclaim optional session data before a
+    /// bounded retry. The callback must preserve borrowed/pinned inputs.
+    pub const WorkingAllocator = struct {
+        const Pressure = @import("antfly_platform").allocator.PressureAllocator;
+        layer: Pressure,
+        session: *Session,
+
+        pub fn init(parent: @import("std").mem.Allocator, session: *Session) @This() {
+            return .{ .layer = .{ .parent = parent, .reclaim = reclaim }, .session = session };
+        }
+        pub fn allocator(self: *@This()) @import("std").mem.Allocator {
+            return self.layer.allocator();
+        }
+        fn reclaim(layer: *Pressure) bool {
+            const self: *@This() = @fieldParentPtr("layer", layer);
+            const state = self.session.state orelse return false;
+            const callback = self.session.reclaim orelse return false;
+            return callback(state);
+        }
+    };
 
     pub fn deinit(self: *Session) void {
         if (self.state) |state| self.release.?(state);
         self.state = null;
+        self.reclaim = null;
     }
 
     pub fn checkDispatch(self: *const Session, elapsed_ns: u64) !void {

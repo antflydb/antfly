@@ -54820,15 +54820,17 @@ test "leann persistent local and replicated searches enforce scratch budgets and
         defer alloc.free(path);
         const Primary = struct {
             vectors: [32][8]f32 = undefined,
-            expected: ?Allocator = null,
+            expected: ?*Budget = null,
             extra_scratch: usize = 0,
             query_loads: usize = 0,
             fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.expected) |expected| {
                     self.query_loads += 1;
-                    try std.testing.expectEqual(expected.ptr, a.ptr);
-                    try std.testing.expectEqual(expected.vtable, a.vtable);
+                    const before = expected.live;
+                    const audit = try a.alloc(u8, 1);
+                    defer a.free(audit);
+                    try std.testing.expectEqual(before + 1, expected.live);
                 }
                 const scratch = try a.alloc(u8, self.extra_scratch);
                 defer a.free(scratch);
@@ -54838,8 +54840,10 @@ test "leann persistent local and replicated searches enforce scratch budgets and
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.expected) |expected| {
                     self.query_loads += 1;
-                    try std.testing.expectEqual(expected.ptr, a.ptr);
-                    try std.testing.expectEqual(expected.vtable, a.vtable);
+                    const before = expected.live;
+                    const audit = try a.alloc(u8, 1);
+                    defer a.free(audit);
+                    try std.testing.expectEqual(before + 1, expected.live);
                 }
                 const scratch = try a.alloc(u8, self.extra_scratch);
                 defer a.free(scratch);
@@ -54880,7 +54884,7 @@ test "leann persistent local and replicated searches enforce scratch budgets and
             {
                 var budget = Budget.init(std.heap.page_allocator, 32 * 1024);
                 defer std.debug.assert(budget.deinit() == 0);
-                primary.expected = budget.allocator();
+                primary.expected = &budget;
                 primary.extra_scratch = 64 * 1024;
                 primary.query_loads = 0;
                 try std.testing.expectError(error.OutOfMemory, store.searchWithWorkingAllocator(alloc, budget.allocator(), request));
@@ -54890,7 +54894,7 @@ test "leann persistent local and replicated searches enforce scratch budgets and
             var result = block: {
                 var budget = Budget.init(std.heap.page_allocator, 256 * 1024);
                 defer std.debug.assert(budget.deinit() == 0);
-                primary.expected = budget.allocator();
+                primary.expected = &budget;
                 primary.extra_scratch = 0;
                 const answer = try store.searchWithWorkingAllocator(alloc, budget.allocator(), request);
                 try std.testing.expectEqual(@as(usize, 0), budget.live);

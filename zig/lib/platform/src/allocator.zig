@@ -66,6 +66,45 @@ pub fn reclaimingScratch(alloc: std.mem.Allocator) std.mem.Allocator {
     return current;
 }
 
+/// Transparent allocation-pressure layer. Reclaim once after a denied
+/// allocation, preserving the parent's limits and ownership. Resize/remap
+/// failure alone is not pressure: allocators may simply require a move.
+pub const PressureAllocator = struct {
+    parent: std.mem.Allocator,
+    reclaim: *const fn (*PressureAllocator) bool,
+
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    /// Introspection only: accounting may inspect the underlying budget,
+    /// while actual allocation retains this layer's reclamation behavior.
+    pub fn parentAllocator(candidate: std.mem.Allocator) ?std.mem.Allocator {
+        if (candidate.vtable.alloc != allocate) return null;
+        const self: *@This() = @ptrCast(@alignCast(candidate.ptr));
+        return self.parent;
+    }
+
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.parent.rawAlloc(len, alignment, ra)) |bytes| return bytes;
+        if (!self.reclaim(self)) return null;
+        return self.parent.rawAlloc(len, alignment, ra);
+    }
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.parent.rawResize(memory, alignment, len, ra);
+    }
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.parent.rawRemap(memory, alignment, len, ra);
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.parent.rawFree(memory, alignment, ra);
+    }
+};
+
 /// Return unused libc heap pages to the operating system after a coarse
 /// process-lifetime teardown boundary. glibc normally retains freed arenas for
 /// reuse, which is efficient for steady allocation shapes but can preserve the

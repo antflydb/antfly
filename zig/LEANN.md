@@ -718,7 +718,12 @@ Each search owns its recovery session. Cancellation reaches provider discovery
 and inference, and chunk source sets survive scoring batches. Retained source
 sets have a 32 MiB soft limit; a single larger parent remains reusable until a
 different parent is needed, bounding retained data to the limit plus one parent.
-The query working-set cap also applies to that retained parent.
+The query working-set cap also applies to that retained parent. Under memory
+pressure, optional source sets are reclaimed before retrying the denied
+allocation once, including allocations in later scoring batches and native
+read-buffer admission. Retrying an allocation does not repeat completed
+chunker or embedder calls. Borrowed source bytes and cache-map growth are
+pinned against reentrant reclamation.
 External helpers, including `transcribeAudio`, never qualify for text elision.
 
 Transient searches capture graph candidates and their keys under the graph

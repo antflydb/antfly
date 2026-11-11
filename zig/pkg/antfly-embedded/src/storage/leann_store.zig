@@ -690,6 +690,8 @@ pub const LeannStore = struct {
             .budget_ns = if (self.opts.transient) @as(u64, self.opts.reembed_budget_ms) * std.time.ns_per_ms else 0,
         };
         defer recovery.deinit();
+        var pressure = RecoverySession.WorkingAllocator.init(alloc, &recovery);
+        const working = pressure.allocator();
         const accounting = if (req.external_work) |work| work.reembed_elapsed_ns else null;
         if (accounting) |elapsed| recovery.elapsed_ns = elapsed.*;
         defer if (accounting) |elapsed| {
@@ -700,10 +702,10 @@ pub const LeannStore = struct {
         var want: usize = if (filter.distanceActive() and !search_types.requiresExhaustiveCoverage(req)) @max(req.k *| 4, req.k +| 64) else req.k;
         while (true) {
             try recovery.check();
-            var captured = try self.captureSearch(result_alloc, alloc, req, &filter, want, &gate);
-            defer captured.deinit(alloc);
+            var captured = try self.captureSearch(result_alloc, working, req, &filter, want, &gate);
+            defer captured.deinit(working);
             var source = CapturedSource{
-                .alloc = alloc,
+                .alloc = working,
                 .dims = self.opts.dims,
                 .loader = captured.loader,
                 .rows = captured.rows.items,
@@ -715,10 +717,10 @@ pub const LeannStore = struct {
                 const response = score: {
                     if (req.external_work) |work| try work.enter(work.ptr);
                     defer if (req.external_work) |work| work.leave(work.ptr);
-                    break :score try plan.score(alloc, .{ .ctx = &source, .recompute_fn = CapturedSource.recompute, .result_order = CapturedSource.order }, req.query, captured.options);
+                    break :score try plan.score(working, .{ .ctx = &source, .recompute_fn = CapturedSource.recompute, .result_order = CapturedSource.order }, req.query, captured.options);
                 };
                 var scored = response;
-                defer scored.deinit(alloc);
+                defer scored.deinit(working);
                 if (req.external_work) |work| try work.validate(work.ptr);
                 var profile = scored.stats;
                 profile.matches.verified += captured.pending_matches;

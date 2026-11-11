@@ -1880,9 +1880,23 @@ pub fn reembedDenseDocuments(
 const ReembedSessionState = struct {
     alloc: Allocator,
     sources: ReembedChunkSourceCache = .{},
+    retained: ReembedPressureAllocator = undefined,
+    budget: ?*resource_manager_mod.BudgetedAllocator = null,
+    residency: @import("antfly_platform").allocator.reclamation.Reclaimer = undefined,
+
+    fn reclaimResidency(raw: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.sources.tryReclaim(self.alloc);
+    }
+
+    fn reclaim(raw: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.sources.reclaim(self.alloc);
+    }
 
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.budget) |budget| budget.residency.unregister(&self.residency);
         self.sources.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -1917,7 +1931,7 @@ threadlocal var active_recovery_source: ?RecoverySourceRead = null;
 /// Retained chunk sources use the first call's allocator until session.deinit.
 /// That allocator must outlive the session; invocation-only bytes use each
 /// call's allocator. Search sessions use their query working-set allocator.
-pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../../leann_recovery.zig").Session) !void {
+pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, input_alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../../leann_recovery.zig").Session) !void {
     try session.check();
     const previous_source = active_recovery_source;
     if (session.source_read) |view| active_recovery_source = .{ .runtime = runtime, .view = view };
@@ -1925,6 +1939,24 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
     if (requests.len == 0) return;
     if (out.len != requests.len * @as(usize, dims) or found.len != requests.len) return error.InvalidArgument;
     @memset(found, false);
+    const cache: *ReembedSessionState = if (session.state) |raw| @ptrCast(@alignCast(raw)) else create: {
+        const state = try input_alloc.create(ReembedSessionState);
+        state.* = .{ .alloc = input_alloc };
+        state.retained = .init(input_alloc, &state.sources, input_alloc);
+        state.budget = resource_manager_mod.BudgetedAllocator.fromAllocator(input_alloc);
+        if (state.budget) |budget| {
+            state.residency = .{ .ptr = state, .reclaim = ReembedSessionState.reclaimResidency };
+            budget.residency.register(&state.residency);
+        }
+        session.state = state;
+        session.release = ReembedSessionState.release;
+        session.reclaim = ReembedSessionState.reclaim;
+        break :create state;
+    };
+    // Reclaim optional sources at the failing allocation, before retrying it.
+    // This does not repeat source preparation or an external provider call.
+    var pressure = ReembedPressureAllocator.init(input_alloc, &cache.sources, cache.alloc);
+    const alloc = pressure.allocator();
     const Accounting = struct {
         fn begin(raw: *anyopaque) !u64 {
             const active: *@import("../../leann_recovery.zig").Session = @ptrCast(@alignCast(raw));
@@ -1970,13 +2002,6 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
         while (iterator.next()) |key| alloc.free(key.*);
         generations.deinit(alloc);
     }
-    const cache: *ReembedSessionState = if (session.state) |raw| @ptrCast(@alignCast(raw)) else create: {
-        const state = try alloc.create(ReembedSessionState);
-        state.* = .{ .alloc = alloc };
-        session.state = state;
-        session.release = ReembedSessionState.release;
-        break :create state;
-    };
     const generation = try dense_embedder.captureTextGeneration(alloc, requestEmbeddingName(requests[0]));
     const pinned_embedder = dense_embedder.withTextGeneration(generation);
     for (requests, 0..) |base_request, i| {
@@ -2002,7 +2027,7 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
         if (request.input_kind != .document) {
-            const text = (try reembedChunkTextAlloc(runtime, alloc, cache.alloc, request, &cache.sources, scoped_chunker, foreground)) orelse continue;
+            const text = (try reembedChunkTextAlloc(runtime, alloc, cache.retained.allocator(), request, &cache.sources, scoped_chunker, foreground)) orelse continue;
             if (request.expected_source_hash) |expected| {
                 const legacy = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
                 const actual = retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
@@ -2097,6 +2122,55 @@ const ReembedChunkSourceCache = struct {
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     bytes: usize = 0,
     builds: usize = 0,
+    pressure_reclaims: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    pins: usize = 0,
+
+    const Pin = struct {
+        cache: ?*ReembedChunkSourceCache,
+        fn release(self: *@This()) void {
+            const cache = self.cache orelse return;
+            cache.lock();
+            defer cache.mutex.unlock();
+            std.debug.assert(cache.pins > 0);
+            cache.pins -= 1;
+            self.cache = null;
+        }
+    };
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn pin(self: *@This()) Pin {
+        self.lock();
+        defer self.mutex.unlock();
+        self.pins += 1;
+        return .{ .cache = self };
+    }
+
+    fn reclaim(self: *@This(), alloc: Allocator) bool {
+        return self.evict(alloc, true);
+    }
+
+    fn tryReclaim(self: *@This(), alloc: Allocator) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        return self.evictLocked(alloc, true);
+    }
+
+    fn evict(self: *@This(), alloc: Allocator, pressure: bool) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.evictLocked(alloc, pressure);
+    }
+
+    fn evictLocked(self: *@This(), alloc: Allocator, pressure: bool) bool {
+        if (self.pins != 0 or self.entries.count() == 0) return false;
+        self.deinit(alloc);
+        if (pressure) self.pressure_reclaims += 1;
+        return true;
+    }
 
     fn deinit(self: *ReembedChunkSourceCache, alloc: Allocator) void {
         var it = self.entries.iterator();
@@ -2108,6 +2182,30 @@ const ReembedChunkSourceCache = struct {
             alloc.free(item.key_ptr.*);
         }
         self.entries.deinit(alloc);
+        self.entries = .empty;
+        self.bytes = 0;
+    }
+};
+
+/// Delegating allocator with no independent allocation ownership. Retained
+/// objects use a session-owned instance; invocation scratch uses a local one.
+/// Only allocation failure triggers eviction. Failed remaps commonly mean
+/// "move this allocation" and must not discard otherwise useful cache data.
+const ReembedPressureAllocator = struct {
+    const Pressure = @import("antfly_platform").allocator.PressureAllocator;
+    layer: Pressure,
+    cache: *ReembedChunkSourceCache,
+    cache_alloc: Allocator,
+
+    fn init(parent: Allocator, cache: *ReembedChunkSourceCache, cache_alloc: Allocator) @This() {
+        return .{ .layer = .{ .parent = parent, .reclaim = reclaim }, .cache = cache, .cache_alloc = cache_alloc };
+    }
+    fn allocator(self: *@This()) Allocator {
+        return self.layer.allocator();
+    }
+    fn reclaim(layer: *Pressure) bool {
+        const self: *@This() = @fieldParentPtr("layer", layer);
+        return self.cache.reclaim(self.cache_alloc);
     }
 };
 
@@ -2138,14 +2236,14 @@ fn reembedChunkTextAlloc(
     defer alloc.free(worker_key);
     const cache_key = try workerChunkCacheTupleKeyAlloc(alloc, &.{ requestArtifactName(request), worker_key });
     defer alloc.free(cache_key);
+    var pin = source_cache.pin();
+    defer pin.release();
     const entry = source_cache.entries.get(cache_key) orelse create: {
+        const clear_soft_limit = source_cache.bytes >= 32 << 20;
+        pin.release();
         // Keep a hot parent even if it alone exceeds the soft limit. On a
         // different parent, bound retained work to the limit plus one parent.
-        if (source_cache.bytes >= 32 << 20) {
-            const builds = source_cache.builds;
-            source_cache.deinit(alloc);
-            source_cache.* = .{ .builds = builds };
-        }
+        if (clear_soft_limit) _ = source_cache.evict(alloc, false);
         if (!try requestCanReplayLocally(runtime, alloc, parent_request, parent)) return null;
         if (request.chunker_json.len != 0) {
             var config = try @import("../../../chunking/types.zig").parseConfigFromSlice(alloc, request.chunker_json);
@@ -2170,7 +2268,15 @@ fn reembedChunkTextAlloc(
         for (entry.sources.sources, 0..) |source, i| try entry.by_key.put(alloc, source.key, i);
         const owned_key = try alloc.dupe(u8, cache_key);
         errdefer alloc.free(owned_key);
-        try source_cache.entries.put(alloc, owned_key, entry);
+        // A map cannot be reclaimed reentrantly during its own growth.
+        pin = source_cache.pin();
+        source_cache.entries.put(alloc, owned_key, entry) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            pin.release();
+            if (!source_cache.reclaim(alloc)) return err;
+            pin = source_cache.pin();
+            try source_cache.entries.put(alloc, owned_key, entry);
+        };
         source_cache.builds += 1;
         source_cache.bytes +|= owned_key.len + @sizeOf(ReembedChunkSourceCache.Entry);
         for (entry.sources.sources) |source| source_cache.bytes +|= source.text.len + source.key.len + @sizeOf(@TypeOf(entry.sources.sources[0]));
@@ -2179,7 +2285,16 @@ fn reembedChunkTextAlloc(
     const index = entry.by_key.get(request.doc_key) orelse return null;
     const source = entry.sources.sources[index];
     if (source.metadata != null) return error.ReembedUnsupportedInput;
-    return try result_alloc.dupe(u8, source.text);
+    return result_alloc.dupe(u8, source.text) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        // Detach the selected text before releasing the parent that owns it.
+        // Earlier batch inputs are already independent owned copies.
+        entry.sources.sources[index].text = &.{};
+        pin.release();
+        _ = source_cache.reclaim(alloc);
+        defer alloc.free(source.text);
+        return try result_alloc.dupe(u8, source.text);
+    };
 }
 
 /// Whether rendered content parts are text only, so the vector they embed is
@@ -48487,6 +48602,25 @@ test "leann recovery charges source reads rendering and retained chunks to reque
     const Budget = @import("../../test_allocator.zig").BoundedAllocator;
     const Probe = struct {
         calls: usize = 0,
+        chunk_calls: usize = 0,
+        fn chunk(raw: *anyopaque, a: Allocator, _: []const u8, input: @import("inference_chunker").Input, _: @import("../../../chunking/types.zig").Config, control: inference_request_context.RequestContext) ![]@import("inference_chunker").Chunk {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try control.check();
+            self.chunk_calls += 1;
+            const chunks = try a.alloc(@import("inference_chunker").Chunk, 8);
+            var initialized: usize = 0;
+            errdefer {
+                for (chunks[0..initialized]) |*item| item.deinit(a);
+                a.free(chunks);
+            }
+            for (chunks, 0..) |*item, i| {
+                const begin = i * input.text.len / chunks.len;
+                const end = (i + 1) * input.text.len / chunks.len;
+                item.* = .{ .id = @intCast(i), .mime_type = "text/plain", .text = try a.dupe(u8, input.text[begin..end]), .owns_text = true, .start_char = @intCast(begin), .end_char = @intCast(end) };
+                initialized += 1;
+            }
+            return chunks;
+        }
         fn embed(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -48620,4 +48754,92 @@ test "leann recovery charges source reads rendering and retained chunks to reque
     session.deinit();
     session_open = false;
     try std.testing.expectEqual(@as(usize, 0), owner.live);
+    // Many parents each fit comfortably on their own, but their optional
+    // retained sources cannot all coexist under this sub-32-MiB budget.
+    // Allocation-level reclamation must not repeat completed chunker calls.
+    {
+        runtime.config.chunk_provider = .{ .ptr = &probe, .boundary_dispatch = chunk_provider.CallbackBoundary.local_dispatch, .chunk_input_with_context_callback = @ptrCast(&Probe.chunk) };
+        defer runtime.config.chunk_provider = null;
+        var limited = Budget.init(std.heap.page_allocator, 1024 * 1024);
+        defer std.debug.assert(limited.deinit() == 0);
+        var pressured: @import("../../leann_recovery.zig").Session = .{};
+        defer pressured.deinit();
+        var query = @import("../../leann_recovery.zig").Session.WorkingAllocator.init(limited.allocator(), &pressured);
+        const calls = probe.calls;
+        const chunks = probe.chunk_calls;
+        for (0..16) |i| {
+            const name = try std.fmt.allocPrint(alloc, "pressure-{d}", .{i});
+            defer alloc.free(name);
+            const key = try documentSourceStoreKeyAlloc(&runtime, name);
+            defer alloc.free(key);
+            try storePutWithRetry(&runtime, key, raw);
+            const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, name, "chunks", 0);
+            defer alloc.free(chunk_key);
+            var candidate = child;
+            candidate.doc_key = chunk_key;
+            candidate.chunker_json = "{\"provider\":\"antfly\",\"model\":\"fixed\"}";
+            try reembedDenseDocumentsSession(&runtime, query.allocator(), &.{candidate}, 2, &output, &found, &pressured);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 1 }, &output);
+            try std.testing.expect(limited.live <= limited.limit);
+        }
+        const cached: *ReembedSessionState = @ptrCast(@alignCast(pressured.state.?));
+        try std.testing.expect(cached.sources.pressure_reclaims > 0);
+        try std.testing.expect(cached.sources.bytes < 32 << 20);
+        try std.testing.expectEqual(@as(usize, 16), cached.sources.builds);
+        try std.testing.expectEqual(calls + 16, probe.calls);
+        try std.testing.expectEqual(chunks + 16, probe.chunk_calls);
+        // A denied copy must release the cache without invalidating the
+        // selected bytes before retry/cleanup, or repeating chunker work.
+        const last_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "pressure-15", "chunks", 0);
+        defer alloc.free(last_key);
+        var last = child;
+        last.doc_key = last_key;
+        last.chunker_json = "{\"provider\":\"antfly\",\"model\":\"fixed\"}";
+        try std.testing.expect(cached.sources.entries.count() > 0);
+        try std.testing.expectError(error.OutOfMemory, reembedChunkTextAlloc(&runtime, std.testing.failing_allocator, cached.retained.allocator(), last, &cached.sources, runtime.config.chunk_provider, false));
+        try std.testing.expectEqual(@as(usize, 0), cached.sources.entries.count());
+        try std.testing.expectEqual(chunks + 16, probe.chunk_calls);
+        try reembedDenseDocumentsSession(&runtime, query.allocator(), &.{last}, 2, &output, &found, &pressured);
+        try std.testing.expect(found[0]);
+        // Later plan/scoring allocations outside source preparation can also
+        // reclaim the retained parent without repeating provider work.
+        const reclaims = cached.sources.pressure_reclaims;
+        const scratch = try query.allocator().alloc(u8, limited.limit - limited.live + 1);
+        query.allocator().free(scratch);
+        try std.testing.expect(cached.sources.pressure_reclaims > reclaims);
+        try std.testing.expectEqual(@as(usize, 0), cached.sources.entries.count());
+        try std.testing.expectEqual(chunks + 17, probe.chunk_calls);
+        pressured.deinit();
+        try std.testing.expectEqual(@as(usize, 0), limited.live);
+    }
+}
+
+test "leann pressure reclamation preserves pinned source entries" {
+    var budget = @import("../../test_allocator.zig").BoundedAllocator.init(std.heap.page_allocator, 256 * 1024);
+    defer std.debug.assert(budget.deinit() == 0);
+    const alloc = budget.allocator();
+    var cache = ReembedChunkSourceCache{};
+    defer cache.deinit(alloc);
+    const sources = try alloc.alloc(ChunkEmbeddingSource, 1);
+    sources[0] = .{ .key = try alloc.dupe(u8, "chunk"), .text = try alloc.alloc(u8, 128 * 1024) };
+    @memset(sources[0].text, 'x');
+    const entry = try alloc.create(ReembedChunkSourceCache.Entry);
+    entry.* = .{ .sources = .{ .sources = sources } };
+    try cache.entries.put(alloc, try alloc.dupe(u8, "parent"), entry);
+    cache.bytes = sources[0].text.len;
+    var pressure = ReembedPressureAllocator.init(alloc, &cache, alloc);
+    var pin = cache.pin();
+    defer pin.release();
+    const amount = budget.limit - budget.live + 1;
+    try std.testing.expectError(error.OutOfMemory, pressure.allocator().alloc(u8, amount));
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try std.testing.expectEqual(@as(u8, 'x'), entry.sources.sources[0].text[0]);
+    try std.testing.expectEqual(@as(usize, 0), cache.pressure_reclaims);
+    pin.release();
+    const scratch = try pressure.allocator().alloc(u8, amount);
+    pressure.allocator().free(scratch);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    try std.testing.expectEqual(@as(usize, 1), cache.pressure_reclaims);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

@@ -730,7 +730,7 @@ pub const ReplicatedState = struct {
         return self.searchWithWorkingAllocatorAndStats(alloc, alloc, req, search_stats);
     }
 
-    pub fn searchWithWorkingAllocatorAndStats(self: *const ReplicatedState, result_alloc: Allocator, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
+    pub fn searchWithWorkingAllocatorAndStats(self: *const ReplicatedState, result_alloc: Allocator, input_alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
         if (search_stats) |profile| profile.* = .{};
         var out = search_results.SearchResults.init(result_alloc, req.k);
         errdefer out.deinit();
@@ -742,6 +742,8 @@ pub const ReplicatedState = struct {
         var gate = SearchGate.init(req, if (loader.load_batch_session != null) 0 else budget_ms);
         var recovery = @import("leann_recovery.zig").Session{ .cancellation = req.cancellation, .deadline_ns = req.deadline_ns, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
         defer recovery.deinit();
+        var pressure = @import("leann_recovery.zig").Session.WorkingAllocator.init(input_alloc, &recovery);
+        const alloc = pressure.allocator();
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns, .recovery = &recovery };
         var filter = try Filter.init(alloc, req);
         defer filter.deinit(alloc);

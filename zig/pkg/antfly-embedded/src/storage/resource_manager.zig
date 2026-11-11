@@ -3949,6 +3949,9 @@ pub const BudgetedAllocator = struct {
         pub fn growTo(self: *BorrowedScratch, bytes: usize) !void {
             if (self.reservation.released) return error.ReservationReleased;
             if (bytes <= self.bytes) return;
+            // Borrowed read buffers must be able to release optional query
+            // residency just like allocator-backed scratch, before owner locks.
+            self.owner.prepareAllocation(bytes - self.bytes);
             lockAtomic(&self.owner.allocator_mutex);
             defer self.owner.allocator_mutex.unlock();
             const growth = bytes - self.bytes;
@@ -4111,8 +4114,8 @@ pub const BudgetedAllocator = struct {
         self.* = undefined;
     }
 
-    /// Recognize only our own allocator and standard arena wrappers. Unknown
-    /// wrappers retain their original allocation path and budget semantics.
+    /// Recognize our allocator through standard arenas and transparent
+    /// pressure layers. Unknown quota/failure wrappers remain boundaries.
     pub fn fromAllocator(candidate: std.mem.Allocator) ?*BudgetedAllocator {
         var current = candidate;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -4120,6 +4123,10 @@ pub const BudgetedAllocator = struct {
         for (0..8) |_| {
             if (current.vtable.alloc == alloc or current.vtable.alloc == lockedAlloc)
                 return @ptrCast(@alignCast(current.ptr));
+            if (@import("antfly_platform").allocator.PressureAllocator.parentAllocator(current)) |parent| {
+                current = parent;
+                continue;
+            }
             if (current.vtable != arena_vtable) return null;
             const wrapped: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
             current = wrapped.child_allocator;
@@ -6899,4 +6906,58 @@ test "external lake native chunk reclamation preserves pins and skips contended 
     try std.testing.expectEqual(@as(u64, 0), ResourceManager.NativeChunks.reclaim(owner, MiB));
     try std.testing.expectEqualStrings("pinned native extent", bytes);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+}
+
+test "leann pressure layers preserve borrowed native read budget recognition" {
+    const PressureLayer = @import("antfly_platform").allocator.PressureAllocator;
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.dense_search_working_set)] = .{ .soft_limit_bytes = 64, .hard_limit_bytes = 128 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var budget = BudgetedAllocator.init(&manager, .dense_search_working_set, std.testing.allocator, 1);
+    defer budget.deinit();
+    const Layer = struct {
+        layer: PressureLayer,
+        retained: ?[]u8 = null,
+        reclaims: usize = 0,
+        hook: allocator_residency.Reclaimer = undefined,
+        fn reclaimResidency(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return reclaim(&self.layer);
+        }
+        fn reclaim(layer: *PressureLayer) bool {
+            const self: *@This() = @fieldParentPtr("layer", layer);
+            const retained = self.retained orelse return false;
+            self.retained = null;
+            self.layer.parent.free(retained);
+            self.reclaims += 1;
+            return true;
+        }
+    };
+    var inner = Layer{ .layer = .{ .parent = budget.allocator(), .reclaim = Layer.reclaim } };
+    inner.retained = try budget.allocator().alloc(u8, 80);
+    defer if (inner.retained) |bytes| budget.allocator().free(bytes);
+    var outer = Layer{ .layer = .{ .parent = inner.layer.allocator(), .reclaim = Layer.reclaim } };
+    const alloc = outer.layer.allocator();
+    try std.testing.expectEqual(&budget, BudgetedAllocator.fromAllocator(alloc).?);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try std.testing.expectEqual(&budget, BudgetedAllocator.fromAllocator(arena.allocator()).?);
+    {
+        const bytes = try alloc.alloc(u8, 96);
+        defer alloc.free(bytes);
+        try std.testing.expectEqual(@as(usize, 1), inner.reclaims);
+        try std.testing.expectEqual(@as(usize, 0), outer.reclaims);
+        var borrowed = try BudgetedAllocator.fromAllocator(alloc).?.borrowResidentScratch(16, null);
+        defer borrowed.release();
+        try std.testing.expectEqual(@as(u64, 16), budget.borrowed_bytes);
+        try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 32));
+    }
+    inner.retained = try budget.allocator().alloc(u8, 80);
+    inner.hook = .{ .ptr = &inner, .reclaim = Layer.reclaimResidency };
+    budget.residency.register(&inner.hook);
+    defer budget.residency.unregister(&inner.hook);
+    var borrowed = try BudgetedAllocator.fromAllocator(alloc).?.borrowResidentScratch(96, null);
+    defer borrowed.release();
+    try std.testing.expectEqual(@as(usize, 2), inner.reclaims);
+    try std.testing.expectEqual(@as(u64, 96), budget.borrowed_bytes);
 }
