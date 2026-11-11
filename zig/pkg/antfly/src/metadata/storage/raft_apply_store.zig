@@ -5913,6 +5913,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 pub const TransitionCommand = union(enum) {
     activate_retained_dataset: retained_owner_model.Activation,
     release_retained_source: retained_owner_model.Activation,
+    finish_retained_collection: retained_owner_model.Collection,
     acknowledge_retained_owner: retained_owner_receipt.Receipt,
     acknowledge_retained_archive: retained_owner_model.ArchiveAcknowledgement,
     register_retained_owners: retained_owner_model.Registration,
@@ -6220,6 +6221,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .activate_retained_dataset, .release_retained_source => |request| try request.validate(),
         .acknowledge_retained_owner => |receipt| try receipt.verify(),
         .acknowledge_retained_archive => |receipt| try receipt.validate(),
+        .finish_retained_collection => |proof| try proof.validate(),
         .register_retained_owners => |request| try request.validate(),
         .apply_relation_reconciliation => |bytes| _ = try relation_control.Command.decode(bytes),
         .advance_resolver_namespace => |intent| if (intent.table_id == 0) return error.InvalidResolverCurationRequest,
@@ -15297,6 +15299,38 @@ pub const RaftApplyStore = struct {
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
     }
 
+    fn finishRetainedCollectionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, proof: retained_owner_model.Collection) !void {
+        try proof.validate();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var resource = (try system_catalog_storage.getById(a, txn, group, .dataset, proof.resource)) orelse return;
+        defer resource.deinit();
+        var descriptor = try system_catalog.retained_datasets.parse(a, resource.value.source_json);
+        defer descriptor.deinit();
+        const current = descriptor.value;
+        if (current.phase != .retiring or current.source != null or current.revision != proof.revision or current.definition.generation != proof.generation or current.collection_receipt != null or
+            !std.mem.eql(u8, &try current.definition.fingerprint(a), &proof.definition)) return;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/retained-collection/v1");
+        hash.update(&current.definition.id);
+        hash.update(&proof.definition);
+        if (!std.mem.eql(u8, &hash.finalResult(), &proof.receipt)) return error.InvalidRetainedOwnerPlan;
+        const plan = (try retained_owner_journal.getPlan(a, txn, group, proof.resource, proof.generation)) orelse return;
+        _ = try retained_owner_journal.finishCollection(a, txn, group, .{ .resource = proof.resource, .generation = proof.generation }, plan.revision, proof.receipt);
+        var next = current;
+        next.revision = try std.math.add(u64, next.revision, 1);
+        next.collection_receipt = proof.receipt;
+        try current.validateNext(a, next);
+        var replacement = resource.value;
+        replacement.source_json = try std.json.Stringify.valueAlloc(a, next, .{});
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        var upserts = [_]system_catalog.Resource{replacement};
+        var removes: [0]system_catalog.Resource = .{};
+        try self.applySystemCatalogDeltaTxn(a, txn, group, .{ .upserts = &upserts, .removes = &removes, .next_id = meta.next_id }, meta, proof.receipt);
+        self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
+    }
+
     fn acknowledgeRetainedArchiveTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, proof: retained_owner_model.ArchiveAcknowledgement) !void {
         try proof.validate();
         const scope = proof.scope;
@@ -15483,6 +15517,7 @@ pub const RaftApplyStore = struct {
                 .retiring => plan.phase == .retiring or plan.phase == .retired,
             };
             if (!compatible) return error.RetainedOwnerPlanChanged;
+            if (!std.meta.eql(value.collection_receipt, plan.collection_receipt)) return error.RetainedOwnerPlanChanged;
             if (value.source == null and (value.closed_receipt == null or !std.meta.eql(value.closed_receipt, plan.source_release_receipt))) return error.RetainedOwnerPlanChanged;
         }
     }
@@ -19194,7 +19229,7 @@ pub const RaftApplyStore = struct {
             .ack_initial_fk_retirement => metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_retire),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
-            .activate_retained_dataset, .release_retained_source, .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.retained_owner_plan) |
+            .finish_retained_collection, .activate_retained_dataset, .release_retained_source, .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.retained_owner_plan) |
                 metadataSnapshotProjectionBit(.retained_owner) | metadataSnapshotProjectionBit(.retained_owner_work) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
@@ -21583,6 +21618,7 @@ pub const RaftApplyStore = struct {
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
             .activate_retained_dataset => |request| try self.activateRetainedDatasetTxn(txn, group_id, request),
             .release_retained_source => |request| try self.releaseRetainedSourceTxn(txn, group_id, request),
+            .finish_retained_collection => |proof| try self.finishRetainedCollectionTxn(txn, group_id, proof),
             .acknowledge_retained_archive => |proof| try self.acknowledgeRetainedArchiveTxn(txn, group_id, proof),
             .acknowledge_retained_owner => |receipt| self.acknowledgeRetainedOwnerTxn(txn, group_id, receipt) catch |err| switch (err) {
                 // Authority may change after a legitimate observation was
@@ -28700,6 +28736,7 @@ const TransitionTag = enum(u8) {
     activate_retained_dataset = 85,
     acknowledge_retained_archive = 86,
     release_retained_source = 87,
+    finish_retained_collection = 88,
     apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
     apply_transaction_sessions = 82,
@@ -28856,6 +28893,13 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendInt(alloc, &out, u64, request.generation);
             try out.appendSlice(alloc, &request.plan);
             try appendInt(alloc, &out, u64, request.revision);
+        },
+        .finish_retained_collection => |proof| {
+            try proof.validate();
+            try out.append(alloc, @backingInt(TransitionTag.finish_retained_collection));
+            const bytes = try std.json.Stringify.valueAlloc(alloc, proof, .{});
+            defer alloc.free(bytes);
+            try appendRequiredString(alloc, &out, bytes);
         },
         .acknowledge_retained_archive => |proof| {
             try proof.validate();
@@ -29359,6 +29403,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             request.revision = try readInt(encoded, &pos, u64);
             try request.validate();
             break :blk if (tag == .activate_retained_dataset) .{ .activate_retained_dataset = request } else .{ .release_retained_source = request };
+        },
+        .finish_retained_collection => blk: {
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(retained_owner_model.Collection, alloc, bytes, .{});
+            defer parsed.deinit();
+            try parsed.value.validate();
+            break :blk .{ .finish_retained_collection = parsed.value };
         },
         .acknowledge_retained_archive => blk: {
             var proof: retained_owner_model.ArchiveAcknowledgement = .{ .scope = .{ .resource = try readInt(encoded, &pos, u64), .generation = try readInt(encoded, &pos, u64), .group = try readInt(encoded, &pos, u64), .revision = try readInt(encoded, &pos, u64), .plan = undefined }, .closure = undefined, .receipt = undefined };
@@ -46411,6 +46463,49 @@ test "system catalog retained owner acknowledgements verify physical authority a
     a.free(closed_cut);
     try applySystemCatalogTestCommand(&store, 6, .{ .expected_revision = (try store.systemCatalogMeta(a, group)).revision, .mutation = .{ .action = .set_definition, .kind = .dataset, .name = "stats", .source_json = retiring_json.?, .expected_dataset_revision = closed_revision } });
     try std.testing.expectError(error.RetainedOwnerPlanChanged, store.retainedDatasetReadCutJson(a, group, .{ .table = "stats" }));
+    // Only verified, revision-fenced collection removes work. Keep the tombstone.
+    const before_collection = try store.retainedArchiveWorkJson(a, group, 0);
+    defer a.free(before_collection);
+    try std.testing.expect(!std.mem.eql(u8, before_collection, "null"));
+    var collection_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    collection_hash.update("antfly/retained-collection/v1");
+    collection_hash.update(&descriptor.definition.id);
+    const fingerprint = try descriptor.definition.fingerprint(a);
+    collection_hash.update(&fingerprint);
+    var collection: retained_owner_model.Collection = .{ .resource = resource_id, .generation = 1, .revision = closed_revision + 1, .definition = fingerprint, .receipt = collection_hash.finalResult() };
+    var forged = collection;
+    forged.receipt = @splat(42);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InvalidRetainedOwnerPlan, store.finishRetainedCollectionTxn(&txn, group, forged));
+    }
+    collection.revision -= 1;
+    try store.applyStandaloneCommand(group, .{ .finish_retained_collection = collection });
+    collection.revision += 1;
+    const collection_wire = try encodeTransitionCommand(a, .{ .finish_retained_collection = collection });
+    defer a.free(collection_wire);
+    var collection_command = (try decodeTransitionCommand(a, collection_wire)).?;
+    defer collection_command.deinit(a);
+    try std.testing.expectEqualDeep(collection, collection_command.finish_retained_collection);
+    try store.applyStandaloneCommand(group, collection_command);
+    try store.applyStandaloneCommand(group, collection_command);
+    const after_collection = try store.retainedArchiveWorkJson(a, group, 0);
+    defer a.free(after_collection);
+    try std.testing.expectEqualStrings("null", after_collection);
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        const completed = (try retained_owner_journal.getPlan(a, &txn, group, resource_id, 1)).?;
+        try std.testing.expectEqual(retained_owner_model.Phase.retired, completed.phase);
+        try std.testing.expectEqualDeep(@as(?retained_owner_model.Id, collection.receipt), completed.collection_receipt);
+        var tombstone = (try system_catalog_storage.getById(a, &txn, group, .dataset, resource_id)).?;
+        defer tombstone.deinit();
+        var retired = try retained.parse(a, tombstone.value.source_json);
+        defer retired.deinit();
+        try std.testing.expectEqual(retained.Phase.retiring, retired.value.phase);
+        try std.testing.expectEqualDeep(@as(?retained.Id, collection.receipt), retired.value.collection_receipt);
+    }
     // An enrolled but superseded physical reporter is not current authority.
     reporter.reporter_incarnation += 1;
     try store.applyStandaloneCommand(group, .{ .register_store = reporter });

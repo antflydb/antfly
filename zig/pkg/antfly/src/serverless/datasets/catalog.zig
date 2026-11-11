@@ -842,6 +842,52 @@ pub const Catalog = struct {
     /// Retirement rejects new readers before any object deletion is attempted.
     /// Ordered expiry seek. The caller advances the cursor when a pin or
     /// dependency defers one extent, so unrelated history can still retire.
+    /// Resume hints live with the archive, not in an evictable metadata cache.
+    /// Advance before attempting collection so durable holds cannot starve the
+    /// following segment. A crash may delay a retry until the next full sweep.
+    pub fn nextMaintenanceExpiry(self: Catalog) !?Expiry {
+        const session = try self.open(true);
+        defer session.deinit();
+        const previous = try self.get(session.value, ?ExpiryCursor, "maintenance/expiry");
+        defer if (previous) |value| value.deinit();
+        const next = try self.nextExpiry(if (previous) |value| value.value else null);
+        if (next == null and (if (previous) |value| value.value == null else true)) return null;
+        const bytes = try std.json.Stringify.valueAlloc(self.context.alloc, if (next) |value| @as(?ExpiryCursor, value.cursor) else null, .{});
+        defer self.context.alloc.free(bytes);
+        try self.commit(session.value, &.{.{ .kind = .put, .key = "maintenance/expiry", .value = bytes }});
+        return next;
+    }
+
+    pub fn nextMaintenanceDiscard(self: Catalog) !?t.Id {
+        const session = try self.open(true);
+        defer session.deinit();
+        const previous = try self.get(session.value, ?t.Id, "maintenance/discard");
+        defer if (previous) |value| value.deinit();
+        const next = try self.nextDiscard(if (previous) |value| value.value else null);
+        const bytes = try std.json.Stringify.valueAlloc(self.context.alloc, next, .{});
+        defer self.context.alloc.free(bytes);
+        // nextDiscard may have committed the terminal fence itself. There is
+        // no resume hint to save once completion is durable.
+        if (next == null and try self.discardReceipt() != null) return null;
+        try self.commit(session.value, &.{.{ .kind = .put, .key = "maintenance/discard", .value = bytes }});
+        return next;
+    }
+
+    /// Stable evidence of physical collection. The permanent discard fence
+    /// remains even after metadata removes this dataset from its work index.
+    pub fn discardReceipt(self: Catalog) !?t.Id {
+        const session = try self.open(false);
+        defer session.deinit();
+        const state = (try self.get(session.value, Discard, "discard")) orelse return null;
+        defer state.deinit();
+        if (!state.value.complete) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/retained-collection/v1");
+        hash.update(&self.dataset);
+        hash.update(&state.value.definition);
+        return hash.finalResult();
+    }
+
     pub fn nextExpiry(self: Catalog, after: ?ExpiryCursor) !?Expiry {
         const now = self.clock.unix();
         if (now == 0) return error.DatasetLeaseExpired;

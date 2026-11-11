@@ -12312,7 +12312,40 @@ pub const DataServer = struct {
         const snapshot = try self.loadRetainedReadOwner(a, table_name, request.scope, context);
         const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
         const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
-        var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = platform_time.realtimeNs(), .dimensions_json = request.dimensions_json, .after = request.after }, context);
+        // The read clock must survive failover/rollback before it can hide
+        // history. Quantize to bucket expiry boundaries: steady-state reads
+        // share one durable admission per interval rather than one write/read.
+        const now = platform_time.realtimeNs();
+        const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table_name, .status, context), .{});
+        const entry = for (status.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+        } else return error.RetainedSeriesNotReady;
+        try local.storage_retained_series_control.requireFence(fence, entry.binding.spec);
+        const spec = entry.binding.spec;
+        const threshold = try std.math.add(i128, try spec.bucket(try std.math.sub(i128, now, spec.retention_ns)), spec.retention_ns);
+        if (entry.progress.admitted_ns < threshold) {
+            if (self.hotStandbyWriteGate()) |gate| try gate.check();
+            const batch: antfly.db.types.BatchRequest = .{ .retained_series = .{ .action = .admit_retention, .fence = fence }, .timestamp_ns = std.math.cast(u64, threshold) orelse return error.RetainedSeriesTimeOverflow };
+            const term = blk: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                const raft = self.data_raft orelse break :blk @as(?u64, null);
+                if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+                const current = raft.host.http_host.host.raftStatus(group) orelse return error.UnknownGroup;
+                break :blk @as(?u64, current.hard.current_term);
+            };
+            if (term) |leader_term| try self.proposeRaftBatchGroup(a, group, table_name, batch, .{
+                .discovery = .cached,
+                .required_local_term = leader_term,
+                .allow_remote_forward = false,
+                .admission_deadline_ns = context.deadline_ns,
+                .visibility_cancellation = context.cancellation,
+            }) else {
+                if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
+                try owners.applyRetainedSeriesNative(a, group, table_name, batch, context);
+            }
+        }
+        var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = now, .dimensions_json = request.dimensions_json, .after = request.after }, context);
         defer reader.deinit();
         var rows: std.ArrayList(local.storage_retained_series.Bucket) = .empty;
         var encoded_bytes: usize = 0;
@@ -13259,6 +13292,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.retained_series) |command| return @import("../common/data_raft_protocol.zig").retainedSeriesCommandVersion(command);
         if (req.retained_series != null or req.expiration_deletes.len != 0) return @import("../common/data_raft_protocol.zig").batch_retained_series_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
         const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
@@ -58393,6 +58427,8 @@ test "retained series lifecycle protocol dominates document revision negotiation
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     req.document_version_scheme = .revision_v1;
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series.?.action = .admit_retention;
+    try std.testing.expectEqual(p.batch_retained_read_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
     req.retained_series = null;
     req.expiration_deletes = &.{"expired"};
     try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));

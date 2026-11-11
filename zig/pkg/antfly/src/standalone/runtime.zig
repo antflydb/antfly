@@ -2836,7 +2836,17 @@ const LocalStandaloneMetadata = struct {
         const store = self.lifecycle_store orelse return std.time.ns_per_s;
         const io = self.backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         try context.ensureActive();
-        try self.retained_archive.run(self.alloc, store, group_ids.main_metadata_group_id, config, server.api_server_cfg.secret_store, io, platform_time.monotonicNs(), &context);
+        const Completion = struct {
+            metadata: *LocalStandaloneMetadata,
+            pub fn finish(value: @This(), resource: @import("antfly_local_sources").system_catalog_domain.Resource, receipt: [32]u8) !void {
+                const proof = try @import("../serverless/datasets/configured_archive.zig").collectionProof(value.metadata.alloc, resource, receipt);
+                lockAtomic(&value.metadata.mutex);
+                defer value.metadata.mutex.unlock();
+                try value.metadata.applyJobCommandLocked(.{ .finish_retained_collection = proof });
+                try value.metadata.refreshRetainedDatasetProjectionLocked(value.metadata.alloc, resource.id);
+            }
+        };
+        try self.retained_archive.run(self.alloc, store, group_ids.main_metadata_group_id, config, server.api_server_cfg.secret_store, io, platform_time.monotonicNs(), &context, Completion{ .metadata = self });
         return self.retained_archive.next_ns -| platform_time.monotonicNs();
     }
 

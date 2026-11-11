@@ -21,7 +21,7 @@ const capture = @import("retained_series_capture.zig");
 const A = std.mem.Allocator;
 pub const Fence = @import("retained_series_revocation.zig").Fence;
 pub const Command = struct {
-    action: enum { install, backfill, tick, cleanup, close, revoke, drain, purge },
+    action: enum { install, backfill, tick, cleanup, close, revoke, drain, purge, admit_retention },
     fence: Fence,
     binding: ?capture.Binding = null,
     complete_from_ns: i128 = 0,
@@ -126,6 +126,7 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
         .install, .revoke, .purge => unreachable,
         .backfill => _ = try capture.backfillPage(a, txn, spec.id, spec.generation, command.expected_cursor, command.work_limit),
         .tick => _ = try engine.tick(txn, admitted_ns, command.work_limit),
+        .admit_retention => try engine.admitRetentionClock(txn, admitted_ns),
         .cleanup => _ = try engine.cleanupBackfill(txn, command.work_limit),
         .close => try capture.closeBinding(a, txn, spec.id, spec.generation, admitted_ns),
         .drain => try engine.beginClose(txn, admitted_ns),

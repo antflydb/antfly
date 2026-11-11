@@ -67,13 +67,11 @@ pub const Opened = struct {
 pub const ExpiryMaintenance = struct {
     after: u64 = 0,
     next_ns: u64 = 0,
-    cursors: std.AutoHashMapUnmanaged(u64, catalog.ExpiryCursor) = .empty,
-    discard_cursors: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
     cycle_progress: bool = false,
 
     pub fn deinit(self: *ExpiryMaintenance, alloc: std.mem.Allocator) void {
-        self.cursors.deinit(alloc);
-        self.discard_cursors.deinit(alloc);
+        _ = self;
+        _ = alloc;
     }
 
     pub fn run(
@@ -86,6 +84,7 @@ pub const ExpiryMaintenance = struct {
         io: std.Io,
         now: u64,
         context: *const operation.RequestContext,
+        completion: anytype,
     ) !void {
         if (now < self.next_ns) return;
         if (config.storage.artifacts.connection == null) {
@@ -94,22 +93,24 @@ pub const ExpiryMaintenance = struct {
         }
         const Worker = struct {
             maintenance: *ExpiryMaintenance,
-            alloc: std.mem.Allocator,
             source: @TypeOf(store_),
             group: u64,
             config: *const local.common_config.Config,
             secrets: ?*local.common_secrets.FileStore,
             io: std.Io,
             context: *const operation.RequestContext,
+            completion: @TypeOf(completion),
             fn next(self_: @This(), a: std.mem.Allocator, after: u64) !?local.system_catalog_domain.Resource {
                 const bytes = try self_.source.retainedArchiveWorkJson(a, self_.group, after);
                 return std.json.parseFromSliceLeaky(?local.system_catalog_domain.Resource, a, bytes, .{});
             }
             fn visit(self_: @This(), a: std.mem.Allocator, resource: local.system_catalog_domain.Resource) !bool {
-                return self_.maintenance.process(a, self_.alloc, resource, self_.config, self_.secrets, self_.io, self_.context);
+                const result = try self_.maintenance.process(a, resource, self_.config, self_.secrets, self_.io, self_.context);
+                if (result.receipt) |receipt| try self_.completion.finish(resource, receipt);
+                return result.progress;
             }
         };
-        return self.drain(alloc, now, context, Worker{ .maintenance = self, .alloc = alloc, .source = store_, .group = group, .config = config, .secrets = secrets, .io = io, .context = context });
+        return self.drain(alloc, now, context, Worker{ .maintenance = self, .source = store_, .group = group, .config = config, .secrets = secrets, .io = io, .context = context, .completion = completion });
     }
 
     fn drain(self: *ExpiryMaintenance, alloc: std.mem.Allocator, now: u64, context: *const operation.RequestContext, worker: anytype) !void {
@@ -144,7 +145,9 @@ pub const ExpiryMaintenance = struct {
         }
     }
 
-    fn process(self: *ExpiryMaintenance, a: std.mem.Allocator, alloc: std.mem.Allocator, resource: local.system_catalog_domain.Resource, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, io: std.Io, context: *const operation.RequestContext) !bool {
+    const Outcome = struct { progress: bool = false, receipt: ?[32]u8 = null };
+
+    fn process(_: *ExpiryMaintenance, a: std.mem.Allocator, resource: local.system_catalog_domain.Resource, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, io: std.Io, context: *const operation.RequestContext) !Outcome {
         var descriptor = try local.system_catalog_retained_datasets.parse(a, resource.source_json);
         defer descriptor.deinit();
         var archive = try Opened.init(a, config, secrets, descriptor.value, false);
@@ -152,23 +155,11 @@ pub const ExpiryMaintenance = struct {
         const archive_catalog = archive.store(io, context);
         if (descriptor.value.phase == .retiring) {
             try archive_catalog.beginDiscard(descriptor.value.definition);
-            const after = self.discard_cursors.get(resource.id);
-            const work = (try archive_catalog.nextDiscard(after)) orelse {
-                _ = self.discard_cursors.remove(resource.id);
-                return false;
-            };
-            if (self.discard_cursors.count() >= 4096) self.discard_cursors.clearRetainingCapacity();
-            try self.discard_cursors.put(alloc, resource.id, work);
-            return archive_catalog.discardOne(work, archive.location());
+            const work = (try archive_catalog.nextMaintenanceDiscard()) orelse return .{ .receipt = try archive_catalog.discardReceipt() };
+            return .{ .progress = try archive_catalog.discardOne(work, archive.location()) };
         }
-        const after = self.cursors.get(resource.id);
-        const work = (try archive_catalog.nextExpiry(after)) orelse {
-            _ = self.cursors.remove(resource.id);
-            return false;
-        };
-        if (self.cursors.count() >= 4096) self.cursors.clearRetainingCapacity();
-        try self.cursors.put(alloc, resource.id, work.cursor);
-        return archive_catalog.collectExpired(work.segment, archive.location());
+        const work = (try archive_catalog.nextMaintenanceExpiry()) orelse return .{};
+        return .{ .progress = try archive_catalog.collectExpired(work.segment, archive.location()) };
     }
 
     pub fn retryable(err: anyerror) bool {
@@ -178,6 +169,13 @@ pub const ExpiryMaintenance = struct {
         };
     }
 };
+
+pub fn collectionProof(a: std.mem.Allocator, resource: local.system_catalog_domain.Resource, receipt: [32]u8) !@import("../../metadata/retained_dataset_owners.zig").Collection {
+    var descriptor = try local.system_catalog_retained_datasets.parse(a, resource.source_json);
+    defer descriptor.deinit();
+    if (descriptor.value.phase != .retiring or descriptor.value.source != null) return error.RetainedOwnerPlanChanged;
+    return .{ .resource = resource.id, .generation = descriptor.value.definition.generation, .revision = descriptor.value.revision, .definition = try descriptor.value.definition.fingerprint(a), .receipt = receipt };
+}
 
 pub fn locationIdentity(storage_identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});

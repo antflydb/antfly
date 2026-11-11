@@ -644,7 +644,15 @@ pub const MetadataServer = struct {
         const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = now +| 2 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.restore_supervisor_stop) };
         try self.svc.ensureLinearizableReadWithContext(context);
         const store = self.svc.projectedStore() orelse return;
-        try self.retained_archive.run(self.alloc, store, self.svc.metadata_group_id, config, self.svc.secret_store, io, now, &context);
+        const Completion = struct {
+            server: *MetadataServer,
+            context: @import("antfly_local_sources").api_operation.RequestContext,
+            pub fn finish(value: @This(), resource: @import("antfly_local_sources").system_catalog_domain.Resource, receipt: [32]u8) !void {
+                const proof = try @import("../serverless/datasets/configured_archive.zig").collectionProof(value.server.alloc, resource, receipt);
+                _ = try @import("service.zig").proposeCatalogWithContext(value.server.svc, value.context, .{ .finish_retained_collection = proof });
+            }
+        };
+        try self.retained_archive.run(self.alloc, store, self.svc.metadata_group_id, config, self.svc.secret_store, io, now, &context, Completion{ .server = self, .context = context });
     }
 
     fn restoreSupervisorDeinit(_: *anyopaque) void {}

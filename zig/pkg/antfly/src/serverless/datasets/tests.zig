@@ -992,3 +992,145 @@ test "retained dataset discard fences publication and drains pins and dependenci
     try std.testing.expectEqual(@as(?t.Id, null), try reopened.nextDiscard(null));
     try std.testing.expectError(error.DatasetSegmentRetired, reopened.publish(segment(), hot, "states"));
 }
+
+test "retained dataset complete reads traverse bounded files and byte-limited pages resume without loss" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const shared = @import("antfly_local_sources");
+    const series = shared.storage_retained_series;
+    const export_page = @import("closure_export.zig");
+    const spec: series.Spec = .{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    const cut: export_page.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    var first_segment: t.Id = undefined;
+    var frontier = t.rowKey(0, @splat(0));
+    var first_bytes: usize = 0;
+    for (0..33) |i| {
+        const row: series.Bucket = .{ .start_ns = @intCast(i * 60), .dimensions = "[]", .rows = 1, .metrics = &metrics };
+        const page = (try export_page.encode(a, def, spec, cut, frontier, &.{row}, false, cold)).?;
+        defer export_page.deinit(a, page);
+        if (i == 0) {
+            first_bytes = page.bytes.len;
+            first_segment = page.segment.id;
+        }
+        try export_page.publish(store, spec, cut, page, cold);
+        frontier = (try page.segment.span()).end;
+    }
+    const manifest = try store.sealClosedExport(spec, cut, frontier);
+    const receipt = try manifest.receipt();
+    const Resolver = struct {
+        loc: api.Location,
+        pub fn location(self: @This(), _: t.Id) !api.Location {
+            return self.loc;
+        }
+    };
+    const resolver: Resolver = .{ .loc = cold };
+    var single = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "60" }, .{ .dimensions_json = "[]" }, cut, receipt, resolver);
+    defer single.deinit();
+    try std.testing.expectEqual(@as(usize, 1), single.rows.len);
+    for ([_]?[]const u8{ null, "[]" }) |dimensions| {
+        var complete = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "1980" }, .{ .segments = 2, .dimensions_json = dimensions }, cut, receipt, resolver);
+        defer complete.deinit();
+        try std.testing.expectEqual(@as(usize, 33), complete.rows.len);
+        try std.testing.expect(complete.next == null);
+        try std.testing.expectError(error.DatasetPageBudgetExceeded, api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "1980" }, .{ .rows = 32, .dimensions_json = dimensions }, cut, receipt, resolver));
+        var page = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "120" }, .{ .rows = 2, .bytes = first_bytes * 2 - 1, .page = true, .dimensions_json = dimensions }, cut, receipt, resolver);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expect(page.next != null);
+        var next = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "120" }, .{ .rows = 2, .bytes = first_bytes * 2 - 1, .page = true, .dimensions_json = dimensions, .after = page.next }, cut, receipt, resolver);
+        defer next.deinit();
+        try std.testing.expectEqual(@as(usize, 1), next.rows.len);
+        try std.testing.expectEqual(@as(i128, 60), next.rows[0].start_ns);
+        try std.testing.expect(next.next == null);
+    }
+    const hold: api.catalog.Dependency = .{ .id = @splat(8), .consumer = @splat(9), .consumer_generation = 1 };
+    try store.hold(first_segment, hold);
+    clock.now = def.retention_ns + 10000;
+    const first_work = (try store.nextMaintenanceExpiry()).?;
+    try std.testing.expectEqual(first_segment, first_work.segment);
+    try std.testing.expectError(error.DatasetDependencyPending, store.collectExpired(first_work.segment, cold));
+    const reopened = catalog(&memory, &clock);
+    const second_work = (try reopened.nextMaintenanceExpiry()).?;
+    try std.testing.expect(!std.mem.eql(u8, &first_work.segment, &second_work.segment));
+}
+
+test "retained dataset durable maintenance seeks past held work across catalog reopen" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    const def = definition(.summary);
+    try store.create(def);
+    var second = segment();
+    second.id = @splat(5);
+    second.coverage = .{ .start_ns = "60", .end_ns = "120" };
+    try store.publish(segment(), hot, "states");
+    try store.publish(second, hot, "states");
+    const hold: api.catalog.Dependency = .{ .id = @splat(8), .consumer = @splat(9), .consumer_generation = 1 };
+    try store.hold(segment().id, hold);
+    // Each call opens a fresh durable catalog; no process-local cursor survives.
+    const reopened = catalog(&memory, &clock);
+    try store.beginDiscard(def);
+    const selected = (try store.nextMaintenanceDiscard()).?;
+    try std.testing.expectEqual(segment().id, selected);
+    try std.testing.expectError(error.DatasetDependencyPending, store.discardOne(selected, hot));
+    try std.testing.expectEqual(second.id, (try reopened.nextMaintenanceDiscard()).?);
+    try std.testing.expect(try reopened.discardOne(second.id, hot));
+    try std.testing.expectEqual(@as(?t.Id, null), try reopened.nextMaintenanceDiscard());
+    try std.testing.expect((try reopened.discardReceipt()) == null);
+    try store.releaseHold(segment().id, hold);
+    try std.testing.expectEqual(segment().id, (try reopened.nextMaintenanceDiscard()).?);
+    try std.testing.expect(try reopened.discardOne(segment().id, hot));
+    // Wrap, then observe the empty catalog and publish terminal evidence.
+    try std.testing.expectEqual(@as(?t.Id, null), try reopened.nextMaintenanceDiscard());
+    try std.testing.expectEqual(@as(?t.Id, null), try reopened.nextMaintenanceDiscard());
+    const receipt = (try reopened.discardReceipt()).?;
+    try std.testing.expectEqual(receipt, (try store.discardReceipt()).?);
+    try std.testing.expectError(error.DatasetSegmentRetired, store.publish(segment(), hot, "states"));
+}
+
+test "retained dataset tuple ranges decode spanning files once within the exact byte budget" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const series = @import("antfly_local_sources").storage_retained_series;
+    const export_page = @import("closure_export.zig");
+    const spec: series.Spec = .{ .id = def.id, .definition = try def.fingerprint(a), .generation = 1, .source_partition = segment().source.partition, .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    const cut: export_page.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    var rows: [33]series.Bucket = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .start_ns = @intCast(i * 60), .dimensions = "[]", .rows = 1, .metrics = &metrics };
+    const page = (try export_page.encode(a, def, spec, cut, t.rowKey(0, @splat(0)), &rows, false, cold)).?;
+    defer export_page.deinit(a, page);
+    try export_page.publish(store, spec, cut, page, cold);
+    const manifest = try store.sealClosedExport(spec, cut, (try page.segment.span()).end);
+    const Resolver = struct {
+        loc: api.Location,
+        pub fn location(self: @This(), _: t.Id) !api.Location {
+            return self.loc;
+        }
+    };
+    var result = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "1980" }, .{ .dimensions_json = "[]", .bytes = page.bytes.len }, cut, try manifest.receipt(), Resolver{ .loc = cold });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 33), result.rows.len);
+    try std.testing.expectEqual(page.bytes.len, result.bytes_read);
+    var missing = try api.summary_read.readClosed(a, store, def, spec, .{ .start_ns = "0", .end_ns = "1980" }, .{ .dimensions_json = "[404]", .segments = 1, .page = true, .bytes = page.bytes.len }, cut, try manifest.receipt(), Resolver{ .loc = cold });
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.rows.len);
+    try std.testing.expect(missing.next == null);
+    try std.testing.expectEqual(page.bytes.len, missing.bytes_read);
+}

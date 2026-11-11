@@ -747,6 +747,20 @@ pub const Engine = struct {
         }
     }
 
+    /// Persist read admission without changing source sequence, closure cuts or
+    /// emitting replay events. Callers coalesce admission at expiry boundaries.
+    pub fn admitRetentionClock(self: Engine, txn: anytype, admitted_ns: i128) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var state = try self.load(a, txn);
+        if (state.revoked) return error.RetainedSeriesSourceRevoked;
+        if (!state.ready) return error.RetainedSeriesNotReady;
+        if (admitted_ns <= state.admitted_ns) return;
+        state.admitted_ns = admitted_ns;
+        try self.save(a, txn, state);
+    }
+
     /// Replicate canonical clock ticks even on an idle source. Logical expiry
     /// produces keyed removals; mutable extrema support is reclaimed separately
     /// within the same work bound. This does not depend on raw TTL being enabled.

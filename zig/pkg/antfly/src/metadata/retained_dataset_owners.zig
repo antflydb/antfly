@@ -30,6 +30,18 @@ pub const Activation = struct {
         try (Registration{ .resource = self.resource, .generation = self.generation, .plan = self.plan, .revision = self.revision, .limit = 1 }).validate();
     }
 };
+/// Private metadata publication, issued only after verifying the terminal
+/// archive discard fence. Revisions prevent stale completion from resurfacing.
+pub const Collection = struct {
+    resource: u64,
+    generation: u64,
+    revision: u64,
+    definition: Id,
+    receipt: Id,
+    pub fn validate(self: Collection) !void {
+        if (self.resource == 0 or self.generation == 0 or self.revision == 0 or self.generation > types.max_public_counter or self.revision > types.max_public_counter or types.zero(self.definition) or types.zero(self.receipt)) return error.InvalidRetainedOwnerPlan;
+    }
+};
 pub const Registration = struct {
     resource: u64,
     generation: u64,

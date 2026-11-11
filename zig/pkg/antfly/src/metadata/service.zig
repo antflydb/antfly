@@ -3586,6 +3586,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => {},
     }
+    if (command == .finish_retained_collection) return metadata_topology_protocol.retained_collection_version;
     if (command == .activate_retained_dataset) return metadata_topology_protocol.retained_datasets_version;
     if (command == .acknowledge_retained_archive or command == .release_retained_source) return metadata_topology_protocol.retained_archive_acknowledgements_version;
     if (command == .acknowledge_retained_owner) return metadata_topology_protocol.retained_owner_acknowledgements_version;

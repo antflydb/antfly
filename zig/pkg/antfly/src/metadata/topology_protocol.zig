@@ -122,7 +122,9 @@ const std = @import("std");
 /// Version 87 verifies signed observations against current store enrollment.
 /// Version 88 distinguishes snapshot-origin summaries from certified history.
 /// Version 89 verifies archive authority and atomically releases sources.
-pub const current_version: u16 = 89;
+/// Version 90 publishes terminal retained collection and removes scheduling work.
+pub const current_version: u16 = 90;
+pub const retained_collection_version: u16 = 90;
 pub const retained_archive_acknowledgements_version: u16 = 89;
 pub const retained_owner_acknowledgements_version: u16 = 87;
 pub const retained_datasets_version: u16 = 88;

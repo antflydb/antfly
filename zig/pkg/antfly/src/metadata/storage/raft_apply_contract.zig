@@ -253,6 +253,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
         .apply_system_catalog,
         .activate_retained_dataset,
         .release_retained_source,
+        .finish_retained_collection,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_sql_completion_reference,

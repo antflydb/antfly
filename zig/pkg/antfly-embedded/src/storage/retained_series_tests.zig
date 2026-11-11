@@ -817,3 +817,21 @@ test "retained series exact dimensions seek across cardinality and resume by pub
     try std.testing.expectEqual(@as(usize, 0), absent.rows.len);
     try std.testing.expect(store.ordered_seeks < 20);
 }
+
+test "retained series read admission is durable across rollback and does not alter replay sequence" {
+    var store = Store.init();
+    defer store.deinit();
+    var e = engine();
+    e.spec.retention_ns = 1000;
+    try ready(e, &store);
+    const values = [_]?f64{ null, 1, 1, 1, 1 };
+    try e.apply(&store, 1, 1, .mutation, &.{.{ .key = "row", .after = sample(1, &values) }});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const before = try e.snapshotCursor(&store);
+    try e.admitRetentionClock(&store, 1100);
+    try std.testing.expect(std.meta.eql(before, try e.snapshotCursor(&store)));
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, e.scan(arena.allocator(), &store, 0, 10, 1100, null, 10));
+    try e.admitRetentionClock(&store, 1000);
+    try std.testing.expectError(error.RetainedSeriesHistoryExpired, e.scan(arena.allocator(), &store, 0, 10, 1000, null, 10));
+}

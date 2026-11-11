@@ -91,8 +91,12 @@ pub const Descriptor = struct {
     /// is structural validation, not authority to detach a source: admission
     /// must verify the referenced receipts under its metadata fence.
     closed_receipt: ?Id = null,
+    collection_receipt: ?Id = null,
 
     pub fn jsonStringify(self: Descriptor, writer: anytype) !void {
+        // Preserve predecessor bytes until terminal collection is published
+        // under its coordinated decoder barrier.
+        if (self.collection_receipt == null) return datasets.writeFieldsOmitting(self, .{}, .{"collection_receipt"}, writer);
         try datasets.writeFields(self, .{}, writer);
     }
     pub fn identity(self: Descriptor) Identity {
@@ -100,6 +104,9 @@ pub const Descriptor = struct {
     }
     pub fn validate(self: Descriptor) !void {
         try self.definition.validate();
+        if (self.collection_receipt) |receipt| {
+            if (self.phase != .retiring or self.source != null or self.closed_receipt == null or std.mem.allEqual(u8, &receipt, 0)) return error.InvalidRetainedDatasetResource;
+        }
         if (self.format != 1 or self.revision == 0 or self.revision > datasets.max_public_counter or
             std.mem.allEqual(u8, &self.catalog_location, 0) or std.mem.allEqual(u8, &self.catalog_storage_identity, 0)) return error.InvalidRetainedDatasetResource;
         if (self.source) |source| {
@@ -115,7 +122,7 @@ pub const Descriptor = struct {
 
     pub fn validateCreation(self: Descriptor) !void {
         try self.validate();
-        if (self.phase != .activating or self.closed_receipt != null or self.revision != 1 or self.definition.generation != 1) return error.InvalidRetainedDatasetResource;
+        if (self.phase != .activating or self.collection_receipt != null or self.closed_receipt != null or self.revision != 1 or self.definition.generation != 1) return error.InvalidRetainedDatasetResource;
     }
 
     /// This validates lifecycle structure only. Receipt verification and source
@@ -127,6 +134,7 @@ pub const Descriptor = struct {
             !std.mem.eql(u8, &self.definition.id, &next.definition.id) or
             !std.mem.eql(u8, &self.catalog_location, &next.catalog_location) or
             !std.mem.eql(u8, &self.catalog_storage_identity, &next.catalog_storage_identity)) return error.RetainedDatasetResourceChanged;
+        if (self.collection_receipt != null and !std.meta.eql(self.collection_receipt, next.collection_receipt)) return error.RetainedDatasetResourceChanged;
         if (self.closed_receipt != null and !std.meta.eql(self.closed_receipt, next.closed_receipt)) return error.RetainedDatasetResourceChanged;
         if (next.definition.generation != self.definition.generation) return error.RetainedDatasetGenerationTransitionRequired;
         var arena = std.heap.ArenaAllocator.init(a);

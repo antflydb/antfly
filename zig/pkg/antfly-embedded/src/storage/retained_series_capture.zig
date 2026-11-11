@@ -958,6 +958,15 @@ test "retained series native DB lifecycle and ordinary writes share replay progr
     const status = try std.json.parseFromSliceLeaky(@import("retained_series_query.zig").Status, alloc, status_json, .{});
     try std.testing.expectEqual(@as(usize, 1), status.entries.len);
     try std.testing.expectEqualDeep(binding.spec, status.entries[0].binding.spec);
+    const admitted_sequence = status.entries[0].progress.source_sequence;
+    try db.batch(.{ .timestamp_ns = 9, .retained_series = .{ .action = .admit_retention, .fence = fence } });
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        const progress = try (series.Engine{ .alloc = a, .spec = binding.spec }).status(alloc, &current);
+        try std.testing.expectEqual(admitted_sequence, progress.source_sequence);
+        try std.testing.expectEqual(@as(i128, 9), progress.admitted_ns);
+    }
     const replay_json = try db.queryRetainedSeriesJson(a, .{ .poll = .{ .fence = fence, .root_incarnation = db.root_incarnation, .cursor = cut } });
     defer a.free(replay_json);
     const replay = try std.json.parseFromSliceLeaky(@import("retained_series_query.zig").Replay, alloc, replay_json, .{});

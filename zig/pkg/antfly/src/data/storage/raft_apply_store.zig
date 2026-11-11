@@ -2453,7 +2453,8 @@ pub const RaftApplyStore = struct {
         if (decoded.batch.req.retained_series != null or decoded.batch.req.expiration_deletes.len != 0) {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
             try @import("antfly_local_sources").storage_retained_series_control.validateRequest(decoded.batch.req);
-            try operations.append(alloc, .{ .require_raft_batch_protocol = @import("../../common/data_raft_protocol.zig").batch_retained_series_protocol_version });
+            const protocol = @import("../../common/data_raft_protocol.zig");
+            try operations.append(alloc, .{ .require_raft_batch_protocol = if (decoded.batch.req.retained_series) |command| protocol.retainedSeriesCommandVersion(command) else protocol.batch_retained_series_protocol_version });
             if (decoded.batch.req.retained_series != null) return;
         }
         const native_transfer = decoded.batch.req.restore_staging != null or
@@ -5945,4 +5946,9 @@ test "retained series raft projection requires native effects and a durable prot
     try RaftApplyStore.appendDataOperations(a, 1, bytes, &operations, true);
     try std.testing.expectEqual(@as(usize, 1), operations.items.len);
     try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_series_protocol_version, operations.items[0].require_raft_batch_protocol);
+    const admission = try data_raft_batch.encode(a, "docs", .{ .timestamp_ns = 1, .document_version_scheme = .legacy, .retained_series = .{ .action = .admit_retention, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } });
+    defer a.free(admission);
+    try RaftApplyStore.appendDataOperations(a, 1, admission, &operations, true);
+    try std.testing.expectEqual(@as(usize, 2), operations.items.len);
+    try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_read_admission_protocol_version, operations.items[1].require_raft_batch_protocol);
 }
