@@ -37698,10 +37698,31 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
             try std.testing.expect(!lite_runtime.retrying);
             try std.testing.expectEqual(rewound, try enrichment_state.loadAuthoritativeRuntimeObservation(alloc, writer_store, scope_name));
 
-            var clock: platform_clock.ManualClock = .{};
-            const guard: ForegroundCatchUpGuard = .{ .clock = clock.clock(), .deadline_ns = 75 * std.time.ns_per_ms };
+            const ProbeClock = struct {
+                elapsed_ms: u64 = 0,
+                sleeps: usize = 0,
+
+                fn now(ctx: ?*anyopaque) u64 {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    return self.elapsed_ms * std.time.ns_per_ms;
+                }
+
+                fn sleep(ctx: ?*anyopaque, ms: u64) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    const expected = [_]u64{ 2, 4, 8, 16, 32, 13 };
+                    std.debug.assert(self.sleeps < expected.len and ms == expected[self.sleeps]);
+                    self.sleeps += 1;
+                    self.elapsed_ms += ms;
+                }
+            };
+            var clock: ProbeClock = .{};
+            const guard: ForegroundCatchUpGuard = .{
+                .clock = .{ .ctx = &clock, .now_realtime_ns_fn = ProbeClock.now, .sleep_ms_fn = ProbeClock.sleep },
+                .deadline_ns = 75 * std.time.ns_per_ms,
+            };
             try std.testing.expectError(error.EnrichmentWaitTimeout, refreshVisibilityCut(&lite_runtime, old_cut, guard));
-            try std.testing.expectEqual(guard.deadline_ns.?, clock.clock().nowRealtimeNs());
+            try std.testing.expectEqual(@as(usize, 6), clock.sleeps);
+            try std.testing.expectEqual(@as(u64, 75), clock.elapsed_ms);
         }
 
         // A futex cancellation observed after a cached completion must use the
