@@ -48,15 +48,18 @@ pub fn selectCached(a: A, table: sql.Table, source: *local.serverless_query_lake
     return selectCachedWithLease(a, table, source, store, context, policy, cache, null);
 }
 pub fn selectCachedWithLease(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle) !?Selected {
+    return selectCachedWithLeasePipelined(a, table, source, store, context, policy, cache, reader, null);
+}
+pub fn selectCachedWithLeasePipelined(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle, pending: ?*@import("lake_publication_opening.zig").Pending) !?Selected {
     try context.ensureActive();
-    return selectVerified(a, table, source, store, context, cache, reader) catch |err| {
+    return selectVerified(a, table, source, store, context, cache, reader, pending) catch |err| {
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         if (policy == .required) return err;
         return null;
     };
 }
-fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle) !Selected {
+fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle, pending: ?*@import("lake_publication_opening.zig").Pending) !Selected {
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     var state = try catalog.parse(a, definitions.catalog_json);
     errdefer state.deinit();
@@ -68,10 +71,16 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     if (!std.mem.eql(u8, &published.signature.credentials, &try source.credentialIdentity(binding))) return error.ExternalLakeIndexCredentialsChanged;
     store.implementation.cloud_io = context.io;
     try store.bindPublication(published, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none);
+    if (store.cloud_binding) |*bound| bound.reader.trace = context.trace;
     var artifacts = store.artifactStore();
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
     const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.cache_identity, .context = context } else null;
+    if (cached) |read| {
+        if (pending) |pipeline| {
+            try pipeline.start(store, published, read, normalized);
+        } else try @import("lake_publication_opening.zig").warm(store, published, read, normalized);
+    }
     var inventory_lease: ?@import("lake_index_decoded_metadata.zig").Owned(InventoryMetadata) = null;
     errdefer if (inventory_lease) |owned| owned.release();
     var owned_inventory: ?InventoryMetadata = null;
@@ -243,7 +252,7 @@ test "external lake navigation distinguishes stale source cuts from invalid publ
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, validateNavigationIdentity(root, root.domain, changed, 2));
 }
 
-test "external lake inventory coverage proofs bind immutable plans publications and fresh request authority" {
+test "external lake opening inventory coverage proofs bind immutable plans publications and fresh request authority" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("coverage-proof-selection");
     defer directory.cleanup();
@@ -251,11 +260,14 @@ test "external lake inventory coverage proofs bind immutable plans publications 
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .converted_type = 0, .values = &.{"needle"} }});
+    var ids: [1000]i64 = undefined;
+    for (&ids, 0..) |*id, ordinal| id.* = @intCast(ordinal);
+    const bodies: [1000][]const u8 = @splat("needle");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .values = &ids }}, &.{.{ .column_id = "body", .converted_type = 0, .values = &bodies }});
     defer a.free(data);
     var upload = try client.putObject("antfly", "part.parquet", data, .{});
     upload.deinit(a);
-    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"object_mutability\":\"immutable\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}}}}}}}}}}", .{directory.path()});
+    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"object_mutability\":\"immutable\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\",\"row_identity\":{{\"key_columns\":[\"id\"]}}}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"integer\"}},\"body\":{{\"type\":\"string\"}}}}}}}}}}}}", .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
     defer binding.deinit(a);
@@ -279,6 +291,73 @@ test "external lake inventory coverage proofs bind immutable plans publications 
     defer a.free(published);
     var parsed = try catalog.parse(a, published);
     defer parsed.deinit();
+    try std.testing.expect(parsed.value.published.?.opening_bundles.len > 0);
+    var opening_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer opening_cache.deinit();
+    var opening_trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    const opening_read: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &opening_cache, .scope = @splat(21), .context = .{ .io = std.testing.io, .trace = &opening_trace } };
+    var expired_read = opening_read;
+    expired_read.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, expired_read, .none));
+    try std.testing.expectEqual(@as(u64, 0), opening_trace.snapshot().provider_reads);
+    try @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, opening_read, .none);
+    const seed_reads = opening_trace.snapshot().provider_reads;
+    try std.testing.expectEqual(parsed.value.published.?.opening_bundles.len, seed_reads);
+    try @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, opening_read, .none);
+    try std.testing.expectEqual(seed_reads, opening_trace.snapshot().provider_reads);
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var warmed_publication = parsed.value.published.?;
+        try @import("lake_index_directory.zig").hydrateLazy(sa, artifact_store, &warmed_publication, .none, opening_read);
+        const corpus = @import("lake_index_native_text.zig");
+        const Capture = struct {
+            store: @import("../serverless/artifacts/store.zig").ArtifactStore,
+            read: @import("lake_index_aggregate_artifact.zig").CachedRead,
+            a: A,
+            count: usize = 0,
+            fn record(raw: *anyopaque, value: *const @import("lake_index_text_directory.zig").SegmentRecord) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const descriptor = value.route.descriptor orelse return error.MissingAdmissionDescriptor;
+                _ = try corpus.loadCachedAdmissions(self.a, self.store, .{ .kind = .text_segment, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len }, .none, self.read);
+                for ([_]?@import("lake_index_aggregate_artifact.zig").ChunkRef{ value.manifest, value.physical }) |maybe| if (maybe) |ref| {
+                    const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(self.a, self.store, ref, .none, self.read);
+                    self.a.free(bytes);
+                };
+                for (value.sources) |span| {
+                    const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(self.a, self.store, span.physical, .none, self.read);
+                    self.a.free(bytes);
+                }
+                self.count += 1;
+            }
+        };
+        var capture: Capture = .{ .store = artifact_store, .read = opening_read, .a = sa };
+        for (warmed_publication.declarations) |declaration| {
+            if (declaration.artifact.kind != .text_segment) continue;
+            const canonical = try corpus.loadRootDirectory(sa, artifact_store, declaration.artifact, .none, opening_read);
+            const serving = try corpus.servingRoot(sa, artifact_store, canonical, .none, opening_read);
+            try std.testing.expect(canonical.serving != null);
+            try std.testing.expect(canonical.segment_count > serving.segment_count);
+            for ([_]corpus.Root{ canonical, serving }) |root| {
+                const cursor = try @import("lake_index_text_directory.zig").RoutingCursor.create(sa, root, artifact_store, opening_read, .none);
+                defer cursor.deinit();
+                cursor.observer = .{ .ptr = &capture, .record = Capture.record };
+                var identities: [64][32]u8 = undefined;
+                while (try cursor.next(&identities)) |_| {}
+            }
+        }
+        try std.testing.expect(capture.count > 0);
+        try std.testing.expectEqual(seed_reads, opening_trace.snapshot().provider_reads);
+    }
+    var damaged = parsed.value.published.?;
+    var bad_bundle = damaged.opening_bundles[0];
+    bad_bundle.decoded_bytes += 1;
+    damaged.opening_bundles = &.{bad_bundle};
+    // Authenticated but invalid optional seed cannot make the original
+    // publication unavailable. The demand paths below remain authoritative.
+    try @import("lake_publication_opening.zig").warm(&store, damaged, opening_read, .none);
+
     // Exercise the current inventory-backed proof memo independently of
     // optional source-navigation admission.
     const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
@@ -290,6 +369,7 @@ test "external lake inventory coverage proofs bind immutable plans publications 
     parsed.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
     parsed.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
     parsed.value.published.?.source_navigation = null;
+    parsed.value.published.?.row_identity = null;
     parsed.value.published.?.signature.source = (try coverage.finish(&source, .{}, try coverage.pinData(&source, .{}, null, null))).source;
     const legacy_json = try catalog.encode(a, parsed.value);
     defer a.free(legacy_json);

@@ -604,14 +604,15 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         try identity.reseal(a);
         break :published try row_identity_api.publish(na, &scoped, identity.*, cancellation);
     } else null;
+    var completed = try clock.now_ms(clock.ptr);
+    var publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref, .row_identity = row_identity_ref, .directory = directory };
+    publication.opening_bundles = try @import("lake_publication_opening.zig").publish(na, &scoped, publication, declarations, context, cancellation);
     // All uploads in this attempt are complete before its namespace evidence
     // is sealed. Certificates are advisory; failure retains the full audit.
     scoped.sealClosures(cancellation) catch {
         try context.ensureActive();
         try cancellation.check();
     };
-    var completed = try clock.now_ms(clock.ptr);
-    var publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref, .row_identity = row_identity_ref, .directory = directory };
     if (cloud_writer) |*writer| try cloud_api.finish(na, writer, cloud_object.?, &publication, declarations, table.table_id, store_identity, context, cancellation, cloud_binding != null and cloud_object.?.cloud_certificate_until_ms != 0 and current.value.checkpoint == null);
     completed = try clock.now_ms(clock.ptr);
     publication.published_at_ms = completed;

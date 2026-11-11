@@ -17,6 +17,8 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 
 test {
+    _ = @import("api/lake_publication_opening.zig");
+    _ = @import("api/lake_owned_cut_jobs.zig");
     _ = @import("serverless/configured_object_store_support.zig");
     _ = @import("api/lake_ordering_keys.zig");
     _ = @import("api/lake_owned_serving_test.zig");
@@ -72,6 +74,8 @@ test {
     _ = @import("api/lake_row_verification.zig");
     _ = @import("api/lake_index_repairs.zig");
     _ = @import("api/lake_index_navigation_warming.zig");
+    _ = @import("api/lake_index_readiness.zig");
+    _ = @import("api/lake_index_physical_set.zig");
     _ = @import("api/lake_row_identity_reader.zig");
     _ = @import("api/lake_row_identity.zig");
     _ = @import("api/lake_row_fragments.zig");

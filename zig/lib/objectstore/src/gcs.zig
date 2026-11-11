@@ -24,6 +24,12 @@ const s3 = @import("s3.zig");
 const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
+// Control responses contain bounded object metadata, never object data. GCS
+// limits custom metadata to 8 KiB and object ACLs to 100 entries; leave ample
+// JSON/escaping headroom without reserving the 100 MiB media-body default.
+// https://docs.cloud.google.com/storage/quotas
+const metadata_response_limit = 1024 * 1024;
+const listing_response_limit = 8 * 1024 * 1024;
 
 pub const CredentialSource = enum { default, bearer_token, service_account };
 
@@ -367,7 +373,7 @@ pub const JsonApiClient = struct {
         const url = try bucketMetadataUrlAlloc(self.alloc, self.cfg, bucket);
         defer self.alloc.free(url);
 
-        var response = try self.performWithResponseLimitAndCancellation(.GET, url, &.{}, null, null, null, opts.cancellation);
+        var response = try self.performWithResponseLimitAndCancellation(.GET, url, &.{}, null, null, metadata_response_limit, opts.cancellation);
         defer response.deinit(self.alloc);
         return switch (response.status) {
             200 => true,
@@ -384,7 +390,7 @@ pub const JsonApiClient = struct {
         const payload = try httpx.json.Json.stringify(self.alloc, .{ .name = bucket });
         defer self.alloc.free(payload);
 
-        var response = try self.performWithResponseLimitAndCancellation(.POST, url, &.{}, payload, "application/json", null, opts.cancellation);
+        var response = try self.performWithResponseLimitAndCancellation(.POST, url, &.{}, payload, "application/json", metadata_response_limit, opts.cancellation);
         defer response.deinit(self.alloc);
         switch (response.status) {
             200, 201 => return,
@@ -516,7 +522,7 @@ pub const JsonApiClient = struct {
             headers.items,
             body,
             opts.content_type orelse "application/octet-stream",
-            null,
+            metadata_response_limit,
             opts.cancellation,
         );
         defer response.deinit(alloc);
@@ -561,7 +567,7 @@ pub const JsonApiClient = struct {
             &initiate_headers,
             metadata_payload,
             "application/json",
-            null,
+            metadata_response_limit,
             opts.cancellation,
         );
         defer initiated.deinit(alloc);
@@ -593,7 +599,7 @@ pub const JsonApiClient = struct {
             &upload_headers,
             body,
             content_type,
-            null,
+            metadata_response_limit,
             opts.cancellation,
         );
         defer response.deinit(alloc);
@@ -666,7 +672,7 @@ pub const JsonApiClient = struct {
             &initiate_headers,
             metadata_payload,
             "application/json",
-            null,
+            metadata_response_limit,
             opts.cancellation,
         );
         defer initiated.deinit(alloc);
@@ -707,7 +713,7 @@ pub const JsonApiClient = struct {
                 &headers,
                 buffer[0..wanted],
                 upload_type,
-                null,
+                metadata_response_limit,
                 opts.cancellation,
             );
             if (offset + wanted < stat.size) {
@@ -742,7 +748,7 @@ pub const JsonApiClient = struct {
             &.{},
             null,
             null,
-            null,
+            metadata_response_limit,
             cancellation,
         );
         defer response.deinit(self.alloc);
@@ -903,7 +909,7 @@ pub const JsonApiClient = struct {
         const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, generation);
         defer alloc.free(url);
 
-        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, url, &.{}, null, null, null, cancellation);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, url, &.{}, null, null, metadata_response_limit, cancellation);
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -934,7 +940,7 @@ pub const JsonApiClient = struct {
             headers.items,
             null,
             null,
-            null,
+            metadata_response_limit,
             opts.cancellation,
         );
         defer response.deinit(self.alloc);
@@ -958,7 +964,7 @@ pub const JsonApiClient = struct {
             &.{},
             null,
             null,
-            null,
+            listing_response_limit,
             opts.cancellation,
         );
         defer response.deinit(alloc);
@@ -1650,6 +1656,10 @@ fn objectListUrlAlloc(alloc: Allocator, cfg: JsonApiConfig, bucket: []const u8, 
         try parts.append(alloc, try std.fmt.allocPrint(alloc, "pageToken={s}", .{escaped}));
     }
     try parts.append(alloc, try std.fmt.allocPrint(alloc, "maxResults={d}", .{opts.max_keys}));
+    // Exclude arbitrary custom metadata and ACLs from each listed object.
+    // Include every field used by both listing decoders, including retention
+    // and generation, and preserve opaque continuation and prefix results.
+    try parts.append(alloc, try alloc.dupe(u8, "fields=items(name,etag,size,retentionExpirationTime,generation),prefixes,nextPageToken"));
 
     var query = std.ArrayListUnmanaged(u8).empty;
     defer query.deinit(alloc);
@@ -2077,7 +2087,7 @@ fn testGenerationPinnedReads(alloc: Allocator, client_alloc: Allocator) !void {
 
             switch (self.calls) {
                 0 => {
-                    try std.testing.expectEqual(@as(?usize, null), max_response_size);
+                    try std.testing.expectEqual(@as(?usize, metadata_response_limit), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
@@ -2417,7 +2427,7 @@ test "json api client lists objects and prefixes" {
             _ = body;
             _ = content_type;
             try std.testing.expectEqual(HttpMethod.GET, method);
-            try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o?prefix=docs%2F&delimiter=%2F&startOffset=docs%2Fa&maxResults=10", url);
+            try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o?prefix=docs%2F&delimiter=%2F&startOffset=docs%2Fa&maxResults=10&fields=items(name,etag,size,retentionExpirationTime,generation),prefixes,nextPageToken", url);
             return .{
                 .status = 200,
                 .body = try request_alloc.dupe(u8,

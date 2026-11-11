@@ -1,0 +1,731 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Publication-scoped, optional immutable opening bundles. All admission still
+//! uses current source/credential/reader authority. Bundles only seed the same
+//! content-verified byte cache as ordinary demand reads, including after restart.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const catalog = local.metadata_lake_index_catalog;
+const stores = @import("../serverless/artifacts/store.zig");
+const artifacts = @import("lake_index_aggregate_artifact.zig");
+const packs = @import("lake_index_text_opening_pack.zig");
+const tree = @import("../serverless/graph_segment/page_tree.zig");
+const pages = @import("../serverless/graph_segment/page_store.zig");
+const Store = @import("lake_index_store.zig").Store;
+const Cache = local.serverless_query_lake_serving_cache.Cache;
+const Context = local.serverless_query_lake_read_context.Context;
+const Token = @import("antfly_cancellation").CancellationToken;
+const A = std.mem.Allocator;
+pub const max_bundles = 4;
+pub const max_pages = 64;
+const read_budget = 32 * 1024 * 1024;
+const decode_budget = 64 * 1024 * 1024;
+const parallel_budget = 64 * 1024 * 1024;
+
+const Navigation = struct { domain: [32]u8, ref: tree.Ref, depth: u8 = 0, optional: bool = false };
+// Byte-cached navigation does not need a second inline provider selector.
+// Reserve the fixed catalog envelope for payloads that remain demand reads.
+const LocatorSet = struct {
+    const Entry = struct { value: catalog.ProviderLocator, priority: u8 };
+    entries: std.ArrayList(Entry) = .empty,
+    fn candidate(self: *LocatorSet, id: []const u8, priority: u8) bool {
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, entry.value.id, id)) {
+            entry.priority = @max(entry.priority, priority);
+            return false;
+        };
+        if (self.entries.items.len < 128) return true;
+        for (self.entries.items) |entry| if (entry.priority < priority) return true;
+        return false;
+    }
+    fn put(self: *LocatorSet, a: A, value: catalog.ProviderLocator, priority: u8) !void {
+        if (!self.candidate(value.id, priority)) return;
+        if (self.entries.items.len == 128) {
+            var lowest: usize = 0;
+            for (self.entries.items, 0..) |entry, i| if (entry.priority < self.entries.items[lowest].priority) {
+                lowest = i;
+            };
+            _ = self.entries.orderedRemove(lowest);
+        }
+        try self.entries.append(a, .{ .value = value, .priority = priority });
+    }
+};
+
+test "external lake cold working set payload locators displace cached navigation without widening catalog bounds" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var set: LocatorSet = .{};
+    defer set.entries.deinit(a);
+    for (0..128) |i| try set.put(a, .{ .id = try std.fmt.allocPrint(arena.allocator(), "navigation-{d}", .{i}), .bytes = 42, .generation = "v1" }, 0);
+    // Duplicates upgrade priority in place, preserving their admitted selector.
+    try std.testing.expect(!set.candidate("navigation-0", 1));
+    for (0..127) |i| try set.put(a, .{ .id = try std.fmt.allocPrint(arena.allocator(), "payload-{d}", .{i}), .bytes = 43, .generation = "v2" }, 1);
+    try std.testing.expectEqual(@as(usize, 128), set.entries.items.len);
+    try std.testing.expectEqualStrings("navigation-0", set.entries.items[0].value.id);
+    for (set.entries.items) |entry| try std.testing.expectEqual(@as(u8, 1), entry.priority);
+    try std.testing.expect(!set.candidate("uncached-navigation", 0));
+    try std.testing.expect(!set.candidate("overflow-payload", 1));
+    try set.put(a, .{ .id = "bootstrap", .bytes = 44, .generation = "v3" }, 2);
+    try std.testing.expectEqualStrings("bootstrap", set.entries.items[127].value.id);
+    try std.testing.expect(!set.candidate("overflow-payload", 1));
+}
+const Producer = struct {
+    a: A,
+    store: *stores.ArtifactStore,
+    collector: packs.Collector,
+    cache: Cache,
+    cached: artifacts.CachedRead = undefined,
+    queue: [max_pages]Navigation = undefined,
+    count: usize = 0,
+    position: usize = 0,
+    segments: usize = 0,
+    text_roots: [32]@import("lake_index_native_text.zig").Root = undefined,
+    text_count: usize = 0,
+    capture_small: bool = false,
+    capture_optional: bool = false,
+    capture_domain: [32]u8 = undefined,
+    seed_reads: usize = 0,
+    small: [16]struct { ref: artifacts.ChunkRef, optional: bool } = undefined,
+    small_count: usize = 0,
+    working: [32]struct { ref: artifacts.ChunkRef, optional: bool } = undefined,
+    working_count: usize = 0,
+    locators: LocatorSet = .{},
+    locator_attempts: usize = 0,
+    remaining: u64 = read_budget,
+    token: Token,
+
+    fn recordLocator(raw: *anyopaque, ref: artifacts.ChunkRef) !void {
+        return recordLocatorPriority(raw, ref, 0);
+    }
+    fn recordPayloadLocator(raw: *anyopaque, ref: artifacts.ChunkRef) !void {
+        return recordLocatorPriority(raw, ref, 1);
+    }
+    fn recordLocatorPriority(raw: *anyopaque, ref: artifacts.ChunkRef, priority: u8) !void {
+        const self: *Producer = @ptrCast(@alignCast(raw));
+        if (!self.locators.candidate(ref.artifact_id, priority) or self.locator_attempts == 512 or (priority == 0 and self.locator_attempts >= 256)) return;
+        const object = self.store.providerStore() orelse return;
+        const writer = object.cloud_writer orelse return;
+        // Relocated/legacy dependencies may remain valid demand inputs while
+        // belonging to another map namespace. Optional hints cannot authorize
+        // those IDs or make an otherwise valid publication unreadable.
+        const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return;
+        if (!std.mem.eql(u8, &scope.domain, &writer.scope.domain)) return;
+        self.locator_attempts += 1;
+        const found = writer.lookup(self.a, ref.artifact_id, self.token) catch |err| switch (err) {
+            error.CloudGenerationMissing => return,
+            else => return err,
+        };
+        var record = found orelse return;
+        defer record.deinit(self.a);
+        if (record.bytes != ref.byte_len) return error.InvalidCloudGenerationMap;
+        try self.locators.put(self.a, .{ .id = try self.a.dupe(u8, record.id), .bytes = record.bytes, .generation = try self.a.dupe(u8, record.generation), .retention_until_ms = record.retention_until_ms }, priority);
+    }
+    fn capture(raw: *anyopaque, identity: []const u8, digest: [32]u8, bytes: []const u8) !void {
+        const self: *Producer = @ptrCast(@alignCast(raw));
+        if (self.collector.full()) return error.OpeningBundleBudgetExceeded;
+        if (bytes.len > self.remaining) return error.OpeningBundleBudgetExceeded;
+        self.remaining -= bytes.len;
+        // Physical object captures also cover child navigation pages reached
+        // through the page store. Synthetic range identities have no map entry.
+        if (identity.len == 175) if ((stores.uploadScopeFromArtifactId(identity) catch null) != null) try recordLocator(self, .{ .artifact_id = identity, .checksum = "", .byte_len = bytes.len });
+        try self.collector.addIdentity(identity, digest, bytes);
+    }
+    fn add(self: *Producer, domain: [32]u8, ref: ?tree.Ref, depth: u8, optional: bool) void {
+        const value = ref orelse return;
+        if (depth > 3) return;
+        for (self.queue[0..self.count]) |*prior| if (std.mem.eql(u8, &prior.domain, &domain) and prior.ref.eql(value)) {
+            prior.optional = prior.optional and optional;
+            prior.depth = @min(prior.depth, depth);
+            return;
+        };
+        if (self.count == self.queue.len) return;
+        self.queue[self.count] = .{ .domain = domain, .ref = value, .depth = depth, .optional = optional };
+        self.count += 1;
+    }
+    fn read(self: *Producer, a: A, ref: artifacts.ChunkRef) !void {
+        return self.readUsing(a, ref, self.store.*);
+    }
+    fn readUsing(self: *Producer, a: A, ref: artifacts.ChunkRef, read_store: stores.ArtifactStore) !void {
+        if (ref.byte_len > packs.max_decoded_bytes or self.collector.full()) return;
+        const digest = try stores.sha256DigestFromChecksum(ref.checksum);
+        if (self.collector.containsIdentity(ref.artifact_id, digest) or self.seed_reads == 256) return;
+        self.seed_reads += 1;
+        try recordLocator(self, ref);
+        const bytes = try artifacts.readArtifact(a, read_store, ref, self.token, self.cached);
+        a.free(bytes);
+    }
+    fn collect(self: *Producer, publication: catalog.Publication, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+        defer arena.deinit();
+        const a = arena.allocator();
+        // These roots can be needed before an opening seed is admitted, or
+        // again after byte-cache eviction. Never displace their exact selectors
+        // with speculative payload locations or captured child navigation.
+        try recordLocatorPriority(self, .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len }, 2);
+        if (publication.directory) |ref| try recordLocatorPriority(self, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 2);
+        if (publication.source_navigation) |ref| try recordLocatorPriority(self, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 2);
+        if (publication.row_identity) |ref| try recordLocatorPriority(self, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, 2);
+        try self.read(a, .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
+        if (publication.directory) |ref| try self.read(a, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+        if (publication.source_navigation) |ref| if (ref.byte_len <= packs.max_decoded_bytes) {
+            const root = try @import("lake_source_navigation.zig").load(a, self.store.*, ref, self.token, self.cached);
+            self.add(root.domain, root.files, 0, false);
+            self.add(root.domain, root.public, 0, false);
+            self.add(root.domain, root.private, 0, false);
+        };
+        if (publication.row_identity) |ref| if (ref.byte_len <= packs.max_decoded_bytes) {
+            const root = try @import("lake_row_identity.zig").load(a, self.store.*, ref, self.token, self.cached);
+            var dependencies = @import("lake_row_identity.zig").dependencies(root);
+            while (dependencies.next()) |page| self.add(root.domain, page, 0, false);
+        };
+        for (declarations, 0..) |declaration, i| {
+            if (i == max_pages or self.collector.full()) break;
+            try self.token.check();
+            try self.cached.context.ensureActive();
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const ref = declaration.artifact;
+            if (ref.byte_len > packs.max_decoded_bytes) continue;
+            if (ref.kind == .text_segment and ref.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
+                const corpus = @import("lake_index_native_text.zig");
+                const canonical = try corpus.loadRootDirectory(self.a, self.store.*, ref, self.token, self.cached);
+                // Exact ordering and physical visibility may select canonical
+                // segments even when a compacted serving root exists. Both
+                // are authoritative planner choices and need bounded seeds.
+                if (canonical.serving != null) try self.addTextRoot(sa, try corpus.servingRoot(self.a, self.store.*, canonical, self.token, self.cached));
+                try self.addTextRoot(sa, canonical);
+            } else if (ref.kind == .ordered_row_index) {
+                const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, self.store.*, ref, self.token, self.cached);
+                inline for (.{ root.page, root.reverse, root.covering, root.ties, root.predicates }) |page| self.add(root.domain, page, 0, false);
+                if (root.file_dictionary) |dictionary| inline for (.{ dictionary.slots, dictionary.names, dictionary.public }) |page| self.add(root.domain, page, 0, false);
+            }
+        }
+        while (self.position < self.count and !self.collector.full()) : (self.position += 1) {
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const selected = self.queue[self.position];
+            var remaining: u64 = tree.max_page_bytes;
+            var writes: u64 = 0;
+            var read_store = if (selected.optional) self.store.optionalReadView() else self.store.*;
+            var store: pages.PageStore = .{ .domain = selected.domain, .artifacts = &read_store, .cancellation = self.token, .remaining_read_bytes = &remaining, .remaining_write_bytes = &writes, .read_cache = @import("lake_index_navigation_pages.zig").cacheBinding(&self.cached) };
+            var visitor = Visitor{ .producer = self, .navigation = selected };
+            tree.walkPage(sa, store.store(), selected.ref, &visitor) catch |err| {
+                if (selected.optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        }
+        // Navigation roots get first claim on the opening budget. Then stream
+        // a bounded prefix through the normal fragmented-routing decoder:
+        // descriptors must not cost one dependent GET per scored segment.
+        for (self.text_roots[0..self.text_count]) |root| {
+            if (self.segments == 64 or self.collector.full()) break;
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            self.capture_optional = root.serving != null;
+            self.capture_domain = root.domain;
+            const read_store = if (self.capture_optional) self.store.optionalReadView() else self.store.*;
+            const cursor = @import("lake_index_text_directory.zig").RoutingCursor.create(scratch.allocator(), root, read_store, self.cached, self.token) catch |err| {
+                if (self.capture_optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+            defer cursor.deinit();
+            cursor.observer = .{ .ptr = self, .record = captureRecord };
+            self.capture_small = root.serving_bytes != 0 and root.serving_bytes <= 256 * 1024 and root.segment_count <= self.small.len;
+            var identities: [64][32]u8 = undefined;
+            while (self.segments < 64 and !self.collector.full()) {
+                const window = cursor.next(identities[0 .. 64 - self.segments]) catch |err| {
+                    if (self.capture_optional and optionalUnavailable(err)) break;
+                    return err;
+                };
+                if (window == null) break;
+            }
+        }
+        for (self.small[0..self.small_count]) |entry| {
+            if (self.collector.full()) break;
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            const read_store = if (entry.optional) self.store.optionalReadView() else self.store.*;
+            _ = @import("lake_index_seekable_text.zig").warmSmall(scratch.allocator(), .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordLocator } }, entry.ref, 512 * 1024) catch |err| {
+                if (entry.optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        }
+        // Metadata has first claim. Pack bounded complete ranking sections,
+        // identity bytes and compact source columns next; arbitrary archive
+        // prefixes never displace navigation or trigger an unbounded scan.
+        var working_bytes: usize = 0;
+        working: for (self.working[0..self.working_count]) |entry| {
+            if (self.collector.full() or working_bytes == 8 * 1024 * 1024) break;
+            // The complete tiny segment was captured above. Reopening it with
+            // a zero-residency producer cache would repeat all provider reads
+            // while contributing no new member to the deduplicated bundles.
+            for (self.small[0..self.small_count]) |tiny| if (std.mem.eql(u8, entry.ref.artifact_id, tiny.ref.artifact_id)) continue :working;
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+            defer scratch.deinit();
+            const read_store = if (entry.optional) self.store.optionalReadView() else self.store.*;
+            working_bytes += @import("lake_index_seekable_text.zig").warmWorkingSet(scratch.allocator(), .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token }, entry.ref, @min(2 * 1024 * 1024, 8 * 1024 * 1024 - working_bytes)) catch |err| {
+                if (entry.optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        }
+    }
+    fn addTextRoot(self: *Producer, scratch: A, root: @import("lake_index_native_text.zig").Root) !void {
+        if (self.text_count < self.text_roots.len and root.seekable and root.inventory_version == 3 and root.directories.routing != null and root.collection != null) {
+            const duplicate = for (self.text_roots[0..self.text_count]) |prior| {
+                if (std.mem.eql(u8, &prior.domain, &root.domain) and prior.directories.routing.?.eql(root.directories.routing.?)) break true;
+            } else false;
+            if (!duplicate) {
+                self.text_roots[self.text_count] = root;
+                self.text_count += 1;
+            }
+        }
+        inline for (.{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.ordered, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds }) |page| self.add(root.domain, page, 0, root.serving != null);
+        self.add(root.domain, root.directories.segments, 0, root.serving != null);
+        const read_store = if (root.serving != null) self.store.optionalReadView() else self.store.*;
+        for (root.open_packs) |pack| self.readUsing(scratch, pack, read_store) catch |err| {
+            if (root.serving != null and optionalUnavailable(err)) continue;
+            return err;
+        };
+    }
+    fn captureRecord(raw: *anyopaque, record: *const @import("lake_index_text_directory.zig").SegmentRecord) !void {
+        const self: *Producer = @ptrCast(@alignCast(raw));
+        if (self.collector.full() or self.segments == 64) return error.OpeningBundleBudgetExceeded;
+        self.segments += 1;
+        self.captureRecordBytes(record) catch |err| {
+            if (self.capture_optional and optionalUnavailable(err)) return;
+            return err;
+        };
+    }
+    fn captureRecordBytes(self: *Producer, record: *const @import("lake_index_text_directory.zig").SegmentRecord) !void {
+        const route = record.route;
+        const read_store = if (self.capture_optional) self.store.optionalReadView() else self.store.*;
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        // Scoring admissions, canonical file metadata and physical row maps
+        // serve different readers. A filtered/ordered query can need all three.
+        for ([_]?artifacts.ChunkRef{ record.manifest, record.physical, route.descriptor }) |maybe| if (maybe) |ref| {
+            self.readUsing(a, ref, read_store) catch |err| {
+                if (self.capture_optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        };
+        for (record.sources[0..@min(64, record.sources.len)]) |span| {
+            if (self.seed_reads == 256 or self.collector.full()) break;
+            try @import("lake_index_text_directory.zig").validateRef(span.physical, self.capture_domain);
+            self.readUsing(a, span.physical, read_store) catch |err| {
+                if (self.capture_optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        }
+        for (record.source_pages[0..@min(64, record.source_pages.len)]) |ref| {
+            if (self.seed_reads == 256 or self.collector.full()) break;
+            try @import("lake_index_text_directory.zig").validateRef(ref, self.capture_domain);
+            self.readUsing(a, ref, read_store) catch |err| {
+                if (self.capture_optional and optionalUnavailable(err)) continue;
+                return err;
+            };
+        }
+        // Bound navigation decoding separately from descriptor capture. Demand
+        // retains the original authenticated fallback beyond this prefix.
+        if (self.segments <= 32) {
+            _ = try @import("lake_index_seekable_text.zig").warmOpening(a, .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordPayloadLocator } }, route.ref, 1024 * 1024);
+            self.working[self.working_count] = .{ .ref = .{ .artifact_id = try self.a.dupe(u8, route.ref.artifact_id), .checksum = try self.a.dupe(u8, route.ref.checksum), .byte_len = route.ref.byte_len }, .optional = self.capture_optional };
+            self.working_count += 1;
+        } else {
+            // Exact sorting can choose any of the observed canonical routes.
+            // The 32-opening working-set cap must not also truncate selectors.
+            try @import("lake_index_seekable_text.zig").warmLocators(a, .{ .store = read_store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordPayloadLocator } }, route.ref);
+        }
+        if (self.capture_small and route.bytes <= 256 * 1024 and self.small_count < self.small.len) {
+            for (self.small[0..self.small_count]) |*prior| if (std.mem.eql(u8, prior.ref.artifact_id, route.ref.artifact_id)) {
+                prior.optional = prior.optional and self.capture_optional;
+                return;
+            };
+            self.small[self.small_count] = .{ .ref = .{ .artifact_id = try self.a.dupe(u8, route.ref.artifact_id), .checksum = try self.a.dupe(u8, route.ref.checksum), .byte_len = route.ref.byte_len }, .optional = self.capture_optional };
+            self.small_count += 1;
+        }
+    }
+    const Visitor = struct {
+        producer: *Producer,
+        navigation: Navigation,
+        children: usize = 0,
+        pub fn child(self: *Visitor, ref: tree.Ref) !void {
+            if (self.children == 8) return;
+            self.children += 1;
+            self.producer.add(self.navigation.domain, ref, self.navigation.depth + 1, self.navigation.optional);
+        }
+        pub fn record(_: *Visitor, _: []const u8, _: []const u8) !void {}
+    };
+};
+
+fn optionalUnavailable(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.CloudGenerationMissing, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch => true,
+        else => false,
+    };
+}
+
+/// Every original artifact stays independently rooted. The new bundles contain
+/// copies, so legacy/missing/corrupt cache seeds never weaken serving authority.
+pub fn publish(a: A, store: *stores.ArtifactStore, publication: catalog.Publication, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, context: Context, token: Token) ![]const catalog.OpeningBundle {
+    if (publication.reader_protocol < 98) return &.{};
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var producer: Producer = .{ .a = sa, .store = store, .collector = .{ .a = sa, .out = a, .store = store, .cancellation = token, .version = 2, .max_packs = max_bundles }, .cache = Cache.initWithMemoryLimit(sa, 0), .token = token };
+    defer producer.collector.deinit();
+    defer producer.cache.deinit();
+    producer.cached = .{ .cache = &producer.cache, .scope = publication.signature.store, .context = context, .capture = .{ .ptr = &producer, .record = Producer.capture }, .locator = .{ .ptr = &producer, .record = Producer.recordLocator } };
+    producer.collect(publication, declarations) catch |err| switch (err) {
+        error.OpeningBundleBudgetExceeded => {},
+        else => return err,
+    };
+    try producer.collector.flush();
+    const result = try a.alloc(catalog.OpeningBundle, producer.collector.refs.items.len);
+    for (producer.collector.refs.items, result) |pack, *out| {
+        out.* = .{ .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = pack.artifact.artifact_id, .checksum = pack.artifact.checksum, .byte_len = pack.artifact.byte_len }, .decoded_bytes = @intCast(pack.decoded_bytes) };
+        if (store.providerStore()) |object| if (object.cloud_writer) |writer| if (try writer.lookup(sa, pack.artifact.artifact_id, token)) |captured| {
+            var record = captured;
+            defer record.deinit(sa);
+            if (record.bytes != pack.artifact.byte_len) return error.InvalidCloudGenerationMap;
+            out.provider_generation = try a.dupe(u8, record.generation);
+        };
+    }
+    if (publication.reader_protocol >= 99 and result.len != 0 and producer.locators.entries.items.len != 0) {
+        const locators = try a.alloc(catalog.ProviderLocator, producer.locators.entries.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (locators[0..copied]) |value| {
+                a.free(value.id);
+                a.free(value.generation);
+            }
+            a.free(locators);
+        }
+        for (producer.locators.entries.items, locators) |entry, *out| {
+            const value = entry.value;
+            const id = try a.dupe(u8, value.id);
+            errdefer a.free(id);
+            out.* = .{ .id = id, .bytes = value.bytes, .generation = try a.dupe(u8, value.generation), .retention_until_ms = value.retention_until_ms };
+            copied += 1;
+        }
+        result[0].provider_locators = locators;
+    }
+    return result;
+}
+
+const Worker = struct {
+    backing: A,
+    store: *const Store,
+    publication: catalog.Publication,
+    bundle: ?catalog.OpeningBundle,
+    singleflight: bool = false,
+    speculative: bool = true,
+    stopped: std.atomic.Value(bool) = .init(false),
+    domain: [32]u8,
+    cached: artifacts.CachedRead,
+    token: Token,
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const Worker = @ptrCast(@alignCast(raw));
+        if (self.stopped.load(.acquire)) return true;
+        return if (self.token.ptr) |ptr| if (self.token.is_cancelled_fn) |callback| callback(ptr) else false else false;
+    }
+    fn check(raw: *const anyopaque) anyerror!void {
+        const self: *const Worker = @ptrCast(@alignCast(raw));
+        if (self.stopped.load(.acquire)) return error.Canceled;
+        try self.token.check();
+    }
+    fn run(self: *Worker) anyerror!void {
+        const guard: artifacts.ReadCancellation = .{ .parent = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = check }, .context = self.cached.context };
+        const token = guard.token();
+        try guard.check();
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        // Clients and cloud-generation readers have independent ownership;
+        // no request-arena allocator or mutable provider map crosses workers.
+        var store = try self.store.reopenReadOnlyWithAdmission(a, .{ .speculative = self.speculative, .wait_for_speculative_io = self.singleflight });
+        defer store.deinit();
+        store.implementation.cloud_io = self.cached.context.io;
+        // The parent already admitted publication/reader/retention authority.
+        // A seed worker always reads and hashes the entire optional bundle;
+        // it never uses certificate shortcuts or needs another provider clock.
+        try store.bindGenerationMap(self.publication.cloud_generations, token);
+        if (store.cloud_binding) |binding| try binding.reader.bindPublicationLocators(self.publication.opening_bundles);
+        const bundle = self.bundle orelse {
+            // Overlap map-root navigation with direct seed GETs. Otherwise
+            // skipping the map here merely moves its cold miss into ranking.
+            if (store.cloud_binding) |binding| if (binding.reader.shared != null) if (binding.reader.root) |root| {
+                _ = try binding.reader.read(a, root, 0, token);
+            };
+            return;
+        };
+        if (bundle.provider_generation) |generation| if (store.cloud_binding) |binding| {
+            try binding.reader.bindOpeningHint(.{ .id = bundle.artifact.artifact_id, .bytes = bundle.artifact.byte_len, .generation = generation });
+        };
+        self.warmSeed(a, &store, bundle, token) catch |err| switch (err) {
+            // Optional corrupt/missing hints never hide required source reads.
+            error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeTextOpeningPack => return,
+            else => return err,
+        };
+    }
+    fn warmSeed(self: *Worker, a: A, store: *Store, bundle: catalog.OpeningBundle, token: Token) !void {
+        // Joined SQL opening already has a publication-level singleflight.
+        // Avoid nesting another decoded admission under that loading flight.
+        if (!self.singleflight) return packs.warmPublication(a, store.artifactStore(), .{ .artifact = .{ .artifact_id = bundle.artifact.artifact_id, .checksum = bundle.artifact.checksum, .byte_len = bundle.artifact.byte_len }, .decoded_bytes = bundle.decoded_bytes }, self.domain, self.cached, token);
+        // A pack-level marker avoids decoding and readmitting the same seeds
+        // on each pipelined warm query; it retains no reader or credentials.
+        var seed: SeedLoader = .{ .a = a, .store = store.artifactStore(), .bundle = bundle, .domain = self.domain, .cached = self.cached, .token = token };
+        const seed_key = @import("lake_wal_image.zig").digest(.{ .kind = "publication-opening-seed-v1", .store = store.identity, .scope = self.cached.scope, .namespace = self.publication.namespace, .generation = self.publication.generation, .bundle = bundle });
+        const marker = try self.cached.cache.decoded.acquire(seed_key, decode_budget, self.cached.context, .{ .ptr = &seed, .load = SeedLoader.load });
+        marker.release();
+    }
+};
+const SeedLoader = struct {
+    a: A,
+    store: stores.ArtifactStore,
+    bundle: catalog.OpeningBundle,
+    domain: [32]u8,
+    cached: artifacts.CachedRead,
+    token: Token,
+    fn load(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try packs.warmPublication(self.a, self.store, .{ .artifact = .{ .artifact_id = self.bundle.artifact.artifact_id, .checksum = self.bundle.artifact.checksum, .byte_len = self.bundle.artifact.byte_len }, .decoded_bytes = self.bundle.decoded_bytes }, self.domain, self.cached, self.token);
+        const marker = try item.arena.allocator().create(u8);
+        marker.* = 1;
+        item.payload = .{ .extension = marker };
+    }
+};
+/// Query-owned seed pipeline. Opening the first seed releases the reader to
+/// rank ready segments while later seeds continue under speculative admission.
+pub const Pending = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    store: ?*Store = null,
+    work: [max_bundles]Worker = undefined,
+    tasks: [max_bundles]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null),
+    io: ?std.Io = null,
+    started: bool = false,
+
+    pub fn deinit(self: *Pending) void {
+        if (self.io) |io| for (&self.tasks, &self.work) |*task, *worker| if (task.*) |*owned| {
+            worker.stopped.store(true, .release);
+            _ = owned.cancel(io) catch {};
+            task.* = null;
+        };
+        if (self.store) |store| store.deinit();
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+    pub fn start(self: *Pending, store: *const Store, publication: catalog.Publication, cached: artifacts.CachedRead, token: Token) !void {
+        if (self.started or publication.opening_bundles.len == 0) return;
+        try publication.validate();
+        try cached.context.ensureActive();
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer if (cached.context.trace) |trace| trace.add("opening_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+        self.started = true;
+        self.arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        errdefer self.deinit();
+        const a = self.arena.?.allocator();
+        const owned_store = try a.create(Store);
+        owned_store.* = try store.reopenReadOnly(a);
+        self.store = owned_store;
+        const encoded = try std.json.Stringify.valueAlloc(a, publication, .{});
+        const held = try std.json.parseFromSliceLeaky(catalog.Publication, a, encoded, .{ .allocate = .alloc_always });
+        const scope = (try stores.uploadScopeFromArtifactId(held.inventory.artifact_id)) orelse return error.InvalidLakeIndexCatalog;
+        self.io = cached.context.io;
+        for (held.opening_bundles, 0..) |bundle, i| {
+            self.work[i] = .{ .singleflight = true, .speculative = i != 0, .backing = std.heap.smp_allocator, .store = owned_store, .publication = held, .bundle = bundle, .domain = scope.domain, .cached = cached, .token = token };
+            if (self.io) |io| {
+                const cost = 2 * (bundle.artifact.byte_len + bundle.decoded_bytes) + 2 * 1024 * 1024;
+                self.tasks[i] = local.sql_parallel_scheduler.global().submitIo(io, @intCast(cost), Worker.run, .{&self.work[i]});
+            }
+        }
+        // The first pack carries bootstrap/navigation bytes. Declined optional
+        // work uses normal required reads. Its failure never hides source data.
+        if (self.tasks[0]) |*task| {
+            const result = task.await(self.io.?);
+            self.tasks[0] = null;
+            result catch |err| {
+                try cached.context.ensureActive();
+                try token.check();
+                if (err == error.OutOfMemory) return err;
+            };
+        } else {
+            self.work[0].run() catch |err| {
+                try cached.context.ensureActive();
+                try token.check();
+                if (err == error.OutOfMemory) return err;
+            };
+        }
+    }
+};
+
+const Loader = struct {
+    store: *const Store,
+    publication: catalog.Publication,
+    cached: artifacts.CachedRead,
+    token: Token,
+    domain: [32]u8,
+    fn load(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+        const self: *Loader = @ptrCast(@alignCast(raw));
+        const backing = local.sql_memory_budget.reclaimingAllocator(item.arena.allocator());
+        var root_work: Worker = .{ .backing = backing, .store = self.store, .publication = self.publication, .bundle = null, .domain = self.domain, .cached = self.cached, .token = self.token };
+        var root_task: ?local.sql_parallel_scheduler.Task(anyerror!void) = null;
+        defer if (root_task) |*active| {
+            root_work.stopped.store(true, .release);
+            active.cancel(self.cached.context.io.?) catch {};
+        };
+        const has_hint = for (self.publication.opening_bundles) |bundle| {
+            if (bundle.provider_generation != null) break true;
+        } else false;
+        const has_locators = for (self.publication.opening_bundles) |bundle| {
+            if (bundle.provider_locators.len != 0) break true;
+        } else false;
+        const root_cost = 8 * 1024 * 1024;
+        // Current bundles supply authenticated direct locators. Speculating on
+        // their entire map adds contention and an unnecessary joined teardown.
+        // Missing locators retain the normal authoritative demand fallback.
+        if (has_hint and !has_locators and self.publication.cloud_generations != null) if (self.cached.context.io) |io| {
+            root_task = local.sql_parallel_scheduler.global().submitIo(io, root_cost, Worker.run, .{&root_work});
+        };
+        const wave_budget = parallel_budget - @as(usize, if (root_task != null) root_cost else 0);
+        var position: usize = 0;
+        while (position < self.publication.opening_bundles.len) {
+            var work: [max_bundles]Worker = undefined;
+            var tasks: [max_bundles]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+            defer if (self.cached.context.io) |io| for (&tasks, &work) |*task, *worker| if (task.*) |*owned| {
+                worker.stopped.store(true, .release);
+                owned.cancel(io) catch {};
+            };
+            var width: usize = 0;
+            var bytes: u64 = 0;
+            while (position + width < self.publication.opening_bundles.len and width < work.len) {
+                const bundle = self.publication.opening_bundles[position + width];
+                // Include provider buffers, decoding, member admission and
+                // independent client setup rather than counting wire bytes only.
+                const cost = 2 * (bundle.artifact.byte_len + bundle.decoded_bytes) + 2 * 1024 * 1024;
+                if (width != 0 and bytes + cost > wave_budget) break;
+                bytes += cost;
+                work[width] = .{ .backing = backing, .store = self.store, .publication = self.publication, .bundle = bundle, .domain = self.domain, .cached = self.cached, .token = self.token };
+                if (self.cached.context.io) |io| {
+                    tasks[width] = local.sql_parallel_scheduler.global().submitIo(io, @intCast(cost), Worker.run, .{&work[width]}) orelse return error.NavigationWarmupInProgress;
+                } else try work[width].run();
+                width += 1;
+            }
+            for (tasks[0..width]) |*task| if (task.*) |*owned| {
+                const result = owned.await(self.cached.context.io.?);
+                task.* = null;
+                try result;
+            };
+            position += width;
+        }
+        // Root warming is optional: do not extend a ready seed wave waiting
+        // for unrelated speculation. Its stop token interrupts provider I/O.
+        if (root_task) |*active| {
+            root_work.stopped.store(true, .release);
+            active.cancel(self.cached.context.io.?) catch {};
+            root_task = null;
+        }
+        try self.cached.context.ensureActive();
+        try self.token.check();
+        const marker = try item.arena.allocator().create(u8);
+        marker.* = 1;
+        item.payload = .{ .extension = marker };
+    }
+};
+
+/// Singleflight covers fetch, validation and admission, not just the pack GET.
+/// Only a data-only marker survives; no authority, client or request is cached.
+pub fn warm(store: *const Store, publication: catalog.Publication, cached: artifacts.CachedRead, token: Token) !void {
+    if (publication.opening_bundles.len == 0) return;
+    const started = @import("antfly_platform").time.monotonicNs();
+    defer if (cached.context.trace) |trace| trace.add("opening_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+    try publication.validate();
+    try cached.context.ensureActive();
+    const scope = (try stores.uploadScopeFromArtifactId(publication.inventory.artifact_id)) orelse return error.InvalidLakeIndexCatalog;
+    const key = @import("lake_wal_image.zig").digest(.{ .kind = "publication-opening-admission-v1", .store = store.identity, .scope = cached.scope, .namespace = publication.namespace, .generation = publication.generation, .bundles = publication.opening_bundles });
+    var loader: Loader = .{ .store = store, .publication = publication, .cached = cached, .token = token, .domain = scope.domain };
+    const held = cached.cache.decoded.acquire(key, decode_budget, cached.context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+        try cached.context.ensureActive();
+        try token.check();
+        if (err == error.OutOfMemory or err == error.Canceled or err == error.DeadlineExceeded) return err;
+        // Optional acceleration must not suppress authoritative source errors
+        // or make a valid publication unavailable under cache/worker pressure.
+        return;
+    };
+    held.release();
+}
+
+test "external lake opening pipeline owns seeds through cancellation and reader teardown" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("opening-pipeline-lifetime");
+    defer directory.cleanup();
+    var store = try Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const scope = try stores.UploadScope.forPublication(@splat(81), 1, std.testing.io);
+    var output = store.artifactStore();
+    output.upload_scope = scope;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var collector: packs.Collector = .{ .a = a, .out = ca, .store = &output, .cancellation = .none, .version = 2, .max_packs = 2 };
+    defer collector.deinit();
+    var inventory = try output.putScoped(scope, "inventory", .none);
+    defer inventory.deinit(a);
+    const ref: artifacts.ChunkRef = .{ .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len };
+    try collector.add(ref, "inventory");
+    try collector.flush();
+    var later = try output.putScoped(scope, "later", .none);
+    defer later.deinit(a);
+    try collector.add(.{ .artifact_id = later.artifact_id, .checksum = later.checksum, .byte_len = later.byte_len }, "later");
+    try collector.flush();
+    var bundles: [2]catalog.OpeningBundle = undefined;
+    for (collector.refs.items, &bundles) |pack, *bundle| bundle.* = .{
+        .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = pack.artifact.artifact_id, .checksum = pack.artifact.checksum, .byte_len = pack.artifact.byte_len },
+        .decoded_bytes = @intCast(pack.decoded_bytes),
+    };
+    const publication: catalog.Publication = .{
+        .namespace = scope.domain,
+        .generation = 1,
+        .token = @splat(1),
+        .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = store.identity },
+        .published_at_ms = 1,
+        .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } },
+        .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len },
+        .opening_bundles = &bundles,
+    };
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = store.cache_identity, .context = .{ .io = std.testing.io } };
+    var pending: Pending = .{};
+    defer pending.deinit();
+    try pending.start(&store, publication, cached, .none);
+    const Miss = struct {
+        fn load(_: *anyopaque, _: A) ![]u8 {
+            return error.UnexpectedOpeningCacheMiss;
+        }
+    };
+    var dummy: u8 = 0;
+    const bytes = try cache.readImmutableAlloc(a, cached.scope, inventory.artifact_id, inventory.byte_len, try stores.sha256DigestFromChecksum(inventory.checksum), cached.context, .{ .ptr = &dummy, .load = Miss.load });
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("inventory", bytes);
+    // Joins every optional worker before releasing its private store/arena.
+    pending.deinit();
+    try std.testing.expect(pending.store == null and pending.arena == null);
+    for (pending.tasks) |task| try std.testing.expect(task == null);
+}

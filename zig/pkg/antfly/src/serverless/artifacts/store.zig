@@ -296,6 +296,10 @@ pub const ArtifactStore = struct {
     }
 
     pub const VTable = struct {
+        /// Optional hints must not turn an unused representation's missing
+        /// bytes into mandatory derived-state recovery. Adapters opt in; all
+        /// unrecognized authorization/provider wrappers remain intact.
+        optional_read_view: ?*const fn (*anyopaque) ArtifactStore = null,
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
         retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
@@ -327,6 +331,17 @@ pub const ArtifactStore = struct {
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
     };
 
+    /// Borrowed hint-only view. The backend owner must outlive it. Preserve
+    /// caller scope, allocator and I/O admission; only opted-in recovery
+    /// decorators change. Required reads keep their original recovery policy.
+    pub fn optionalReadView(self: ArtifactStore) ArtifactStore {
+        const callback = self.vtable.optional_read_view orelse return self;
+        const target = callback(self.ptr);
+        var result = self;
+        result.ptr = target.ptr;
+        result.vtable = target.vtable;
+        return result;
+    }
     pub fn providerStore(self: ArtifactStore) ?*@import("object_store.zig").ObjectStore {
         return if (self.vtable.object_store) |call| call(self.ptr) else null;
     }
