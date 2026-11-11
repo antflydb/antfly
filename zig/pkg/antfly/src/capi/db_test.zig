@@ -4993,8 +4993,6 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 return .{ .ptr = self, .dense_embed_fn = embed, .computation_key_fn = computationKey, .dense_embed_with_context_fn = embedWithContext, .foreground_bounded = true };
             }
         };
-        var clock: antfly.platform_clock.ManualClock = .{};
-        clock.setRealtimeNs(antfly.platform_clock.Clock.real().nowRealtimeNs());
         var gate: Gate = .{};
         defer gate.allowed.set(shared.handleLockIo());
         var directory = try TestDirectory.init("capi-sql-detached-maintenance");
@@ -5027,7 +5025,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 .kind = .dense_vector,
                 .config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"progressive\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
             });
-            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface(), .clock = clock.clock() });
+            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
             captured_runtime = guard.handle.db.enrichment_runtime.?;
             captured_database = &guard.handle.db;
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
@@ -5138,20 +5136,35 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             // A completed result survives unrelated commits, while an updated
             // source fails its live transactional digest/incarnation guard.
             try std.testing.expect((completed == null) == source_changed);
-            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface(), .clock = clock.clock() });
+            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
             connection.maintenance_pending = true;
         }
         try std.testing.expectEqual(@as(usize, 1), gate.calls.load(.monotonic));
         var idle = false;
         for (0..64) |_| {
-            // A refused publication may persist retry backoff even after its
-            // data checkpoint advances. Drive that clock explicitly; tight
-            // polling must not assume a wall-clock retry deadline has elapsed.
-            clock.advanceMs(1_000);
             if (!try connection.maintenanceTurnForTest()) {
                 idle = true;
                 break;
             }
+            // Serving refresh can replace the runtime (and its clock). Drive
+            // the admitted owner's actual retry deadline instead of advancing
+            // a discarded fixture clock or spinning before backoff is due.
+            const delay_ms = delay: {
+                const probe = public.enterHandle(handle, .read).?;
+                defer probe.leave();
+                const runtime = probe.handle.db.enrichment_runtime orelse break :delay @as(u64, 0);
+                const stats = runtime.stats();
+                break :delay if (stats.retrying) @min(stats.next_retry_at_ms -| runtime.clock.nowRealtimeMs(), 250) else @as(u64, 0);
+            };
+            if (delay_ms != 0) try shared.handleLockIo().sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
+        }
+        if (!idle) {
+            const probe = public.enterHandle(handle, .read).?;
+            defer probe.leave();
+            const stats = probe.handle.db.pendingWorkStats();
+            const runtime = probe.handle.db.enrichment_runtime.?;
+            std.debug.print("detached embedding runtime: workers={} future={} runtime_now={d} backend_now={d} retries={d} fingerprint={d} maintenance_error={?s}\n", .{ probe.handle.db.local_execution.optional_runtime_workers_enabled, runtime.future != null, runtime.clock.nowRealtimeMs(), probe.handle.db.backend_runtime.clock().nowRealtimeMs(), runtime.consecutive_retry_count, runtime.retry_failure_fingerprint, connection.publication_stats.last_maintenance_error });
+            std.debug.print("detached embedding did not publish: changed={} calls={d} writes={d} target={d} enrichment={d}/{d} retrying={} retry_at={d} now={d} worker_failed={} lease={} acquired={d} lost={d} owner_pending={} storage_pending={}\n", .{ source_changed, gate.calls.load(.monotonic), foreground.writes.load(.monotonic), stats.derived_target_sequence, stats.enrichment.applied_sequence, stats.enrichment.target_sequence, stats.enrichment.retrying, stats.enrichment.next_retry_at_ms, runtime.clock.nowRealtimeMs(), stats.enrichment.worker_failed, stats.enrichment.has_lease, stats.enrichment.acquisition_count, stats.enrichment.lost_leases, connection.maintenance_pending, connection.maintenance_storage_pending });
         }
         try std.testing.expect(idle);
         // One original computation and one new document: retry reused the first
