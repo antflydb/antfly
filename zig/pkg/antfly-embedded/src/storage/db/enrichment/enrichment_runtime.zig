@@ -16422,7 +16422,11 @@ fn processAsset(
 
     if (producer_cfg.type == .copy) {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text);
-        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, source_text)) {
+        // Same reasoning as the generic producer's receipt below: key the
+        // reuse receipt on the declared source (`source_text`), not the
+        // whole primary document (`raw`), so an edit to an unrelated field
+        // doesn't invalidate it.
+        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, source_text, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             // The artifact exists and is current: produced coverage, so an
@@ -16434,7 +16438,7 @@ fn processAsset(
         const receipt_key = try local.key(runtime.alloc, key);
         defer runtime.alloc.free(receipt_key);
         const producer_recipe = local.requestRecipe(request);
-        const receipt = local.encode(producer_recipe, raw, source_text);
+        const receipt = local.encode(producer_recipe, source_text, source_text);
         try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
@@ -16494,7 +16498,15 @@ fn processAsset(
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
-            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+            // Same reasoning as the `.copy` branch above: key the reuse
+            // receipt on the declared source (`source_text`), which
+            // `shouldSkipAssetProducer` just proved unchanged, not the
+            // whole primary document (`raw`) -- otherwise an edit to an
+            // unrelated field silently defeats the skip this check exists
+            // to provide (`storePutBatchGuarded`'s separate fencing digest,
+            // a few lines below in the write path, still keys on `raw` to
+            // guard against a genuinely concurrent primary change).
+            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, source_text, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
                 try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
                 // Private outputs also require their destination-owned witness.
@@ -18125,7 +18137,20 @@ fn applyAssetProducerBatchOutput(
     const receipt_key = try local.key(runtime.alloc, item.artifact_key);
     defer runtime.alloc.free(receipt_key);
     const producer_recipe = local.requestRecipe(item.request);
-    const receipt = local.encode(producer_recipe, item.raw_doc, validated);
+    // This receipt's "parent" proves the output was produced from exactly
+    // this input, for `reusableLocalAsset`'s skip-the-provider check
+    // (`requireLocalAssetSource` reads it back). That input is the
+    // producer's own declared source (`item.source_text`, already what
+    // `shouldSkipAssetProducer`'s state-value check keys its skip decision
+    // on), not the whole primary document (`item.raw_doc`, which also
+    // carries fields the producer never saw, e.g. doc_key's own metadata
+    // consumed by nothing it depends on) -- the matching privacy witness a
+    // few lines above already makes exactly this choice for its own
+    // non-private-consumer case. Keying this receipt on `item.raw_doc`
+    // instead invalidated it on every unrelated field edit, silently
+    // defeating the skip (the duplicate work `shouldSkipAssetProducer`
+    // already proved is unnecessary) on every such edit.
+    const receipt = local.encode(producer_recipe, item.source_text, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
     try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
 
