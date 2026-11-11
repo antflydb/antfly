@@ -3324,7 +3324,7 @@ fn decodeCompressedExactAlloc(
             var in: std.Io.Reader = .fixed(compressed);
             const window = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
             defer alloc.free(window);
-            var decompress: std.compress.zstd.Decompress = .init(&in, window, .{});
+            var decompress: @import("antfly_compress").ZstdDecoder = .init(&in, window, .{});
             break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
     };

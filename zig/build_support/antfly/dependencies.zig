@@ -1414,6 +1414,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
         .hash = hash_mod,
+        .compress = b.createModule(.{ .root_source_file = b.path("lib/compress/src/mod.zig"), .target = target, .optimize = optimize }),
         .matcher = matcher_mod,
         .resolver = resolver_mod,
         .casbin = casbin_mod,

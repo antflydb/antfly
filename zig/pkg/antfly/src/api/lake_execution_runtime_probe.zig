@@ -288,5 +288,5 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     var hits = try index.search(query, 10);
     defer hits.deinit();
     if (hits.getHits().len == 0) return error.InvalidProbeWorkload;
-    std.debug.print("PARQUET_BULK algorithm={s} vectors={} dims={} total_ns={} reopened_hits={} checkpoints={}\n", .{ algorithm, index.stats().active_count, dims, elapsed, hits.getHits().len, state.checkpoints });
+    std.debug.print("PARQUET_BULK algorithm={s} vectors={} dims={} total_ns={} reopened_hits={} checkpoints={} logical_identity={}\n", .{ algorithm, index.stats().active_count, dims, elapsed, hits.getHits().len, state.checkpoints, ready.value.published.?.row_identity != null });
 }

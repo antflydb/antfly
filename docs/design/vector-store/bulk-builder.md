@@ -52,7 +52,11 @@ separately to process RSS.
 1. Decode authored Parquet `LIST<FLOAT>` and `LIST<DOUBLE>` columns into borrowed
    float32 vectors. Repetition and definition levels preserve rows across page
    boundaries and distinguish null lists from empty lists. The reader retains
-   one physical page and a bounded output cohort. Shared producer replay keeps
+   one physical page and a bounded output cohort. Zstandard pages use the shared
+   native decoder's bounded Huffman prefix table: at most 2,048 two-byte entries
+   replace per-literal linear symbol searches. Short stream tails retain exact
+   bit-width traversal and four-stream transitions. Decoder windows use the
+   admitted heap. Shared producer replay keeps
    vector values in packed float32 form. Identity evidence hashes canonical
    coordinate bits in bounded blocks, preserving its existing digest without
    issuing a hash update for every coordinate. SQL and stored-source consumers
@@ -185,7 +189,33 @@ To use an existing object-store source, set `ANTFLY_LAKE_BULK_PARQUET` to its
 URI instead. A filesystem URI identifies a native framed object store, whose
 objects are installed through `Client.putFile`, rather than a plain directory.
 
+The timer covers the native build call, including its artifact publication and
+returned catalog candidate. Initial fixture preparation and source opening,
+the caller's final catalog transaction, and reopen/search are outside the timer.
+The report includes whether optional logical identity evidence was published.
+
 The operation probe preserves the authored vector coordinates and uses squared
 L2. Its query checks serving and exact-vector reopening. Recall measurement
 continues to use held-out queries and matching ground truth in the quality
 benchmark.
+
+
+## Compressed-source kernel benchmark
+
+The native Zstandard prefix decoder shares the existing frame, dictionary,
+checksum, window, and bitstream implementation. The table occupies 4 KiB per
+Huffman tree and is rebuilt when entropy tables change. Valid-frame output is
+checked against the standard decoder, with multiblock, truncated-frame, and
+exhaustive eleven-bit-prefix regressions. Existing raw/trained dictionary
+reference fixtures also exercise the shared codec.
+
+```sh
+cd zig
+zig build bench-zstd -Doptimize=ReleaseFast
+zig-out/bin/bench_zstd lib/compress/src/testdata/cohere_literals.zst 2000 24576 5
+```
+
+Each trial decodes 49,152,000 bytes through each implementation using equal
+window allocations and checks every output. Trial order alternates. Kernel
+measurements isolate compressed-source decoding; complete Parquet operation
+measurements remain separate.

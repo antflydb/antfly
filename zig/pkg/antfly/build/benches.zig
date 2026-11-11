@@ -749,6 +749,11 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
     build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
 
+    const zstd_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_zstd.zig"), .target = target, .optimize = optimize });
+    zstd_bench_mod.addImport("antfly_compress", options.antfly_imports.compress);
+    const zstd_bench = b.addExecutable(.{ .name = "bench_zstd", .root_module = zstd_bench_mod });
+    b.step("bench-zstd", "Compare bounded native Huffman lookup with standard Zstandard decoding").dependOn(&b.addInstallArtifact(zstd_bench, .{}).step);
+
     const spool_tests = b.addTest(.{
         .root_module = options.antfly_test_mod,
         .filters = &.{ "spooled bulk", "offline lake build configuration", "stable generation finalization", "authoritative external-vector HBC", "experimental posting checkpoint reopens", "native posting initial acceleration", "prepared posting activation" },
