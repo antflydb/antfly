@@ -625,6 +625,9 @@ and retains the existing PDF/OCR recipe and artifact names. Use
 MIME types before applying file limits, and saves the profile for resume,
 publication, loading and grep configuration. A resume cannot change it.
 Raw `stage-originals` remains independent and preserves every media type.
+The native transcription profile selects WAV, MP3, MP4/M4A, Ogg/Opus, AAC,
+AIFF, CAF and FLAC. AMR originals are preserved by raw staging but are excluded
+from this profile because the native decoder does not support them.
 
 Each profile uses a separate state and table in the **same Cloud instance**.
 This keeps the accepted PDF table, producer settings and sample OCR unchanged.
@@ -649,7 +652,9 @@ antfly-grep --table-config ./grepstein-speech/grep.json 'pattern'
 
 `INFERENCE_URL` is the configured shared-inference endpoint. The secret name
 references a credential already available in the server keystore; it is never a
-literal token. The default model is the pinned hosted Whisper-small revision in
+literal token. For the Antfly provider, this flag overrides both `api_key` and
+`bearer_token` in the authored configuration, leaving one effective credential.
+The default model is the pinned hosted Whisper-small revision in
 [whisper-transcriber.example.json](whisper-transcriber.example.json). Pass
 `load --transcriber-config FILE` to select another native STT model/provider.
 Do not put credential values in that file; use server secret references. Keep
@@ -675,6 +680,11 @@ jq -s '.[0].tables += .[1].tables | .[0]' \
   ./grepstein-corpus/grep.json ./grepstein-speech/grep.json > ./grepstein-all.json
 antfly-grep --table-config ./grepstein-all.json 'pattern'
 ```
+
+Qualification dispatches from the saved profile, verifies that each record
+belongs to that profile, and includes its name in the receipt. MIME identifies
+accepted sources; the profile chooses the evidence policy. Future recipes sharing
+a MIME must explicitly select their coverage policy.
 
 Qualification proves both unit/chunk indexes are complete/queryable and inspects
 the raw native completion manifest. PDF qualification checks the sealed page
@@ -756,3 +766,9 @@ credentials or a second fetch of the private GCS URL. Native STT preserves the
 recording MIME for negotiated framed transport; older local callbacks receive an
 inline recording at their existing URL boundary. These engine fixes must be in
 the deployed Antfly runtime before using the new profiles against Cloud.
+
+Hosted transcription negotiates segmented framed attachments when advertised,
+borrowing the already fetched recording. The JSON fallback encodes directly into
+one exactly sized request body. Invocation memory planning follows the selected
+transport; local callback compatibility accounts for its inline data URI. Missing
+audio MIME is inferred from the native format detector without decoding samples.

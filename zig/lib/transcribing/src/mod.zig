@@ -16,6 +16,7 @@
 const std = @import("std");
 pub const cloudflare = @import("antfly_cloudflare_config");
 const audio = @import("antfly_audio_openapi");
+const audio_codec = @import("inference_audio");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const google_auth = @import("antfly_google").auth;
@@ -863,25 +864,13 @@ const AntflyTranscriberState = struct {
         var audio_content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
         defer audio_content.deinit(alloc);
         const audio_bytes = audio_content.bytes();
-        var encoded: ?[]u8 = null;
-        defer if (encoded) |value| alloc.free(value);
-        const audio_field = if (self.framed_attachments)
-            "attachment:0"
-        else blk: {
-            const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
-            encoded = try alloc.alloc(u8, encoded_len);
-            _ = std.base64.standard.Encoder.encode(encoded.?, audio_bytes);
-            break :blk encoded.?;
-        };
-
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-
-        const body = try httpx.json.Json.stringify(alloc, inference_api.types.ReadRequest{
-            .model = self.model,
-            .audio = audio_field,
-            .audio_options = .{ .language = req.language orelse self.language_code, .timestamps = req.timestamps orelse self.timestamps, .diarization = req.diarization orelse self.diarization },
-        });
+        const body = try antflyAudioReadBodyAlloc(alloc, self.model, .{
+            .language = req.language orelse self.language_code,
+            .timestamps = req.timestamps orelse self.timestamps,
+            .diarization = req.diarization orelse self.diarization,
+        }, audio_bytes, self.framed_attachments);
         defer alloc.free(body);
 
         var header_buf: [5][2][]const u8 = undefined;
@@ -906,10 +895,10 @@ const AntflyTranscriberState = struct {
         defer if (framed_body) |*value| value.deinit();
         if (self.framed_attachments) {
             framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, body, &.{.{
-                .mime_type = switch (audio_content) {
+                .mime_type = try audioContentType(audio_bytes, switch (audio_content) {
                     .owned => |content| content.content_type,
-                    .borrowed => self.options.resolved_audio_content_type orelse "application/octet-stream",
-                },
+                    .borrowed => self.options.resolved_audio_content_type,
+                }),
                 .data = audio_bytes,
             }});
             header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
@@ -943,6 +932,60 @@ const AntflyTranscriberState = struct {
         return fromReadObjectAlloc(alloc, first);
     }
 };
+
+/// Keep one exact-sized JSON request body. Encoding into a separate base64
+/// string would retain two recording-sized buffers and violate the public
+/// boundary's base64-payload memory contract.
+fn antflyAudioReadBodyAlloc(a: Allocator, model: []const u8, options: inference_api.AudioReadOptions, bytes: []const u8, framed: bool) ![]u8 {
+    const json_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    const metadata = try std.json.Stringify.valueAlloc(a, .{ .model = model, .audio_options = options, .audio = "" }, json_options);
+    defer a.free(metadata);
+    const encoded_len = if (framed) "attachment:0".len else std.base64.standard.Encoder.calcSize(bytes.len);
+    const size = try std.math.add(usize, metadata.len, encoded_len);
+    const body = try a.alloc(u8, size);
+    errdefer a.free(body);
+    var output = std.Io.Writer.fixed(body);
+    const AudioValue = struct {
+        bytes: []const u8,
+        framed: bool,
+        pub fn jsonStringify(value: @This(), jw: *std.json.Stringify) !void {
+            if (value.framed) return jw.write("attachment:0");
+            try jw.beginWriteRaw();
+            try jw.writer.writeByte('"');
+            try std.base64.standard.Encoder.encodeWriter(jw.writer, value.bytes);
+            try jw.writer.writeByte('"');
+            jw.endWriteRaw();
+        }
+    };
+    try std.json.Stringify.value(.{ .model = model, .audio_options = options, .audio = AudioValue{ .bytes = bytes, .framed = framed } }, json_options, &output);
+    std.debug.assert(output.end == body.len);
+    return body;
+}
+
+/// Resolve MIME from shared native format detection when a caller has no MIME
+/// evidence. Preserve explicit audio/container declarations for the receiver's
+/// codec-aware validation; never invent a generic binary audio attachment.
+pub fn audioContentType(bytes: []const u8, hint: ?[]const u8) ![]const u8 {
+    if (hint) |mime| {
+        const essence = try scraping.data_uri.mediaTypeEssence(mime);
+        if (audio_codec.detectFormatFromMime(essence) != null) return mime;
+        if (!std.ascii.eqlIgnoreCase(essence, "application/octet-stream")) return error.UnsupportedAudioFormat;
+    }
+    return audio_codec.mimeForBytes(bytes);
+}
+
+/// URL-only local callbacks share this compatibility boundary. The source is
+/// borrowed until return; only its inline transport representation is owned.
+pub fn inlineAudioSourceAlloc(a: Allocator, bytes: []const u8, mime_hint: ?[]const u8, max_bytes: ?usize) ![]u8 {
+    if (bytes.len > effectiveMaxDownloadBytes(max_bytes)) return error.ResponseTooLarge;
+    const mime = try audioContentType(bytes, mime_hint);
+    const prefix_len = "data:;base64,".len + mime.len;
+    const result = try a.alloc(u8, try std.math.add(usize, prefix_len, std.base64.standard.Encoder.calcSize(bytes.len)));
+    errdefer a.free(result);
+    _ = try std.fmt.bufPrint(result[0..prefix_len], "data:{s};base64,", .{mime});
+    _ = std.base64.standard.Encoder.encode(result[prefix_len..], bytes);
+    return result;
+}
 
 fn audioReadResponseError(alloc: Allocator, body: []const u8) anyerror {
     if (body.len > 4096) return error.TranscribeRequestFailed;
@@ -2295,7 +2338,7 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
     try std.testing.expectEqualStrings("en", response.?.language.?);
 }
 
-test "Antfly transcriber sends negotiated framed audio attachments" {
+test "Antfly transcriber sends negotiated framed audio attachments and infers missing MIME" {
     const allocator = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2324,7 +2367,7 @@ test "Antfly transcriber sends negotiated framed audio attachments" {
                 .model = "whisper",
                 .url = url,
                 .framed_attachments = true,
-            }, .{ .url = "gs://private/must-not-fetch.wav" }, .{ .resolved_audio = "fake", .resolved_audio_content_type = "audio/wav" }) catch |err| {
+            }, .{ .url = "gs://private/must-not-fetch.wav" }, .{ .resolved_audio = framed_audio_fixture }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -2622,6 +2665,8 @@ fn expectAntflyTranscriberDiarization(req: httpx.testing_mod.RequestInfo) !void 
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"diarization\":true") != null);
 }
 
+const framed_audio_fixture = "RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00";
+
 fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings(
         httpx.attachment_envelope.content_type,
@@ -2631,7 +2676,7 @@ fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {
     defer envelope.deinit();
     try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
     try std.testing.expectEqualStrings("audio/wav", envelope.attachments[0].mime_type);
-    try std.testing.expectEqualStrings("fake", envelope.attachments[0].data);
+    try std.testing.expectEqualStrings(framed_audio_fixture, envelope.attachments[0].data);
     try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"audio\":\"attachment:0\"") != null);
 }
 
@@ -2843,4 +2888,34 @@ test "audio read owned inline content releases every allocation" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "borrowed audio MIME uses native headers without decoding and preserves container evidence" {
+    const wav = "RIFF\x24\x00\x00\x00WAVEfmt ";
+    try std.testing.expectEqualStrings("audio/wav", try audioContentType(wav, null));
+    try std.testing.expectEqualStrings("audio/wav", try audioContentType(wav, "application/octet-stream"));
+    try std.testing.expectEqualStrings("audio/x-wav", try audioContentType(wav, "audio/x-wav"));
+    try std.testing.expectEqualStrings("audio/opus", try audioContentType("OggS00000000OpusHead", null));
+    try std.testing.expectError(error.UnsupportedAudioFormat, audioContentType("#!AMR\n", null));
+    try std.testing.expectError(error.UnsupportedAudioFormat, audioContentType(wav, "image/png"));
+}
+
+test "Antfly audio JSON encoding owns one exactly sized body under a tight allocator" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 65536);
+    defer a.free(bytes);
+    @memset(bytes, 42);
+    const capacity = std.base64.standard.Encoder.calcSize(bytes.len) + 1024;
+    const buffer = try a.alloc(u8, capacity);
+    defer a.free(buffer);
+    var fixed = std.heap.FixedBufferAllocator.init(buffer);
+    const body = try antflyAudioReadBodyAlloc(fixed.allocator(), "owner/escaped\"model", .{ .timestamps = true }, bytes, false);
+    const value = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer value.deinit();
+    try std.testing.expectEqualStrings("owner/escaped\"model", value.value.object.get("model").?.string);
+    const encoded = value.value.object.get("audio").?.string;
+    const decoded = try a.alloc(u8, bytes.len);
+    defer a.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, encoded);
+    try std.testing.expectEqualSlices(u8, bytes, decoded);
 }
