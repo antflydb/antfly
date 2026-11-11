@@ -337,20 +337,36 @@ func (w *SyncWriter) PublicationProofs() map[string]string {
 	return w.publicationProofs
 }
 
-// RestorePublicationProofs rechecks every expected row in bounded batches.
-// A mismatch leaves the writer unmodified so acquisition can safely replay.
+// RestorePublicationProofs rechecks the supplied inventory subset in bounded
+// batches. A mismatch leaves the writer unmodified.
 func (w *SyncWriter) RestorePublicationProofs(ctx context.Context, proofs map[string]string) (bool, error) {
-	if !w.authoritative || w.failed || w.finished || len(proofs) != len(w.inventory) {
-		return false, nil
+	matched, err := w.matchPublicationProofs(ctx, proofs)
+	if err != nil || len(matched) == 0 || len(matched) != len(proofs) {
+		return false, err
+	}
+	w.markPublicationVerified(matched)
+	return true, nil
+}
+
+func (w *SyncWriter) markPublicationVerified(proofs map[string]string) {
+	for id := range proofs {
+		w.verified[id] = true
+	}
+}
+
+func (w *SyncWriter) matchPublicationProofs(ctx context.Context, proofs map[string]string) (map[string]string, error) {
+	if !w.authoritative || w.failed || w.finished || len(proofs) == 0 || len(proofs) > len(w.inventory) {
+		return nil, nil
 	}
 	ids := make([]string, 0, len(proofs))
 	for id, digest := range proofs {
 		if !w.inventory[id] || len(digest) != 64 {
-			return false, nil
+			return nil, nil
 		}
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	matched := make(map[string]string, len(proofs))
 	const proofBatch = 64
 	for start := 0; start < len(ids); start += proofBatch {
 		keys := ids[start:min(start+proofBatch, len(ids))]
@@ -360,32 +376,32 @@ func (w *SyncWriter) RestorePublicationProofs(ctx context.Context, proofs map[st
 		})
 		raw, err := w.client.Query(ctx, w.table, body)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		hits, err := decodeSyncHits(raw)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		if len(hits) != len(keys) {
-			return false, nil
-		}
-		for i, hit := range hits {
-			if hit.ID != keys[i] || !sourceRowMatches(hit, w.sourceID) {
-				return false, nil
+		seen := make(map[string]bool, len(hits))
+		for _, hit := range hits {
+			if seen[hit.ID] {
+				return nil, fmt.Errorf("duplicate source publication proof identity")
+			}
+			seen[hit.ID] = true
+			i := sort.SearchStrings(keys, hit.ID)
+			if i == len(keys) || keys[i] != hit.ID || !sourceRowMatches(hit, w.sourceID) {
+				continue
 			}
 			digest, err := projectionDigest(hit.Source.Document)
 			if err != nil {
-				return false, err
+				return nil, err
 			}
-			if hex.EncodeToString(digest[:]) != proofs[hit.ID] {
-				return false, nil
+			if expected := proofs[hit.ID]; hex.EncodeToString(digest[:]) == expected {
+				matched[hit.ID] = expected
 			}
 		}
 	}
-	for id := range proofs {
-		w.verified[id] = true
-	}
-	return true, nil
+	return matched, nil
 }
 
 // Finish never removes missing rows for partial inventories or repairs. A full

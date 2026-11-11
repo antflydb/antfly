@@ -91,6 +91,10 @@ type Runner struct {
 	Publisher             *Publisher
 	Restart               bool
 }
+
+const projectedPageBatchCount = 64
+const projectedPageBatchBytes = 2 << 20
+
 type runState struct {
 	RecordFormat                          int
 	Version                               int
@@ -449,7 +453,14 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 	}
 	journalPath := statePath + ".owned"
-	if err := replayOwnership(journalPath, request.SourceNamespace, state.Owned); err != nil {
+	// A committed or restarted run has no proofs to recover. Ownership
+	// events still apply, even when their publication never completed.
+	if state.Pending == nil || r.Restart {
+		state.PublicationProofs = nil
+	} else if state.PublicationProofs == nil {
+		state.PublicationProofs = map[string]string{}
+	}
+	if err := replaySourceJournal(journalPath, request.SourceNamespace, state.Owned, state.PublicationProofs); err != nil {
 		return 0, "", err
 	}
 	phase = "connect"
@@ -549,35 +560,48 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	// Projected pages can resume from verified rows because both their bytes
 	// and citation metadata have provider revisions. Recheck access before
 	// reusing any published rows.
+	var projectedPages bool
 	itemsToPublish := state.Pending.Objects
 	if google, ok := connector.(*GoogleConnector); ok && google.ProviderName == ProviderGCS {
 		config, err := decodeSourceConfig[GoogleConfig](request.Config)
 		if err != nil {
 			return 0, "", err
 		}
-		if config.PageProvenance {
-			restored := false
-			if state.PublicationProofs != nil {
+		projectedPages = config.PageProvenance
+		if projectedPages {
+			if len(state.PublicationProofs) > 0 {
 				phase = "restore_publication"
-				restored, err = writer.RestorePublicationProofs(ctx, state.PublicationProofs)
+				restored, err := writer.matchPublicationProofs(ctx, state.PublicationProofs)
 				if err != nil {
 					return 0, "", err
 				}
-				if restored {
-					if err := google.validateGCSObjectAccess(ctx, request, state.Pending.Objects); err != nil {
+				if len(restored) > 0 {
+					restoredItems := make([]Item, 0, len(restored))
+					itemsToPublish = make([]Item, 0, len(state.Pending.Objects)-len(restored))
+					for _, item := range state.Pending.Objects {
+						key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
+						if err != nil {
+							return 0, "", err
+						}
+						if _, ok := restored[key]; ok {
+							restoredItems = append(restoredItems, item)
+						} else {
+							itemsToPublish = append(itemsToPublish, item)
+						}
+					}
+					if err := google.validateGCSObjectAccess(ctx, request, restoredItems); err != nil {
 						return 0, "", err
 					}
-					itemsToPublish = nil
-				} else {
-					state.PublicationProofs = nil
+					writer.markPublicationVerified(restored)
+				}
+				if len(restored) != len(state.PublicationProofs) {
+					state.PublicationProofs = restored
 					if err := writeJSON(statePath, state, 256<<20); err != nil {
 						return 0, "", err
 					}
 				}
 			}
-			if !restored {
-				writer.TrackPublicationProofs()
-			}
+			writer.TrackPublicationProofs()
 		}
 	}
 	legacy := []string{}
@@ -593,6 +617,41 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		selected[item.ID] = true
 	}
 	var total int64
+	var pageBytes int
+	page := map[string]Document{}
+	pageOwners := map[string]string{}
+	flush := func() error {
+		if len(page) == 0 {
+			return nil
+		}
+		if err := journalOwnership(journalPath, ownershipEvent{Add: pageOwners}); err != nil {
+			return err
+		}
+		if _, err := writer.Upsert(ctx, page); err != nil {
+			return err
+		}
+		proofs := make(map[string]string, len(page))
+		for key := range page {
+			proofs[key] = writer.PublicationProofs()[key]
+		}
+		if err := journalOwnership(journalPath, ownershipEvent{Proofs: proofs}); err != nil {
+			return err
+		}
+		clear(page)
+		clear(pageOwners)
+		pageBytes = 0
+		return nil
+	}
+	// Keep the aggregate read budget across retries as well as fresh reads.
+	if projectedPages {
+		for _, item := range state.Pending.Objects {
+			if item.Size < 0 || item.Size > 10<<30-total {
+				return 0, "", fmt.Errorf("invalid projected page size or source run exceeds 10 GiB")
+			}
+			total += item.Size
+		}
+		total = 0
+	}
 	for _, item := range itemsToPublish {
 		if err := ctx.Err(); err != nil {
 			return 0, "", err
@@ -638,26 +697,37 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if _, exists := state.Owned[item.ID]; !exists && len(state.Owned) >= maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget; complete reconciliation before selecting more items")
 		}
-		if err := journalOwnership(journalPath, ownershipEvent{ID: item.ID, Revision: item.Revision}); err != nil {
-			return 0, "", err
-		}
-		state.Owned[item.ID] = item.Revision
-		if len(state.Owned) > maxOwnedSourceObjects {
-			return 0, "", fmt.Errorf("source ownership exceeds budget")
-		}
 		key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
 		if err != nil {
 			return 0, "", err
 		}
+		if projectedPages {
+			if len(page) > 0 && pageBytes+len(doc.Content) > projectedPageBatchBytes {
+				if err := flush(); err != nil {
+					return 0, "", err
+				}
+			}
+			page[key], pageOwners[item.ID] = doc, item.Revision
+			state.Owned[item.ID] = item.Revision
+			pageBytes += len(doc.Content)
+			if len(page) == projectedPageBatchCount || pageBytes >= projectedPageBatchBytes {
+				if err := flush(); err != nil {
+					return 0, "", err
+				}
+			}
+			continue
+		}
+		if err := journalOwnership(journalPath, ownershipEvent{ID: item.ID, Revision: item.Revision}); err != nil {
+			return 0, "", err
+		}
+		state.Owned[item.ID] = item.Revision
 		if _, err := writer.Upsert(ctx, map[string]Document{key: doc}); err != nil {
 			return 0, "", err
 		}
 	}
-	if proofs := writer.PublicationProofs(); len(proofs) > 0 {
-		state.PublicationProofs = proofs
-		if err := writeJSON(statePath, state, 256<<20); err != nil {
-			return 0, "", err
-		}
+	phase = "publish"
+	if err := flush(); err != nil {
+		return 0, "", err
 	}
 	absent := []string{}
 	for id := range state.Owned {

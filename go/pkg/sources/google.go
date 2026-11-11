@@ -242,7 +242,7 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 				return fmt.Errorf("invalid GCS generation")
 			}
 			// Console-created directory markers are not source documents.
-			if config.Key == "" && size == 0 && strings.HasSuffix(item.Name, "/") {
+			if config.PageProvenance && config.Key == "" && size == 0 && strings.HasSuffix(item.Name, "/") {
 				continue
 			}
 			canonical := "gs://" + config.Bucket + "/" + escapeSourcePath(item.Name)
@@ -427,7 +427,11 @@ func (c *GoogleConnector) readWithin(ctx context.Context, client *http.Client, r
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, googleResponseError(resp)
+		providerErr := googleResponseError(resp)
+		if c.ProviderName == ProviderGCS {
+			return nil, gcsPinnedAccessError(o, providerErr)
+		}
+		return nil, providerErr
 	}
 	if c.ProviderName == ProviderGCS && resp.Header.Get("X-Goog-Generation") != o.Revision {
 		return nil, &RevisionChangedError{Expected: o.Revision, Actual: resp.Header.Get("X-Goog-Generation")}
@@ -545,7 +549,7 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 		Generation string `json:"generation"`
 	}
 	if err := c.get(ctx, client, path, &object); err != nil {
-		return err
+		return gcsPinnedAccessError(o, err)
 	}
 	if object.Generation != o.Revision {
 		return &RevisionChangedError{Expected: o.Revision, Actual: object.Generation}
@@ -647,6 +651,17 @@ func ValidatePageProvenancePublication(provider string, config GoogleConfig, pub
 		return fmt.Errorf("%w: page_provenance requires a GCS source with text publication", ErrInvalidInput)
 	}
 	return nil
+}
+
+// A failed precondition cannot succeed on the same pinned inventory.
+func gcsPinnedAccessError(item Item, err error) error {
+	var provider *GoogleHTTPError
+	if errors.As(err, &provider) && provider.Status == http.StatusPreconditionFailed {
+		return &restartRequiredError{cause: &RevisionChangedError{
+			Expected: item.Revision, Actual: "GCS generation or metageneration precondition failed",
+		}}
+	}
+	return err
 }
 
 func gcsObjectAccessPath(config GoogleConfig, item Item) (string, error) {

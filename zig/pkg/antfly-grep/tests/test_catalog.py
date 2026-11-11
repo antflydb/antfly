@@ -39,6 +39,7 @@ class CatalogTests(unittest.TestCase):
         self.content_uri = "s3://docs/manual.txt"
         self.pages = []
         self.content_requests = []
+        self.content_source_ids = []
         self.file_catalog = None
         self.records = []
         for i in range(70):
@@ -117,6 +118,7 @@ class CatalogTests(unittest.TestCase):
                     self.reply(404, {})
                     return
                 test.content_requests.append(body)
+                test.content_source_ids.append(self.headers.get("X-Antfly-Source-ID"))
                 if not body.get("remote_snapshot"):
                     if test.mode == "syncing_before_snapshot":
                         test.records[0]["_source"]["source"]["status"] = "syncing"
@@ -229,6 +231,48 @@ class CatalogTests(unittest.TestCase):
         result = self.search("--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(self.content_uri.encode(), result.stdout)
+
+    def test_physical_row_scope_in_file_and_table_catalogs(self):
+        source = self.records[0]["_source"]["source"]
+        logical_id = source["id"]
+        row_source_id = str(uuid.UUID(int=100))
+        source["row_source_id"] = row_source_id
+        source["filter"] = {
+            "conjuncts": [
+                {"field": "source_id", "equals": row_source_id},
+                {"field": "doc_type", "equals": "source_item"},
+            ]
+        }
+        self.file_catalog = Path(self.temp.name) / "catalog.json"
+        self.file_catalog.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "endpoint": self.endpoint,
+                    "sources": [dict(source, published_revision="inventory-1")],
+                }
+            )
+        )
+        for catalog in (self.file_catalog, None):
+            with self.subTest(catalog=catalog):
+                self.file_catalog = catalog
+                self.content_requests.clear()
+                self.content_source_ids.clear()
+                result = self.search()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b"retry budget", result.stdout)
+                self.assertTrue(self.content_source_ids)
+                self.assertTrue(
+                    all(value == logical_id for value in self.content_source_ids)
+                )
+                self.assertIn(
+                    row_source_id,
+                    json.dumps(self.content_requests[0]["filter_query"]),
+                )
+        source["filter"]["conjuncts"][0]["equals"] = logical_id
+        result = self.search()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"InvalidSourceCatalog", result.stderr)
 
     def test_publication_changes_before_snapshot_fail_without_output(self):
         for mode, error in (

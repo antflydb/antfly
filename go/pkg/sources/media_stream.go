@@ -267,7 +267,11 @@ func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, s
 	}
 	if response.StatusCode != expectedStatus {
 		defer response.Body.Close()
-		return nil, mediaProviderError(googleResponseError(response))
+		providerErr := googleResponseError(response)
+		if c.ProviderName == ProviderGCS {
+			return nil, mediaProviderError(gcsPinnedAccessError(item, providerErr))
+		}
+		return nil, mediaProviderError(providerErr)
 	}
 	if response.ContentLength != span.Length {
 		response.Body.Close()

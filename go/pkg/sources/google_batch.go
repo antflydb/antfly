@@ -134,7 +134,7 @@ func (c *GoogleConnector) CheckGCSAccessBatch(ctx context.Context, r Request, it
 func checkGCSAccessReply(reply *http.Response, item Item) error {
 	defer reply.Body.Close()
 	if reply.StatusCode != http.StatusOK {
-		return googleResponseError(reply)
+		return gcsPinnedAccessError(item, googleResponseError(reply))
 	}
 	var object struct {
 		Generation string `json:"generation"`

@@ -789,7 +789,9 @@ destination table is immutable; use a new UUID to move destinations. Restored
 connections can resume without losing their ledger.
 
 Failed job receipts include a safe `failure` object with `source_id`, `phase`,
-`code`, and `retryable`. The same fields are logged without raw provider messages,
+`code`, and `retryable`. A failure with `restart_required: true` needs a
+fresh inventory. Use `--restart` on the CLI or pass `"restart": true` to
+`POST /v1/sync`. The same fields are logged without raw provider messages,
 URLs or credentials. Inspect this receipt before retrying; failed and interrupted
 jobs retain their durable acquisition checkpoint.
 
@@ -1015,4 +1017,10 @@ Each object must have `original_pdf_uri`, `original_page`,
 the text digest, retains the projection location in metadata, and cites the
 original PDF URI with its page fragment. Use a generation-pinned original URI
 such as `gs://original-bucket/report.pdf?generation=42`. The cited generation
-must remain available in the original bucket.
+must remain available in the original bucket. Projected-page prefix scans skip
+zero-byte directory markers. Ordinary GCS sources and exact-key selections
+retain zero-byte objects.
+
+Projected-page syncs checkpoint each verified publication batch. On resume,
+the sync rechecks the indexed rows and the pinned GCS generations and
+metagenerations before reusing them.
