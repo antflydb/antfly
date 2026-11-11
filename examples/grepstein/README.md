@@ -126,6 +126,10 @@ disk-backed ordinal index restores source order at publication, with a fixed
 map in memory. Active spool files are bounded
 by concurrency times the maximum object size; failed workers cancel siblings
 and remove their owned spools before returning.
+Create-only collisions during either streaming or finalization are resolved
+by size/checksum verification of the winning object. Cleanup cancels only the
+upload, preserving the verification context; permission and source I/O failures
+remain errors. No collision recovery overwrites an object.
 SHA-addressed objects are reused only after size/checksum verification; staged
 PDF originals use the same keys as subsequent PDF publication. ZIP members are read/hashed one at a time and uploads run through the bounded
 worker window; scratch state must be outside input directories. Defaults cap

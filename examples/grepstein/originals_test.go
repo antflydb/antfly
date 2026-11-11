@@ -23,9 +23,11 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +37,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -453,5 +456,147 @@ func TestOriginalCompletionIndexOrdersAndRejectsHoles(t *testing.T) {
 	json.NewEncoder(&want).Encode(b)
 	if !bytes.Equal(got.Bytes(), want.Bytes()) {
 		t.Fatal("completion order changed catalog")
+	}
+}
+
+// A resumable upload may lose its create-only race before Write has consumed
+// the source, or only when Close flushes a small buffered source. Both outcomes
+// must verify the competing object without cancelling the verification context.
+func TestOriginalGCSConcurrentCreationDuringWriteAndClose(t *testing.T) {
+	for _, phase := range []string{"write", "close"} {
+		for _, outcome := range []string{"matching", "mismatch", "denied", "missing-winner"} {
+			t.Run(phase+"/"+outcome, func(t *testing.T) {
+				data := []byte("small buffered original")
+				if phase == "write" {
+					data = bytes.Repeat([]byte("media"), 4<<20)
+				}
+				record, err := originalFileRecord(bytes.NewReader(data), "video/mp4")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var checksum [4]byte
+				binary.BigEndian.PutUint32(checksum[:], record.CRC32C)
+				md5 := record.MD5
+				if outcome == "mismatch" {
+					md5 = []byte("wrong-checksum")
+				}
+				attrs := fmt.Sprintf(`{"size":%q,"generation":"42","md5Hash":%q,"crc32c":%q}`, fmt.Sprint(record.Bytes), base64.StdEncoding.EncodeToString(md5), base64.StdEncoding.EncodeToString(checksum[:]))
+				var gets, posts atomic.Int64
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					switch r.Method {
+					case "GET":
+						if gets.Add(1) == 1 || outcome == "missing-winner" {
+							w.WriteHeader(404)
+							fmt.Fprint(w, `{"error":{"code":404,"message":"not found"}}`)
+							return
+						}
+						fmt.Fprint(w, attrs)
+					case "POST":
+						posts.Add(1)
+						if r.URL.Query().Get("ifGenerationMatch") != "0" {
+							t.Error("upload lost create-only predicate")
+						}
+						io.Copy(io.Discard, r.Body)
+						code := 412
+						if outcome == "denied" {
+							code = 403
+						}
+						w.WriteHeader(code)
+						fmt.Fprintf(w, `{"error":{"code":%d,"message":"upload rejected"}}`, code)
+					default:
+						t.Errorf("unexpected request %s", r.Method)
+						w.WriteHeader(500)
+					}
+				}))
+				defer server.Close()
+				client, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				source := &originalCountingSource{Reader: bytes.NewReader(data)}
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				generation, err := originalGCSWriter(client)(ctx, "private", "objects/test.mp4", source, record)
+				switch outcome {
+				case "matching":
+					if err != nil || generation != "42" {
+						t.Fatalf("reuse generation=%s err=%v", generation, err)
+					}
+				case "mismatch":
+					if err == nil || !strings.Contains(err.Error(), "integrity mismatch") {
+						t.Fatalf("mismatched winner: %v", err)
+					}
+				case "denied":
+					var apiErr *googleapi.Error
+					if !errors.As(err, &apiErr) || apiErr.Code != 403 {
+						t.Fatalf("lost upload error: %v", err)
+					}
+				case "missing-winner":
+					if err == nil {
+						t.Fatal("accepted missing winner")
+					}
+				}
+				expectedGets := int64(2)
+				if outcome == "denied" {
+					expectedGets = 1
+				}
+				if gets.Load() != expectedGets || posts.Load() != 1 {
+					t.Fatalf("unexpected retry/verification: GET=%d POST=%d", gets.Load(), posts.Load())
+				}
+				if phase == "write" && source.bytes >= record.Bytes {
+					t.Fatal("fixture did not exercise failure during Write")
+				}
+				if phase == "close" && source.bytes != record.Bytes {
+					t.Fatal("fixture did not exercise failure during Close")
+				}
+			})
+		}
+	}
+}
+
+type originalCountingSource struct {
+	*bytes.Reader
+	bytes int64
+}
+
+func (s *originalCountingSource) Read(p []byte) (int, error) {
+	n, err := s.Reader.Read(p)
+	s.bytes += int64(n)
+	return n, err
+}
+
+type originalFailingSource struct {
+	*bytes.Reader
+	failure error
+}
+
+func (s originalFailingSource) Read([]byte) (int, error) { return 0, s.failure }
+
+func TestOriginalGCSSourceReadFailureAbortsWithoutPublishing(t *testing.T) {
+	failure := errors.New("source disk read failed")
+	var uploads atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			uploads.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(404)
+		fmt.Fprint(w, `{"error":{"code":404,"message":"not found"}}`)
+	}))
+	defer server.Close()
+	client, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	source := originalFailingSource{Reader: bytes.NewReader(nil), failure: failure}
+	_, err = originalGCSWriter(client)(t.Context(), "private", "objects/test", source, originalRecord{Bytes: 5})
+	if !errors.Is(err, failure) {
+		t.Fatalf("lost source failure: %v", err)
+	}
+	if uploads.Load() != 0 {
+		t.Fatal("finalized an unreadable source")
 	}
 }

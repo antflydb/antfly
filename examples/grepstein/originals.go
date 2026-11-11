@@ -500,28 +500,42 @@ func originalGCSWriter(client *storage.Client) originalPut {
 		if !errors.Is(err, storage.ErrObjectNotExist) {
 			return "", err
 		}
-		writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
+		// Upload cancellation must not cancel the subsequent integrity read when
+		// another creator wins. Keep a separate bounded operation context alive.
+		uploadCtx, cancelUpload := context.WithCancel(ctx)
+		defer cancelUpload()
+		writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(uploadCtx)
 		writer.ChunkSize = originalUploadChunkSize(record.Bytes)
 		writer.ContentType = record.MIME
 		writer.CRC32C = record.CRC32C
 		writer.SendCRC32C = true
 		writer.Metadata = map[string]string{"sha256": record.SHA256}
-		n, copyErr := io.Copy(writer, io.LimitReader(source, record.Bytes+1))
-		if copyErr != nil || n != record.Bytes {
-			cancel()
-			writer.Close()
-			return "", fmt.Errorf("original upload interrupted or source changed")
-		}
-		if err := writer.Close(); err != nil {
+		resolveUploadError := func(uploadErr error) (string, error) {
 			var apiErr *googleapi.Error
-			if errors.As(err, &apiErr) && apiErr.Code == 412 {
+			if errors.As(uploadErr, &apiErr) && apiErr.Code == 412 {
+				// GCS can reject creation during Write or Close. Either phase
+				// establishes only a collision; size and checksums prove reuse.
 				attrs, err := object.Attrs(ctx)
 				if err != nil {
-					return "", err
+					return "", fmt.Errorf("verify concurrent original creation: %w", err)
 				}
 				return verify(attrs)
 			}
-			return "", err
+			return "", fmt.Errorf("upload original %s: %w", key, uploadErr)
+		}
+		n, copyErr := io.Copy(writer, io.LimitReader(source, record.Bytes+1))
+		if copyErr != nil || n != record.Bytes {
+			// Never finalize an upload after a failed source read or a size
+			// mismatch. Join the SDK worker before returning or verifying reuse.
+			cancelUpload()
+			_ = writer.Close()
+			if copyErr != nil {
+				return resolveUploadError(copyErr)
+			}
+			return "", fmt.Errorf("original source size changed: expected %d bytes, copied %d", record.Bytes, n)
+		}
+		if err := writer.Close(); err != nil {
+			return resolveUploadError(err)
 		}
 		return verify(writer.Attrs())
 	}
