@@ -30,10 +30,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -174,7 +176,21 @@ func stageOriginalsCmd(args []string) error {
 		return err
 	}
 	defer unlock()
-	ctx := context.Background()
+	// The exclusive state lock proves that spools from killed prior invocations
+	// have no live owner. Never delete acquired archives or completed catalogs.
+	entries, err := os.ReadDir(*state)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && (strings.HasPrefix(entry.Name(), ".original-spool-") || strings.HasPrefix(entry.Name(), ".originals-")) {
+			if err := os.Remove(filepath.Join(*state, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	var put originalPut
 	if !*inventory {
 		client, err := storage.NewClient(ctx)

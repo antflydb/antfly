@@ -351,3 +351,24 @@ func TestOriginalMIMECoversLargeReleaseNativeFormats(t *testing.T) {
 		}
 	}
 }
+
+func TestStageOriginalsRecoversOnlyOwnedOrphanSpools(t *testing.T) {
+	source, state := t.TempDir(), t.TempDir()
+	writeCorpusFixture(t, filepath.Join(source, "document.pdf"), []byte("original"))
+	for _, name := range []string{".original-spool-abandoned", ".originals-abandoned", "preserve.txt"} {
+		if err := os.WriteFile(filepath.Join(state, name), []byte("old"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stageOriginalsCmd([]string{"--inventory-only", "--source", "doj-08=" + source, "--state", state}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{".original-spool-abandoned", ".originals-abandoned"} {
+		if _, err := os.Stat(filepath.Join(state, name)); !os.IsNotExist(err) {
+			t.Fatal("orphan not reclaimed", name, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(state, "preserve.txt")); err != nil || string(b) != "old" {
+		t.Fatal("cleanup deleted unrelated state")
+	}
+}
