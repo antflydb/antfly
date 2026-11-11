@@ -161,7 +161,7 @@ func corpusPrepareCmd(args []string) error {
 		if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.Trim(u.Path, "/") != "" {
 			return fmt.Errorf("base-url must be an HTTP(S) origin without credentials, path, or query")
 		}
-		cfg = corpusConfig{BaseURL: *base, PagesPerRecord: *pages, LimitPages: *limitPages, LimitFiles: *limitFiles}
+		cfg = corpusConfig{IndexedAt: time.Now().Unix(), BaseURL: *base, PagesPerRecord: *pages, LimitPages: *limitPages, LimitFiles: *limitFiles}
 		cfg.Key, err = newCorpusKey()
 		if err != nil {
 			return err
@@ -191,6 +191,9 @@ func corpusPrepareCmd(args []string) error {
 		if err = atomicCorpusJSON(cfgPath, cfg); err != nil {
 			return err
 		}
+	}
+	if cfg.IndexedAt <= 0 {
+		return fmt.Errorf("saved preparation is missing indexed_at; start a new --state")
 	}
 	archives := map[int]*archiveReceipt{}
 	for i, source := range cfg.Sources {
@@ -344,7 +347,7 @@ func corpusPrepareCmd(args []string) error {
 			versionBytes, _ := json.Marshal(loc)
 			version := sha256.Sum256(versionBytes)
 			original := entry.Locator
-			doc := map[string]any{"title": path.Base(loc.Name), "filename": path.Base(loc.Name), "mime_type": entry.MIME, "version": hex.EncodeToString(version[:]), "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "url": sourceURL(cfg, loc), "original_url": sourceURL(cfg, original), "metadata": map[string]any{"dataset": entry.Dataset, "document_id": entry.ID, "source_locator": loc, "page_start": loc.First, "page_end": loc.Last, "original_pages": totalPages}}
+			doc := map[string]any{"title": path.Base(loc.Name), "filename": path.Base(loc.Name), "mime_type": entry.MIME, "version": hex.EncodeToString(version[:]), "indexed_at": cfg.IndexedAt, "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "url": sourceURL(cfg, loc), "original_url": sourceURL(cfg, original), "metadata": map[string]any{"dataset": entry.Dataset, "document_id": entry.ID, "source_locator": loc, "page_start": loc.First, "page_end": loc.Last, "original_pages": totalPages}}
 			source := cfg.Sources[loc.Source]
 			if receipt := archives[loc.Source]; receipt != nil {
 				doc["metadata"].(map[string]any)["archive_source"] = receipt

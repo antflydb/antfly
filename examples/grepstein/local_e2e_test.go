@@ -284,7 +284,11 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 }
 
 func nativeGCSFixturePDF() []byte {
-	content := "BT /F1 12 Tf 40 700 Td (Native GCS extraction evidence) Tj ET\n"
+	// A complete digital-text page must pass the default native-text quality
+	// policy. A short title alone intentionally needs OCR and cannot qualify.
+	content := "BT /F1 12 Tf 40 700 Td (Native GCS extraction evidence) Tj\n" +
+		"0 -18 Td (This digital document contains ordinary readable evidence text.) Tj\n" +
+		"0 -18 Td (Its native units and chunks retain the original source identity.) Tj ET\n"
 	objects := []string{"<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content)}
 	var out bytes.Buffer
 	out.WriteString("%PDF-1.4\n")

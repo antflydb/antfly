@@ -373,7 +373,10 @@ readiness is checked separately from source publication, including failed OCR.
 
 The binding maps the corpus's existing fields to source identity and permissions.
 New prepared rows include `indexed_at` and private `user:self` reader metadata;
-regenerate and publish older prepared rows before using the new binding. Local
+regenerate and publish older prepared rows before using the new binding. Preparation
+saves one `indexed_at` timestamp in `sources.json`, so resumed rows retain the
+same manifest bytes. Older preparation states without that timestamp require a
+new `--state`; do not edit sealed manifests to fabricate it. Local
 principal filtering narrows results; exposed APIs still require their own current
 caller authorization/RLS. The ordinary Antfly API and binding format are the
 same in Cloud and self-hosted deployments. Never distribute a write/admin key
@@ -447,7 +450,8 @@ are deferred; their raw originals can be preserved independently.
 ### Investigating incomplete OCR
 
 A manifest's `merge_status: converged` reports artifact publication, not OCR
-success. Inspect `ocr_failed_count` on document artifact summaries and run
+success. Inspect `ocr_failed_count` and the raw manifest's
+`incomplete_unit_count` and run
 `qualify` before declaring extraction complete. A nonempty text index can still
 contain embedded PDF text while OCR pages have failed. Failed OCR pages must not
 qualify for Antfly's unchanged-source fast path. Transient failures use the

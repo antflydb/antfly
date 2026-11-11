@@ -140,6 +140,14 @@ func TestCorpusResumeTruncatesUncommittedTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Model a preparation resumed much later without a timing-dependent sleep.
+	// Both committed and replayed rows must retain the saved generation time.
+	cfg := testCorpusConfig(t, state)
+	expected = bytes.ReplaceAll(expected, []byte(fmt.Sprintf("\"indexed_at\":%d", cfg.IndexedAt)), []byte("\"indexed_at\":1700000000"))
+	cfg.IndexedAt = 1700000000
+	if err := atomicCorpusJSON(filepath.Join(state, "sources.json"), cfg); err != nil {
+		t.Fatal(err)
+	}
 	inventory, _ := os.ReadFile(filepath.Join(state, "inventory.ndjson"))
 	lines := bytes.SplitAfter(expected, []byte("\n"))
 	firstOffset := len(lines[0]) + len(lines[1])
