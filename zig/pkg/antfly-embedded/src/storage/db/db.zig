@@ -56744,7 +56744,7 @@ fn appendGeneratedBatchFromEnrichment(
 
         pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.fence) |fence| if (fence.replay_generation) |generation|
+            if (self.fence) |active_fence| if (active_fence.replay_generation) |generation|
                 try enrichment_state.validateReplayGenerationTxn(alloc, txn, enrichment_runtime_mod.scope_name, generation);
             try self.validateLease(alloc, txn);
             for (self.source_guards) |guard| {
